@@ -53,6 +53,32 @@ pub const Workbook = workbook_mod.Workbook;
 /// §9.1 M10q's arena-fill probe. Public so the bench harness can install
 /// tallies; inert in every build that does not (`pkg/fill.zig`).
 pub const fill_probe = workbook_mod.fill_probe;
+/// §9.1f M10w's graph-block census and page-rate knob, public on the same
+/// terms and for the complementary reason: the build era's peak is one
+/// `gpa` block carved by a `FixedBufferAllocator`, which is the one region
+/// an arena tally cannot reach.
+///
+/// **Two symbols, not the module.** Re-exporting `zlsx_formula.graph`
+/// would put `Graph` — and `Graph.block`, whose slack past the last carve
+/// is unspecified — in this package's public API for the sake of a probe.
+pub const graph_probe = struct {
+    const graph = @import("zlsx_formula").graph;
+
+    pub const Census = graph.Census;
+
+    /// Install a census sink, or clear it with `null`. Not thread-safe;
+    /// see `graph.census_sink`.
+    pub fn install(sink: ?*Census) void {
+        graph.census_sink = sink;
+    }
+
+    /// N bytes of never-carved slack on the retained block, so its cost
+    /// in resident pages can be measured against its own unpadded run on
+    /// the same binary. Zero is the working default.
+    pub fn setBlockPadding(bytes: usize) void {
+        graph.probe_block_padding = bytes;
+    }
+};
 pub const Worksheet = workbook_mod.Worksheet;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;

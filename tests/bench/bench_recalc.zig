@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !u8 {
             "usage: {s} <emit|open|recalc|save|phases|heap|fill|pages> <fixture.xlsx>" ++
                 " [--workload f1|criteria|text|registry|sparse|bigtext|longform]" ++
                 " [--size named|small|tiny] [--rows N] [--cols N] [--text-bytes N]" ++
-                " [--terms N] [--out PATH]\n",
+                " [--terms N] [--block-padding N] [--out PATH]\n",
             .{args[0]},
         );
         return 2;
@@ -206,6 +206,14 @@ pub fn main(init: std.process.Init) !u8 {
             // fraction while cutting its rows tenfold.
             i += 1;
             cols_opt = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--block-padding") and i + 1 < args.len) {
+            // §9.1f's page-rate probe: N bytes of never-carved slack on
+            // the graph's retained block, on the same binary as the
+            // unpadded run, so the block's marginal cost at the build
+            // era's peak is measured rather than inferred from a
+            // rebuild whose layout moved.
+            i += 1;
+            pkg.graph_probe.setBlockPadding(try std.fmt.parseInt(usize, args[i], 10));
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_path = args[i];
@@ -400,6 +408,13 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
     }
     defer fill.clear();
 
+    // §9.1f M10w: the build era's peak is one `gpa` block beside three
+    // builder lists, so it is the one region no arena tally reaches.
+    const graph_probe = pkg.graph_probe;
+    var census: graph_probe.Census = .{};
+    graph_probe.install(&census);
+    defer graph_probe.install(null);
+
     const rss_start = peakRssBytes();
     var wb = try Workbook.open(gpa, io, path);
     defer wb.deinit();
@@ -424,6 +439,26 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
         "arena_totals capacity_end={d} fill_peak={d} unfilled={d}\n",
         .{ cap_total, fill_total, cap_total -| fill_total },
     );
+
+    // The block, term by term, and the builder lists alive beside it.
+    // Printed in carve order so `carved_before_last_read` can be checked
+    // against the terms above it rather than taken on trust.
+    try w.print("\n--- graph block census (M10w) ---\n", .{});
+    inline for (std.meta.fields(graph_probe.Census)) |f| {
+        try w.print("census {s}={d}\n", .{ f.name, @field(census, f.name) });
+    }
+    const scratch_at_block = census.owners_bytes + census.refs_bytes +
+        census.logs_bytes + census.refs_data_bytes + census.by_coord_bytes +
+        census.tails_bytes + census.builder_keys_bytes;
+    try w.print(
+        "census_derived builder_scratch_at_block={d} block_deferrable={d} at_last_read={d}\n",
+        .{
+            scratch_at_block,
+            census.block_bytes -| census.carved_before_last_read,
+            census.carved_before_last_read + scratch_at_block,
+        },
+    );
+
     var b0: [24]u8 = undefined;
     var b1: [24]u8 = undefined;
     var b2: [24]u8 = undefined;

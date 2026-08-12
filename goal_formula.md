@@ -4678,11 +4678,13 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 > amendment below), but the **3 × model bytes ceiling no longer gates a
 > release.** By owner decision (§9.1b) the blocking gate is an absolute
 > ratcheted budget on the digest-gated named fixture — opened at
-> **53 813 576 B**, ratcheted to **53 631 549 B** by M10t (§9.1c) and
-> re-affirmed by M10u (§9.1d) — and 15.15 MiB survives as a non-blocking
-> research hypothesis expressed per modeled cell (158.8 B/cell against
-> 532 B/cell measured). The evaluate ≤ 500 ms and end-to-end ≤ 1 s
-> ceilings are **unchanged** by this amendment.
+> **53 813 576 B**, ratcheted to **53 631 549 B** by M10t (§9.1c),
+> re-affirmed by M10u (§9.1d) and M10v (§9.1e), and ratcheted again to
+> **51 645 808 B** by M10w (§9.1f) — and 15.15 MiB survives as a
+> non-blocking research hypothesis expressed per modeled cell (158.8
+> B/cell against 511 B/cell measured in the ReleaseSafe gate lane, 496
+> B/cell in ReleaseFast — §9.1f). The evaluate ≤ 500 ms and end-to-end
+> ≤ 1 s ceilings are **unchanged** by this amendment.
 >
 > **Amended 2026-08-11 (second) — the baseline-adjustment wording.**
 > §9.1a logged a defect in the measurement contract itself: this section
@@ -7491,6 +7493,358 @@ proof that every layout change behaves this way.
   rather than flat, styled/rich-text-heavy workbooks, and any shape at
   all above 400 000 cells.
 
+### 9.1f M10w — the block, the knob, and the budget spent (2026-08-11)
+
+§9.1c ended in a no-go and left an exact figure behind it: **2 048 000 B**,
+the gap from the resident maximum down to the runner-up, and the whole
+budget any further ladder row could ever pay. §9.1d and §9.1e spent none
+of it — they measured curves. This row asks the question the no-go left
+open: *is there a cut that fits inside that budget, or is the ladder
+closed?*
+
+There is one. It collects **2 031 616 B**, reproduced on two independently
+built pairs of binaries, and it removes no data at all. Its ReleaseFast
+reading then says the whole of that is the safety memset being paid later
+rather than memory a user gets back, which is the part of this row a
+reader must not skip.
+
+#### What the maximum is made of
+
+The resident maximum is not an arena and not a phase, which is why
+neither instrument §9.1 already had could price it. It is **one `gpa`
+block, carved by a `FixedBufferAllocator`, standing beside builder lists
+that die at different times.** The heap trace localizes it: site `id47`,
+`graph.zig`'s `link`, **10 210 051 B in a single allocation** — and the
+resident curve rises **10 125 312 B** into the era that sets the maximum
+(43 122 688 → 53 248 000 in the pre-cut vector below), which is 99.2 % of
+the block. Those are two *local maxima*, not two instants, so read the
+step as corroboration and the census below as the identification.
+
+So this row's first product is an instrument. `graph.census_sink` is a
+process-wide opt-in on `fill_probe`'s exact terms — null by default, no
+wrapper in any allocation path, four branches per graph build and none
+per allocation, reached through `pkg.graph_probe` and printed by
+`zlsx-bench-recalc fill`. It reports the block term by term, the carver's
+position at three named instants, and the builder lists alive beside it.
+
+On the digest-gated `f1_mix_named` fixture (sha256 `b2b42c0b…8ad0`),
+89 999 nodes of which 80 000 are cell-like:
+
+| region | bytes | first read |
+|---|---:|---|
+| keys | 4 319 952 | the walk-log loop's `findIn` |
+| index, both sort orders | 2 560 000 | the range arm, **after** the loop |
+| walk logs | 1 799 980 | written *in* the loop |
+| dep offsets | 360 000 | after the loop |
+| component | 359 996 | after the loop |
+| cyclic | 89 999 | after the loop |
+| order offsets | 360 000 | after the loop |
+| order member data | 359 996 | after the loop |
+| headroom | 128 | never |
+| **block** | **10 210 051** | |
+
+The nine terms sum to the request exactly, and `carved_at_return` is
+**10 209 924** — one byte of alignment padding across nine carves, 127 B
+of the headroom unused. The headroom is safe against *any* carve order:
+eight carves after the first, each of alignment at most 8 over an
+8-aligned block, cannot waste more than 56 B.
+
+Beside it, at the instant the block is requested: `owners` 7 680 000,
+`refs_data` 6 654 760, the builder's own `keys` 4 319 952 (given back four
+lines later), `logs` 960 000, `refs` 640 000, `by_coord` 480 128 —
+**20 734 840 B of builder scratch**, of which the walk-log loop holds
+9 280 000 B alive only to read them once more.
+
+#### The mechanism, and why every byte of the block was resident
+
+`Allocator.alloc` memsets its whole result to `undefined` in Debug and
+ReleaseSafe (§9.1c). The block came from `alignedAlloc`. **So all
+10 210 051 B became resident at the request, including the six regions
+whose first reader does not run until those owner lists have been
+freed.** The carver's laziness bought nothing: the pages had already
+arrived.
+
+#### The page rate, measured on one binary
+
+Before writing anything, the block's bytes had to be priced in pages.
+M10t priced one cut at −114 688 B and then −98 304 B on two builds
+differing only in dead code and a comment — the raw peak moves ±1 page
+with binary layout — so this row prices with a **runtime knob**
+(`--block-padding N`): N bytes of never-carved slack past the last
+region, turned on the *same binary* as the unpadded arm, so layout
+cancels exactly rather than approximately.
+
+| padding | baseline-adjusted | Δ vs unpadded |
+|---:|---:|---:|
+| 0 | 53 166 080 | — |
+| 1 048 576 | 54 214 656 | **+1 048 576** |
+| 2 097 152 | 55 263 232 | **+2 097 152** |
+| 4 194 304 | 57 360 384 | **+4 194 304** |
+
+**1.000 B of resident page per byte of block, three times, exact, and
+byte-identical across three repetitions each.** The padding is never
+carved and never written by the program — it is resident *only* because
+`alloc` memset it. That is §9.1c's mechanism measured on the gate's own
+fixture and in the gate's own currency, instead of on a synthetic
+`page_allocator` request.
+
+#### The candidates, each priced before it was written
+
+| candidate | deferrable bytes | verdict |
+|---|---:|---|
+| the index, carved before a loop that never reads it | **2 560 000** | shipped |
+| dep offsets, component, cyclic, order, headroom | **1 530 119** | shipped |
+| `keys` | 4 319 952 | **zero** — the loop's own `findIn` reads it |
+| `walk logs` | 1 799 980 | **zero** — the loop writes it |
+| `owners` / `refs` / `logs` | 9 280 000 | **zero** — already freed at their last read (M10j) |
+| `refs_data` | 6 654 760 | **zero** — the graph retains it |
+| `by_coord` | 480 128 | **zero** — live until `seedAll` |
+
+**The column is bytes, not pages, and the distinction is load-bearing.**
+A region's boundaries are not page-aligned and two regions share the page
+they meet on, so none of these figures is a *measured* page count —
+2 560 000 and 1 530 119 are not even multiples of the 16 384 B page. What
+converts them is the sweep above: at a measured 1.000 B/B, a region of B
+bytes is B bytes of pages **to within one page**. The only figure in this
+row measured directly in resident pages is the gate delta below.
+
+Deferrable total for the two that ship: **4 090 119 B**, twice the budget.
+The prediction the era vector then makes — M10l's rule, stated before the
+cut and not after it — is that a cut pays at most the gap to the next
+era, so the payoff should be the gap and the maximum should land on the
+runner-up.
+
+#### The cut
+
+Two changes, both in `link`, neither touching what the graph contains.
+
+1. **The block is requested with `rawAlloc`**, which does not itself
+   write; each `fa.alloc` then poisons its own region as it is carved.
+   Every byte handed out is memset exactly as before. What the change
+   gives up is the poison on the bytes handed to *nobody* — the alignment
+   padding and the headroom — and `Graph.block`'s doc comment now says so,
+   because Zig has no private fields and a caller can reach them. The
+   padding knob is read once and added with `std.math.add`, so a value
+   past `usize` is `error.OutOfMemory` rather than a panic in ReleaseSafe
+   and undefined behaviour in ReleaseFast.
+2. **`Index.build` moves below the three `clearAndFree` calls.** It reads
+   nothing but `keys`, its first reader is the range arm, and no
+   statement between the two positions touches `idx` — so its 2 560 000 B
+   now arrive at an instant 9 280 000 B lower.
+
+Neither change removes a byte. `block_bytes` is 10 210 051 before and
+after; `carved_at_return` is 10 209 924 before and after, so the reorder
+cost no extra padding. What moved is **when** the pages arrive, and the
+census reads exactly that: `carved_before_last_read` and
+`carved_after_lists_freed` both **8 679 932 → 6 119 932**, deferrable
+**1 530 119 → 4 090 119**.
+
+#### The gate, re-measured
+
+Three arms interleaved, the baseline re-read immediately before every
+peak, three repetitions — **every raw peak and every baseline
+byte-identical across its three**:
+
+| arm | baseline | raw peak | baseline-adjusted |
+|---|---:|---:|---:|
+| §9.1e tip (`640e05b`), rebuilt today | 1 818 624 | 55 001 088 | 53 182 464 |
+| + census + knob, cut reverted | 1 818 624 | 54 984 704 | 53 166 080 |
+| **+ the cut** | 1 835 008 | 52 969 472 | **51 134 464** |
+
+| | value |
+|---|---:|
+| **baseline-adjusted** | **51 134 464 — 48.77 MiB** |
+| vs the same source with the cut reverted | **−2 031 616 (−3.82 %)** |
+| ratcheted budget (figure + 1 %) | **51 645 808** |
+| vs the 15.15 MiB research hypothesis | 3.22× |
+| B/cell (ReleaseSafe / ReleaseFast) | 511.3 / **495.9** |
+
+The two cut arms drew baselines one page apart, so the −2 031 616 is a
+raw-peak difference of 2 015 232 plus one page of baseline. **The
+adjusted delta is the quantity the gate is defined on, and it reproduced
+at exactly 2 031 616 on a second, independently built pair** whose two
+arms happened to draw the *same* baseline (53 198 848 → 51 167 232, raw
+55 017 472 → 52 985 856). Two pairs, two different (peak, baseline)
+splits, one delta.
+
+*The §9.1e tip reads 53 182 464 here against the 53 166 080 recorded in
+§9.1e — one page higher, entirely in the baseline (1 818 624 today,
+1 835 008 then; the raw peak 55 001 088 reproduced exactly). A usage
+invocation is not stable across sessions to better than a page, so an
+adjusted figure carried between sessions is a ±16 384 B quantity. That is
+0.8 % of this cut and would have been 17 % of M10t's. For the same
+reason the −2 048 000 this row reads against that rebuilt tip is not a
+second measurement of §9.1c's 2 048 000 B budget; it is this cut's
+−2 031 616 plus a page, and the coincidence of digits is arithmetic.*
+
+#### The envelope, before and after
+
+The maximum moves, and the `pages` instrument says which kind of era it
+moves between — by the **measured arena fill**, not by a phase name the
+instrument does not report:
+
+| | pre-cut | post-cut |
+|---|---|---|
+| eras detected | 23 | 22 |
+| **maximum** | era 16, fill 8 530 137 — **53 248 000** | era 9, fill 8 352 — **51 216 384** |
+| runner-up | era 10, fill 8 352 — 51 232 768 | era 18, fill 8 533 121 — 49 872 896 |
+| **gap** | **2 015 232** | **1 343 488** |
+
+**The maximum moves from an era where the graph's arenas are full to one
+where nothing has been filled yet** — the decode half, which is where
+§9.1c placed its era 10. That is the whole of what this table identifies;
+the two vectors do **not** have comparable era numbering — 23 rows against
+22, the dip rule having found one fewer local maximum on the post-cut
+curve, **and it lost it in the decode half, where this cut provably cannot
+act** (the graph does not exist yet). So the missing row is the sampler's
+own timing, no era-by-era difference is quoted, and an earlier pair of
+binaries whose vectors *did* segment identically — every decode era equal
+to the byte — was a property of that pair rather than of the method.
+
+The pre-cut gap, 2 015 232 B, and the measured gate delta, 2 031 616 B,
+agree **to within one page**. On the other pair both read 2 031 616. So
+M10l's rule — a cut pays at most the gap to the next era — is confirmed at
+the resolution these figures have, which is one page, and the maximum did
+land on the runner-up.
+
+#### The knob again, after the cut: the envelope's shape, measured
+
+The same knob on the post-cut binary no longer reads 1.000 B/B. It reads
+zero until the padding exceeds the new gap, and 1.000 B/B after:
+
+| padding | baseline-adjusted | Δ | padding − Δ |
+|---:|---:|---:|---:|
+| 0 | 51 134 464 | — | — |
+| 1 048 576 | 51 134 464 | **+0** | — |
+| 1 343 488 | 51 134 464 | **+0** | — |
+| 2 097 152 | 51 888 128 | +753 664 | **1 343 488** |
+| 4 194 304 | 53 985 280 | +2 850 816 | **1 343 488** |
+
+Four sampled points, consistent with a hinge at **1 343 488 B**: the
+padding is absorbed entirely below it, and above it the absorbed part is
+that same figure at both points — **the runner-up gap the era table
+reports, from an instrument with a different baseline, and identical on
+both binary pairs.** What is measured is the four points and the absorbed
+amount; the response *between* 1 343 488 and 2 097 152 was not sampled,
+and any envelope 1 343 488 B below the maximum would produce the same four
+readings.
+
+Why the padding is ever resident is source inspection, not measurement:
+`Allocator.free` memsets before releasing, so the graph's teardown is the
+one explicit full-span write left. Unpadded that costs nothing, because by
+then every byte of the block has been carved. Which era the teardown falls
+in, this row does not claim.
+
+So one knob, turned twice, measures both the mechanism and the envelope:
+before the cut the block sat *on* the envelope, and after it the block
+sits **1 343 488 B below** it.
+
+#### The ReleaseFast lane, which is where the honesty is
+
+| arm | baseline | raw peak | baseline-adjusted |
+|---|---:|---:|---:|
+| §9.1e tip, ReleaseFast | 1 720 320 | 51 331 072 | 49 610 752 |
+| cut reverted, ReleaseFast | 1 720 320 | 51 314 688 | 49 594 368 |
+| **+ the cut, ReleaseFast** | 1 720 320 | **51 314 688** | **49 594 368** |
+| either arm + 4 MiB padding | 1 720 320 | 51 314 688 | 49 594 368 |
+
+**In ReleaseFast the cut changes nothing: the two arms' raw peaks are
+identical to the byte.** So is the 4 MiB padding arm, on both sides of the
+cut — the knob has no reading to give where there is no memset to probe,
+which is the cleanest evidence that it probes exactly that.
+
+(An earlier pair read −16 384 B here, one page, between a differently
+built pre-cut arm and the same cut. Across the two pairs the ReleaseFast
+effect is **0 ± 1 page**: not distinguishable from zero, and certainly not
+a 2 MB saving.)
+
+That makes the decomposition exact rather than an attribution:
+
+| term | bytes |
+|---|---:|
+| ReleaseSafe delta | **−2 031 616** |
+| ReleaseFast delta | **0** |
+| therefore, change in the safety-memset tax | **−2 031 616** |
+
+The tax M10t named — the ReleaseSafe-minus-ReleaseFast difference —
+measured on this row's own arms: **3 571 712 B (6.72 %)** before,
+**1 540 096 B (3.01 %)** after. (M10t's own figure for it, on a different
+binary in a different session, was also 3 571 712.) **This row halves a
+tax; it does not shrink the program**, and a reader taking 2 MB as a
+user-visible saving is reading a ReleaseSafe figure as a universal one.
+
+It ships anyway, and the reason is not rhetorical: §9.1b defines the
+blocking release gate in the ReleaseSafe lane, so 51 134 464 B is the
+number the gate reads and the budget ratchets against. Debug and
+ReleaseSafe builds — which is what a Zig consumer gets by default — pay
+the tax this row halves.
+
+#### The maximum is now the decode half, and that revives a priced-at-zero answer
+
+§9.1c priced its candidate 2 — the first scan's 1 431 436 B of unhinted
+list slack — at **zero pages, because it lived in era 10 and era 10 was
+2 048 000 B below the maximum**. The maximum is now an era of the decode
+half, the region §9.1c placed that candidate in. The same waste is now
+worth up to the new gap, **1 343 488 B**, and nothing about the waste
+changed: this row changed what it is measured against. That is M10n's "a
+runner-up only with respect to a particular cut" arriving as a consequence
+rather than a caution, and it is the first candidate in §9.1 measured at
+zero that later became live.
+
+Whether it is a row is a question for whoever asks it. This row does not
+claim it — and §9.1c's finding that decode holds no *profitable* cut was a
+statement about a 2 048 000 B ceiling that no longer applies.
+
+#### What this does and does not say
+
+- **No data was removed and no structure shrank.** The graph holds the
+  same 10 210 051 B for the same lifetime. The row moved the page arrival
+  of 4 090 119 B of it to a later instant and collected the 2 031 616 B
+  the envelope had between the two.
+- **All of it is a lane effect, and that is measured, not attributed.**
+  ReleaseFast's two arms are byte-identical. What a Debug or ReleaseSafe
+  build gets is real; what a ReleaseFast build gets is nothing.
+- **`rawAlloc` promises less than the cut relies on.** The interface says
+  nothing about untouched pages — a backing allocator may write what it
+  returns, and the test double in `graph.zig` deliberately does. That the
+  pages arrive untouched is a measured property of the allocator this runs
+  on. The one thing the change gives up is poison on the block's
+  never-carved slack, which `Graph.block` now documents as unspecified;
+  every byte handed out is memset exactly as before.
+- **The knob is the method advance.** §9.1c's ±1-page layout confound was
+  17 % of the effect it was pricing; a runtime knob makes both arms the
+  same binary, and the padding steps came out exact in both directions and
+  on both binary pairs. Any future §9.1 row pricing a single allocation
+  should reach for a knob before a rebuild — and should bound it, because
+  an unchecked knob on an allocation size is a panic in ReleaseSafe and
+  undefined behaviour in ReleaseFast.
+- **Era segmentation is not stable across binaries.** 23 eras against 22
+  on two builds whose decode halves are one page apart. An era-by-era
+  difference table is only ever available when both arms happen to
+  segment alike, and M10t's rule — compare shapes, not rows — is the
+  default, not the exception.
+- **The four new tests were each verified to fail without their own fix**,
+  by three inverse patches built and run:
+  - both halves reverted → the two stamp tests read **0xaa where 0x5a is
+    asserted**, and the carve test reads **368 against 272** — the 96 B of
+    index on the three-cell test input;
+  - `Index.build` moved to *between* the walk-log loop and the frees →
+    only the second carver reading fires, **368 against 272**. That case
+    passes the first reading, which is exactly why the second exists: a
+    carve there would hold the same 9 280 000 B alive that the cut is for.
+    This assertion was added because a review found the gap; it was not
+    guessed at.
+  - the checked add replaced by `+` → the overflow test does not merely
+    fail, it **crashes with `panic: integer overflow`**, which is the
+    failure mode the check exists to remove.
+
+  In ReleaseFast the memset is elided, so the two stamp tests discriminate
+  only in Debug and ReleaseSafe; those are the lanes they are for.
+- **The budget is spent.** The maximum has moved to the decode half, the
+  new gap is 1 343 488 B, and the ratcheted budget is 51 645 808 B.
+- Still untested, unchanged from §9.1e: real cross-sheet edges at scale,
+  deeply nested rather than flat formulas, styled/rich-text-heavy
+  workbooks, and any shape above 400 000 cells.
 ---
 
 ## 10. Refusal & error taxonomy
