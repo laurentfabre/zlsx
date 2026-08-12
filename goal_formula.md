@@ -7894,10 +7894,11 @@ the scan's span is 7 929 856 B below the maximum, and lowering an instant
 that is already below the maximum cannot lower the maximum. The step is
 sound only for the *direct* effect — this row's own cut is the
 counterexample for the indirect one, since it removed bytes in the decode
-half and a graph-half instant fell 163 840 B with it (below). So the
-honest reading is **zero to within the cross-span coupling this row
-measures at ten pages for a removal 8.7× larger**, not zero as an
-identity. That is still a budget of nothing worth writing a row for.
+half and the maximum in the *other* half then came out 163 840 B lower
+(below). So the honest reading is **zero to within the cross-span
+coupling this row measures at ten pages for a removal 8.7× larger**, not
+zero as an identity. That is still a budget of nothing worth writing a
+row for.
 
 The reason §9.1f's inference failed is worth stating plainly, because it
 is the same error §9.1a and §9.1c made in other currencies: **an era is
