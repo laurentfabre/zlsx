@@ -2384,9 +2384,13 @@ pub fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relation
             i = end + 1;
             continue;
         };
+        // Decoded like the other three attributes: an entity-encoded
+        // `TargetMode="Exter&#110;al"` is the same word, and reading
+        // it as internal would let an external rel through guards
+        // that branch on the mode (Codex r6).
         const mode_str = attrAtSlice(attrs, "TargetMode");
         const target_mode: TargetMode = if (mode_str) |m|
-            (if (std.mem.eql(u8, m, "External")) .external else .internal)
+            (if (std.mem.eql(u8, try decodeXmlEntities(arena, m), "External")) .external else .internal)
         else
             .internal;
 
@@ -4421,4 +4425,15 @@ test "parseRelationships: commented relationships are not live (Codex r4)" {
     );
     try std.testing.expectEqual(@as(usize, 1), rels.len);
     try std.testing.expectEqualStrings("../drawings/drawing1.xml", rels[0].target);
+}
+
+test "parseRelationships: entity-encoded TargetMode still reads External (Codex r6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rels = try parseRelationships(
+        arena.allocator(),
+        "<Relationships><Relationship Id=\"rId1\" Type=\"x\" Target=\"../drawings/drawing1.xml\" TargetMode=\"Exter&#110;al\"/></Relationships>",
+    );
+    try std.testing.expectEqual(@as(usize, 1), rels.len);
+    try std.testing.expectEqual(TargetMode.external, rels[0].target_mode);
 }

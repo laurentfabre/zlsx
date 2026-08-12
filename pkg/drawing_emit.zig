@@ -951,11 +951,80 @@ const drawing_successor_elements = [_][]const u8{
     "extLst",
 };
 
+/// The insertion index for a fresh `<drawing>`: the `<` of the first
+/// DIRECT worksheet child named in `drawing_successor_elements`, or
+/// of the live `</worksheet>` when none is present. Null when the
+/// document never closes its root.
+///
+/// Walks live tags with depth tracking rather than substring search:
+/// several successor names legally NEST inside earlier elements —
+/// `extLst` inside `autoFilter`/`sortState` (x14 filter extensions,
+/// real Excel output) — and a substring match there would splice the
+/// drawing INSIDE that element.
+fn drawingInsertPos(sheet_xml: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, sheet_xml, i, '<')) |lt| {
+        // Skip non-element markup inline. `liveIndexOfPos` can't do
+        // it for a bare `<` needle: the special openers all START
+        // with `<`, so nothing can precede the candidate.
+        if (std.mem.startsWith(u8, sheet_xml[lt..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, sheet_xml, lt + "<!--".len, "-->") orelse
+                return null;
+            i = close + "-->".len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, sheet_xml[lt..], "<![CDATA[")) {
+            const close = std.mem.indexOfPos(u8, sheet_xml, lt + "<![CDATA[".len, "]]>") orelse
+                return null;
+            i = close + "]]>".len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, sheet_xml[lt..], "<?")) {
+            const close = std.mem.indexOfPos(u8, sheet_xml, lt + "<?".len, "?>") orelse
+                return null;
+            i = close + "?>".len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, sheet_xml[lt..], "<!")) {
+            const close = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse return null;
+            i = close + 1;
+            continue;
+        }
+        if (lt + 1 >= sheet_xml.len) return null;
+        if (sheet_xml[lt + 1] == '/') {
+            // At depth 1 the only end tag is the root's own — the
+            // no-successor fallback slot.
+            if (depth == 1) return lt;
+            if (depth == 0) return null;
+            depth -= 1;
+            const gt = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse return null;
+            i = gt + 1;
+            continue;
+        }
+        const gt = store_mod.xmlStartTagEnd(sheet_xml, lt) orelse return null;
+        const self_closing = gt > lt + 1 and sheet_xml[gt - 1] == '/';
+        var name_end = lt + 1;
+        while (name_end < gt and
+            !std.ascii.isWhitespace(sheet_xml[name_end]) and sheet_xml[name_end] != '/')
+        {
+            name_end += 1;
+        }
+        const name = sheet_xml[lt + 1 .. name_end];
+        if (depth == 1) {
+            inline for (drawing_successor_elements) |succ| {
+                if (std.mem.eql(u8, name, succ)) return lt;
+            }
+        }
+        if (!self_closing) depth += 1;
+        i = gt + 1;
+    }
+    return null;
+}
+
 /// Splice `<drawing r:id="..."/>` into a sheet's XML at its
-/// CT_Worksheet schema position: before the first live successor
-/// element (`drawing_successor_elements`), or before the live
-/// `</worksheet>` when none is present. Caller owns the returned
-/// bytes.
+/// CT_Worksheet schema position (see `drawingInsertPos`). Caller owns
+/// the returned bytes.
 ///
 /// The element declares `xmlns:r` inline (`ns_r_uri`, the sheet
 /// dialect's relationships URI): every mainstream producer already
@@ -973,28 +1042,8 @@ pub fn appendDrawingElementToSheet(
     assert(rel_id.len > 0);
     assert(ns_r_uri.len > 0);
 
-    const close_tag = "</worksheet>";
-    var insert_at = store_mod.liveLastIndexOf(sheet_xml, close_tag) orelse
+    const insert_at = drawingInsertPos(sheet_xml) orelse
         return error.MalformedSheetXml;
-
-    inline for (drawing_successor_elements) |name| {
-        const needle = "<" ++ name;
-        var pos: usize = 0;
-        while (store_mod.liveIndexOfPos(sheet_xml, pos, needle)) |i| {
-            const after_idx = i + needle.len;
-            if (after_idx >= sheet_xml.len) break;
-            const after = sheet_xml[after_idx];
-            // Name boundary: `<picture ` / `<tableParts>` /
-            // `<extLst/>` qualify; a longer name does not (this is
-            // also what keeps `legacyDrawing` from matching its own
-            // `legacyDrawingHF` sibling at the wrong slot).
-            if (std.ascii.isWhitespace(after) or after == '/' or after == '>') {
-                if (i < insert_at) insert_at = i;
-                break;
-            }
-            pos = after_idx;
-        }
-    }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -1626,6 +1675,21 @@ test "appendDrawingElementToSheet: lands at the CT_Worksheet schema slot" {
     defer std.testing.allocator.free(out4);
     try std.testing.expect(std.mem.indexOf(u8, out4, "-->").? <
         std.mem.indexOf(u8, out4, "<drawing r:id=").?);
+
+    // An extLst NESTED inside autoFilter (x14 filter extensions —
+    // real Excel output) is not the worksheet-level slot: splicing
+    // there would put the drawing INSIDE the autoFilter. Only the
+    // direct-child tableParts is.
+    const nested_ext =
+        "<worksheet><sheetData/>" ++
+        "<autoFilter ref=\"A1:B9\"><extLst><ext uri=\"x\"/></extLst></autoFilter>" ++
+        "<tableParts count=\"1\"><tablePart r:id=\"rId5\"/></tableParts>" ++
+        "</worksheet>";
+    const out5 = try appendDrawingElementToSheet(std.testing.allocator, nested_ext, "rId9", ns_r_transitional);
+    defer std.testing.allocator.free(out5);
+    const dpos = std.mem.indexOf(u8, out5, "<drawing r:id=").?;
+    try std.testing.expect(dpos > std.mem.indexOf(u8, out5, "</autoFilter>").?);
+    try std.testing.expect(dpos < std.mem.indexOf(u8, out5, "<tableParts").?);
 }
 
 test "appendRelationship: appends before </Relationships>" {
