@@ -221,6 +221,11 @@ pub const Error = error{
     /// closing `</Relationships>` tag — refused rather than producing
     /// an unparseable rels part.
     MalformedDrawingRels,
+    /// An id-allocation scan (media part numbers, `rId`s, `cNvPr`
+    /// ids) found the u32 id space exhausted — some existing entry
+    /// already uses maxInt(u32). Crafted input; refused typed before
+    /// any mutation rather than emitting a duplicate id.
+    IdSpaceExhausted,
     /// Image bytes' magic header didn't match the declared `mime`.
     MimeMagicMismatch,
     /// Image anchor had a 0 row or 0 col (OOXML is 1-based).
@@ -4683,10 +4688,15 @@ pub const Workbook = struct {
 
         const a = self.allocator;
 
+        // The fresh drawing part and both relationship Types are
+        // emitted in the sheet's own conformance dialect, so a Strict
+        // workbook doesn't gain a mixed-conformance package.
+        const dialect = drawing_emit.detectSheetDialect(sheet_part.bytes);
+
         // Derive part-name slots. No gap-filling: bumping past the
         // highest seen N keeps the result stable across saves.
-        const image_n = drawing_emit.nextFreeNumber(&self.store, "xl/media/image", "");
-        const drawing_n = drawing_emit.nextFreeNumber(&self.store, "xl/drawings/drawing", ".xml");
+        const image_n = try drawing_emit.nextFreeNumber(&self.store, "xl/media/image", "");
+        const drawing_n = try drawing_emit.nextFreeNumber(&self.store, "xl/drawings/drawing", ".xml");
 
         const ext = mime.extension();
         // Compose part names. Free at function-exit; addPart dupes
@@ -4717,23 +4727,21 @@ pub const Workbook = struct {
         );
         defer a.free(sheet_rels_part_name);
 
-        // Build the drawing artifacts. Fresh parts are Transitional
-        // (buildDrawingXml's own root declares the Transitional URIs),
-        // so the image rel Type matches.
-        const drawing_xml = try drawing_emit.buildDrawingXml(a, anchor_spec);
+        // Build the drawing artifacts in the sheet's dialect.
+        const drawing_xml = try drawing_emit.buildDrawingXml(a, anchor_spec, dialect);
         defer a.free(drawing_xml);
 
         const drawing_rels_xml = try drawing_emit.buildDrawingRels(
             a,
             image_basename,
-            drawing_emit.image_rel_type_transitional,
+            dialect.imageRelType(),
         );
         defer a.free(drawing_rels_xml);
 
         // Pick `rId` for the sheet's drawing rel. New rels file → rId1;
         // existing → next free.
         const sheet_rels_existing = self.store.rels(sheet_part_name);
-        const rid_n = drawing_emit.nextFreeRelId(sheet_rels_existing);
+        const rid_n = try drawing_emit.nextFreeRelId(sheet_rels_existing);
         var rid_buf: [16]u8 = undefined;
         const rid = try std.fmt.bufPrint(&rid_buf, "rId{d}", .{rid_n});
 
@@ -4742,9 +4750,20 @@ pub const Workbook = struct {
         // size cap) leaves the store unchanged.
         const sheet_rels_part = try self.store.part(sheet_rels_part_name);
         const new_sheet_rels_xml: []u8 = if (sheet_rels_part) |p|
-            try drawing_emit.appendRelationship(a, p.bytes, drawing_basename, rid)
+            try drawing_emit.appendRelationship(
+                a,
+                p.bytes,
+                drawing_basename,
+                rid,
+                dialect.drawingRelType(),
+            )
         else
-            try drawing_emit.buildFreshSheetRels(a, drawing_basename, rid);
+            try drawing_emit.buildFreshSheetRels(
+                a,
+                drawing_basename,
+                rid,
+                dialect.drawingRelType(),
+            );
         defer a.free(new_sheet_rels_xml);
 
         // Build the patched sheet XML (appends `<drawing r:id=...>`).
@@ -4879,7 +4898,7 @@ pub const Workbook = struct {
         const dialect = drawing_emit.detectWsDrDialect(drawing_part.bytes) orelse
             return error.UnsupportedDrawingPart;
 
-        const image_n = drawing_emit.nextFreeNumber(&self.store, "xl/media/image", "");
+        const image_n = try drawing_emit.nextFreeNumber(&self.store, "xl/media/image", "");
         const ext = mime.extension();
         const image_basename = try std.fmt.allocPrint(a, "image{d}.{s}", .{ image_n, ext });
         defer a.free(image_basename);
@@ -4899,12 +4918,12 @@ pub const Workbook = struct {
         // then the image rel is its first, `rId1`.
         const drawing_rels_part = try self.store.part(drawing_rels_part_name);
         const rid_n: u32 = if (drawing_rels_part) |p|
-            drawing_emit.nextFreeRelId(try store_mod.parseRelationships(rels_alloc, p.bytes))
+            try drawing_emit.nextFreeRelId(try store_mod.parseRelationships(rels_alloc, p.bytes))
         else
             1;
         var rid_buf: [16]u8 = undefined;
         const rid = try std.fmt.bufPrint(&rid_buf, "rId{d}", .{rid_n});
-        const pic_id = drawing_emit.nextFreeCnvprId(drawing_part.bytes);
+        const pic_id = try drawing_emit.nextFreeCnvprId(drawing_part.bytes);
 
         // Build every artifact BEFORE any store mutation — same
         // discipline as the fresh path: a build failure (malformed
@@ -13384,6 +13403,56 @@ test "Workbook.addImage: unknown wsDr namespace is refused before any mutation" 
     );
     // The refusal came before any mutation: no image part landed.
     try std.testing.expect((try wb.store.part("xl/media/image1.png")) == null);
+}
+
+test "Workbook.addImage: a Strict sheet gets a Strict fresh drawing part" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-strictfresh-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(allocator, io, src_path);
+    defer wb.deinit();
+
+    // Rewrite the sheet root's default namespace to the Strict URI —
+    // the worksheet part of a Strict-conformance package. The fresh
+    // path must emit the drawing part and BOTH relationship Types in
+    // that dialect, not a mixed-conformance package (Codex r2,
+    // MAJOR 5).
+    {
+        const sheet_part = (try wb.store.part("xl/worksheets/sheet1.xml")).?;
+        const patched = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            sheet_part.bytes,
+            drawing_emit.ns_main_transitional,
+            drawing_emit.ns_main_strict,
+        );
+        defer allocator.free(patched);
+        // The fixture really was Transitional; the swap took effect.
+        try std.testing.expect(std.mem.indexOf(u8, patched, drawing_emit.ns_main_strict) != null);
+        try wb.store.replacePart("xl/worksheets/sheet1.xml", patched);
+    }
+
+    try wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png);
+
+    const drawing = (try wb.store.part("xl/drawings/drawing1.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        drawing,
+        "xmlns:xdr=\"" ++ drawing_emit.ns_xdr_strict ++ "\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawing, drawing_emit.ns_a_strict) != null);
+    const drawing_rels = (try wb.store.part("xl/drawings/_rels/drawing1.xml.rels")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, drawing_rels, drawing_emit.image_rel_type_strict) != null);
+    const sheet_rels = (try wb.store.part("xl/worksheets/_rels/sheet1.xml.rels")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, sheet_rels, drawing_emit.drawing_rel_type_strict) != null);
 }
 
 test "Workbook.addImage: rejects 0-based anchor with InvalidAnchor" {

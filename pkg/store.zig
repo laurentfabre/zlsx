@@ -2053,7 +2053,7 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
 
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, "<Default")) |pos| {
-        const end = std.mem.indexOfScalarPos(u8, xml, pos, '>') orelse break;
+        const end = xmlStartTagEnd(xml, pos) orelse break;
         const attrs = xml[pos..end];
         const ext_raw = attrAtSlice(attrs, "Extension") orelse {
             i = end + 1;
@@ -2074,7 +2074,7 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
     }
     i = 0;
     while (std.mem.indexOfPos(u8, xml, i, "<Override")) |pos| {
-        const end = std.mem.indexOfScalarPos(u8, xml, pos, '>') orelse break;
+        const end = xmlStartTagEnd(xml, pos) orelse break;
         const attrs = xml[pos..end];
         const part_name_raw = attrAtSlice(attrs, "PartName") orelse {
             i = end + 1;
@@ -2105,27 +2105,79 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
 }
 
 fn attrAtSlice(attrs: []const u8, key: []const u8) ?[]const u8 {
-    // Match `key="value"` or `key='value'`. Both quote styles are
-    // valid XML; some non-Microsoft OOXML producers (libreoffice,
-    // hand-edited .rels files) emit single quotes, and missing them
-    // would silently leave content types unresolved and relationships
-    // unparsed, causing imageParts / rels / drawing walkers to miss
-    // parts on otherwise well-formed packages.
-    return attrAtSliceWithQuote(attrs, key, '"') orelse
-        attrAtSliceWithQuote(attrs, key, '\'');
+    return xmlAttrValue(attrs, key);
 }
 
-fn attrAtSliceWithQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8 {
-    var search_buf: [64]u8 = undefined;
-    if (key.len + 2 > search_buf.len) return null;
-    @memcpy(search_buf[0..key.len], key);
-    search_buf[key.len] = '=';
-    search_buf[key.len + 1] = quote;
-    const needle = search_buf[0 .. key.len + 2];
-    const found = std.mem.indexOf(u8, attrs, needle) orelse return null;
-    const start = found + needle.len;
-    const close = std.mem.indexOfScalarPos(u8, attrs, start, quote) orelse return null;
-    return attrs[start..close];
+/// Find the `>` that closes the start tag opening at `open_pos`,
+/// skipping `>` characters inside quoted attribute values — `>` is
+/// legal there per XML 1.0 §2.4 (only `<` and `&` must be escaped),
+/// and shape names like `name="a>b"` occur in real parts. Returns
+/// null when the tag never closes.
+pub fn xmlStartTagEnd(xml: []const u8, open_pos: usize) ?usize {
+    std.debug.assert(open_pos < xml.len);
+    std.debug.assert(xml[open_pos] == '<');
+    var i = open_pos + 1;
+    while (i < xml.len) {
+        const c = xml[i];
+        if (c == '"' or c == '\'') {
+            const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse return null;
+            i = close + 1;
+            continue;
+        }
+        if (c == '>') return i;
+        i += 1;
+    }
+    return null;
+}
+
+/// Extract one attribute's value from a start tag by lexing the
+/// attribute list left to right — never by substring search, so a
+/// value containing `=`, `>` or a lookalike key can neither
+/// terminate nor satisfy the scan. Accepts both quote styles and
+/// XML 1.0 §3.1 `Eq` whitespace on either side of `=`; both are
+/// legal spellings some non-Microsoft producers (libreoffice,
+/// hand-edited .rels files) emit, and missing them would silently
+/// leave content types unresolved, relationships unparsed, and — on
+/// the drawing-append path — ids double-allocated.
+///
+/// `tag` is the start tag WITHOUT its closing `>` (as cut by
+/// `xmlStartTagEnd`), either from its `<` (the element name is
+/// skipped) or from anywhere inside the attribute list. The value is
+/// returned raw — entity decoding is the caller's choice. Malformed
+/// attribute syntax stops the lex and returns null.
+pub fn xmlAttrValue(tag: []const u8, name: []const u8) ?[]const u8 {
+    std.debug.assert(name.len > 0);
+    var i: usize = 0;
+    // Skip `<` + element name when handed a full start tag.
+    if (i < tag.len and tag[i] == '<') {
+        i += 1;
+        while (i < tag.len and
+            !std.ascii.isWhitespace(tag[i]) and tag[i] != '/' and tag[i] != '>')
+        {
+            i += 1;
+        }
+    }
+    while (i < tag.len) {
+        if (std.ascii.isWhitespace(tag[i]) or tag[i] == '/') {
+            i += 1;
+            continue;
+        }
+        const name_start = i;
+        while (i < tag.len and !std.ascii.isWhitespace(tag[i]) and tag[i] != '=') i += 1;
+        const attr_name = tag[name_start..i];
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i >= tag.len or tag[i] != '=') return null;
+        i += 1;
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i >= tag.len) return null;
+        const quote = tag[i];
+        if (quote != '"' and quote != '\'') return null;
+        const val_start = i + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, tag, val_start, quote) orelse return null;
+        if (std.mem.eql(u8, attr_name, name)) return tag[val_start..val_end];
+        i = val_end + 1;
+    }
+    return null;
 }
 
 fn extensionEql(name: []const u8, ext: []const u8) bool {
@@ -2260,7 +2312,7 @@ pub fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relation
             i = after;
             continue;
         }
-        const end = std.mem.indexOfScalarPos(u8, xml, pos, '>') orelse break;
+        const end = xmlStartTagEnd(xml, pos) orelse break;
         const attrs = xml[pos..end];
         const id = attrAtSlice(attrs, "Id") orelse {
             i = end + 1;
@@ -4234,4 +4286,45 @@ test "PartStore.openBuffer: generations share one buffer backing" {
         return error.TestUnexpectedResult;
     try std.testing.expect(styles.bytes.len > 0);
     gen1.deinit();
+}
+
+test "xmlAttrValue: lexes quotes, Eq whitespace, and hostile values" {
+    // Both quote styles and XML 1.0 §3.1 Eq whitespace.
+    try std.testing.expectEqualStrings("rId1", xmlAttrValue("<Relationship Id=\"rId1\"", "Id").?);
+    try std.testing.expectEqualStrings("rId1", xmlAttrValue("<Relationship Id='rId1'", "Id").?);
+    try std.testing.expectEqualStrings("rId1", xmlAttrValue("<Relationship Id = 'rId1'", "Id").?);
+    try std.testing.expectEqualStrings("rId1", xmlAttrValue("<Relationship\n  Id\t= \"rId1\"", "Id").?);
+
+    // A value containing `=` or a lookalike key never satisfies nor
+    // derails the lex — attributes are walked, not substring-matched.
+    try std.testing.expectEqualStrings("y", xmlAttrValue("<R Target=\"a=b\" Id=\"y\"", "Id").?);
+    try std.testing.expectEqualStrings("y", xmlAttrValue("<R MyId=\"x\" Id=\"y\"", "Id").?);
+    try std.testing.expect(xmlAttrValue("<R MyId=\"x\"", "Id") == null);
+    // Attribute order is free.
+    try std.testing.expectEqualStrings("t", xmlAttrValue("<R Target='t' Id='i'", "Target").?);
+    // Missing attribute, malformed Eq.
+    try std.testing.expect(xmlAttrValue("<R Id=\"x\"", "Type") == null);
+    try std.testing.expect(xmlAttrValue("<R Id=rId1", "Id") == null);
+}
+
+test "xmlStartTagEnd: skips '>' inside quoted values" {
+    const xml = "<xdr:cNvPr name=\"a>b\" id=\"1\"/><next/>";
+    const end = xmlStartTagEnd(xml, 0).?;
+    // The real close is the one after id="1"/, not the > inside name.
+    try std.testing.expectEqual(@as(u8, '>'), xml[end]);
+    try std.testing.expect(std.mem.startsWith(u8, xml[end + 1 ..], "<next/>"));
+    // An unterminated tag is null, not a scan past the buffer.
+    try std.testing.expect(xmlStartTagEnd("<a href=\"x", 0) == null);
+}
+
+test "parseRelationships: accepts Eq whitespace around = (Codex r2)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rels = try parseRelationships(
+        arena.allocator(),
+        "<Relationships><Relationship Id = 'rId1' Type = 'x' Target = '../drawings/drawing1.xml'/></Relationships>",
+    );
+    try std.testing.expectEqual(@as(usize, 1), rels.len);
+    try std.testing.expectEqualStrings("rId1", rels[0].id);
+    try std.testing.expectEqualStrings("../drawings/drawing1.xml", rels[0].target);
 }

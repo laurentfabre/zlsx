@@ -80,6 +80,11 @@ pub const Error = error{
     InvalidExtent,
     /// `bytes` was empty.
     EmptyImage,
+    /// An id-allocation scan (media part numbers, `rId`s, `cNvPr`
+    /// ids) found the u32 id space exhausted — some existing entry
+    /// already uses maxInt(u32). Crafted input; refused typed before
+    /// any mutation rather than emitting a duplicate id.
+    IdSpaceExhausted,
 };
 
 /// EMU per pixel at the 96 DPI that Office assumes for images without
@@ -409,7 +414,7 @@ pub fn nextFreeNumber(
     store: *const PartStore,
     prefix: []const u8,
     suffix: []const u8,
-) u32 {
+) Error!u32 {
     assert(prefix.len > 0);
     var max_seen: u32 = 0;
     for (store.parts) |p| {
@@ -427,10 +432,11 @@ pub fn nextFreeNumber(
         const n = std.fmt.parseInt(u32, middle[0..digits], 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    // Saturate rather than trap: a part already numbered maxInt(u32)
-    // is attacker-craftable input, and a duplicate name there (which
-    // addPart then refuses, typed) beats a safety-mode panic.
-    return max_seen +| 1;
+    // A part already numbered maxInt(u32) is crafted input; refuse
+    // typed rather than trapping in safe builds or wrapping into a
+    // duplicate name in fast ones.
+    if (max_seen == std.math.maxInt(u32)) return Error.IdSpaceExhausted;
+    return max_seen + 1;
 }
 
 /// Emit one `<xdr:from>` / `<xdr:to>` marker: the four scalar
@@ -480,11 +486,15 @@ pub const ns_a_transitional = "http://schemas.openxmlformats.org/drawingml/2006/
 pub const ns_a_strict = "http://purl.oclc.org/ooxml/drawingml/main";
 pub const ns_r_transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 pub const ns_r_strict = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+pub const ns_main_transitional = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub const ns_main_strict = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 pub const image_rel_type_transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 pub const image_rel_type_strict = "http://purl.oclc.org/ooxml/officeDocument/relationships/image";
+pub const drawing_rel_type_transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing";
+pub const drawing_rel_type_strict = "http://purl.oclc.org/ooxml/officeDocument/relationships/drawing";
 
-/// Which ECMA-376 conformance dialect a drawing part speaks, read off
-/// its root's `xmlns:xdr` declaration by `detectWsDrDialect`.
+/// Which ECMA-376 conformance dialect a part speaks, read off a root
+/// namespace declaration by `detectWsDrDialect` / `detectSheetDialect`.
 pub const WsDrDialect = enum {
     transitional,
     strict,
@@ -516,32 +526,85 @@ pub const WsDrDialect = enum {
             .strict => image_rel_type_strict,
         };
     }
+
+    pub fn drawingRelType(self: WsDrDialect) []const u8 {
+        return switch (self) {
+            .transitional => drawing_rel_type_transitional,
+            .strict => drawing_rel_type_strict,
+        };
+    }
 };
 
-/// Read a host drawing's conformance dialect off its root element's
-/// `xmlns:xdr` declaration. Null when there is no `<xdr:wsDr>` root or
-/// it binds `xdr` to neither known URI — the caller refuses rather
-/// than splicing content the host schema can't admit.
-pub fn detectWsDrDialect(drawing_xml: []const u8) ?WsDrDialect {
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, drawing_xml, pos, "<xdr:wsDr")) |i| {
-        const after_idx = i + "<xdr:wsDr".len;
-        if (after_idx >= drawing_xml.len) return null;
-        const after = drawing_xml[after_idx];
-        // A root using the prefix without declaring it (`>` right
-        // away) is malformed; a longer name (`<xdr:wsDrX`) is a
-        // different element.
-        if (!std.ascii.isWhitespace(after)) {
-            pos = after_idx;
+/// Index of the document's root start-tag `<`, skipping the XML
+/// declaration, processing instructions, comments, a doctype, and
+/// whitespace. Null when no element follows the prolog. Keeps a
+/// commented-out pseudo-root (`<!-- <xdr:wsDr …> -->`) from being
+/// mistaken for the real one.
+fn rootElementStart(xml: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < xml.len) {
+        if (std.ascii.isWhitespace(xml[i])) {
+            i += 1;
             continue;
         }
-        const el_end = std.mem.indexOfScalarPos(u8, drawing_xml, after_idx, '>') orelse return null;
-        const uri = attrValue(drawing_xml[i..el_end], "xmlns:xdr") orelse return null;
-        if (std.mem.eql(u8, uri, ns_xdr_transitional)) return .transitional;
-        if (std.mem.eql(u8, uri, ns_xdr_strict)) return .strict;
-        return null;
+        if (xml[i] != '<') return null;
+        if (std.mem.startsWith(u8, xml[i..], "<?")) {
+            const end = std.mem.indexOfPos(u8, xml, i, "?>") orelse return null;
+            i = end + 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[i..], "<!--")) {
+            const end = std.mem.indexOfPos(u8, xml, i, "-->") orelse return null;
+            i = end + 3;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[i..], "<!")) {
+            // Doctype — never present in OOXML parts; skipping to the
+            // first `>` misses an internal subset, which is beyond
+            // what this writer will chase.
+            const end = std.mem.indexOfScalarPos(u8, xml, i, '>') orelse return null;
+            i = end + 1;
+            continue;
+        }
+        return i;
     }
     return null;
+}
+
+/// Read a host drawing's conformance dialect off its ROOT element's
+/// `xmlns:xdr` declaration — the actual document root, located past
+/// comments and PIs, so a commented-out pseudo-root can't spoof the
+/// answer. Null when the root isn't `<xdr:wsDr>` or binds `xdr` to
+/// neither known URI — the caller refuses rather than splicing
+/// content the host schema can't admit.
+pub fn detectWsDrDialect(drawing_xml: []const u8) ?WsDrDialect {
+    const root = rootElementStart(drawing_xml) orelse return null;
+    if (!std.mem.startsWith(u8, drawing_xml[root..], "<xdr:wsDr")) return null;
+    const after_idx = root + "<xdr:wsDr".len;
+    // A root using the prefix without declaring it (`>` right away)
+    // is malformed; a longer name (`<xdr:wsDrX`) is another element.
+    if (after_idx >= drawing_xml.len) return null;
+    if (!std.ascii.isWhitespace(drawing_xml[after_idx])) return null;
+    const el_end = store_mod.xmlStartTagEnd(drawing_xml, root) orelse return null;
+    const uri = store_mod.xmlAttrValue(drawing_xml[root..el_end], "xmlns:xdr") orelse return null;
+    if (std.mem.eql(u8, uri, ns_xdr_transitional)) return .transitional;
+    if (std.mem.eql(u8, uri, ns_xdr_strict)) return .strict;
+    return null;
+}
+
+/// Read a worksheet part's conformance dialect off its root's default
+/// namespace declaration, so the fresh-image path can emit drawing
+/// parts and relationship Types in the workbook's own dialect.
+/// Defaults to `.transitional` when the root is unrecognized: the
+/// sheet already round-tripped through zlsx's own parser to get here,
+/// and Transitional is what every mainstream producer writes.
+pub fn detectSheetDialect(sheet_xml: []const u8) WsDrDialect {
+    const root = rootElementStart(sheet_xml) orelse return .transitional;
+    if (!std.mem.startsWith(u8, sheet_xml[root..], "<worksheet")) return .transitional;
+    const el_end = store_mod.xmlStartTagEnd(sheet_xml, root) orelse return .transitional;
+    const uri = store_mod.xmlAttrValue(sheet_xml[root..el_end], "xmlns") orelse return .transitional;
+    if (std.mem.eql(u8, uri, ns_main_strict)) return .strict;
+    return .transitional;
 }
 
 /// Whether a built anchor declares its namespace bindings inline.
@@ -673,13 +736,15 @@ pub fn buildPicAnchorXml(
 /// Build a fresh drawingN.xml body holding a single image anchor. The
 /// first image in a fresh part always gets `rId1` / `cNvPr id="1"` —
 /// appends into the part allocate theirs with `nextFreeRelId` /
-/// `nextFreeCnvprId` instead. Fresh parts are always Transitional;
-/// the anchor inherits the bindings this root declares.
+/// `nextFreeCnvprId` instead. The root declares all three prefixes in
+/// `dialect`'s URIs (the fresh path derives it from the host sheet
+/// via `detectSheetDialect`), and the anchor inherits them.
 ///
 /// Caller must have run `validateAnchor` first.
 pub fn buildDrawingXml(
     allocator: std.mem.Allocator,
     spec: ImageAnchorSpec,
+    dialect: WsDrDialect,
 ) ![]u8 {
     const anchor_xml = try buildPicAnchorXml(allocator, spec, "rId1", 1, .inherit);
     defer allocator.free(anchor_xml);
@@ -688,12 +753,13 @@ pub fn buildDrawingXml(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
-    try buf.appendSlice(
-        allocator,
-        "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"" ++
-            " xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"" ++
-            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">",
-    );
+    try buf.appendSlice(allocator, "<xdr:wsDr xmlns:xdr=\"");
+    try buf.appendSlice(allocator, dialect.nsXdr());
+    try buf.appendSlice(allocator, "\" xmlns:a=\"");
+    try buf.appendSlice(allocator, dialect.nsA());
+    try buf.appendSlice(allocator, "\" xmlns:r=\"");
+    try buf.appendSlice(allocator, dialect.nsR());
+    try buf.appendSlice(allocator, "\">");
     try buf.appendSlice(allocator, anchor_xml);
     try buf.appendSlice(allocator, "</xdr:wsDr>");
 
@@ -763,13 +829,18 @@ pub fn buildDrawingRels(
 
 /// Build the bytes for a brand-new `xl/worksheets/_rels/sheetN.xml.rels`
 /// containing exactly one Relationship to `../drawings/drawingN.xml`.
+/// `drawing_type_uri` follows the sheet's dialect
+/// (`WsDrDialect.drawingRelType`); the OPC wrapper namespace does not
+/// vary with it.
 pub fn buildFreshSheetRels(
     allocator: std.mem.Allocator,
     drawing_basename: []const u8,
     rel_id: []const u8,
+    drawing_type_uri: []const u8,
 ) ![]u8 {
     assert(drawing_basename.len > 0);
     assert(rel_id.len > 0);
+    assert(drawing_type_uri.len > 0);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -781,7 +852,9 @@ pub fn buildFreshSheetRels(
     );
     try buf.appendSlice(allocator, "<Relationship Id=\"");
     try buf.appendSlice(allocator, rel_id);
-    try buf.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/");
+    try buf.appendSlice(allocator, "\" Type=\"");
+    try buf.appendSlice(allocator, drawing_type_uri);
+    try buf.appendSlice(allocator, "\" Target=\"../drawings/");
     try buf.appendSlice(allocator, drawing_basename);
     try buf.appendSlice(allocator, "\"/>");
     try buf.appendSlice(allocator, "</Relationships>");
@@ -790,13 +863,16 @@ pub fn buildFreshSheetRels(
 }
 
 /// Splice a `<Relationship>` element into existing rels XML before
-/// `</Relationships>`. Caller owns the returned bytes.
+/// `</Relationships>`. `drawing_type_uri` follows the sheet's dialect
+/// (see `buildFreshSheetRels`). Caller owns the returned bytes.
 pub fn appendRelationship(
     allocator: std.mem.Allocator,
     existing_xml: []const u8,
     drawing_basename: []const u8,
     rel_id: []const u8,
+    drawing_type_uri: []const u8,
 ) ![]u8 {
+    assert(drawing_type_uri.len > 0);
     const close_tag = "</Relationships>";
     const close_pos = std.mem.lastIndexOf(u8, existing_xml, close_tag) orelse
         return error.MalformedSheetRels;
@@ -807,7 +883,9 @@ pub fn appendRelationship(
     try buf.appendSlice(allocator, existing_xml[0..close_pos]);
     try buf.appendSlice(allocator, "<Relationship Id=\"");
     try buf.appendSlice(allocator, rel_id);
-    try buf.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/");
+    try buf.appendSlice(allocator, "\" Type=\"");
+    try buf.appendSlice(allocator, drawing_type_uri);
+    try buf.appendSlice(allocator, "\" Target=\"../drawings/");
     try buf.appendSlice(allocator, drawing_basename);
     try buf.appendSlice(allocator, "\"/>");
     try buf.appendSlice(allocator, existing_xml[close_pos..]);
@@ -881,10 +959,9 @@ pub fn appendDrawingElementToSheet(
 
 /// Pick the next free `rId<N>` for the given existing rels list.
 /// Returns the integer N (caller formats `rId<N>`). Stable across
-/// saves: bumps past max(N) rather than gap-filling. Saturates at
-/// maxInt rather than trapping on a crafted `rId4294967295` (the
-/// duplicate is then the consumer's lenient-parse problem, not a
-/// panic).
+/// saves: bumps past max(N) rather than gap-filling. A crafted
+/// `rId4294967295` exhausts the space — refused typed rather than
+/// trapping or duplicating.
 ///
 /// Callers holding raw rels-file bytes rather than the store's cached
 /// view (the append path — a rels part created by `addPart` earlier
@@ -892,62 +969,23 @@ pub fn appendDrawingElementToSheet(
 /// `replacePart` refreshes) parse them first with
 /// `store.parseRelationships`, the same quote-tolerant,
 /// entity-decoding parser that fills the cache.
-pub fn nextFreeRelId(rels: []const store_mod.Relationship) u32 {
+pub fn nextFreeRelId(rels: []const store_mod.Relationship) Error!u32 {
     var max_seen: u32 = 0;
     for (rels) |r| {
         if (!std.mem.startsWith(u8, r.id, "rId")) continue;
         const n = std.fmt.parseInt(u32, r.id[3..], 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    return max_seen +| 1;
-}
-
-/// Extract one attribute's value from a single element's bytes.
-/// Tolerates single or double quotes AND XML 1.0 §3.1 `Eq` whitespace
-/// on both sides of `=` — the same lexical space
-/// `workbook.findAttrValue` accepts (born from Codex review
-/// REL-602/604; producers emitting single quotes or `name = "v"` are
-/// legal and observed). Entity references in the value are NOT
-/// decoded; callers comparing against wire-format ids (`rId7`) are
-/// unaffected because NMTOKEN-shaped values have nothing to escape.
-fn attrValue(element_bytes: []const u8, attr_name: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < element_bytes.len) {
-        const eq = std.mem.indexOfScalarPos(u8, element_bytes, i, '=') orelse return null;
-        // Walk backward across whitespace to the attribute name.
-        var name_end = eq;
-        while (name_end > 0 and std.ascii.isWhitespace(element_bytes[name_end - 1])) {
-            name_end -= 1;
-        }
-        var name_start = name_end;
-        while (name_start > 0 and !std.ascii.isWhitespace(element_bytes[name_start - 1])) {
-            name_start -= 1;
-        }
-        if (!std.mem.eql(u8, element_bytes[name_start..name_end], attr_name)) {
-            i = eq + 1;
-            continue;
-        }
-        // Walk forward across whitespace to the opening quote.
-        var q = eq + 1;
-        while (q < element_bytes.len and std.ascii.isWhitespace(element_bytes[q])) q += 1;
-        if (q >= element_bytes.len) return null;
-        const quote = element_bytes[q];
-        if (quote != '"' and quote != '\'') {
-            i = eq + 1;
-            continue;
-        }
-        const val_start = q + 1;
-        const val_end = std.mem.indexOfScalarPos(u8, element_bytes, val_start, quote) orelse
-            return null;
-        return element_bytes[val_start..val_end];
-    }
-    return null;
+    if (max_seen == std.math.maxInt(u32)) return Error.IdSpaceExhausted;
+    return max_seen + 1;
 }
 
 /// Extract the `r:id` of a worksheet's `<drawing>` element, or null
 /// when the sheet has none (or carries one without an `r:id`, which
 /// is schema-invalid and unresolvable either way). Returns a slice
-/// into `sheet_xml`.
+/// into `sheet_xml`. Attribute reads go through the shared
+/// `store.xmlAttrValue` lexer (both quote styles, `Eq` whitespace,
+/// `=`/`>`-in-value safe).
 ///
 /// The name test requires XML whitespace after `<drawing` so that
 /// `<drawingHF>` (header/footer images) and a bare `<drawing/>` never
@@ -961,8 +999,8 @@ pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
             pos = after_idx;
             continue;
         }
-        const el_end = std.mem.indexOfScalarPos(u8, sheet_xml, after_idx, '>') orelse return null;
-        return attrValue(sheet_xml[after_idx..el_end], "r:id");
+        const el_end = store_mod.xmlStartTagEnd(sheet_xml, i) orelse return null;
+        return store_mod.xmlAttrValue(sheet_xml[i..el_end], "r:id");
     }
     return null;
 }
@@ -972,9 +1010,10 @@ pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
 /// ids to be unique within their drawing part, and the id space is
 /// shared across shape kinds — pictures, charts' graphicFrames,
 /// shapes — so the scan matches the element name under any namespace
-/// prefix rather than picture anchors only. Saturates at maxInt
-/// rather than trapping on a crafted `id="4294967295"`.
-pub fn nextFreeCnvprId(drawing_xml: []const u8) u32 {
+/// prefix rather than picture anchors only. A crafted
+/// `id="4294967295"` exhausts the space — refused typed rather than
+/// trapping or duplicating.
+pub fn nextFreeCnvprId(drawing_xml: []const u8) Error!u32 {
     var max_seen: u32 = 0;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, drawing_xml, pos, "cNvPr")) |i| {
@@ -988,12 +1027,17 @@ pub fn nextFreeCnvprId(drawing_xml: []const u8) u32 {
         if (before != '<' and before != ':') continue;
         if (pos >= drawing_xml.len) break;
         if (!std.ascii.isWhitespace(drawing_xml[pos])) continue;
-        const tag_end = std.mem.indexOfScalarPos(u8, drawing_xml, pos, '>') orelse break;
-        const id_str = attrValue(drawing_xml[pos..tag_end], "id") orelse continue;
+        // Back up to the element's `<` so the shared lexer sees a full
+        // start tag, cut quote-aware — a `>` inside a name="a>b" value
+        // must not truncate the scan.
+        const lt = std.mem.lastIndexOfScalar(u8, drawing_xml[0..i], '<') orelse continue;
+        const tag_end = store_mod.xmlStartTagEnd(drawing_xml, lt) orelse break;
+        const id_str = store_mod.xmlAttrValue(drawing_xml[lt..tag_end], "id") orelse continue;
         const n = std.fmt.parseInt(u32, id_str, 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    return max_seen +| 1;
+    if (max_seen == std.math.maxInt(u32)) return Error.IdSpaceExhausted;
+    return max_seen + 1;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1054,7 +1098,7 @@ test "buildDrawingXml: anchors to (col-1, row-1) and emits oneCellAnchor" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 3, .row = 5 },
         .ext = one_inch_square,
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
     try expectMarker(xml, "xdr:from", 2, 0, 4, 0);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:oneCellAnchor>") != null);
@@ -1070,7 +1114,7 @@ test "buildDrawingXml: oneCellAnchor extent is whatever the caller passed" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 1, .row = 1 },
         .ext = .{ .cx_emu = 1_524_000, .cy_emu = 762_000 },
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:ext cx=\"1524000\" cy=\"762000\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "914400") == null);
@@ -1080,7 +1124,7 @@ test "buildDrawingXml: oneCellAnchor carries its anchor's pixel offsets" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 3, .row = 5, .col_off_emu = 190_500, .row_off_emu = 95_250 },
         .ext = one_inch_square,
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
     // 20 px and 10 px at 96 DPI, on the grid corner (2, 4).
     try expectMarker(xml, "xdr:from", 2, 190_500, 4, 95_250);
@@ -1091,7 +1135,7 @@ test "buildDrawingXml: twoCellAnchor emits from (col-1) and to (col) markers" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
         .from = .{ .col = 2, .row = 2 },
         .to = .{ .col = 4, .row = 5 },
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
 
     try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:twoCellAnchor>") != null);
@@ -1116,7 +1160,7 @@ test "buildDrawingXml: twoCellAnchor offsets are per-endpoint, not shared" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
         .from = .{ .col = 2, .row = 2, .col_off_emu = 9_525, .row_off_emu = 19_050 },
         .to = .{ .col = 4, .row = 5, .col_off_emu = 28_575, .row_off_emu = 38_100 },
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
     try expectMarker(xml, "xdr:from", 1, 9_525, 1, 19_050);
     try expectMarker(xml, "xdr:to", 4, 28_575, 5, 38_100);
@@ -1127,7 +1171,7 @@ test "buildDrawingXml: 1x1 twoCellAnchor range spans exactly its own cell" {
     const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
         .from = .{ .col = 1, .row = 1 },
         .to = .{ .col = 1, .row = 1 },
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(xml);
     try expectMarker(xml, "xdr:to", 1, 0, 1, 0);
 }
@@ -1444,7 +1488,13 @@ test "appendRelationship: appends before </Relationships>" {
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
         "<Relationship Id=\"rId1\" Type=\"x\" Target=\"y\"/>" ++
         "</Relationships>";
-    const out = try appendRelationship(std.testing.allocator, existing, "drawing1.xml", "rId2");
+    const out = try appendRelationship(
+        std.testing.allocator,
+        existing,
+        "drawing1.xml",
+        "rId2",
+        drawing_rel_type_transitional,
+    );
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Id=\"rId2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../drawings/drawing1.xml\"") != null);
@@ -1496,7 +1546,7 @@ test "detectWsDrDialect: reads the root xmlns:xdr binding" {
     const fresh = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 1, .row = 1 },
         .ext = one_inch_square,
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(fresh);
     try std.testing.expectEqual(@as(?WsDrDialect, .transitional), detectWsDrDialect(fresh));
 
@@ -1513,11 +1563,49 @@ test "detectWsDrDialect: reads the root xmlns:xdr binding" {
     try std.testing.expect(detectWsDrDialect("<xdr:wsDr></xdr:wsDr>") == null);
 }
 
+test "detectWsDrDialect: a commented pseudo-root cannot spoof the dialect" {
+    // The comment binds Strict; the REAL root is Transitional. Reading
+    // the comment's URI would splice Strict content into a
+    // Transitional part (Codex r2, MAJOR 1).
+    const spoofed =
+        "<?xml version=\"1.0\"?>" ++
+        "<!-- <xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_strict ++ "\"> -->" ++
+        "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\"></xdr:wsDr>";
+    try std.testing.expectEqual(@as(?WsDrDialect, .transitional), detectWsDrDialect(spoofed));
+
+    // A comment with no real root after it detects nothing.
+    const only_comment =
+        "<!-- <xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_strict ++ "\"> -->";
+    try std.testing.expect(detectWsDrDialect(only_comment) == null);
+}
+
+test "detectSheetDialect: reads the worksheet root's default namespace" {
+    try std.testing.expectEqual(WsDrDialect.transitional, detectSheetDialect(
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"" ++ ns_main_transitional ++ "\"><sheetData/></worksheet>",
+    ));
+    try std.testing.expectEqual(WsDrDialect.strict, detectSheetDialect(
+        "<worksheet xmlns=\"" ++ ns_main_strict ++ "\"><sheetData/></worksheet>",
+    ));
+    // Unrecognized roots fall back to Transitional — the dialect every
+    // mainstream producer writes.
+    try std.testing.expectEqual(WsDrDialect.transitional, detectSheetDialect("<chartsheet/>"));
+    try std.testing.expectEqual(WsDrDialect.transitional, detectSheetDialect(""));
+}
+
+test "nextFreeCnvprId: a '>' inside an attribute value cannot truncate the scan" {
+    // `>` is legal inside attribute values (XML 1.0 §2.4). Cutting the
+    // tag at the first `>` would hide id 7 and hand out a duplicate
+    // (Codex r2, MAJOR 2).
+    try std.testing.expectEqual(@as(u32, 8), try nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr name=\"a>b\" id=\"7\"/></xdr:wsDr>",
+    ));
+}
+
 test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first anchor" {
     const fresh = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 1, .row = 1 },
         .ext = one_inch_square,
-    } });
+    } }, .transitional);
     defer std.testing.allocator.free(fresh);
 
     const second = try buildPicAnchorXml(std.testing.allocator, .{ .two_cell = .{
@@ -1635,36 +1723,37 @@ test "nextFreeCnvprId: shares the id space across shape kinds" {
         "<xdr:cNvPr id=\"7\" name=\"Chart 1\"/>" ++
         "</xdr:nvGraphicFramePr></xdr:graphicFrame></xdr:twoCellAnchor>" ++
         "</xdr:wsDr>";
-    try std.testing.expectEqual(@as(u32, 8), nextFreeCnvprId(drawing));
+    try std.testing.expectEqual(@as(u32, 8), try nextFreeCnvprId(drawing));
 
     // An empty wsDr starts at 1.
-    try std.testing.expectEqual(@as(u32, 1), nextFreeCnvprId("<xdr:wsDr></xdr:wsDr>"));
+    try std.testing.expectEqual(@as(u32, 1), try nextFreeCnvprId("<xdr:wsDr></xdr:wsDr>"));
     // Attribute order: name before id still parses.
-    try std.testing.expectEqual(@as(u32, 3), nextFreeCnvprId(
+    try std.testing.expectEqual(@as(u32, 3), try nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr name=\"Picture 2\" id=\"2\"/></xdr:wsDr>",
     ));
     // Single quotes and Eq whitespace are legal spellings; missing
     // them would hand out a duplicate id (Codex r1, MAJOR 2).
-    try std.testing.expectEqual(@as(u32, 10), nextFreeCnvprId(
+    try std.testing.expectEqual(@as(u32, 10), try nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr id='9' name='P'/></xdr:wsDr>",
     ));
-    try std.testing.expectEqual(@as(u32, 6), nextFreeCnvprId(
+    try std.testing.expectEqual(@as(u32, 6), try nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr\n id = \"5\" name=\"P\"/></xdr:wsDr>",
     ));
-    // A crafted maxInt id saturates instead of trapping.
-    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), nextFreeCnvprId(
+    // A crafted maxInt id is typed exhaustion, not a trap or a
+    // duplicate.
+    try std.testing.expectError(Error.IdSpaceExhausted, nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr id=\"4294967295\" name=\"P\"/></xdr:wsDr>",
     ));
 }
 
-test "nextFreeRelId: saturates at a crafted maxInt rId instead of trapping" {
+test "nextFreeRelId: a crafted maxInt rId is typed exhaustion" {
     const rels = [_]store_mod.Relationship{.{
         .id = "rId4294967295",
         .type = "x",
         .target = "y",
         .target_mode = .internal,
     }};
-    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), nextFreeRelId(&rels));
+    try std.testing.expectError(Error.IdSpaceExhausted, nextFreeRelId(&rels));
 }
 
 test "validateAnchor: rejects anchors past the sheet grid caps" {
