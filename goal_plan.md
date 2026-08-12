@@ -57,7 +57,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | Z4 | Hidden sheets | done | — | B1 | Report sheets a person cannot see in Excel but that still hold data. |
 | C2a | Extract and replace objects | done | 3-5 wk | B0 | Pull images and charts out, or swap them, without disturbing anything else. |
 | C1 | Formula handling | partial | 10-14 wk | B1 | Keep formulas correct when rows move. References work; text inside formulas does not. |
-| C2b | Create images | planned | 2-3 wk | C2a | Add new images to a workbook from scratch. |
+| C2b | Create images | partial | 2-3 wk | C2a | Add new images to a workbook from scratch. `Workbook.addImage` ships the minimal surface: one image per call, `oneCellAnchor` at zero offset, fixed 1-inch × 1-inch extent, and sheets that already carry a `<drawing>` are refused. Range anchors, pixel offsets and native-size extent are not built. |
 | E1 | Embedding wire format | done | 2-3 wk | B0 | The on-disk shape for vectors stored inside the workbook. |
 | E2 | Embedding read side | done | 1-2 wk | E1 | Open a workbook and get its vectors back, validated. |
 | E3 | Embedding write side | done | 2-3 wk | E2 | Write vectors in, and point the workbook at them so tools keep them. |
@@ -67,7 +67,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | E4B | Carrier survival test | done | 1 wk | E4 | Measure which *other* hiding places survive the apps that erase the vectors. All reachable legs run. Three carriers survive openpyxl + LibreOffice; **Numbers 15.3 strips 5 of 6, including both recovery carriers** — only cell data survives it. |
 | ER | Recovery record | done | 1 wk | E4B, durability decision | The ~200-byte provenance record that makes a stripped vector set detectable. Hidden `<definedName>` + `docProps/custom.xml`; `embeddings()` returns `present`/`stripped`/`absent`. Validated against LibreOffice and openpyxl. |
 | E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
-| E6 | Embeddings from the command line | planned | 2-3 wk | E5 | Add, prune and strip vectors without writing code. |
+| E6 | Embeddings from the command line | done | 2-3 wk | E5 | Add, prune and strip vectors without writing code. `zlsx embed` ships four mutually exclusive modes: `--extract` (rows needing embedding, as NDJSON), `--vectors PATH` (write them back), `--prune` (tombstone stale slots), `--strip` (remove parts *and* the recovery record, so the result reports `absent`). |
 | D1 | Compute formulas | done | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; **v1 complete 2026-08-07** — all 175 frozen names registered, the §13 release gate and §9 perf checks run at M9d. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
 
@@ -84,7 +84,7 @@ graph TD
     B1 --> B2["B2 editing rebuild ✅"]
     B2 --> B3["B3 writing rebuild ✅"]
     B0 --> C2a["C2a extract objects ✅"]
-    C2a --> C2b["C2b create images 📋"]
+    C2a --> C2b["C2b create images ◐ partial"]
     B1 --> C1["C1 formulas ◐ partial"]
 
     B0 --> E1["E1 wire format ✅"]
@@ -98,8 +98,8 @@ graph TD
     E4B --> DEC{{"durability contract<br/>DECIDED 2026-07-26"}}
     E4W -.->|"affects 2a only"| DEC
     DEC --> ER["ER recovery record ✅"]
-    ER --> E5["E5 Python 📋"]
-    E5 --> E6["E6 CLI 📋"]
+    ER --> E5["E5 Python ✅"]
+    E5 --> E6["E6 CLI ✅"]
 
     style DEC fill:#0f3460,stroke:#00d4ff,stroke-width:2px
     style E4 fill:#16213e
