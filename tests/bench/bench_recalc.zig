@@ -214,6 +214,16 @@ pub fn main(init: std.process.Init) !u8 {
             // rebuild whose layout moved.
             i += 1;
             pkg.graph_probe.setBlockPadding(try std.fmt.parseInt(usize, args[i], 10));
+        } else if (std.mem.eql(u8, args[i], "--scan-padding") and i + 1 < args.len) {
+            // §9.1g's pair of knobs, one span apart in the decode half:
+            // N never-written bytes held for one `scanSheet` …
+            i += 1;
+            pkg.shared_probe.setScanPadding(try std.fmt.parseInt(usize, args[i], 10));
+        } else if (std.mem.eql(u8, args[i], "--classify-padding") and i + 1 < args.len) {
+            // … and N held for one `classifySheet`, which is the span
+            // §9.1f left holding the resident maximum.
+            i += 1;
+            pkg.shared_probe.setClassifyPadding(try std.fmt.parseInt(usize, args[i], 10));
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_path = args[i];
@@ -415,6 +425,13 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
     graph_probe.install(&census);
     defer graph_probe.install(null);
 
+    // §9.1g M10x: and since that cut, the resident **maximum** is one
+    // `gpa` list in the decode half, which no arena tally reaches either.
+    const shared_probe = pkg.shared_probe;
+    var shared: shared_probe.Census = .{};
+    shared_probe.install(&shared);
+    defer shared_probe.install(null);
+
     const rss_start = peakRssBytes();
     var wb = try Workbook.open(gpa, io, path);
     defer wb.deinit();
@@ -456,6 +473,27 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
             scratch_at_block,
             census.block_bytes -| census.carved_before_last_read,
             census.carved_before_last_read + scratch_at_block,
+        },
+    );
+
+    // The maximum's own list, and what stands beside it. The census runs
+    // at hand-off — *after* the last growth freed the rung below it — so
+    // `at_handoff` is the surviving capacity plus its neighbours and is
+    // **not** the maximum: the abandoned rung is gone by then, and only
+    // the heap trace sees the two together (§9.1g).
+    try w.print("\n--- shared-topology census (M10x) ---\n", .{});
+    inline for (std.meta.fields(shared_probe.Census)) |f| {
+        try w.print("shared {s}={d}\n", .{ f.name, @field(shared, f.name) });
+    }
+    const neighbours = shared.scan_cells_bytes + shared.scan_slots_bytes +
+        shared.scan_rows_bytes + shared.sheet_xml_bytes;
+    try w.print(
+        "shared_derived entries_len_bytes={d} entries_slack_bytes={d} neighbours={d} at_handoff={d}\n",
+        .{
+            shared.formula_cells * shared.entry_bytes,
+            shared.entries_capacity_bytes -| shared.formula_cells * shared.entry_bytes,
+            neighbours,
+            shared.entries_capacity_bytes + neighbours,
         },
     );
 

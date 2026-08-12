@@ -566,6 +566,101 @@ pub const SheetResult = union(enum) {
     refused: Refusal,
 };
 
+/// §9.1g M10x — what stands at the decode half's resident maximum, term
+/// by term. The maximum is not an arena and not a phase, so `fill_probe`
+/// cannot see it: it is one `gpa` list growing out of place beside the
+/// record blocks the scan handed back (§9.1f made this half the maximum).
+///
+/// `classifySheet` fills the first block, the model builder that calls it
+/// fills the second — the neighbours are its to see, not this file's.
+pub const SharedCensus = struct {
+    // Written by `classifySheet`.
+    /// The input slice's length: cells, not formulas.
+    cells: usize = 0,
+    /// `entries.items.len` at hand-off — one per cell carrying an `<f>`.
+    formula_cells: usize = 0,
+    /// `@sizeOf(Entry)`, so a reader can check the products below rather
+    /// than take them.
+    entry_bytes: usize = 0,
+    /// `entries.capacity` at hand-off, in elements and in bytes. The gap
+    /// to `formula_cells` is the ladder's last rung's slack.
+    entries_capacity: usize = 0,
+    entries_capacity_bytes: usize = 0,
+    groups: usize = 0,
+    groups_capacity_bytes: usize = 0,
+
+    // Written by the caller, at the instant it calls `classifySheet`.
+    /// The scan's record blocks, alive beside the list because the cells
+    /// are its input and the model copy has not run yet.
+    scan_cells_bytes: usize = 0,
+    scan_slots_bytes: usize = 0,
+    scan_rows_bytes: usize = 0,
+    /// The sheet part, which every borrowed span points into.
+    sheet_xml_bytes: usize = 0,
+    /// One `SharedText` per cell — allocated *after* `classifySheet`
+    /// returns, so it is not alive at the maximum.
+    out_bytes: usize = 0,
+    /// The masters' parsed ASTs, one per group.
+    masters_bytes: usize = 0,
+};
+
+/// Process-wide opt-in, null by default and in every build that does not
+/// install one — `graph.census_sink`'s terms, for the complementary
+/// region. It is tested **three times per successful sheet** — twice by
+/// the model builder that owns the neighbouring terms, once here at
+/// hand-off — and **never per cell**.
+///
+/// Not thread-safe: two sheets classified at once would write each
+/// other's terms, and a sink cleared while another thread is inside
+/// `classifySheet` is a dangling pointer, not merely a wrong number.
+/// Installing one is the bench's job, on a process running one workload.
+/// Sequential sheets **overwrite** rather than accumulate, so a sink
+/// installed across a multi-sheet workbook reports the last sheet — the
+/// §9.1 fixture has one, and a per-sheet total is not what a census of
+/// the maximum's own instant would mean anyway.
+pub var census_sink: ?*SharedCensus = null;
+
+/// §9.1g M10x — N bytes of never-written slack held for exactly the
+/// lifetime of one `classifySheet`, the span the resident maximum falls
+/// in. Turned on the same binary as its unpadded arm, so binary layout
+/// cancels exactly instead of moving the raw peak a page (§9.1f).
+///
+/// Its companion is `decode.probe_scan_padding`, one span earlier. The
+/// pair is the point: the same knob at two instants of the same half
+/// prices two candidates, and only one of them reads anything.
+///
+/// Zero by default. Under the serialized use it is written for, the
+/// worst a value can do is `error.OutOfMemory` — it is a whole
+/// allocation size, never a term added to one, so there is no overflow
+/// to reach. Left non-zero it costs that allocation on **every**
+/// subsequent classify, and written concurrently with a classify it is a
+/// data race like any other unsynchronized global.
+pub var probe_classify_padding: usize = 0;
+
+/// What a caller that has already counted can tell this one.
+pub const Options = struct {
+    /// How many of `cells` carry an `<f>`, when the caller knows —
+    /// `decode.Sheet.formula_cells` is exactly that count for exactly
+    /// that slice. The entries list is then allocated once instead of
+    /// walking a doubling ladder whose last rung stood at §9.1's
+    /// resident maximum (§9.1g M10x).
+    ///
+    /// A wrong hint costs only the growth path it failed to remove: too
+    /// low and the list grows from there, too high and the surplus is
+    /// capacity nothing fills. Neither changes what is classified **when
+    /// the reservation succeeds**, which is why this is a hint and not an
+    /// argument.
+    ///
+    /// What it does change is *when* memory is asked for. The reservation
+    /// happens before the first formula is classified, so under memory
+    /// pressure a sheet that would have refused on its first bad `<f>`
+    /// after a small allocation can now return `error.OutOfMemory`
+    /// instead — the same trade every pre-sizing on this path makes
+    /// (`decode.Options.size_hints`), and the reason the ceiling is
+    /// `cells.len` rather than whatever the caller computed.
+    formula_cells: ?usize = null,
+};
+
 /// Classify every `<f>` on one sheet and resolve the shared topology.
 ///
 /// `cells` must be in document order, which is what `decode.scanSheet`
@@ -576,11 +671,25 @@ pub const SheetResult = union(enum) {
 pub fn classifySheet(
     gpa: Allocator,
     cells: []const decode.SheetCell,
+    opts: Options,
 ) error{OutOfMemory}!SheetResult {
+    // §9.1g M10x. Read once so the `alloc` and the `free` cannot disagree.
+    const pad_bytes = probe_classify_padding;
+    const pad: []u8 = if (pad_bytes == 0) &.{} else try gpa.alloc(u8, pad_bytes);
+    defer if (pad.len != 0) gpa.free(pad);
+
     var entries: std.ArrayListUnmanaged(Entry) = .empty;
     errdefer entries.deinit(gpa);
     var groups: std.ArrayListUnmanaged(Group) = .empty;
     errdefer groups.deinit(gpa);
+
+    // §9.1g M10x: the one allocation this list should ever make. Clamped
+    // to `cells.len` because a hint larger than that cannot be right —
+    // there is at most one entry per cell — and an unclamped hint is a
+    // caller's arithmetic reaching an allocation size.
+    if (opts.formula_cells) |n| {
+        try entries.ensureTotalCapacityPrecise(gpa, @min(n, cells.len));
+    }
 
     // Pass one: classify every formula, and collect the masters.
     for (cells, 0..) |c, i| {
@@ -654,6 +763,20 @@ pub fn classifySheet(
             .col = cells[e.cell].col,
             .row = cells[e.cell].row,
         }) } };
+    }
+
+    // Read before the hand-off: `toOwnedSlice` shrinks the block to
+    // length, so the capacity this list actually reached is gone one
+    // statement later — and it is the capacity, not the length, that
+    // stands at the resident maximum (§9.1g).
+    if (census_sink) |c| {
+        c.cells = cells.len;
+        c.formula_cells = entries.items.len;
+        c.entry_bytes = @sizeOf(Entry);
+        c.entries_capacity = entries.capacity;
+        c.entries_capacity_bytes = entries.capacity * @sizeOf(Entry);
+        c.groups = groups.items.len;
+        c.groups_capacity_bytes = groups.capacity * @sizeOf(Group);
     }
 
     // Ownership moves one list at a time, each with its own `errdefer`:
@@ -1787,7 +1910,7 @@ fn classifySheetXml(comptime body: []const u8) !struct {
 } {
     var sheet = try scanCells(sheetXml(body));
     errdefer sheet.deinit();
-    return .{ .sheet = sheet, .result = try classifySheet(testing.allocator, sheet.cells) };
+    return .{ .sheet = sheet, .result = try classifySheet(testing.allocator, sheet.cells, .{}) };
 }
 
 fn expectTopologyRefusal(comptime body: []const u8, want: Refusal.Reason) !void {
@@ -1965,6 +2088,165 @@ test "topology: a refused `<f>` refuses the sheet, at the cell that carried it" 
             try testing.expectEqual(@as(u32, 3), r.cell.?.col);
         },
     }
+}
+
+// ─── the entries list's one allocation (§9.1g M10x) ──────────────
+
+/// Five cells, three of them carrying an `<f>` — an ordinary one, a
+/// master and a bodiless slave, because "a formula cell" here means *an
+/// `<f>` element*, which is what the entries list allocates a record
+/// for. Three is also the smallest count the growth ladder overshoots:
+/// the rungs are 2, 5, 8, … so an unhinted list of three entries buys
+/// five, which is this sheet's four-figure version of the 3 418 240 B
+/// §9.1g measured standing at the recalc's resident maximum.
+const mixed_sheet =
+    \\<row r="1"><c r="A1"><f t="shared" ref="A1:A2" si="0">B1+1</f><v>1</v></c><c r="B1"><v>9</v></c></row>
+    \\<row r="2"><c r="A2"><f t="shared" si="0"/><v>2</v></c><c r="B2"><v>8</v></c></row>
+    \\<row r="3"><c r="A3"><f>B1+B2</f><v>17</v></c></row>
+;
+
+test "M10x: the scan's formula count IS the entries list's length" {
+    // The contract the hint rests on. `scanSheet` counts `<f>` elements
+    // as it appends; `classifySheet` allocates one entry per `<f>`. If
+    // the two ever mean different things the hint is a wrong size, so
+    // this is pinned rather than assumed.
+    var sheet = try scanCells(sheetXml(mixed_sheet));
+    defer sheet.deinit();
+    try testing.expectEqual(@as(usize, 5), sheet.cells.len);
+    try testing.expectEqual(@as(u32, 3), sheet.formula_cells);
+
+    var shared = switch (try classifySheet(testing.allocator, sheet.cells, .{})) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer shared.deinit();
+    try testing.expectEqual(@as(usize, sheet.formula_cells), shared.entries.len);
+}
+
+test "M10x: the hint makes the entries list exact, and its absence does not" {
+    var sheet = try scanCells(sheetXml(mixed_sheet));
+    defer sheet.deinit();
+
+    var census: SharedCensus = .{};
+    census_sink = &census;
+    defer census_sink = null;
+
+    var hinted = switch (try classifySheet(testing.allocator, sheet.cells, .{
+        .formula_cells = sheet.formula_cells,
+    })) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer hinted.deinit();
+    try testing.expectEqual(@as(usize, 3), census.formula_cells);
+    // Exact: capacity is the count, not a rung of the doubling ladder.
+    try testing.expectEqual(@as(usize, 3), census.entries_capacity);
+
+    var blind = switch (try classifySheet(testing.allocator, sheet.cells, .{})) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer blind.deinit();
+    try testing.expectEqual(@as(usize, 3), census.formula_cells);
+    // The ladder overshoots, and on the named fixture the same overshoot
+    // is 3 418 240 B standing at the recalc's resident maximum (§9.1g).
+    // Stated as an inequality: the exact rung is std's business, and a
+    // future growth rule that overshoots by a different amount is not a
+    // regression in this row.
+    try testing.expect(census.entries_capacity > census.formula_cells);
+
+    // Whatever the capacity, the classification is the same — roles and
+    // cells, not just counts, because a hint that changed *what* was
+    // classified would be the bug worth catching.
+    try testing.expectEqual(hinted.entries.len, blind.entries.len);
+    try testing.expectEqual(hinted.groups.len, blind.groups.len);
+    for (hinted.entries, blind.entries) |h, b| {
+        try testing.expectEqual(h.cell, b.cell);
+        try testing.expectEqual(std.meta.activeTag(h.role), std.meta.activeTag(b.role));
+        try testing.expectEqualStrings(h.formula.text, b.formula.text);
+    }
+}
+
+test "M10x: a wrong hint costs only the growth path it failed to remove" {
+    var sheet = try scanCells(sheetXml(mixed_sheet));
+    defer sheet.deinit();
+
+    var census: SharedCensus = .{};
+    census_sink = &census;
+    defer census_sink = null;
+
+    // Too low: the list grows from there, and classifies the same.
+    var low = switch (try classifySheet(testing.allocator, sheet.cells, .{ .formula_cells = 1 })) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer low.deinit();
+    try testing.expectEqual(@as(usize, 3), low.entries.len);
+
+    // Past absurd: a hint is a caller's arithmetic, and an unclamped one
+    // reaching an allocation size is `error.OutOfMemory` on a five-cell
+    // sheet. Clamped to `cells.len`, which no correct hint exceeds.
+    var huge = switch (try classifySheet(testing.allocator, sheet.cells, .{
+        .formula_cells = std.math.maxInt(usize),
+    })) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer huge.deinit();
+    try testing.expectEqual(@as(usize, 3), huge.entries.len);
+    // The clamp's own contract, not a growth rung: `cells.len` is the
+    // ceiling however absurd the hint was.
+    try testing.expectEqual(sheet.cells.len, census.entries_capacity);
+}
+
+test "M10x: a padded classify that refuses still gives the padding back" {
+    // The knobs' `defer` on the path the success test cannot reach. The
+    // sheet below refuses at its second `<f>`, which returns through a
+    // different arm of the same function.
+    decode.probe_scan_padding = 4096;
+    defer decode.probe_scan_padding = 0;
+    probe_classify_padding = 8192;
+    defer probe_classify_padding = 0;
+
+    var sheet = try scanCells(sheetXml(
+        \\<row r="1"><c r="A1"><f>B1+1</f></c></row>
+        \\<row r="7"><c r="D7"><f dt2D="1">1</f></c></row>
+    ));
+    defer sheet.deinit();
+    switch (try classifySheet(testing.allocator, sheet.cells, .{
+        .formula_cells = sheet.formula_cells,
+    })) {
+        .ok => |*s| {
+            var owned = s.*;
+            owned.deinit();
+            return error.TestExpectedRefusal;
+        },
+        .refused => |r| try testing.expectEqual(Refusal.Reason.data_table_formula, r.reason),
+    }
+}
+
+test "M10x: the padding knobs are inert by default and give their bytes back" {
+    // `testing.allocator` fails the test on a leak, so this pins the
+    // `defer` on both knobs as well as their default.
+    try testing.expectEqual(@as(usize, 0), probe_classify_padding);
+    try testing.expectEqual(@as(usize, 0), decode.probe_scan_padding);
+
+    decode.probe_scan_padding = 4096;
+    defer decode.probe_scan_padding = 0;
+    probe_classify_padding = 8192;
+    defer probe_classify_padding = 0;
+
+    var sheet = try scanCells(sheetXml(mixed_sheet));
+    defer sheet.deinit();
+    var shared = switch (try classifySheet(testing.allocator, sheet.cells, .{
+        .formula_cells = sheet.formula_cells,
+    })) {
+        .ok => |s| s,
+        .refused => return error.TestUnexpectedRefusal,
+    };
+    defer shared.deinit();
+    // Padding is slack, never data: the same three entries either way.
+    try testing.expectEqual(@as(usize, 3), shared.entries.len);
 }
 
 // ─── the translation matrix ──────────────────────────────────────
@@ -2652,7 +2934,7 @@ test "checkAllAllocationFailures: nothing in this file leaks under OOM" {
             };
             defer sheet.deinit();
 
-            var shared = switch (try classifySheet(allocator, sheet.cells)) {
+            var shared = switch (try classifySheet(allocator, sheet.cells, .{})) {
                 .ok => |s| s,
                 .refused => return error.UnexpectedRefusal,
             };
@@ -2705,7 +2987,7 @@ test "checkAllAllocationFailures: nothing in this file leaks under OOM" {
                 .refused => return error.UnexpectedRefusal,
             };
             defer bad_sheet.deinit();
-            switch (try classifySheet(allocator, bad_sheet.cells)) {
+            switch (try classifySheet(allocator, bad_sheet.cells, .{})) {
                 .ok => return error.ExpectedRefusal,
                 .refused => |r| if (r.reason != .shared_unknown_si) return error.WrongRefusal,
             }
@@ -2777,7 +3059,7 @@ fn fuzzCalcTarget(_: void, smith: *std.testing.Smith) anyerror!void {
 
                 // The sheet-wide pass over the same cells must not leak
                 // or panic either, whatever the topology turned out to be.
-                var shared = try classifySheet(a, ok.cells);
+                var shared = try classifySheet(a, ok.cells, .{});
                 switch (shared) {
                     .ok => |*s| s.deinit(),
                     .refused => |r| _ = r.planeTwo(),

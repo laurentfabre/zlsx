@@ -4679,12 +4679,13 @@ adds a TEXT-heavy bench; M9d adds a mixed full-registry workload
 > release.** By owner decision (§9.1b) the blocking gate is an absolute
 > ratcheted budget on the digest-gated named fixture — opened at
 > **53 813 576 B**, ratcheted to **53 631 549 B** by M10t (§9.1c),
-> re-affirmed by M10u (§9.1d) and M10v (§9.1e), and ratcheted again to
-> **51 645 808 B** by M10w (§9.1f) — and 15.15 MiB survives as a
-> non-blocking research hypothesis expressed per modeled cell (158.8
-> B/cell against 511 B/cell measured in the ReleaseSafe gate lane, 496
-> B/cell in ReleaseFast — §9.1f). The evaluate ≤ 500 ms and end-to-end
-> ≤ 1 s ceilings are **unchanged** by this amendment.
+> re-affirmed by M10u (§9.1d) and M10v (§9.1e), ratcheted to
+> **51 645 808 B** by M10w (§9.1f) and to **50 189 598 B** by M10x
+> (§9.1g) — and 15.15 MiB survives as a non-blocking research hypothesis
+> expressed per modeled cell (158.8 B/cell against 497 B/cell measured in
+> the ReleaseSafe gate lane, 496 B/cell in ReleaseFast — §9.1g). The
+> evaluate ≤ 500 ms and end-to-end ≤ 1 s ceilings are **unchanged** by
+> this amendment.
 >
 > **Amended 2026-08-11 (second) — the baseline-adjustment wording.**
 > §9.1a logged a defect in the measurement contract itself: this section
@@ -7845,6 +7846,383 @@ statement about a 2 048 000 B ceiling that no longer applies.
 - Still untested, unchanged from §9.1e: real cross-sheet edges at scale,
   deeply nested rather than flat formulas, styled/rich-text-heavy
   workbooks, and any shape above 400 000 cells.
+---
+
+### 9.1g M10x — the list that was the maximum, and the ladder closed (2026-08-12)
+
+§9.1f spent §9.1c's budget, moved the resident maximum into the decode
+half, and left **1 343 488 B** between it and the runner-up. It also left
+a specific claim behind: that §9.1c's candidate 2 — the first scan's
+1 431 436 B of unhinted list slack — had gone from worth nothing to worth
+up to that gap, because "nothing about the waste changed; this row
+changed what it is measured against."
+
+This row prices that candidate with an instrument instead of an
+inference, and **its direct contribution to the envelope is zero a second
+time.** The waste is not where the maximum is. What is there is a different list, in the span
+after the scan returns, and cutting it collects **1 458 176 B** — more
+than the gap. The decode half then falls more than ten megabytes below
+the envelope, the maximum returns to the graph half, and the next gap is
+**229 376 B**, which is the ladder closing.
+
+#### Candidate 2, priced directly: zero, and not marginally
+
+§9.1c priced it by argument (it lives in era 10, era 10 is below the
+maximum). §9.1f re-priced it by argument (era 10 *is* the maximum now).
+Both arguments are about **which era** the waste lives in, and neither
+measured it. So this row builds the knob §9.1f asked future rows to reach
+for — `--scan-padding N`, N bytes of never-written slack held for exactly
+the lifetime of one `scanSheet`, on the same binary as the unpadded arm:
+
+| padding across the scan | baseline-adjusted | Δ |
+|---:|---:|---:|
+| 0 | 51 150 848 | — |
+| **1 431 436** — candidate 2's own figure | 51 150 848 | **+0** |
+| 4 194 304 | 51 150 848 | **+0** |
+| 11 534 336 | 54 755 328 | +3 604 480 |
+| 16 777 216 | 59 998 208 | +8 847 360 |
+
+The two points above the hinge absorb **7 929 856 B each** — the same
+figure twice, from two paddings 5 MiB apart. So the scan's own instants
+sit **7 929 856 B below the envelope**, and candidate 2's 1 431 436 B
+would have to grow by **another 5.54× its own size** — 6.54× in total,
+9 361 292 B — before it moved its first page.
+
+**What the knob measures is an addition, and the candidate is a
+removal**, so the inference needs its one step stated: the padding shows
+the scan's span is 7 929 856 B below the maximum, and lowering an instant
+that is already below the maximum cannot lower the maximum. The step is
+sound only for the *direct* effect — this row's own cut is the
+counterexample for the indirect one, since it removed bytes in the decode
+half and the maximum in the *other* half then came out 163 840 B lower
+(below). So the honest reading is **zero to within the cross-span
+coupling this row measures at ten pages for a removal 8.7× larger**, not
+zero as an identity. That is still a budget of nothing worth writing a
+row for.
+
+The reason §9.1f's inference failed is worth stating plainly, because it
+is the same error §9.1a and §9.1c made in other currencies: **an era is
+not a span.** The maximum was in the decode *half*, which §9.1f said
+correctly; the scan is one span inside that half, and the maximum is in
+the next one. A candidate has to be live at the instant, not merely in
+the neighbourhood.
+
+#### What the maximum actually is
+
+One `gpa` list, growing out of place. `classifySheet` allocates one
+`Entry` per cell carrying an `<f>` and discovers how many there are by
+appending; at the last growth the old buffer and the new one are both
+live, and that pair is the highest the process ever gets.
+
+`calc.census_sink` reports it on `fill_probe`'s terms — null by default,
+no wrapper in any allocation path, **three checks per successful sheet
+and none per cell**, reached through `pkg.shared_probe` and printed by
+`zlsx-bench-recalc fill`. On the digest-gated `f1_mix_named` fixture
+(sha256 `b2b42c0b…8ad0`), 100 010 cells of which 80 000 carry an `<f>`:
+
+| term | bytes |
+|---|---:|
+| `@sizeOf(Entry)` | 128 |
+| entries the sheet needs — 80 000 | **10 240 000** |
+| entries capacity at hand-off — 106 705 | **13 658 240** |
+| … of which slack | 3 418 240 |
+| the abandoned buffer at the last growth — 71 135 | **9 105 280** |
+| **live at the maximum** | **22 763 520** |
+| scan cell records, beside it | 13 601 360 |
+| scan slot records | 7 600 760 |
+| scan row records | 320 032 |
+| the sheet part every span borrows | 5 288 922 |
+| `out`, one `SharedText` per cell — allocated *after* | 4 800 480 |
+| groups, masters | 0, 0 |
+
+**The heap profiler puts the same number at the same era from the other
+side.** Its era-10 top site is `id20` = **22 763 520 B**, and `id20` is
+`workbook.zig:9368` — the `sharedFormulaText` call.
+
+The identification takes **three** inputs, and it is worth being exact
+about which does what, because a review found the write-up claiming two.
+The census runs at hand-off, *after* the last growth has freed the rung
+below it, so what it observes directly is the surviving 106 705-entry
+capacity — the bench prints that sum as `at_handoff`, not as the maximum.
+std's documented growth rule, `minimum + minimum/2 + 1`, gives the rung
+below it as 71 135. The heap site then observes their **total**, 128 ×
+(71 135 + 106 705) = 22 763 520, at the era the resident curve peaks in.
+One measured rung, one predicted rung, one measured sum that matches: not
+a proof, but an identification that would take a coincidence to fake.
+
+The capacity ladder is std's `growCapacity` — `minimum + minimum/2 + 1`
+for a 128-byte element — so the last rung buys 106 705 entries for 80 000
+and the copy holds both rungs at once. Neither figure is a page count:
+they are logical bytes, and what converts them is the knob below.
+
+#### The knob, one span later: 1.000 B of page per byte
+
+`--classify-padding N` is the same probe as `--scan-padding`, moved one
+span along, into `classifySheet`:
+
+| padding across classify | baseline-adjusted | Δ |
+|---:|---:|---:|
+| 0 | 51 150 848 | — |
+| 1 048 576 | 52 199 424 | **+1 048 576** |
+| 2 097 152 | 53 248 000 | **+2 097 152** |
+| 4 194 304 | 55 345 152 | **+4 194 304** |
+
+**1.000 B of resident page per byte, three times, exact, every reading
+byte-identical across three repetitions.** The same knob at two instants
+of the same half: 0.000 in the scan, 1.000 in the classify. That pair is
+the whole pricing argument, and it is one binary, so binary layout
+cancels exactly rather than approximately.
+
+The budget is the other end of the same measurement. §9.1f's own knob,
+turned here: 2 097 152 B of never-carved slack on the graph block reads
+**+802 816**, absorbing **1 294 336 B** — and the `pages` instrument
+reads the maximum at 51 232 768 and the runner-up at 49 938 432, a gap of
+**1 294 336 B**. Two instruments with different baselines, one figure.
+(§9.1f recorded 1 343 488 on its binary; this pair reads three pages
+lower, which is the ±1-page layout sensitivity that section documented,
+here worth 3.8 % of the gap.)
+
+#### The candidates, each priced before it was written
+
+| candidate | bytes at the maximum | verdict |
+|---|---:|---|
+| the entries list's abandoned buffer | **9 105 280** | shipped |
+| the entries list's capacity slack | **3 418 240** | shipped |
+| §9.1c's candidate 2 — the scan's list slack | 1 431 436 | **zero** — 7 929 856 B below the envelope, measured |
+| `out`, sized to cells rather than formulas | 960 480 | **zero** — allocated after `classifySheet` returns |
+| the scan's slot records, whose length is all the model build reads | 7 600 760 | **zero at this budget** — live at the maximum, but the budget is spent twice over without it |
+| the scan's own growth copies | — | **zero** — same span as candidate 2 |
+
+Removable at the maximum: **12 523 520 B**, which is 9.7× the 1 294 336 B
+the envelope allows. So the prediction stated before the cut was that it
+would collect the gap and the maximum would move to the graph half.
+
+#### The cut
+
+One statement, plus the count that makes it possible.
+
+1. **`decode.Sheet` reports `formula_cells`** — how many of the cells it
+   returns carry an `<f>`. The walk counts as it appends, so it costs
+   nothing: this is M10l's `size_hints` one boundary earlier, and the
+   same reasoning (the scan already knows; the next pass was rediscovering
+   it by walking a ladder).
+2. **`classifySheet` takes it as a hint and allocates once.** The hint is
+   clamped to `cells.len` — a hint is a caller's arithmetic and an
+   unclamped one reaching an allocation size is the failure mode §9.1f's
+   review found in the block knob. A wrong hint costs only the growth
+   path it failed to remove, which is why it is a hint and not an
+   argument.
+
+No records are removed and no record lifetime is deferred. The list
+holds the same 80 000 records for the same lifetime; what goes is the
+ladder that found the number — four allocations, a 9 105 280 B copy, and
+3 418 240 B of capacity nothing fills. The census reads it directly: capacity **13 658 240 →
+10 240 000**, slack **3 418 240 → 0**, and the abandoned buffer ceases to
+exist.
+
+#### The gate
+
+Three arms interleaved, the baseline re-read immediately before every
+peak, three repetitions — **every raw peak and every baseline
+byte-identical across its three**:
+
+| arm | baseline | raw peak | baseline-adjusted |
+|---|---:|---:|---:|
+| §9.1f tip (`aaddf01`), rebuilt today | 1 835 008 | 52 969 472 | 51 134 464 |
+| + census + knobs, cut reverted | 1 818 624 | 52 969 472 | 51 150 848 |
+| **+ the cut** | 1 818 624 | 51 511 296 | **49 692 672** |
+
+| | value |
+|---|---:|
+| **baseline-adjusted** | **49 692 672 — 47.39 MiB** |
+| vs the same source with the cut reverted | **−1 458 176 (−2.85 %)** |
+| ratcheted budget — `floor(figure × 1.01)` | **50 189 598** |
+| vs the 15.15 MiB research hypothesis | 3.13× |
+| B/cell (ReleaseSafe / ReleaseFast) | 496.9 / **496.1** |
+
+**−1 458 176 reproduced on four independently built pairs**, across two
+different (raw peak, baseline) splits — 52 985 856/1 835 008 and
+52 969 472/1 818 624 on the reverted side, 51 527 680/1 835 008 and
+51 511 296/1 818 624 on the cut side. The §9.1f tip reproduced its own
+recorded 51 134 464 exactly, so no session-drift correction applies to
+this row's figures.
+
+The instruments themselves cost **one page** (51 134 464 → 51 150 848),
+and the cut is measured against the arm that carries them.
+
+#### The envelope, before and after
+
+| | pre-cut | post-cut |
+|---|---|---|
+| eras detected | 22 | 18 |
+| **maximum** | era 10, fill 8 352 — **51 232 768** | era 14, fill 8 533 121 — **49 774 592** |
+| runner-up | era 18, fill 8 533 121 — 49 938 432 | era 15, fill 8 533 121 — 49 545 216 |
+| **gap** | **1 294 336** | **229 376** |
+| decode-half eras | 11 | 7 |
+| **highest decode-half era** | **51 232 768** | **39 387 136** |
+
+`sampled_peak == getrusage_maxrss` to the byte on every run, coverage
+1.0000. The maximum moves out of the decode half — identified by its
+measured arena fill, never by a phase name the instrument does not report
+— and the decode half lands **10 387 456 B** below the envelope. The
+`pages` instrument's own delta, 51 232 768 − 49 774 592 = **1 458 176**,
+is the gate delta to the byte, from an instrument with a different
+baseline.
+
+The two vectors do **not** have comparable era numbering (22 rows against
+18), so no era-by-era difference is quoted. What *is* comparable is that
+both lanes lose exactly four decode-half eras, 11 → 7. That the four lost
+segments *are* the ladder's four surviving growth copies is the obvious
+reading and is not established here: era segmentation is a dip rule over
+a resident curve, not an allocation event log, and §9.1f already recorded
+that segment counts move between binaries for reasons the code did not
+supply.
+
+**The cut paid 163 840 B more than the gap.** That is the whole of what
+the two vectors support: the post-cut maximum is 163 840 B below the
+pre-cut runner-up. It is *not* a statement that one instant fell, because
+equal `fill_at_era` values do not identify the same instant — the sampler
+records a monotonic fill high-water mark, not instantaneous live fill,
+and the two vectors are already declared non-pairable. What the pair
+establishes is that a cut confined to the decode half is followed by a
+lower maximum in the other half, by ten pages, with no mechanism offered.
+M10r found the same direction, so M10l's rule — a cut pays at most the
+gap to the next era — is a good predictor and not a bound.
+
+Turning the knobs again on the cut binary shows the hand-over from both
+sides. Every arm below drew baseline 1 818 624 and was byte-identical
+across three repetitions:
+
+| knob on the cut binary | padding | raw peak | adjusted | Δ | absorbed |
+|---|---:|---:|---:|---:|---:|
+| — | 0 | 51 511 296 | 49 692 672 | — | — |
+| `--classify-padding` | 4 194 304 | 51 511 296 | 49 692 672 | **+0** | ≥ 4 194 304 |
+| `--classify-padding` | 12 582 912 | 52 969 472 | 51 150 848 | +1 458 176 | **11 124 736** |
+| `--block-padding` | 1 048 576 | 52 559 872 | 50 741 248 | **+1 048 576** | 0 |
+| `--block-padding` | 2 097 152 | 53 608 448 | 51 789 824 | **+2 097 152** | 0 |
+
+**The knob that read 1.000 before the cut reads 0.000 after it, and the
+knob that read 0.000 before reads 1.000 after.** The envelope changed
+hands, and one instrument saw both ends of it.
+
+#### The ReleaseFast lane, which is where the honesty is
+
+| arm | baseline | raw peak | baseline-adjusted |
+|---|---:|---:|---:|
+| cut reverted, ReleaseFast | 1 736 704 | 51 314 688 | 49 577 984 |
+| **+ the cut, ReleaseFast** | 1 736 704 | 51 347 456 | **49 610 752** |
+
+**In ReleaseFast the cut does not help: it costs 32 768 B, two pages,
+reproduced on both pairs.** This is a memset-tax row — the ReleaseSafe
+saving is the safety memset being paid later rather than memory a user of
+a ReleaseFast build gets back. What is *measured* is the lane gap and its
+change; that the gap is the poison rather than some other consequence of
+the optimization mode is §9.1c's directly measured mechanism carried
+over, not something isolated here:
+
+| term | bytes |
+|---|---:|
+| ReleaseSafe delta | **−1 458 176** |
+| ReleaseFast delta | **+32 768** |
+| therefore, change in the lane gap | **−1 490 944** |
+
+The gap itself: **1 572 864 B (3.08 %) before, 81 920 B (0.16 %) after**.
+The two lanes now agree to five pages. Isolating the poison exactly would
+need two builds differing only in it, which this row did not do.
+
+And the lane measurement says something the ReleaseSafe figures cannot:
+**the decode half was never the ReleaseFast maximum.** In that lane the
+maximum sits at fill 8 533 121 — the graph half — on *both* arms, while
+the decode half reads 46 645 248 before the cut and 31 719 424 after it.
+The same instant is 51 232 768 in ReleaseSafe and 46 645 248 in
+ReleaseFast: **a 4 587 520 B memset tax at one instant, and that tax is
+larger than the 1 294 336 B by which the decode half stood above the
+graph half**, and 46 645 248 is already below the 49 938 432 the graph
+half was at. So on this evidence the decode half is the maximum in one
+lane and not the other, and the lane gap at that instant is more than
+enough to account for it. Take ReleaseSafe away and this row has nothing
+to cut.
+
+The padding knob is **not** evidence for that, and an earlier draft of
+this section said it was. 16 777 216 B held across `classifySheet` does
+move the ReleaseFast peak by zero — 51 314 688 raw against 1 736 704 of
+baseline, identical to the unpadded arm — but the padding is never
+written, so in a lane that does not poison it those bytes are never
+resident *wherever* the envelope happens to be. The knob cannot locate a
+ReleaseFast maximum; only the `pages` trace above can, and the claim
+rests on it alone. Pricing a ReleaseFast envelope would need a padding
+probe that touches its own bytes, which this row does not build.
+
+It ships for §9.1f's reason and no other: §9.1b defines the blocking
+release gate in the ReleaseSafe lane, which is also what a Zig consumer's
+default build gets.
+
+#### What this does and does not say
+
+- **The measured direct single-region budget is now 229 376 B**, 0.46 %
+  of the figure — fourteen pages, on a measurement whose own layout
+  sensitivity is one. That bounds what a further row can collect by
+  lowering the maximum while the runner-up holds still; this row's own
+  extra 163 840 B is the standing reminder that the runner-up does not
+  always hold still, so the figure is a budget and not a proof of
+  closure. On it, no further row is justified, and §9.1c's judgement
+  stands: a materially lower figure is a redesign, not a row.
+- **A candidate priced at zero did not become live.** §9.1f's closing
+  paragraph said the opposite about this exact candidate. It was wrong,
+  and the correction is the reusable part: *the maximum is an instant,
+  not a region*, and a candidate is priced by holding bytes across that
+  instant and reading the peak — which is one knob and forty seconds.
+- **No records were removed and no lifetime deferred.** 80 000 records
+  before, 80 000 after. What went is the search for their number — which
+  did cost four allocations and a nine-megabyte copy.
+- **The census and the heap trace are independent and agree exactly**,
+  which is why "the maximum is a list mid-copy" is an identification
+  rather than a reading of one instrument.
+- **All of it is a lane effect, and that is measured, not attributed.**
+  ReleaseFast moves +32 768 the wrong way, and its own maximum never was
+  in this half.
+- **Two knobs, one measurement each, both before the code was written.**
+  §9.1c's candidate 2 was carried through three sections on an argument
+  and priced in one run once someone held bytes at the instant.
+- **The six new tests were each verified to fail without their own fix**,
+  by six inverse patches built and run: the hint ignored → the exactness
+  test reads capacity 5 against 3; the `@min` clamp removed → the
+  wrong-hint test fails on a five-cell sheet; the counter's condition
+  removed → the count-equals-length test reads 5 against 3; the knobs'
+  `defer` replaced by a no-op → **both** padding tests leak, which is the
+  failure mode the `defer` exists to remove; and the model build's
+  forwarding of `scanned.formula_cells` replaced by `null` → the
+  end-to-end test fails while **every `calc.zig` unit test stays green**.
+  That last one exists because a review pointed out that the whole cut
+  could be deleted at the call site without a single test noticing: the
+  unit tests call `classifySheet` directly, so none of them can see the
+  production path. It is the M10 cut review's lesson arriving as a test
+  rather than as a defect.
+- Saved archives byte-identical to the pre-cut arm across all four
+  workloads × tiny/small plus the named fixture — **9/9**.
+- No time cost: F1 named recalc **350.3 → 349.4 ms** (σ 1.4/1.6, N=20,
+  ReleaseFast, the two binaries interleaved by hyperfine), evaluate
+  ≈ 347.9 ms against the 500 ms ceiling; criteria-small −0.8 %,
+  text-small +0.5 %, registry-small +1.8 %, `open` +3 % on a 1.6 ms lane.
+- **What one review round changed.** Eight MAJOR and seven MINOR findings,
+  and they moved this section rather than decorating it: an arithmetic
+  error (`out`'s excess is 960 480 B, not 800 400 — 48 B per `SharedText`,
+  not 40); "two instruments agree to the byte" restated as the three
+  inputs it actually is, and the bench's `at_maximum` renamed
+  `at_handoff`, because the census runs *after* the abandoned rung is
+  freed; candidate 2's zero restated as a direct-envelope zero; the
+  era-count-to-copy mapping and the "one instant fell" reading of the
+  163 840 B withdrawn as unidentifiable from a monotonic fill tally; "the
+  ladder is closed" downgraded to a measured budget, on this row's own
+  evidence that the runner-up is not invariant; and the ReleaseFast
+  padding-knob corroboration **deleted**, because a never-written block is
+  never resident in a lane that does not poison it whatever the envelope
+  is doing — the knob had no power there and the sentence claimed it did.
+  Re-measured after every fix: 49 692 672, unchanged.
+- Still untested, unchanged from §9.1e and §9.1f: real cross-sheet edges
+  at scale, deeply nested rather than flat formulas, styled/rich-text-heavy
+  workbooks, and any shape above 400 000 cells.
+
 ---
 
 ## 10. Refusal & error taxonomy

@@ -1736,6 +1736,18 @@ pub const Sheet = struct {
     /// in which case there is nothing to maintain and nothing to
     /// expand (M7b1).
     dimension: ?DimensionSpans,
+    /// How many of `cells` carry an `<f>` (§9.1g M10x). Counted as the
+    /// walk appends, so it costs nothing: the shared-topology pass that
+    /// runs next allocates one record per formula cell, and until this
+    /// existed it discovered the count by walking a doubling ladder
+    /// whose last rung was the whole recalc's resident maximum. M10l's
+    /// `size_hints` are the same idea one boundary earlier.
+    ///
+    /// It describes `cells` **as returned**, so `releaseCells` leaves it
+    /// stale by construction. That is why the one consumer takes it as a
+    /// hint clamped to the slice it is given (`calc.Options`) rather than
+    /// as a size it trusts.
+    formula_cells: u32,
 
     pub fn deinit(self: *Sheet) void {
         self.releaseCells();
@@ -1774,6 +1786,30 @@ const row_attrs = [_][]const u8{
     "thickBot", "ph",
 };
 
+/// §9.1g M10x — N bytes of never-written slack held for exactly the
+/// lifetime of one `scanSheet`, so the scan's own instants can be priced
+/// against the resident maximum **on the same binary** (§9.1f's knob
+/// method: a rebuild moves the raw peak ±1 page, and a knob does not).
+///
+/// It answers §9.1c's candidate 2. That candidate is bytes the scan holds
+/// and gives back before it returns; if N such bytes do not raise the
+/// peak, the scan's span is not the envelope, so removing them cannot
+/// lower it either — *directly*. The knob measures an addition, and a
+/// removal also changes the allocation history a later era reuses, which
+/// §9.1g measures at ten pages for one cut. Zero by default — a public
+/// mutable global, so zero is what nothing having set it leaves behind
+/// rather than an invariant a released build enforces. The block goes
+/// through `alloc`, so in Debug and ReleaseSafe it is memset and
+/// therefore resident, which is the currency a list's unused capacity is
+/// paid in (§9.1c).
+///
+/// Under the serialized use it is written for, the worst a value can do
+/// is `error.OutOfMemory`: it is a whole allocation size, never a term
+/// added to one. Left non-zero it costs that allocation on **every**
+/// subsequent scan, and written concurrently with a scan it is a data
+/// race like any other unsynchronized global.
+pub var probe_scan_padding: usize = 0;
+
 /// Decode one `xl/worksheets/sheet*.xml` into cells.
 ///
 /// The scan is one pass and refuses at the first thing it cannot
@@ -1792,6 +1828,12 @@ pub fn scanSheet(
 ) error{OutOfMemory}!SheetResult {
     assert(opts.limits.max_depth > 0);
     if (preflight(.worksheet, xml, opts.limits)) |r| return .{ .refused = r };
+
+    // §9.1g M10x: the scan's own instants, priced. Read once so a
+    // concurrent writer cannot make the `alloc` and the `free` disagree.
+    const pad_bytes = probe_scan_padding;
+    const pad: []u8 = if (pad_bytes == 0) &.{} else try gpa.alloc(u8, pad_bytes);
+    defer if (pad.len != 0) gpa.free(pad);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     // See `decodeSharedStrings`: a refusal returns normally, so the
@@ -1939,6 +1981,7 @@ pub fn scanSheet(
         .merges = merge_items,
         .rows = row_items,
         .dimension = w.dimension,
+        .formula_cells = w.formula_cells,
     } };
 }
 
@@ -2010,6 +2053,11 @@ const SheetWalk = struct {
     xml: []const u8,
     opts: Options,
     strings: []const []const u8,
+    /// §9.1g M10x: how many appended cells carried an `<f>`. A u32 like
+    /// every other count here — a cell is at least four part bytes and a
+    /// part is capped at u32 bytes, so it cannot overflow before
+    /// `max_modeled_cells` refuses.
+    formula_cells: u32 = 0,
     cells: *std.ArrayListUnmanaged(SheetCell),
     slots: *std.ArrayListUnmanaged(CellSlot),
 
@@ -2568,6 +2616,9 @@ const SheetWalk = struct {
             .cm = self.cell_cm,
             .vm = self.cell_vm,
         });
+        // After the append, so a failed append never counts a cell the
+        // scan does not return (§9.1g M10x).
+        if (self.formula != null) self.formula_cells += 1;
     }
 
     /// True (and refuses) when the element carries a main-namespace
