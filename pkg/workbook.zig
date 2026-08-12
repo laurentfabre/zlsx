@@ -16955,6 +16955,45 @@ test "M4b1: the carrier split survives a whole package, in both directions" {
     try std.testing.expectEqualStrings(env.symbols.names[0].body, back);
 }
 
+test "M10x: the model build hands `classifySheet` the scan's own count" {
+    // The assertion that fails if this file stops forwarding
+    // `scanned.formula_cells`. Every unit test in `calc.zig` stays green
+    // through that regression — they call `classifySheet` directly — and
+    // §9.1g's whole cut is lost silently. A review found the gap.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // Three `<f>` cells among five, because the growth ladder's rungs
+    // for a 128-byte element are 2, 5, 8, … — a blind list buys five for
+    // three, and an exact one buys three.
+    const sheet = try testSheetXml(
+        ta,
+        "<row r=\"1\"><c r=\"A1\"><f t=\"shared\" ref=\"A1:A2\" si=\"0\">B1+1</f><v>1</v></c>" ++
+            "<c r=\"B1\"><v>9</v></c></row>" ++
+            "<row r=\"2\"><c r=\"A2\"><f t=\"shared\" si=\"0\"/><v>2</v></c>" ++
+            "<c r=\"B2\"><v>8</v></c></row>" ++
+            "<row r=\"3\"><c r=\"A3\"><f>B1+B2</f><v>17</v></c></row>",
+    );
+    defer ta.free(sheet);
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "Sheet1", .body = sheet }}, null);
+    defer wb.deinit();
+
+    var census: engine.calc.SharedCensus = .{};
+    engine.calc.census_sink = &census;
+    defer engine.calc.census_sink = null;
+
+    var env = try expectBuilt(try buildEnvOrRefusal(ta, &wb, .{ .collation = test_collation }));
+    defer env.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), census.cells);
+    try std.testing.expectEqual(@as(usize, 3), census.formula_cells);
+    // The cut, stated as the production path's own invariant: capacity is
+    // the count, on the call site the gate measures.
+    try std.testing.expectEqual(census.formula_cells, census.entries_capacity);
+}
+
 test "M4b1: an entity-escaped sheet name resolves under the name a formula writes" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

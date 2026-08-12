@@ -476,9 +476,11 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
         },
     );
 
-    // The maximum's own list, and what stands beside it. `at_maximum` is
-    // the list's *capacity* plus its neighbours — the length is what the
-    // sheet needs, the capacity is what the pages cost.
+    // The maximum's own list, and what stands beside it. The census runs
+    // at hand-off — *after* the last growth freed the rung below it — so
+    // `at_handoff` is the surviving capacity plus its neighbours and is
+    // **not** the maximum: the abandoned rung is gone by then, and only
+    // the heap trace sees the two together (§9.1g).
     try w.print("\n--- shared-topology census (M10x) ---\n", .{});
     inline for (std.meta.fields(shared_probe.Census)) |f| {
         try w.print("shared {s}={d}\n", .{ f.name, @field(shared, f.name) });
@@ -486,7 +488,7 @@ fn reportFill(io: std.Io, w: *std.Io.Writer, path: []const u8) !u8 {
     const neighbours = shared.scan_cells_bytes + shared.scan_slots_bytes +
         shared.scan_rows_bytes + shared.sheet_xml_bytes;
     try w.print(
-        "shared_derived entries_len_bytes={d} entries_slack_bytes={d} neighbours={d} at_maximum={d}\n",
+        "shared_derived entries_len_bytes={d} entries_slack_bytes={d} neighbours={d} at_handoff={d}\n",
         .{
             shared.formula_cells * shared.entry_bytes,
             shared.entries_capacity_bytes -| shared.formula_cells * shared.entry_bytes,

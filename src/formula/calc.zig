@@ -606,11 +606,14 @@ pub const SharedCensus = struct {
 
 /// Process-wide opt-in, null by default and in every build that does not
 /// install one — `graph.census_sink`'s terms, for the complementary
-/// region. `classifySheet` tests it **once**, at hand-off, so the cost
-/// when it is null is one branch per sheet and none per cell.
+/// region. It is tested **three times per successful sheet** — twice by
+/// the model builder that owns the neighbouring terms, once here at
+/// hand-off — and **never per cell**.
 ///
 /// Not thread-safe: two sheets classified at once would write each
-/// other's terms, which is why installing one is the bench's job.
+/// other's terms, and a sink cleared while another thread is inside
+/// `classifySheet` is a dangling pointer, not merely a wrong number.
+/// Installing one is the bench's job, on a process running one workload.
 /// Sequential sheets **overwrite** rather than accumulate, so a sink
 /// installed across a multi-sheet workbook reports the last sheet — the
 /// §9.1 fixture has one, and a per-sheet total is not what a census of
@@ -626,8 +629,12 @@ pub var census_sink: ?*SharedCensus = null;
 /// pair is the point: the same knob at two instants of the same half
 /// prices two candidates, and only one of them reads anything.
 ///
-/// Zero by default, `error.OutOfMemory` at worst — a whole allocation
-/// size, never a term added to one.
+/// Zero by default. Under the serialized use it is written for, the
+/// worst a value can do is `error.OutOfMemory` — it is a whole
+/// allocation size, never a term added to one, so there is no overflow
+/// to reach. Left non-zero it costs that allocation on **every**
+/// subsequent classify, and written concurrently with a classify it is a
+/// data race like any other unsynchronized global.
 pub var probe_classify_padding: usize = 0;
 
 /// What a caller that has already counted can tell this one.
@@ -640,8 +647,17 @@ pub const Options = struct {
     ///
     /// A wrong hint costs only the growth path it failed to remove: too
     /// low and the list grows from there, too high and the surplus is
-    /// capacity nothing fills. Neither changes what is classified, which
-    /// is why this is a hint and not an argument.
+    /// capacity nothing fills. Neither changes what is classified **when
+    /// the reservation succeeds**, which is why this is a hint and not an
+    /// argument.
+    ///
+    /// What it does change is *when* memory is asked for. The reservation
+    /// happens before the first formula is classified, so under memory
+    /// pressure a sheet that would have refused on its first bad `<f>`
+    /// after a small allocation can now return `error.OutOfMemory`
+    /// instead — the same trade every pre-sizing on this path makes
+    /// (`decode.Options.size_hints`), and the reason the ceiling is
+    /// `cells.len` rather than whatever the caller computed.
     formula_cells: ?usize = null,
 };
 
@@ -2132,14 +2148,23 @@ test "M10x: the hint makes the entries list exact, and its absence does not" {
     };
     defer blind.deinit();
     try testing.expectEqual(@as(usize, 3), census.formula_cells);
-    // The ladder overshoots three entries by two, and on the named
-    // fixture the same overshoot is 3 418 240 B standing at the
-    // recalc's resident maximum (§9.1g).
-    try testing.expectEqual(@as(usize, 5), census.entries_capacity);
+    // The ladder overshoots, and on the named fixture the same overshoot
+    // is 3 418 240 B standing at the recalc's resident maximum (§9.1g).
+    // Stated as an inequality: the exact rung is std's business, and a
+    // future growth rule that overshoots by a different amount is not a
+    // regression in this row.
+    try testing.expect(census.entries_capacity > census.formula_cells);
 
-    // Whatever the capacity, the classification is the same.
+    // Whatever the capacity, the classification is the same — roles and
+    // cells, not just counts, because a hint that changed *what* was
+    // classified would be the bug worth catching.
     try testing.expectEqual(hinted.entries.len, blind.entries.len);
     try testing.expectEqual(hinted.groups.len, blind.groups.len);
+    for (hinted.entries, blind.entries) |h, b| {
+        try testing.expectEqual(h.cell, b.cell);
+        try testing.expectEqual(std.meta.activeTag(h.role), std.meta.activeTag(b.role));
+        try testing.expectEqualStrings(h.formula.text, b.formula.text);
+    }
 }
 
 test "M10x: a wrong hint costs only the growth path it failed to remove" {
@@ -2159,7 +2184,7 @@ test "M10x: a wrong hint costs only the growth path it failed to remove" {
     try testing.expectEqual(@as(usize, 3), low.entries.len);
 
     // Past absurd: a hint is a caller's arithmetic, and an unclamped one
-    // reaching an allocation size is `error.OutOfMemory` on a four-cell
+    // reaching an allocation size is `error.OutOfMemory` on a five-cell
     // sheet. Clamped to `cells.len`, which no correct hint exceeds.
     var huge = switch (try classifySheet(testing.allocator, sheet.cells, .{
         .formula_cells = std.math.maxInt(usize),
@@ -2169,8 +2194,35 @@ test "M10x: a wrong hint costs only the growth path it failed to remove" {
     };
     defer huge.deinit();
     try testing.expectEqual(@as(usize, 3), huge.entries.len);
-    try testing.expectEqual(@as(usize, 5), census.entries_capacity);
-    try testing.expect(census.entries_capacity <= sheet.cells.len);
+    // The clamp's own contract, not a growth rung: `cells.len` is the
+    // ceiling however absurd the hint was.
+    try testing.expectEqual(sheet.cells.len, census.entries_capacity);
+}
+
+test "M10x: a padded classify that refuses still gives the padding back" {
+    // The knobs' `defer` on the path the success test cannot reach. The
+    // sheet below refuses at its second `<f>`, which returns through a
+    // different arm of the same function.
+    decode.probe_scan_padding = 4096;
+    defer decode.probe_scan_padding = 0;
+    probe_classify_padding = 8192;
+    defer probe_classify_padding = 0;
+
+    var sheet = try scanCells(sheetXml(
+        \\<row r="1"><c r="A1"><f>B1+1</f></c></row>
+        \\<row r="7"><c r="D7"><f dt2D="1">1</f></c></row>
+    ));
+    defer sheet.deinit();
+    switch (try classifySheet(testing.allocator, sheet.cells, .{
+        .formula_cells = sheet.formula_cells,
+    })) {
+        .ok => |*s| {
+            var owned = s.*;
+            owned.deinit();
+            return error.TestExpectedRefusal;
+        },
+        .refused => |r| try testing.expectEqual(Refusal.Reason.data_table_formula, r.reason),
+    }
 }
 
 test "M10x: the padding knobs are inert by default and give their bytes back" {

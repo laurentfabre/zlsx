@@ -1791,17 +1791,23 @@ const row_attrs = [_][]const u8{
 /// against the resident maximum **on the same binary** (§9.1f's knob
 /// method: a rebuild moves the raw peak ±1 page, and a knob does not).
 ///
-/// It answers §9.1c's candidate 2 directly. That candidate is bytes the
-/// scan holds and gives back before it returns; if N such bytes do not
-/// move the peak, neither does removing them. Zero by default — a public
+/// It answers §9.1c's candidate 2. That candidate is bytes the scan holds
+/// and gives back before it returns; if N such bytes do not raise the
+/// peak, the scan's span is not the envelope, so removing them cannot
+/// lower it either — *directly*. The knob measures an addition, and a
+/// removal also changes the allocation history a later era reuses, which
+/// §9.1g measures at ten pages for one cut. Zero by default — a public
 /// mutable global, so zero is what nothing having set it leaves behind
 /// rather than an invariant a released build enforces. The block goes
 /// through `alloc`, so in Debug and ReleaseSafe it is memset and
 /// therefore resident, which is the currency a list's unused capacity is
-/// paid in (§9.1c). Not thread-safe, for `graph.census_sink`'s reason.
+/// paid in (§9.1c).
 ///
-/// The worst a caller can do with it is `error.OutOfMemory`: it is a
-/// whole allocation size, never a term added to one.
+/// Under the serialized use it is written for, the worst a value can do
+/// is `error.OutOfMemory`: it is a whole allocation size, never a term
+/// added to one. Left non-zero it costs that allocation on **every**
+/// subsequent scan, and written concurrently with a scan it is a data
+/// race like any other unsynchronized global.
 pub var probe_scan_padding: usize = 0;
 
 /// Decode one `xl/worksheets/sheet*.xml` into cells.
