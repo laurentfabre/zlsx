@@ -2052,7 +2052,7 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
     // Phase 3: assign each part's content_type (Override wins).
 
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Default")) |pos| {
+    while (liveIndexOfPos(xml, i, "<Default")) |pos| {
         const end = xmlStartTagEnd(xml, pos) orelse break;
         const attrs = xml[pos..end];
         const ext_raw = attrAtSlice(attrs, "Extension") orelse {
@@ -2073,7 +2073,7 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
         i = end + 1;
     }
     i = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Override")) |pos| {
+    while (liveIndexOfPos(xml, i, "<Override")) |pos| {
         const end = xmlStartTagEnd(xml, pos) orelse break;
         const attrs = xml[pos..end];
         const part_name_raw = attrAtSlice(attrs, "PartName") orelse {
@@ -2178,6 +2178,64 @@ pub fn xmlAttrValue(tag: []const u8, name: []const u8) ?[]const u8 {
         i = val_end + 1;
     }
     return null;
+}
+
+/// Index of the first occurrence of `needle` at or after `start` that
+/// lies in LIVE markup — outside comments, CDATA sections, and
+/// processing instructions (the XML declaration included). Element
+/// scans that key on raw bytes use this so commented-out lookalikes,
+/// PI payloads (which may legally contain `<!--`), and CDATA text are
+/// never mistaken for markup. An unterminated special region hides
+/// everything after its opener. Doctypes are not handled — they do
+/// not occur in OOXML parts.
+pub fn liveIndexOfPos(xml: []const u8, start: usize, needle: []const u8) ?usize {
+    std.debug.assert(needle.len > 0);
+    const Special = struct {
+        open: []const u8,
+        close: []const u8,
+    };
+    const specials = [_]Special{
+        .{ .open = "<!--", .close = "-->" },
+        .{ .open = "<![CDATA[", .close = "]]>" },
+        .{ .open = "<?", .close = "?>" },
+    };
+    var i = start;
+    while (i < xml.len) {
+        const cand = std.mem.indexOfPos(u8, xml, i, needle) orelse return null;
+        // The earliest special-region opener in [i, cand) decides:
+        // none → cand is live; one → skip its whole region (which may
+        // swallow cand) and rescan.
+        var nearest: ?usize = null;
+        var nearest_close: []const u8 = undefined;
+        var nearest_open_len: usize = 0;
+        for (specials) |sp| {
+            if (std.mem.indexOfPos(u8, xml[0..cand], i, sp.open)) |p| {
+                if (nearest == null or p < nearest.?) {
+                    nearest = p;
+                    nearest_close = sp.close;
+                    nearest_open_len = sp.open.len;
+                }
+            }
+        }
+        const open = nearest orelse return cand;
+        const close = std.mem.indexOfPos(u8, xml, open + nearest_open_len, nearest_close) orelse
+            return null;
+        i = close + nearest_close.len;
+    }
+    return null;
+}
+
+/// Last live occurrence of `needle`, or null. The splice helpers use
+/// this so a close tag quoted inside an epilog comment cannot steal
+/// the splice point from the real one.
+pub fn liveLastIndexOf(xml: []const u8, needle: []const u8) ?usize {
+    var last: ?usize = null;
+    var i: usize = 0;
+    while (liveIndexOfPos(xml, i, needle)) |p| {
+        last = p;
+        i = p + 1;
+    }
+    return last;
 }
 
 fn extensionEql(name: []const u8, ext: []const u8) bool {
@@ -2301,7 +2359,7 @@ fn relsOwner(arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
 pub fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship {
     var out: std.ArrayListUnmanaged(Relationship) = .empty;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |pos| {
+    while (liveIndexOfPos(xml, i, "<Relationship")) |pos| {
         // Skip `<Relationships ...>` (the wrapper) — only match
         // `<Relationship ` or `<Relationship>` followed by
         // attributes; the root tag is `<Relationships>` (with `s`).
@@ -2355,7 +2413,9 @@ pub fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relation
 /// through verbatim. Malformed numeric refs (no closing `;`, empty
 /// digit run, out-of-range code point) also pass through verbatim,
 /// matching the lenient behaviour of OOXML readers.
-fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
+/// Public alongside `parseRelationships`: id-allocation scans decode
+/// attribute values through the same routine the parsers use.
+pub fn decodeXmlEntities(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, s, '&') == null) return arena.dupe(u8, s);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(arena);
@@ -4344,4 +4404,21 @@ test "xmlStartTagEnd: a quote in following text cannot extend a valid start tag"
     const xml = "<Relationship Id=\"rId1\">text with a stray \" quote > after</Relationship>";
     const end = xmlStartTagEnd(xml, 0).?;
     try std.testing.expectEqualStrings("<Relationship Id=\"rId1\"", xml[0..end]);
+}
+
+test "parseRelationships: commented relationships are not live (Codex r4)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // A stale commented rId1 pointing elsewhere precedes the live
+    // rId1: parsing the comment would silently redirect an append
+    // into another sheet's drawing part.
+    const rels = try parseRelationships(
+        arena.allocator(),
+        "<Relationships>" ++
+            "<!-- <Relationship Id=\"rId1\" Type=\"x\" Target=\"../drawings/drawing2.xml\"/> -->" ++
+            "<Relationship Id=\"rId1\" Type=\"x\" Target=\"../drawings/drawing1.xml\"/>" ++
+            "</Relationships>",
+    );
+    try std.testing.expectEqual(@as(usize, 1), rels.len);
+    try std.testing.expectEqualStrings("../drawings/drawing1.xml", rels[0].target);
 }

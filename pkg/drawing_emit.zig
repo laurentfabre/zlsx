@@ -784,7 +784,7 @@ pub fn appendAnchorToDrawing(
     assert(anchor_xml.len > 0);
 
     const close_tag = "</xdr:wsDr>";
-    const close_pos = std.mem.lastIndexOf(u8, drawing_xml, close_tag) orelse
+    const close_pos = store_mod.liveLastIndexOf(drawing_xml, close_tag) orelse
         return error.UnsupportedDrawingPart;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -876,7 +876,7 @@ pub fn appendRelationship(
 ) ![]u8 {
     assert(drawing_type_uri.len > 0);
     const close_tag = "</Relationships>";
-    const close_pos = std.mem.lastIndexOf(u8, existing_xml, close_tag) orelse
+    const close_pos = store_mod.liveLastIndexOf(existing_xml, close_tag) orelse
         return error.MalformedSheetRels;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -912,7 +912,7 @@ pub fn appendImageRelationship(
     assert(image_type_uri.len > 0);
 
     const close_tag = "</Relationships>";
-    const close_pos = std.mem.lastIndexOf(u8, existing_xml, close_tag) orelse
+    const close_pos = store_mod.liveLastIndexOf(existing_xml, close_tag) orelse
         return error.MalformedDrawingRels;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -932,27 +932,36 @@ pub fn appendImageRelationship(
 }
 
 /// Splice `<drawing r:id="..."/>` into a sheet's XML, immediately
-/// before `</worksheet>`. Caller owns the returned bytes.
+/// before its live `</worksheet>`. Caller owns the returned bytes.
+///
+/// The element declares `xmlns:r` inline (`ns_r_uri`, the sheet
+/// dialect's relationships URI): every mainstream producer already
+/// binds `r:` at the worksheet root, where the re-declaration is
+/// redundant-but-conformant, and a sheet that binds it elsewhere (or
+/// not at all) still gets a well-formed, correctly-namespaced
+/// element. XML attribute order carries no meaning, so `r:id` may
+/// precede the declaration that binds it.
 pub fn appendDrawingElementToSheet(
     allocator: std.mem.Allocator,
     sheet_xml: []const u8,
     rel_id: []const u8,
+    ns_r_uri: []const u8,
 ) ![]u8 {
     assert(rel_id.len > 0);
+    assert(ns_r_uri.len > 0);
 
     const close_tag = "</worksheet>";
-    const close_pos = std.mem.lastIndexOf(u8, sheet_xml, close_tag) orelse
+    const close_pos = store_mod.liveLastIndexOf(sheet_xml, close_tag) orelse
         return error.MalformedSheetXml;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, sheet_xml[0..close_pos]);
-    // The `r:` namespace prefix is bound in the worksheet root by
-    // every OOXML producer we've round-tripped (xmlns:r=...
-    // /relationships); we emit it without re-declaring.
     try buf.appendSlice(allocator, "<drawing r:id=\"");
     try buf.appendSlice(allocator, rel_id);
+    try buf.appendSlice(allocator, "\" xmlns:r=\"");
+    try buf.appendSlice(allocator, ns_r_uri);
     try buf.appendSlice(allocator, "\"/>");
     try buf.appendSlice(allocator, sheet_xml[close_pos..]);
 
@@ -982,18 +991,6 @@ pub fn nextFreeRelId(rels: []const store_mod.Relationship) Error!u32 {
     return max_seen + 1;
 }
 
-/// When index `i` falls inside an XML comment, return the index just
-/// past that comment's `-->` (or `xml.len` for an unterminated one)
-/// so scanners can resume after it; null when `i` is live markup.
-/// Comments cannot nest, so the nearest `<!--` before `i` decides.
-fn commentSkip(xml: []const u8, i: usize) ?usize {
-    const lo = std.mem.lastIndexOf(u8, xml[0..i], "<!--") orelse return null;
-    const close = std.mem.indexOfPos(u8, xml, lo + "<!--".len, "-->") orelse
-        return xml.len;
-    if (close + "-->".len <= i) return null;
-    return close + "-->".len;
-}
-
 /// Whether the sheet carries a LIVE `<drawing>` element — the
 /// append/fresh branch decision. Name-boundary aware (`<drawingHF>`
 /// never matches) and comment-aware: a commented-out
@@ -1002,11 +999,7 @@ fn commentSkip(xml: []const u8, i: usize) ?usize {
 /// sheet never references.
 pub fn hasDrawingElement(sheet_xml: []const u8) bool {
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
-        if (commentSkip(sheet_xml, i)) |resume_at| {
-            pos = resume_at;
-            continue;
-        }
+    while (store_mod.liveIndexOfPos(sheet_xml, pos, "<drawing")) |i| {
         const after_idx = i + "<drawing".len;
         if (after_idx >= sheet_xml.len) return false;
         const after = sheet_xml[after_idx];
@@ -1028,11 +1021,7 @@ pub fn hasDrawingElement(sheet_xml: []const u8) bool {
 /// match — only an attribute-carrying worksheet drawing element does.
 pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
-        if (commentSkip(sheet_xml, i)) |resume_at| {
-            pos = resume_at;
-            continue;
-        }
+    while (store_mod.liveIndexOfPos(sheet_xml, pos, "<drawing")) |i| {
         const after_idx = i + "<drawing".len;
         if (after_idx >= sheet_xml.len) return null;
         if (!std.ascii.isWhitespace(sheet_xml[after_idx])) {
@@ -1056,14 +1045,7 @@ pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
 pub fn nextFreeCnvprId(drawing_xml: []const u8) Error!u32 {
     var max_seen: u32 = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, drawing_xml, pos, "cNvPr")) |i| {
-        // A commented-out anchor is not markup: counting its id could
-        // fake exhaustion (a commented maxInt id) or inflate the
-        // allocation.
-        if (commentSkip(drawing_xml, i)) |resume_at| {
-            pos = resume_at;
-            continue;
-        }
+    while (store_mod.liveIndexOfPos(drawing_xml, pos, "cNvPr")) |i| {
         pos = i + "cNvPr".len;
         // Element-name boundary on both sides: `<cNvPr` (no prefix) or
         // `:cNvPr` (prefixed) before, whitespace after (`id` is a
@@ -1080,7 +1062,16 @@ pub fn nextFreeCnvprId(drawing_xml: []const u8) Error!u32 {
         const lt = std.mem.lastIndexOfScalar(u8, drawing_xml[0..i], '<') orelse continue;
         const tag_end = store_mod.xmlStartTagEnd(drawing_xml, lt) orelse break;
         const id_str = store_mod.xmlAttrValue(drawing_xml[lt..tag_end], "id") orelse continue;
-        const n = std.fmt.parseInt(u32, id_str, 10) catch continue;
+        // Character references are legal in the value (`id="&#49;"` is
+        // id 1); decode through the parsers' own routine. 512 bytes
+        // because the decoder's ArrayList first-grows by a cache-line
+        // quantum (128) and toOwnedSlice may copy — an id spelled in
+        // more references than fits here isn't a numeric id anyway,
+        // and the OOM lands in the same `catch continue`.
+        var dec_buf: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&dec_buf);
+        const decoded = store_mod.decodeXmlEntities(fba.allocator(), id_str) catch continue;
+        const n = std.fmt.parseInt(u32, decoded, 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
     if (max_seen == std.math.maxInt(u32)) return Error.IdSpaceExhausted;
@@ -1520,13 +1511,30 @@ test "buildDrawingRels: includes ../media/<basename> target and the given Type" 
     ) != null);
 }
 
-test "appendDrawingElementToSheet: splices before </worksheet>" {
+test "appendDrawingElementToSheet: splices before </worksheet>, declaring xmlns:r" {
     const sheet =
         "<?xml version=\"1.0\"?>" ++
         "<worksheet xmlns:r=\"...\"><sheetData/></worksheet>";
-    const out = try appendDrawingElementToSheet(std.testing.allocator, sheet, "rId7");
+    const out = try appendDrawingElementToSheet(std.testing.allocator, sheet, "rId7", ns_r_transitional);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "<drawing r:id=\"rId7\"/></worksheet>") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "<drawing r:id=\"rId7\" xmlns:r=\"" ++ ns_r_transitional ++ "\"/></worksheet>",
+    ) != null);
+
+    // A close tag quoted inside an epilog comment cannot steal the
+    // splice point: the element must land before the LIVE close
+    // (Codex r4).
+    const commented_close =
+        "<worksheet><sheetData/></worksheet><!-- stale </worksheet> -->";
+    const out2 = try appendDrawingElementToSheet(std.testing.allocator, commented_close, "rId3", ns_r_transitional);
+    defer std.testing.allocator.free(out2);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out2,
+        "\"/></worksheet><!-- stale </worksheet> -->",
+    ) != null);
 }
 
 test "appendRelationship: appends before </Relationships>" {
@@ -1700,6 +1708,51 @@ test "hasDrawingElement / extractDrawingRelId: commented drawing elements are no
     try std.testing.expect(hasDrawingElement("<worksheet><drawing/></worksheet>"));
     try std.testing.expect(hasDrawingElement("<worksheet><drawing r:id=\"rId1\"/></worksheet>"));
     try std.testing.expect(!hasDrawingElement("<worksheet><drawingHF r:id=\"rId1\"/></worksheet>"));
+}
+
+test "hasDrawingElement: a comment opener inside a PI cannot hide live markup" {
+    // PI content may legally contain `<!--`. Backward comment
+    // inference paired that opener with a LATER real comment's close
+    // and swallowed the live drawing between them, emitting a second
+    // drawing element on a wired sheet (Codex r4, BLOCKER 1). The
+    // forward scanner skips the PI as a unit instead.
+    const pi_trap =
+        "<worksheet><sheetData/>" ++
+        "<?vendor <!-- ?><drawing r:id=\"rId1\"/><!--later-->" ++
+        "</worksheet>";
+    try std.testing.expect(hasDrawingElement(pi_trap));
+    try std.testing.expectEqualStrings("rId2", extractDrawingRelId(
+        "<worksheet><?vendor <!-- ?><drawing r:id=\"rId2\"/><!--x--></worksheet>",
+    ).?);
+
+    // Conversely, a fake element inside PI or CDATA is dead text.
+    try std.testing.expect(!hasDrawingElement(
+        "<worksheet><?p <drawing r:id=\"rId9\"/> ?><sheetData/></worksheet>",
+    ));
+    try std.testing.expect(!hasDrawingElement(
+        "<worksheet><x><![CDATA[<drawing r:id=\"rId9\"/>]]></x></worksheet>",
+    ));
+}
+
+test "nextFreeCnvprId: entity-encoded ids count (id=\"&#49;\" is id 1)" {
+    // Character references are legal spellings; ignoring one would
+    // hand its normalized value out again (Codex r4).
+    try std.testing.expectEqual(@as(u32, 2), try nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr id=\"&#49;\" name=\"P\"/></xdr:wsDr>",
+    ));
+}
+
+test "appendAnchorToDrawing: an epilog-comment close tag cannot steal the splice" {
+    const drawing =
+        "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\">" ++
+        "</xdr:wsDr><!-- </xdr:wsDr> -->";
+    const out = try appendAnchorToDrawing(std.testing.allocator, drawing, "<FAKE/>");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "<FAKE/></xdr:wsDr><!-- </xdr:wsDr> -->",
+    ) != null);
 }
 
 test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first anchor" {

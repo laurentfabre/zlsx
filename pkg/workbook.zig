@@ -4768,6 +4768,7 @@ pub const Workbook = struct {
             a,
             sheet_part.bytes,
             rid,
+            dialect.nsR(),
         );
         defer a.free(new_sheet_xml);
 
