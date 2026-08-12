@@ -2239,7 +2239,14 @@ fn relsOwner(arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
     return out;
 }
 
-fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship {
+/// Parse a rels part's bytes into Relationship entries. Public so
+/// callers holding bytes the `rels_by_owner` cache doesn't cover (a
+/// rels part created by `addPart` in the same session — only
+/// `replacePart` refreshes the cache) can chase them with the SAME
+/// quote-tolerant, entity-decoding parser that fills the cache,
+/// rather than a divergent scanner. `arena` owns every returned
+/// slice; callers typically pass a temporary ArenaAllocator.
+pub fn parseRelationships(arena: std.mem.Allocator, xml: []const u8) ![]Relationship {
     var out: std.ArrayListUnmanaged(Relationship) = .empty;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, "<Relationship")) |pos| {

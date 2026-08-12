@@ -35,6 +35,7 @@ const assert = std.debug.assert;
 
 const store_mod = @import("store.zig");
 const PartStore = store_mod.PartStore;
+const coords = @import("zlsx_refs");
 
 pub const ImageMime = enum {
     png,
@@ -202,16 +203,29 @@ pub const ImageAnchorSpec = union(enum) {
     two_cell: ImageCellRange,
 };
 
-/// Reject anchors OOXML can't express: 0 row/col (the wire format is
-/// 1-based on our side, 0-based on its own, so 0 has no valid
-/// pre-image) and ranges whose bottom-right precedes their top-left.
+/// Reject an anchor cell the sheet grid can't hold: 0 row/col (the
+/// wire format is 1-based on our side, 0-based on its own, so 0 has
+/// no valid pre-image) or a coordinate past Excel's XFD / 1_048_576
+/// grid caps. The grid caps also keep every emitted wire coordinate
+/// inside `xsd:int` — the marker types' value space — with room to
+/// spare (a `to` corner emits `col`, at most 16_384).
+pub fn validateAnchorCell(at: ImageCellAnchor) Error!void {
+    if (at.col == 0 or at.row == 0) return Error.InvalidAnchor;
+    if (at.col > coords.max_col_1based or at.row > coords.max_row) {
+        return Error.InvalidAnchor;
+    }
+}
+
+/// Reject anchors OOXML can't express: cells outside the sheet grid
+/// (see `validateAnchorCell`) and ranges whose bottom-right precedes
+/// their top-left.
 ///
 /// Callers must run this before `buildDrawingXml`, which asserts the
 /// same invariants rather than re-checking them.
 pub fn validateAnchor(spec: ImageAnchorSpec) Error!void {
     switch (spec) {
         .one_cell => |o| {
-            if (o.at.col == 0 or o.at.row == 0) return Error.InvalidAnchor;
+            try validateAnchorCell(o.at);
             // A 0 axis renders as an invisible picture; an axis past
             // the schema cap makes Office reject the whole part.
             if (o.ext.cx_emu == 0 or o.ext.cy_emu == 0) return Error.InvalidExtent;
@@ -222,8 +236,8 @@ pub fn validateAnchor(spec: ImageAnchorSpec) Error!void {
             }
         },
         .two_cell => |r| {
-            if (r.from.col == 0 or r.from.row == 0) return Error.InvalidAnchor;
-            if (r.to.col == 0 or r.to.row == 0) return Error.InvalidAnchor;
+            try validateAnchorCell(r.from);
+            try validateAnchorCell(r.to);
             if (r.to.col < r.from.col or r.to.row < r.from.row) {
                 return Error.InvertedAnchorRange;
             }
@@ -413,7 +427,10 @@ pub fn nextFreeNumber(
         const n = std.fmt.parseInt(u32, middle[0..digits], 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    return max_seen + 1;
+    // Saturate rather than trap: a part already numbered maxInt(u32)
+    // is attacker-craftable input, and a duplicate name there (which
+    // addPart then refuses, typed) beats a safety-mode panic.
+    return max_seen +| 1;
 }
 
 /// Emit one `<xdr:from>` / `<xdr:to>` marker: the four scalar
@@ -450,6 +467,96 @@ fn appendAnchorMarker(
     try buf.append(allocator, '>');
 }
 
+/// OOXML namespace URIs for the three prefixes emitted anchors use.
+/// Transitional (ECMA-376 1st edition) and Strict (2nd edition) are
+/// the same logical names under different URIs; `pkg/drawings.zig`
+/// accepts both on the read side, and the append path must emit
+/// whichever dialect the host drawing part already speaks — a
+/// Transitional child inside a Strict `wsDr` (or vice versa) is a
+/// foreign-namespace element the host schema doesn't admit.
+pub const ns_xdr_transitional = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+pub const ns_xdr_strict = "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing";
+pub const ns_a_transitional = "http://schemas.openxmlformats.org/drawingml/2006/main";
+pub const ns_a_strict = "http://purl.oclc.org/ooxml/drawingml/main";
+pub const ns_r_transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub const ns_r_strict = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+pub const image_rel_type_transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+pub const image_rel_type_strict = "http://purl.oclc.org/ooxml/officeDocument/relationships/image";
+
+/// Which ECMA-376 conformance dialect a drawing part speaks, read off
+/// its root's `xmlns:xdr` declaration by `detectWsDrDialect`.
+pub const WsDrDialect = enum {
+    transitional,
+    strict,
+
+    pub fn nsXdr(self: WsDrDialect) []const u8 {
+        return switch (self) {
+            .transitional => ns_xdr_transitional,
+            .strict => ns_xdr_strict,
+        };
+    }
+
+    pub fn nsA(self: WsDrDialect) []const u8 {
+        return switch (self) {
+            .transitional => ns_a_transitional,
+            .strict => ns_a_strict,
+        };
+    }
+
+    pub fn nsR(self: WsDrDialect) []const u8 {
+        return switch (self) {
+            .transitional => ns_r_transitional,
+            .strict => ns_r_strict,
+        };
+    }
+
+    pub fn imageRelType(self: WsDrDialect) []const u8 {
+        return switch (self) {
+            .transitional => image_rel_type_transitional,
+            .strict => image_rel_type_strict,
+        };
+    }
+};
+
+/// Read a host drawing's conformance dialect off its root element's
+/// `xmlns:xdr` declaration. Null when there is no `<xdr:wsDr>` root or
+/// it binds `xdr` to neither known URI — the caller refuses rather
+/// than splicing content the host schema can't admit.
+pub fn detectWsDrDialect(drawing_xml: []const u8) ?WsDrDialect {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, drawing_xml, pos, "<xdr:wsDr")) |i| {
+        const after_idx = i + "<xdr:wsDr".len;
+        if (after_idx >= drawing_xml.len) return null;
+        const after = drawing_xml[after_idx];
+        // A root using the prefix without declaring it (`>` right
+        // away) is malformed; a longer name (`<xdr:wsDrX`) is a
+        // different element.
+        if (!std.ascii.isWhitespace(after)) {
+            pos = after_idx;
+            continue;
+        }
+        const el_end = std.mem.indexOfScalarPos(u8, drawing_xml, after_idx, '>') orelse return null;
+        const uri = attrValue(drawing_xml[i..el_end], "xmlns:xdr") orelse return null;
+        if (std.mem.eql(u8, uri, ns_xdr_transitional)) return .transitional;
+        if (std.mem.eql(u8, uri, ns_xdr_strict)) return .strict;
+        return null;
+    }
+    return null;
+}
+
+/// Whether a built anchor declares its namespace bindings inline.
+/// `.inherit` relies on the enclosing document's root — correct for
+/// the fresh path, which writes that root itself. `.declare` pins all
+/// three prefixes on the anchor element in the given dialect, so a
+/// splice into a host that doesn't declare `a:`/`r:` at its root (or
+/// binds them to other URIs) stays well-formed and schema-valid;
+/// where the host already declares them, the local re-declaration is
+/// redundant but conformant.
+pub const NsDecl = union(enum) {
+    inherit,
+    declare: WsDrDialect,
+};
+
 /// Build one anchor element (`<xdr:oneCellAnchor>` /
 /// `<xdr:twoCellAnchor>`) for a single image — the unit that both a
 /// fresh drawing part and an append into an existing one are made of.
@@ -475,6 +582,7 @@ pub fn buildPicAnchorXml(
     spec: ImageAnchorSpec,
     rel_id: []const u8,
     pic_id: u32,
+    ns: NsDecl,
 ) ![]u8 {
     assert(rel_id.len > 0);
     assert(pic_id >= 1);
@@ -507,6 +615,18 @@ pub fn buildPicAnchorXml(
     };
     try buf.append(allocator, '<');
     try buf.appendSlice(allocator, wrapper);
+    switch (ns) {
+        .inherit => {},
+        .declare => |d| {
+            try buf.appendSlice(allocator, " xmlns:xdr=\"");
+            try buf.appendSlice(allocator, d.nsXdr());
+            try buf.appendSlice(allocator, "\" xmlns:a=\"");
+            try buf.appendSlice(allocator, d.nsA());
+            try buf.appendSlice(allocator, "\" xmlns:r=\"");
+            try buf.appendSlice(allocator, d.nsR());
+            try buf.append(allocator, '"');
+        },
+    }
     try buf.append(allocator, '>');
 
     switch (spec) {
@@ -552,15 +672,16 @@ pub fn buildPicAnchorXml(
 
 /// Build a fresh drawingN.xml body holding a single image anchor. The
 /// first image in a fresh part always gets `rId1` / `cNvPr id="1"` —
-/// appends into the part allocate theirs with `nextFreeRelIdInXml` /
-/// `nextFreeCnvprId` instead.
+/// appends into the part allocate theirs with `nextFreeRelId` /
+/// `nextFreeCnvprId` instead. Fresh parts are always Transitional;
+/// the anchor inherits the bindings this root declares.
 ///
 /// Caller must have run `validateAnchor` first.
 pub fn buildDrawingXml(
     allocator: std.mem.Allocator,
     spec: ImageAnchorSpec,
 ) ![]u8 {
-    const anchor_xml = try buildPicAnchorXml(allocator, spec, "rId1", 1);
+    const anchor_xml = try buildPicAnchorXml(allocator, spec, "rId1", 1, .inherit);
     defer allocator.free(anchor_xml);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -609,11 +730,18 @@ pub fn appendAnchorToDrawing(
 }
 
 /// Build the drawing-rels file linking `rId1` to `../media/imageN.{ext}`.
+///
+/// `image_type_uri` is the relationship Type — Transitional or Strict
+/// to match the owning drawing's dialect (`WsDrDialect.imageRelType`).
+/// The wrapping package-relationships namespace is OPC (ISO 29500
+/// Part 2) and does not vary with the Part 1 dialect.
 pub fn buildDrawingRels(
     allocator: std.mem.Allocator,
     image_part_basename: []const u8,
+    image_type_uri: []const u8,
 ) ![]u8 {
     assert(image_part_basename.len > 0);
+    assert(image_type_uri.len > 0);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -623,7 +751,9 @@ pub fn buildDrawingRels(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
             "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
     );
-    try buf.appendSlice(allocator, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/");
+    try buf.appendSlice(allocator, "<Relationship Id=\"rId1\" Type=\"");
+    try buf.appendSlice(allocator, image_type_uri);
+    try buf.appendSlice(allocator, "\" Target=\"../media/");
     try buf.appendSlice(allocator, image_part_basename);
     try buf.appendSlice(allocator, "\"/>");
     try buf.appendSlice(allocator, "</Relationships>");
@@ -687,16 +817,19 @@ pub fn appendRelationship(
 
 /// Splice an image `<Relationship>` into an existing drawing-rels file
 /// before `</Relationships>` — the sibling of `appendRelationship` for
-/// the drawing → image edge of the graph. Caller owns the returned
-/// bytes.
+/// the drawing → image edge of the graph. `image_type_uri` follows the
+/// owning drawing's dialect (see `buildDrawingRels`). Caller owns the
+/// returned bytes.
 pub fn appendImageRelationship(
     allocator: std.mem.Allocator,
     existing_xml: []const u8,
     image_basename: []const u8,
     rel_id: []const u8,
+    image_type_uri: []const u8,
 ) ![]u8 {
     assert(image_basename.len > 0);
     assert(rel_id.len > 0);
+    assert(image_type_uri.len > 0);
 
     const close_tag = "</Relationships>";
     const close_pos = std.mem.lastIndexOf(u8, existing_xml, close_tag) orelse
@@ -708,7 +841,9 @@ pub fn appendImageRelationship(
     try buf.appendSlice(allocator, existing_xml[0..close_pos]);
     try buf.appendSlice(allocator, "<Relationship Id=\"");
     try buf.appendSlice(allocator, rel_id);
-    try buf.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/");
+    try buf.appendSlice(allocator, "\" Type=\"");
+    try buf.appendSlice(allocator, image_type_uri);
+    try buf.appendSlice(allocator, "\" Target=\"../media/");
     try buf.appendSlice(allocator, image_basename);
     try buf.appendSlice(allocator, "\"/>");
     try buf.appendSlice(allocator, existing_xml[close_pos..]);
@@ -746,7 +881,17 @@ pub fn appendDrawingElementToSheet(
 
 /// Pick the next free `rId<N>` for the given existing rels list.
 /// Returns the integer N (caller formats `rId<N>`). Stable across
-/// saves: bumps past max(N) rather than gap-filling.
+/// saves: bumps past max(N) rather than gap-filling. Saturates at
+/// maxInt rather than trapping on a crafted `rId4294967295` (the
+/// duplicate is then the consumer's lenient-parse problem, not a
+/// panic).
+///
+/// Callers holding raw rels-file bytes rather than the store's cached
+/// view (the append path — a rels part created by `addPart` earlier
+/// in the same session is absent from the cache, which only
+/// `replacePart` refreshes) parse them first with
+/// `store.parseRelationships`, the same quote-tolerant,
+/// entity-decoding parser that fills the cache.
 pub fn nextFreeRelId(rels: []const store_mod.Relationship) u32 {
     var max_seen: u32 = 0;
     for (rels) |r| {
@@ -754,51 +899,47 @@ pub fn nextFreeRelId(rels: []const store_mod.Relationship) u32 {
         const n = std.fmt.parseInt(u32, r.id[3..], 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    return max_seen + 1;
+    return max_seen +| 1;
 }
 
-/// `nextFreeRelId` over raw rels-file bytes instead of the store's
-/// parsed view. The append path needs this form: a rels part created
-/// by `addPart` earlier in the same session (the fresh-image path)
-/// exists as bytes but is absent from `PartStore.rels`'s cache, which
-/// only `replacePart` refreshes.
-pub fn nextFreeRelIdInXml(rels_xml: []const u8) u32 {
-    var max_seen: u32 = 0;
-    var pos: usize = 0;
-    const key = " Id=\"rId";
-    while (std.mem.indexOfPos(u8, rels_xml, pos, key)) |i| {
-        const val_start = i + key.len;
-        const val_end = std.mem.indexOfScalarPos(u8, rels_xml, val_start, '"') orelse break;
-        pos = val_end;
-        const n = std.fmt.parseInt(u32, rels_xml[val_start..val_end], 10) catch continue;
-        if (n > max_seen) max_seen = n;
-    }
-    return max_seen + 1;
-}
-
-/// Extract the value of `key` (spelled with its leading space and
-/// opening quote, e.g. ` Id="`) from one element's attribute region.
-fn attrValue(tag: []const u8, key: []const u8) ?[]const u8 {
-    const p = std.mem.indexOf(u8, tag, key) orelse return null;
-    const start = p + key.len;
-    const end = std.mem.indexOfScalarPos(u8, tag, start, '"') orelse return null;
-    return tag[start..end];
-}
-
-/// Find the `Target` of the `<Relationship>` whose `Id` equals
-/// `rel_id`, scanning raw rels-file bytes (see `nextFreeRelIdInXml`
-/// for why bytes rather than the store's parsed view). Returns a
-/// slice into `rels_xml`, or null when no such Id exists.
-pub fn findRelTarget(rels_xml: []const u8, rel_id: []const u8) ?[]const u8 {
-    assert(rel_id.len > 0);
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, rels_xml, pos, "<Relationship ")) |el| {
-        const el_end = std.mem.indexOfScalarPos(u8, rels_xml, el, '>') orelse return null;
-        pos = el_end;
-        const tag = rels_xml[el..el_end];
-        const id = attrValue(tag, " Id=\"") orelse continue;
-        if (!std.mem.eql(u8, id, rel_id)) continue;
-        return attrValue(tag, " Target=\"");
+/// Extract one attribute's value from a single element's bytes.
+/// Tolerates single or double quotes AND XML 1.0 §3.1 `Eq` whitespace
+/// on both sides of `=` — the same lexical space
+/// `workbook.findAttrValue` accepts (born from Codex review
+/// REL-602/604; producers emitting single quotes or `name = "v"` are
+/// legal and observed). Entity references in the value are NOT
+/// decoded; callers comparing against wire-format ids (`rId7`) are
+/// unaffected because NMTOKEN-shaped values have nothing to escape.
+fn attrValue(element_bytes: []const u8, attr_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < element_bytes.len) {
+        const eq = std.mem.indexOfScalarPos(u8, element_bytes, i, '=') orelse return null;
+        // Walk backward across whitespace to the attribute name.
+        var name_end = eq;
+        while (name_end > 0 and std.ascii.isWhitespace(element_bytes[name_end - 1])) {
+            name_end -= 1;
+        }
+        var name_start = name_end;
+        while (name_start > 0 and !std.ascii.isWhitespace(element_bytes[name_start - 1])) {
+            name_start -= 1;
+        }
+        if (!std.mem.eql(u8, element_bytes[name_start..name_end], attr_name)) {
+            i = eq + 1;
+            continue;
+        }
+        // Walk forward across whitespace to the opening quote.
+        var q = eq + 1;
+        while (q < element_bytes.len and std.ascii.isWhitespace(element_bytes[q])) q += 1;
+        if (q >= element_bytes.len) return null;
+        const quote = element_bytes[q];
+        if (quote != '"' and quote != '\'') {
+            i = eq + 1;
+            continue;
+        }
+        const val_start = q + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, element_bytes, val_start, quote) orelse
+            return null;
+        return element_bytes[val_start..val_end];
     }
     return null;
 }
@@ -808,7 +949,7 @@ pub fn findRelTarget(rels_xml: []const u8, rel_id: []const u8) ?[]const u8 {
 /// is schema-invalid and unresolvable either way). Returns a slice
 /// into `sheet_xml`.
 ///
-/// The name test requires a space after `<drawing` so that
+/// The name test requires XML whitespace after `<drawing` so that
 /// `<drawingHF>` (header/footer images) and a bare `<drawing/>` never
 /// match — only an attribute-carrying worksheet drawing element does.
 pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
@@ -816,12 +957,12 @@ pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
     while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
         const after_idx = i + "<drawing".len;
         if (after_idx >= sheet_xml.len) return null;
-        if (sheet_xml[after_idx] != ' ') {
+        if (!std.ascii.isWhitespace(sheet_xml[after_idx])) {
             pos = after_idx;
             continue;
         }
         const el_end = std.mem.indexOfScalarPos(u8, sheet_xml, after_idx, '>') orelse return null;
-        return attrValue(sheet_xml[after_idx..el_end], " r:id=\"");
+        return attrValue(sheet_xml[after_idx..el_end], "r:id");
     }
     return null;
 }
@@ -831,7 +972,8 @@ pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
 /// ids to be unique within their drawing part, and the id space is
 /// shared across shape kinds — pictures, charts' graphicFrames,
 /// shapes — so the scan matches the element name under any namespace
-/// prefix rather than picture anchors only.
+/// prefix rather than picture anchors only. Saturates at maxInt
+/// rather than trapping on a crafted `id="4294967295"`.
 pub fn nextFreeCnvprId(drawing_xml: []const u8) u32 {
     var max_seen: u32 = 0;
     var pos: usize = 0;
@@ -847,11 +989,11 @@ pub fn nextFreeCnvprId(drawing_xml: []const u8) u32 {
         if (pos >= drawing_xml.len) break;
         if (!std.ascii.isWhitespace(drawing_xml[pos])) continue;
         const tag_end = std.mem.indexOfScalarPos(u8, drawing_xml, pos, '>') orelse break;
-        const id_str = attrValue(drawing_xml[pos..tag_end], " id=\"") orelse continue;
+        const id_str = attrValue(drawing_xml[pos..tag_end], "id") orelse continue;
         const n = std.fmt.parseInt(u32, id_str, 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
-    return max_seen + 1;
+    return max_seen +| 1;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1268,11 +1410,23 @@ test "emuFromPixels: agrees with the inch constant and stays in range" {
     try std.testing.expect(emuFromPixels(std.math.maxInt(u32)) > st_positive_coordinate_max);
 }
 
-test "buildDrawingRels: includes ../media/<basename> target" {
-    const rels = try buildDrawingRels(std.testing.allocator, "image1.png");
+test "buildDrawingRels: includes ../media/<basename> target and the given Type" {
+    const rels = try buildDrawingRels(std.testing.allocator, "image1.png", image_rel_type_transitional);
     defer std.testing.allocator.free(rels);
     try std.testing.expect(std.mem.indexOf(u8, rels, "Target=\"../media/image1.png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rels, "Id=\"rId1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rels, image_rel_type_transitional) != null);
+
+    // A Strict host gets the Strict Type; the OPC wrapper namespace
+    // stays the Part 2 URI either way.
+    const strict = try buildDrawingRels(std.testing.allocator, "image1.png", image_rel_type_strict);
+    defer std.testing.allocator.free(strict);
+    try std.testing.expect(std.mem.indexOf(u8, strict, image_rel_type_strict) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        strict,
+        "http://schemas.openxmlformats.org/package/2006/relationships",
+    ) != null);
 }
 
 test "appendDrawingElementToSheet: splices before </worksheet>" {
@@ -1304,14 +1458,59 @@ test "buildPicAnchorXml: plumbs the rel id and cNvPr id/name" {
     const xml = try buildPicAnchorXml(std.testing.allocator, .{ .one_cell = .{
         .at = .{ .col = 2, .row = 3 },
         .ext = one_inch_square,
-    } }, "rId7", 3);
+    } }, "rId7", 3, .inherit);
     defer std.testing.allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "r:embed=\"rId7\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:cNvPr id=\"3\" name=\"Picture 3\"/>") != null);
-    // A fragment, not a document: no wsDr wrapper of its own.
+    // A fragment, not a document: no wsDr wrapper of its own, and
+    // `.inherit` declares nothing.
     try std.testing.expect(std.mem.indexOf(u8, xml, "wsDr") == null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns") == null);
     try std.testing.expect(std.mem.startsWith(u8, xml, "<xdr:oneCellAnchor>"));
     try std.testing.expect(std.mem.endsWith(u8, xml, "</xdr:oneCellAnchor>"));
+}
+
+test "buildPicAnchorXml: .declare pins all three prefixes in the host's dialect" {
+    const xml = try buildPicAnchorXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = one_inch_square,
+    } }, "rId2", 2, .{ .declare = .strict });
+    defer std.testing.allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns:xdr=\"" ++ ns_xdr_strict ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns:a=\"" ++ ns_a_strict ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns:r=\"" ++ ns_r_strict ++ "\"") != null);
+    // The declarations live on the anchor's open tag, before its `>`.
+    const decl_pos = std.mem.indexOf(u8, xml, "xmlns:xdr").?;
+    const first_close = std.mem.indexOfScalar(u8, xml, '>').?;
+    try std.testing.expect(decl_pos < first_close);
+
+    const trans = try buildPicAnchorXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = one_inch_square,
+    } }, "rId2", 2, .{ .declare = .transitional });
+    defer std.testing.allocator.free(trans);
+    try std.testing.expect(std.mem.indexOf(u8, trans, "xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\"") != null);
+}
+
+test "detectWsDrDialect: reads the root xmlns:xdr binding" {
+    const fresh = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = one_inch_square,
+    } });
+    defer std.testing.allocator.free(fresh);
+    try std.testing.expectEqual(@as(?WsDrDialect, .transitional), detectWsDrDialect(fresh));
+
+    const strict =
+        "<xdr:wsDr xmlns:xdr='" ++ ns_xdr_strict ++ "'></xdr:wsDr>";
+    try std.testing.expectEqual(@as(?WsDrDialect, .strict), detectWsDrDialect(strict));
+
+    // Unknown URI, foreign root, or a root that never declares the
+    // prefix: no dialect — the caller refuses to splice.
+    const bogus =
+        "<xdr:wsDr xmlns:xdr=\"http://example.com/not-a-drawing\"></xdr:wsDr>";
+    try std.testing.expect(detectWsDrDialect(bogus) == null);
+    try std.testing.expect(detectWsDrDialect("<c:chartSpace></c:chartSpace>") == null);
+    try std.testing.expect(detectWsDrDialect("<xdr:wsDr></xdr:wsDr>") == null);
 }
 
 test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first anchor" {
@@ -1324,17 +1523,17 @@ test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first ancho
     const second = try buildPicAnchorXml(std.testing.allocator, .{ .two_cell = .{
         .from = .{ .col = 2, .row = 2 },
         .to = .{ .col = 4, .row = 5 },
-    } }, "rId2", 2);
+    } }, "rId2", 2, .{ .declare = .transitional });
     defer std.testing.allocator.free(second);
 
     const out = try appendAnchorToDrawing(std.testing.allocator, fresh, second);
     defer std.testing.allocator.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "<xdr:oneCellAnchor>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "<xdr:twoCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</xdr:twoCellAnchor>") != null);
     // The splice lands after the existing anchor, inside the wrapper.
     const one_pos = std.mem.indexOf(u8, out, "</xdr:oneCellAnchor>").?;
-    const two_pos = std.mem.indexOf(u8, out, "<xdr:twoCellAnchor>").?;
+    const two_pos = std.mem.indexOf(u8, out, "<xdr:twoCellAnchor").?;
     const close_pos = std.mem.indexOf(u8, out, "</xdr:wsDr>").?;
     try std.testing.expect(one_pos < two_pos);
     try std.testing.expect(two_pos < close_pos);
@@ -1358,46 +1557,40 @@ test "appendImageRelationship: appends an image rel before </Relationships>" {
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/image1.png\"/>" ++
         "</Relationships>";
-    const out = try appendImageRelationship(std.testing.allocator, existing, "image2.gif", "rId2");
+    const out = try appendImageRelationship(
+        std.testing.allocator,
+        existing,
+        "image2.gif",
+        "rId2",
+        image_rel_type_transitional,
+    );
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Id=\"rId2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../media/image2.gif\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../media/image1.png\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, out, "</Relationships>"));
 
+    // The Type is whatever dialect the caller resolved.
+    const strict_out = try appendImageRelationship(
+        std.testing.allocator,
+        existing,
+        "image2.gif",
+        "rId2",
+        image_rel_type_strict,
+    );
+    defer std.testing.allocator.free(strict_out);
+    try std.testing.expect(std.mem.indexOf(u8, strict_out, image_rel_type_strict) != null);
+
     try std.testing.expectError(
         error.MalformedDrawingRels,
-        appendImageRelationship(std.testing.allocator, "<Relationships>", "image2.gif", "rId2"),
+        appendImageRelationship(
+            std.testing.allocator,
+            "<Relationships>",
+            "image2.gif",
+            "rId2",
+            image_rel_type_transitional,
+        ),
     );
-}
-
-test "nextFreeRelIdInXml: bumps past the highest rId, ignoring foreign ids" {
-    const rels =
-        "<Relationships>" ++
-        "<Relationship Id=\"rId1\" Type=\"x\" Target=\"a\"/>" ++
-        "<Relationship Id=\"rId5\" Type=\"x\" Target=\"b\"/>" ++
-        "<Relationship Id=\"custom9\" Type=\"x\" Target=\"c\"/>" ++
-        "</Relationships>";
-    try std.testing.expectEqual(@as(u32, 6), nextFreeRelIdInXml(rels));
-    try std.testing.expectEqual(@as(u32, 1), nextFreeRelIdInXml("<Relationships></Relationships>"));
-}
-
-test "findRelTarget: matches the exact Id under any attribute order" {
-    const rels =
-        "<Relationships>" ++
-        "<Relationship Id=\"rId1\" Type=\"x\" Target=\"../drawings/drawing1.xml\"/>" ++
-        "<Relationship Target=\"../drawings/drawing10.xml\" Type=\"x\" Id=\"rId10\"/>" ++
-        "</Relationships>";
-    try std.testing.expectEqualStrings(
-        "../drawings/drawing1.xml",
-        findRelTarget(rels, "rId1").?,
-    );
-    // Exact match: "rId1" must not resolve through "rId10"'s entry.
-    try std.testing.expectEqualStrings(
-        "../drawings/drawing10.xml",
-        findRelTarget(rels, "rId10").?,
-    );
-    try std.testing.expect(findRelTarget(rels, "rId2") == null);
 }
 
 test "extractDrawingRelId: pulls the r:id and skips non-drawing lookalikes" {
@@ -1413,6 +1606,20 @@ test "extractDrawingRelId: pulls the r:id and skips non-drawing lookalikes" {
     try std.testing.expect(extractDrawingRelId("<worksheet><drawingHF r:id=\"rId2\"/></worksheet>") == null);
     // A bare <drawing> without attributes carries no r:id to chase.
     try std.testing.expect(extractDrawingRelId("<worksheet><drawing/></worksheet>") == null);
+}
+
+test "extractDrawingRelId: accepts single quotes and Eq whitespace" {
+    // Both are legal XML 1.0 spellings some producers emit; missing
+    // them turns a resolvable drawing into DrawingRelationshipNotFound
+    // (Codex r1, MAJOR 2).
+    try std.testing.expectEqualStrings(
+        "rId9",
+        extractDrawingRelId("<worksheet><drawing r:id='rId9'/></worksheet>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "rId4",
+        extractDrawingRelId("<worksheet><drawing\n  r:id = \"rId4\" /></worksheet>").?,
+    );
 }
 
 test "nextFreeCnvprId: shares the id space across shape kinds" {
@@ -1436,4 +1643,48 @@ test "nextFreeCnvprId: shares the id space across shape kinds" {
     try std.testing.expectEqual(@as(u32, 3), nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr name=\"Picture 2\" id=\"2\"/></xdr:wsDr>",
     ));
+    // Single quotes and Eq whitespace are legal spellings; missing
+    // them would hand out a duplicate id (Codex r1, MAJOR 2).
+    try std.testing.expectEqual(@as(u32, 10), nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr id='9' name='P'/></xdr:wsDr>",
+    ));
+    try std.testing.expectEqual(@as(u32, 6), nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr\n id = \"5\" name=\"P\"/></xdr:wsDr>",
+    ));
+    // A crafted maxInt id saturates instead of trapping.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr id=\"4294967295\" name=\"P\"/></xdr:wsDr>",
+    ));
+}
+
+test "nextFreeRelId: saturates at a crafted maxInt rId instead of trapping" {
+    const rels = [_]store_mod.Relationship{.{
+        .id = "rId4294967295",
+        .type = "x",
+        .target = "y",
+        .target_mode = .internal,
+    }};
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), nextFreeRelId(&rels));
+}
+
+test "validateAnchor: rejects anchors past the sheet grid caps" {
+    // XFD / 1_048_576 are the last legal cells; one past either axis
+    // is outside the grid (and would eventually leave the marker
+    // types' xsd:int value space far behind at u32 extremes).
+    try validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 16_384, .row = 1_048_576 },
+        .ext = one_inch_square,
+    } });
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 16_385, .row = 1 },
+        .ext = one_inch_square,
+    } }));
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1_048_577 },
+        .ext = one_inch_square,
+    } }));
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 1, .row = 1 },
+        .to = .{ .col = std.math.maxInt(u32), .row = 5 },
+    } }));
 }
