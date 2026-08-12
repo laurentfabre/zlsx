@@ -4869,8 +4869,23 @@ pub const Workbook = struct {
         const sheet_rels_part = (try self.store.part(sheet_rels_part_name)) orelse
             return error.DrawingRelationshipNotFound;
         const sheet_rels = try store_mod.parseRelationships(rels_alloc, sheet_rels_part.bytes);
-        const target = relTargetForId(sheet_rels, drawing_rid) orelse
+        // Match on Id AND semantics: the rel must be internal and of a
+        // drawing Type. A hand-edited sheet whose `<drawing r:id>`
+        // names a hyperlink or external rel must refuse, not chase
+        // whatever target that rel happens to carry into a mutation.
+        const target = blk: {
+            for (sheet_rels) |r| {
+                if (!std.mem.eql(u8, r.id, drawing_rid)) continue;
+                if (r.target_mode != .internal) return error.DrawingRelationshipNotFound;
+                if (!std.mem.eql(u8, r.type, drawing_emit.drawing_rel_type_transitional) and
+                    !std.mem.eql(u8, r.type, drawing_emit.drawing_rel_type_strict))
+                {
+                    return error.DrawingRelationshipNotFound;
+                }
+                break :blk r.target;
+            }
             return error.DrawingRelationshipNotFound;
+        };
         // Targets resolve against the OWNER part's directory, not the
         // rels sidecar's (`../drawings/…` from `xl/worksheets/`).
         const drawing_part_name = (try self.store.resolve(sheet_part_name, target)) orelse
@@ -13401,6 +13416,71 @@ test "Workbook.addImage: unknown wsDr namespace is refused before any mutation" 
     );
     // The refusal came before any mutation: no image part landed.
     try std.testing.expect((try wb.store.part("xl/media/image1.png")) == null);
+}
+
+test "Workbook.addImage: a drawing r:id naming a non-drawing rel refuses typed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-reltype-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(allocator, io, src_path);
+    defer wb.deinit();
+
+    // The sheet's <drawing r:id> names a HYPERLINK rel — hand-edited
+    // wiring. Chasing whatever target that rel carries would mutate
+    // an unrelated part; the semantic check must refuse instead
+    // (Codex r5).
+    try testWireExistingDrawing(
+        &wb,
+        "<drawing r:id=\"rId1\"/>",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"../drawings/drawing1.xml\"/>" ++
+            "</Relationships>",
+        "<?xml version=\"1.0\"?><xdr:wsDr xmlns:xdr=\"" ++ drawing_emit.ns_xdr_transitional ++ "\"></xdr:wsDr>",
+        null,
+    );
+    try std.testing.expectError(
+        error.DrawingRelationshipNotFound,
+        wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png),
+    );
+    try std.testing.expect((try wb.store.part("xl/media/image1.png")) == null);
+}
+
+test "Workbook.addImage: an external-mode drawing rel refuses typed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-addimg-relext-{d}.xlsx", .{prng.random().int(u32)});
+    try writeMinimalSstLessXlsx(allocator, io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(allocator, io, src_path);
+    defer wb.deinit();
+
+    try testWireExistingDrawing(
+        &wb,
+        "<drawing r:id=\"rId1\"/>",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"http://example.com/d.xml\" TargetMode=\"External\"/>" ++
+            "</Relationships>",
+        "<?xml version=\"1.0\"?><xdr:wsDr xmlns:xdr=\"" ++ drawing_emit.ns_xdr_transitional ++ "\"></xdr:wsDr>",
+        null,
+    );
+    try std.testing.expectError(
+        error.DrawingRelationshipNotFound,
+        wb.addImage(0, .{ .col = 1, .row = 1 }, &tiny_png_1x1, .png),
+    );
 }
 
 test "Workbook.addImage: a Strict sheet gets a Strict fresh drawing part" {

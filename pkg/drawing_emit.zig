@@ -931,8 +931,31 @@ pub fn appendImageRelationship(
     return try buf.toOwnedSlice(allocator);
 }
 
-/// Splice `<drawing r:id="..."/>` into a sheet's XML, immediately
-/// before its live `</worksheet>`. Caller owns the returned bytes.
+/// The CT_Worksheet children that must FOLLOW `drawing` in schema
+/// order (ECMA-376 §18.3.1.99's sequence). A fresh `<drawing>` is
+/// spliced before the first of these present — inserting it at the
+/// end of a sheet that carries `tableParts` or `extLst` (both
+/// ordinary: zlsx itself emits tableParts) produces schema-invalid
+/// output that Office offers to "repair". These names appear only as
+/// direct worksheet children in real parts, so a boundary-checked
+/// first-live-occurrence scan places the splice correctly.
+const drawing_successor_elements = [_][]const u8{
+    "drawingHF",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+};
+
+/// Splice `<drawing r:id="..."/>` into a sheet's XML at its
+/// CT_Worksheet schema position: before the first live successor
+/// element (`drawing_successor_elements`), or before the live
+/// `</worksheet>` when none is present. Caller owns the returned
+/// bytes.
 ///
 /// The element declares `xmlns:r` inline (`ns_r_uri`, the sheet
 /// dialect's relationships URI): every mainstream producer already
@@ -951,19 +974,38 @@ pub fn appendDrawingElementToSheet(
     assert(ns_r_uri.len > 0);
 
     const close_tag = "</worksheet>";
-    const close_pos = store_mod.liveLastIndexOf(sheet_xml, close_tag) orelse
+    var insert_at = store_mod.liveLastIndexOf(sheet_xml, close_tag) orelse
         return error.MalformedSheetXml;
+
+    inline for (drawing_successor_elements) |name| {
+        const needle = "<" ++ name;
+        var pos: usize = 0;
+        while (store_mod.liveIndexOfPos(sheet_xml, pos, needle)) |i| {
+            const after_idx = i + needle.len;
+            if (after_idx >= sheet_xml.len) break;
+            const after = sheet_xml[after_idx];
+            // Name boundary: `<picture ` / `<tableParts>` /
+            // `<extLst/>` qualify; a longer name does not (this is
+            // also what keeps `legacyDrawing` from matching its own
+            // `legacyDrawingHF` sibling at the wrong slot).
+            if (std.ascii.isWhitespace(after) or after == '/' or after == '>') {
+                if (i < insert_at) insert_at = i;
+                break;
+            }
+            pos = after_idx;
+        }
+    }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, sheet_xml[0..close_pos]);
+    try buf.appendSlice(allocator, sheet_xml[0..insert_at]);
     try buf.appendSlice(allocator, "<drawing r:id=\"");
     try buf.appendSlice(allocator, rel_id);
     try buf.appendSlice(allocator, "\" xmlns:r=\"");
     try buf.appendSlice(allocator, ns_r_uri);
     try buf.appendSlice(allocator, "\"/>");
-    try buf.appendSlice(allocator, sheet_xml[close_pos..]);
+    try buf.appendSlice(allocator, sheet_xml[insert_at..]);
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -1071,7 +1113,11 @@ pub fn nextFreeCnvprId(drawing_xml: []const u8) Error!u32 {
         var dec_buf: [512]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&dec_buf);
         const decoded = store_mod.decodeXmlEntities(fba.allocator(), id_str) catch continue;
-        const n = std.fmt.parseInt(u32, decoded, 10) catch continue;
+        // xsd:unsignedInt collapses surrounding whitespace, so
+        // `id=" 1 "` names id 1 — trim before parsing or the entry is
+        // skipped into a duplicate.
+        const trimmed = std.mem.trim(u8, decoded, " \t\r\n");
+        const n = std.fmt.parseInt(u32, trimmed, 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
     if (max_seen == std.math.maxInt(u32)) return Error.IdSpaceExhausted;
@@ -1537,6 +1583,51 @@ test "appendDrawingElementToSheet: splices before </worksheet>, declaring xmlns:
     ) != null);
 }
 
+test "appendDrawingElementToSheet: lands at the CT_Worksheet schema slot" {
+    // `drawing` must PRECEDE tableParts / extLst / legacyDrawing in
+    // the worksheet sequence; appending at the end of a sheet with
+    // tables (which zlsx itself emits) produced schema-invalid output
+    // and an Office repair prompt (Codex r5, BLOCKER).
+    const with_tables =
+        "<worksheet><sheetData/>" ++
+        "<tableParts count=\"1\"><tablePart r:id=\"rId5\"/></tableParts>" ++
+        "</worksheet>";
+    const out = try appendDrawingElementToSheet(std.testing.allocator, with_tables, "rId9", ns_r_transitional);
+    defer std.testing.allocator.free(out);
+    const drawing_pos = std.mem.indexOf(u8, out, "<drawing r:id=").?;
+    try std.testing.expect(drawing_pos < std.mem.indexOf(u8, out, "<tableParts").?);
+    try std.testing.expect(drawing_pos > std.mem.indexOf(u8, out, "<sheetData/>").?);
+
+    const with_ext =
+        "<worksheet><sheetData/>" ++
+        "<extLst><ext uri=\"x\"/></extLst>" ++
+        "</worksheet>";
+    const out2 = try appendDrawingElementToSheet(std.testing.allocator, with_ext, "rId9", ns_r_transitional);
+    defer std.testing.allocator.free(out2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "<drawing r:id=").? <
+        std.mem.indexOf(u8, out2, "<extLst").?);
+
+    // legacyDrawing (cell-comment VML) also follows drawing.
+    const with_legacy =
+        "<worksheet><sheetData/>" ++
+        "<legacyDrawing r:id=\"rId2\"/>" ++
+        "</worksheet>";
+    const out3 = try appendDrawingElementToSheet(std.testing.allocator, with_legacy, "rId9", ns_r_transitional);
+    defer std.testing.allocator.free(out3);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "<drawing r:id=").? <
+        std.mem.indexOf(u8, out3, "<legacyDrawing").?);
+
+    // A commented-out successor is not a slot.
+    const commented_tables =
+        "<worksheet><sheetData/>" ++
+        "<!-- <tableParts count=\"1\"/> -->" ++
+        "</worksheet>";
+    const out4 = try appendDrawingElementToSheet(std.testing.allocator, commented_tables, "rId9", ns_r_transitional);
+    defer std.testing.allocator.free(out4);
+    try std.testing.expect(std.mem.indexOf(u8, out4, "-->").? <
+        std.mem.indexOf(u8, out4, "<drawing r:id=").?);
+}
+
 test "appendRelationship: appends before </Relationships>" {
     const existing =
         "<?xml version=\"1.0\"?>" ++
@@ -1739,6 +1830,18 @@ test "nextFreeCnvprId: entity-encoded ids count (id=\"&#49;\" is id 1)" {
     // hand its normalized value out again (Codex r4).
     try std.testing.expectEqual(@as(u32, 2), try nextFreeCnvprId(
         "<xdr:wsDr><xdr:cNvPr id=\"&#49;\" name=\"P\"/></xdr:wsDr>",
+    ));
+}
+
+test "nextFreeCnvprId: xsd whitespace collapse on the id value" {
+    // xsd:unsignedInt collapses surrounding whitespace: `id=" 7 "` is
+    // id 7, and the entity + whitespace combination normalizes to 1
+    // (Codex r5).
+    try std.testing.expectEqual(@as(u32, 8), try nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr id=\" 7 \" name=\"P\"/></xdr:wsDr>",
+    ));
+    try std.testing.expectEqual(@as(u32, 2), try nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr id=\" &#49; \" name=\"P\"/></xdr:wsDr>",
     ));
 }
 
