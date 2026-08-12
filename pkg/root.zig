@@ -139,6 +139,17 @@ pub const RichEntry = workbook_mod.RichEntry;
 const drawing_emit_mod = @import("drawing_emit.zig");
 pub const ImageMime = drawing_emit_mod.ImageMime;
 pub const ImageCellAnchor = drawing_emit_mod.ImageCellAnchor;
+/// Range-anchor (`twoCellAnchor`) surface, for
+/// `Workbook.addImageRange` / `Workbook.addImageAnchored`.
+pub const ImageCellRange = drawing_emit_mod.ImageCellRange;
+pub const ImageAnchorSpec = drawing_emit_mod.ImageAnchorSpec;
+/// Native-size sizing, for callers that want to inspect or override
+/// what `Workbook.addImage` derives from an image header.
+pub const ImageExtent = drawing_emit_mod.ImageExtent;
+pub const ImagePixelSize = drawing_emit_mod.ImagePixelSize;
+pub const imagePixelSize = drawing_emit_mod.pixelSize;
+pub const imageNativeExtent = drawing_emit_mod.nativeExtent;
+pub const emuFromPixels = drawing_emit_mod.emuFromPixels;
 
 /// Editor — load-modify-save overlay (relocated to pkg/ in B2 iter-er-0).
 const editor_mod = @import("editor.zig");
