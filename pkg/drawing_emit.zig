@@ -1,19 +1,28 @@
-//! Greenfield drawing emit (B1 iter-wb-c2b, minimal).
+//! Greenfield drawing emit (B1 iter-wb-c2b).
 //!
-//! Scope of v1: a single image, anchored at one cell (top-left), zero
-//! pixel offset, fixed 1-inch × 1-inch extent. Sheets that already
-//! carry a `<drawing>` element are rejected with
-//! `error.SheetHasExistingDrawing`. Range-anchor, pixel offsets, and
-//! native-size extent come in follow-up iters.
+//! Scope: images anchored either at one cell (`oneCellAnchor` —
+//! top-left pinned, sized by an explicit extent) or across a cell
+//! range (`twoCellAnchor` — the range itself sizes the image). Every
+//! anchor marker carries a pixel offset into its cell, and
+//! `Workbook.addImage` derives the one-cell extent from the image's
+//! own header at 96 DPI. One image per call; a sheet that already
+//! carries a `<drawing>` element gets each further image spliced into
+//! that existing drawing part as one more anchor — with a fresh `rId`
+//! in the drawing's rels and a fresh `cNvPr` id — never a second
+//! drawing part.
 //!
 //! Per OOXML spec (Part 1, Annex A) emitting a single image into a
 //! drawing-less sheet requires touching FIVE artifacts:
 //!
 //!   1. `xl/media/imageN.{ext}`           — image bytes (STORED).
-//!   2. `xl/drawings/drawingN.xml`        — wsDr/oneCellAnchor wrapper.
+//!   2. `xl/drawings/drawingN.xml`        — wsDr/anchor wrapper.
 //!   3. `xl/drawings/_rels/drawingN.xml.rels` — drawing → image link.
 //!   4. `xl/worksheets/sheetN.xml`        — append `<drawing r:id=...>`.
 //!   5. `xl/worksheets/_rels/sheetN.xml.rels` — sheet → drawing link.
+//!
+//! Appending into an existing drawing touches only artifacts 1–3: the
+//! sheet's `<drawing r:id>` element and its rels entry already exist
+//! and stay byte-identical.
 //!
 //! `PartStore.addPart` registers content types via the
 //! `<Override>` mechanism; the image content type (`image/png` etc.)
@@ -52,14 +61,48 @@ pub const ImageMime = enum {
 pub const Error = error{
     /// `bytes` magic header didn't match `mime`.
     MimeMagicMismatch,
-    /// `cell_anchor` carried a 0 row or 0 col (OOXML is 1-based).
+    /// An anchor cell carried a 0 row or 0 col (OOXML is 1-based).
     InvalidAnchor,
-    /// Target sheet already has a `<drawing>` element. Multi-image
-    /// support against existing drawings is out of scope for v1.
-    SheetHasExistingDrawing,
+    /// A range anchor's bottom-right cell sat above or left of its
+    /// top-left cell. Emitting it would produce a negative-extent
+    /// `<xdr:twoCellAnchor>`, which Office renders as an invisible or
+    /// mirrored image rather than refusing the file.
+    InvertedAnchorRange,
+    /// The declared MIME's magic matched, but the header that follows
+    /// it is truncated or carries a nonsensical size — so the image's
+    /// native pixel dimensions can't be read. Also covers a 0-pixel
+    /// axis (invisible in Office) and a PNG axis above the spec's
+    /// 2^31-1 cap.
+    UndecodableImageHeader,
+    /// A `one_cell` extent had a 0 axis, or an axis above OOXML's
+    /// `ST_PositiveCoordinate` maximum.
+    InvalidExtent,
     /// `bytes` was empty.
     EmptyImage,
 };
+
+/// EMU per pixel at the 96 DPI that Office assumes for images without
+/// their own resolution metadata: 914 400 EMU/inch ÷ 96 px/inch.
+pub const emu_per_pixel_96dpi: u64 = 9525;
+
+/// Upper bound of OOXML's `ST_PositiveCoordinate` (ECMA-376 Part 1,
+/// §20.1.10.42) — about 29 837 inches. Extents above it are outside
+/// the schema's value space, so Office rejects the part outright
+/// rather than clamping.
+pub const st_positive_coordinate_max: u64 = 27273042316900;
+
+/// Convert a pixel count to EMU at 96 DPI.
+///
+/// The product always fits `u64`, but it only stays inside
+/// `st_positive_coordinate_max` for `px <= 2_863_310_478`; a full
+/// `u32` overshoots the schema cap by about 1.5×. `pixelSize` caps
+/// every axis at 2^31-1, which is comfortably below that, so extents
+/// derived from a decoded header are always in range. Callers passing
+/// their own pixel counts should check the result against
+/// `st_positive_coordinate_max` — `validateAnchor` does it for them.
+pub fn emuFromPixels(px: u32) u64 {
+    return @as(u64, px) * emu_per_pixel_96dpi;
+}
 
 /// 1-based (col, row), matching OOXML A1 conventions. Distinct from
 /// `Workbook.CellRef` (which is row-major) because the only call site
@@ -68,7 +111,125 @@ pub const Error = error{
 pub const ImageCellAnchor = struct {
     col: u32,
     row: u32,
+    /// Horizontal offset into the anchor cell, in EMU. `u32` rather
+    /// than a signed coordinate on purpose: a negative offset is
+    /// schema-legal but places the image outside the cell it names,
+    /// which no caller of a create-an-image API means to do. Every
+    /// `u32` is a valid `ST_PositiveCoordinate`, so no range check is
+    /// needed. Use `emuFromPixels` to convert from pixels at 96 DPI.
+    col_off_emu: u32 = 0,
+    /// Vertical offset into the anchor cell, in EMU. See
+    /// `col_off_emu`.
+    row_off_emu: u32 = 0,
+
+    /// Build an anchor whose offsets are given in pixels at 96 DPI,
+    /// which is how callers usually think about nudging an image
+    /// inside its cell.
+    ///
+    /// Pixels are `u16` so the conversion is total: 65 535 px is
+    /// 624 220 875 EMU, comfortably inside `u32`, so this can neither
+    /// overflow nor need a cast at the call site. Offsets beyond that
+    /// exceed any real cell and can be set on the fields directly.
+    pub fn atPixelOffset(col: u32, row: u32, col_px: u16, row_px: u16) ImageCellAnchor {
+        return .{
+            .col = col,
+            .row = row,
+            .col_off_emu = @intCast(emuFromPixels(col_px)),
+            .row_off_emu = @intCast(emuFromPixels(row_px)),
+        };
+    }
 };
+
+/// Rendered size of a `oneCellAnchor` image, in EMU — the
+/// `<xdr:ext cx=… cy=…>` pair. `twoCellAnchor` images carry no extent
+/// because the cell range supplies it.
+pub const ImageExtent = struct {
+    cx_emu: u64,
+    cy_emu: u64,
+};
+
+/// An image's intrinsic size in pixels, as recorded in its own header.
+pub const ImagePixelSize = struct {
+    width: u32,
+    height: u32,
+
+    /// This size as a `oneCellAnchor` extent at 96 DPI.
+    pub fn extent(self: ImagePixelSize) ImageExtent {
+        return .{
+            .cx_emu = emuFromPixels(self.width),
+            .cy_emu = emuFromPixels(self.height),
+        };
+    }
+};
+
+/// Inclusive 1-based cell range for a `twoCellAnchor` image: the
+/// picture covers `from` through `to` in full, the way a spreadsheet
+/// user reads "B2:D5". Both endpoints are `ImageCellAnchor`s, so a
+/// 1×1 range (`from` == `to`) is legal and covers exactly that cell.
+///
+/// **Wire mapping.** OOXML anchor markers are 0-based *grid corners*,
+/// not cell indices: `<xdr:from>` is the top-left corner of the first
+/// covered cell (`from.col - 1`) and `<xdr:to>` is the top-left corner
+/// of the cell *after* the last covered one (`to.col`, no decrement).
+/// The asymmetry is what makes an inclusive range come out right — see
+/// `buildDrawingXml`.
+pub const ImageCellRange = struct {
+    from: ImageCellAnchor,
+    to: ImageCellAnchor,
+};
+
+/// Which OOXML anchor wrapper an image gets. `Workbook.addImage` and
+/// `Workbook.addImageRange` are thin wrappers that each pick one
+/// variant; `Workbook.addImageAnchored` takes the union directly.
+pub const ImageAnchorSpec = union(enum) {
+    /// `<xdr:oneCellAnchor>` — pinned at one cell at an explicit
+    /// extent. The image does not resize when the anchor cell's
+    /// row/col does.
+    ///
+    /// The extent lives in the payload rather than in a separate
+    /// parameter so that the one form that needs it cannot be built
+    /// without it, and the form that must not carry it cannot be
+    /// handed one. `Workbook.addImage` fills `ext` from
+    /// `nativeExtent`; callers wanting a deliberate size pass their
+    /// own through `Workbook.addImageAnchored`.
+    one_cell: struct {
+        at: ImageCellAnchor,
+        ext: ImageExtent,
+    },
+    /// `<xdr:twoCellAnchor>` — spans a cell range and resizes with it
+    /// (the spec's default `editAs="twoCell"` behaviour, which we get
+    /// by omitting the attribute).
+    two_cell: ImageCellRange,
+};
+
+/// Reject anchors OOXML can't express: 0 row/col (the wire format is
+/// 1-based on our side, 0-based on its own, so 0 has no valid
+/// pre-image) and ranges whose bottom-right precedes their top-left.
+///
+/// Callers must run this before `buildDrawingXml`, which asserts the
+/// same invariants rather than re-checking them.
+pub fn validateAnchor(spec: ImageAnchorSpec) Error!void {
+    switch (spec) {
+        .one_cell => |o| {
+            if (o.at.col == 0 or o.at.row == 0) return Error.InvalidAnchor;
+            // A 0 axis renders as an invisible picture; an axis past
+            // the schema cap makes Office reject the whole part.
+            if (o.ext.cx_emu == 0 or o.ext.cy_emu == 0) return Error.InvalidExtent;
+            if (o.ext.cx_emu > st_positive_coordinate_max or
+                o.ext.cy_emu > st_positive_coordinate_max)
+            {
+                return Error.InvalidExtent;
+            }
+        },
+        .two_cell => |r| {
+            if (r.from.col == 0 or r.from.row == 0) return Error.InvalidAnchor;
+            if (r.to.col == 0 or r.to.row == 0) return Error.InvalidAnchor;
+            if (r.to.col < r.from.col or r.to.row < r.from.row) {
+                return Error.InvertedAnchorRange;
+            }
+        },
+    }
+}
 
 /// Validate the magic header for `mime` against the leading bytes of
 /// `bytes`. Defensive: callers pass a declared MIME plus a byte
@@ -101,6 +262,130 @@ pub fn validateMagic(mime: ImageMime, bytes: []const u8) Error!void {
     }
 }
 
+/// PNG caps each axis at 2^31-1 (spec §11.2.2). We reuse the bound
+/// for every format: it is far above any real image, and holding to
+/// it keeps `emuFromPixels` inside `st_positive_coordinate_max`.
+const pixel_axis_max: u32 = std.math.maxInt(i32);
+
+/// Shared tail of the three header readers: a size is only usable if
+/// both axes are non-zero (a 0 axis renders as nothing) and within
+/// `pixel_axis_max`.
+fn checkedPixelSize(width: u32, height: u32) Error!ImagePixelSize {
+    if (width == 0 or height == 0) return Error.UndecodableImageHeader;
+    if (width > pixel_axis_max or height > pixel_axis_max) {
+        return Error.UndecodableImageHeader;
+    }
+    return .{ .width = width, .height = height };
+}
+
+/// PNG: IHDR is mandated to be the first chunk, at a fixed offset —
+/// 8-byte signature, 4-byte chunk length, 4-byte type, then two
+/// big-endian u32 axes. No chunk walk needed.
+fn pngPixelSize(bytes: []const u8) Error!ImagePixelSize {
+    if (bytes.len < 24) return Error.UndecodableImageHeader;
+    if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return Error.UndecodableImageHeader;
+    return checkedPixelSize(
+        std.mem.readInt(u32, bytes[16..20], .big),
+        std.mem.readInt(u32, bytes[20..24], .big),
+    );
+}
+
+/// GIF: the logical screen descriptor follows the 6-byte header, and
+/// its first four bytes are the canvas size as two little-endian u16s.
+/// Frames may be smaller, but the canvas is what Office lays out.
+fn gifPixelSize(bytes: []const u8) Error!ImagePixelSize {
+    if (bytes.len < 10) return Error.UndecodableImageHeader;
+    return checkedPixelSize(
+        std.mem.readInt(u16, bytes[6..8], .little),
+        std.mem.readInt(u16, bytes[8..10], .little),
+    );
+}
+
+/// True for SOF0..SOF15 — the frame headers that carry a size —
+/// excluding the three markers that share the range but do not:
+/// `C4` DHT, `C8` JPG, `CC` DAC.
+fn isStartOfFrame(marker: u8) bool {
+    return switch (marker) {
+        0xC0...0xC3, 0xC5...0xC7, 0xC9...0xCB, 0xCD...0xCF => true,
+        else => false,
+    };
+}
+
+/// JPEG: unlike PNG and GIF the size lives at no fixed offset, so walk
+/// the marker chain from just past SOI until a frame header turns up.
+/// Its payload is precision(1), height(2), width(2) — height first,
+/// which is the classic place to get this backwards.
+fn jpegPixelSize(bytes: []const u8) Error!ImagePixelSize {
+    var i: usize = 2;
+    while (i + 1 < bytes.len) {
+        if (bytes[i] != 0xFF) return Error.UndecodableImageHeader;
+
+        // A marker may be preceded by any number of 0xFF fill bytes.
+        var marker = bytes[i + 1];
+        i += 2;
+        while (marker == 0xFF) {
+            if (i >= bytes.len) return Error.UndecodableImageHeader;
+            marker = bytes[i];
+            i += 1;
+        }
+
+        switch (marker) {
+            // Standalone: no length field, no payload.
+            0x01, 0xD0...0xD7 => continue,
+            // SOI cannot recur mid-stream, and reaching EOI or the
+            // start of scan data means no frame header ever came.
+            0xD8, 0xD9, 0xDA => return Error.UndecodableImageHeader,
+            else => {},
+        }
+
+        if (i + 2 > bytes.len) return Error.UndecodableImageHeader;
+        const seg_len = std.mem.readInt(u16, bytes[i..][0..2], .big);
+        // The length field counts itself, so anything under 2 is junk.
+        if (seg_len < 2) return Error.UndecodableImageHeader;
+        const payload = bytes[i + 2 ..];
+        const payload_len = seg_len - 2;
+        if (payload.len < payload_len) return Error.UndecodableImageHeader;
+
+        if (isStartOfFrame(marker)) {
+            if (payload_len < 5) return Error.UndecodableImageHeader;
+            return checkedPixelSize(
+                std.mem.readInt(u16, payload[3..5], .big),
+                std.mem.readInt(u16, payload[1..3], .big),
+            );
+        }
+        i += seg_len;
+    }
+    return Error.UndecodableImageHeader;
+}
+
+/// Read an image's intrinsic pixel size from its own header. Reads
+/// headers only — no pixel data is decoded, so this stays O(header)
+/// and pulls in no codec.
+///
+/// The declared `mime` is checked against the magic first, so a
+/// mismatch surfaces as `MimeMagicMismatch` rather than as a confusing
+/// `UndecodableImageHeader` from the wrong parser.
+pub fn pixelSize(mime: ImageMime, bytes: []const u8) Error!ImagePixelSize {
+    try validateMagic(mime, bytes);
+    return switch (mime) {
+        .png => pngPixelSize(bytes),
+        .jpeg => jpegPixelSize(bytes),
+        .gif => gifPixelSize(bytes),
+    };
+}
+
+/// The `oneCellAnchor` extent for `bytes` at its native size, mapping
+/// pixels to EMU at 96 DPI.
+///
+/// Office's own "insert picture" does the same thing for images that
+/// carry no resolution metadata. We do it unconditionally: PNG `pHYs`
+/// and JPEG JFIF density fields exist but are unreliable in the wild,
+/// and honouring them only sometimes would make the emitted size
+/// depend on which encoder produced the file.
+pub fn nativeExtent(mime: ImageMime, bytes: []const u8) Error!ImageExtent {
+    return (try pixelSize(mime, bytes)).extent();
+}
+
 /// Walk every part name in the store and return the lowest unused
 /// `<prefix>N<suffix>` integer >= 1. Used for `imageN.png`,
 /// `drawingN.xml` etc. — the OOXML convention for autogenerated
@@ -117,21 +402,166 @@ pub fn nextFreeNumber(
         if (!std.mem.startsWith(u8, p.name, prefix)) continue;
         if (!std.mem.endsWith(u8, p.name, suffix)) continue;
         const middle = p.name[prefix.len .. p.name.len - suffix.len];
-        const n = std.fmt.parseInt(u32, middle, 10) catch continue;
+        // Leading digits only: the image call passes an empty suffix
+        // (Excel numbers media across extensions, so `.png` and `.jpg`
+        // must share one number space), which leaves the extension in
+        // `middle` ("1.png"). A middle with no leading digit isn't a
+        // numbered slot at all.
+        var digits: usize = 0;
+        while (digits < middle.len and std.ascii.isDigit(middle[digits])) digits += 1;
+        if (digits == 0) continue;
+        const n = std.fmt.parseInt(u32, middle[0..digits], 10) catch continue;
         if (n > max_seen) max_seen = n;
     }
     return max_seen + 1;
 }
 
-/// Build the drawingN.xml body for a single oneCellAnchor image
-/// pinned at `(col-1, row-1)` with zero pixel offset and a fixed
-/// 1-inch × 1-inch extent (914 400 EMU per inch).
+/// Emit one `<xdr:from>` / `<xdr:to>` marker: the four scalar
+/// children OOXML requires, in schema order. `col0` / `row0` are
+/// already in wire (0-based) coordinates — the caller owns the
+/// inclusive→corner conversion — while the offsets pass through as
+/// given.
+fn appendAnchorMarker(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    tag: []const u8,
+    col0: u32,
+    row0: u32,
+    anchor: ImageCellAnchor,
+) !void {
+    assert(tag.len > 0);
+
+    var num_buf: [32]u8 = undefined;
+    try buf.append(allocator, '<');
+    try buf.appendSlice(allocator, tag);
+    try buf.append(allocator, '>');
+    try buf.appendSlice(allocator, "<xdr:col>");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{col0}));
+    try buf.appendSlice(allocator, "</xdr:col><xdr:colOff>");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{anchor.col_off_emu}));
+    try buf.appendSlice(allocator, "</xdr:colOff>");
+    try buf.appendSlice(allocator, "<xdr:row>");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{row0}));
+    try buf.appendSlice(allocator, "</xdr:row><xdr:rowOff>");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{anchor.row_off_emu}));
+    try buf.appendSlice(allocator, "</xdr:rowOff>");
+    try buf.appendSlice(allocator, "</");
+    try buf.appendSlice(allocator, tag);
+    try buf.append(allocator, '>');
+}
+
+/// Build one anchor element (`<xdr:oneCellAnchor>` /
+/// `<xdr:twoCellAnchor>`) for a single image — the unit that both a
+/// fresh drawing part and an append into an existing one are made of.
+/// Every marker carries its anchor's pixel offsets.
+///
+///   - `.one_cell`: `<xdr:oneCellAnchor>` at `(col-1, row-1)` sized by
+///     the payload's `ext`.
+///   - `.two_cell`: `<xdr:twoCellAnchor>` from `(from.col-1,
+///     from.row-1)` to `(to.col, to.row)`. The `to` marker is *not*
+///     decremented: OOXML anchor markers name grid corners, so the
+///     corner that closes an inclusive range is the top-left of the
+///     next cell over. No `<xdr:ext>` — the range sizes the image.
+///
+/// `rel_id` is the image relationship in the OWNING DRAWING's rels
+/// (`r:embed`), and `pic_id` the `cNvPr` id — unique per drawing part,
+/// so appenders must allocate it with `nextFreeCnvprId`. The shape
+/// name is derived as `Picture {pic_id}`, mirroring Excel.
+///
+/// Caller must have run `validateAnchor` first; the invariants are
+/// asserted here, not re-checked.
+pub fn buildPicAnchorXml(
+    allocator: std.mem.Allocator,
+    spec: ImageAnchorSpec,
+    rel_id: []const u8,
+    pic_id: u32,
+) ![]u8 {
+    assert(rel_id.len > 0);
+    assert(pic_id >= 1);
+    switch (spec) {
+        .one_cell => |o| {
+            assert(o.at.col >= 1);
+            assert(o.at.row >= 1);
+            assert(o.ext.cx_emu >= 1);
+            assert(o.ext.cy_emu >= 1);
+            assert(o.ext.cx_emu <= st_positive_coordinate_max);
+            assert(o.ext.cy_emu <= st_positive_coordinate_max);
+        },
+        .two_cell => |r| {
+            assert(r.from.col >= 1);
+            assert(r.from.row >= 1);
+            assert(r.to.col >= r.from.col);
+            assert(r.to.row >= r.from.row);
+        },
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // `editAs` is omitted on the two-cell form: the spec's default is
+    // `twoCell` (move AND size with the cells), which is the whole
+    // point of anchoring to a range.
+    const wrapper = switch (spec) {
+        .one_cell => "xdr:oneCellAnchor",
+        .two_cell => "xdr:twoCellAnchor",
+    };
+    try buf.append(allocator, '<');
+    try buf.appendSlice(allocator, wrapper);
+    try buf.append(allocator, '>');
+
+    switch (spec) {
+        .one_cell => |o| {
+            try appendAnchorMarker(allocator, &buf, "xdr:from", o.at.col - 1, o.at.row - 1, o.at);
+            var ext_buf: [64]u8 = undefined;
+            try buf.appendSlice(allocator, try std.fmt.bufPrint(
+                &ext_buf,
+                "<xdr:ext cx=\"{d}\" cy=\"{d}\"/>",
+                .{ o.ext.cx_emu, o.ext.cy_emu },
+            ));
+        },
+        .two_cell => |r| {
+            try appendAnchorMarker(allocator, &buf, "xdr:from", r.from.col - 1, r.from.row - 1, r.from);
+            try appendAnchorMarker(allocator, &buf, "xdr:to", r.to.col, r.to.row, r.to);
+        },
+    }
+
+    var id_buf: [16]u8 = undefined;
+    const id_digits = try std.fmt.bufPrint(&id_buf, "{d}", .{pic_id});
+
+    try buf.appendSlice(allocator, "<xdr:pic>");
+    try buf.appendSlice(allocator, "<xdr:nvPicPr><xdr:cNvPr id=\"");
+    try buf.appendSlice(allocator, id_digits);
+    try buf.appendSlice(allocator, "\" name=\"Picture ");
+    try buf.appendSlice(allocator, id_digits);
+    try buf.appendSlice(allocator, "\"/><xdr:cNvPicPr/></xdr:nvPicPr>");
+    try buf.appendSlice(allocator, "<xdr:blipFill><a:blip r:embed=\"");
+    try buf.appendSlice(allocator, rel_id);
+    try buf.appendSlice(allocator, "\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>");
+    try buf.appendSlice(
+        allocator,
+        "<xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>",
+    );
+    try buf.appendSlice(allocator, "</xdr:pic>");
+    try buf.appendSlice(allocator, "<xdr:clientData/>");
+    try buf.appendSlice(allocator, "</");
+    try buf.appendSlice(allocator, wrapper);
+    try buf.append(allocator, '>');
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Build a fresh drawingN.xml body holding a single image anchor. The
+/// first image in a fresh part always gets `rId1` / `cNvPr id="1"` —
+/// appends into the part allocate theirs with `nextFreeRelIdInXml` /
+/// `nextFreeCnvprId` instead.
+///
+/// Caller must have run `validateAnchor` first.
 pub fn buildDrawingXml(
     allocator: std.mem.Allocator,
-    anchor: ImageCellAnchor,
+    spec: ImageAnchorSpec,
 ) ![]u8 {
-    assert(anchor.col >= 1);
-    assert(anchor.row >= 1);
+    const anchor_xml = try buildPicAnchorXml(allocator, spec, "rId1", 1);
+    defer allocator.free(anchor_xml);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -143,35 +573,37 @@ pub fn buildDrawingXml(
             " xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"" ++
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">",
     );
-    try buf.appendSlice(allocator, "<xdr:oneCellAnchor>");
-    try buf.appendSlice(allocator, "<xdr:from>");
-    var num_buf: [32]u8 = undefined;
-    try buf.appendSlice(allocator, "<xdr:col>");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{anchor.col - 1}));
-    try buf.appendSlice(allocator, "</xdr:col><xdr:colOff>0</xdr:colOff>");
-    try buf.appendSlice(allocator, "<xdr:row>");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{anchor.row - 1}));
-    try buf.appendSlice(allocator, "</xdr:row><xdr:rowOff>0</xdr:rowOff>");
-    try buf.appendSlice(allocator, "</xdr:from>");
-    // 1 inch = 914400 EMU. Fixed for v1.
-    try buf.appendSlice(allocator, "<xdr:ext cx=\"914400\" cy=\"914400\"/>");
-    try buf.appendSlice(allocator, "<xdr:pic>");
-    try buf.appendSlice(
-        allocator,
-        "<xdr:nvPicPr><xdr:cNvPr id=\"1\" name=\"Picture 1\"/><xdr:cNvPicPr/></xdr:nvPicPr>",
-    );
-    try buf.appendSlice(
-        allocator,
-        "<xdr:blipFill><a:blip r:embed=\"rId1\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>",
-    );
-    try buf.appendSlice(
-        allocator,
-        "<xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>",
-    );
-    try buf.appendSlice(allocator, "</xdr:pic>");
-    try buf.appendSlice(allocator, "<xdr:clientData/>");
-    try buf.appendSlice(allocator, "</xdr:oneCellAnchor>");
+    try buf.appendSlice(allocator, anchor_xml);
     try buf.appendSlice(allocator, "</xdr:wsDr>");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Splice a pre-built anchor element into an existing drawing part,
+/// immediately before its closing `</xdr:wsDr>`. Caller owns the
+/// returned bytes.
+///
+/// `error.UnsupportedDrawingPart` when no `</xdr:wsDr>` exists — the
+/// part is not a spreadsheet-drawing wrapper this writer knows how to
+/// extend (a legacy VML part, a chartSpace root, or a wsDr bound to a
+/// prefix other than `xdr`).
+pub fn appendAnchorToDrawing(
+    allocator: std.mem.Allocator,
+    drawing_xml: []const u8,
+    anchor_xml: []const u8,
+) ![]u8 {
+    assert(anchor_xml.len > 0);
+
+    const close_tag = "</xdr:wsDr>";
+    const close_pos = std.mem.lastIndexOf(u8, drawing_xml, close_tag) orelse
+        return error.UnsupportedDrawingPart;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, drawing_xml[0..close_pos]);
+    try buf.appendSlice(allocator, anchor_xml);
+    try buf.appendSlice(allocator, drawing_xml[close_pos..]);
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -253,6 +685,37 @@ pub fn appendRelationship(
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Splice an image `<Relationship>` into an existing drawing-rels file
+/// before `</Relationships>` — the sibling of `appendRelationship` for
+/// the drawing → image edge of the graph. Caller owns the returned
+/// bytes.
+pub fn appendImageRelationship(
+    allocator: std.mem.Allocator,
+    existing_xml: []const u8,
+    image_basename: []const u8,
+    rel_id: []const u8,
+) ![]u8 {
+    assert(image_basename.len > 0);
+    assert(rel_id.len > 0);
+
+    const close_tag = "</Relationships>";
+    const close_pos = std.mem.lastIndexOf(u8, existing_xml, close_tag) orelse
+        return error.MalformedDrawingRels;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, existing_xml[0..close_pos]);
+    try buf.appendSlice(allocator, "<Relationship Id=\"");
+    try buf.appendSlice(allocator, rel_id);
+    try buf.appendSlice(allocator, "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/");
+    try buf.appendSlice(allocator, image_basename);
+    try buf.appendSlice(allocator, "\"/>");
+    try buf.appendSlice(allocator, existing_xml[close_pos..]);
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// Splice `<drawing r:id="..."/>` into a sheet's XML, immediately
 /// before `</worksheet>`. Caller owns the returned bytes.
 pub fn appendDrawingElementToSheet(
@@ -294,6 +757,103 @@ pub fn nextFreeRelId(rels: []const store_mod.Relationship) u32 {
     return max_seen + 1;
 }
 
+/// `nextFreeRelId` over raw rels-file bytes instead of the store's
+/// parsed view. The append path needs this form: a rels part created
+/// by `addPart` earlier in the same session (the fresh-image path)
+/// exists as bytes but is absent from `PartStore.rels`'s cache, which
+/// only `replacePart` refreshes.
+pub fn nextFreeRelIdInXml(rels_xml: []const u8) u32 {
+    var max_seen: u32 = 0;
+    var pos: usize = 0;
+    const key = " Id=\"rId";
+    while (std.mem.indexOfPos(u8, rels_xml, pos, key)) |i| {
+        const val_start = i + key.len;
+        const val_end = std.mem.indexOfScalarPos(u8, rels_xml, val_start, '"') orelse break;
+        pos = val_end;
+        const n = std.fmt.parseInt(u32, rels_xml[val_start..val_end], 10) catch continue;
+        if (n > max_seen) max_seen = n;
+    }
+    return max_seen + 1;
+}
+
+/// Extract the value of `key` (spelled with its leading space and
+/// opening quote, e.g. ` Id="`) from one element's attribute region.
+fn attrValue(tag: []const u8, key: []const u8) ?[]const u8 {
+    const p = std.mem.indexOf(u8, tag, key) orelse return null;
+    const start = p + key.len;
+    const end = std.mem.indexOfScalarPos(u8, tag, start, '"') orelse return null;
+    return tag[start..end];
+}
+
+/// Find the `Target` of the `<Relationship>` whose `Id` equals
+/// `rel_id`, scanning raw rels-file bytes (see `nextFreeRelIdInXml`
+/// for why bytes rather than the store's parsed view). Returns a
+/// slice into `rels_xml`, or null when no such Id exists.
+pub fn findRelTarget(rels_xml: []const u8, rel_id: []const u8) ?[]const u8 {
+    assert(rel_id.len > 0);
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, rels_xml, pos, "<Relationship ")) |el| {
+        const el_end = std.mem.indexOfScalarPos(u8, rels_xml, el, '>') orelse return null;
+        pos = el_end;
+        const tag = rels_xml[el..el_end];
+        const id = attrValue(tag, " Id=\"") orelse continue;
+        if (!std.mem.eql(u8, id, rel_id)) continue;
+        return attrValue(tag, " Target=\"");
+    }
+    return null;
+}
+
+/// Extract the `r:id` of a worksheet's `<drawing>` element, or null
+/// when the sheet has none (or carries one without an `r:id`, which
+/// is schema-invalid and unresolvable either way). Returns a slice
+/// into `sheet_xml`.
+///
+/// The name test requires a space after `<drawing` so that
+/// `<drawingHF>` (header/footer images) and a bare `<drawing/>` never
+/// match — only an attribute-carrying worksheet drawing element does.
+pub fn extractDrawingRelId(sheet_xml: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, sheet_xml, pos, "<drawing")) |i| {
+        const after_idx = i + "<drawing".len;
+        if (after_idx >= sheet_xml.len) return null;
+        if (sheet_xml[after_idx] != ' ') {
+            pos = after_idx;
+            continue;
+        }
+        const el_end = std.mem.indexOfScalarPos(u8, sheet_xml, after_idx, '>') orelse return null;
+        return attrValue(sheet_xml[after_idx..el_end], " r:id=\"");
+    }
+    return null;
+}
+
+/// Walk every `cNvPr` element in a drawing part and return the lowest
+/// id above the highest one seen (>= 1). ECMA-376 requires `cNvPr`
+/// ids to be unique within their drawing part, and the id space is
+/// shared across shape kinds — pictures, charts' graphicFrames,
+/// shapes — so the scan matches the element name under any namespace
+/// prefix rather than picture anchors only.
+pub fn nextFreeCnvprId(drawing_xml: []const u8) u32 {
+    var max_seen: u32 = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, drawing_xml, pos, "cNvPr")) |i| {
+        pos = i + "cNvPr".len;
+        // Element-name boundary on both sides: `<cNvPr` (no prefix) or
+        // `:cNvPr` (prefixed) before, whitespace after (`id` is a
+        // required attribute, so a bare `<cNvPr>` names nothing). This
+        // is what keeps `cNvPicPr` / `cNvSpPr` from matching.
+        if (i == 0) continue;
+        const before = drawing_xml[i - 1];
+        if (before != '<' and before != ':') continue;
+        if (pos >= drawing_xml.len) break;
+        if (!std.ascii.isWhitespace(drawing_xml[pos])) continue;
+        const tag_end = std.mem.indexOfScalarPos(u8, drawing_xml, pos, '>') orelse break;
+        const id_str = attrValue(drawing_xml[pos..tag_end], " id=\"") orelse continue;
+        const n = std.fmt.parseInt(u32, id_str, 10) catch continue;
+        if (n > max_seen) max_seen = n;
+    }
+    return max_seen + 1;
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 test "validateMagic: PNG accepts canonical 8-byte signature" {
@@ -320,14 +880,392 @@ test "validateMagic: GIF accepts 'GIF' prefix" {
     try validateMagic(.gif, gif);
 }
 
+/// Assert `xml` contains the exact marker element these coordinates
+/// and offsets imply. Built by formatting rather than spelled as a
+/// literal so that a zero offset has no hard-coded spelling anywhere
+/// in this file — the whole point of the offsets work.
+fn expectMarker(
+    xml: []const u8,
+    tag: []const u8,
+    col0: u32,
+    col_off: u32,
+    row0: u32,
+    row_off: u32,
+) !void {
+    var buf: [256]u8 = undefined;
+    const want = try std.fmt.bufPrint(
+        &buf,
+        "<{s}><xdr:col>{d}</xdr:col><xdr:colOff>{d}</xdr:colOff>" ++
+            "<xdr:row>{d}</xdr:row><xdr:rowOff>{d}</xdr:rowOff></{s}>",
+        .{ tag, col0, col_off, row0, row_off, tag },
+    );
+    if (std.mem.indexOf(u8, xml, want) == null) {
+        std.debug.print("missing marker:\n  want: {s}\n  in:   {s}\n", .{ want, xml });
+        return error.MarkerNotFound;
+    }
+}
+
+/// A 1-inch square, the extent every pre-native-size caller got.
+const one_inch_square: ImageExtent = .{ .cx_emu = 914400, .cy_emu = 914400 };
+
 test "buildDrawingXml: anchors to (col-1, row-1) and emits oneCellAnchor" {
-    const xml = try buildDrawingXml(std.testing.allocator, .{ .col = 3, .row = 5 });
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 3, .row = 5 },
+        .ext = one_inch_square,
+    } });
     defer std.testing.allocator.free(xml);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:col>2</xdr:col>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:row>4</xdr:row>") != null);
+    try expectMarker(xml, "xdr:from", 2, 0, 4, 0);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:oneCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "</xdr:oneCellAnchor>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "r:embed=\"rId1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "cx=\"914400\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:ext cx=\"914400\" cy=\"914400\"/>") != null);
+    // The one-cell form carries no `<xdr:to>`.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:to>") == null);
+}
+
+test "buildDrawingXml: oneCellAnchor extent is whatever the caller passed" {
+    // Not a round inch: proves the value is plumbed, not defaulted.
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = 1_524_000, .cy_emu = 762_000 },
+    } });
+    defer std.testing.allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:ext cx=\"1524000\" cy=\"762000\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "914400") == null);
+}
+
+test "buildDrawingXml: oneCellAnchor carries its anchor's pixel offsets" {
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 3, .row = 5, .col_off_emu = 190_500, .row_off_emu = 95_250 },
+        .ext = one_inch_square,
+    } });
+    defer std.testing.allocator.free(xml);
+    // 20 px and 10 px at 96 DPI, on the grid corner (2, 4).
+    try expectMarker(xml, "xdr:from", 2, 190_500, 4, 95_250);
+}
+
+test "buildDrawingXml: twoCellAnchor emits from (col-1) and to (col) markers" {
+    // B2:D5 inclusive → from corner (1,1), to corner (4,5).
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
+        .from = .{ .col = 2, .row = 2 },
+        .to = .{ .col = 4, .row = 5 },
+    } });
+    defer std.testing.allocator.free(xml);
+
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:twoCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "</xdr:twoCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:oneCellAnchor>") == null);
+
+    try expectMarker(xml, "xdr:from", 1, 0, 1, 0);
+    try expectMarker(xml, "xdr:to", 4, 0, 5, 0);
+
+    // The range sizes the picture, so no fixed extent element.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:ext") == null);
+    // Wire order: from, to, pic — a `to` after `<xdr:pic>` is invalid.
+    const to_pos = std.mem.indexOf(u8, xml, "<xdr:to>").?;
+    const pic_pos = std.mem.indexOf(u8, xml, "<xdr:pic>").?;
+    try std.testing.expect(to_pos < pic_pos);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "r:embed=\"rId1\"") != null);
+}
+
+test "buildDrawingXml: twoCellAnchor offsets are per-endpoint, not shared" {
+    // Distinct values on all four fields: a marker that reused the
+    // wrong endpoint's offsets would still match a symmetric case.
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
+        .from = .{ .col = 2, .row = 2, .col_off_emu = 9_525, .row_off_emu = 19_050 },
+        .to = .{ .col = 4, .row = 5, .col_off_emu = 28_575, .row_off_emu = 38_100 },
+    } });
+    defer std.testing.allocator.free(xml);
+    try expectMarker(xml, "xdr:from", 1, 9_525, 1, 19_050);
+    try expectMarker(xml, "xdr:to", 4, 28_575, 5, 38_100);
+}
+
+test "buildDrawingXml: 1x1 twoCellAnchor range spans exactly its own cell" {
+    // A1:A1 → from corner (0,0), to corner (1,1): one cell of area.
+    const xml = try buildDrawingXml(std.testing.allocator, .{ .two_cell = .{
+        .from = .{ .col = 1, .row = 1 },
+        .to = .{ .col = 1, .row = 1 },
+    } });
+    defer std.testing.allocator.free(xml);
+    try expectMarker(xml, "xdr:to", 1, 0, 1, 0);
+}
+
+test "validateAnchor: rejects zero col/row on both anchor forms" {
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 0, .row = 1 },
+        .ext = one_inch_square,
+    } }));
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 0 },
+        .ext = one_inch_square,
+    } }));
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 0, .row = 1 },
+        .to = .{ .col = 2, .row = 2 },
+    } }));
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 1, .row = 1 },
+        .to = .{ .col = 2, .row = 0 },
+    } }));
+}
+
+test "validateAnchor: rejects inverted range, accepts degenerate and forward" {
+    try std.testing.expectError(Error.InvertedAnchorRange, validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 4, .row = 2 },
+        .to = .{ .col = 2, .row = 5 },
+    } }));
+    try std.testing.expectError(Error.InvertedAnchorRange, validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 2, .row = 9 },
+        .to = .{ .col = 4, .row = 5 },
+    } }));
+    // from == to is a legal 1×1 range, not an inversion.
+    try validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 3, .row = 3 },
+        .to = .{ .col = 3, .row = 3 },
+    } });
+    try validateAnchor(.{ .two_cell = .{
+        .from = .{ .col = 1, .row = 1 },
+        .to = .{ .col = 8, .row = 12 },
+    } });
+    try validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = one_inch_square,
+    } });
+}
+
+test "validateAnchor: rejects a zero or over-large one-cell extent" {
+    try std.testing.expectError(Error.InvalidExtent, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = 0, .cy_emu = 914400 },
+    } }));
+    try std.testing.expectError(Error.InvalidExtent, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = 914400, .cy_emu = 0 },
+    } }));
+    try std.testing.expectError(Error.InvalidExtent, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = st_positive_coordinate_max + 1, .cy_emu = 914400 },
+    } }));
+    try std.testing.expectError(Error.InvalidExtent, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = 914400, .cy_emu = st_positive_coordinate_max + 1 },
+    } }));
+    // Exactly at the cap is legal.
+    try validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = .{ .cx_emu = st_positive_coordinate_max, .cy_emu = st_positive_coordinate_max },
+    } });
+}
+
+test "validateAnchor: a zero-row anchor is rejected before its extent" {
+    // Both fields are bad; the anchor error is the more specific
+    // diagnosis, so it must win.
+    try std.testing.expectError(Error.InvalidAnchor, validateAnchor(.{ .one_cell = .{
+        .at = .{ .col = 0, .row = 0 },
+        .ext = .{ .cx_emu = 0, .cy_emu = 0 },
+    } }));
+}
+
+// ─── Native-size header reads ─────────────────────────────────────────
+
+/// Canonical 1×1 PNG — the smallest legal IHDR.
+const png_1x1 = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x3A, 0x7E, 0x9B,
+    0x55,
+};
+
+/// A PNG header claiming 640×480, to prove the axes are read
+/// big-endian and in the right order.
+const png_640x480 = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x01, 0xE0,
+    0x08, 0x06, 0x00, 0x00, 0x00,
+};
+
+test "pixelSize: PNG reads IHDR width and height big-endian" {
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 1, .height = 1 },
+        try pixelSize(.png, &png_1x1),
+    );
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 640, .height = 480 },
+        try pixelSize(.png, &png_640x480),
+    );
+}
+
+test "pixelSize: PNG truncated inside IHDR is undecodable" {
+    // Signature and chunk type present, axes cut short.
+    try std.testing.expectError(
+        Error.UndecodableImageHeader,
+        pixelSize(.png, png_640x480[0..20]),
+    );
+    // Signature only.
+    try std.testing.expectError(
+        Error.UndecodableImageHeader,
+        pixelSize(.png, png_640x480[0..8]),
+    );
+}
+
+test "pixelSize: PNG whose first chunk isn't IHDR is undecodable" {
+    var bad = png_640x480;
+    // "IHDR" → "iHDR": a valid-looking signature over a wrong chunk.
+    bad[12] = 'i';
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.png, &bad));
+}
+
+test "pixelSize: PNG with a zero or over-cap axis is undecodable" {
+    var zero_w = png_640x480;
+    zero_w[16] = 0;
+    zero_w[17] = 0;
+    zero_w[18] = 0;
+    zero_w[19] = 0;
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.png, &zero_w));
+
+    var huge_h = png_640x480;
+    // 0x80000000 = 2^31, one past the spec's cap.
+    huge_h[20] = 0x80;
+    huge_h[21] = 0x00;
+    huge_h[22] = 0x00;
+    huge_h[23] = 0x00;
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.png, &huge_h));
+}
+
+test "pixelSize: GIF reads the logical screen descriptor little-endian" {
+    // "GIF89a" then 640×480 as two LE u16s.
+    const gif = [_]u8{ 'G', 'I', 'F', '8', '9', 'a', 0x80, 0x02, 0xE0, 0x01, 0x00 };
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 640, .height = 480 },
+        try pixelSize(.gif, &gif),
+    );
+}
+
+test "pixelSize: GIF truncated before its descriptor is undecodable" {
+    const gif = [_]u8{ 'G', 'I', 'F', '8', '9', 'a', 0x80, 0x02 };
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.gif, &gif));
+}
+
+test "pixelSize: JPEG walks segments to SOF0 and reads height before width" {
+    const jpeg = [_]u8{
+        0xFF, 0xD8, // SOI
+        0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, // APP0, length 4 → 2 payload bytes
+        0xFF, 0xDB, 0x00, 0x03, 0x00, // DQT, length 3 → 1 payload byte
+        0xFF, 0xC0, 0x00, 0x0B, // SOF0, length 11
+        0x08, // precision
+        0x01, 0xE0, // height 480
+        0x02, 0x80, // width 640
+        0x01, 0x01,
+        0x11, 0x00,
+    };
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 640, .height = 480 },
+        try pixelSize(.jpeg, &jpeg),
+    );
+}
+
+test "pixelSize: JPEG skips DHT, whose marker sits inside the SOF range" {
+    // 0xC4 is DHT, not a frame header: reading its payload as a size
+    // would yield 0x0102 × 0x0304 instead of walking on to SOF2.
+    const jpeg = [_]u8{
+        0xFF, 0xD8,
+        0xFF, 0xC4, 0x00, 0x07, 0x00, 0x01, 0x02, 0x03, 0x04, // DHT
+        0xFF, 0xC2, 0x00, 0x0B, // SOF2 (progressive)
+        0x08,
+        0x00, 0x64, // height 100
+        0x00, 0xC8, // width 200
+        0x01, 0x01,
+        0x11, 0x00,
+    };
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 200, .height = 100 },
+        try pixelSize(.jpeg, &jpeg),
+    );
+}
+
+test "pixelSize: JPEG tolerates 0xFF fill bytes before a marker" {
+    const jpeg = [_]u8{
+        0xFF, 0xD8,
+        0xFF, 0xFF, 0xFF, 0xC0, 0x00, 0x0B, // two fill bytes, then SOF0
+        0x08,
+        0x00, 0x10, // height 16
+        0x00, 0x20, // width 32
+        0x01, 0x01,
+        0x11, 0x00,
+    };
+    try std.testing.expectEqual(
+        ImagePixelSize{ .width = 32, .height = 16 },
+        try pixelSize(.jpeg, &jpeg),
+    );
+}
+
+test "pixelSize: JPEG reaching scan data without a frame header is undecodable" {
+    const jpeg = [_]u8{
+        0xFF, 0xD8,
+        0xFF, 0xE0,
+        0x00, 0x04,
+        0x00, 0x00,
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, // SOS
+    };
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.jpeg, &jpeg));
+}
+
+test "pixelSize: JPEG with a segment length past the buffer is undecodable" {
+    // Claims a 200-byte segment inside a 10-byte file.
+    const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0xC8, 0x08, 0x00, 0x10, 0x00 };
+    try std.testing.expectError(Error.UndecodableImageHeader, pixelSize(.jpeg, &jpeg));
+}
+
+test "pixelSize: a mime/magic mismatch outranks an undecodable header" {
+    // Truncated JPEG bytes declared as PNG: the caller's first mistake
+    // is the declaration, so report that, not the failed parse.
+    const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF };
+    try std.testing.expectError(Error.MimeMagicMismatch, pixelSize(.png, &jpeg));
+    try std.testing.expectError(Error.EmptyImage, pixelSize(.png, &.{}));
+}
+
+test "nativeExtent: maps pixels to EMU at 96 DPI" {
+    // 96 px = 1 inch = 914 400 EMU.
+    const gif = [_]u8{ 'G', 'I', 'F', '8', '9', 'a', 0x60, 0x00, 0x30, 0x00, 0x00 };
+    const ext = try nativeExtent(.gif, &gif);
+    try std.testing.expectEqual(@as(u64, 914_400), ext.cx_emu);
+    try std.testing.expectEqual(@as(u64, 457_200), ext.cy_emu);
+
+    // A 1×1 PNG is one pixel, not one inch — the old fixed extent
+    // would have been 96× too large on each axis.
+    const tiny = try nativeExtent(.png, &png_1x1);
+    try std.testing.expectEqual(@as(u64, 9_525), tiny.cx_emu);
+    try std.testing.expectEqual(@as(u64, 9_525), tiny.cy_emu);
+}
+
+test "ImageCellAnchor.atPixelOffset: converts at 96 DPI without a cast" {
+    const a = ImageCellAnchor.atPixelOffset(3, 5, 4, 7);
+    try std.testing.expectEqual(@as(u32, 3), a.col);
+    try std.testing.expectEqual(@as(u32, 5), a.row);
+    try std.testing.expectEqual(@as(u32, 38_100), a.col_off_emu);
+    try std.testing.expectEqual(@as(u32, 66_675), a.row_off_emu);
+
+    // The widest pixel offset the helper accepts still fits `u32`,
+    // which is what makes the internal `@intCast` total.
+    const widest = ImageCellAnchor.atPixelOffset(1, 1, std.math.maxInt(u16), std.math.maxInt(u16));
+    try std.testing.expectEqual(@as(u32, 624_220_875), widest.col_off_emu);
+    try std.testing.expect(widest.col_off_emu < std.math.maxInt(u32));
+
+    // Default is a flush-to-the-cell-corner anchor.
+    const plain: ImageCellAnchor = .{ .col = 1, .row = 1 };
+    try std.testing.expectEqual(@as(u32, 0), plain.col_off_emu);
+    try std.testing.expectEqual(@as(u32, 0), plain.row_off_emu);
+}
+
+test "emuFromPixels: agrees with the inch constant and stays in range" {
+    try std.testing.expectEqual(@as(u64, 0), emuFromPixels(0));
+    try std.testing.expectEqual(@as(u64, 914_400), emuFromPixels(96));
+    // The bound the doc comment claims for decoded headers.
+    try std.testing.expect(emuFromPixels(pixel_axis_max) <= st_positive_coordinate_max);
+    // And the bound it warns about for raw u32 input.
+    try std.testing.expect(emuFromPixels(std.math.maxInt(u32)) > st_positive_coordinate_max);
 }
 
 test "buildDrawingRels: includes ../media/<basename> target" {
@@ -358,4 +1296,144 @@ test "appendRelationship: appends before </Relationships>" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../drawings/drawing1.xml\"") != null);
     // Original rel still present.
     try std.testing.expect(std.mem.indexOf(u8, out, "Id=\"rId1\"") != null);
+}
+
+// ─── Append-to-existing-drawing helpers ───────────────────────────────
+
+test "buildPicAnchorXml: plumbs the rel id and cNvPr id/name" {
+    const xml = try buildPicAnchorXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 2, .row = 3 },
+        .ext = one_inch_square,
+    } }, "rId7", 3);
+    defer std.testing.allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "r:embed=\"rId7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<xdr:cNvPr id=\"3\" name=\"Picture 3\"/>") != null);
+    // A fragment, not a document: no wsDr wrapper of its own.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "wsDr") == null);
+    try std.testing.expect(std.mem.startsWith(u8, xml, "<xdr:oneCellAnchor>"));
+    try std.testing.expect(std.mem.endsWith(u8, xml, "</xdr:oneCellAnchor>"));
+}
+
+test "appendAnchorToDrawing: splices before </xdr:wsDr>, keeping the first anchor" {
+    const fresh = try buildDrawingXml(std.testing.allocator, .{ .one_cell = .{
+        .at = .{ .col = 1, .row = 1 },
+        .ext = one_inch_square,
+    } });
+    defer std.testing.allocator.free(fresh);
+
+    const second = try buildPicAnchorXml(std.testing.allocator, .{ .two_cell = .{
+        .from = .{ .col = 2, .row = 2 },
+        .to = .{ .col = 4, .row = 5 },
+    } }, "rId2", 2);
+    defer std.testing.allocator.free(second);
+
+    const out = try appendAnchorToDrawing(std.testing.allocator, fresh, second);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "<xdr:oneCellAnchor>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<xdr:twoCellAnchor>") != null);
+    // The splice lands after the existing anchor, inside the wrapper.
+    const one_pos = std.mem.indexOf(u8, out, "</xdr:oneCellAnchor>").?;
+    const two_pos = std.mem.indexOf(u8, out, "<xdr:twoCellAnchor>").?;
+    const close_pos = std.mem.indexOf(u8, out, "</xdr:wsDr>").?;
+    try std.testing.expect(one_pos < two_pos);
+    try std.testing.expect(two_pos < close_pos);
+    try std.testing.expect(std.mem.endsWith(u8, out, "</xdr:wsDr>"));
+}
+
+test "appendAnchorToDrawing: refuses a part without a wsDr wrapper" {
+    const chart =
+        "<?xml version=\"1.0\"?>" ++
+        "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" ++
+        "</c:chartSpace>";
+    try std.testing.expectError(
+        error.UnsupportedDrawingPart,
+        appendAnchorToDrawing(std.testing.allocator, chart, "<xdr:oneCellAnchor/>"),
+    );
+}
+
+test "appendImageRelationship: appends an image rel before </Relationships>" {
+    const existing =
+        "<?xml version=\"1.0\"?>" ++
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/image1.png\"/>" ++
+        "</Relationships>";
+    const out = try appendImageRelationship(std.testing.allocator, existing, "image2.gif", "rId2");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Id=\"rId2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../media/image2.gif\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Target=\"../media/image1.png\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "</Relationships>"));
+
+    try std.testing.expectError(
+        error.MalformedDrawingRels,
+        appendImageRelationship(std.testing.allocator, "<Relationships>", "image2.gif", "rId2"),
+    );
+}
+
+test "nextFreeRelIdInXml: bumps past the highest rId, ignoring foreign ids" {
+    const rels =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"x\" Target=\"a\"/>" ++
+        "<Relationship Id=\"rId5\" Type=\"x\" Target=\"b\"/>" ++
+        "<Relationship Id=\"custom9\" Type=\"x\" Target=\"c\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqual(@as(u32, 6), nextFreeRelIdInXml(rels));
+    try std.testing.expectEqual(@as(u32, 1), nextFreeRelIdInXml("<Relationships></Relationships>"));
+}
+
+test "findRelTarget: matches the exact Id under any attribute order" {
+    const rels =
+        "<Relationships>" ++
+        "<Relationship Id=\"rId1\" Type=\"x\" Target=\"../drawings/drawing1.xml\"/>" ++
+        "<Relationship Target=\"../drawings/drawing10.xml\" Type=\"x\" Id=\"rId10\"/>" ++
+        "</Relationships>";
+    try std.testing.expectEqualStrings(
+        "../drawings/drawing1.xml",
+        findRelTarget(rels, "rId1").?,
+    );
+    // Exact match: "rId1" must not resolve through "rId10"'s entry.
+    try std.testing.expectEqualStrings(
+        "../drawings/drawing10.xml",
+        findRelTarget(rels, "rId10").?,
+    );
+    try std.testing.expect(findRelTarget(rels, "rId2") == null);
+}
+
+test "extractDrawingRelId: pulls the r:id and skips non-drawing lookalikes" {
+    const sheet =
+        "<worksheet><sheetData/>" ++
+        "<drawing r:id=\"rId3\"/>" ++
+        "</worksheet>";
+    try std.testing.expectEqualStrings("rId3", extractDrawingRelId(sheet).?);
+
+    // No drawing element at all.
+    try std.testing.expect(extractDrawingRelId("<worksheet><sheetData/></worksheet>") == null);
+    // Header/footer images use <drawingHF>, a different element.
+    try std.testing.expect(extractDrawingRelId("<worksheet><drawingHF r:id=\"rId2\"/></worksheet>") == null);
+    // A bare <drawing> without attributes carries no r:id to chase.
+    try std.testing.expect(extractDrawingRelId("<worksheet><drawing/></worksheet>") == null);
+}
+
+test "nextFreeCnvprId: shares the id space across shape kinds" {
+    // A picture anchor (id 1) plus a chart graphicFrame (id 7): the
+    // next picture must clear BOTH, and the cNvPicPr decoy must not
+    // parse as a cNvPr.
+    const drawing =
+        "<xdr:wsDr>" ++
+        "<xdr:oneCellAnchor><xdr:pic><xdr:nvPicPr>" ++
+        "<xdr:cNvPr id=\"1\" name=\"Picture 1\"/><xdr:cNvPicPr/>" ++
+        "</xdr:nvPicPr></xdr:pic></xdr:oneCellAnchor>" ++
+        "<xdr:twoCellAnchor><xdr:graphicFrame><xdr:nvGraphicFramePr>" ++
+        "<xdr:cNvPr id=\"7\" name=\"Chart 1\"/>" ++
+        "</xdr:nvGraphicFramePr></xdr:graphicFrame></xdr:twoCellAnchor>" ++
+        "</xdr:wsDr>";
+    try std.testing.expectEqual(@as(u32, 8), nextFreeCnvprId(drawing));
+
+    // An empty wsDr starts at 1.
+    try std.testing.expectEqual(@as(u32, 1), nextFreeCnvprId("<xdr:wsDr></xdr:wsDr>"));
+    // Attribute order: name before id still parses.
+    try std.testing.expectEqual(@as(u32, 3), nextFreeCnvprId(
+        "<xdr:wsDr><xdr:cNvPr name=\"Picture 2\" id=\"2\"/></xdr:wsDr>",
+    ));
 }
