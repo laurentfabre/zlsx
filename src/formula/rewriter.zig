@@ -14,17 +14,28 @@
 //!   - Bare A1 ranges:                       A1:B5, $A$1:$B$5
 //!   - Sheet-qualified refs:                 Sheet1!A1, 'My Sheet'!A1:B5
 //!   - Apostrophe-escaped quoted sheets:    'It''s'!A1
+//!   - 3D spans, row/col shifts only:       Sheet1:Sheet3!A1, 'Jan:Mar'!A1
+//!   - Full-column / full-row spans:        A:A, $A:$XFD, 1:5, $1:$1
+//!     (bare, sheet-qualified, and 3D-span spellings). A `name:name`
+//!     pair counts as a full-column span whenever BOTH halves spell an
+//!     in-grid column: Excel gives the reference interpretation
+//!     precedence over defined names in that position (the 2007 grid
+//!     expansion force-renamed names the new columns shadowed), so no
+//!     name-registry lookup is needed to disambiguate `Start:End`.
 //!   - Insert/delete rows/cols, sheet rename
 //!
 //! Out of scope (deferred):
-//!   - R1C1, structured table refs, 3D refs, dynamic-array `#`/`@`,
+//!   - R1C1, structured table refs, dynamic-array `#`/`@`,
 //!     external-workbook brackets. Since M1a the tokenizer gives each
 //!     of these its own kind rather than lumping them into
 //!     `.unknown`; `isOpaqueQualifier` is where the rewriter names the
 //!     ones it must not follow.
-//!   - Full-column / full-row refs (`A:A`, `1:5`). The tokenizer
-//!     reports these as `name op_range name` / `number op_range
-//!     number`; this iter does not yet reshape them.
+//!   - Rename/delete of a 3D span ENDPOINT. Contracting
+//!     `Sheet1:Sheet3` when a member sheet is deleted — or deciding
+//!     whether a renamed sheet sits inside the span — requires the
+//!     workbook's sheet ORDER, which lives in workbook.xml and is
+//!     deliberately invisible to this layer. Those edits keep the
+//!     pre-3D behavior (single-qualifier path only).
 
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
@@ -257,6 +268,85 @@ inline fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+// ─── full-column / full-row spans ────────────────────────────────
+
+const AxisKind = enum { cols, rows };
+
+/// One bound of a full-column / full-row span: `$A` → { abs, 1 },
+/// `5` → { !abs, 5 }. `n` is 1-based and in-grid for its axis.
+const AxisBound = struct {
+    abs: bool,
+    n: u32,
+};
+
+/// A whole-axis span occupying three tokens: bound, op_range, bound.
+/// `first`/`second` keep the WRITTEN order (`C:A` stays reversed);
+/// arithmetic normalises internally and writes back positionally.
+const AxisRange = struct {
+    kind: AxisKind,
+    first: AxisBound,
+    second: AxisBound,
+};
+
+/// Parse one full-column bound: optional `$`, then 1..3 column
+/// letters mapping into the grid. Null for anything else.
+fn parseColSpec(s: []const u8) ?AxisBound {
+    if (s.len == 0) return null;
+    var i: usize = 0;
+    var abs = false;
+    if (s[0] == '$') {
+        abs = true;
+        i = 1;
+    }
+    if (i == s.len) return null;
+    for (s[i..]) |c| {
+        if (!isAsciiAlpha(c)) return null;
+    }
+    const col = colLettersToNum(s[i..]) orelse return null;
+    if (col == 0 or col > MAX_COLS) return null;
+    return .{ .abs = abs, .n = col };
+}
+
+/// Parse one full-row bound: optional `$`, then digits only (so
+/// `1.5` and `1e5` — legal number lexemes — are rejected), value
+/// inside the grid. Null for anything else.
+fn parseRowSpec(s: []const u8) ?AxisBound {
+    if (s.len == 0) return null;
+    var i: usize = 0;
+    var abs = false;
+    if (s[0] == '$') {
+        abs = true;
+        i = 1;
+    }
+    if (i == s.len) return null;
+    for (s[i..]) |c| {
+        if (!isDigit(c)) return null;
+    }
+    const row = std.fmt.parseInt(u32, s[i..], 10) catch return null;
+    if (row == 0 or row > MAX_ROWS) return null;
+    return .{ .abs = abs, .n = row };
+}
+
+fn formatAxisBound(allocator: std.mem.Allocator, kind: AxisKind, bound: AxisBound) Error![]u8 {
+    const cap: u32 = switch (kind) {
+        .cols => MAX_COLS,
+        .rows => MAX_ROWS,
+    };
+    assert(bound.n >= 1 and bound.n <= cap);
+
+    var buf: [9]u8 = undefined; // worst case: $1048576 = 8 bytes
+    var len: usize = 0;
+    if (bound.abs) {
+        buf[len] = '$';
+        len += 1;
+    }
+    switch (kind) {
+        .cols => len += writeColLetters(buf[len..], bound.n),
+        .rows => len += std.fmt.printInt(buf[len..], bound.n, 10, .lower, .{}),
+    }
+    return allocator.dupe(u8, buf[0..len]);
+}
+
 // ─── shift application ───────────────────────────────────────────
 
 const ShiftOutcome = union(enum) {
@@ -330,6 +420,93 @@ fn applyShift(ref: Ref, edit: RewriteEdit) ShiftOutcome {
         // unchanged here; the caller has already collapsed the
         // qualified ref to #REF! before applyShift runs.
         .delete_sheet => return .unchanged,
+    }
+}
+
+const AxisOutcome = union(enum) {
+    unchanged,
+    shifted: AxisRange,
+    deleted,
+};
+
+/// Shift a full-column / full-row span. Edits on the perpendicular
+/// axis never touch it (deleting rows cannot reshape `A:A`).
+///
+/// Deletion uses INTERVAL semantics — the span shrinks around the
+/// deleted block and collapses to #REF! only when every spanned
+/// column/row is gone — unlike the cell-range path's per-endpoint
+/// policy (`A4:A5` → `A4:#REF!`): `A:#REF!` is not a printable
+/// reference, so a partially deleted span must stay a span.
+fn applyAxisShift(axis: AxisRange, edit: RewriteEdit) AxisOutcome {
+    const relevant = switch (edit) {
+        .insert_rows, .delete_rows => axis.kind == .rows,
+        .insert_cols, .delete_cols => axis.kind == .cols,
+        .rename_sheet, .delete_sheet => false,
+    };
+    if (!relevant) return .unchanged;
+
+    const cap: u32 = switch (axis.kind) {
+        .cols => MAX_COLS,
+        .rows => MAX_ROWS,
+    };
+    assert(axis.first.n >= 1 and axis.first.n <= cap);
+    assert(axis.second.n >= 1 and axis.second.n <= cap);
+
+    switch (edit) {
+        .insert_rows, .insert_cols => |spec| {
+            assert(spec.at >= 1);
+            if (spec.count == 0) return .unchanged;
+            // Per-bound, mirroring the cell path: a bound the insert
+            // would push off-grid keeps its position (`A:XFD` stays
+            // `A:XFD`; `C:XFD` still becomes `D:XFD`).
+            var out = axis;
+            var changed = false;
+            for ([_]*AxisBound{ &out.first, &out.second }) |bound| {
+                if (bound.n < spec.at) continue;
+                const shifted = std.math.add(u32, bound.n, spec.count) catch continue;
+                if (shifted > cap) continue;
+                bound.n = shifted;
+                changed = true;
+            }
+            if (!changed) return .unchanged;
+            return .{ .shifted = out };
+        },
+        .delete_rows, .delete_cols => |spec| {
+            assert(spec.at >= 1);
+            if (spec.count == 0) return .unchanged;
+            const lo = @min(axis.first.n, axis.second.n);
+            const hi = @max(axis.first.n, axis.second.n);
+            // Deleted zone is [at, zone_end); saturate so a huge
+            // count reads as "to the end of the grid".
+            const zone_end = std.math.add(u32, spec.at, spec.count) catch std.math.maxInt(u32);
+            if (spec.at > hi) return .unchanged;
+            if (zone_end <= lo) {
+                // Zone entirely before the span: both bounds slide.
+                var out = axis;
+                out.first.n -= spec.count;
+                out.second.n -= spec.count;
+                assert(out.first.n >= 1 and out.second.n >= 1);
+                return .{ .shifted = out };
+            }
+            if (spec.at <= lo and zone_end > hi) return .deleted;
+            // Partial overlap: the surviving interval, in post-delete
+            // positions. A bound inside the zone snaps to the zone's
+            // edge; a bound past it slides down.
+            const new_lo = if (lo < spec.at) lo else spec.at;
+            const new_hi = if (hi >= zone_end) hi - spec.count else spec.at - 1;
+            assert(new_lo >= 1 and new_lo <= new_hi);
+            var out = axis;
+            if (axis.first.n <= axis.second.n) {
+                out.first.n = new_lo;
+                out.second.n = new_hi;
+            } else {
+                out.first.n = new_hi;
+                out.second.n = new_lo;
+            }
+            return .{ .shifted = out };
+        },
+        // Filtered out by `relevant` above.
+        .rename_sheet, .delete_sheet => unreachable,
     }
 }
 
@@ -410,6 +587,15 @@ fn applyEdit(
 ) Error!void {
     assert(work.len >= 0);
 
+    // 3D spans participate in row/col shifts only. Rename/delete of
+    // a span endpoint needs the workbook's sheet order (see module
+    // header), so those edits skip the 3D matcher and fall through
+    // to the single-qualifier path unchanged.
+    const edit_shifts = switch (ctx.edit) {
+        .insert_rows, .delete_rows, .insert_cols, .delete_cols => true,
+        .rename_sheet, .delete_sheet => false,
+    };
+
     var i: usize = 0;
     while (i < work.len) {
         // An external-workbook prefix disqualifies everything it
@@ -421,6 +607,18 @@ fn applyEdit(
         if (work[i].kind == .external_ref) {
             i = endOfExternalReference(work, i);
             continue;
+        }
+
+        // Detect 3D span: (sheet_name | name) : (sheet_name | name)
+        // bang cell_ref [: cell_ref]. Must run before the single-
+        // sheet matcher, which would otherwise claim the second
+        // endpoint (`Sheet3!A1`) and shift under the wrong scoping.
+        if (edit_shifts) {
+            if (matchThreeDQualifier(work, i)) |info| {
+                try rewriteThreeD(allocator, work, owned, ctx, info);
+                i = info.end;
+                continue;
+            }
         }
 
         // Detect sheet qualifier: (sheet_name | name) bang cell_ref [: cell_ref]
@@ -447,6 +645,24 @@ fn applyEdit(
             continue;
         }
 
+        // Bare full-column / full-row span (`A:A`, `1:5`) starting at
+        // this token. Same opaque-qualifier guard as cell refs: a
+        // span after `[..]!` or an unclassifiable `!` belongs to a
+        // sheet the rewriter cannot reason about.
+        if (work[i].kind == .name or work[i].kind == .number) {
+            if (i >= 2 and work[i - 1].kind == .bang and isOpaqueQualifier(work[i - 2].kind)) {
+                i += 1;
+                continue;
+            }
+            if (matchAxisRange(work, i)) |axis| {
+                if (bareEditApplies(ctx)) {
+                    try applyAxisRange(allocator, work, owned, ctx.edit, i, axis);
+                }
+                i += 3;
+                continue;
+            }
+        }
+
         i += 1;
     }
 }
@@ -464,18 +680,35 @@ fn isOpaqueQualifier(kind: Token.Kind) bool {
 }
 
 /// Index just past everything an `.external_ref` at `start` qualifies:
-/// `[1]Sheet1!A1:B2`, `[1]!Name`, `'[B.xlsx]S'!A1`. Each element is
-/// optional, so a bare `[1]` consumes only itself.
+/// `[1]Sheet1!A1:B2`, `[1]Sheet1:Sheet3!A1`, `[1]!Name`,
+/// `'[B.xlsx]S'!A1`. Each element is optional, so a bare `[1]`
+/// consumes only itself.
 fn endOfExternalReference(work: []const Token, start: usize) usize {
     assert(work[start].kind == .external_ref);
     var i = start + 1;
-    if (i < work.len and (work[i].kind == .name or work[i].kind == .sheet_name)) i += 1;
+    if (i < work.len and (work[i].kind == .name or work[i].kind == .sheet_name)) {
+        i += 1;
+        // External 3D span: consume the second endpoint only when a
+        // bang follows, so a genuine range operator after `[1]Name`
+        // is left for the ordinary walk.
+        if (i + 2 < work.len and work[i].kind == .op_range and
+            (work[i + 1].kind == .name or work[i + 1].kind == .sheet_name) and
+            work[i + 2].kind == .bang)
+        {
+            i += 2;
+        }
+    }
     if (i < work.len and work[i].kind == .bang) i += 1;
     if (i < work.len and work[i].kind == .cell_ref) {
         i += 1;
         if (i + 1 < work.len and work[i].kind == .op_range and work[i + 1].kind == .cell_ref) {
             i += 2;
         }
+    } else if (matchAxisRange(work, i)) |_| {
+        // `[1]Sheet1!A:A` / `[1]Sheet1!1:5` — a whole-axis span
+        // inside a workbook we cannot see. Without this arm the walk
+        // resumes on the span and the axis matcher rewrites it.
+        i += 3;
     } else if (i < work.len and work[i].kind == .name) {
         // `[1]!DefinedName`
         i += 1;
@@ -486,10 +719,13 @@ fn endOfExternalReference(work: []const Token, start: usize) usize {
 const SheetQualifierInfo = struct {
     sheet_idx: usize, // index of the sheet token (.sheet_name or .name)
     bang_idx: usize, // index of the `!`
-    ref_start: usize, // index of the first cell_ref
-    ref_end: usize, // exclusive — i.e. ref_start+1 (single) or ref_start+3 (range)
+    ref_start: usize, // index of the first cell_ref (or axis bound)
+    ref_end: usize, // exclusive — i.e. ref_start+1 (single) or ref_start+3 (range/axis)
     end: usize, // index just past the whole pattern (== ref_end)
     is_range: bool,
+    /// Non-null when the ref part is a full-column / full-row span
+    /// (`Sheet1!A:A`, `'My Sheet'!1:5`) rather than cell refs.
+    axis: ?AxisRange = null,
 };
 
 fn matchSheetQualifier(work: []const Token, i: usize) ?SheetQualifierInfo {
@@ -497,7 +733,19 @@ fn matchSheetQualifier(work: []const Token, i: usize) ?SheetQualifierInfo {
     const sheet_kind = work[i].kind;
     if (sheet_kind != .sheet_name and sheet_kind != .name) return null;
     if (work[i + 1].kind != .bang) return null;
-    if (work[i + 2].kind != .cell_ref) return null;
+    if (work[i + 2].kind != .cell_ref) {
+        // Whole-axis tail: `Sheet1!A:A`, `Sheet1!$1:$5`.
+        const axis = matchAxisRange(work, i + 2) orelse return null;
+        return .{
+            .sheet_idx = i,
+            .bang_idx = i + 1,
+            .ref_start = i + 2,
+            .ref_end = i + 5,
+            .end = i + 5,
+            .is_range = true,
+            .axis = axis,
+        };
+    }
     var end: usize = i + 3;
     var is_range = false;
     if (i + 4 < work.len and work[i + 3].kind == .op_range and work[i + 4].kind == .cell_ref) {
@@ -521,6 +769,152 @@ fn isRangeAt(work: []const Token, i: usize) bool {
         work[i + 2].kind == .cell_ref;
 }
 
+/// Match a full-column (`A:A`, `$A:$XFD`) or full-row (`1:5`,
+/// `$1:$1`) span at `i`. Column bounds arrive as `.name` tokens; row
+/// bounds as `.number` (bare) or `.name` (`$`-prefixed — the
+/// tokenizer folds the marker into an identifier lexeme). Both
+/// halves must parse on the SAME axis; a half that spells anything
+/// else (a defined name, an off-grid column, a non-integer number)
+/// rejects the whole pattern and the tokens pass through untouched.
+fn matchAxisRange(work: []const Token, i: usize) ?AxisRange {
+    if (i + 2 >= work.len) return null;
+    if (work[i + 1].kind != .op_range) return null;
+    // A trailing bang means the pair is a 3D span qualifier
+    // (`AB:CD!A1`), never a whole-axis reference.
+    if (i + 3 < work.len and work[i + 3].kind == .bang) return null;
+    const a = work[i];
+    const b = work[i + 2];
+    if (a.kind == .name and b.kind == .name) {
+        if (parseColSpec(a.text)) |first| {
+            if (parseColSpec(b.text)) |second| {
+                return .{ .kind = .cols, .first = first, .second = second };
+            }
+        }
+    }
+    const a_rowish = a.kind == .number or a.kind == .name;
+    const b_rowish = b.kind == .number or b.kind == .name;
+    if (a_rowish and b_rowish) {
+        if (parseRowSpec(a.text)) |first| {
+            if (parseRowSpec(b.text)) |second| {
+                return .{ .kind = .rows, .first = first, .second = second };
+            }
+        }
+    }
+    return null;
+}
+
+const ThreeDQualifierInfo = struct {
+    first_idx: usize, // index of the first endpoint (.sheet_name or .name)
+    second_idx: usize, // index of the second endpoint
+    ref_start: usize, // index of the first cell_ref (or axis bound)
+    is_range: bool,
+    end: usize, // index just past the whole pattern
+    /// Non-null when the ref part is a full-column / full-row span
+    /// (`Sheet1:Sheet3!A:A`) rather than cell refs.
+    axis: ?AxisRange = null,
+};
+
+/// Match a 3D span qualifier: (sheet_name | name) op_range
+/// (sheet_name | name) bang cell_ref [op_range cell_ref]. The bang
+/// disambiguates from a defined-name range (`Start:End` inside SUM)
+/// and from full-column refs (`A:A`), neither of which is followed
+/// by `!`.
+fn matchThreeDQualifier(work: []const Token, i: usize) ?ThreeDQualifierInfo {
+    if (i + 4 >= work.len) return null; // need sheet, :, sheet, !, ref
+    if (work[i].kind != .sheet_name and work[i].kind != .name) return null;
+    if (work[i + 1].kind != .op_range) return null;
+    if (work[i + 2].kind != .sheet_name and work[i + 2].kind != .name) return null;
+    if (work[i + 3].kind != .bang) return null;
+    if (work[i + 4].kind != .cell_ref) {
+        // Whole-axis tail: `Sheet1:Sheet3!A:A`, `Sheet1:Sheet3!1:5`.
+        const axis = matchAxisRange(work, i + 4) orelse return null;
+        return .{
+            .first_idx = i,
+            .second_idx = i + 2,
+            .ref_start = i + 4,
+            .is_range = true,
+            .end = i + 7,
+            .axis = axis,
+        };
+    }
+    var end: usize = i + 5;
+    var is_range = false;
+    if (i + 6 < work.len and work[i + 5].kind == .op_range and work[i + 6].kind == .cell_ref) {
+        end = i + 7;
+        is_range = true;
+    }
+    return .{
+        .first_idx = i,
+        .second_idx = i + 2,
+        .ref_start = i + 4,
+        .is_range = is_range,
+        .end = end,
+    };
+}
+
+/// Decode a sheet-qualifier token to its plain-text name: unquote
+/// and unescape `.sheet_name`, dupe `.name` verbatim. Caller frees.
+fn decodeSheetToken(allocator: std.mem.Allocator, tok: Token) Error![]u8 {
+    if (tok.kind == .sheet_name) return decodeQuotedSheet(allocator, tok.text);
+    return allocator.dupe(u8, tok.text);
+}
+
+/// Row/col target matching for a decoded sheet qualifier. A colon is
+/// illegal in Excel sheet names, so a decoded qualifier containing
+/// exactly one colon with text on both sides can only be the quoted
+/// 3D span spelling (`'Jan:Mar'!A1`); the target then matches either
+/// endpoint. Mid-span membership (Feb in Jan:Mar) needs the
+/// workbook's sheet order, which this layer cannot see — a mid-span
+/// target does not match and the ref stays put.
+fn sheetTargetMatches(decoded: []const u8, target: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse
+        return std.mem.eql(u8, decoded, target);
+    const first = decoded[0..colon];
+    const second = decoded[colon + 1 ..];
+    const is_span = first.len >= 1 and second.len >= 1 and
+        std.mem.indexOfScalar(u8, second, ':') == null;
+    if (!is_span) return std.mem.eql(u8, decoded, target);
+    return std.mem.eql(u8, first, target) or std.mem.eql(u8, second, target);
+}
+
+/// Apply a row/col shift to a 3D span's cell refs. The endpoints
+/// themselves are never mutated here — only the trailing A1 part
+/// shifts, with the same semantics as a single-sheet qualified ref.
+fn rewriteThreeD(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    ctx: RewriteContext,
+    info: ThreeDQualifierInfo,
+) Error!void {
+    switch (ctx.edit) {
+        .insert_rows, .delete_rows, .insert_cols, .delete_cols => {},
+        // applyEdit gates on edit_shifts before matching this pattern.
+        .rename_sheet, .delete_sheet => unreachable,
+    }
+
+    const target_match = blk: {
+        const t = ctx.target_sheet orelse break :blk true;
+        const first = try decodeSheetToken(allocator, work[info.first_idx]);
+        defer allocator.free(first);
+        const second = try decodeSheetToken(allocator, work[info.second_idx]);
+        defer allocator.free(second);
+        // A named target matches when it is one of the span's two
+        // endpoints. A mid-span sheet also contains the edit, but
+        // deciding membership needs the workbook's sheet order;
+        // without it the ref is left unchanged — conservative,
+        // never corrupting.
+        break :blk std.mem.eql(u8, first, t) or std.mem.eql(u8, second, t);
+    };
+    if (!target_match) return;
+
+    if (info.axis) |axis| {
+        try applyAxisRange(allocator, work, owned, ctx.edit, info.ref_start, axis);
+    } else {
+        try applyToRefRange(allocator, work, owned, ctx.edit, info.ref_start, info.is_range);
+    }
+}
+
 fn rewriteSheetQualified(
     allocator: std.mem.Allocator,
     work: []Token,
@@ -532,13 +926,7 @@ fn rewriteSheetQualified(
     assert(info.bang_idx == info.sheet_idx + 1);
 
     // Decode sheet name to plain text.
-    const decoded: []u8 = blk: {
-        const tok = work[info.sheet_idx];
-        if (tok.kind == .sheet_name) {
-            break :blk try decodeQuotedSheet(allocator, tok.text);
-        }
-        break :blk try allocator.dupe(u8, tok.text);
-    };
+    const decoded = try decodeSheetToken(allocator, work[info.sheet_idx]);
     defer allocator.free(decoded);
 
     // Sheet rename.
@@ -594,24 +982,50 @@ fn rewriteSheetQualified(
 
     // Row/col edits apply only when the sheet matches the edit's
     // target_sheet. `target_sheet == null` means "apply everywhere."
+    // `sheetTargetMatches` also covers the quoted 3D span spelling
+    // ('Jan:Mar'!A1 arrives here as ONE .sheet_name token): the
+    // target then matches either endpoint of the span.
     const target_match = blk: {
         switch (ctx.edit) {
             .rename_sheet, .delete_sheet => break :blk false, // already handled
             else => {},
         }
-        if (ctx.target_sheet) |t| break :blk std.mem.eql(u8, current_sheet, t);
+        if (ctx.target_sheet) |t| break :blk sheetTargetMatches(current_sheet, t);
         break :blk true;
     };
     if (!target_match) return;
 
-    try applyToRefRange(
-        allocator,
-        work,
-        owned,
-        ctx.edit,
-        info.ref_start,
-        info.is_range,
-    );
+    if (info.axis) |axis| {
+        try applyAxisRange(allocator, work, owned, ctx.edit, info.ref_start, axis);
+    } else {
+        try applyToRefRange(
+            allocator,
+            work,
+            owned,
+            ctx.edit,
+            info.ref_start,
+            info.is_range,
+        );
+    }
+}
+
+/// Scoping rule shared by every BARE reference (cell or whole-axis):
+/// bare refs are scoped to `on_sheet`, so the edit applies only when
+/// `target_sheet` matches it (or either side is null = "everywhere").
+fn bareEditApplies(ctx: RewriteContext) bool {
+    switch (ctx.edit) {
+        .rename_sheet => return false, // bare refs have no sheet to rename
+        // delete_sheet only collapses qualified refs. Bare refs
+        // are scoped to the formula's owning sheet, which is
+        // necessarily a sheet that's NOT being deleted (the
+        // deleted sheet's own formulas are dropped wholesale by
+        // Workbook.deleteSheet, not rewritten).
+        .delete_sheet => return false,
+        else => {},
+    }
+    if (ctx.target_sheet == null) return true;
+    if (ctx.on_sheet == null) return true; // permissive default
+    return std.mem.eql(u8, ctx.on_sheet.?, ctx.target_sheet.?);
 }
 
 fn rewriteBareRefOrRange(
@@ -625,24 +1039,7 @@ fn rewriteBareRefOrRange(
     assert(start < end);
     assert(end <= work.len);
 
-    // Bare refs are scoped to `on_sheet`. Apply the edit only when
-    // `target_sheet` matches `on_sheet` (or is null = "everywhere").
-    const target_match = blk: {
-        switch (ctx.edit) {
-            .rename_sheet => break :blk false, // bare refs have no sheet to rename
-            // delete_sheet only collapses qualified refs. Bare refs
-            // are scoped to the formula's owning sheet, which is
-            // necessarily a sheet that's NOT being deleted (the
-            // deleted sheet's own formulas are dropped wholesale by
-            // Workbook.deleteSheet, not rewritten).
-            .delete_sheet => break :blk false,
-            else => {},
-        }
-        if (ctx.target_sheet == null) break :blk true;
-        if (ctx.on_sheet == null) break :blk true; // permissive default
-        break :blk std.mem.eql(u8, ctx.on_sheet.?, ctx.target_sheet.?);
-    };
-    if (!target_match) return;
+    if (!bareEditApplies(ctx)) return;
 
     const is_range = (end - start == 3);
     try applyToRefRange(allocator, work, owned, ctx.edit, start, is_range);
@@ -721,6 +1118,49 @@ fn applyToRefRange(
         },
         .deleted => {
             work[ref_start + 2] = .{ .kind = .error_lit, .text = "#REF!" };
+        },
+    }
+}
+
+/// Apply a row/col edit to a full-column / full-row span occupying
+/// tokens [ref_start, ref_start+3). A bound that kept its position
+/// keeps its borrowed lexeme (case and spelling preserved); a moved
+/// bound re-emits canonically with its `$` marker intact. Full
+/// deletion collapses the three tokens to one `#REF!`, mirroring
+/// the cell-range collapse shape.
+fn applyAxisRange(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    edit: RewriteEdit,
+    ref_start: usize,
+    axis: AxisRange,
+) Error!void {
+    assert(ref_start + 2 < work.len);
+    assert(work[ref_start + 1].kind == .op_range);
+
+    switch (applyAxisShift(axis, edit)) {
+        .unchanged => {},
+        .shifted => |new_axis| {
+            if (new_axis.first.n != axis.first.n) {
+                work[ref_start].text = try registerOwned(
+                    allocator,
+                    owned,
+                    try formatAxisBound(allocator, axis.kind, new_axis.first),
+                );
+            }
+            if (new_axis.second.n != axis.second.n) {
+                work[ref_start + 2].text = try registerOwned(
+                    allocator,
+                    owned,
+                    try formatAxisBound(allocator, axis.kind, new_axis.second),
+                );
+            }
+        },
+        .deleted => {
+            work[ref_start] = .{ .kind = .error_lit, .text = "#REF!" };
+            work[ref_start + 1] = .{ .kind = .unknown, .text = "" };
+            work[ref_start + 2] = .{ .kind = .unknown, .text = "" };
         },
     }
 }
@@ -967,6 +1407,446 @@ test "sheet-qualified ranges shift both endpoints" {
     );
 }
 
+test "rewrite: 3D refs shift on row edits" {
+    try expectRewrite(
+        "SUM(Sheet1:Sheet3!A5)",
+        .{ .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } } },
+        "SUM(Sheet1:Sheet3!A6)",
+    );
+    // Range: both endpoints of the cell part shift.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1:B10",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "Sheet1:Sheet3!A2:B11",
+    );
+    // Deleted-territory collapse mirrors the single-sheet behavior:
+    // the span survives, the cell part becomes #REF!.
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{ .edit = .{ .delete_rows = .{ .at = 5, .count = 2 } } },
+        "Sheet1:Sheet3!#REF!",
+    );
+    try expectRewrite(
+        "Sheet1:Sheet3!A5:A6",
+        .{ .edit = .{ .delete_rows = .{ .at = 5, .count = 2 } } },
+        "Sheet1:Sheet3!#REF!",
+    );
+    // Post-range refs shift back.
+    try expectRewrite(
+        "Sheet1:Sheet3!A10",
+        .{ .edit = .{ .delete_rows = .{ .at = 5, .count = 2 } } },
+        "Sheet1:Sheet3!A8",
+    );
+}
+
+test "rewrite: 3D refs shift on column edits" {
+    try expectRewrite(
+        "Sheet1:Sheet3!C1",
+        .{ .edit = .{ .insert_cols = .{ .at = 2, .count = 1 } } },
+        "Sheet1:Sheet3!D1",
+    );
+    try expectRewrite(
+        "Sheet1:Sheet3!$B$5",
+        .{ .edit = .{ .delete_cols = .{ .at = 2, .count = 2 } } },
+        "Sheet1:Sheet3!#REF!",
+    );
+    // Absolute markers survive the shift.
+    try expectRewrite(
+        "Sheet1:Sheet3!$C$5:$D$6",
+        .{ .edit = .{ .insert_cols = .{ .at = 2, .count = 1 } } },
+        "Sheet1:Sheet3!$D$5:$E$6",
+    );
+}
+
+test "rewrite: 3D quoted span spellings" {
+    // Excel's canonical quoted form wraps the WHOLE span in one
+    // quote pair — it arrives as a single .sheet_name token.
+    try expectRewrite(
+        "SUM('Jan Sales:Mar Sales'!A5)",
+        .{ .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } } },
+        "SUM('Jan Sales:Mar Sales'!A6)",
+    );
+    // Per-endpoint quoting and the mixed spelling tokenize as
+    // separate endpoint tokens; both shift the same way.
+    try expectRewrite(
+        "'Jan Sales':'Mar Sales'!A5",
+        .{ .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } } },
+        "'Jan Sales':'Mar Sales'!A6",
+    );
+    try expectRewrite(
+        "'Jan Sales':Mar!A5:B6",
+        .{ .edit = .{ .delete_rows = .{ .at = 5, .count = 2 } } },
+        "'Jan Sales':Mar!#REF!",
+    );
+    // Apostrophe-escaped endpoint names decode before comparison.
+    try expectRewrite(
+        "'It''s':Sheet3!A5",
+        .{
+            .target_sheet = "It's",
+            .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } },
+        },
+        "'It''s':Sheet3!A6",
+    );
+}
+
+test "rewrite: 3D target_sheet scopes to span endpoints" {
+    // Either endpoint of the span matches a named target.
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{
+            .target_sheet = "Sheet1",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A6",
+    );
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{
+            .target_sheet = "Sheet3",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A6",
+    );
+    // A mid-span sheet contains the edit too, but membership needs
+    // the workbook's sheet order, which this layer cannot see: the
+    // ref stays put rather than risking a wrong rewrite.
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A5",
+    );
+    // The quoted-combined spelling scopes by endpoint the same way.
+    try expectRewrite(
+        "'Jan:Mar'!A5",
+        .{
+            .target_sheet = "Jan",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "'Jan:Mar'!A6",
+    );
+    try expectRewrite(
+        "'Jan:Mar'!A5",
+        .{
+            .target_sheet = "Feb",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "'Jan:Mar'!A5",
+    );
+}
+
+test "rewrite: 3D refs clamp at the grid caps" {
+    // Off-grid shifts follow the leave-alone policy the bare-ref
+    // path already has (see "insert beyond grid leaves ref alone").
+    try expectRewrite(
+        "Sheet1:Sheet3!XFD1",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "Sheet1:Sheet3!XFD1",
+    );
+    try expectRewrite(
+        "Sheet1:Sheet3!A1048576",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "Sheet1:Sheet3!A1048576",
+    );
+}
+
+test "rewrite: full-column spans shift on column edits" {
+    try expectRewrite(
+        "SUM(A:A)",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "SUM(B:B)",
+    );
+    // Insert inside the span: only the bounds at/past the insertion
+    // point move.
+    try expectRewrite(
+        "A:C",
+        .{ .edit = .{ .insert_cols = .{ .at = 2, .count = 1 } } },
+        "A:D",
+    );
+    // Delete entirely before the span: both bounds slide down.
+    try expectRewrite(
+        "C:E",
+        .{ .edit = .{ .delete_cols = .{ .at = 1, .count = 1 } } },
+        "B:D",
+    );
+    // Lowercase bounds re-emit canonically once shifted (same
+    // normalization trade-off as the cell path).
+    try expectRewrite(
+        "a:c",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "B:D",
+    );
+}
+
+test "rewrite: full-column spans shrink and collapse on delete" {
+    // Every spanned column deleted → the whole span is #REF!.
+    try expectRewrite(
+        "A:C",
+        .{ .edit = .{ .delete_cols = .{ .at = 1, .count = 3 } } },
+        "#REF!",
+    );
+    // Partial deletion SHRINKS the span (interval semantics — there
+    // is no printable `A:#REF!`, unlike the cell-range path).
+    try expectRewrite(
+        "A:C",
+        .{ .edit = .{ .delete_cols = .{ .at = 2, .count = 1 } } },
+        "A:B",
+    );
+    // Zone overshoots the span's end: survivors only.
+    try expectRewrite(
+        "A:C",
+        .{ .edit = .{ .delete_cols = .{ .at = 2, .count = 5 } } },
+        "A:A",
+    );
+    // Zone eats the span's head: the survivor lands at the zone's
+    // start position.
+    try expectRewrite(
+        "C:E",
+        .{ .edit = .{ .delete_cols = .{ .at = 1, .count = 4 } } },
+        "A:A",
+    );
+    // Reversed spelling keeps its written order positionally.
+    try expectRewrite(
+        "E:C",
+        .{ .edit = .{ .delete_cols = .{ .at = 4, .count = 5 } } },
+        "C:C",
+    );
+}
+
+test "rewrite: full-row spans shift, shrink and collapse on row edits" {
+    try expectRewrite(
+        "1:5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 2 } } },
+        "3:7",
+    );
+    try expectRewrite(
+        "10:20",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 2 } } },
+        "8:18",
+    );
+    try expectRewrite(
+        "1:5",
+        .{ .edit = .{ .delete_rows = .{ .at = 2, .count = 2 } } },
+        "1:3",
+    );
+    try expectRewrite(
+        "3:5",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 4 } } },
+        "1:1",
+    );
+    try expectRewrite(
+        "SUM(1:1)",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 1 } } },
+        "SUM(#REF!)",
+    );
+    // Edit entirely past the span: untouched.
+    try expectRewrite(
+        "2:3",
+        .{ .edit = .{ .insert_rows = .{ .at = 5, .count = 1 } } },
+        "2:3",
+    );
+}
+
+test "rewrite: full-span absolute markers preserved" {
+    try expectRewrite(
+        "$A:$C",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "$B:$D",
+    );
+    try expectRewrite(
+        "$1:$1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "$2:$2",
+    );
+    // Mixed markers: each bound keeps its own spelling; an unmoved
+    // bound keeps its borrowed lexeme verbatim.
+    try expectRewrite(
+        "$A:C",
+        .{ .edit = .{ .insert_cols = .{ .at = 2, .count = 1 } } },
+        "$A:D",
+    );
+    try expectRewrite(
+        "1:$5",
+        .{ .edit = .{ .delete_rows = .{ .at = 2, .count = 2 } } },
+        "1:$3",
+    );
+}
+
+test "rewrite: full-span perpendicular edits leave the span alone" {
+    // Row edits never reshape a column span…
+    try expectRewrite(
+        "A:A",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 5 } } },
+        "A:A",
+    );
+    try expectRewrite(
+        "A:C",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 10 } } },
+        "A:C",
+    );
+    // …and column edits never reshape a row span.
+    try expectRewrite(
+        "1:5",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 5 } } },
+        "1:5",
+    );
+    try expectRewrite(
+        "1:5",
+        .{ .edit = .{ .delete_cols = .{ .at = 1, .count = 10 } } },
+        "1:5",
+    );
+}
+
+test "rewrite: full-span sheet-qualified spellings" {
+    try expectRewrite(
+        "Sheet1!A:A",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "Sheet1!B:B",
+    );
+    // target_sheet scopes qualified spans exactly like qualified cells.
+    try expectRewrite(
+        "Sheet1!A:A+Sheet2!A:A",
+        .{
+            .target_sheet = "Sheet1",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1!B:B+Sheet2!A:A",
+    );
+    try expectRewrite(
+        "'My Sheet'!1:5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "'My Sheet'!2:6",
+    );
+    // Qualifier-level edits reach axis spans too.
+    try expectRewrite(
+        "Doomed!A:A",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "#REF!",
+    );
+    try expectRewrite(
+        "Sheet1!1:5",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } } },
+        "Renamed!1:5",
+    );
+    // Bare spans scope to on_sheet, mirroring bare cell refs.
+    try expectRewrite(
+        "A:A",
+        .{
+            .on_sheet = "Sheet2",
+            .target_sheet = "Sheet1",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "A:A",
+    );
+    try expectRewrite(
+        "A:A",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet1",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "B:B",
+    );
+}
+
+test "rewrite: full-span 3D spellings" {
+    try expectRewrite(
+        "SUM(Sheet1:Sheet3!A:A)",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "SUM(Sheet1:Sheet3!B:B)",
+    );
+    // The span endpoints survive an axis collapse, mirroring the
+    // 3D cell-range behavior.
+    try expectRewrite(
+        "Sheet1:Sheet3!1:5",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 5 } } },
+        "Sheet1:Sheet3!#REF!",
+    );
+    // Endpoint scoping: a named target matches either endpoint; a
+    // mid-span target conservatively leaves the ref unchanged.
+    try expectRewrite(
+        "Sheet1:Sheet3!A:A",
+        .{
+            .target_sheet = "Sheet3",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!B:B",
+    );
+    try expectRewrite(
+        "Sheet1:Sheet3!A:A",
+        .{
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A:A",
+    );
+    // Quoted-combined span spelling scopes by endpoint the same way.
+    try expectRewrite(
+        "'Jan:Mar'!A:A",
+        .{
+            .target_sheet = "Jan",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "'Jan:Mar'!B:B",
+    );
+}
+
+test "rewrite: full-span grid caps" {
+    // A bound the insert would push off-grid stays clamped at the
+    // edge while the other bound still moves — matching Excel's
+    // clamp-at-cap for ranges touching the last column/row.
+    try expectRewrite(
+        "A:XFD",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "B:XFD",
+    );
+    try expectRewrite(
+        "XFD:XFD",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "XFD:XFD",
+    );
+    try expectRewrite(
+        "1:1048576",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "2:1048576",
+    );
+    try expectRewrite(
+        "1048576:1048576",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "1048576:1048576",
+    );
+}
+
+test "rewrite: full-span lookalikes stay untouched" {
+    // `name:name` pairs whose halves do NOT both spell in-grid
+    // columns are defined-name unions (or malformed input) and pass
+    // through byte-identically under every edit.
+    for ([_][]const u8{
+        "Start:End", // multi-letter names, not columns
+        "SUM(Alpha:Omega)",
+        "ZZZZ:A", // four letters — off the grid
+        "XFE:XFE", // one past the last column
+        "1.5:2", // non-integer number lexeme
+        "1e3:5", // exponent number lexeme
+        "1:B", // mixed axes
+        "A:1",
+        "0:5", // row 0 does not exist
+        "1048577:1048578", // past the last row
+        "\u{20AC}!A:A", // opaque `!` qualifier — unknowable sheet
+    }) |c| try expectIdentityUnderEveryEdit(c);
+    // The flip side of the shadowing rule: halves that DO spell
+    // in-grid columns are a column span even when they read like
+    // words — Excel's reference interpretation takes precedence
+    // over defined names here.
+    try expectRewrite(
+        "Foo:Bar",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "FOP:BAS",
+    );
+}
+
 test "target_sheet scopes bare refs to on_sheet match" {
     // on_sheet = "Sheet2", target_sheet = "Sheet1" → bare ref unchanged.
     try expectRewrite(
@@ -1089,6 +1969,22 @@ test "compat: external references survive every edit byte-identically" {
         "[1]Sheet1!A1:B2",
         "[1]!Total",
         "[12]'My Sheet'!A1",
+        // External 3D spans: the whole chain lives in a workbook we
+        // cannot see. Before the 3D leg, the walk stopped at the
+        // range operator and the single-sheet matcher claimed
+        // `Sheet3!A1` — a silent corruption this line now pins.
+        "[1]Sheet1:Sheet3!A1",
+        "[1]Sheet1:Sheet3!A1:B2",
+        "[12]'My Sheet':Other!A1",
+        "'[Book.xlsx]Sheet1:Sheet3'!A1",
+        // External whole-axis spans: before the full-span leg, the
+        // external walk stopped at the bang and the axis matcher
+        // rewrote a span inside an unseen workbook.
+        "[1]Sheet1!A:A",
+        "[1]Sheet1!1:5",
+        "'[Book.xlsx]Sheet1'!A:A",
+        "'[Book.xlsx]Sheet1'!1:5",
+        "[1]Sheet1:Sheet3!A:A",
     }) |c| try expectIdentityUnderEveryEdit(c);
 }
 
@@ -1259,10 +2155,35 @@ test "checkAllAllocationFailures: rewrite is leak-safe under OOM" {
             );
             allocator.free(out);
         }
+        fn runThreeD(allocator: std.mem.Allocator) !void {
+            // Named target exercises decodeSheetToken on a quoted AND
+            // an unquoted endpoint, plus the #REF! collapse path.
+            const out = try rewriteFormula(
+                allocator,
+                "SUM('Jan Sales':Mar!A5:B6)+Sheet1:Sheet3!C7",
+                .{
+                    .target_sheet = "Mar",
+                    .edit = .{ .delete_rows = .{ .at = 5, .count = 2 } },
+                },
+            );
+            allocator.free(out);
+        }
+        fn runAxisSpans(allocator: std.mem.Allocator) !void {
+            // Bare span shrink (one bound re-emitted) plus a quoted
+            // qualified span slide (both bounds re-emitted).
+            const out = try rewriteFormula(
+                allocator,
+                "SUM(A:C)+'My Sheet'!$D:$E",
+                .{ .edit = .{ .delete_cols = .{ .at = 2, .count = 1 } } },
+            );
+            allocator.free(out);
+        }
     };
 
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runRename, .{});
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runShiftAndCollapse, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.runThreeD, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.runAxisSpans, .{});
 }
 
 test "many-column shift writes correct multi-letter columns" {
