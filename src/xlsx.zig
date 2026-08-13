@@ -7409,8 +7409,8 @@ pub const formatCellRef = @import("writer.zig").formatCellRef;
 pub const max_output_archive_bytes = @import("writer.zig").max_output_archive_bytes;
 
 /// C1 M2 m1 — pure-function A1 cell-formula rewriter. Re-exported
-/// for `zlsx_pkg` so `Workbook.rewriteAllFormulas(edit)` can apply
-/// row/col/sheet edits to every cell formula via
+/// for `zlsx_pkg` so `Workbook.rewriteAllFormulas(edit, target_sheet)`
+/// can apply row/col/sheet edits to every cell formula via
 /// `@import("zlsx").formula_rewriter`.
 ///
 /// Reached through the **named** `zlsx_formula` module rather than by

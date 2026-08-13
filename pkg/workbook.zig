@@ -3743,13 +3743,20 @@ pub const Workbook = struct {
     ///
     /// **This rewrites formulas only.** Row/col edits applied here
     /// shift formula references but do NOT structurally move cells —
-    /// that's a follow-up iter (`Workbook.insertRow` etc.). For
-    /// `rename_sheet` the workflow is coherent: pair this call with
-    /// a manual `xl/workbook.xml` `<sheet name=>` rewrite. (A
-    /// `Workbook.renameSheet` convenience is a future iter.)
+    /// `Workbook.insertRow` etc. pair this call with the byte-level
+    /// sheet transform.
+    ///
+    /// `target_sheet` plumbs into `RewriteContext.target_sheet`:
+    /// the sheet whose grid the row/col edit moved. Bare refs shift
+    /// only in formulas ON that sheet; qualified refs shift only
+    /// when the qualifier matches it. `null` means "apply
+    /// everywhere" per the rewriter's permissive default — the
+    /// right value for `rename_sheet`/`delete_sheet` edits, which
+    /// match on the edit's own sheet name and ignore bare refs.
     pub fn rewriteAllFormulas(
         self: *Workbook,
         edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
     ) Error!u32 {
         var count: u32 = 0;
         const a = self.allocator;
@@ -3775,7 +3782,7 @@ pub const Workbook = struct {
                     if (f.len == 0) continue;
                     const ctx = zlsx.formula_rewriter.RewriteContext{
                         .on_sheet = ws_name,
-                        .target_sheet = null,
+                        .target_sheet = target_sheet,
                         .edit = edit,
                     };
                     const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, f, ctx);
@@ -4355,7 +4362,7 @@ pub const Workbook = struct {
     /// 1. Validate `new_name` per Excel rules (length, forbidden chars,
     ///    "history" reserved, no duplicate of any other sheet name).
     /// 2. Rewrite every formula in every sheet via
-    ///    `rewriteAllFormulas(.{ .rename_sheet = ... })`. Cross-sheet
+    ///    `rewriteAllFormulas(.{ .rename_sheet = ... }, null)`. Cross-sheet
     ///    references targeting `old_name` get retargeted to `new_name`.
     /// 3. Patch `xl/workbook.xml` so the `<sheet name="OLD" .../>`
     ///    element for `sheet_idx` carries the new (XML-escaped) name.
@@ -4424,7 +4431,7 @@ pub const Workbook = struct {
         // tolerant of "no carriers in the workbook" — they short-
         // circuit on empty workbooks rather than erroring, so
         // calling all four unconditionally is cheap.
-        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllFormulas(edit, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
@@ -5071,7 +5078,7 @@ pub const Workbook = struct {
         const doomed_name_owned = try self.allocator.dupe(u8, doomed_name_src);
         defer self.allocator.free(doomed_name_owned);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
-        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllFormulas(edit, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
@@ -5282,7 +5289,7 @@ pub const Workbook = struct {
             .insert => .{ .insert_cols = .{ .at = spec.col.?, .count = 1 } },
             .delete => .{ .delete_cols = .{ .at = spec.col.?, .count = 1 } },
         };
-        _ = try self.rewriteAllFormulas(edit);
+        _ = try self.rewriteAllFormulas(edit, target);
         _ = try self.rewriteAllDefinedNames(edit, target);
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
@@ -11919,10 +11926,11 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
 
-    // Insert 1 row at row 4 — every ref to row >= 4 shifts +1.
+    // Insert 1 row at row 4 — every ref to row >= 4 shifts +1
+    // (null target = the permissive apply-everywhere default).
     const count = try wb.rewriteAllFormulas(.{
         .insert_rows = .{ .at = 4, .count = 1 },
-    });
+    }, null);
     // A1's SUM(B5:B10) → SUM(B6:B11) — 1 rewrite
     // B2's B7+1 → B8+1 — 1 rewrite
     // C3's B2*B5 → B2*B6 (B2 unchanged, B5 → B6) — 1 rewrite
@@ -11957,7 +11965,7 @@ test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formul
     // Pristine fixture has no <f> cells — nothing to rewrite.
     const count = try wb.rewriteAllFormulas(.{
         .insert_rows = .{ .at = 1, .count = 1 },
-    });
+    }, null);
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 
@@ -11986,7 +11994,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     defer wb.deinit();
     const count = try wb.rewriteAllFormulas(.{
         .rename_sheet = .{ .old = "Sheet2", .new = "Renamed" },
-    });
+    }, null);
     try std.testing.expectEqual(@as(u32, 1), count);
 
     var tmp2_buf: [256]u8 = undefined;
