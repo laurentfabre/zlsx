@@ -3960,7 +3960,10 @@ pub const Workbook = struct {
             a.free(decoded);
             errdefer a.free(rewritten);
 
-            const name_dup = try a.dupe(u8, dn.name);
+            // The name IDENTIFIER decodes too — the splice escapes
+            // it on emit, and a raw `&#95;foo` would re-emit as the
+            // broken literal `&amp;#95;foo` (Codex #188 r3).
+            const name_dup = try store_mod.decodeXmlEntities(a, dn.name);
             errdefer a.free(name_dup);
 
             try owned_formulas.append(a, rewritten);
@@ -4205,8 +4208,12 @@ pub const Workbook = struct {
         try hiddens.ensureTotalCapacity(a, total);
 
         for (existing) |dn| {
-            try owned_names.append(a, try a.dupe(u8, dn.name));
-            try owned_formulas.append(a, try a.dupe(u8, dn.formula));
+            // Existing entries are raw XML bytes and the splice
+            // escapes on emit — duplicating the raw form would
+            // double-escape entity-bearing names/formulas every time
+            // the plan re-emits the block (Codex #188 r3).
+            try owned_names.append(a, try store_mod.decodeXmlEntities(a, dn.name));
+            try owned_formulas.append(a, try store_mod.decodeXmlEntities(a, dn.formula));
             try local_ids.append(a, dn.local_sheet_id);
             try hiddens.append(a, dn.hidden);
         }
@@ -13113,6 +13120,53 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
     try std.testing.expectEqualStrings("Sheet1!A2+B2", wb2.definedNames()[0].formula);
     try std.testing.expectEqualStrings("MyName", wb2.definedNames()[0].name);
     try std.testing.expectEqual(@as(?u32, null), wb2.definedNames()[0].local_sheet_id);
+}
+
+test "Workbook.rewriteAllDefinedNames: entity-encoded name identifier survives block re-emit" {
+    // Codex #188 r3: a producer may entity-encode a plain-legal
+    // identifier (`name="&#95;foo"` for `_foo`). The splice escapes
+    // on emit, so carrying the raw spelling through re-emitted it as
+    // the broken literal `&amp;#95;foo`. Decode-in must restore the
+    // identifier to its decoded form.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-entity-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<definedName name=\"&#95;foo\">Sheet1:Sheet2!A1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    // The rename rewrites the 3D span's first endpoint, which
+    // re-emits the whole definedNames block — the identifier must
+    // come back decoded, exactly once.
+    try wb.renameSheet(0, "New");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-entity-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wb2.definedNames().len);
+    try std.testing.expectEqualStrings("_foo", wb2.definedNames()[0].name);
+    try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
 }
 
 test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across rewrite" {
