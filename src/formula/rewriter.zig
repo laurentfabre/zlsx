@@ -888,14 +888,25 @@ fn splitQuotedSpan(decoded: []const u8) ?SpanHalves {
     return .{ .first = first, .second = second };
 }
 
-/// Position of `name` in the workbook tab order, resolved with
-/// Excel's case rule. Null when the name is not in this workbook —
-/// the conservative signal that span arithmetic must not run.
+/// Position of `name` in the workbook tab order. A byte-exact entry
+/// wins outright; otherwise the name resolves with Excel's case rule
+/// — but only when that resolution is UNIQUE. Excel forbids
+/// case-variant duplicate sheet names, so a well-formed order never
+/// has two case-fold matches; a malformed or caller-supplied order
+/// that does is ambiguous, and span arithmetic through an arbitrary
+/// pick could contract through the wrong interval. Null means "do
+/// not run span arithmetic" — the conservative signal.
 fn orderIndexOf(order: []const []const u8, name: []const u8) ?usize {
+    var folded: ?usize = null;
+    var folded_count: usize = 0;
     for (order, 0..) |entry, idx| {
-        if (casefold.excelSheetNameEql(entry, name)) return idx;
+        if (std.mem.eql(u8, entry, name)) return idx;
+        if (casefold.excelSheetNameEql(entry, name)) {
+            folded = idx;
+            folded_count += 1;
+        }
     }
-    return null;
+    return if (folded_count == 1) folded else null;
 }
 
 /// True when `target` is a member of the span `first:second` —
@@ -2012,6 +2023,23 @@ test "rewrite: 3D endpoint delete contracts the span via sheet order" {
         "Sheet1:Sheet9!A1",
         .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet1" } },
         "Sheet1:Sheet9!A1",
+    );
+    // Case-variant duplicates in a malformed order: the byte-exact
+    // entry wins, so the interval anchors at `sheet1` (index 2) and
+    // contraction steps to its true neighbor — never through the
+    // case-fold twin's interval (Codex r1 finding 2).
+    const dup = [_][]const u8{ "Sheet1", "X", "sheet1", "Y", "Sheet3" };
+    try expectRewrite(
+        "sheet1:Sheet3!A1",
+        .{ .sheet_order = &dup, .edit = .{ .delete_sheet = "sheet1" } },
+        "Y:Sheet3!A1",
+    );
+    // No byte-exact entry and two case-fold candidates: ambiguous,
+    // untouched.
+    try expectRewrite(
+        "SHEET1:Sheet3!A1",
+        .{ .sheet_order = &dup, .edit = .{ .delete_sheet = "SHEET1" } },
+        "SHEET1:Sheet3!A1",
     );
 }
 
