@@ -26,6 +26,13 @@
 //! `Column<id>_2`, ... until finding a free name to avoid clashing
 //! with a pre-existing column literally named "Column4" etc.
 //!
+//! `renameTableColumn` (C1) is the second entry point: renames one
+//! `<tableColumn name>` and routes every `calculatedColumnFormula` /
+//! `totalsRowFormula` body through the formula rewriter so
+//! structured references (`T[Old]`, bare `[@Old]`) follow the
+//! rename. The Editor path finishes the job with the header-cell
+//! text and the workbook-wide formula sweep.
+//!
 //! Pre-flight refusals: a table cannot legally collapse to zero
 //! columns or zero rows (header + ≥0 data rows). Edits that would
 //! do so surface `error.TableCollapseUnsafe` so the Editor can
@@ -51,6 +58,7 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 const sheet_edit = @import("sheet_edit.zig");
+const store_mod = @import("store.zig");
 const coords = @import("zlsx_refs");
 
 const Allocator = std.mem.Allocator;
@@ -64,6 +72,17 @@ pub const Error = error{
     TableCoordinateOverflow,
     TableCollapseUnsafe,
     TableHeaderRowDeleteUnsafe,
+    /// `renameTableColumn`: no `<tableColumn>` matches the old name
+    /// under the symbol layer's fold rule.
+    TableColumnNotFound,
+    /// `renameTableColumn`: another column already carries the new
+    /// name (fold rule — ECMA-376 §18.5.1.78 requires names unique
+    /// within the parent table, and Excel compares them
+    /// case-insensitively).
+    TableColumnNameInUse,
+    /// `renameTableColumn`: empty name, or a control byte XML
+    /// cannot carry.
+    InvalidTableColumnName,
     /// Surfaces only when an internal `bufPrint` overflows the
     /// fixed 48-byte ref buffer — an A1 range fits in ~13 bytes
     /// so this is practically unreachable.
@@ -644,6 +663,418 @@ fn scanMaxTableColumnId(src: []const u8, body_start: usize, body_end: usize) u32
     return max_id;
 }
 
+// ─── column rename (C1: structured-ref rewriting) ───────────────
+
+pub const RenameColumnResult = struct {
+    /// The rewritten table part. Caller frees.
+    bytes: []u8,
+    /// 0-based position of the renamed column among the table's
+    /// direct `<tableColumn>` children — also its offset from the
+    /// range's left edge, which the width check below guarantees.
+    column_pos: u32,
+    /// 1-based grid coordinates of the header cell whose text
+    /// mirrors the column name (ECMA-376 §18.5.1.3: the header row
+    /// cell IS the column name); null for a header-less table
+    /// (`headerRowCount="0"`).
+    header_row: ?u32,
+    header_col: ?u32,
+    /// The table's declared range (1-based, inclusive), for the
+    /// caller's producer-cell scoping: bare structured refs in cell
+    /// formulas bind to the table whose range contains the cell.
+    tl_row: u32,
+    tl_col: u32,
+    br_row: u32,
+    br_col: u32,
+    /// Decoded formula-visible table name (`displayName`, falling
+    /// back to `name`) — what structured references spell and what
+    /// the caller passes to the workbook-wide formula rewrite.
+    /// Caller frees.
+    display_name: []u8,
+
+    pub fn deinit(self: *RenameColumnResult, allocator: Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.display_name);
+        self.* = undefined;
+    }
+};
+
+/// Rename the `<tableColumn>` whose decoded `name` matches
+/// `old_name` (the symbol layer's fold rule — same as formula
+/// resolution) to `new_name`, and rewrite every
+/// `calculatedColumnFormula` / `totalsRowFormula` body in the part
+/// so structured references follow the rename. `old_name` /
+/// `new_name` are decoded plain text; XML escaping happens at the
+/// splice boundaries. Refusals all precede byte work.
+///
+/// The caller (Editor path) is responsible for the two mutations
+/// this function cannot see: the header CELL text in the host
+/// sheet (`header_row`/`header_col`) and the workbook-wide formula
+/// rewrite (`display_name` + the same edit).
+pub fn renameTableColumn(
+    allocator: Allocator,
+    src: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) Error!RenameColumnResult {
+    if (old_name.len == 0 or new_name.len == 0) return error.InvalidTableColumnName;
+    if (!isXmlSafeName(new_name)) return error.InvalidTableColumnName;
+
+    const hdr = parseTableHeader(src) orelse return error.MalformedTableXml;
+    const table_attrs = src[hdr.tag.start + "<table".len .. hdr.tag.after_open - 1];
+    const display_raw = blk: {
+        if (getAttr(table_attrs, "displayName")) |v| {
+            if (v.len > 0) break :blk v;
+        }
+        const v = getAttr(table_attrs, "name") orelse return error.MalformedTableXml;
+        if (v.len == 0) return error.MalformedTableXml;
+        break :blk v;
+    };
+    const display_name = try store_mod.decodeXmlEntities(allocator, display_raw);
+    errdefer allocator.free(display_name);
+
+    const tc = findTableColumns(src) orelse return error.MalformedTableXml;
+
+    // Pass 1 (pre-flight): locate the target, refuse ambiguity and
+    // collisions before any output exists.
+    var target_pos: ?u32 = null;
+    var count: u32 = 0;
+    {
+        var it = ColumnIter{ .src = src, .k = tc.body_start, .end = tc.close_pos };
+        while (it.next()) |col| {
+            count += 1;
+            const attrs = src[col.tag.start + "<tableColumn".len .. col.tag.after_open - 1];
+            const name_raw = getAttr(attrs, "name") orelse return error.MalformedTableXml;
+            const decoded = try store_mod.decodeXmlEntities(allocator, name_raw);
+            defer allocator.free(decoded);
+            if (try foldedEql(allocator, decoded, old_name)) {
+                // Two columns matching the old name means the part
+                // already violates §18.5.1.78 uniqueness — corrupt
+                // input, not an ambiguity to resolve silently.
+                if (target_pos != null) return error.MalformedTableXml;
+                target_pos = col.pos;
+                // The renamed column itself never collides with its
+                // own new spelling (case-respell is a legal rename).
+                continue;
+            }
+            if (try foldedEql(allocator, decoded, new_name)) {
+                return error.TableColumnNameInUse;
+            }
+        }
+    }
+    const pos = target_pos orelse return error.TableColumnNotFound;
+
+    // Width agreement (the REL-A505 discipline): the header-cell
+    // coordinate is tl_col + pos, meaningful only when the column
+    // list and the declared range agree.
+    const width = hdr.br_col -| hdr.tl_col + 1;
+    if (count != width) return error.MalformedTableXml;
+
+    // Pass 2: emit. Direct `<tableColumn>` children get the name
+    // splice (target only) and a body walk that rewrites formula
+    // elements; every byte outside those is copied verbatim.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var attr_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer attr_buf.deinit(allocator);
+    try appendAttrEscaped(allocator, &attr_buf, new_name);
+
+    var pos_seen: u32 = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const lt = std.mem.indexOfScalarPos(u8, src, i, '<') orelse {
+            try out.appendSlice(allocator, src[i..]);
+            break;
+        };
+        try out.appendSlice(allocator, src[i..lt]);
+        i = lt;
+
+        const in_columns = lt >= tc.body_start and lt < tc.close_pos;
+        if (in_columns) {
+            if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
+                const extent = columnExtent(src, ct, tc.close_pos);
+                if (pos_seen == pos) {
+                    try sheet_edit.writeWithReplacedAttr(
+                        allocator,
+                        &out,
+                        src,
+                        ct,
+                        "<tableColumn".len,
+                        "name",
+                        attr_buf.items,
+                    );
+                } else {
+                    try out.appendSlice(allocator, src[ct.start..ct.after_open]);
+                }
+                if (extent.body_end) |body_end| {
+                    try emitColumnBodyWithRewrites(
+                        allocator,
+                        &out,
+                        src,
+                        ct.after_open,
+                        body_end,
+                        display_name,
+                        old_name,
+                        new_name,
+                    );
+                    try out.appendSlice(allocator, src[body_end..extent.end]);
+                }
+                pos_seen += 1;
+                i = extent.end;
+                continue;
+            }
+        }
+        try out.append(allocator, '<');
+        i += 1;
+    }
+
+    const has_header = hdr.header_row_count >= 1;
+    return .{
+        .bytes = try out.toOwnedSlice(allocator),
+        .column_pos = pos,
+        .header_row = if (has_header) hdr.tl_row else null,
+        .header_col = if (has_header) hdr.tl_col + pos else null,
+        .tl_row = hdr.tl_row,
+        .tl_col = hdr.tl_col,
+        .br_row = hdr.br_row,
+        .br_col = hdr.br_col,
+        .display_name = display_name,
+    };
+}
+
+/// The raw `displayName` attribute (falling back to `name`) of a
+/// table part's `<table>` open tag — the spelling structured
+/// references resolve against, still XML-encoded. Null when the
+/// part has no parseable `<table>` tag or neither attribute.
+/// Public for the Workbook's locate-table-by-name scan.
+pub fn tableDisplayNameRaw(src: []const u8) ?[]const u8 {
+    const hdr = parseTableHeader(src) orelse return null;
+    const attrs = src[hdr.tag.start + "<table".len .. hdr.tag.after_open - 1];
+    if (getAttr(attrs, "displayName")) |v| {
+        if (v.len > 0) return v;
+    }
+    const v = getAttr(attrs, "name") orelse return null;
+    return if (v.len > 0) v else null;
+}
+
+/// The `<tableColumns>` block: body span and close position.
+const TableColumnsSpan = struct {
+    tag: TagOpen,
+    body_start: usize,
+    close_pos: usize,
+};
+
+fn findTableColumns(src: []const u8) ?TableColumnsSpan {
+    var i: usize = 0;
+    while (i < src.len) {
+        const lt = std.mem.indexOfScalarPos(u8, src, i, '<') orelse return null;
+        if (sheet_edit.matchTagAt(src, lt, "tableColumns")) |t| {
+            const close = std.mem.indexOfPos(u8, src, t.after_open, "</tableColumns>") orelse return null;
+            return .{ .tag = t, .body_start = t.after_open, .close_pos = close };
+        }
+        i = lt + 1;
+    }
+    return null;
+}
+
+/// Direct `<tableColumn>` children of a `<tableColumns>` body, in
+/// document order with 0-based positions. Advances past each
+/// column's FULL extent (Codex Ticket 701: a descendant
+/// `<tableColumn>` nested in an `<extLst>` extension must not be
+/// double-counted as a sibling).
+const ColumnIter = struct {
+    src: []const u8,
+    k: usize,
+    end: usize,
+    pos: u32 = 0,
+
+    const Item = struct { tag: TagOpen, pos: u32 };
+
+    fn next(self: *ColumnIter) ?Item {
+        while (self.k < self.end) {
+            const lt = std.mem.indexOfScalarPos(u8, self.src, self.k, '<') orelse return null;
+            if (lt >= self.end) return null;
+            if (sheet_edit.matchTagAt(self.src, lt, "tableColumn")) |ct| {
+                if (ct.after_open > self.end) return null;
+                const extent = columnExtent(self.src, ct, self.end);
+                self.k = extent.end;
+                const item: Item = .{ .tag = ct, .pos = self.pos };
+                self.pos += 1;
+                return item;
+            }
+            self.k = lt + 1;
+        }
+        return null;
+    }
+};
+
+/// Full extent of one `<tableColumn>`: `end` is just past the
+/// element (self-closing open tag, or `</tableColumn>`);
+/// `body_end` is the close tag's start for the non-self-closing
+/// form, null otherwise. Mirrors the `ct_end` advance in
+/// `processTableColumnsForCol`.
+const ColumnExtent = struct { end: usize, body_end: ?usize };
+
+fn columnExtent(src: []const u8, ct: TagOpen, bound: usize) ColumnExtent {
+    const attrs_full = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
+    const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+        return .{ .end = ct.after_open, .body_end = null };
+    }
+    const cend = "</tableColumn>";
+    const p = std.mem.indexOfPos(u8, src, ct.after_open, cend) orelse
+        return .{ .end = bound, .body_end = bound };
+    if (p + cend.len <= bound) return .{ .end = p + cend.len, .body_end = p };
+    return .{ .end = bound, .body_end = bound };
+}
+
+/// Copy one `<tableColumn>` body, rewriting the inner text of every
+/// `<calculatedColumnFormula>` / `<totalsRowFormula>` through the
+/// formula rewriter (decode-in / escape-out). The part's own
+/// formulas are the table's producers, so BARE structured refs
+/// (`[Old]`, `[@Old]`) scope to this table via `owning_table`. A
+/// body whose rewrite is byte-identical keeps its original bytes —
+/// entity spellings included.
+fn emitColumnBodyWithRewrites(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    from: usize,
+    to: usize,
+    display_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) Error!void {
+    var i = from;
+    while (i < to) {
+        const lt = std.mem.indexOfScalarPos(u8, src, i, '<') orelse break;
+        if (lt >= to) break;
+        try out.appendSlice(allocator, src[i..lt]);
+        i = lt;
+
+        const t: ?TagOpen, const close_tag: []const u8 = blk: {
+            if (sheet_edit.matchTagAt(src, lt, "calculatedColumnFormula")) |t| {
+                break :blk .{ t, "</calculatedColumnFormula>" };
+            }
+            if (sheet_edit.matchTagAt(src, lt, "totalsRowFormula")) |t| {
+                break :blk .{ t, "</totalsRowFormula>" };
+            }
+            break :blk .{ null, "" };
+        };
+        const tag = t orelse {
+            try out.append(allocator, '<');
+            i += 1;
+            continue;
+        };
+
+        const attrs_full = src[tag.start .. tag.after_open - 1];
+        const trimmed = std.mem.trimEnd(u8, attrs_full, " \t\r\n");
+        if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+            // Self-closing formula element: no body to rewrite.
+            try out.appendSlice(allocator, src[tag.start..tag.after_open]);
+            i = tag.after_open;
+            continue;
+        }
+        const close_pos = std.mem.indexOfPos(u8, src, tag.after_open, close_tag) orelse
+            return error.MalformedTableXml;
+        if (close_pos + close_tag.len > to) return error.MalformedTableXml;
+
+        try out.appendSlice(allocator, src[tag.start..tag.after_open]);
+        const body = src[tag.after_open..close_pos];
+        try appendRewrittenFormula(allocator, out, body, display_name, old_name, new_name);
+        try out.appendSlice(allocator, src[close_pos .. close_pos + close_tag.len]);
+        i = close_pos + close_tag.len;
+    }
+    if (i < to) try out.appendSlice(allocator, src[i..to]);
+}
+
+fn appendRewrittenFormula(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    body: []const u8,
+    display_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) Error!void {
+    if (body.len == 0) return;
+    const decoded = try store_mod.decodeXmlEntities(allocator, body);
+    defer allocator.free(decoded);
+    const rewritten = xlsx.formula_rewriter.rewriteFormula(allocator, decoded, .{
+        .owning_table = display_name,
+        .edit = .{ .rename_table_column = .{
+            .table = display_name,
+            .old = old_name,
+            .new = new_name,
+        } },
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Old/new emptiness is refused at this function's entry.
+        error.InvalidEdit => unreachable,
+    };
+    defer allocator.free(rewritten);
+    if (std.mem.eql(u8, rewritten, decoded)) {
+        // No-op rewrite: keep the source bytes, original entity
+        // spellings included.
+        try out.appendSlice(allocator, body);
+        return;
+    }
+    try appendTextEscaped(allocator, out, rewritten);
+}
+
+/// Fold-equality on decoded names — the formula engine's matching
+/// rule (`SymbolTable.fold` before every lookup). Invalid UTF-8
+/// matches nothing the symbol layer admitted.
+fn foldedEql(allocator: Allocator, a: []const u8, b: []const u8) Error!bool {
+    return xlsx.casefold.eqlFolded(allocator, a, b) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return false;
+    };
+}
+
+/// XML 1.0 can carry tab/LF/CR but no other control byte, in any
+/// context. Everything else is escapable at the splice boundaries.
+fn isXmlSafeName(s: []const u8) bool {
+    for (s) |b| {
+        if (b < 0x20 and b != 0x09 and b != 0x0A and b != 0x0D) return false;
+    }
+    return true;
+}
+
+/// Attribute-value escape for the double-quoted splice
+/// `writeWithReplacedAttr` performs.
+fn appendAttrEscaped(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    text: []const u8,
+) Error!void {
+    for (text) |b| {
+        switch (b) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            else => try out.append(allocator, b),
+        }
+    }
+}
+
+/// Element-content escape (3-entity, matching the byte-stable
+/// contract everywhere else formulas are spliced).
+fn appendTextEscaped(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    text: []const u8,
+) Error!void {
+    for (text) |b| {
+        switch (b) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            else => try out.append(allocator, b),
+        }
+    }
+}
+
 // ─── tests ──────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -993,4 +1424,156 @@ test "fuzz: applyEditToTable never crashes on adversarial XML" {
             "<table id=\"1\" ref=\"4294967295\"/>",
         },
     });
+}
+
+// ─── renameTableColumn ──────────────────────────────────────────
+
+const rename_sample =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="2" name="Sales" displayName="Sales" ref="B2:D6">
+    \\<autoFilter ref="B2:D6"/>
+    \\<tableColumns count="3">
+    \\<tableColumn id="1" name="R&amp;D"/>
+    \\<tableColumn id="2" name="Total"><calculatedColumnFormula>SUM(Sales[R&amp;D])*2</calculatedColumnFormula></tableColumn>
+    \\<tableColumn id="3" name="Note"><totalsRowFormula>COUNTA([R&amp;D])</totalsRowFormula></tableColumn>
+    \\</tableColumns>
+    \\<tableStyleInfo name="TS"/>
+    \\</table>
+;
+
+test "renameTableColumn rewrites the name attr and both formula sites" {
+    const a = testing.allocator;
+    var r = try renameTableColumn(a, rename_sample, "R&D", "Budget");
+    defer r.deinit(a);
+
+    // The attr splice, the qualified calculatedColumnFormula ref,
+    // and the BARE totalsRowFormula ref (scoped through
+    // owning_table) all follow the rename; every other byte is
+    // untouched.
+    const expected =
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="2" name="Sales" displayName="Sales" ref="B2:D6">
+        \\<autoFilter ref="B2:D6"/>
+        \\<tableColumns count="3">
+        \\<tableColumn id="1" name="Budget"/>
+        \\<tableColumn id="2" name="Total"><calculatedColumnFormula>SUM(Sales[Budget])*2</calculatedColumnFormula></tableColumn>
+        \\<tableColumn id="3" name="Note"><totalsRowFormula>COUNTA([Budget])</totalsRowFormula></tableColumn>
+        \\</tableColumns>
+        \\<tableStyleInfo name="TS"/>
+        \\</table>
+    ;
+    try testing.expectEqualStrings(expected, r.bytes);
+    try testing.expectEqualStrings("Sales", r.display_name);
+    try testing.expectEqual(@as(u32, 0), r.column_pos);
+    // Header cell: top row of B2:D6, first column.
+    try testing.expectEqual(@as(?u32, 2), r.header_row);
+    try testing.expectEqual(@as(?u32, 2), r.header_col);
+}
+
+test "renameTableColumn escapes the new name at both boundaries" {
+    const a = testing.allocator;
+    var r = try renameTableColumn(a, rename_sample, "R&D", "P&L");
+    defer r.deinit(a);
+    // Attr boundary: XML attr escape. Formula boundary: entity
+    // escape of the rewritten body — where the `&` also makes
+    // `columnNeedsBrackets` bracket the part, the canonical
+    // printer's spelling for punctuation-carrying names.
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "<tableColumn id=\"1\" name=\"P&amp;L\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "SUM(Sales[[P&amp;L]])*2") != null);
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "COUNTA([[P&amp;L]])") != null);
+}
+
+test "renameTableColumn matches and collides under the fold rule" {
+    const a = testing.allocator;
+    // Old-name match is folded: `r&d` finds `R&amp;D`.
+    var r = try renameTableColumn(a, rename_sample, "r&d", "Budget");
+    defer r.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "name=\"Budget\"") != null);
+
+    // Collision with ANOTHER column is folded too.
+    try testing.expectError(
+        error.TableColumnNameInUse,
+        renameTableColumn(a, rename_sample, "R&D", "total"),
+    );
+
+    // A case-respell of the SAME column is a legal rename, not a
+    // self-collision.
+    var respell = try renameTableColumn(a, rename_sample, "total", "TOTAL");
+    defer respell.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, respell.bytes, "name=\"TOTAL\"") != null);
+    try testing.expectEqual(@as(u32, 1), respell.column_pos);
+}
+
+test "renameTableColumn refusals" {
+    const a = testing.allocator;
+    try testing.expectError(
+        error.TableColumnNotFound,
+        renameTableColumn(a, rename_sample, "Missing", "X"),
+    );
+    try testing.expectError(
+        error.InvalidTableColumnName,
+        renameTableColumn(a, rename_sample, "Total", ""),
+    );
+    try testing.expectError(
+        error.InvalidTableColumnName,
+        renameTableColumn(a, rename_sample, "", "X"),
+    );
+    try testing.expectError(
+        error.InvalidTableColumnName,
+        renameTableColumn(a, rename_sample, "Total", "a\x01b"),
+    );
+    // Column list disagreeing with the declared range width: the
+    // header-cell coordinate would be meaningless.
+    const skewed =
+        "<table id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:C5\">" ++
+        "<tableColumns count=\"2\"><tableColumn id=\"1\" name=\"A\"/>" ++
+        "<tableColumn id=\"2\" name=\"B\"/></tableColumns></table>";
+    try testing.expectError(
+        error.MalformedTableXml,
+        renameTableColumn(a, skewed, "A", "X"),
+    );
+}
+
+test "renameTableColumn: header-less table returns null header cell" {
+    const a = testing.allocator;
+    const headerless =
+        "<table id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B3\" headerRowCount=\"0\">" ++
+        "<tableColumns count=\"2\"><tableColumn id=\"1\" name=\"In\"/>" ++
+        "<tableColumn id=\"2\" name=\"Out\"/></tableColumns></table>";
+    var r = try renameTableColumn(a, headerless, "Out", "Result");
+    defer r.deinit(a);
+    try testing.expectEqual(@as(?u32, null), r.header_row);
+    try testing.expectEqual(@as(?u32, null), r.header_col);
+    try testing.expectEqual(@as(u32, 1), r.column_pos);
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "name=\"Result\"") != null);
+}
+
+test "renameTableColumn: nested extLst tableColumn is not a sibling" {
+    const a = testing.allocator;
+    // Ticket-701 shape: a descendant <tableColumn> inside an
+    // extension block must not shift sibling positions — the
+    // renamed column here is at pos 1, header col B.
+    const nested =
+        "<table id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B3\">" ++
+        "<tableColumns count=\"2\">" ++
+        "<tableColumn id=\"1\" name=\"A\"><extLst><ext><tableColumn id=\"9\" name=\"Decoy\"/></ext></extLst></tableColumn>" ++
+        "<tableColumn id=\"2\" name=\"B\"/>" ++
+        "</tableColumns></table>";
+    var r = try renameTableColumn(a, nested, "B", "Renamed");
+    defer r.deinit(a);
+    try testing.expectEqual(@as(u32, 1), r.column_pos);
+    try testing.expectEqual(@as(?u32, 2), r.header_col);
+    // The decoy is untouched; the sibling is renamed.
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "name=\"Decoy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r.bytes, "name=\"Renamed\"") != null);
+}
+
+test "renameTableColumn: OOM-safe at every allocation site" {
+    const helpers = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var r = try renameTableColumn(allocator, rename_sample, "R&D", "Budget");
+            r.deinit(allocator);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.run, .{});
 }
