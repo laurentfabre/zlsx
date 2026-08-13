@@ -760,13 +760,11 @@ pub const Editor = struct {
         return new_idx;
     }
 
-    /// Rename a sheet (Phase 3e, iter-sheet-2). v1 patches only
-    /// `xl/workbook.xml` — formulas in other sheets that reference
-    /// this sheet by name (`'OLD'!A1`) are NOT rewritten. A real
-    /// formula tokenizer (iter-col-1) will close that gap. The
-    /// caller-visible contract: rename succeeds even when cross-
-    /// sheet refs exist; those refs become `#REF!` in Excel until
-    /// the next iter ships.
+    /// Rename a sheet (Phase 3e, iter-sheet-2). Delegates to
+    /// `Workbook.renameSheet`, which patches `xl/workbook.xml`
+    /// in-memory and runs the formula + defined-name rewriters:
+    /// cross-sheet refs (`'OLD'!A1`) follow the rename instead of
+    /// decaying to `#REF!`.
     pub fn renameSheet(self: *Editor, sheet_idx: u32, new_name: []const u8) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         // B2 iter-er-4 (2/N): delegate to Workbook.renameSheet,
@@ -789,8 +787,9 @@ pub const Editor = struct {
     ///   - Pending-new-sheet path: removes from `pending_new_sheets`.
     ///   - Source sheet path: records the delete + drops the path
     ///     from `sheet_paths`.
-    ///   - Cross-sheet formula refs to the deleted sheet become
-    ///     `#REF!` (deferred to iter-col-1's formula tokenizer).
+    ///   - Cross-sheet formula refs to the deleted sheet collapse
+    ///     to `#REF!` via the workbook rewriters; refs to
+    ///     surviving sheets stay intact.
     /// Sheet indices SHIFT after a delete: the call invalidates
     /// every sheet_idx > deleted_idx.
     pub fn deleteSheet(self: *Editor, sheet_idx: u32) !void {
@@ -840,13 +839,15 @@ pub const Editor = struct {
 
     /// Insert a blank row at position `before_row` in sheet
     /// `sheet_idx` (Phase 3e, iter-row-2). Every existing row at
-    /// or below `before_row` shifts down by 1. v1 limitations:
+    /// or below `before_row` shifts down by 1.
     ///   - Worksheet XML rewrites: <row r="N"> renumber, <c r="A1">
     ///     row component, <mergeCells> rect bounds, <dimension>.
-    ///   - Refuses if the worksheet contains <hyperlinks>,
-    ///     <dataValidations>, <conditionalFormatting>, <f>
-    ///     formulas, or any <drawing>/<picture> reference — those
-    ///     can carry row indices we don't yet rewrite.
+    ///   - Formulas, defined names, hyperlink locations, DV/CF
+    ///     formulas, drawings (xdr + VML), panes, autoFilter and
+    ///     table parts are rewritten in step (iter-er-5, dr-1/dr-2).
+    ///     Still refused: sheets with pivot tables, `<xm:f>`
+    ///     extension formulas, and unsafe table edits (collapse /
+    ///     header-row delete).
     ///   - The sheet must not have other pending mutations
     ///     (setCell / appendRows / row inserts/deletes); save
     ///     first to apply those.
@@ -855,16 +856,15 @@ pub const Editor = struct {
     }
 
     /// Delete row `row` in sheet `sheet_idx` (Phase 3e, iter-row-3).
-    /// Every row > `row` shifts up by 1. Same v1 limitations as
-    /// `insertRow`.
+    /// Every row > `row` shifts up by 1. Same rewrite coverage and
+    /// refusal contract as `insertRow`.
     pub fn deleteRow(self: *Editor, sheet_idx: u32, row: u32) !void {
         try self.recordRowEdit(sheet_idx, row, false);
     }
 
     /// Insert a blank column at position `before_col` (1-based,
-    /// A=1) in sheet `sheet_idx`. Phase 3e iter-col-3. Same v1
-    /// limitations as `insertRow` — formula bodies, defined names,
-    /// and structured-table refs aren't rewritten and are refused.
+    /// A=1) in sheet `sheet_idx`. Phase 3e iter-col-3. Same
+    /// rewrite coverage and refusal contract as `insertRow`.
     pub fn insertColumn(self: *Editor, sheet_idx: u32, before_col_1based: u32) !void {
         try self.recordColEdit(sheet_idx, before_col_1based, true);
     }
@@ -2930,6 +2930,206 @@ test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)"
         defer ed.deinit();
         try ed.deleteColumn(0, 1);
     }
+}
+
+// C1 wiring — per-edit forwarding proofs. Each of the six
+// structural edits must reach `Workbook.rewriteAllFormulas`; the
+// byte transform alone moves `<c r=>` anchors but never rewrites
+// `<f>` bodies, so asserting the rewritten body text after
+// save → reopen fails exactly when that edit's rewriter call is
+// deleted. One Editor instance per edit: the rewriter stages its
+// output as setCell deltas, which the clean-sheet guard on a
+// following edit would refuse.
+
+test "Editor: insertRow forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_insrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_insrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try s.writeRowWithFormulas(&.{.{ .integer = 3 }}, &.{"A1+A2"});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A4")).?;
+    try std.testing.expectEqualStrings("A1+A3", c.formula.?);
+}
+
+test "Editor: deleteRow forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_delrow_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_delrow_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try s.writeRow(&.{.{ .integer = 2 }});
+        try s.writeRow(&.{.{ .integer = 3 }});
+        try s.writeRowWithFormulas(&.{.{ .integer = 5 }}, &.{"A2+A3"});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.deleteRow(0, 1);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A3")).?;
+    try std.testing.expectEqualStrings("A1+A2", c.formula.?);
+}
+
+test "Editor: insertColumn forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_inscol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_inscol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.writeRowWithFormulas(&.{.{ .integer = 3 }}, &.{"A1+B1"});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.insertColumn(0, 2);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A2")).?;
+    try std.testing.expectEqualStrings("A1+C1", c.formula.?);
+}
+
+test "Editor: deleteColumn forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_delcol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_delcol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } });
+        try s.writeRowWithFormulas(&.{.{ .integer = 6 }}, &.{"C1*2"});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 2);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A2")).?;
+    try std.testing.expectEqualStrings("B1*2", c.formula.?);
+}
+
+test "Editor: renameSheet forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_rename_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_rename_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Alpha");
+        try s1.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"Beta!A1+1"});
+        var s2 = try w.addSheet("Beta");
+        try s2.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.renameSheet(1, "Gamma");
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("Gamma!A1+1", c.formula.?);
+}
+
+test "Editor: deleteSheet forwards formulas to the rewriter (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_delsheet_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_delsheet_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Keep");
+        try s1.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"Doomed!A1+1"});
+        var s2 = try w.addSheet("Doomed");
+        try s2.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.deleteSheet(1);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const c = (try (try wb.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("#REF!+1", c.formula.?);
 }
 
 test "Editor: deleteSheet drops a source sheet (iter-sheet-3)" {
