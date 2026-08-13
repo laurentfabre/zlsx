@@ -3991,10 +3991,21 @@ pub const Workbook = struct {
 
         var patches: std.ArrayList(SourcePatch) = .empty;
         defer patches.deinit(a);
-        try collectDefinedNamePatches(a, source, &patches, &new_bodies);
-        // Typed view and source share entry order; a missing splice
-        // site means the source was mutated under us, which is a
-        // `replacePart`-ordering bug.
+        var body_it = new_bodies.iterator();
+        while (body_it.next()) |e| {
+            // Patch sites come from the PARSER itself — `body_start`/
+            // `body_end` are the raw offsets it recorded while
+            // building this very view — so the view and the patches
+            // cannot disagree on indexing. A second scanner
+            // reproducing the parser's walk diverged on legal XML it
+            // tolerates: whitespace around `=`, commented-out
+            // elements, `>` inside quoted attribute values
+            // (Codex #188 r6).
+            const dn = self.workbook.defined_names[e.key_ptr.*];
+            assert(dn.body_start <= dn.body_end);
+            assert(dn.body_end <= source.len);
+            try patches.append(a, .{ .start = dn.body_start, .end = dn.body_end, .new = e.value_ptr.* });
+        }
         assert(patches.items.len == changed);
 
         const new_xml = try spliceFormulas(a, source, patches.items);
@@ -8495,6 +8506,28 @@ const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 ///
 /// Helper used only by
 /// `Workbook.rewriteAllValidationsAndConditionalFormats`.
+/// Find the next occurrence of a literal closing tag (`</c>`,
+/// `</sheetData>`, …) that is REAL markup — comments, CDATA
+/// sections, PIs and DOCTYPE blocks are skipped via the workbook
+/// scanner's `skipNonElement`, so a decoy inside `<!-- … -->` can
+/// never terminate an element early. Returns the index of the `<`.
+fn findClosingTagAware(source: []const u8, from: usize, close_tag: []const u8) ?usize {
+    assert(close_tag.len >= 3);
+    assert(close_tag[0] == '<' and close_tag[1] == '/');
+    var i = from;
+    while (i < source.len) {
+        const lt = std.mem.indexOfScalarPos(u8, source, i, '<') orelse return null;
+        const skip_to = workbook_xml_mod.skipNonElement(source, lt) catch return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (std.mem.startsWith(u8, source[lt..], close_tag)) return lt;
+        i = lt + 1;
+    }
+    return null;
+}
+
 /// Collect source-byte patches for rewritten CELL formula bodies:
 /// locate each staged `<c r="REF">`'s `<f …>` inner text inside the
 /// raw sheet XML and queue the decoded replacement. Only the body
@@ -8504,6 +8537,13 @@ const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 /// and cached `<v>` values all stay byte-identical. Regenerating
 /// `sheetData` from the typed view drops everything the model
 /// doesn't carry (Codex #188 r5).
+///
+/// Scanning rides the workbook scanner (`findTagOpen` /
+/// `skipNonElement` / `getAttr`): comment/CDATA/PI decoys are
+/// skipped and quoted attribute values may contain `>` — a
+/// hand-rolled `indexOf` walk patched a decoy `<f>` inside an XML
+/// comment while the live formula kept its old bytes
+/// (Codex #188 r6).
 fn collectCellFormulaPatches(
     a: Allocator,
     source: []const u8,
@@ -8511,99 +8551,44 @@ fn collectCellFormulaPatches(
     new_bodies: *const std.StringHashMapUnmanaged([]u8),
 ) Error!void {
     assert(source.len > 0);
-    const sd_open = std.mem.indexOf(u8, source, "<sheetData") orelse return;
-    const sd_open_gt = std.mem.indexOfScalarPos(u8, source, sd_open, '>') orelse
-        return error.NoSheetData;
-    if (sd_open_gt > 0 and source[sd_open_gt - 1] == '/') return; // <sheetData/>
-    const sd_close = std.mem.indexOfPos(u8, source, sd_open_gt, "</sheetData>") orelse
+    const sd = (workbook_xml_mod.findTagOpen(source, 0, "sheetData") catch
+        return error.NoSheetData) orelse return;
+    if (sd.self_closing) return;
+    const sd_close = findClosingTagAware(source, sd.after_tag_close, "</sheetData>") orelse
         return error.NoSheetData;
 
-    var probe: usize = sd_open_gt + 1;
+    var probe: usize = sd.after_tag_close;
     while (probe < sd_close) {
-        const c_open = std.mem.indexOfPos(u8, source, probe, "<c") orelse break;
-        if (c_open >= sd_close) break;
-        const after = c_open + "<c".len;
-        if (after >= source.len) break;
-        // Boundary check: reject `<cols>`, `<cfRule>`, and any other
-        // element whose name merely starts with "c".
-        const sep = source[after];
-        if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
-            probe = after;
+        const hit = (workbook_xml_mod.findTagOpen(source, probe, "c") catch
+            return error.NoSheetData) orelse break;
+        if (hit.open_lt >= sd_close) break;
+        if (hit.self_closing) {
+            // `<c r="…"/>` carries no formula.
+            probe = hit.after_tag_close;
             continue;
         }
-        const c_open_gt = std.mem.indexOfScalarPos(u8, source, c_open, '>') orelse
+        const c_close = findClosingTagAware(source, hit.after_tag_close, "</c>") orelse
             return error.NoSheetData;
-        if (c_open_gt > 0 and source[c_open_gt - 1] == '/') {
-            // Self-closing `<c r="…"/>` carries no formula.
-            probe = c_open_gt + 1;
-            continue;
-        }
-        const c_close = std.mem.indexOfPos(u8, source, c_open_gt, "</c>") orelse
-            return error.NoSheetData;
-        const attrs = source[after..c_open_gt];
-        if (extractAttrValue(attrs, "r")) |ref| {
+        const attrs = source[hit.attrs_start..hit.attrs_end];
+        if (workbook_xml_mod.getAttr(attrs, "r")) |ref| {
             if (new_bodies.get(ref)) |new_body| {
-                if (findInnerSpan(source, c_open_gt + 1, c_close, "<f", "</f>")) |span| {
-                    try out.append(a, .{ .start = span[0], .end = span[1], .new = new_body });
+                if (workbook_xml_mod.findTagOpen(source, hit.after_tag_close, "f") catch
+                    return error.NoSheetData) |f_hit|
+                {
+                    if (f_hit.open_lt < c_close and !f_hit.self_closing) {
+                        const f_close = findClosingTagAware(source, f_hit.after_tag_close, "</f>") orelse
+                            return error.NoSheetData;
+                        assert(f_close < c_close);
+                        try out.append(a, .{
+                            .start = f_hit.after_tag_close,
+                            .end = f_close,
+                            .new = new_body,
+                        });
+                    }
                 }
             }
         }
         probe = c_close + "</c>".len;
-    }
-}
-
-/// Locate `<definedName>` body spans in raw workbook.xml, indexed
-/// exactly the way `workbook_xml`'s parser indexes entries: scoped
-/// to the `<definedNames>` section, self-closing tags and tags
-/// without a non-empty `name=` attribute are skipped WITHOUT
-/// consuming an index. Only queued indices produce patches; every
-/// other byte of the part — including attributes the typed model
-/// doesn't carry (`workbookParameter`, `function`, `vbProcedure`,
-/// comments) — is preserved verbatim (Codex #188 r5).
-fn collectDefinedNamePatches(
-    a: Allocator,
-    source: []const u8,
-    out: *std.ArrayList(SourcePatch),
-    new_bodies: *const std.AutoHashMapUnmanaged(usize, []u8),
-) Error!void {
-    assert(source.len > 0);
-    const dn_open = std.mem.indexOf(u8, source, "<definedNames") orelse return;
-    const dn_open_gt = std.mem.indexOfScalarPos(u8, source, dn_open, '>') orelse
-        return error.MalformedXml;
-    if (dn_open_gt > 0 and source[dn_open_gt - 1] == '/') return; // <definedNames/>
-    const dn_close = std.mem.indexOfPos(u8, source, dn_open_gt, "</definedNames>") orelse
-        return error.MalformedXml;
-
-    var probe: usize = dn_open_gt + 1;
-    var idx: usize = 0;
-    while (probe < dn_close) {
-        const e_open = std.mem.indexOfPos(u8, source, probe, "<definedName") orelse break;
-        if (e_open >= dn_close) break;
-        const after = e_open + "<definedName".len;
-        if (after >= source.len) break;
-        const sep = source[after];
-        if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
-            probe = after;
-            continue;
-        }
-        const e_open_gt = std.mem.indexOfScalarPos(u8, source, e_open, '>') orelse
-            return error.MalformedXml;
-        if (e_open_gt > 0 and source[e_open_gt - 1] == '/') {
-            probe = e_open_gt + 1;
-            continue;
-        }
-        const body_start = e_open_gt + 1;
-        const close_idx = std.mem.indexOfPos(u8, source, body_start, "</definedName>") orelse
-            return error.MalformedXml;
-        const attrs = source[after..e_open_gt];
-        const name = extractAttrValue(attrs, "name");
-        if (name != null and name.?.len > 0) {
-            if (new_bodies.get(idx)) |new_body| {
-                try out.append(a, .{ .start = body_start, .end = close_idx, .new = new_body });
-            }
-            idx += 1;
-        }
-        probe = close_idx + "</definedName>".len;
     }
 }
 
@@ -12843,6 +12828,110 @@ test "Workbook.rewriteAllDefinedNames: unmodeled attributes survive a body rewri
     try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
     const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
     try std.testing.expect(std.mem.indexOf(u8, bytes, "workbookParameter=\"1\"") != null);
+}
+
+test "Workbook.rewriteAllFormulas: comment decoy <f> is not the patch site" {
+    // Codex #188 r6: the typed view parses SANITIZED bytes (comments
+    // stripped) while the patcher walks the raw source — a naive
+    // `indexOf` walk patched the decoy `<f>` inside the comment and
+    // left the live formula pointing at the old sheet.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-decoy-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-decoy-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        _ = try ws.ensureParsed();
+        const new_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><!-- <f>decoy</f> --><f>Sheet1:Sheet2!B1</f><v>7</v></c>" ++
+            "</row></sheetData></worksheet>";
+        try wb.store.replacePart(ws.resolved_part_name.?, new_xml);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "New");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws2 = try wb2.sheet(0);
+    _ = try ws2.ensureParsed();
+    const bytes = (try wb2.store.part(ws2.resolved_part_name.?)).?.bytes;
+    // The LIVE formula rewrote; the decoy comment is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<f>Sheet1:New!B1</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<!-- <f>decoy</f> -->") != null);
+}
+
+test "Workbook.rewriteAllDefinedNames: parser-recorded spans defeat decoys and odd grammar" {
+    // Codex #188 r6: patch sites now come from the parser's own
+    // body offsets, so entries a second scanner mis-indexed — a
+    // commented-out decoy element, whitespace around `=`, a `>`
+    // inside a quoted attribute value — cannot skew the splice.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-decoy-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<!-- <definedName name=\"Ghost\">Sheet1:Sheet2!Z9</definedName> -->" ++
+                "<definedName name = \"First\" comment=\"a>b\">Sheet1:Sheet2!A1</definedName>" ++
+                "<definedName name=\"Second\">Sheet1:Sheet2!B1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(usize, 2), wb.definedNames().len);
+    try wb.renameSheet(0, "New");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-decoy-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), wb2.definedNames().len);
+    try std.testing.expectEqualStrings("First", wb2.definedNames()[0].name);
+    try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
+    try std.testing.expectEqualStrings("Second", wb2.definedNames()[1].name);
+    try std.testing.expectEqualStrings("New:Sheet2!B1", wb2.definedNames()[1].formula);
+    const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
+    // The commented-out decoy and the odd-grammar start tag survive
+    // byte-identically.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<!-- <definedName name=\"Ghost\">Sheet1:Sheet2!Z9</definedName> -->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "name = \"First\" comment=\"a>b\"") != null);
 }
 
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {

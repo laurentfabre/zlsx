@@ -66,6 +66,15 @@ pub const DefinedName = struct {
     /// workbook-scoped when null.
     local_sheet_id: ?u32,
     hidden: bool,
+    /// Raw byte span of `formula` inside the xml slice handed to
+    /// `parse` — `xml[body_start..body_end] == formula`. Recorded by
+    /// the parser so a body-splicing editor patches exactly the
+    /// element THIS entry was built from; reproducing the parser's
+    /// indexing with a second scanner diverges on legal XML the
+    /// parser tolerates (whitespace around `=`, commented-out
+    /// elements, `>` inside quoted attribute values).
+    body_start: usize,
+    body_end: usize,
 };
 
 pub const CalcProperties = struct {
@@ -279,6 +288,10 @@ fn collectDefinedNames(
             .formula = formula,
             .local_sheet_id = local_sheet_id,
             .hidden = hidden,
+            // `body_start`/`close_idx` are block-relative; store the
+            // absolute raw offsets.
+            .body_start = section_open + body_start,
+            .body_end = section_open + close_idx,
         });
 
         // Advance past `</definedName>`.
@@ -392,7 +405,7 @@ fn parseCalcProperties(xml: []const u8) Error!CalcProperties {
 
 // ─── XML scanner primitives ──────────────────────────────────────────
 
-const TagHit = struct {
+pub const TagHit = struct {
     /// Byte index of the opening `<`.
     open_lt: usize,
     /// Index of the first byte of the attributes region (just past the
@@ -410,7 +423,7 @@ const TagHit = struct {
 /// Locate the next `<tag` whose name matches `tag` exactly, starting
 /// from `from`. Skips XML comments, CDATA, processing instructions,
 /// and DOCTYPE blocks. Returns `null` when no further match exists.
-fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) Error!?TagHit {
+pub fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) Error!?TagHit {
     assert(tag.len > 0);
 
     var i: usize = from;
@@ -483,7 +496,7 @@ fn isTagNameBoundary(c: u8) bool {
 
 /// If `xml[at]..` opens a comment / CDATA / PI / DOCTYPE, return the
 /// index just past the construct. Otherwise return `at` unchanged.
-fn skipNonElement(xml: []const u8, at: usize) Error!usize {
+pub fn skipNonElement(xml: []const u8, at: usize) Error!usize {
     assert(at < xml.len);
     assert(xml[at] == '<');
 
@@ -604,7 +617,7 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
 /// the helper in `src/xlsx.zig` (kept private here so this file is
 /// self-contained per the project's per-typed-part isolation rule).
 /// Values are returned verbatim — no entity decoding.
-fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
+pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
     assert(name.len > 0);
     var i: usize = 0;
     while (i < attrs.len) {
