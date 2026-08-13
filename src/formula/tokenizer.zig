@@ -840,14 +840,16 @@ fn scanR1C1Atom(input: []const u8, start: usize) ?ScannedR1C1 {
         row = scanR1C1Part(input, &i, "Cc") orelse return null;
     }
     var col: ?R1C1Part = null;
-    var col_mark = i;
+    const col_mark = i;
     if (i < input.len and (input[i] == 'C' or input[i] == 'c')) {
-        col_mark = i;
-        col = scanR1C1Part(input, &i, "");
-        // A malformed col part doesn't sink a valid row: in
-        // `R[1]C$2` the atom is `R[1]` and `C$2` lexes on its own
-        // (as the A1 ref it spells).
-        if (col == null) i = col_mark;
+        // A failed col ATTEMPT sinks the whole atom (Codex #192 F2):
+        // merging just the row prefix of `R[8]C[99999999]` or
+        // `R[1]C$2` would hand the rewriter a live atom that is a
+        // strict prefix of a construct it couldn't read, and the
+        // leftover bytes would rewrite under their A1 reading. The
+        // full fallback keeps every such spelling byte-identical to
+        // its pre-merge tokenization.
+        col = scanR1C1Part(input, &i, "") orelse return null;
     }
     // Shape gate: which part combinations are R1C1 rather than a name
     // or an A1 ref. `RC4` is column RC row 4 (cell-ref precedence,
@@ -1353,9 +1355,16 @@ test "R1C1: unclean spellings keep the pre-merge fragment tokenization" {
     try expectKinds("R[foo]", &.{ .name, .structured_ref });
     try expectRefusals("R[foo]", &.{.r1c1_reference});
     try expectKinds("R[]", &.{ .name, .structured_ref });
-    // A col part that keeps going as a lexeme is not a col part.
-    try expectKinds("R[1]C2x", &.{ .r1c1_ref, .name });
-    try expectKinds("R[1]C$2", &.{ .r1c1_ref, .cell_ref });
+    // A failed col ATTEMPT sinks the whole atom (Codex #192 F2):
+    // merging just `R[1]` would leave bytes that rewrite under
+    // their A1 reading. These keep the full pre-merge fragment
+    // stream — where `[1]` scans as an external-workbook index,
+    // whose chain-skip is what protects the tail fragments.
+    try expectKinds("R[1]C2x", &.{ .name, .external_ref, .name });
+    try expectRefusals("R[1]C2x", &.{ .r1c1_reference, .external_reference });
+    try expectKinds("R[1]C$2", &.{ .name, .external_ref, .cell_ref });
+    try expectKinds("R[8]C[99999999]", &.{ .name, .external_ref, .name, .structured_ref });
+    try expectRefusals("R[8]C[99999999]", &.{ .r1c1_reference, .external_reference, .r1c1_reference });
 }
 
 test "R1C1: parseR1C1AtomText decomposes exactly what the scanner merged" {

@@ -5555,6 +5555,33 @@ pub const Workbook = struct {
         if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
 
         const part_name = try ws.resolvePartName();
+
+        // The FORMULA sweep runs BEFORE the byte transform (Codex
+        // #192 F1): formula text spells PRE-edit positions, and
+        // relative R1C1 parts respell against RewriteContext.host —
+        // the formula's own cell — which must live in that same
+        // pre-edit space. Post-transform, `c.ref` is the shifted
+        // coordinate: a `R[-1]C` in B6 under deleteRow(4) re-parsed
+        // from B5 would infer target B4 = "deleted" and corrupt to
+        // #REF!. The A1 path is order-blind (it maps text positions
+        // only), so only this sweep moves; the three host-free
+        // sweeps below stay after the transform.
+        const target = try store_mod.decodeXmlEntities(self.allocator, self.workbook.sheets[sheet_idx].name);
+        defer self.allocator.free(target);
+        const edit: zlsx.formula_rewriter.RewriteEdit = if (spec.row) |r|
+            switch (spec.kind) {
+                .insert => .{ .insert_rows = .{ .at = r, .count = 1 } },
+                .delete => .{ .delete_rows = .{ .at = r, .count = 1 } },
+            }
+        else switch (spec.kind) {
+            .insert => .{ .insert_cols = .{ .at = spec.col.?, .count = 1 } },
+            .delete => .{ .delete_cols = .{ .at = spec.col.?, .count = 1 } },
+        };
+        _ = try self.rewriteAllFormulas(edit, target, null);
+
+        // Re-fetch AFTER the sweep: a rewrite replaced the part, and
+        // the transform must shift the spliced bytes, not the stale
+        // originals.
         const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
 
         const new_xml = if (spec.row) |r|
@@ -5593,33 +5620,12 @@ pub const Workbook = struct {
             ws.parsed = null;
         }
 
-        // B2 iter-er-5 lift (row/col axes): rewrite cross-sheet
-        // refs in formulas, defined names, internal hyperlink
-        // locations, and DV/CF formulas. Each rewriter targets the
-        // edited sheet's bare-ref space so references like
-        // `=A1+B2` (no sheet qualifier) on the edited sheet shift
-        // alongside the byte-level row/col attrs above.
-        //
-        // The four rewriters write their edits as
-        // `Worksheet.setCell` deltas (formulas) or in-place splices
-        // (defined names, hyperlinks, DV/CF). Both compose with
-        // the byte transform: the parsed view we just invalidated
-        // re-parses from the shifted bytes on next access, so
-        // `emitWithDeltas` at save time merges shifted-ref text
-        // with shifted-r-attr cells.
-        // Decoded per the rewrite boundary's decode-in contract.
-        const target = try store_mod.decodeXmlEntities(self.allocator, self.workbook.sheets[sheet_idx].name);
-        defer self.allocator.free(target);
-        const edit: zlsx.formula_rewriter.RewriteEdit = if (spec.row) |r|
-            switch (spec.kind) {
-                .insert => .{ .insert_rows = .{ .at = r, .count = 1 } },
-                .delete => .{ .delete_rows = .{ .at = r, .count = 1 } },
-            }
-        else switch (spec.kind) {
-            .insert => .{ .insert_cols = .{ .at = spec.col.?, .count = 1 } },
-            .delete => .{ .delete_cols = .{ .at = spec.col.?, .count = 1 } },
-        };
-        _ = try self.rewriteAllFormulas(edit, target, null);
+        // B2 iter-er-5 lift (row/col axes), remaining carriers:
+        // defined names, internal hyperlink locations, and DV/CF
+        // formulas. All three splice text in place and carry no
+        // host, so they compose with the byte transform in either
+        // order; the formula sweep already ran ABOVE the transform
+        // (see there for why).
         _ = try self.rewriteAllDefinedNames(edit, target);
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
@@ -12481,6 +12487,53 @@ test "Workbook.rewriteAllFormulas: relative R1C1 respells against each cell's ow
     try std.testing.expectEqualStrings("R2C2", (try s0.cellByRef("A1")).?.formula.?);
     try std.testing.expectEqualStrings("R[-2]C", (try s0.cellByRef("B5")).?.formula.?);
     try std.testing.expectEqualStrings("SUM(R[3]C,R4C1)", (try s0.cellByRef("C3")).?.formula.?);
+}
+
+test "Workbook.deleteRow: R1C1 hosts are pre-edit coordinates (transform ordering)" {
+    // Codex #192 F1: the byte transform used to run BEFORE the
+    // formula sweep, so a formula's `c.ref` arrived post-edit while
+    // the host arithmetic assumed pre-edit space: `R[-1]C` in D6
+    // under deleteRow(4) re-parsed from D5, inferred target D4 =
+    // "deleted", and corrupted to #REF!. The sweep now runs first.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-delrow-r1c1-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Host D6 → D5, target D5 → D4: offset intact.
+        try s0.setCell("D6", .{ .formula = "R[-1]C" });
+        // Host E6 → E5, target E3 unmoved: offset narrows.
+        try s0.setCell("E6", .{ .formula = "R[-3]C" });
+        // A1 guard: order-blind behavior unchanged.
+        try s0.setCell("F6", .{ .formula = "B7+1" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try wb.deleteRow(0, 4);
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-delrow-r1c1-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    try std.testing.expectEqualStrings("R[-1]C", (try s0.cellByRef("D5")).?.formula.?);
+    try std.testing.expectEqualStrings("R[-2]C", (try s0.cellByRef("E5")).?.formula.?);
+    try std.testing.expectEqualStrings("B6+1", (try s0.cellByRef("F5")).?.formula.?);
 }
 
 test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formulas" {

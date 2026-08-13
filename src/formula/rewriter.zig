@@ -664,6 +664,32 @@ fn hostSheetMoves(ctx: RewriteContext) bool {
     return casefold.excelSheetNameEql(ctx.on_sheet.?, ctx.target_sheet.?);
 }
 
+/// True when every present part of `atom` provably denotes an
+/// in-grid position — or cannot be checked (relative with no host).
+/// Digits parts must sit in [1, cap]; relative parts with a known
+/// host must resolve into the grid.
+fn r1c1AtomInGrid(atom: tokenizer.R1C1Atom, host: ?Host) bool {
+    if (atom.row) |p| {
+        if (!r1c1PartInGrid(p, if (host) |h| h.row else null, MAX_ROWS)) return false;
+    }
+    if (atom.col) |p| {
+        if (!r1c1PartInGrid(p, if (host) |h| h.col else null, MAX_COLS)) return false;
+    }
+    return true;
+}
+
+fn r1c1PartInGrid(part: tokenizer.R1C1Part, host_pos: ?u32, cap: u32) bool {
+    switch (part.form) {
+        .digits => return part.value >= 1 and part.value <= cap,
+        .bracket, .bare => {
+            const h = host_pos orelse return true; // unresolvable ≠ invalid
+            if (h < 1 or h > cap) return false;
+            const t = @as(i64, h) + part.value;
+            return t >= 1 and t <= cap;
+        },
+    }
+}
+
 const R1C1TokenOutcome = union(enum) {
     unchanged,
     /// New token text, already registered in `owned`.
@@ -703,6 +729,14 @@ fn shiftR1C1Text(
     // Defensive: scanner output always re-parses; treat "doesn't"
     // as "don't touch" rather than trusting and asserting.
     const atom = tokenizer.parseR1C1AtomText(text) orelse return .unchanged;
+    // Whole-atom veto (Codex #192 F3): an atom with a PROVABLY
+    // out-of-grid component on EITHER axis (`R0C1`, a relative part
+    // whose known host resolves off-grid) is not a reference this
+    // rewriter understands — rewriting its other axis would mutate
+    // half of a construct main left untouched. A relative part with
+    // an UNKNOWN host is merely unresolvable, not invalid; the
+    // documented per-axis conservatism still applies to it.
+    if (!r1c1AtomInGrid(atom, host)) return .unchanged;
     const part = (if (axis == .rows) atom.row else atom.col) orelse {
         // Whole-axis atom on the perpendicular axis (`C[2]` under a
         // row edit): the reference spans every position the edit
@@ -1386,9 +1420,13 @@ fn endOfExternalReference(work: []const Token, start: usize) usize {
     }
     if (i < work.len and work[i].kind == .bang) i += 1;
     if (i < work.len and (work[i].kind == .cell_ref or work[i].kind == .r1c1_ref)) {
-        const pair_kind = work[i].kind;
         i += 1;
-        if (i + 1 < work.len and work[i].kind == .op_range and work[i + 1].kind == pair_kind) {
+        // Second endpoint: either notation (Codex #192 F4 — a mixed
+        // `[1]Sheet1!R5C3:A6` is still one external chain; leaving
+        // the A1 half for the walk would rewrite it as local).
+        if (i + 1 < work.len and work[i].kind == .op_range and
+            (work[i + 1].kind == .cell_ref or work[i + 1].kind == .r1c1_ref))
+        {
             i += 2;
         }
     } else if (matchAxisRange(work, i)) |_| {
@@ -3858,12 +3896,51 @@ test "R1C1: absolute atoms shift like A1 anchors" {
         "R1048576C1",
     );
     // Out-of-grid SPELLING (`R0C1` — no such row): never reasoned
-    // about, never touched.
+    // about, never touched — on EITHER axis. A column edit must not
+    // rewrite the valid col part of an atom whose row part is
+    // invalid (Codex #192 F3).
     try expectRewrite(
         "R0C1",
         .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
         "R0C1",
     );
+    try expectRewrite(
+        "R0C1",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "R0C1",
+    );
+    try expectRewrite(
+        "R1C0",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R1C0",
+    );
+    // A relative part whose KNOWN host resolves off-grid also vetoes
+    // the whole atom (wrap-around is not modeled).
+    try expectRewrite(
+        "R[-9]C5",
+        .{
+            .host = .{ .row = 5, .col = 3 },
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "R[-9]C5",
+    );
+}
+
+test "R1C1: a failed col attempt never leaves a live row prefix" {
+    // Codex #192 F2: `R[8]C[99999999]` (8-digit offset) must not
+    // merge `R[8]` alone and shift it inside a construct the
+    // rewriter couldn't read. The full fragment fallback keeps the
+    // bytes under every edit, host or no host.
+    try expectIdentityUnderEveryEdit("R[8]C[99999999]");
+    try expectRewrite(
+        "R[8]C[99999999]",
+        .{
+            .host = .{ .row = 1, .col = 1 },
+            .edit = .{ .insert_rows = .{ .at = 9, .count = 1 } },
+        },
+        "R[8]C[99999999]",
+    );
+    try expectIdentityUnderEveryEdit("R[1]C$2");
 }
 
 test "R1C1: the fragment-corruption class is closed" {
@@ -4134,6 +4211,9 @@ test "R1C1: 3D-qualified atoms shift and collapse like their A1 kin" {
 test "R1C1: external-workbook R1C1 tails stay untouchable" {
     try expectIdentityUnderEveryEdit("[1]Sheet1!R5C3");
     try expectIdentityUnderEveryEdit("'[Book.xlsx]Sheet1'!R1C1");
+    // Mixed-notation external range: the A1 endpoint is part of the
+    // same external chain, not a local ref (Codex #192 F4).
+    try expectIdentityUnderEveryEdit("[1]Sheet1!R5C3:A6");
 }
 
 test "R1C1: rewritten spellings re-tokenize as R1C1 atoms" {
