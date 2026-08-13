@@ -1282,6 +1282,11 @@ pub fn build(b: *std.Build) void {
     // this one cannot be confined to a test block — it is what two
     // shipped functions compute with.
     formula_pkg_mod.addImport("zlsx_casing", casing_mod);
+    // C1 wiring: `rewriter.zig` matches row/col target sheets with
+    // `casefold.excelSheetNameEql` — Excel resolves sheet names
+    // case-insensitively (Unicode, NFC-aware), so byte or ASCII
+    // comparison silently skips case-variant qualifiers.
+    formula_pkg_mod.addImport("zlsx_casefold", unicode_mod);
     // `src/xlsx.zig` re-exports the rewriter from here rather than by
     // relative path: `rewriter.zig` and the engine module both contain
     // `tokenizer.zig`, and a file may belong to only one module. Wired
@@ -1314,8 +1319,8 @@ pub fn build(b: *std.Build) void {
     // rewriter. Imports the M1 tokenizer via a relative path inside
     // src/formula/, so this module's package dir matches the
     // tokenizer's. Sibling of formula_tokenizer_mod with its own
-    // test target — the rewriter has no other cross-deps yet
-    // (Workbook.rewriteReferences wiring lands in a later iter).
+    // test target. Deps mirror the file's imports: refs/xid for
+    // coordinates, casefold for Excel-rule sheet-name matching.
     const formula_rewriter_mod = b.createModule(.{
         .root_source_file = b.path("src/formula/rewriter.zig"),
         .target = target,
@@ -1324,6 +1329,7 @@ pub fn build(b: *std.Build) void {
     formula_rewriter_mod.addImport("zlsx_control", control_mod);
     formula_rewriter_mod.addImport("zlsx_refs", refs_mod);
     formula_rewriter_mod.addImport("zlsx_xid", xid_mod);
+    formula_rewriter_mod.addImport("zlsx_casefold", unicode_mod);
     const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rewriter_tests).step);
 
