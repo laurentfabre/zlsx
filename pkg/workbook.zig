@@ -3768,11 +3768,14 @@ pub const Workbook = struct {
     /// Apply a structural-edit rewrite to every formula in every
     /// sheet. Walks each worksheet, materializes its SheetXml, runs
     /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
-    /// `formula != null`, then stages the rewritten text via
-    /// `Worksheet.setCell(ref, .{ .formula = new })`. Returns the
-    /// number of cells rewritten (cells whose rewrite produced
-    /// byte-identical output are NOT counted and don't grow the
-    /// delta map).
+    /// `formula != null`, then patches the changed `<f>` BODIES in
+    /// source-byte space (the DV/CF path's technique): row, cell and
+    /// `<f>` attributes plus cached `<v>` values survive
+    /// byte-identically. Staging through `setCell` instead would
+    /// re-emit whole rows from the typed model and drop everything
+    /// the model doesn't carry (Codex #188 r5). Returns the number
+    /// of cells rewritten (cells whose rewrite produced
+    /// byte-identical output are NOT counted).
     ///
     /// **This rewrites formulas only.** Row/col edits applied here
     /// shift formula references but do NOT structurally move cells —
@@ -3804,9 +3807,8 @@ pub const Workbook = struct {
             const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
             defer a.free(ws_name);
 
-            // Collect (ref, new_text) pairs first so we don't mutate
-            // the Worksheet's delta map while iterating its parsed
-            // view's row/cell slices.
+            // Collect (ref, new_text) pairs first; the source-byte
+            // walk below needs the parsed view's slices intact.
             const Pending = struct { ref: []const u8, text: []u8 };
             var pending: std.ArrayList(Pending) = .empty;
             defer {
@@ -3846,13 +3848,39 @@ pub const Workbook = struct {
                 }
             }
 
-            // Stage the deltas. `setCell` dupes the formula text
-            // into its own allocation, so freeing `pending.items[i].text`
-            // in the defer above is correct.
-            for (pending.items) |p| {
-                try ws.setCell(p.ref, .{ .formula = p.text });
-                count += 1;
-            }
+            if (pending.items.len == 0) continue;
+
+            // Phase B (mirrors the DV/CF path): patch only the
+            // changed `<f>` bodies in the raw part bytes.
+            var new_bodies: std.StringHashMapUnmanaged([]u8) = .empty;
+            defer new_bodies.deinit(a);
+            for (pending.items) |p| try new_bodies.put(a, p.ref, p.text);
+
+            const part_name = ws.resolved_part_name orelse return error.MissingSheetPart;
+            const source = blk: {
+                const p = try self.store.part(part_name) orelse return error.MissingSheetPart;
+                break :blk p.bytes;
+            };
+            assert(source.len > 0);
+
+            var patches: std.ArrayList(SourcePatch) = .empty;
+            defer patches.deinit(a);
+            try collectCellFormulaPatches(a, source, &patches, &new_bodies);
+            // Typed view and source share cell refs; a missing splice
+            // site means the source was mutated under us, which is a
+            // `replacePart`-ordering bug.
+            assert(patches.items.len == pending.items.len);
+
+            const new_xml = try spliceFormulas(a, source, patches.items);
+            defer a.free(new_xml);
+            try self.store.replacePart(part_name, new_xml);
+            count += @intCast(pending.items.len);
+
+            // Invalidate the cached parsed view: its leaves borrowed
+            // from the old part bytes which `replacePart` swapped.
+            var stale = ws.parsed.?;
+            stale.deinit(self.allocator);
+            ws.parsed = null;
         }
         return count;
     }
@@ -3871,19 +3899,20 @@ pub const Workbook = struct {
     /// output differs from the input (byte-identical rewrites are not
     /// counted).
     ///
-    /// **Splice contract.** Three shapes for `<definedNames>` are
-    /// handled in `xl/workbook.xml`:
-    ///   - Paired `<definedNames>...</definedNames>` — classical splice
-    ///   - Self-closing `<definedNames/>` — upgraded to paired form
-    ///   - Block absent — insert fresh paired block before `<calcPr` (or
-    ///     before `</workbook>` if no calcPr)
+    /// **Splice contract.** Changed formula BODIES are patched in
+    /// source-byte space (`collectDefinedNamePatches`); the start
+    /// tags — including attributes the typed model doesn't carry
+    /// (`workbookParameter`, `function`, `vbProcedure`, comments) —
+    /// and every untouched entry survive byte-identically. The
+    /// whole-block regeneration lives on only in the fresh-emit plan
+    /// path (`applyWorkbookXmlPlanDefinedNames`), which must rebuild
+    /// the block to add entries.
     ///
     /// **Bug-fix vs prior iter (PR #37).** The earlier draft re-parsed
     /// `self.workbook` mid-iteration over `defined_names`, leaving the
     /// loop reading freed memory on the sheet-scope branch. This impl
-    /// collects ALL rewrites into parallel allocator-owned arrays
-    /// FIRST, then performs the splice + `replacePart` + re-parse in a
-    /// single transactional step.
+    /// collects ALL rewrites FIRST, then performs the splice +
+    /// `replacePart` + re-parse in a single transactional step.
     pub fn rewriteAllDefinedNames(
         self: *Workbook,
         edit: zlsx.formula_rewriter.RewriteEdit,
@@ -3893,36 +3922,24 @@ pub const Workbook = struct {
 
         if (self.workbook.defined_names.len == 0) return 0;
 
-        // Order snapshot borrows from the workbook arena; every
-        // rewrite below finishes before `refreshWorkbookXmlView`
-        // swaps that arena out.
+        // Order snapshot borrows nothing from the workbook arena
+        // (entries are decoded copies), but every rewrite below still
+        // finishes before `refreshWorkbookXmlView` swaps the arena
+        // the VIEW slices borrow from.
         const sheet_order = try self.sheetOrderSnapshot();
         defer self.freeSheetOrder(sheet_order);
 
-        // Owned strings for every defined name we plan to emit. Either
-        // the rewritten formula (mutated) or a duplicated copy of the
-        // original (unchanged). Owning every entry uniformly simplifies
-        // the splice loop's lifetime story.
-        var owned_formulas: std.ArrayList([]u8) = .empty;
+        // Changed decoded bodies, keyed by the entry's position in
+        // the parsed view — the index `collectDefinedNamePatches`
+        // reproduces over the raw source.
+        var new_bodies: std.AutoHashMapUnmanaged(usize, []u8) = .{};
         defer {
-            for (owned_formulas.items) |s| a.free(s);
-            owned_formulas.deinit(a);
+            var it = new_bodies.iterator();
+            while (it.next()) |e| a.free(e.value_ptr.*);
+            new_bodies.deinit(a);
         }
-        // Parallel arrays: name / local_sheet_id / hidden, dup'd so
-        // they survive the upcoming `refreshWorkbookXmlView` call which
-        // frees the source `defined_names` arena.
-        var owned_names: std.ArrayList([]u8) = .empty;
-        defer {
-            for (owned_names.items) |s| a.free(s);
-            owned_names.deinit(a);
-        }
-        var local_ids: std.ArrayList(?u32) = .empty;
-        defer local_ids.deinit(a);
-        var hiddens: std.ArrayList(bool) = .empty;
-        defer hiddens.deinit(a);
 
-        var changed: u32 = 0;
-        for (self.workbook.defined_names) |dn| {
+        for (self.workbook.defined_names, 0..) |dn, dn_idx| {
             // Resolve `on_sheet`: null for workbook-scope, sheet name
             // for sheet-scope (via local_sheet_id index lookup). The
             // decoded order snapshot doubles as the decoded-name
@@ -3947,46 +3964,42 @@ pub const Workbook = struct {
             };
 
             // Decode-in: `dn.formula` is raw XML inner text (still
-            // entity-escaped); the splice re-escapes every formula on
-            // emit, so raw input double-escaped entity bytes — for
-            // UNTOUCHED names too, since the splice re-emits the
-            // whole block. Decoded copies round-trip exactly.
+            // entity-escaped); the rewriter operates on decoded text
+            // and `spliceFormulas` re-escapes the patched bodies on
+            // emit.
             const decoded = try store_mod.decodeXmlEntities(a, dn.formula);
             const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
                 a.free(decoded);
                 return err;
             };
-            if (!std.mem.eql(u8, rewritten, decoded)) changed += 1;
+            const unchanged = std.mem.eql(u8, rewritten, decoded);
             a.free(decoded);
+            if (unchanged) {
+                a.free(rewritten);
+                continue;
+            }
             errdefer a.free(rewritten);
-
-            // The name IDENTIFIER decodes too — the splice escapes
-            // it on emit, and a raw `&#95;foo` would re-emit as the
-            // broken literal `&amp;#95;foo` (Codex #188 r3).
-            const name_dup = try store_mod.decodeXmlEntities(a, dn.name);
-            errdefer a.free(name_dup);
-
-            try owned_formulas.append(a, rewritten);
-            try owned_names.append(a, name_dup);
-            try local_ids.append(a, dn.local_sheet_id);
-            try hiddens.append(a, dn.hidden);
+            try new_bodies.put(a, dn_idx, rewritten);
         }
 
-        // Pair-assertion: parallel arrays agree in length and match
-        // the source slice's length.
-        assert(owned_formulas.items.len == self.workbook.defined_names.len);
-        assert(owned_names.items.len == self.workbook.defined_names.len);
-        assert(local_ids.items.len == self.workbook.defined_names.len);
-        assert(hiddens.items.len == self.workbook.defined_names.len);
-
+        const changed: u32 = @intCast(new_bodies.count());
         if (changed == 0) return 0;
 
-        try self.spliceDefinedNamesBlock(
-            owned_names.items,
-            owned_formulas.items,
-            local_ids.items,
-            hiddens.items,
-        );
+        const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+        const source = part.bytes;
+        assert(source.len > 0);
+
+        var patches: std.ArrayList(SourcePatch) = .empty;
+        defer patches.deinit(a);
+        try collectDefinedNamePatches(a, source, &patches, &new_bodies);
+        // Typed view and source share entry order; a missing splice
+        // site means the source was mutated under us, which is a
+        // `replacePart`-ordering bug.
+        assert(patches.items.len == changed);
+
+        const new_xml = try spliceFormulas(a, source, patches.items);
+        defer a.free(new_xml);
+        try self.store.replacePart("xl/workbook.xml", new_xml);
 
         // Re-parse so subsequent reads of `self.workbook.defined_names`
         // see the new bytes. Source slice borrows from the OLD bytes
@@ -8482,6 +8495,118 @@ const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 ///
 /// Helper used only by
 /// `Workbook.rewriteAllValidationsAndConditionalFormats`.
+/// Collect source-byte patches for rewritten CELL formula bodies:
+/// locate each staged `<c r="REF">`'s `<f …>` inner text inside the
+/// raw sheet XML and queue the decoded replacement. Only the body
+/// bytes are spliced — row attributes (`ht`, `hidden`,
+/// `customHeight`, outline levels), cell attributes (`cm`, `vm`,
+/// `ph`), `<f>` attributes (`t="shared"`, `si`, `ref`, `t="array"`)
+/// and cached `<v>` values all stay byte-identical. Regenerating
+/// `sheetData` from the typed view drops everything the model
+/// doesn't carry (Codex #188 r5).
+fn collectCellFormulaPatches(
+    a: Allocator,
+    source: []const u8,
+    out: *std.ArrayList(SourcePatch),
+    new_bodies: *const std.StringHashMapUnmanaged([]u8),
+) Error!void {
+    assert(source.len > 0);
+    const sd_open = std.mem.indexOf(u8, source, "<sheetData") orelse return;
+    const sd_open_gt = std.mem.indexOfScalarPos(u8, source, sd_open, '>') orelse
+        return error.NoSheetData;
+    if (sd_open_gt > 0 and source[sd_open_gt - 1] == '/') return; // <sheetData/>
+    const sd_close = std.mem.indexOfPos(u8, source, sd_open_gt, "</sheetData>") orelse
+        return error.NoSheetData;
+
+    var probe: usize = sd_open_gt + 1;
+    while (probe < sd_close) {
+        const c_open = std.mem.indexOfPos(u8, source, probe, "<c") orelse break;
+        if (c_open >= sd_close) break;
+        const after = c_open + "<c".len;
+        if (after >= source.len) break;
+        // Boundary check: reject `<cols>`, `<cfRule>`, and any other
+        // element whose name merely starts with "c".
+        const sep = source[after];
+        if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
+            probe = after;
+            continue;
+        }
+        const c_open_gt = std.mem.indexOfScalarPos(u8, source, c_open, '>') orelse
+            return error.NoSheetData;
+        if (c_open_gt > 0 and source[c_open_gt - 1] == '/') {
+            // Self-closing `<c r="…"/>` carries no formula.
+            probe = c_open_gt + 1;
+            continue;
+        }
+        const c_close = std.mem.indexOfPos(u8, source, c_open_gt, "</c>") orelse
+            return error.NoSheetData;
+        const attrs = source[after..c_open_gt];
+        if (extractAttrValue(attrs, "r")) |ref| {
+            if (new_bodies.get(ref)) |new_body| {
+                if (findInnerSpan(source, c_open_gt + 1, c_close, "<f", "</f>")) |span| {
+                    try out.append(a, .{ .start = span[0], .end = span[1], .new = new_body });
+                }
+            }
+        }
+        probe = c_close + "</c>".len;
+    }
+}
+
+/// Locate `<definedName>` body spans in raw workbook.xml, indexed
+/// exactly the way `workbook_xml`'s parser indexes entries: scoped
+/// to the `<definedNames>` section, self-closing tags and tags
+/// without a non-empty `name=` attribute are skipped WITHOUT
+/// consuming an index. Only queued indices produce patches; every
+/// other byte of the part — including attributes the typed model
+/// doesn't carry (`workbookParameter`, `function`, `vbProcedure`,
+/// comments) — is preserved verbatim (Codex #188 r5).
+fn collectDefinedNamePatches(
+    a: Allocator,
+    source: []const u8,
+    out: *std.ArrayList(SourcePatch),
+    new_bodies: *const std.AutoHashMapUnmanaged(usize, []u8),
+) Error!void {
+    assert(source.len > 0);
+    const dn_open = std.mem.indexOf(u8, source, "<definedNames") orelse return;
+    const dn_open_gt = std.mem.indexOfScalarPos(u8, source, dn_open, '>') orelse
+        return error.MalformedXml;
+    if (dn_open_gt > 0 and source[dn_open_gt - 1] == '/') return; // <definedNames/>
+    const dn_close = std.mem.indexOfPos(u8, source, dn_open_gt, "</definedNames>") orelse
+        return error.MalformedXml;
+
+    var probe: usize = dn_open_gt + 1;
+    var idx: usize = 0;
+    while (probe < dn_close) {
+        const e_open = std.mem.indexOfPos(u8, source, probe, "<definedName") orelse break;
+        if (e_open >= dn_close) break;
+        const after = e_open + "<definedName".len;
+        if (after >= source.len) break;
+        const sep = source[after];
+        if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
+            probe = after;
+            continue;
+        }
+        const e_open_gt = std.mem.indexOfScalarPos(u8, source, e_open, '>') orelse
+            return error.MalformedXml;
+        if (e_open_gt > 0 and source[e_open_gt - 1] == '/') {
+            probe = e_open_gt + 1;
+            continue;
+        }
+        const body_start = e_open_gt + 1;
+        const close_idx = std.mem.indexOfPos(u8, source, body_start, "</definedName>") orelse
+            return error.MalformedXml;
+        const attrs = source[after..e_open_gt];
+        const name = extractAttrValue(attrs, "name");
+        if (name != null and name.?.len > 0) {
+            if (new_bodies.get(idx)) |new_body| {
+                try out.append(a, .{ .start = body_start, .end = close_idx, .new = new_body });
+            }
+            idx += 1;
+        }
+        probe = close_idx + "</definedName>".len;
+    }
+}
+
 fn collectDvCfPatches(
     a: Allocator,
     source: []const u8,
@@ -12617,6 +12742,109 @@ test "Workbook.renameSheet: entity-named sheet renames across both qualifier spe
     try std.testing.expectEqualStrings("Test!B1+Sheet2:Test!C1", a1.formula.?);
 }
 
+test "Workbook.rewriteAllFormulas: rewrite preserves row metadata, f-attrs and cached values" {
+    // Codex #188 r5: staging rewrites through setCell re-emitted
+    // whole rows from the typed model, dropping row heights/hidden
+    // flags, `<f>` attributes (shared/array metadata) and cached
+    // `<v>` values. Source-byte body patching keeps every byte the
+    // rewrite didn't change.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-rowmeta-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-rowmeta-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        _ = try ws.ensureParsed();
+        const part_name = ws.resolved_part_name.?;
+        const new_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheetData><row r=\"1\" ht=\"24\" customHeight=\"1\" hidden=\"1\">" ++
+            "<c r=\"A1\"><f t=\"array\" ref=\"A1\">Sheet1:Sheet2!B1</f><v>7</v></c>" ++
+            "<c r=\"B1\" s=\"0\"><f t=\"shared\" ref=\"B1:B2\" si=\"0\">Sheet2!C1</f><v>3</v></c>" ++
+            "</row></sheetData></worksheet>";
+        try wb.store.replacePart(part_name, new_xml);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "New");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws2 = try wb2.sheet(0);
+    _ = try ws2.ensureParsed();
+    const bytes = (try wb2.store.part(ws2.resolved_part_name.?)).?.bytes;
+    // Both formula bodies rewrote…
+    try std.testing.expect(std.mem.indexOf(u8, bytes, ">Sheet1:New!B1</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, ">New!C1</f>") != null);
+    // …and everything else survived byte-identically.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<row r=\"1\" ht=\"24\" customHeight=\"1\" hidden=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<f t=\"array\" ref=\"A1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<f t=\"shared\" ref=\"B1:B2\" si=\"0\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<v>7</v>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<v>3</v>") != null);
+}
+
+test "Workbook.rewriteAllDefinedNames: unmodeled attributes survive a body rewrite" {
+    // Codex #188 r5: the whole-block regeneration emitted only
+    // name/localSheetId/hidden, silently dropping standard
+    // attributes like workbookParameter. Body patching preserves
+    // the start tag verbatim.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-param-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<definedName name=\"P\" workbookParameter=\"1\">Sheet1:Sheet2!A1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try wb.renameSheet(0, "New");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-param-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
+    const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "workbookParameter=\"1\"") != null);
+}
+
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -13124,10 +13352,11 @@ test "Workbook.rewriteAllDefinedNames: workbook-scope insert_rows shifts and per
 
 test "Workbook.rewriteAllDefinedNames: entity-encoded name identifier survives block re-emit" {
     // Codex #188 r3: a producer may entity-encode a plain-legal
-    // identifier (`name="&#95;foo"` for `_foo`). The splice escapes
-    // on emit, so carrying the raw spelling through re-emitted it as
-    // the broken literal `&amp;#95;foo`. Decode-in must restore the
-    // identifier to its decoded form.
+    // identifier (`name="&#95;foo"` for `_foo`). The old whole-block
+    // regeneration re-emitted the raw spelling as the broken literal
+    // `&amp;#95;foo`; since r5 the rewrite patches formula BODIES
+    // only, so the identifier's original raw spelling survives
+    // byte-identically.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -13165,7 +13394,10 @@ test "Workbook.rewriteAllDefinedNames: entity-encoded name identifier survives b
     var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
     defer wb2.deinit();
     try std.testing.expectEqual(@as(usize, 1), wb2.definedNames().len);
-    try std.testing.expectEqualStrings("_foo", wb2.definedNames()[0].name);
+    // The view exposes raw bytes: the identifier keeps its original
+    // (odd but legal) entity spelling — byte-preservation, not
+    // canonicalization.
+    try std.testing.expectEqualStrings("&#95;foo", wb2.definedNames()[0].name);
     try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
 }
 

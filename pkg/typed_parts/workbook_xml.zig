@@ -325,10 +325,21 @@ fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
                 const semi = std.mem.indexOfScalarPos(u8, s, i + 2, ';') orelse return null;
                 const digits = s[i + 2 .. semi];
                 if (digits.len == 0) return null;
-                const cp = if (digits[0] == 'x' or digits[0] == 'X')
-                    std.fmt.parseInt(u32, digits[1..], 16) catch return null
-                else
-                    std.fmt.parseInt(u32, digits, 10) catch return null;
+                // Validate the digit run before parseInt — parseInt
+                // accepts `+` signs and `_` separators, which XML
+                // numeric references forbid (`&#+49;` is malformed,
+                // not "1").
+                const is_hex = digits[0] == 'x' or digits[0] == 'X';
+                const run = if (is_hex) digits[1..] else digits;
+                if (run.len == 0) return null;
+                for (run) |d| {
+                    const ok = if (is_hex)
+                        std.ascii.isHex(d)
+                    else
+                        d >= '0' and d <= '9';
+                    if (!ok) return null;
+                }
+                const cp = std.fmt.parseInt(u32, run, if (is_hex) 16 else 10) catch return null;
                 if (cp > 127) return null;
                 c = @intCast(cp);
                 consumed = semi - i + 1;
@@ -720,6 +731,22 @@ test "parse: rejects empty input and missing root" {
         error.MissingRoot,
         parse(std.testing.allocator, "<notWorkbook/>"),
     );
+}
+
+test "decodeScalarAttr: decodes entities, rejects malformed numeric refs" {
+    var buf: [32]u8 = undefined;
+    // Named + numeric forms of "1".
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "1").?);
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "&#49;").?);
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "&#x31;").?);
+    try std.testing.expectEqualStrings("true", decodeScalarAttr(&buf, "true").?);
+    // parseInt would accept these; XML numeric references forbid
+    // signs and separators (Codex #188 r5 finding 3).
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#+49;"));
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#4_9;"));
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#x+31;"));
+    // Non-ASCII code points are never valid scalars.
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#955;"));
 }
 
 test "parse: rejects invalid sheetId" {
