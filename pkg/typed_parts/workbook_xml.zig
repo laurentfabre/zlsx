@@ -66,6 +66,15 @@ pub const DefinedName = struct {
     /// workbook-scoped when null.
     local_sheet_id: ?u32,
     hidden: bool,
+    /// Raw byte span of `formula` inside the xml slice handed to
+    /// `parse` — `xml[body_start..body_end] == formula`. Recorded by
+    /// the parser so a body-splicing editor patches exactly the
+    /// element THIS entry was built from; reproducing the parser's
+    /// indexing with a second scanner diverges on legal XML the
+    /// parser tolerates (whitespace around `=`, commented-out
+    /// elements, `>` inside quoted attribute values).
+    body_start: usize,
+    body_end: usize,
 };
 
 pub const CalcProperties = struct {
@@ -250,25 +259,43 @@ fn collectDefinedNames(
             continue;
         }
 
-        // Locate the matching `</definedName>`. We scan from the byte
-        // after the opening tag.
+        // Locate the matching `</definedName>`, comment/CDATA-aware.
+        // A raw `indexOfPos` stopped at a decoy close inside a
+        // comment, which both truncated the recorded body AND left
+        // the scan resuming mid-comment — a fake element in the same
+        // comment then parsed as a real entry whose clean-looking
+        // body was eligible for rewriting (Codex #188 r9).
         const body_start = hit.after_tag_close;
-        const close_idx = std.mem.indexOfPos(u8, block, body_start, "</definedName>") orelse
+        const close_idx = (try findClosingTag(block, body_start, "</definedName>")) orelse
             return error.MalformedXml;
         const formula = block[body_start..close_idx];
 
-        const local_sheet_id: ?u32 = if (getAttr(attrs, "localSheetId")) |s|
-            (std.fmt.parseInt(u32, s, 10) catch return error.InvalidLocalSheetId)
-        else
-            null;
+        // Semantic scalars decode before interpretation: XML resolves
+        // entity references in attribute values, so `hidden="&#49;"`
+        // IS `hidden="1"` — comparing the raw spelling would read it
+        // as false and the defined-names block re-emit would then
+        // silently drop the flag.
+        var lsid_buf: [32]u8 = undefined;
+        const local_sheet_id: ?u32 = if (getAttr(attrs, "localSheetId")) |s| blk: {
+            const dec = decodeScalarAttr(&lsid_buf, s) orelse return error.InvalidLocalSheetId;
+            break :blk std.fmt.parseInt(u32, dec, 10) catch return error.InvalidLocalSheetId;
+        } else null;
 
-        const hidden = if (getAttr(attrs, "hidden")) |s| isXmlTrue(s) else false;
+        var hid_buf: [32]u8 = undefined;
+        const hidden = if (getAttr(attrs, "hidden")) |s|
+            if (decodeScalarAttr(&hid_buf, s)) |dec| isXmlTrue(dec) else false
+        else
+            false;
 
         try out.append(allocator, .{
             .name = name,
             .formula = formula,
             .local_sheet_id = local_sheet_id,
             .hidden = hidden,
+            // `body_start`/`close_idx` are block-relative; store the
+            // absolute raw offsets.
+            .body_start = section_open + body_start,
+            .body_end = section_open + close_idx,
         });
 
         // Advance past `</definedName>`.
@@ -276,9 +303,91 @@ fn collectDefinedNames(
     }
 }
 
+/// Comment/CDATA/PI/DOCTYPE-aware search for a literal closing tag
+/// (`</definedName>`, …). Returns the index of its `<`, or null when
+/// the tag never occurs as real markup.
+pub fn findClosingTag(xml: []const u8, from: usize, close_tag: []const u8) Error!?usize {
+    assert(close_tag.len >= 3);
+    assert(close_tag[0] == '<' and close_tag[1] == '/');
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = try skipNonElement(xml, lt);
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], close_tag)) return lt;
+        i = lt + 1;
+    }
+    return null;
+}
+
 fn isXmlTrue(s: []const u8) bool {
     // OOXML allows "1"/"true" interchangeably for boolean attrs.
     return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+}
+
+/// Decode a SEMANTIC scalar attribute value (bool / integer) into
+/// `buf`: the five named XML entities plus ASCII-range numeric
+/// character references. Scalars are tiny and pure ASCII, so a
+/// decoded byte outside 0..127 or an overflow of `buf` returns null
+/// — the value was never a valid scalar. Unknown named entities pass
+/// their `&` through verbatim, matching `store.decodeXmlEntities`'s
+/// lenient contract.
+fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        var c: u8 = s[i];
+        var consumed: usize = 1;
+        if (s[i] == '&') {
+            const rest = s[i..];
+            if (std.mem.startsWith(u8, rest, "&amp;")) {
+                c = '&';
+                consumed = 5;
+            } else if (std.mem.startsWith(u8, rest, "&lt;")) {
+                c = '<';
+                consumed = 4;
+            } else if (std.mem.startsWith(u8, rest, "&gt;")) {
+                c = '>';
+                consumed = 4;
+            } else if (std.mem.startsWith(u8, rest, "&quot;")) {
+                c = '"';
+                consumed = 6;
+            } else if (std.mem.startsWith(u8, rest, "&apos;")) {
+                c = '\'';
+                consumed = 6;
+            } else if (std.mem.startsWith(u8, rest, "&#")) {
+                const semi = std.mem.indexOfScalarPos(u8, s, i + 2, ';') orelse return null;
+                const digits = s[i + 2 .. semi];
+                if (digits.len == 0) return null;
+                // Validate the digit run before parseInt — parseInt
+                // accepts `+` signs and `_` separators, which XML
+                // numeric references forbid (`&#+49;` is malformed,
+                // not "1").
+                const is_hex = digits[0] == 'x' or digits[0] == 'X';
+                const run = if (is_hex) digits[1..] else digits;
+                if (run.len == 0) return null;
+                for (run) |d| {
+                    const ok = if (is_hex)
+                        std.ascii.isHex(d)
+                    else
+                        d >= '0' and d <= '9';
+                    if (!ok) return null;
+                }
+                const cp = std.fmt.parseInt(u32, run, if (is_hex) 16 else 10) catch return null;
+                if (cp > 127) return null;
+                c = @intCast(cp);
+                consumed = semi - i + 1;
+            }
+        }
+        if (n >= buf.len) return null;
+        buf[n] = c;
+        n += 1;
+        i += consumed;
+    }
+    return buf[0..n];
 }
 
 // ─── Calc properties ─────────────────────────────────────────────────
@@ -320,7 +429,7 @@ fn parseCalcProperties(xml: []const u8) Error!CalcProperties {
 
 // ─── XML scanner primitives ──────────────────────────────────────────
 
-const TagHit = struct {
+pub const TagHit = struct {
     /// Byte index of the opening `<`.
     open_lt: usize,
     /// Index of the first byte of the attributes region (just past the
@@ -338,7 +447,7 @@ const TagHit = struct {
 /// Locate the next `<tag` whose name matches `tag` exactly, starting
 /// from `from`. Skips XML comments, CDATA, processing instructions,
 /// and DOCTYPE blocks. Returns `null` when no further match exists.
-fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) Error!?TagHit {
+pub fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) Error!?TagHit {
     assert(tag.len > 0);
 
     var i: usize = from;
@@ -411,7 +520,7 @@ fn isTagNameBoundary(c: u8) bool {
 
 /// If `xml[at]..` opens a comment / CDATA / PI / DOCTYPE, return the
 /// index just past the construct. Otherwise return `at` unchanged.
-fn skipNonElement(xml: []const u8, at: usize) Error!usize {
+pub fn skipNonElement(xml: []const u8, at: usize) Error!usize {
     assert(at < xml.len);
     assert(xml[at] == '<');
 
@@ -510,7 +619,11 @@ fn findSectionOpen(xml: []const u8, section: []const u8) ?usize {
 }
 
 /// Find the start of `</section>` at or after `from`. Used to bound a
-/// wrapper section's contents.
+/// wrapper section's contents. Comment/CDATA/PI-aware like the rest
+/// of the scanner: a raw search truncated the section at a decoy
+/// close inside a comment, handing the aware entry walk a block that
+/// ends MID-COMMENT — which it then rejected as malformed, refusing
+/// a valid file (Codex #188 r10).
 fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
     assert(section.len > 0);
     // Allocate a small stack buffer for `</section>`. Section names in
@@ -523,7 +636,7 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
     @memcpy(buf[2 .. 2 + section.len], section);
     buf[2 + section.len] = '>';
     const needle = buf[0 .. 3 + section.len];
-    return std.mem.indexOfPos(u8, xml, from, needle);
+    return findClosingTag(xml, from, needle) catch null;
 }
 
 // ─── Attribute extraction ────────────────────────────────────────────
@@ -532,7 +645,7 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
 /// the helper in `src/xlsx.zig` (kept private here so this file is
 /// self-contained per the project's per-typed-part isolation rule).
 /// Values are returned verbatim — no entity decoding.
-fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
+pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
     assert(name.len > 0);
     var i: usize = 0;
     while (i < attrs.len) {
@@ -659,6 +772,22 @@ test "parse: rejects empty input and missing root" {
         error.MissingRoot,
         parse(std.testing.allocator, "<notWorkbook/>"),
     );
+}
+
+test "decodeScalarAttr: decodes entities, rejects malformed numeric refs" {
+    var buf: [32]u8 = undefined;
+    // Named + numeric forms of "1".
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "1").?);
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "&#49;").?);
+    try std.testing.expectEqualStrings("1", decodeScalarAttr(&buf, "&#x31;").?);
+    try std.testing.expectEqualStrings("true", decodeScalarAttr(&buf, "true").?);
+    // parseInt would accept these; XML numeric references forbid
+    // signs and separators (Codex #188 r5 finding 3).
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#+49;"));
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#4_9;"));
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#x+31;"));
+    // Non-ASCII code points are never valid scalars.
+    try std.testing.expectEqual(@as(?[]const u8, null), decodeScalarAttr(&buf, "&#955;"));
 }
 
 test "parse: rejects invalid sheetId" {

@@ -14,7 +14,7 @@
 //!   - Bare A1 ranges:                       A1:B5, $A$1:$B$5
 //!   - Sheet-qualified refs:                 Sheet1!A1, 'My Sheet'!A1:B5
 //!   - Apostrophe-escaped quoted sheets:    'It''s'!A1
-//!   - 3D spans, row/col shifts only:       Sheet1:Sheet3!A1, 'Jan:Mar'!A1
+//!   - 3D spans (all edits):                Sheet1:Sheet3!A1, 'Jan:Mar'!A1
 //!   - Full-column / full-row spans:        A:A, $A:$XFD, 1:5, $1:$1
 //!     (bare, sheet-qualified, and 3D-span spellings). A `name:name`
 //!     pair counts as a full-column span whenever BOTH halves spell an
@@ -30,12 +30,15 @@
 //!     of these its own kind rather than lumping them into
 //!     `.unknown`; `isOpaqueQualifier` is where the rewriter names the
 //!     ones it must not follow.
-//!   - Rename/delete of a 3D span ENDPOINT. Contracting
-//!     `Sheet1:Sheet3` when a member sheet is deleted — or deciding
-//!     whether a renamed sheet sits inside the span — requires the
-//!     workbook's sheet ORDER, which lives in workbook.xml and is
-//!     deliberately invisible to this layer. Those edits keep the
-//!     pre-3D behavior (single-qualifier path only).
+//!
+//! Rename/delete of a 3D span ENDPOINT is in scope when the caller
+//! supplies `RewriteContext.sheet_order` (the workbook's tab order,
+//! as of BEFORE the edit). Renaming an endpoint rewrites its
+//! spelling (order-independent); deleting an endpoint contracts the
+//! span inward to its order-neighbor, with `#REF!` only when the
+//! deletion covers the whole span. Without `sheet_order`, delete
+//! cannot locate the neighbor and leaves the span untouched —
+//! conservative, never corrupting.
 
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
@@ -95,6 +98,18 @@ pub const RewriteContext = struct {
     /// to a sheet named `Edited` / `CAFÉ`, because Excel resolves
     /// sheet names case-insensitively.
     target_sheet: ?[]const u8 = null,
+    /// Workbook tab order (sheet names, first tab first), as of
+    /// BEFORE the edit is applied: for `delete_sheet` it still
+    /// contains the doomed sheet; for `rename_sheet` it spells the
+    /// OLD name. Enables 3D span endpoint edits (contracting
+    /// `Sheet1:Sheet3` when an endpoint is deleted) and mid-span
+    /// membership for `target_sheet` scoping. Name resolution
+    /// against this list is Excel's case rule
+    /// (`casefold.excelSheetNameEql`), like `target_sheet`. `null`
+    /// means "order unknown": rename still rewrites endpoints
+    /// (order-independent), delete leaves spans it cannot contract
+    /// untouched, and mid-span targets conservatively don't match.
+    sheet_order: ?[]const []const u8 = null,
     edit: RewriteEdit,
 };
 
@@ -593,15 +608,6 @@ fn applyEdit(
 ) Error!void {
     assert(work.len >= 0);
 
-    // 3D spans participate in row/col shifts only. Rename/delete of
-    // a span endpoint needs the workbook's sheet order (see module
-    // header), so those edits skip the 3D matcher and fall through
-    // to the single-qualifier path unchanged.
-    const edit_shifts = switch (ctx.edit) {
-        .insert_rows, .delete_rows, .insert_cols, .delete_cols => true,
-        .rename_sheet, .delete_sheet => false,
-    };
-
     var i: usize = 0;
     while (i < work.len) {
         // An external-workbook prefix disqualifies everything it
@@ -618,13 +624,12 @@ fn applyEdit(
         // Detect 3D span: (sheet_name | name) : (sheet_name | name)
         // bang cell_ref [: cell_ref]. Must run before the single-
         // sheet matcher, which would otherwise claim the second
-        // endpoint (`Sheet3!A1`) and shift under the wrong scoping.
-        if (edit_shifts) {
-            if (matchThreeDQualifier(work, i)) |info| {
-                try rewriteThreeD(allocator, work, owned, ctx, info);
-                i = info.end;
-                continue;
-            }
+        // endpoint (`Sheet3!A1`) and shift — or rename/collapse —
+        // under the wrong scoping.
+        if (matchThreeDQualifier(work, i)) |info| {
+            try rewriteThreeD(allocator, work, owned, ctx, info);
+            i = info.end;
+            continue;
         }
 
         // Detect sheet qualifier: (sheet_name | name) bang cell_ref [: cell_ref]
@@ -865,28 +870,230 @@ fn decodeSheetToken(allocator: std.mem.Allocator, tok: Token) Error![]u8 {
     return allocator.dupe(u8, tok.text);
 }
 
-/// Row/col target matching for a decoded sheet qualifier. A colon is
+/// Decoded 3D span endpoints, in WRITTEN order (a reversed spelling
+/// like `Sheet3:Sheet1` keeps its orientation; arithmetic normalises
+/// internally and writes back positionally, mirroring `AxisRange`).
+const SpanHalves = struct { first: []const u8, second: []const u8 };
+
+/// Split a decoded sheet qualifier into 3D-span halves. A colon is
 /// illegal in Excel sheet names, so a decoded qualifier containing
 /// exactly one colon with text on both sides can only be the quoted
-/// 3D span spelling (`'Jan:Mar'!A1`); the target then matches either
-/// endpoint. Mid-span membership (Feb in Jan:Mar) needs the
-/// workbook's sheet order, which this layer cannot see — a mid-span
-/// target does not match and the ref stays put. Name comparison
-/// follows Excel's case rule — see `RewriteContext.target_sheet`.
-fn sheetTargetMatches(decoded: []const u8, target: []const u8) bool {
-    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse
-        return casefold.excelSheetNameEql(decoded, target);
+/// 3D span spelling (`'Jan:Mar'!A1`). Null for anything else.
+fn splitQuotedSpan(decoded: []const u8) ?SpanHalves {
+    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return null;
     const first = decoded[0..colon];
     const second = decoded[colon + 1 ..];
-    const is_span = first.len >= 1 and second.len >= 1 and
-        std.mem.indexOfScalar(u8, second, ':') == null;
-    if (!is_span) return casefold.excelSheetNameEql(decoded, target);
-    return casefold.excelSheetNameEql(first, target) or casefold.excelSheetNameEql(second, target);
+    if (first.len == 0 or second.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, second, ':') != null) return null;
+    return .{ .first = first, .second = second };
 }
 
-/// Apply a row/col shift to a 3D span's cell refs. The endpoints
-/// themselves are never mutated here — only the trailing A1 part
-/// shifts, with the same semantics as a single-sheet qualified ref.
+/// Position of `name` in the workbook tab order. A byte-exact entry
+/// wins outright; otherwise the name resolves with Excel's case rule
+/// — but only when that resolution is UNIQUE. Excel forbids
+/// case-variant duplicate sheet names, so a well-formed order never
+/// has two case-fold matches; a malformed or caller-supplied order
+/// that does is ambiguous, and span arithmetic through an arbitrary
+/// pick could contract through the wrong interval. Null means "do
+/// not run span arithmetic" — the conservative signal.
+fn orderIndexOf(order: []const []const u8, name: []const u8) ?usize {
+    var folded: ?usize = null;
+    var folded_count: usize = 0;
+    for (order, 0..) |entry, idx| {
+        if (std.mem.eql(u8, entry, name)) return idx;
+        if (casefold.excelSheetNameEql(entry, name)) {
+            folded = idx;
+            folded_count += 1;
+        }
+    }
+    return if (folded_count == 1) folded else null;
+}
+
+/// True when `target` is a member of the span `first:second` —
+/// an endpoint, or (when `order` is supplied) a mid-span sheet.
+/// Without `order`, mid-span membership is undecidable and the
+/// target conservatively does not match.
+fn spanContainsTarget(
+    first: []const u8,
+    second: []const u8,
+    target: []const u8,
+    order: ?[]const []const u8,
+) bool {
+    if (casefold.excelSheetNameEql(first, target)) return true;
+    if (casefold.excelSheetNameEql(second, target)) return true;
+    const ord = order orelse return false;
+    const ti = orderIndexOf(ord, target) orelse return false;
+    const fi = orderIndexOf(ord, first) orelse return false;
+    const si = orderIndexOf(ord, second) orelse return false;
+    return @min(fi, si) <= ti and ti <= @max(fi, si);
+}
+
+/// Row/col target matching for a decoded sheet qualifier. For the
+/// quoted 3D span spelling (`'Jan:Mar'!A1`) the target matches
+/// either endpoint, or any mid-span member when the workbook order
+/// is available. Name comparison follows Excel's case rule — see
+/// `RewriteContext.target_sheet`.
+fn sheetTargetMatches(decoded: []const u8, target: []const u8, order: ?[]const []const u8) bool {
+    const span = splitQuotedSpan(decoded) orelse
+        return casefold.excelSheetNameEql(decoded, target);
+    return spanContainsTarget(span.first, span.second, target, order);
+}
+
+/// What `delete_sheet` does to a 3D span, decided from the decoded
+/// endpoint names and the workbook tab order. Endpoint matching is
+/// byte-exact, mirroring the pinned single-qualifier rename/delete
+/// semantics; order positions resolve with Excel's case rule.
+const SpanDeleteOutcome = union(enum) {
+    /// Doomed sheet is mid-span, outside the span, or an endpoint we
+    /// cannot contract (no order / unresolvable name). A mid-span
+    /// member is never spelled in the text, so "unchanged" is exact
+    /// for the first two and conservative for the rest.
+    unchanged,
+    /// The deletion covers the whole span — the qualified ref
+    /// collapses to `#REF!`.
+    collapse,
+    /// The deleted endpoint steps inward to its order-neighbor;
+    /// slices borrow from `order` or the caller's decoded names.
+    contract: SpanHalves,
+};
+
+fn deleteSpanOutcome(
+    first: []const u8,
+    second: []const u8,
+    doomed: []const u8,
+    order: ?[]const []const u8,
+) SpanDeleteOutcome {
+    const first_matches = std.mem.eql(u8, first, doomed);
+    const second_matches = std.mem.eql(u8, second, doomed);
+    // Both endpoints spell the doomed sheet: the span covers exactly
+    // one sheet position, so the deletion covers the whole span —
+    // decidable without any order.
+    if (first_matches and second_matches) return .collapse;
+    if (!first_matches and !second_matches) return .unchanged;
+
+    const ord = order orelse return .unchanged;
+    const fi = orderIndexOf(ord, first) orelse return .unchanged;
+    const si = orderIndexOf(ord, second) orelse return .unchanged;
+    const lo = @min(fi, si);
+    const hi = @max(fi, si);
+    // Distinct spellings on one order position can only be a
+    // case-variant pair (`SHEET1:Sheet1`) — still a single-position
+    // span, fully covered by the deletion.
+    if (lo == hi) return .collapse;
+
+    // The matched endpoint steps inward: the interval minimum moves
+    // up, the maximum moves down. The replacement lands on whichever
+    // WRITTEN endpoint spelled the doomed name, so a reversed
+    // spelling keeps its orientation.
+    var new_first = first;
+    var new_second = second;
+    if (first_matches) new_first = ord[if (fi == lo) lo + 1 else hi - 1];
+    if (second_matches) new_second = ord[if (si == lo) lo + 1 else hi - 1];
+    return .{ .contract = .{ .first = new_first, .second = new_second } };
+}
+
+/// Rename applied to a span's decoded endpoints, byte-exact per the
+/// pinned single-qualifier rename semantics. Needs no sheet order:
+/// only endpoints are ever spelled, so a mid-span rename leaves the
+/// text unchanged (null).
+fn renameSpanEndpoints(first: []const u8, second: []const u8, spec: Rename) ?SpanHalves {
+    const first_matches = std.mem.eql(u8, first, spec.old);
+    const second_matches = std.mem.eql(u8, second, spec.old);
+    if (!first_matches and !second_matches) return null;
+    return .{
+        .first = if (first_matches) spec.new else first,
+        .second = if (second_matches) spec.new else second,
+    };
+}
+
+/// Encode span halves as ONE token-text slice, Excel-canonically:
+/// unquoted `First:Second` when both halves can stand bare, else the
+/// pair quoted as a unit (`'Jan Sales:Apr'`) with apostrophes
+/// doubled — Excel quotes a 3D span as a whole, never per half.
+/// Caller frees.
+fn encodeSpanPair(allocator: std.mem.Allocator, halves: SpanHalves) Error![]u8 {
+    assert(halves.first.len >= 1);
+    assert(halves.second.len >= 1);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const bare = canEmitUnquoted(halves.first) and canEmitUnquoted(halves.second);
+    if (!bare) try out.append(allocator, '\'');
+    for ([2][]const u8{ halves.first, halves.second }, 0..) |half, idx| {
+        if (idx == 1) try out.append(allocator, ':');
+        for (half) |c| {
+            if (!bare and c == '\'') try out.append(allocator, '\'');
+            try out.append(allocator, c);
+        }
+    }
+    if (!bare) try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
+}
+
+/// Replace the single sheet-qualifier token at `idx` with an encoded
+/// span pair. The unquoted pair keeps `.name` despite the embedded
+/// colon — the pattern is fully consumed by its rewriter, so the
+/// kind is inert; only the text reaches the printer.
+fn emitSpanPairToken(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    idx: usize,
+    halves: SpanHalves,
+) Error!void {
+    const merged = try registerOwned(allocator, owned, try encodeSpanPair(allocator, halves));
+    work[idx] = .{
+        .kind = if (merged[0] == '\'') .sheet_name else .name,
+        .text = merged,
+    };
+}
+
+/// Re-emit rewritten span endpoints into the unquoted 3-token
+/// spelling's slots. When either new half needs quoting, the pair
+/// merges into ONE `.sheet_name` token (Excel quotes the span as a
+/// unit) and the operator + second slots become empty whitespace.
+fn emitSpanEndpoints(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    first_idx: usize,
+    second_idx: usize,
+    halves: SpanHalves,
+) Error!void {
+    assert(second_idx == first_idx + 2);
+    assert(work[first_idx + 1].kind == .op_range);
+    if (canEmitUnquoted(halves.first) and canEmitUnquoted(halves.second)) {
+        const f = try registerOwned(allocator, owned, try allocator.dupe(u8, halves.first));
+        const s = try registerOwned(allocator, owned, try allocator.dupe(u8, halves.second));
+        work[first_idx] = .{ .kind = .name, .text = f };
+        work[second_idx] = .{ .kind = .name, .text = s };
+        return;
+    }
+    try emitSpanPairToken(allocator, work, owned, first_idx, halves);
+    work[first_idx + 1] = .{ .kind = .whitespace, .text = "" };
+    work[second_idx] = .{ .kind = .whitespace, .text = "" };
+}
+
+/// Collapse tokens [lead, end_exclusive) to a single `#REF!`: the
+/// lead token becomes the error literal, the rest become empty
+/// whitespace (the printer concatenates `.text` verbatim, so empty
+/// text contributes nothing).
+fn collapseTokensToRef(work: []Token, lead: usize, end_exclusive: usize) void {
+    assert(lead < end_exclusive);
+    assert(end_exclusive <= work.len);
+    work[lead] = .{ .kind = .error_lit, .text = "#REF!" };
+    var k: usize = lead + 1;
+    while (k < end_exclusive) : (k += 1) {
+        work[k] = .{ .kind = .whitespace, .text = "" };
+    }
+}
+
+/// Apply an edit to a 3D span (unquoted 3-token spelling). Row/col
+/// shifts mutate only the trailing A1 part, scoped by span
+/// membership of `target_sheet`. Rename rewrites matching endpoints
+/// byte-exact (order-independent); delete contracts the span via
+/// `deleteSpanOutcome`.
 fn rewriteThreeD(
     allocator: std.mem.Allocator,
     work: []Token,
@@ -895,30 +1102,49 @@ fn rewriteThreeD(
     info: ThreeDQualifierInfo,
 ) Error!void {
     switch (ctx.edit) {
-        .insert_rows, .delete_rows, .insert_cols, .delete_cols => {},
-        // applyEdit gates on edit_shifts before matching this pattern.
-        .rename_sheet, .delete_sheet => unreachable,
-    }
+        .insert_rows, .delete_rows, .insert_cols, .delete_cols => {
+            const target_match = blk: {
+                const t = ctx.target_sheet orelse break :blk true;
+                const first = try decodeSheetToken(allocator, work[info.first_idx]);
+                defer allocator.free(first);
+                const second = try decodeSheetToken(allocator, work[info.second_idx]);
+                defer allocator.free(second);
+                break :blk spanContainsTarget(first, second, t, ctx.sheet_order);
+            };
+            if (!target_match) return;
 
-    const target_match = blk: {
-        const t = ctx.target_sheet orelse break :blk true;
-        const first = try decodeSheetToken(allocator, work[info.first_idx]);
-        defer allocator.free(first);
-        const second = try decodeSheetToken(allocator, work[info.second_idx]);
-        defer allocator.free(second);
-        // A named target matches when it is one of the span's two
-        // endpoints. A mid-span sheet also contains the edit, but
-        // deciding membership needs the workbook's sheet order;
-        // without it the ref is left unchanged — conservative,
-        // never corrupting.
-        break :blk casefold.excelSheetNameEql(first, t) or casefold.excelSheetNameEql(second, t);
-    };
-    if (!target_match) return;
-
-    if (info.axis) |axis| {
-        try applyAxisRange(allocator, work, owned, ctx.edit, info.ref_start, axis);
-    } else {
-        try applyToRefRange(allocator, work, owned, ctx.edit, info.ref_start, info.is_range);
+            if (info.axis) |axis| {
+                try applyAxisRange(allocator, work, owned, ctx.edit, info.ref_start, axis);
+            } else {
+                try applyToRefRange(allocator, work, owned, ctx.edit, info.ref_start, info.is_range);
+            }
+        },
+        .rename_sheet => |spec| {
+            const first = try decodeSheetToken(allocator, work[info.first_idx]);
+            defer allocator.free(first);
+            const second = try decodeSheetToken(allocator, work[info.second_idx]);
+            defer allocator.free(second);
+            const halves = renameSpanEndpoints(first, second, spec) orelse return;
+            try emitSpanEndpoints(allocator, work, owned, info.first_idx, info.second_idx, halves);
+        },
+        .delete_sheet => |doomed| {
+            const first = try decodeSheetToken(allocator, work[info.first_idx]);
+            defer allocator.free(first);
+            const second = try decodeSheetToken(allocator, work[info.second_idx]);
+            defer allocator.free(second);
+            switch (deleteSpanOutcome(first, second, doomed, ctx.sheet_order)) {
+                .unchanged => {},
+                .collapse => collapseTokensToRef(work, info.first_idx, info.end),
+                .contract => |halves| try emitSpanEndpoints(
+                    allocator,
+                    work,
+                    owned,
+                    info.first_idx,
+                    info.second_idx,
+                    halves,
+                ),
+            }
+        },
     }
 }
 
@@ -943,7 +1169,16 @@ fn rewriteSheetQualified(
 
     if (ctx.edit == .rename_sheet) {
         const spec = ctx.edit.rename_sheet;
-        if (std.mem.eql(u8, decoded, spec.old)) {
+        if (splitQuotedSpan(decoded)) |halves| {
+            // Quoted 3D span spelling ('Jan:Mar'!A1 arrives as ONE
+            // token). Endpoints rename byte-exact, mirroring the
+            // 3-token spelling in `rewriteThreeD`. `current_sheet`
+            // needn't track the result — the row/col targeting below
+            // never runs for rename.
+            if (renameSpanEndpoints(halves.first, halves.second, spec)) |renamed| {
+                try emitSpanPairToken(allocator, work, owned, info.sheet_idx, renamed);
+            }
+        } else if (std.mem.eql(u8, decoded, spec.old)) {
             const new_lex = try registerOwned(allocator, owned, try encodeSheetName(allocator, spec.new));
             // The encoded form already wraps with quotes when needed,
             // so it goes straight into the token stream.
@@ -968,18 +1203,26 @@ fn rewriteSheetQualified(
     // (or skipped via target_match).
     if (ctx.edit == .delete_sheet) {
         const target = ctx.edit.delete_sheet;
+        if (splitQuotedSpan(decoded)) |halves| {
+            // Quoted 3D span spelling: same outcome logic as the
+            // 3-token spelling in `rewriteThreeD`.
+            switch (deleteSpanOutcome(halves.first, halves.second, target, ctx.sheet_order)) {
+                .unchanged => {},
+                .collapse => collapseTokensToRef(work, info.sheet_idx, info.ref_end),
+                .contract => |contracted| try emitSpanPairToken(
+                    allocator,
+                    work,
+                    owned,
+                    info.sheet_idx,
+                    contracted,
+                ),
+            }
+            return;
+        }
         if (std.mem.eql(u8, decoded, target)) {
             // Collapse the entire qualified-ref token sequence to a
-            // single `#REF!` by replacing the leading token's text
-            // with `#REF!` and zeroing the trailing tokens' text.
-            // The printer concatenates `.text` slices verbatim, so
-            // empty `.text` contributes nothing to the output.
-            const ref_lex = try registerOwned(allocator, owned, try allocator.dupe(u8, "#REF!"));
-            work[info.sheet_idx] = .{ .kind = .error_lit, .text = ref_lex };
-            var k: usize = info.sheet_idx + 1;
-            while (k < info.ref_end) : (k += 1) {
-                work[k] = .{ .kind = .whitespace, .text = "" };
-            }
+            // single `#REF!`.
+            collapseTokensToRef(work, info.sheet_idx, info.ref_end);
             return;
         }
         // Different sheet — nothing to do (bare-ref / row-col path
@@ -991,13 +1234,14 @@ fn rewriteSheetQualified(
     // target_sheet. `target_sheet == null` means "apply everywhere."
     // `sheetTargetMatches` also covers the quoted 3D span spelling
     // ('Jan:Mar'!A1 arrives here as ONE .sheet_name token): the
-    // target then matches either endpoint of the span.
+    // target then matches either endpoint — or, with `sheet_order`,
+    // any mid-span member.
     const target_match = blk: {
         switch (ctx.edit) {
             .rename_sheet, .delete_sheet => break :blk false, // already handled
             else => {},
         }
-        if (ctx.target_sheet) |t| break :blk sheetTargetMatches(current_sheet, t);
+        if (ctx.target_sheet) |t| break :blk sheetTargetMatches(current_sheet, t, ctx.sheet_order);
         break :blk true;
     };
     if (!target_match) return;
@@ -1602,6 +1846,238 @@ test "rewrite: 3D target_sheet scopes to span endpoints" {
             .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
         },
         "'Jan:Mar'!A5",
+    );
+}
+
+test "rewrite: 3D endpoint rename rewrites span endpoints" {
+    const order = [_][]const u8{ "Sheet1", "Sheet2", "Sheet3" };
+    // First endpoint — the case the pre-order fallthrough could
+    // never reach (only `Sheet3!A1` matched the single-qualifier
+    // path). Order-independent: null `sheet_order`.
+    try expectRewrite(
+        "SUM(Sheet1:Sheet3!A1)",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "Start" } } },
+        "SUM(Start:Sheet3!A1)",
+    );
+    // Second endpoint, with the order supplied.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1:B2",
+        .{
+            .sheet_order = &order,
+            .edit = .{ .rename_sheet = .{ .old = "Sheet3", .new = "End" } },
+        },
+        "Sheet1:End!A1:B2",
+    );
+    // Both endpoints spell the old name.
+    try expectRewrite(
+        "Doomed:Doomed!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Doomed", .new = "Kept" } } },
+        "Kept:Kept!A1",
+    );
+    // Mid-span rename: endpoints are the only names ever spelled, so
+    // the text is exactly unchanged.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1",
+        .{
+            .sheet_order = &order,
+            .edit = .{ .rename_sheet = .{ .old = "Sheet2", .new = "Mid" } },
+        },
+        "Sheet1:Sheet3!A1",
+    );
+    // Endpoint matching stays byte-exact — the pinned single-
+    // qualifier rename semantics extend to span endpoints.
+    try expectRewrite(
+        "sheet1:Sheet3!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "X" } } },
+        "sheet1:Sheet3!A1",
+    );
+    // A new name needing quotes merges the pair into one quoted
+    // unit — Excel quotes a 3D span as a whole, never per half.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet3", .new = "Q3 End" } } },
+        "'Sheet1:Q3 End'!A1",
+    );
+    // Apostrophes double inside the merged quoted pair.
+    try expectRewrite(
+        "Jan:Mar!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Mar", .new = "It's" } } },
+        "'Jan:It''s'!A1",
+    );
+    // Quoted-pair spelling unquotes when both halves can stand bare...
+    try expectRewrite(
+        "'Jan:Mar'!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Mar", .new = "Apr" } } },
+        "Jan:Apr!A1",
+    );
+    // ...and stays a quoted pair when one half still needs it.
+    try expectRewrite(
+        "'Jan Sales:Mar'!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Mar", .new = "Apr" } } },
+        "'Jan Sales:Apr'!A1",
+    );
+    // Mixed spelling: renaming the quoted half to a bare-safe name
+    // unquotes the whole span.
+    try expectRewrite(
+        "'Jan Sales':Mar!A1",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Jan Sales", .new = "Jan" } } },
+        "Jan:Mar!A1",
+    );
+    // Whole-axis tail: endpoints rewrite the same way.
+    try expectRewrite(
+        "Sheet1:Sheet3!A:A",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "Start" } } },
+        "Start:Sheet3!A:A",
+    );
+}
+
+test "rewrite: 3D endpoint delete contracts the span via sheet order" {
+    const order = [_][]const u8{ "Sheet1", "Sheet2", "Sheet3" };
+    // First endpoint: the interval minimum steps up to its
+    // order-neighbor inside the span.
+    try expectRewrite(
+        "SUM(Sheet1:Sheet3!A1)",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet1" } },
+        "SUM(Sheet2:Sheet3!A1)",
+    );
+    // Second endpoint: the maximum steps down.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1:B2",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet1:Sheet2!A1:B2",
+    );
+    // Mid-span delete: never spelled, text exactly unchanged.
+    try expectRewrite(
+        "Sheet1:Sheet3!A1",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet2" } },
+        "Sheet1:Sheet3!A1",
+    );
+    // Outside the span: unchanged.
+    try expectRewrite(
+        "Sheet1:Sheet2!A1",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet1:Sheet2!A1",
+    );
+    // Two-sheet span contracts to a single-sheet span; the span FORM
+    // is kept (`Sheet2:Sheet2` evaluates identically to `Sheet2`).
+    const two = [_][]const u8{ "Sheet1", "Sheet2" };
+    try expectRewrite(
+        "Sheet1:Sheet2!A1",
+        .{ .sheet_order = &two, .edit = .{ .delete_sheet = "Sheet1" } },
+        "Sheet2:Sheet2!A1",
+    );
+    // Single-position span wholly deleted → #REF!, decidable with no
+    // order at all.
+    try expectRewrite(
+        "SUM(Doomed:Doomed!A1)",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "SUM(#REF!)",
+    );
+    // Reversed written order keeps its orientation; the replacement
+    // lands on the token that spelled the doomed name.
+    try expectRewrite(
+        "Sheet3:Sheet1!A1",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet2:Sheet1!A1",
+    );
+    // Quoted-pair spelling contracts too, with canonical emission.
+    const months = [_][]const u8{ "Jan", "Feb", "Mar" };
+    try expectRewrite(
+        "'Jan:Mar'!A1",
+        .{ .sheet_order = &months, .edit = .{ .delete_sheet = "Mar" } },
+        "Jan:Feb!A1",
+    );
+    // Contraction onto a name that needs quoting emits a quoted
+    // pair; whole-axis tail rewrites the same way.
+    const spaced = [_][]const u8{ "Jan", "Feb 2", "Mar" };
+    try expectRewrite(
+        "Jan:Mar!A:A",
+        .{ .sheet_order = &spaced, .edit = .{ .delete_sheet = "Mar" } },
+        "'Jan:Feb 2'!A:A",
+    );
+    // Order lookup resolves with Excel's case rule; only the edit's
+    // own name match is byte-exact.
+    const shouty = [_][]const u8{ "SHEET1", "SHEET2", "SHEET3" };
+    try expectRewrite(
+        "Sheet1:Sheet3!A1",
+        .{ .sheet_order = &shouty, .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet1:SHEET2!A1",
+    );
+    // Byte-exact endpoint matching, pinned: a case-variant spelling
+    // of the doomed sheet is NOT an endpoint match.
+    try expectRewrite(
+        "Sheet1:SHEET3!A1",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet1:SHEET3!A1",
+    );
+    // No order: an endpoint delete cannot locate its neighbor — the
+    // span stays untouched (NOT the pre-order `Sheet1:#REF!`
+    // fallthrough corruption).
+    try expectRewrite(
+        "Sheet1:Sheet3!A1",
+        .{ .edit = .{ .delete_sheet = "Sheet3" } },
+        "Sheet1:Sheet3!A1",
+    );
+    // Endpoint missing from the order: undecidable, untouched.
+    try expectRewrite(
+        "Sheet1:Sheet9!A1",
+        .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Sheet1" } },
+        "Sheet1:Sheet9!A1",
+    );
+    // Case-variant duplicates in a malformed order: the byte-exact
+    // entry wins, so the interval anchors at `sheet1` (index 2) and
+    // contraction steps to its true neighbor — never through the
+    // case-fold twin's interval (Codex r1 finding 2).
+    const dup = [_][]const u8{ "Sheet1", "X", "sheet1", "Y", "Sheet3" };
+    try expectRewrite(
+        "sheet1:Sheet3!A1",
+        .{ .sheet_order = &dup, .edit = .{ .delete_sheet = "sheet1" } },
+        "Y:Sheet3!A1",
+    );
+    // No byte-exact entry and two case-fold candidates: ambiguous,
+    // untouched.
+    try expectRewrite(
+        "SHEET1:Sheet3!A1",
+        .{ .sheet_order = &dup, .edit = .{ .delete_sheet = "SHEET1" } },
+        "SHEET1:Sheet3!A1",
+    );
+}
+
+test "rewrite: 3D mid-span target matches with sheet order" {
+    const order = [_][]const u8{ "Sheet1", "Sheet2", "Sheet3" };
+    // The conservative no-order case is pinned in "3D target_sheet
+    // scopes to span endpoints"; with the order, membership is
+    // decidable and the shift lands.
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{
+            .sheet_order = &order,
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A6",
+    );
+    // Quoted spelling gets the same membership rule.
+    const months = [_][]const u8{ "Jan", "Feb", "Mar" };
+    try expectRewrite(
+        "'Jan:Mar'!A5",
+        .{
+            .sheet_order = &months,
+            .target_sheet = "Feb",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "'Jan:Mar'!A6",
+    );
+    // A target outside the span still does not match.
+    const wide = [_][]const u8{ "Sheet1", "Sheet2", "Sheet3", "Sheet4" };
+    try expectRewrite(
+        "Sheet1:Sheet3!A5",
+        .{
+            .sheet_order = &wide,
+            .target_sheet = "Sheet4",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet1:Sheet3!A5",
     );
 }
 
@@ -2236,6 +2712,24 @@ test "checkAllAllocationFailures: rewrite is leak-safe under OOM" {
             );
             allocator.free(out);
         }
+        fn runThreeDEndpointEdits(allocator: std.mem.Allocator) !void {
+            // Endpoint rename into a merged quoted pair (both span
+            // spellings), then an order-driven contraction — the
+            // allocation paths the sheet_order leg added.
+            const renamed = try rewriteFormula(
+                allocator,
+                "SUM('Jan Sales':Mar!A5)+'Jan:Mar'!B2",
+                .{ .edit = .{ .rename_sheet = .{ .old = "Mar", .new = "New's" } } },
+            );
+            allocator.free(renamed);
+            const order = [_][]const u8{ "Jan", "Feb", "Mar" };
+            const contracted = try rewriteFormula(
+                allocator,
+                "Jan:Mar!A1+'Jan:Mar'!A1",
+                .{ .sheet_order = &order, .edit = .{ .delete_sheet = "Mar" } },
+            );
+            allocator.free(contracted);
+        }
         fn runAxisSpans(allocator: std.mem.Allocator) !void {
             // Bare span shrink (one bound re-emitted) plus a quoted
             // qualified span slide (both bounds re-emitted).
@@ -2251,6 +2745,7 @@ test "checkAllAllocationFailures: rewrite is leak-safe under OOM" {
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runRename, .{});
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runShiftAndCollapse, .{});
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runThreeD, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.runThreeDEndpointEdits, .{});
     try testing.checkAllAllocationFailures(testing.allocator, helpers.runAxisSpans, .{});
 }
 
