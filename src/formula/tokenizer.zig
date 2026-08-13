@@ -33,9 +33,13 @@
 //! at 255 code points (Excel's defined-name limit) and invalid UTF-8
 //! is refused. The tables live in `unicode/xid.zig`.
 //!
-//! R1C1 notation is recognised only to reject it. LAMBDA/LET
-//! parameter prefixes (`_xlpm.`) tokenize as ordinary names; the
-//! parser refuses them at M2.
+//! R1C1 notation is recognised and refused — evaluation stays
+//! A1-only. A clean whole atom (`R1C1`, `R[-1]C[2]`) additionally
+//! merges into one `.r1c1_ref` token so the C1 rewriter can shift it
+//! as a unit; unclean spellings keep the pre-merge fragment
+//! tokenization byte-for-byte. LAMBDA/LET parameter prefixes
+//! (`_xlpm.`) tokenize as ordinary names; the parser refuses them
+//! at M2.
 //!
 //! Bytes that don't match any rule still fall through as `.unknown`
 //! so round-trip stays lossless on partially malformed input.
@@ -82,6 +86,17 @@ pub const Token = struct {
         /// `'[Book.xlsx]Sheet1'` form or the `[1]` index form.
         /// Always accompanied by a `.external_reference` refusal.
         external_ref,
+        /// A complete R1C1-style reference — `R1C1`, `R12C`, `R1C[2]`,
+        /// `R[-1]C[2]`, `R[2]`, `C[2]` — as ONE token, bracketed
+        /// relative parts included. Always accompanied by a
+        /// `.r1c1_reference` refusal: evaluation still refuses the
+        /// construct (v1 is A1-only). The kind exists for the C1
+        /// rewriter, which must shift the atom as a unit — fragment
+        /// scanning left its `C5`-shaped column part looking like a
+        /// live A1 cell ref, which the A1 path then row-shifted.
+        /// Decompose with `parseR1C1AtomText` — the same grammar the
+        /// scanner merged with, never a second scanner.
+        r1c1_ref,
         // Literals
         number, // 1, 1.5, .5, 1.5e10, 1E+5
         string, // "..." with "" escape
@@ -431,6 +446,15 @@ const Scanner = struct {
             return;
         }
         if (isR1C1Shape(lex)) {
+            // A clean whole atom merges into one `.r1c1_ref` — which
+            // may run past the lexeme when a bare col letter grows a
+            // bracket (`R1C` + `[2]`). Anything unclean keeps the
+            // pre-merge fragment behavior byte-for-byte.
+            if (scanR1C1Atom(input, start)) |scanned| {
+                try self.refuse(.r1c1_reference, start, scanned.end - start);
+                try self.emit(.r1c1_ref, start, scanned.end);
+                return;
+            }
             try self.refuse(.r1c1_reference, start, end - start);
             try self.emit(.name, start, end);
             return;
@@ -442,6 +466,11 @@ const Scanner = struct {
         if (lex.len == 1 and isRowColLetter(lex[0]) and
             end < input.len and input[end] == '[')
         {
+            if (scanR1C1Atom(input, start)) |scanned| {
+                try self.refuse(.r1c1_reference, start, scanned.end - start);
+                try self.emit(.r1c1_ref, start, scanned.end);
+                return;
+            }
             try self.refuse(.r1c1_reference, start, end - start);
         }
         if (isBoolLit(lex)) {
@@ -748,6 +777,156 @@ fn isCellRef(s: []const u8) bool {
     if (i != s.len) return false;
     return columnInRange(s[col_start .. col_start + col_len]) and
         rowInRange(s[row_start .. row_start + row_len]);
+}
+
+/// One axis component of an R1C1 atom. The three forms are spelling,
+/// not just value — the rewriter preserves each part's form (`R5`
+/// stays digits, `R[5]` stays bracketed, a trailing bare `C` stays
+/// bare until its offset has to change).
+pub const R1C1Part = struct {
+    pub const Form = enum {
+        /// `R5` — absolute 1-based position in `value`. The scanner
+        /// checks shape only, not grid bounds: `R0C1` carries 0.
+        digits,
+        /// `R[-2]` — relative offset in `value`.
+        bracket,
+        /// Trailing bare `R`/`C` — relative offset 0. `value` is 0.
+        bare,
+    };
+    form: Form,
+    value: i64,
+};
+
+/// A decomposed `.r1c1_ref` token. Exactly one of the two single-part
+/// spellings the scanner can produce is null-row (`C[2]`); `R[2]` is
+/// null-col. Both parts present for the cell forms.
+pub const R1C1Atom = struct {
+    row: ?R1C1Part,
+    col: ?R1C1Part,
+    /// Byte offset (within the atom's text) where the col part
+    /// begins; equals the text length when `col` is null. Lets the
+    /// rewriter splice one axis while keeping the other axis's bytes
+    /// — spelling, letter case — verbatim.
+    col_start: usize,
+};
+
+const ScannedR1C1 = struct { atom: R1C1Atom, end: usize };
+
+/// The one R1C1 grammar. The scanner calls it to decide whether the
+/// bytes at `start` form a complete, well-formed atom to merge into a
+/// single `.r1c1_ref` token; the rewriter calls `parseR1C1AtomText`
+/// (below) to decompose that token's text. One implementation on both
+/// sides is what guarantees they can never disagree (#188 r6: never
+/// mirror a parser with a second scanner).
+///
+/// Accepted atoms — the reachable-and-emittable set, nothing more:
+///   - row digits + col part:      `R1C1`, `R5C`, `R1C[2]`
+///   - row bracket + optional col: `R[2]`, `R[1]C`, `R[1]C2`, `R[-1]C[2]`
+///   - col bracket alone:          `C[2]`
+/// Rejected (returns null → caller falls back to the pre-merge
+/// fragment behavior): a bare row letter with no bracket (`RC`,
+/// `RC4` — those read as A1), digits that run past 7, a malformed
+/// bracket body (`R[foo]`, `R[]`, unterminated), a digits part that
+/// is really a longer lexeme (`R[1]C2x`, `R[1]C$2` — the col part is
+/// simply not consumed), and any atom followed directly by `[`
+/// (`R1C1[2]` could be a specifier on a foreign-produced table name;
+/// leave those bytes exactly as they always tokenized).
+fn scanR1C1Atom(input: []const u8, start: usize) ?ScannedR1C1 {
+    var i = start;
+    var row: ?R1C1Part = null;
+    if (i < input.len and (input[i] == 'R' or input[i] == 'r')) {
+        // A malformed row part sinks the whole atom — nothing R1C1
+        // starts to the right of a broken `R[…`.
+        row = scanR1C1Part(input, &i, "Cc") orelse return null;
+    }
+    var col: ?R1C1Part = null;
+    var col_mark = i;
+    if (i < input.len and (input[i] == 'C' or input[i] == 'c')) {
+        col_mark = i;
+        col = scanR1C1Part(input, &i, "");
+        // A malformed col part doesn't sink a valid row: in
+        // `R[1]C$2` the atom is `R[1]` and `C$2` lexes on its own
+        // (as the A1 ref it spells).
+        if (col == null) i = col_mark;
+    }
+    // Shape gate: which part combinations are R1C1 rather than a name
+    // or an A1 ref. `RC4` is column RC row 4 (cell-ref precedence,
+    // §5.2) and `R5` is a plain name, so a bare row letter never
+    // anchors an atom and a digits row needs a col part.
+    if (row) |r| switch (r.form) {
+        .bare => return null,
+        .digits => if (col == null) return null,
+        .bracket => {},
+    } else {
+        const c = col orelse return null;
+        if (c.form != .bracket) return null; // bare `C` / `C5`: name / A1
+    }
+    // A `[` directly after the atom means these bytes may spell
+    // something else entirely (`R1C1[2]` on a foreign-produced table
+    // named `R1C1`) — leave them exactly as they always tokenized.
+    if (i < input.len and input[i] == '[') return null;
+    return .{
+        .atom = .{
+            .row = row,
+            .col = col,
+            .col_start = (if (col != null) col_mark else i) - start,
+        },
+        .end = i,
+    };
+}
+
+/// Scan one `R`/`C` part at `i.*` (caller has already matched the
+/// letter): letter alone (bare), letter + digits, or letter +
+/// `[signed digits]`. Advances `i.*` past what it consumed. Returns
+/// null — with `i.*` unspecified — for a malformed part: a bad
+/// bracket body, more than 7 digits, or a digits/bare spelling whose
+/// next byte keeps the lexeme going (`R1C2x`, `R[1]Cx` — that is a
+/// name, not a part). `boundary_exempt` names bytes allowed to follow
+/// a digits/bare spelling anyway: the row part exempts `Cc` because
+/// its digits are legitimately followed by the col letter.
+fn scanR1C1Part(input: []const u8, i: *usize, boundary_exempt: []const u8) ?R1C1Part {
+    std.debug.assert(i.* < input.len);
+    var j = i.* + 1;
+    if (j < input.len and input[j] == '[') {
+        j += 1;
+        const neg = j < input.len and input[j] == '-';
+        if (neg) j += 1;
+        const digit_start = j;
+        while (j < input.len and isDigit(input[j])) : (j += 1) {}
+        const n_digits = j - digit_start;
+        if (n_digits == 0 or n_digits > 7) return null;
+        if (j >= input.len or input[j] != ']') return null;
+        const magnitude = std.fmt.parseInt(i64, input[digit_start..j], 10) catch unreachable;
+        i.* = j + 1;
+        return .{ .form = .bracket, .value = if (neg) -magnitude else magnitude };
+    }
+    const digit_start = j;
+    while (j < input.len and isDigit(input[j])) : (j += 1) {}
+    const n_digits = j - digit_start;
+    if (n_digits > 7) return null;
+    if (j < input.len) {
+        const next = input[j];
+        const exempt = std.mem.indexOfScalar(u8, boundary_exempt, next) != null;
+        if (!exempt and (next == '$' or next >= 0x80 or isAsciiIdentContinue(next))) {
+            return null;
+        }
+    }
+    i.* = j;
+    if (n_digits == 0) return .{ .form = .bare, .value = 0 };
+    return .{
+        .form = .digits,
+        .value = std.fmt.parseInt(i64, input[digit_start..j], 10) catch unreachable,
+    };
+}
+
+/// Decompose a `.r1c1_ref` token's text. The token was produced by
+/// `scanR1C1Atom`, so this cannot fail on scanner output; the return
+/// stays optional because the rewriter treats "doesn't re-parse" as
+/// "don't touch" rather than trusting and asserting.
+pub fn parseR1C1AtomText(text: []const u8) ?R1C1Atom {
+    const scanned = scanR1C1Atom(text, 0) orelse return null;
+    if (scanned.end != text.len) return null;
+    return scanned.atom;
 }
 
 /// True for the bracket-free R1C1 forms — `R1C1`, `R12C`, `RC4`.
@@ -1117,10 +1296,11 @@ test "R1C1 shapes are recognised only to reject them" {
     try expectRefusals("R12C4", &.{.r1c1_reference});
     try expectRefusals("r1c1", &.{.r1c1_reference});
     try expectRefusals("R1C", &.{.r1c1_reference});
-    // Bracketed relative forms: the lexeme ends at `[`, so the trailing
-    // bracket is what identifies them.
+    // Bracketed relative forms merge with the letter into one atom —
+    // one construct, one refusal.
     try expectRefusals("R[-1]C", &.{.r1c1_reference});
     try expectRefusals("C[2]", &.{.r1c1_reference});
+    try expectRefusals("R[-1]C[2]", &.{.r1c1_reference});
     // Refused, but still round-tripped.
     try expectRoundTrip("R1C1");
     try expectRoundTrip("R[-1]C[2]");
@@ -1139,6 +1319,79 @@ test "R1C1 shapes are recognised only to reject them" {
     // A sheet named R1C1 is a name, not a reference.
     try expectKinds("R1C1!A1", &.{ .name, .bang, .cell_ref });
     try expectRefusals("R1C1!A1", &.{});
+}
+
+test "R1C1: clean whole atoms merge into one .r1c1_ref token" {
+    try expectKinds("R1C1", &.{.r1c1_ref});
+    try expectKinds("R12C4", &.{.r1c1_ref});
+    try expectKinds("r1c1", &.{.r1c1_ref});
+    try expectKinds("R1C", &.{.r1c1_ref});
+    try expectKinds("R1C[2]", &.{.r1c1_ref});
+    try expectKinds("R[-1]C", &.{.r1c1_ref});
+    try expectKinds("R[-1]C[2]", &.{.r1c1_ref});
+    // Pre-merge, `[1]` in here scanned as an external-workbook index
+    // and `C2` as a live A1 cell ref the rewriter would shift.
+    try expectKinds("R[1]C2", &.{.r1c1_ref});
+    try expectRefusals("R[1]C2", &.{.r1c1_reference});
+    // Whole-row / whole-col relative forms.
+    try expectKinds("R[2]", &.{.r1c1_ref});
+    try expectKinds("C[-3]", &.{.r1c1_ref});
+    try expectKinds("R[0]", &.{.r1c1_ref});
+    // Ranges pair two atoms around the ordinary range operator.
+    try expectKinds("R1C1:R2C2", &.{ .r1c1_ref, .op_range, .r1c1_ref });
+    // Sheet-qualified: the qualifier lexes exactly as before.
+    try expectKinds("Sheet2!R5C3", &.{ .name, .bang, .r1c1_ref });
+    try expectRoundTrip("SUM(R[-2]C7,R1C1:R2C2)");
+}
+
+test "R1C1: unclean spellings keep the pre-merge fragment tokenization" {
+    // Digit-tailed atom followed by `[`: could be a specifier on a
+    // foreign-produced table named `R1C1`.
+    try expectKinds("R1C1[2]", &.{ .name, .structured_ref });
+    try expectRefusals("R1C1[2]", &.{.r1c1_reference});
+    // Malformed bracket bodies.
+    try expectKinds("R[foo]", &.{ .name, .structured_ref });
+    try expectRefusals("R[foo]", &.{.r1c1_reference});
+    try expectKinds("R[]", &.{ .name, .structured_ref });
+    // A col part that keeps going as a lexeme is not a col part.
+    try expectKinds("R[1]C2x", &.{ .r1c1_ref, .name });
+    try expectKinds("R[1]C$2", &.{ .r1c1_ref, .cell_ref });
+}
+
+test "R1C1: parseR1C1AtomText decomposes exactly what the scanner merged" {
+    const abs_abs = parseR1C1AtomText("R5C3").?;
+    try testing.expectEqual(R1C1Part.Form.digits, abs_abs.row.?.form);
+    try testing.expectEqual(@as(i64, 5), abs_abs.row.?.value);
+    try testing.expectEqual(R1C1Part.Form.digits, abs_abs.col.?.form);
+    try testing.expectEqual(@as(i64, 3), abs_abs.col.?.value);
+
+    const rel_bare = parseR1C1AtomText("R[-1]C").?;
+    try testing.expectEqual(R1C1Part.Form.bracket, rel_bare.row.?.form);
+    try testing.expectEqual(@as(i64, -1), rel_bare.row.?.value);
+    try testing.expectEqual(R1C1Part.Form.bare, rel_bare.col.?.form);
+
+    try testing.expectEqual(@as(usize, 2), abs_abs.col_start); // "R5"|"C3"
+
+    const col_only = parseR1C1AtomText("c[12]").?;
+    try testing.expect(col_only.row == null);
+    try testing.expectEqual(@as(i64, 12), col_only.col.?.value);
+    try testing.expectEqual(@as(usize, 0), col_only.col_start);
+
+    const row_only = parseR1C1AtomText("R[0]").?;
+    try testing.expect(row_only.col == null);
+    try testing.expectEqual(@as(i64, 0), row_only.row.?.value);
+    try testing.expectEqual(@as(usize, 4), row_only.col_start); // == text.len
+
+    // The gate set: spellings that are NOT atoms.
+    try testing.expect(parseR1C1AtomText("RC4") == null); // A1: column RC
+    try testing.expect(parseR1C1AtomText("RC") == null);
+    try testing.expect(parseR1C1AtomText("R5") == null); // plain name
+    try testing.expect(parseR1C1AtomText("C5") == null); // A1 cell
+    try testing.expect(parseR1C1AtomText("R") == null);
+    try testing.expect(parseR1C1AtomText("C") == null);
+    try testing.expect(parseR1C1AtomText("R[8]C[99999999]") == null); // >7 digits
+    try testing.expect(parseR1C1AtomText("R1C1[2]") == null);
+    try testing.expect(parseR1C1AtomText("R[1]x") == null); // trailing bytes
 }
 
 test "operators" {

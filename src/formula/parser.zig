@@ -1583,6 +1583,18 @@ const Parser = struct {
                 return self.parseStructured(null, start);
             },
             .name => return self.parseNameLike(qualified, start),
+            .r1c1_ref => {
+                // An R1C1 atom in operand position. The tokenizer has
+                // already recorded its `.r1c1_reference` refusal; parse
+                // the same name-shaped operand the pre-merge fragments
+                // produced (`R1C1` lexed as one `.name`) so the
+                // surrounding expression still builds and every other
+                // refusal keeps its chance to report. Deliberately no
+                // call/structured adjacency lookahead: `R[1]C(` is not
+                // a call.
+                _ = self.advance();
+                return self.addNode(try self.nameNode(t.text, self.spanFrom(start), .value));
+            },
             .paren_open => {
                 if (qualified) return self.failHere(.unexpected_token);
                 return self.parseParen(start);

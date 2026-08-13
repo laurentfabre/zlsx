@@ -3872,6 +3872,12 @@ pub const Workbook = struct {
                         .target_sheet = target_sheet,
                         .sheet_order = sheet_order,
                         .owning_table = owningTableFor(table_scope, sheet_idx, c.ref),
+                        // Relative R1C1 parts respell against the
+                        // formula's own cell. For a shared-formula
+                        // master this is the master's cell — the only
+                        // cell whose `<f>` BODY exists in the source;
+                        // follower cells carry no body to patch.
+                        .host = hostFromRef(c.ref),
                         .edit = edit,
                     };
                     // Decode-in: view formulas are raw XML bytes
@@ -8714,6 +8720,19 @@ fn maybeRewrite(
 /// when the cell sits inside the scoped table's range on its host
 /// sheet, null otherwise — the rewriter then leaves bare specifiers
 /// alone, matching the engine's owner rule (`vtStructured`).
+/// The formula's own cell, for the rewriter's relative-R1C1 parts.
+/// A ref the A1 parser cannot read yields null — the rewriter then
+/// leaves relative R1C1 untouched rather than guessing. The
+/// defined-name and DV/CF sweeps pass no host at all: a defined
+/// name's relative R1C1 is anchored to the caller's active cell and
+/// a DV/CF formula to its sqref anchor, neither of which this sweep
+/// models — absolute R1C1 parts still rewrite there.
+fn hostFromRef(ref: []const u8) ?zlsx.formula_rewriter.Host {
+    const col = sheet_edit.parseColFromA1(ref) orelse return null;
+    const row = sheet_edit.parseRowFromA1(ref) orelse return null;
+    return .{ .row = row, .col = col };
+}
+
 fn owningTableFor(
     scope: ?Workbook.TableScope,
     sheet_idx: u32,
@@ -12415,6 +12434,53 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     try std.testing.expectEqualStrings("B8+1", b2.formula.?);
     const c3 = (try s0.cellByRef("C3")).?;
     try std.testing.expectEqualStrings("B2*B6", c3.formula.?);
+}
+
+test "Workbook.rewriteAllFormulas: relative R1C1 respells against each cell's own host" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rewrite-r1c1-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Absolute atom above the edit point: untouched, uncounted.
+        try s0.setCell("A1", .{ .formula = "R2C2" });
+        // Relative atom whose HOST (row 5) crosses the insertion
+        // while its target (row 4) does not: the offset widens.
+        try s0.setCell("B5", .{ .formula = "R[-1]C" });
+        // Mixed: the relative part's TARGET (row 3+2=5) crosses, the
+        // host (row 3) does not; the absolute part stays put.
+        try s0.setCell("C3", .{ .formula = "SUM(R[2]C,R4C1)" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    const count = try wb.rewriteAllFormulas(.{
+        .insert_rows = .{ .at = 5, .count = 1 },
+    }, null, null);
+    try std.testing.expectEqual(@as(u32, 2), count);
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-rewrite-r1c1-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    try std.testing.expectEqualStrings("R2C2", (try s0.cellByRef("A1")).?.formula.?);
+    try std.testing.expectEqualStrings("R[-2]C", (try s0.cellByRef("B5")).?.formula.?);
+    try std.testing.expectEqualStrings("SUM(R[3]C,R4C1)", (try s0.cellByRef("C3")).?.formula.?);
 }
 
 test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formulas" {
