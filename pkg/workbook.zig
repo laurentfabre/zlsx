@@ -5556,6 +5556,26 @@ pub const Workbook = struct {
 
         const part_name = try ws.resolvePartName();
 
+        // Preflight the transform on the PRE-sweep bytes, discarding
+        // the output (Codex #192 F5): every refusal-class error the
+        // transform can raise (ColEditExceedsMaxCol on an occupied
+        // last column, RowEditExceedsMaxRow, malformed sheet XML)
+        // must fire BEFORE the first mutation — the sweep below
+        // replaces parts, and a refusal after it would strand
+        // phantom formula rewrites that a later save persists. The
+        // sweep only rewrites `<f>` inner text, so a transform that
+        // passes preflight cannot newly refuse on the swept bytes;
+        // an error there anyway falls under the documented
+        // post-validation contract (discard, reopen).
+        {
+            const pre = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+            const probe = if (spec.row) |r|
+                try sheet_edit.applyRowEditToWorksheet(self.allocator, pre.bytes, r, spec.kind)
+            else
+                try sheet_edit.applyColEditToWorksheet(self.allocator, pre.bytes, spec.col.?, spec.kind);
+            self.allocator.free(probe);
+        }
+
         // The FORMULA sweep runs BEFORE the byte transform (Codex
         // #192 F1): formula text spells PRE-edit positions, and
         // relative R1C1 parts respell against RewriteContext.host —
@@ -12534,6 +12554,53 @@ test "Workbook.deleteRow: R1C1 hosts are pre-edit coordinates (transform orderin
     try std.testing.expectEqualStrings("R[-1]C", (try s0.cellByRef("D5")).?.formula.?);
     try std.testing.expectEqualStrings("R[-2]C", (try s0.cellByRef("E5")).?.formula.?);
     try std.testing.expectEqualStrings("B6+1", (try s0.cellByRef("F5")).?.formula.?);
+}
+
+test "Workbook.insertColumn: a REFUSED edit leaves formulas unmutated (preflight)" {
+    // Codex #192 F5: with the formula sweep reordered before the
+    // byte transform, a transform refusal (occupied last column →
+    // ColEditExceedsMaxCol) fired AFTER formulas were already
+    // rewritten — the caught error stranded phantom rewrites that a
+    // later save persisted. The preflight recomputes the transform
+    // on pre-sweep bytes first, so the refusal precedes all
+    // mutation, exactly as on main.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-preflight-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        // Occupied last column makes any column insert refuse.
+        try s0.setCell("XFD1", .{ .number = 1 });
+        // A bare formula the sweep WOULD have rewritten (B5 → C5).
+        try s0.setCell("A2", .{ .formula = "B5" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try std.testing.expectError(error.ColEditExceedsMaxCol, wb.insertColumn(0, 1));
+
+    // The refused edit must leave NOTHING behind: saving now and
+    // reopening shows the pre-edit formula byte-for-byte.
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-preflight-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const s0 = try wb2.sheet(0);
+    try std.testing.expectEqualStrings("B5", (try s0.cellByRef("A2")).?.formula.?);
 }
 
 test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formulas" {
