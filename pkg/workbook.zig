@@ -3807,9 +3807,14 @@ pub const Workbook = struct {
             const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
             defer a.free(ws_name);
 
-            // Collect (ref, new_text) pairs first; the source-byte
-            // walk below needs the parsed view's slices intact.
-            const Pending = struct { ref: []const u8, text: []u8 };
+            // Collect (ref, expected_body, new_text) first; the
+            // source-byte walk below needs the parsed view's slices
+            // intact. `expected` is the body the rewrite was derived
+            // from — the walker refuses to splice a located body
+            // that no longer holds those bytes (stale cached view,
+            // markup embedded in the body), rather than overwriting
+            // whatever sits there now (Codex #188 r8).
+            const Pending = struct { ref: []const u8, expected: []const u8, text: []u8 };
             var pending: std.ArrayList(Pending) = .empty;
             defer {
                 for (pending.items) |p| a.free(p.text);
@@ -3844,7 +3849,7 @@ pub const Workbook = struct {
                         continue;
                     }
                     errdefer a.free(rewritten);
-                    try pending.append(a, .{ .ref = c.ref, .text = rewritten });
+                    try pending.append(a, .{ .ref = c.ref, .expected = f, .text = rewritten });
                 }
             }
 
@@ -3852,9 +3857,11 @@ pub const Workbook = struct {
 
             // Phase B (mirrors the DV/CF path): patch only the
             // changed `<f>` bodies in the raw part bytes.
-            var new_bodies: std.StringHashMapUnmanaged([]u8) = .empty;
+            var new_bodies: std.StringHashMapUnmanaged(CellBodySwap) = .empty;
             defer new_bodies.deinit(a);
-            for (pending.items) |p| try new_bodies.put(a, p.ref, p.text);
+            for (pending.items) |p| {
+                try new_bodies.put(a, p.ref, .{ .expected = p.expected, .text = p.text });
+            }
 
             const part_name = ws.resolved_part_name orelse return error.MissingSheetPart;
             const source = blk: {
@@ -3962,6 +3969,16 @@ pub const Workbook = struct {
                 .sheet_order = sheet_order,
                 .edit = edit,
             };
+
+            // A raw `<` cannot appear in a well-formed formula body
+            // (content escapes it as `&lt;`) — its presence means
+            // embedded markup: a comment or CDATA block, which also
+            // defeats the parser's raw close-tag search, so the
+            // recorded span may stop at a decoy `</definedName>`
+            // inside a comment. Splicing such a span would expose
+            // the decoy as live markup. Conservative: never rewrite
+            // a markup-bearing body (Codex #188 r8).
+            if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) continue;
 
             // Decode-in: `dn.formula` is raw XML inner text (still
             // entity-escaped); the rewriter operates on decoded text
@@ -8554,11 +8571,15 @@ fn findClosingTagAware(source: []const u8, from: usize, close_tag: []const u8) ?
 /// hand-rolled `indexOf` walk patched a decoy `<f>` inside an XML
 /// comment while the live formula kept its old bytes
 /// (Codex #188 r6).
+/// A staged cell-formula replacement: the body bytes the rewrite was
+/// derived from, and the decoded rewritten text to splice in.
+const CellBodySwap = struct { expected: []const u8, text: []u8 };
+
 fn collectCellFormulaPatches(
     a: Allocator,
     source: []const u8,
     out: *std.ArrayList(SourcePatch),
-    new_bodies: *const std.StringHashMapUnmanaged([]u8),
+    new_bodies: *const std.StringHashMapUnmanaged(CellBodySwap),
 ) Error!void {
     assert(source.len > 0);
     const sd = (workbook_xml_mod.findTagOpen(source, 0, "sheetData") catch
@@ -8581,7 +8602,7 @@ fn collectCellFormulaPatches(
             return error.NoSheetData;
         const attrs = source[hit.attrs_start..hit.attrs_end];
         if (workbook_xml_mod.getAttr(attrs, "r")) |ref| {
-            if (new_bodies.get(ref)) |new_body| {
+            if (new_bodies.get(ref)) |swap| {
                 if (workbook_xml_mod.findTagOpen(source, hit.after_tag_close, "f") catch
                     return error.NoSheetData) |f_hit|
                 {
@@ -8589,10 +8610,20 @@ fn collectCellFormulaPatches(
                         const f_close = findClosingTagAware(source, f_hit.after_tag_close, "</f>") orelse
                             return error.NoSheetData;
                         assert(f_close < c_close);
+                        // The located body must still hold the bytes
+                        // the rewrite was derived from; a cached view
+                        // gone stale (the part was swapped underneath
+                        // it) or markup embedded in the body would
+                        // otherwise be overwritten with text computed
+                        // from something else. Refuse loudly
+                        // (Codex #188 r8).
+                        if (!std.mem.eql(u8, source[f_hit.after_tag_close..f_close], swap.expected)) {
+                            return error.MalformedXml;
+                        }
                         try out.append(a, .{
                             .start = f_hit.after_tag_close,
                             .end = f_close,
-                            .new = new_body,
+                            .new = swap.text,
                         });
                     }
                 }
@@ -13050,6 +13081,100 @@ test "Workbook.rewriteAllDefinedNames: stale parser spans refuse instead of spli
         error.MalformedXml,
         wb.rewriteAllDefinedNames(
             .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } },
+            null,
+        ),
+    );
+}
+
+test "Workbook.rewriteAllDefinedNames: closing-tag decoy in a comment never splices" {
+    // Codex #188 r8: the parser's raw close-tag search records
+    // `Sheet1:Sheet2!A1<!-- ` (span ending at the decoy) for this
+    // body; splicing that span would expose the decoy close as live
+    // markup. Markup-bearing bodies are skipped wholesale — the
+    // entire element survives byte-identically and the file stays
+    // well-formed.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-closedecoy-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<definedName name=\"Trap\">Sheet1:Sheet2!A1<!-- </definedName> --></definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try wb.renameSheet(0, "New");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-closedecoy-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bytes,
+        "<definedName name=\"Trap\">Sheet1:Sheet2!A1<!-- </definedName> --></definedName>",
+    ) != null);
+}
+
+test "Workbook.rewriteAllFormulas: stale cached view refuses instead of splicing blind" {
+    // Codex #188 r8: a rewrite derived from a cached view must not
+    // overwrite whatever currently sits in the part. Swap the sheet
+    // bytes under the live view: the walker finds `<c r="A1">` with
+    // a DIFFERENT body than the one the rewrite was computed from,
+    // and refuses.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-staleview-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("A1", .{ .formula = "Sheet1:Sheet2!B1" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    _ = try ws.ensureParsed(); // cache the view of the ORIGINAL bytes
+    const part_name = ws.resolved_part_name.?;
+
+    // Swap the part under the cached view: same ref, different body.
+    const swapped =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheetData><row r=\"1\"><c r=\"A1\"><f>OTHER!Z1</f></c></row></sheetData></worksheet>";
+    try wb.store.replacePart(part_name, swapped);
+
+    try std.testing.expectError(
+        error.MalformedXml,
+        wb.rewriteAllFormulas(
+            .{ .rename_sheet = .{ .old = "Sheet2", .new = "New" } },
             null,
         ),
     );
