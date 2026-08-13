@@ -140,14 +140,15 @@ pub const RewriteContext = struct {
     /// (order-independent), delete leaves spans it cannot contract
     /// untouched, and mid-span targets conservatively don't match.
     sheet_order: ?[]const []const u8 = null,
-    /// The table whose producer owns this formula, if any — the
-    /// table part's own `calculatedColumnFormula` /
-    /// `totalsRowFormula` bodies, or a materialized producer cell
-    /// inside the table's range. Decoded plain text (the
-    /// `displayName`). Scopes BARE structured refs (`[Old]`,
-    /// `[@Old]`) for `rename_table_column`: the bare form names the
-    /// owner's own table, which only a table producer has, so with
-    /// `null` (the default) bare structured refs are never touched.
+    /// The table this formula's bare structured refs (`[Old]`,
+    /// `[@Old]`) belong to, if any: the table part's own
+    /// `calculatedColumnFormula` / `totalsRowFormula` bodies, or a
+    /// cell inside the table's range — Excel binds the bare form
+    /// anywhere inside the range (that is how in-table formulas are
+    /// written); the engine's producer-owner rule is a strict
+    /// subset, so rewriting here never changes what the engine
+    /// binds. Decoded plain text (the `displayName`). With `null`
+    /// (the default) bare structured refs are never touched.
     owning_table: ?[]const u8 = null,
     edit: RewriteEdit,
 };

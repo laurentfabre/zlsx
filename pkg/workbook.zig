@@ -3808,6 +3808,15 @@ pub const Workbook = struct {
     /// (`[Old]`, `[@Old]`): they bind to the table whose range
     /// contains the formula's cell, so the walk needs the table's
     /// geometry. The six structural edits pass null.
+    ///
+    /// The whole rectangle is in scope DELIBERATELY. Excel binds a
+    /// bare specifier in any formula inside the table's range —
+    /// that is how in-table formulas are written — while the
+    /// engine's `vtStructured` binds only producer-owned formulas,
+    /// a strict subset. Rewriting a bare ref the engine leaves
+    /// unbound changes nothing for the engine (unbound before and
+    /// after) and is REQUIRED for Excel, which would otherwise
+    /// reopen the workbook with a stale column name.
     pub const TableScope = struct {
         /// Sheet hosting the table (workbook order index).
         sheet_idx: u32,
@@ -4650,9 +4659,19 @@ pub const Workbook = struct {
     ///
     /// `table_name` / `old_name` / `new_name` are decoded plain
     /// text. Returns the number of cell formulas rewritten (the
-    /// count `rewriteAllFormulas` reports). Like `renameSheet`,
-    /// partial work is possible only on post-validation failures
-    /// (OOM mid-sweep); every refusal happens before mutation.
+    /// count `rewriteAllFormulas` reports).
+    ///
+    /// **Failure contract** (same as `renameSheet`'s): every
+    /// REFUSAL — table or column not found, name collision or
+    /// invalid, malformed part — happens before any mutation, and
+    /// the refusals test pins that byte-exactly. Post-validation
+    /// failures (OOM mid-sweep, a stale-splice refusal from a part
+    /// mutated under us) can leave the workbook partially rewritten,
+    /// exactly as a mid-sweep failure in `renameSheet` can; callers
+    /// treat any error after open as "discard, reopen". Full
+    /// prepare-then-commit transactionality across the four sweeps
+    /// is a workbook-wide change deliberately out of this leg's
+    /// scope.
     pub fn renameTableColumn(
         self: *Workbook,
         table_name: []const u8,
@@ -4677,7 +4696,14 @@ pub const Workbook = struct {
                 const part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
                 const part = (try self.store.part(part_name)) orelse continue;
                 const display_raw = table_edit.tableDisplayNameRaw(part.bytes) orelse continue;
-                const display = try store_mod.decodeXmlEntities(a, display_raw);
+                // STRING-carrier decode (entities + ST_Xstring) —
+                // resolution parity with the engine, which reads
+                // `displayName="Sales_x0041_"` as SalesA. A part
+                // whose attr the codec refuses simply doesn't match.
+                const display = engine.decode.decodeAt(a, .table_name, display_raw) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    continue;
+                };
                 defer a.free(display);
                 const matches = zlsx.casefold.eqlFolded(a, display, table_name) catch |err| blk: {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -5846,9 +5872,18 @@ const TablePartRidIterator = struct {
     fn init(sheet_xml: []const u8) TablePartRidIterator {
         // Locate `<tableParts>` open + matching close. Leave
         // cursor inside the block; on absence, set cursor == end.
+        // Comment/CDATA/PI decoys are skipped on both the open and
+        // the close search (Codex #190 r1 F5 — the rename lookup
+        // widened this scanner's blast radius, so it learned the
+        // aware walk for every consumer).
         var i: usize = 0;
         while (i < sheet_xml.len) {
             const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse break;
+            const skip = workbook_xml_mod.skipNonElement(sheet_xml, lt) catch break;
+            if (skip != lt) {
+                i = skip;
+                continue;
+            }
             const need = "<tableParts".len;
             if (lt + need >= sheet_xml.len) break;
             if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<tableParts")) {
@@ -5861,7 +5896,7 @@ const TablePartRidIterator = struct {
                     if (open_end > 0 and sheet_xml[open_end - 1] == '/') {
                         return .{ .sheet_xml = sheet_xml, .cursor = 0, .block_end = 0, .found_block = false };
                     }
-                    const close = std.mem.indexOfPos(u8, sheet_xml, open_end + 1, "</tableParts>") orelse break;
+                    const close = (workbook_xml_mod.findClosingTag(sheet_xml, open_end + 1, "</tableParts>") catch break) orelse break;
                     return .{
                         .sheet_xml = sheet_xml,
                         .cursor = open_end + 1,
@@ -5880,6 +5915,11 @@ const TablePartRidIterator = struct {
         while (self.cursor < self.block_end) {
             const lt = std.mem.indexOfScalarPos(u8, self.sheet_xml, self.cursor, '<') orelse return null;
             if (lt >= self.block_end) return null;
+            const skip = self.skipDecoy(lt) orelse return null;
+            if (skip != lt) {
+                self.cursor = skip;
+                continue;
+            }
             const need = "<tablePart".len;
             if (lt + need >= self.sheet_xml.len) return null;
             if (std.mem.eql(u8, self.sheet_xml[lt .. lt + need], "<tablePart")) {
@@ -5906,6 +5946,15 @@ const TablePartRidIterator = struct {
             self.cursor = lt + 1;
         }
         return null;
+    }
+
+    /// Bounded `skipNonElement`: the index past a comment / CDATA /
+    /// PI construct starting at `lt`, `lt` itself for real markup,
+    /// or null when the construct is unterminated (the block is
+    /// malformed — stop iterating rather than resume mid-comment).
+    fn skipDecoy(self: *const TablePartRidIterator, lt: usize) ?usize {
+        const skip = workbook_xml_mod.skipNonElement(self.sheet_xml, lt) catch return null;
+        return skip;
     }
 };
 
