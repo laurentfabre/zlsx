@@ -3000,8 +3000,8 @@ test "Editor: insertRow scopes bare refs to the edited sheet (C1 wiring proof)" 
         try s1.writeRowWithFormulas(&.{.{ .integer = 3 }}, &.{"A1+A2"});
         var s2 = try w.addSheet("Other");
         try s2.writeRowWithFormulas(
-            &.{ .{ .integer = 0 }, .{ .integer = 0 } },
-            &.{ "A2+1", "Edited!A2*2" },
+            &.{ .{ .integer = 0 }, .{ .integer = 0 }, .{ .integer = 0 } },
+            &.{ "A2+1", "Edited!A2*2", "edited!A2+3" },
         );
         try w.save(io, src_path);
     }
@@ -3019,6 +3019,10 @@ test "Editor: insertRow scopes bare refs to the edited sheet (C1 wiring proof)" 
     try std.testing.expectEqualStrings("A2+1", other_bare.formula.?);
     const other_qualified = (try (try wb.sheet(1)).cellByRef("B1")).?;
     try std.testing.expectEqualStrings("Edited!A3*2", other_qualified.formula.?);
+    // Case-variant qualifier: Excel resolves sheet names case-
+    // insensitively, so `edited!` scopes to sheet "Edited" too.
+    const other_case = (try (try wb.sheet(1)).cellByRef("C1")).?;
+    try std.testing.expectEqualStrings("edited!A3+3", other_case.formula.?);
 }
 
 test "Editor: deleteRow forwards formulas to the rewriter (C1 wiring proof)" {

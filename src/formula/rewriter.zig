@@ -88,6 +88,12 @@ pub const RewriteContext = struct {
     on_sheet: ?[]const u8 = null,
     /// The sheet the row/col edit targets. `null` means "apply to
     /// bare refs everywhere AND every sheet-qualified ref."
+    /// Name matching is ASCII case-insensitive (a..z ↔ A..Z):
+    /// Excel resolves sheet names without regard to case, so a
+    /// qualifier spelled `edited!A2` must still scope to a sheet
+    /// named `Edited`. ASCII-only mirrors Workbook's collision-
+    /// check compromise (see `Workbook.renameSheet`); the Unicode
+    /// case-fold upgrade is the same follow-up iter.
     target_sheet: ?[]const u8 = null,
     edit: RewriteEdit,
 };
@@ -865,16 +871,17 @@ fn decodeSheetToken(allocator: std.mem.Allocator, tok: Token) Error![]u8 {
 /// 3D span spelling (`'Jan:Mar'!A1`); the target then matches either
 /// endpoint. Mid-span membership (Feb in Jan:Mar) needs the
 /// workbook's sheet order, which this layer cannot see — a mid-span
-/// target does not match and the ref stays put.
+/// target does not match and the ref stays put. Name comparison is
+/// ASCII case-insensitive — see `RewriteContext.target_sheet`.
 fn sheetTargetMatches(decoded: []const u8, target: []const u8) bool {
     const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse
-        return std.mem.eql(u8, decoded, target);
+        return std.ascii.eqlIgnoreCase(decoded, target);
     const first = decoded[0..colon];
     const second = decoded[colon + 1 ..];
     const is_span = first.len >= 1 and second.len >= 1 and
         std.mem.indexOfScalar(u8, second, ':') == null;
-    if (!is_span) return std.mem.eql(u8, decoded, target);
-    return std.mem.eql(u8, first, target) or std.mem.eql(u8, second, target);
+    if (!is_span) return std.ascii.eqlIgnoreCase(decoded, target);
+    return std.ascii.eqlIgnoreCase(first, target) or std.ascii.eqlIgnoreCase(second, target);
 }
 
 /// Apply a row/col shift to a 3D span's cell refs. The endpoints
@@ -904,7 +911,7 @@ fn rewriteThreeD(
         // deciding membership needs the workbook's sheet order;
         // without it the ref is left unchanged — conservative,
         // never corrupting.
-        break :blk std.mem.eql(u8, first, t) or std.mem.eql(u8, second, t);
+        break :blk std.ascii.eqlIgnoreCase(first, t) or std.ascii.eqlIgnoreCase(second, t);
     };
     if (!target_match) return;
 
@@ -1025,7 +1032,7 @@ fn bareEditApplies(ctx: RewriteContext) bool {
     }
     if (ctx.target_sheet == null) return true;
     if (ctx.on_sheet == null) return true; // permissive default
-    return std.mem.eql(u8, ctx.on_sheet.?, ctx.target_sheet.?);
+    return std.ascii.eqlIgnoreCase(ctx.on_sheet.?, ctx.target_sheet.?);
 }
 
 fn rewriteBareRefOrRange(
@@ -1391,6 +1398,32 @@ test "apostrophe-escaped sheet names round-trip" {
             .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
         },
         "'It''s'!A1",
+    );
+}
+
+test "row/col target_sheet matches sheet names ASCII case-insensitively" {
+    // Excel resolves sheet names without regard to case, so a
+    // qualifier spelled in a different case than the workbook's
+    // canonical name still refers to the edited sheet and must
+    // shift. ASCII fold only — the Unicode upgrade is the same
+    // follow-up iter as Workbook's collision check.
+    try expectRewrite(
+        "edited!A2*2",
+        .{
+            .target_sheet = "Edited",
+            .edit = .{ .insert_rows = .{ .at = 2, .count = 1 } },
+        },
+        "edited!A3*2",
+    );
+    // Bare refs: on_sheet vs target_sheet folds the same way.
+    try expectRewrite(
+        "A2+1",
+        .{
+            .on_sheet = "EDITED",
+            .target_sheet = "Edited",
+            .edit = .{ .insert_rows = .{ .at = 2, .count = 1 } },
+        },
+        "A3+1",
     );
 }
 
