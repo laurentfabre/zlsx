@@ -4002,8 +4002,18 @@ pub const Workbook = struct {
             // elements, `>` inside quoted attribute values
             // (Codex #188 r6).
             const dn = self.workbook.defined_names[e.key_ptr.*];
-            assert(dn.body_start <= dn.body_end);
-            assert(dn.body_end <= source.len);
+            // The spans were recorded when THIS view was parsed. If
+            // the part bytes changed since — a refresh that failed
+            // after a prior splice, or a low-level `replacePart` —
+            // positional patching would splice into unrelated bytes.
+            // Content equality at the recorded offset is precisely
+            // "the view still describes these bytes"; refuse loudly
+            // otherwise (Codex #188 r7).
+            if (dn.body_start > dn.body_end or dn.body_end > source.len or
+                !std.mem.eql(u8, source[dn.body_start..dn.body_end], dn.formula))
+            {
+                return error.MalformedXml;
+            }
             try patches.append(a, .{ .start = dn.body_start, .end = dn.body_end, .new = e.value_ptr.* });
         }
         assert(patches.items.len == changed);
@@ -12932,6 +12942,117 @@ test "Workbook.rewriteAllDefinedNames: parser-recorded spans defeat decoys and o
     // byte-identically.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "<!-- <definedName name=\"Ghost\">Sheet1:Sheet2!Z9</definedName> -->") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "name = \"First\" comment=\"a>b\"") != null);
+}
+
+test "Workbook.rewriteAllFormulas: CDATA payload markup never becomes a formula" {
+    // Codex #188 r7: the sanitizer copied CDATA content verbatim, so
+    // `<![CDATA[<f>…</f>]]>` became a live `<f>` to the view while
+    // the raw walker (correctly) skipped it — the two selected
+    // DIFFERENT formulas and the walker overwrote the live one with
+    // the rewritten decoy. CDATA is character data; it now
+    // entity-escapes into the sanitized buffer.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-cdata-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-cdata-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        _ = try ws.ensureParsed();
+        const new_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><![CDATA[<f>Doomed!Z9</f>]]><f>Sheet1:Sheet2!B1</f><v>7</v></c>" ++
+            "<c r=\"B1\"><![CDATA[<f>Sheet1:Sheet2!B1</f>]]><f>C1+1</f><v>3</v></c>" ++
+            "</row></sheetData></worksheet>";
+        try wb.store.replacePart(ws.resolved_part_name.?, new_xml);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "New");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws2 = try wb2.sheet(0);
+    _ = try ws2.ensureParsed();
+    const bytes = (try wb2.store.part(ws2.resolved_part_name.?)).?.bytes;
+    // A1: the LIVE 3D formula rewrote; its CDATA decoy is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<f>Sheet1:New!B1</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<![CDATA[<f>Doomed!Z9</f>]]>") != null);
+    // B1: the CDATA 3D text is data, not a formula — nothing staged,
+    // both its CDATA and its live formula are byte-identical.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<![CDATA[<f>Sheet1:Sheet2!B1</f>]]>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "<f>C1+1</f>") != null);
+}
+
+test "Workbook.rewriteAllDefinedNames: stale parser spans refuse instead of splicing blind" {
+    // Codex #188 r7: body spans are positions in the bytes the view
+    // was parsed FROM. If the part is swapped underneath the view
+    // (failed refresh after a prior splice, low-level replacePart),
+    // patching by position would corrupt unrelated bytes — the
+    // content guard must refuse.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-stale-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<definedName name=\"MyName\">Sheet1:Sheet2!A1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+
+    // Shift every recorded offset by swapping the part bytes under
+    // the live view (no refresh).
+    {
+        const part = (try wb.store.part("xl/workbook.xml")).?;
+        const at = std.mem.indexOf(u8, part.bytes, "<definedNames>").?;
+        var shifted: std.ArrayList(u8) = .empty;
+        defer shifted.deinit(std.testing.allocator);
+        try shifted.appendSlice(std.testing.allocator, part.bytes[0..at]);
+        try shifted.appendSlice(std.testing.allocator, "<!-- shift -->");
+        try shifted.appendSlice(std.testing.allocator, part.bytes[at..]);
+        try wb.store.replacePart("xl/workbook.xml", shifted.items);
+    }
+
+    try std.testing.expectError(
+        error.MalformedXml,
+        wb.rewriteAllDefinedNames(
+            .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } },
+            null,
+        ),
+    );
 }
 
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {

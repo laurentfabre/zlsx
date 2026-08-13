@@ -186,9 +186,11 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
 
 /// Produces a copy of `xml` with comments (`<!-- ... -->`), CDATA
 /// (`<![CDATA[ ... ]]>`), and processing instructions (`<? ... ?>`)
-/// elided. CDATA contents are kept literally so a `<![CDATA[<row/>]]>`
-/// payload can never be misread as a real element. Returns a fresh
-/// allocator-owned slice; caller owns the memory.
+/// elided. CDATA contents are CHARACTER DATA and are entity-escaped
+/// into the copy so a `<![CDATA[<row/>]]>` payload can never be
+/// misread as a real element — the verbatim copy this doc always
+/// promised to prevent actually allowed it (Codex #188 r7). Returns
+/// a fresh allocator-owned slice; caller owns the memory.
 ///
 /// This is the perf-critical pre-pass: it converts every downstream
 /// scan from "comment-aware" to "comment-free", eliminating the
@@ -215,7 +217,12 @@ fn sanitizeXml(allocator: std.mem.Allocator, xml: []const u8) ParseError![]const
         }
         if (i + 9 <= xml.len and std.mem.eql(u8, xml[i .. i + 9], "<![CDATA[")) {
             const close = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse return error.MalformedXml;
-            try out.appendSlice(allocator, xml[i + 9 .. close]);
+            for (xml[i + 9 .. close]) |b| switch (b) {
+                '&' => try out.appendSlice(allocator, "&amp;"),
+                '<' => try out.appendSlice(allocator, "&lt;"),
+                '>' => try out.appendSlice(allocator, "&gt;"),
+                else => try out.append(allocator, b),
+            };
             i = close + 3;
             continue;
         }
