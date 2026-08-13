@@ -23,13 +23,21 @@
 //!     expansion force-renamed names the new columns shadowed), so no
 //!     name-registry lookup is needed to disambiguate `Start:End`.
 //!   - Insert/delete rows/cols, sheet rename
+//!   - Structured table refs, for `rename_table_column` ONLY:
+//!     `Table1[Old]` → `Table1[New]` in every spelling the specifier
+//!     grammar admits (`[@Old]`, `[[#Data],[Old]]`, `[[A]:[B]]`,
+//!     escaped names). The specifier is parsed by
+//!     `parser.parseStructuredSpecParts` — the SAME grammar the
+//!     engine resolves with — and only the matched column-name
+//!     subspans are replaced; every other byte of the token passes
+//!     through verbatim. For every OTHER edit the token stays opaque.
 //!
 //! Out of scope (deferred):
-//!   - R1C1, structured table refs, dynamic-array `#`/`@`,
-//!     external-workbook brackets. Since M1a the tokenizer gives each
-//!     of these its own kind rather than lumping them into
-//!     `.unknown`; `isOpaqueQualifier` is where the rewriter names the
-//!     ones it must not follow.
+//!   - R1C1, dynamic-array `#`/`@`, external-workbook brackets.
+//!     Since M1a the tokenizer gives each of these its own kind
+//!     rather than lumping them into `.unknown`;
+//!     `isOpaqueQualifier` is where the rewriter names the ones it
+//!     must not follow.
 //!
 //! Rename/delete of a 3D span ENDPOINT is in scope when the caller
 //! supplies `RewriteContext.sheet_order` (the workbook's tab order,
@@ -42,6 +50,7 @@
 
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
+const parser = @import("parser.zig");
 const coords = @import("zlsx_refs");
 const casefold = @import("zlsx_casefold");
 const assert = std.debug.assert;
@@ -57,6 +66,19 @@ pub const Span = struct { at: u32, count: u32 };
 /// are decoded — quoting/escape happens at the emit boundary, not
 /// the comparison).
 pub const Rename = struct { old: []const u8, new: []const u8 };
+
+/// Payload for `rename_table_column`. All three are PLAIN text —
+/// decoded XML, and `old`/`new` unescaped (`R&D`, not `R&amp;D` and
+/// not a `'`-escaped specifier spelling). Matching uses the same
+/// rule the engine resolves with (`casefold.eqlFolded` — the symbol
+/// layer folds both table and column names before lookup); the
+/// escape-out spelling of `new` happens at the emit boundary.
+pub const TableColumnRename = struct {
+    /// The table's formula-visible name (`displayName`).
+    table: []const u8,
+    old: []const u8,
+    new: []const u8,
+};
 
 /// Structural edit applied to every reference the rewriter recognises.
 /// Row / column counts use 1-based positions to match Excel's user-
@@ -81,6 +103,14 @@ pub const RewriteEdit = union(enum) {
     /// sheet's own formulas are dropped with the sheet, not
     /// rewritten).
     delete_sheet: []const u8,
+    /// Rename a column of the named table: rewrite the column-name
+    /// half of every `.structured_ref` token that resolves to it.
+    /// Qualified refs (`Table1[Old]`) match on the adjacent table
+    /// name; bare refs (`[Old]`, `[@Old]`) match only when
+    /// `RewriteContext.owning_table` names the same table — the
+    /// engine binds the bare form through a table-producer owner
+    /// (`vtStructured`), and the rewriter mirrors that rule.
+    rename_table_column: TableColumnRename,
 };
 
 pub const RewriteContext = struct {
@@ -110,6 +140,16 @@ pub const RewriteContext = struct {
     /// (order-independent), delete leaves spans it cannot contract
     /// untouched, and mid-span targets conservatively don't match.
     sheet_order: ?[]const []const u8 = null,
+    /// The table this formula's bare structured refs (`[Old]`,
+    /// `[@Old]`) belong to, if any: the table part's own
+    /// `calculatedColumnFormula` / `totalsRowFormula` bodies, or a
+    /// cell inside the table's range — Excel binds the bare form
+    /// anywhere inside the range (that is how in-table formulas are
+    /// written); the engine's producer-owner rule is a strict
+    /// subset, so rewriting here never changes what the engine
+    /// binds. Decoded plain text (the `displayName`). With `null`
+    /// (the default) bare structured refs are never touched.
+    owning_table: ?[]const u8 = null,
     edit: RewriteEdit,
 };
 
@@ -185,6 +225,14 @@ fn validateEdit(edit: RewriteEdit) Error!void {
             // silently no-op.
             if (name.len == 0) return error.InvalidEdit;
             assert(name.len >= 1);
+        },
+        .rename_table_column => |spec| {
+            // Same policy as rename_sheet: an empty table or old
+            // name has no targets, an empty new name produces an
+            // unaddressable specifier (`Table1[]` is malformed).
+            if (spec.table.len == 0) return error.InvalidEdit;
+            if (spec.old.len == 0) return error.InvalidEdit;
+            if (spec.new.len == 0) return error.InvalidEdit;
         },
     }
 }
@@ -441,6 +489,9 @@ fn applyShift(ref: Ref, edit: RewriteEdit) ShiftOutcome {
         // unchanged here; the caller has already collapsed the
         // qualified ref to #REF! before applyShift runs.
         .delete_sheet => return .unchanged,
+        // Structured refs never contain live A1 refs (the token is
+        // opaque to this path); nothing to shift.
+        .rename_table_column => return .unchanged,
     }
 }
 
@@ -462,7 +513,7 @@ fn applyAxisShift(axis: AxisRange, edit: RewriteEdit) AxisOutcome {
     const relevant = switch (edit) {
         .insert_rows, .delete_rows => axis.kind == .rows,
         .insert_cols, .delete_cols => axis.kind == .cols,
-        .rename_sheet, .delete_sheet => false,
+        .rename_sheet, .delete_sheet, .rename_table_column => false,
     };
     if (!relevant) return .unchanged;
 
@@ -527,7 +578,7 @@ fn applyAxisShift(axis: AxisRange, edit: RewriteEdit) AxisOutcome {
             return .{ .shifted = out };
         },
         // Filtered out by `relevant` above.
-        .rename_sheet, .delete_sheet => unreachable,
+        .rename_sheet, .delete_sheet, .rename_table_column => unreachable,
     }
 }
 
@@ -598,6 +649,123 @@ fn canEmitUnquoted(name: []const u8) bool {
     return true;
 }
 
+// ─── structured-ref column rename ────────────────────────────────
+
+/// Rewrite one `.structured_ref` token for `rename_table_column`.
+/// Every other edit kind leaves the token opaque, as do specifiers
+/// scoped to another table, specifiers without a matching column,
+/// and malformed specifiers (which the engine refuses to bind — a
+/// rewrite there could only corrupt).
+fn rewriteStructuredRef(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    ctx: RewriteContext,
+    i: usize,
+) Error!void {
+    assert(work[i].kind == .structured_ref);
+    const spec = switch (ctx.edit) {
+        .rename_table_column => |s| s,
+        else => return,
+    };
+
+    // Scope: whose specifier is this? `Name[…]` — adjacent, the
+    // parser's own `kindAt(1)` pairing rule, so `Table1 [x]` with
+    // whitespace between is NOT a table specifier — belongs to that
+    // name. Anything reached through a `!` is qualified by a sheet
+    // or an external workbook and is never a local table specifier
+    // (Excel admits neither `Sheet1!Table1[c]` nor `Sheet1![c]`).
+    // A bare `[…]` names the owner's own table, which only a
+    // table-producer context has (`RewriteContext.owning_table`).
+    if (i >= 1 and work[i - 1].kind == .bang) return;
+    if (i >= 1 and work[i - 1].kind == .name) {
+        if (i >= 2 and work[i - 2].kind == .bang) return;
+        if (!try plainNamesMatch(allocator, work[i - 1].text, spec.table)) return;
+    } else {
+        const owner = ctx.owning_table orelse return;
+        if (!try plainNamesMatch(allocator, owner, spec.table)) return;
+    }
+
+    if (try rewriteSpecifierColumns(allocator, work[i].text, spec)) |new_text| {
+        work[i].text = try registerOwned(allocator, owned, new_text);
+    }
+}
+
+/// Fold-equality on decoded plain names — the engine's matching rule
+/// for both table and column names (the symbol layer folds each side
+/// before every lookup, `pkg/workbook.zig::columnIndex`). Invalid
+/// UTF-8 cannot match anything the symbol layer admitted, so it
+/// reads as "no match" rather than an error.
+fn plainNamesMatch(allocator: std.mem.Allocator, a: []const u8, b: []const u8) Error!bool {
+    return casefold.eqlFolded(allocator, a, b) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return false;
+    };
+}
+
+/// Replace every column-name part of `raw` (a full `[…]` specifier,
+/// brackets included) that names `spec.old` with the spelling of
+/// `spec.new`. Returns the new token text, or null when nothing
+/// matched. The specifier is parsed by the parser's own grammar and
+/// only the matched parts' byte spans are replaced — item
+/// specifiers, separators, whitespace and every unmatched byte pass
+/// through verbatim. A bracketed part keeps its brackets and swaps
+/// inner text only; a bare part gains brackets when the new name
+/// needs them (`columnNeedsBrackets` — the printer's policy, so the
+/// rewriter and the canonical printer agree on which names go bare).
+fn rewriteSpecifierColumns(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    spec: TableColumnRename,
+) Error!?[]u8 {
+    const parsed = parser.parseStructuredSpecParts(raw) orelse return null;
+
+    var parts_buf: [2]parser.ColumnPart = undefined;
+    const parts: []const parser.ColumnPart = switch (parsed.columns) {
+        .none => &.{},
+        .one => |p| blk: {
+            parts_buf[0] = p;
+            break :blk parts_buf[0..1];
+        },
+        // Source order: `first` precedes `last` in the raw bytes, so
+        // the cursor below advances monotonically.
+        .range => |r| blk: {
+            parts_buf[0] = r.first;
+            parts_buf[1] = r.last;
+            break :blk parts_buf[0..2];
+        },
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    var matched = false;
+    for (parts) |p| {
+        // The grammar hands back slices INTO `raw`; recover each
+        // part's offset for the splice.
+        const off = @intFromPtr(p.text.ptr) - @intFromPtr(raw.ptr);
+        assert(off + p.text.len <= raw.len);
+        const decoded = try parser.decodeColumnName(allocator, p.text);
+        defer allocator.free(decoded);
+        if (!try plainNamesMatch(allocator, decoded, spec.old)) continue;
+        matched = true;
+        const encoded = try parser.encodeColumnName(allocator, spec.new);
+        defer allocator.free(encoded);
+        try out.appendSlice(allocator, raw[cursor..off]);
+        const wrap = !p.bracketed and parser.columnNeedsBrackets(encoded);
+        if (wrap) try out.append(allocator, '[');
+        try out.appendSlice(allocator, encoded);
+        if (wrap) try out.append(allocator, ']');
+        cursor = off + p.text.len;
+    }
+    if (!matched) {
+        out.deinit(allocator);
+        return null;
+    }
+    try out.appendSlice(allocator, raw[cursor..]);
+    return try out.toOwnedSlice(allocator);
+}
+
 // ─── token walk + rewrite ───────────────────────────────────────
 
 fn applyEdit(
@@ -618,6 +786,16 @@ fn applyEdit(
         // whole chain.
         if (work[i].kind == .external_ref) {
             i = endOfExternalReference(work, i);
+            continue;
+        }
+
+        // Structured table specifier. Opaque to every edit except
+        // `rename_table_column`, which rewrites the column-name
+        // subspans in place; the token count never changes, so the
+        // matchers below are unaffected.
+        if (work[i].kind == .structured_ref) {
+            try rewriteStructuredRef(allocator, work, owned, ctx, i);
+            i += 1;
             continue;
         }
 
@@ -1145,6 +1323,8 @@ fn rewriteThreeD(
                 ),
             }
         },
+        // A 3D span qualifies plain refs, never structured ones.
+        .rename_table_column => {},
     }
 }
 
@@ -1238,7 +1418,9 @@ fn rewriteSheetQualified(
     // any mid-span member.
     const target_match = blk: {
         switch (ctx.edit) {
-            .rename_sheet, .delete_sheet => break :blk false, // already handled
+            // rename/delete_sheet: already handled above.
+            // rename_table_column: no rows/cols to shift.
+            .rename_sheet, .delete_sheet, .rename_table_column => break :blk false,
             else => {},
         }
         if (ctx.target_sheet) |t| break :blk sheetTargetMatches(current_sheet, t, ctx.sheet_order);
@@ -1272,6 +1454,9 @@ fn bareEditApplies(ctx: RewriteContext) bool {
         // deleted sheet's own formulas are dropped wholesale by
         // Workbook.deleteSheet, not rewritten).
         .delete_sheet => return false,
+        // Bare CELL refs carry no column names; the structured-ref
+        // walk has its own scoping (`owning_table`).
+        .rename_table_column => return false,
         else => {},
     }
     if (ctx.target_sheet == null) return true;
@@ -2464,6 +2649,10 @@ const all_edits = [_]RewriteEdit{
     .{ .delete_cols = .{ .at = 1, .count = 1 } },
     .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } },
     .{ .delete_sheet = "Sheet1" },
+    // Out-of-scope table: proves structured refs survive the ONE
+    // edit that can touch them whenever the table doesn't match,
+    // and that no other construct is touched by it at all.
+    .{ .rename_table_column = .{ .table = "NoSuchTable", .old = "Nope", .new = "Never" } },
 };
 
 fn expectIdentityUnderEveryEdit(input: []const u8) !void {
@@ -2773,4 +2962,256 @@ test "insert beyond grid leaves ref alone" {
         .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
         "XFD1",
     );
+}
+
+// ─── rename_table_column ─────────────────────────────────────────
+
+/// Shorthand ctx for the common qualified-ref cases.
+fn renameColEdit(table: []const u8, old: []const u8, new: []const u8) RewriteContext {
+    return .{ .edit = .{ .rename_table_column = .{ .table = table, .old = old, .new = new } } };
+}
+
+test "rename_table_column: qualified single-column spellings" {
+    // Bare part inside the specifier.
+    try expectRewrite(
+        "SUM(Table1[Old])",
+        renameColEdit("Table1", "Old", "New"),
+        "SUM(Table1[New])",
+    );
+    // `@` shorthand keeps the `@`.
+    try expectRewrite(
+        "Table1[@Old]*2",
+        renameColEdit("Table1", "Old", "New"),
+        "Table1[@New]*2",
+    );
+    // Bracketed part keeps its brackets, swaps inner text only.
+    try expectRewrite(
+        "Table1[[#This Row],[Old]]",
+        renameColEdit("Table1", "Old", "New"),
+        "Table1[[#This Row],[New]]",
+    );
+    try expectRewrite(
+        "SUM(Table1[[#Data],[Old]])",
+        renameColEdit("Table1", "Old", "New"),
+        "SUM(Table1[[#Data],[New]])",
+    );
+    // Bracketed single part (`[[Old Col]]` spelling).
+    try expectRewrite(
+        "Table1[[Old Col]]",
+        renameColEdit("Table1", "Old Col", "X"),
+        "Table1[[X]]",
+    );
+    // Two refs to the same table in one formula: both rewritten.
+    try expectRewrite(
+        "Table1[Old]+Table1[[#Totals],[Old]]",
+        renameColEdit("Table1", "Old", "New"),
+        "Table1[New]+Table1[[#Totals],[New]]",
+    );
+}
+
+test "rename_table_column: column ranges rewrite the matching half" {
+    try expectRewrite(
+        "SUM(Table1[[Old]:[Other]])",
+        renameColEdit("Table1", "Old", "New"),
+        "SUM(Table1[[New]:[Other]])",
+    );
+    try expectRewrite(
+        "SUM(Table1[[Other]:[Old]])",
+        renameColEdit("Table1", "Old", "New"),
+        "SUM(Table1[[Other]:[New]])",
+    );
+    // Both halves name the old column: both rewrite.
+    try expectRewrite(
+        "SUM(Table1[[Old]:[Old]])",
+        renameColEdit("Table1", "Old", "New"),
+        "SUM(Table1[[New]:[New]])",
+    );
+    // Items + range combined form.
+    try expectRewrite(
+        "Table1[[#Data],[Old]:[Other]]",
+        renameColEdit("Table1", "Old", "New"),
+        "Table1[[#Data],[New]:[Other]]",
+    );
+}
+
+test "rename_table_column: decode-in on the OLD name's escapes" {
+    // Column literally named `C]x` is spelled `C']x` in the
+    // specifier; the edit names it decoded.
+    try expectRewrite(
+        "Table1[C']x]",
+        renameColEdit("Table1", "C]x", "Plain"),
+        "Table1[Plain]",
+    );
+    // Column literally named `#Foo` (escaped `#` — an UNescaped
+    // leading `#` would be an item specifier).
+    try expectRewrite(
+        "Table1['#Foo]",
+        renameColEdit("Table1", "#Foo", "New"),
+        "Table1[New]",
+    );
+    // `@` mid-name.
+    try expectRewrite(
+        "Table1[Rate '@Peak]",
+        renameColEdit("Table1", "Rate @Peak", "Flat"),
+        "Table1[Flat]",
+    );
+}
+
+test "rename_table_column: escape-out on the NEW name" {
+    // Reserved bytes gain a `'` escape, and the punctuation makes
+    // `columnNeedsBrackets` bracket the part — the printer's policy,
+    // matching the spelling Excel itself writes for such names.
+    try expectRewrite(
+        "Table1[Old]",
+        renameColEdit("Table1", "Old", "A]B"),
+        "Table1[[A']B]]",
+    );
+    try expectRewrite(
+        "Table1[Old]",
+        renameColEdit("Table1", "Old", "Q[1]"),
+        "Table1[[Q'[1']]]",
+    );
+    // A space forces the bracketed spelling on a bare part — the
+    // printer's own policy, so canonical output agrees.
+    try expectRewrite(
+        "Table1[Old]",
+        renameColEdit("Table1", "Old", "New Col"),
+        "Table1[[New Col]]",
+    );
+    try expectRewrite(
+        "Table1[@Old]",
+        renameColEdit("Table1", "Old", "New Col"),
+        "Table1[@[New Col]]",
+    );
+    // Already-bracketed parts never need the wrap.
+    try expectRewrite(
+        "Table1[[#Data],[Old]]",
+        renameColEdit("Table1", "Old", "New Col"),
+        "Table1[[#Data],[New Col]]",
+    );
+}
+
+test "rename_table_column: fold-rule matching, byte-exact emit" {
+    // Table and column names match under the symbol layer's fold —
+    // the same rule resolution uses — while everything emitted is
+    // the edit's exact spelling.
+    try expectRewrite(
+        "TABLE1[OLD]",
+        renameColEdit("table1", "old", "New"),
+        "TABLE1[New]",
+    );
+    // Unicode fold (é vs É).
+    try expectRewrite(
+        "Ventes[CAFÉ]",
+        renameColEdit("ventes", "café", "thé"),
+        "Ventes[thé]",
+    );
+}
+
+test "rename_table_column: out-of-scope specifiers survive byte-identically" {
+    const edit = renameColEdit("Table1", "Old", "New");
+    // Another table's column.
+    try expectRewrite("Other[Old]", edit, "Other[Old]");
+    // Same table, different column; item specifiers are not columns.
+    try expectRewrite("Table1[Older]", edit, "Table1[Older]");
+    try expectRewrite("Table1[#All]", renameColEdit("Table1", "#All", "New"), "Table1[#All]");
+    // Whitespace breaks the name↔specifier adjacency (the parser's
+    // own pairing rule), so this is a bare specifier without an
+    // owner — untouched.
+    try expectRewrite("Table1 [Old]", edit, "Table1 [Old]");
+    // Nothing after a `!` is a local table specifier.
+    try expectRewrite("Sheet1!Table1[Old]", edit, "Sheet1!Table1[Old]");
+    // Spaces are PART of the name in the specifier grammar (the
+    // engine's columnIndex does not trim either): ` Old ` ≠ `Old`.
+    try expectRewrite("Table1[ Old ]", edit, "Table1[ Old ]");
+    // Malformed specifier: trailing separator never parses, so the
+    // token stays opaque even though the table matches.
+    try expectRewrite("Table1[Old,]", edit, "Table1[Old,]");
+    // A formula with no structured refs at all round-trips.
+    try expectRewrite("A1+B2*SUM(C:C)", edit, "A1+B2*SUM(C:C)");
+}
+
+test "rename_table_column: bare specifiers scope through owning_table" {
+    const rename: RewriteEdit = .{ .rename_table_column = .{
+        .table = "Table1",
+        .old = "Old",
+        .new = "New",
+    } };
+    // The table part's own formulas (calculatedColumnFormula /
+    // totalsRowFormula) and producer cells inside the table's range
+    // carry bare specifiers; `owning_table` names their table.
+    try expectRewrite(
+        "[@Old]*2",
+        .{ .owning_table = "Table1", .edit = rename },
+        "[@New]*2",
+    );
+    try expectRewrite(
+        "SUM([Old])",
+        .{ .owning_table = "Table1", .edit = rename },
+        "SUM([New])",
+    );
+    try expectRewrite(
+        "SUM([[Old]:[Other]])",
+        .{ .owning_table = "Table1", .edit = rename },
+        "SUM([[New]:[Other]])",
+    );
+    try expectRewrite(
+        "[@[Old Col]]",
+        .{ .owning_table = "Table1", .edit = .{ .rename_table_column = .{
+            .table = "Table1",
+            .old = "Old Col",
+            .new = "New",
+        } } },
+        "[@[New]]",
+    );
+    // No owner (the default): the bare form has no table to match.
+    try expectRewrite("[@Old]*2", .{ .edit = rename }, "[@Old]*2");
+    // Another table's producer.
+    try expectRewrite(
+        "[@Old]*2",
+        .{ .owning_table = "Other", .edit = rename },
+        "[@Old]*2",
+    );
+    // owning_table scopes BARE forms only — a qualified ref inside
+    // a producer formula still matches on its own table name.
+    try expectRewrite(
+        "Other[Old]+[Old]",
+        .{ .owning_table = "Table1", .edit = rename },
+        "Other[Old]+[New]",
+    );
+}
+
+test "rename_table_column: refuses empty names" {
+    const cases = [_]RewriteEdit{
+        .{ .rename_table_column = .{ .table = "", .old = "Old", .new = "New" } },
+        .{ .rename_table_column = .{ .table = "T", .old = "", .new = "New" } },
+        .{ .rename_table_column = .{ .table = "T", .old = "Old", .new = "" } },
+    };
+    for (cases) |edit| {
+        try testing.expectError(
+            error.InvalidEdit,
+            rewriteFormula(testing.allocator, "T[Old]", .{ .edit = edit }),
+        );
+    }
+}
+
+test "rename_table_column: OOM-safe at every allocation site" {
+    const helpers = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const out = try rewriteFormula(
+                allocator,
+                "SUM(Table1[[#Data],[Old]:[Other]])+[@Old]",
+                .{
+                    .owning_table = "Table1",
+                    .edit = .{ .rename_table_column = .{
+                        .table = "Table1",
+                        .old = "Old",
+                        .new = "New Col",
+                    } },
+                },
+            );
+            allocator.free(out);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.run, .{});
 }

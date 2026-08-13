@@ -435,6 +435,31 @@ pub const ColumnSelector = union(enum) {
     range: struct { first: []const u8, last: []const u8 },
 };
 
+/// A column half with its source spelling: `bracketed` records whether
+/// the part was written `[…]`-wrapped inside the specifier (`[[Col
+/// A]:[Col B]]` vs the bare `[Amount]`). The rewriter needs the flag to
+/// splice a replacement byte-exactly — a bracketed part swaps only its
+/// inner text, a bare part may need to GAIN brackets when the new name
+/// carries bytes the bare form cannot spell.
+pub const ColumnPart = struct { text: []const u8, bracketed: bool };
+
+/// `ColumnSelector`, with each name's `ColumnPart` spelling context.
+pub const ColumnPartSelector = union(enum) {
+    none,
+    one: ColumnPart,
+    range: struct { first: ColumnPart, last: ColumnPart },
+};
+
+/// `StructuredSpec`, with spelling context (see `ColumnPart`). The
+/// slices point INTO the `raw` argument of
+/// `parseStructuredSpecParts`, which is what lets a caller recover
+/// each part's byte offset for surgical replacement.
+pub const StructuredSpecParts = struct {
+    items: ItemSet,
+    at_shorthand: bool,
+    columns: ColumnPartSelector,
+};
+
 /// A qualifying sheet, or sheet span for a 3D reference. Raw text: the
 /// quoted form keeps its quotes and its `''` escapes, because the
 /// printer must hand back the spelling that was written.
@@ -690,7 +715,7 @@ fn printRowBound(
 /// Excel brackets anything carrying a space or a punctuation byte, and
 /// a canonical form that produced `Table1[@Col A]` where Excel writes
 /// `Table1[@[Col A]]` would be a spelling no other reader expects.
-fn columnNeedsBrackets(raw: []const u8) bool {
+pub fn columnNeedsBrackets(raw: []const u8) bool {
     if (raw.len == 0) return true;
     for (raw) |c| {
         const simple = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
@@ -780,6 +805,28 @@ pub fn decodeColumnName(
             i += 1;
         }
         try out.append(allocator, raw[i]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Inverse of `decodeColumnName`: spell a plain column name in raw
+/// specifier form, `'`-escaping the five bytes the grammar reserves
+/// (`'`, `[`, `]`, `#`, `@` — §5.2, and what Excel itself escapes).
+/// Everything else passes through verbatim; bytes like `,` or `:` have
+/// no escape and instead force the BRACKETED spelling, which is
+/// `columnNeedsBrackets`'s call. Caller frees.
+pub fn encodeColumnName(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) error{OutOfMemory}![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (name) |c| {
+        switch (c) {
+            '\'', '[', ']', '#', '@' => try out.append(allocator, '\''),
+            else => {},
+        }
+        try out.append(allocator, c);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -2045,15 +2092,36 @@ const StructuredSpec = struct {
 
 const SpecPart = struct { text: []const u8, bracketed: bool };
 
+/// `parseStructuredSpecParts`, flattened to the `ColumnSelector` shape
+/// the AST keeps. The grammar lives in the parts variant; this wrapper
+/// exists so the AST node stays byte-identical to what it always held.
+fn parseStructuredSpec(raw: []const u8) ?StructuredSpec {
+    const p = parseStructuredSpecParts(raw) orelse return null;
+    return .{
+        .items = p.items,
+        .at_shorthand = p.at_shorthand,
+        .columns = switch (p.columns) {
+            .none => .none,
+            .one => |c| .{ .one = c.text },
+            .range => |r| .{ .range = .{ .first = r.first.text, .last = r.last.text } },
+        },
+    };
+}
+
 /// Parse a `[…]` specifier, brackets included. Null on anything the
-/// item-specifier grammar does not admit — the caller turns that into
+/// item-specifier grammar does not admit — the parser turns that into
 /// `malformed_structured_ref`.
 ///
 /// Grammar (§5.2): `#All #Data #Headers #Totals #This Row`, `@`, a
 /// single column, a `[a]:[b]` column range, and the comma-joined
 /// combined forms. `'` escapes the byte after it, which is how a column
 /// name carries `[`, `]`, `#`, `@`, or `'` itself.
-fn parseStructuredSpec(raw: []const u8) ?StructuredSpec {
+///
+/// Pub for the rewriter: this is THE structured-ref grammar, and the
+/// column-name slices point into `raw`, so a caller can recover each
+/// part's byte offset for surgical replacement instead of mirroring
+/// the walk with a second scanner.
+pub fn parseStructuredSpecParts(raw: []const u8) ?StructuredSpecParts {
     if (raw.len < 2 or raw[0] != '[' or raw[raw.len - 1] != ']') return null;
     var inner = raw[1 .. raw.len - 1];
 
@@ -2092,7 +2160,7 @@ fn parseStructuredSpec(raw: []const u8) ?StructuredSpec {
     }
 
     var items: ItemSet = .{};
-    var columns: ColumnSelector = .none;
+    var columns: ColumnPartSelector = .none;
     if (at_shorthand) items.this_row = true;
 
     var k: usize = 0;
@@ -2116,11 +2184,14 @@ fn parseStructuredSpec(raw: []const u8) ?StructuredSpec {
             const q = parts[k + 1];
             if (isItemSpecifier(q.text)) return null;
             if (seps[k + 1] != 0) return null; // nothing may follow a range
-            columns = .{ .range = .{ .first = p.text, .last = q.text } };
+            columns = .{ .range = .{
+                .first = .{ .text = p.text, .bracketed = p.bracketed },
+                .last = .{ .text = q.text, .bracketed = q.bracketed },
+            } };
             k += 2;
             continue;
         }
-        columns = .{ .one = p.text };
+        columns = .{ .one = .{ .text = p.text, .bracketed = p.bracketed } };
         if (seps[k] != 0) return null; // nothing may follow a column
         k += 1;
     }

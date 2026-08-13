@@ -360,6 +360,21 @@ pub const Error = error{
     /// remaps this to `RowEditUnsafeForSheet`. Surfaces from
     /// `pkg/table_edit.zig`.
     TableHeaderRowDeleteUnsafe,
+    /// `Workbook.renameTableColumn`: no table in the workbook
+    /// carries the given `displayName` (fold rule).
+    TableNotFound,
+    /// `Workbook.renameTableColumn`: the named table has no column
+    /// matching the old name (fold rule). Surfaces from
+    /// `pkg/table_edit.zig`.
+    TableColumnNotFound,
+    /// `Workbook.renameTableColumn`: another column in the same
+    /// table already carries the new name (fold rule — ECMA-376
+    /// §18.5.1.78 uniqueness). Surfaces from `pkg/table_edit.zig`.
+    TableColumnNameInUse,
+    /// `Workbook.renameTableColumn` rejected the new name: empty,
+    /// or a control byte XML cannot carry. Surfaces from
+    /// `pkg/table_edit.zig`.
+    InvalidTableColumnName,
     /// `Workbook.addSheet` refused because the workbook already
     /// holds the type-system maximum (`std.math.maxInt(u32)`)
     /// number of sheets. Excel imposes no documented sheet count
@@ -3789,10 +3804,37 @@ pub const Workbook = struct {
     /// everywhere" per the rewriter's permissive default — the
     /// right value for `rename_sheet`/`delete_sheet` edits, which
     /// match on the edit's own sheet name and ignore bare refs.
+    /// `rename_table_column` scoping for BARE structured refs
+    /// (`[Old]`, `[@Old]`): they bind to the table whose range
+    /// contains the formula's cell, so the walk needs the table's
+    /// geometry. The six structural edits pass null.
+    ///
+    /// The whole rectangle is in scope DELIBERATELY. Excel binds a
+    /// bare specifier in any formula inside the table's range —
+    /// that is how in-table formulas are written — while the
+    /// engine's `vtStructured` binds only producer-owned formulas,
+    /// a strict subset. Rewriting a bare ref the engine leaves
+    /// unbound changes nothing for the engine (unbound before and
+    /// after) and is REQUIRED for Excel, which would otherwise
+    /// reopen the workbook with a stale column name.
+    pub const TableScope = struct {
+        /// Sheet hosting the table (workbook order index).
+        sheet_idx: u32,
+        /// Declared range, 1-based inclusive.
+        tl_row: u32,
+        tl_col: u32,
+        br_row: u32,
+        br_col: u32,
+        /// Decoded `displayName` — what `RewriteContext.owning_table`
+        /// carries for cells inside the range.
+        table: []const u8,
+    };
+
     pub fn rewriteAllFormulas(
         self: *Workbook,
         edit: zlsx.formula_rewriter.RewriteEdit,
         target_sheet: ?[]const u8,
+        table_scope: ?TableScope,
     ) Error!u32 {
         var count: u32 = 0;
         const a = self.allocator;
@@ -3829,6 +3871,7 @@ pub const Workbook = struct {
                         .on_sheet = ws_name,
                         .target_sheet = target_sheet,
                         .sheet_order = sheet_order,
+                        .owning_table = owningTableFor(table_scope, sheet_idx, c.ref),
                         .edit = edit,
                     };
                     // Decode-in: view formulas are raw XML bytes
@@ -4580,7 +4623,7 @@ pub const Workbook = struct {
         // tolerant of "no carriers in the workbook" — they short-
         // circuit on empty workbooks rather than erroring, so
         // calling all four unconditionally is cheap.
-        _ = try self.rewriteAllFormulas(edit, null);
+        _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
@@ -4591,6 +4634,133 @@ pub const Workbook = struct {
         // Postcondition: the in-memory view now reports the new name.
         assert(sheet_idx < self.workbook.sheets.len);
         assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
+    }
+
+    /// Rename a column of the table whose `displayName` matches
+    /// `table_name` (the symbol layer's fold rule, like all name
+    /// resolution). Composes, in order:
+    ///
+    /// 1. Locate the table part through each sheet's
+    ///    `<tableParts>` rels (first fold-match wins; `displayName`
+    ///    is workbook-unique per ECMA-376 §18.5.1.2).
+    /// 2. `table_edit.renameTableColumn`: validates the old column
+    ///    exists and the new name is free (both fold-rule), then
+    ///    rewrites `<tableColumn name>` and every
+    ///    `calculatedColumnFormula` / `totalsRowFormula` body in
+    ///    the part. All refusals precede any mutation.
+    /// 3. Rewrite structured references workbook-wide: cell
+    ///    formulas (bare `[Old]` / `[@Old]` specifiers scope to
+    ///    cells inside the table's range via `TableScope`), defined
+    ///    names, hyperlink locations, and DV/CF formulas.
+    /// 4. Replace the table part and stage the header-cell text
+    ///    (`setCell` shared-string delta) when the table has a
+    ///    header row — Excel repairs a table whose header cell
+    ///    disagrees with its column name.
+    ///
+    /// `table_name` / `old_name` / `new_name` are decoded plain
+    /// text. Returns the number of cell formulas rewritten (the
+    /// count `rewriteAllFormulas` reports).
+    ///
+    /// **Failure contract** (same as `renameSheet`'s): every
+    /// REFUSAL — table or column not found, name collision or
+    /// invalid, malformed part — happens before any mutation, and
+    /// the refusals test pins that byte-exactly. Post-validation
+    /// failures (OOM mid-sweep, a stale-splice refusal from a part
+    /// mutated under us) can leave the workbook partially rewritten,
+    /// exactly as a mid-sweep failure in `renameSheet` can; callers
+    /// treat any error after open as "discard, reopen". Full
+    /// prepare-then-commit transactionality across the four sweeps
+    /// is a workbook-wide change deliberately out of this leg's
+    /// scope.
+    pub fn renameTableColumn(
+        self: *Workbook,
+        table_name: []const u8,
+        old_name: []const u8,
+        new_name: []const u8,
+    ) Error!u32 {
+        if (table_name.len == 0) return error.TableNotFound;
+
+        // Step 1: locate the table part and its host sheet.
+        const a = self.allocator;
+        var host_sheet_idx: ?u32 = null;
+        var table_part_name: []const u8 = "";
+        var sheet_idx: u32 = 0;
+        outer: while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const sheet_part_name = try ws.resolvePartName();
+            const sheet_part = (try self.store.part(sheet_part_name)) orelse continue;
+            const rels = self.store.rels(sheet_part_name);
+            var rid_iter = TablePartRidIterator.init(sheet_part.bytes);
+            while (rid_iter.next()) |rid| {
+                const target = relTargetForId(rels, rid) orelse continue;
+                const part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
+                const part = (try self.store.part(part_name)) orelse continue;
+                const display_raw = table_edit.tableDisplayNameRaw(part.bytes) orelse continue;
+                // STRING-carrier decode (entities + ST_Xstring) —
+                // resolution parity with the engine, which reads
+                // `displayName="Sales_x0041_"` as SalesA. A part
+                // whose attr the codec refuses simply doesn't match.
+                const display = engine.decode.decodeAt(a, .table_name, display_raw) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    continue;
+                };
+                defer a.free(display);
+                const matches = zlsx.casefold.eqlFolded(a, display, table_name) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    break :blk false;
+                };
+                if (matches) {
+                    host_sheet_idx = sheet_idx;
+                    table_part_name = part_name;
+                    break :outer;
+                }
+            }
+        }
+        const host_idx = host_sheet_idx orelse return error.TableNotFound;
+
+        // Step 2: rewrite the table part (validations included —
+        // nothing below runs unless the rename is fully legal).
+        const table_part = (try self.store.part(table_part_name)) orelse return error.TableNotFound;
+        var renamed = try table_edit.renameTableColumn(a, table_part.bytes, old_name, new_name);
+        defer renamed.deinit(a);
+
+        // Step 3: workbook-wide structured-ref rewrite. The edit's
+        // table spelling is the part's own displayName — `table_name`
+        // may be a case variant.
+        const edit: zlsx.formula_rewriter.RewriteEdit = .{ .rename_table_column = .{
+            .table = renamed.display_name,
+            .old = old_name,
+            .new = new_name,
+        } };
+        const scope: TableScope = .{
+            .sheet_idx = host_idx,
+            .tl_row = renamed.tl_row,
+            .tl_col = renamed.tl_col,
+            .br_row = renamed.br_row,
+            .br_col = renamed.br_col,
+            .table = renamed.display_name,
+        };
+        const count = try self.rewriteAllFormulas(edit, null, scope);
+        _ = try self.rewriteAllDefinedNames(edit, null);
+        _ = try self.rewriteAllHyperlinkLocations(edit, null);
+        _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
+
+        // Step 4: commit the part and sync the header cell.
+        if (!std.mem.eql(u8, table_part.bytes, renamed.bytes)) {
+            try self.store.replacePart(table_part_name, renamed.bytes);
+        }
+        if (renamed.header_row) |hr| {
+            const hc = renamed.header_col.?;
+            var ref_buf: [16]u8 = undefined;
+            var len: usize = coords.writeColLetters(
+                ref_buf[0..3],
+                coords.Col.fromOneBased(hc) catch return error.InvalidCellRef,
+            );
+            len += std.fmt.printInt(ref_buf[len..], hr, 10, .lower, .{});
+            const host = try self.sheet(host_idx);
+            try host.setCell(ref_buf[0..len], .{ .shared_string = new_name });
+        }
+        return count;
     }
 
     /// Add a new empty sheet to the workbook (B2 iter-er-4
@@ -5230,7 +5400,7 @@ pub const Workbook = struct {
         const doomed_name_owned = try store_mod.decodeXmlEntities(self.allocator, doomed_name_src);
         defer self.allocator.free(doomed_name_owned);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
-        _ = try self.rewriteAllFormulas(edit, null);
+        _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
@@ -5443,7 +5613,7 @@ pub const Workbook = struct {
             .insert => .{ .insert_cols = .{ .at = spec.col.?, .count = 1 } },
             .delete => .{ .delete_cols = .{ .at = spec.col.?, .count = 1 } },
         };
-        _ = try self.rewriteAllFormulas(edit, target);
+        _ = try self.rewriteAllFormulas(edit, target, null);
         _ = try self.rewriteAllDefinedNames(edit, target);
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
@@ -5702,9 +5872,18 @@ const TablePartRidIterator = struct {
     fn init(sheet_xml: []const u8) TablePartRidIterator {
         // Locate `<tableParts>` open + matching close. Leave
         // cursor inside the block; on absence, set cursor == end.
+        // Comment/CDATA/PI decoys are skipped on both the open and
+        // the close search (Codex #190 r1 F5 — the rename lookup
+        // widened this scanner's blast radius, so it learned the
+        // aware walk for every consumer).
         var i: usize = 0;
         while (i < sheet_xml.len) {
             const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse break;
+            const skip = workbook_xml_mod.skipNonElement(sheet_xml, lt) catch break;
+            if (skip != lt) {
+                i = skip;
+                continue;
+            }
             const need = "<tableParts".len;
             if (lt + need >= sheet_xml.len) break;
             if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<tableParts")) {
@@ -5717,7 +5896,7 @@ const TablePartRidIterator = struct {
                     if (open_end > 0 and sheet_xml[open_end - 1] == '/') {
                         return .{ .sheet_xml = sheet_xml, .cursor = 0, .block_end = 0, .found_block = false };
                     }
-                    const close = std.mem.indexOfPos(u8, sheet_xml, open_end + 1, "</tableParts>") orelse break;
+                    const close = (workbook_xml_mod.findClosingTag(sheet_xml, open_end + 1, "</tableParts>") catch break) orelse break;
                     return .{
                         .sheet_xml = sheet_xml,
                         .cursor = open_end + 1,
@@ -5736,6 +5915,11 @@ const TablePartRidIterator = struct {
         while (self.cursor < self.block_end) {
             const lt = std.mem.indexOfScalarPos(u8, self.sheet_xml, self.cursor, '<') orelse return null;
             if (lt >= self.block_end) return null;
+            const skip = self.skipDecoy(lt) orelse return null;
+            if (skip != lt) {
+                self.cursor = skip;
+                continue;
+            }
             const need = "<tablePart".len;
             if (lt + need >= self.sheet_xml.len) return null;
             if (std.mem.eql(u8, self.sheet_xml[lt .. lt + need], "<tablePart")) {
@@ -5762,6 +5946,15 @@ const TablePartRidIterator = struct {
             self.cursor = lt + 1;
         }
         return null;
+    }
+
+    /// Bounded `skipNonElement`: the index past a comment / CDATA /
+    /// PI construct starting at `lt`, `lt` itself for real markup,
+    /// or null when the construct is unterminated (the block is
+    /// malformed — stop iterating rather than resume mid-comment).
+    fn skipDecoy(self: *const TablePartRidIterator, lt: usize) ?usize {
+        const skip = workbook_xml_mod.skipNonElement(self.sheet_xml, lt) catch return null;
+        return skip;
     }
 };
 
@@ -8515,6 +8708,24 @@ fn maybeRewrite(
         return null;
     }
     return rewritten;
+}
+
+/// The table a cell's BARE structured refs bind to: `scope.table`
+/// when the cell sits inside the scoped table's range on its host
+/// sheet, null otherwise — the rewriter then leaves bare specifiers
+/// alone, matching the engine's owner rule (`vtStructured`).
+fn owningTableFor(
+    scope: ?Workbook.TableScope,
+    sheet_idx: u32,
+    ref: []const u8,
+) ?[]const u8 {
+    const s = scope orelse return null;
+    if (s.sheet_idx != sheet_idx) return null;
+    const col = sheet_edit.parseColFromA1(ref) orelse return null;
+    const row = sheet_edit.parseRowFromA1(ref) orelse return null;
+    if (row < s.tl_row or row > s.br_row) return null;
+    if (col < s.tl_col or col > s.br_col) return null;
+    return s.table;
 }
 
 /// Per-formula splice patch in source-byte space. `[start..end]` is
@@ -12184,7 +12395,7 @@ test "Workbook.rewriteAllFormulas: insert_rows shifts every formula's row refs i
     // (null target = the permissive apply-everywhere default).
     const count = try wb.rewriteAllFormulas(.{
         .insert_rows = .{ .at = 4, .count = 1 },
-    }, null);
+    }, null, null);
     // A1's SUM(B5:B10) → SUM(B6:B11) — 1 rewrite
     // B2's B7+1 → B8+1 — 1 rewrite
     // C3's B2*B5 → B2*B6 (B2 unchanged, B5 → B6) — 1 rewrite
@@ -12219,7 +12430,7 @@ test "Workbook.rewriteAllFormulas: no-op count == 0 on a workbook without formul
     // Pristine fixture has no <f> cells — nothing to rewrite.
     const count = try wb.rewriteAllFormulas(.{
         .insert_rows = .{ .at = 1, .count = 1 },
-    }, null);
+    }, null, null);
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 
@@ -12248,7 +12459,7 @@ test "Workbook.rewriteAllFormulas: rename_sheet rewrites quoted sheet qualifiers
     defer wb.deinit();
     const count = try wb.rewriteAllFormulas(.{
         .rename_sheet = .{ .old = "Sheet2", .new = "Renamed" },
-    }, null);
+    }, null, null);
     try std.testing.expectEqual(@as(u32, 1), count);
 
     var tmp2_buf: [256]u8 = undefined;
@@ -12629,7 +12840,7 @@ test "Workbook.rewriteAllFormulas: entity-bearing formula survives a rewrite byt
     {
         var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
-        const n = try wb.rewriteAllFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Sheet2");
+        const n = try wb.rewriteAllFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Sheet2", null);
         try std.testing.expectEqual(@as(u32, 1), n);
         try wb.save(io, tmp2_path);
     }
@@ -13163,6 +13374,7 @@ test "Workbook.rewriteAllFormulas: stale cached view refuses instead of splicing
         error.MalformedXml,
         wb.rewriteAllFormulas(
             .{ .rename_sheet = .{ .old = "Sheet2", .new = "New" } },
+            null,
             null,
         ),
     );
@@ -18485,6 +18697,175 @@ const TestSheetSpec = struct {
     /// needs bytes the encoder would never emit.
     raw_name: ?[]const u8 = null,
 };
+
+test "Workbook.renameTableColumn: end-to-end structured-ref rename" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // Table T over A1:B3 on sheet S. Producer cells B2/B3 carry the
+    // qualified and BARE spellings; D2 and D5 sit OUTSIDE the range
+    // (qualified rewrites anywhere, bare only inside); S2 has a
+    // cross-sheet qualified ref.
+    const sheet1 = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\"><v>0</v></c><c r=\"B1\"><v>0</v></c></row>" ++
+            "<row r=\"2\"><c r=\"B2\"><f>T[In]*2</f><v>2</v></c>" ++
+            "<c r=\"D2\"><f>SUM(T[In])</f><v>9</v></c></row>" ++
+            "<row r=\"3\"><c r=\"B3\"><f>[@In]*3</f><v>3</v></c></row>" ++
+            "<row r=\"5\"><c r=\"D5\"><f>[@In]</f><v>0</v></c></row>" ++
+            "</sheetData>" ++
+            "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet1);
+    const sheet2 = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\"><f>COUNTA(T[In])</f><v>1</v></c></row>" ++
+            "</sheetData></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet2);
+
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{ .{ .name = "S", .body = sheet1 }, .{ .name = "S2", .body = sheet2 } },
+        null,
+        "<definedNames><definedName name=\"ColRef\">T[In]</definedName></definedNames>",
+    );
+    defer wb.deinit();
+
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "<?xml version=\"1.0\"?><table xmlns=\"" ++ engine.decode.ns_main ++
+            "\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B3\"><tableColumns count=\"2\">" ++
+            "<tableColumn id=\"1\" name=\"In\"/>" ++
+            "<tableColumn id=\"2\" name=\"Out\"><calculatedColumnFormula>T[In]*2</calculatedColumnFormula></tableColumn>" ++
+            "</tableColumns></table>",
+    );
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+
+    const count = try wb.renameTableColumn("T", "In", "Input");
+    // B2 (qualified), D2 (qualified outside the range), B3 (bare
+    // inside), S2!A1 (cross-sheet qualified). D5's bare ref is
+    // outside the range and stays.
+    try std.testing.expectEqual(@as(u32, 4), count);
+
+    const s1 = (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, s1, "<f>T[Input]*2</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "<f>SUM(T[Input])</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "<f>[@Input]*3</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "<f>[@In]</f>") != null);
+
+    const s2 = (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, s2, "<f>COUNTA(T[Input])</f>") != null);
+
+    const tbl = (try wb.store.part("xl/tables/table1.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, tbl, "name=\"Input\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tbl, "<calculatedColumnFormula>T[Input]*2</calculatedColumnFormula>") != null);
+
+    const wb_xml = (try wb.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, ">T[Input]<") != null);
+
+    // Header-cell sync: A1 staged as a shared-string delta; commit
+    // and re-read to observe it on the wire.
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rename-tablecol-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb2 = try Workbook.open(ta, io, tmp_path);
+    defer wb2.deinit();
+    const sst = (try wb2.sst()).?;
+    var found = false;
+    for (sst.entries) |e| {
+        switch (e) {
+            .plain => |p| {
+                if (std.mem.eql(u8, p, "Input")) found = true;
+            },
+            .rich => {},
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Workbook.renameTableColumn: refusals precede any mutation" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    const sheet = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"2\"><c r=\"B2\"><f>T[In]*2</f><v>2</v></c></row>" ++
+            "</sheetData>" ++
+            "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromParts(ta, io, &.{.{ .name = "S", .body = sheet }}, null);
+    defer wb.deinit();
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "<?xml version=\"1.0\"?><table xmlns=\"" ++ engine.decode.ns_main ++
+            "\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B3\"><tableColumns count=\"2\">" ++
+            "<tableColumn id=\"1\" name=\"In\"/><tableColumn id=\"2\" name=\"Out\"/>" ++
+            "</tableColumns></table>",
+    );
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+
+    const sheet_before = try ta.dupe(u8, (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+    defer ta.free(sheet_before);
+    const table_before = try ta.dupe(u8, (try wb.store.part("xl/tables/table1.xml")).?.bytes);
+    defer ta.free(table_before);
+
+    try std.testing.expectError(error.TableNotFound, wb.renameTableColumn("Nope", "In", "X"));
+    try std.testing.expectError(error.TableColumnNotFound, wb.renameTableColumn("T", "Missing", "X"));
+    // Fold-rule collision: `out` collides with the existing `Out`.
+    try std.testing.expectError(error.TableColumnNameInUse, wb.renameTableColumn("T", "In", "out"));
+    try std.testing.expectError(error.InvalidTableColumnName, wb.renameTableColumn("T", "In", ""));
+    // Formula-unencodable control byte (Codex #190 r2): refused
+    // before any sweep runs.
+    try std.testing.expectError(error.InvalidTableColumnName, wb.renameTableColumn("T", "In", "a\x01b"));
+
+    // Nothing was mutated by any refusal.
+    try std.testing.expectEqualStrings(sheet_before, (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+    try std.testing.expectEqualStrings(table_before, (try wb.store.part("xl/tables/table1.xml")).?.bytes);
+
+    // Table lookup follows the fold rule: a case-variant table name
+    // still resolves.
+    const n = try wb.renameTableColumn("t", "In", "Input");
+    try std.testing.expectEqual(@as(u32, 1), n);
+}
 
 /// Build a workbook entirely in memory: `PartStore.fresh` seeds
 /// `[Content_Types].xml` and `addPart` registers the rest, so a test can

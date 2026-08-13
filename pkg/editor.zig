@@ -877,6 +877,27 @@ pub const Editor = struct {
         try self.recordColEdit(sheet_idx, col_1based, false);
     }
 
+    /// Rename a column of the named table (C1: structured-ref
+    /// rewriting). Delegates to `Workbook.renameTableColumn`:
+    /// `<tableColumn name>` + the table part's own formulas, every
+    /// structured reference workbook-wide (`Table1[Old]`, and bare
+    /// `[Old]` / `[@Old]` in cells inside the table's range), defined
+    /// names, hyperlink locations, DV/CF formulas, and the header
+    /// cell's text. Names are decoded plain text; matching follows
+    /// the fold rule name resolution uses. Refusals
+    /// (`TableNotFound`, `TableColumnNotFound`,
+    /// `TableColumnNameInUse`, `InvalidTableColumnName`) all precede
+    /// mutation. Like the other structural edits, changes are staged
+    /// in-memory; `save` commits them.
+    pub fn renameTableColumn(
+        self: *Editor,
+        table_name: []const u8,
+        old_name: []const u8,
+        new_name: []const u8,
+    ) !void {
+        _ = try self.workbook.renameTableColumn(table_name, old_name, new_name);
+    }
+
     /// True iff any worksheet in the embedded workbook has staged
     /// `setCell`/`deleteCell` deltas. B2 iter-er-2 replacement for
     /// the retired `self.pending_mutations.count() > 0` check.
@@ -4692,6 +4713,45 @@ test "Editor: deleteColumn inside table drops matching tableColumn" {
     try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "ref=\"C9:D10\""));
     try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "<tableColumns count=\"2\">"));
     try std.testing.expect(!try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
+}
+
+test "Editor: renameTableColumn on a real-producer table part" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, io, "tbl_rencol_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "tbl_rencol_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    copyCorpusToTmp(io, "tests/corpus/poi_xxe_in_schema.xlsx", src_path) catch return error.SkipZigTest;
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        // POI's table1.xml: Table1 at C9:E10, columns `/Test/Test`,
+        // `Column1`, `Column2` — a producer-written part, xmlColumnPr
+        // body included.
+        try ed.renameTableColumn("Table1", "Column1", "Renamed Col");
+        // Refusals surface through the same path.
+        try std.testing.expectError(
+            error.TableColumnNotFound,
+            ed.renameTableColumn("Table1", "Nope", "X"),
+        );
+        try std.testing.expectError(
+            error.TableColumnNameInUse,
+            ed.renameTableColumn("Table1", "Column2", "renamed col"),
+        );
+        try ed.save(io, dst_path);
+    }
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Renamed Col\""));
+    try std.testing.expect(!try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Column1\""));
+    // Sibling columns and the xmlColumnPr body survive untouched.
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "name=\"Column2\""));
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/tables/table1.xml", "xpath=\"/Test/Test\""));
+    // Header cell D9 (row 9, second column of C9:E10) now carries
+    // the new name through the shared-string table.
+    try std.testing.expect(try tablePartContains(io, dst_path, "xl/sharedStrings.xml", "Renamed Col"));
 }
 
 test "Editor: deleteRow on table's header row refuses with RowEditUnsafeForSheet" {

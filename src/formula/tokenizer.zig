@@ -39,8 +39,10 @@
 //!
 //! Bytes that don't match any rule still fall through as `.unknown`
 //! so round-trip stays lossless on partially malformed input.
-//! Rewriters MUST NOT mutate `.unknown`, `.structured_ref`, or
-//! `.external_ref` tokens.
+//! Rewriters MUST NOT mutate `.unknown` or `.external_ref` tokens.
+//! `.structured_ref` is opaque to every edit except
+//! `rename_table_column`, which re-parses the specifier through the
+//! parser's own grammar and replaces only the column-name subspans.
 //!
 //! Refusals vs round-trip
 //! ----------------------
