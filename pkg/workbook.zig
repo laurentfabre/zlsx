@@ -18853,6 +18853,9 @@ test "Workbook.renameTableColumn: refusals precede any mutation" {
     // Fold-rule collision: `out` collides with the existing `Out`.
     try std.testing.expectError(error.TableColumnNameInUse, wb.renameTableColumn("T", "In", "out"));
     try std.testing.expectError(error.InvalidTableColumnName, wb.renameTableColumn("T", "In", ""));
+    // Formula-unencodable control byte (Codex #190 r2): refused
+    // before any sweep runs.
+    try std.testing.expectError(error.InvalidTableColumnName, wb.renameTableColumn("T", "In", "a\x01b"));
 
     // Nothing was mutated by any refusal.
     try std.testing.expectEqualStrings(sheet_before, (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes);
