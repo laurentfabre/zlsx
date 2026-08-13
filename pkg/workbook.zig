@@ -13169,6 +13169,54 @@ test "Workbook.rewriteAllDefinedNames: entity-encoded name identifier survives b
     try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
 }
 
+test "Workbook.rewriteAllDefinedNames: entity-encoded semantic attributes survive re-emit" {
+    // Codex #188 r4: XML resolves entity references in attribute
+    // values, so `hidden="&#49;"` IS `hidden="1"`. Raw comparison
+    // read it as false, and the block re-emit then silently dropped
+    // the flag (and errored on an entity-encoded localSheetId).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-attr-in-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(
+            &wb,
+            io,
+            "<definedName name=\"Cloaked\" localSheetId=\"&#48;\" hidden=\"&#49;\">Sheet1:Sheet2!A1</definedName>",
+            tmp_path,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try std.testing.expectEqual(true, wb.definedNames()[0].hidden);
+    try std.testing.expectEqual(@as(?u32, 0), wb.definedNames()[0].local_sheet_id);
+
+    // Force the whole-block re-emit through a 3D endpoint rename.
+    try wb.renameSheet(0, "New");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-attr-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wb2.definedNames().len);
+    try std.testing.expectEqual(true, wb2.definedNames()[0].hidden);
+    try std.testing.expectEqual(@as(?u32, 0), wb2.definedNames()[0].local_sheet_id);
+    try std.testing.expectEqualStrings("New:Sheet2!A1", wb2.definedNames()[0].formula);
+}
+
 test "Workbook.rewriteAllDefinedNames: sheet-scope localSheetId preserved across rewrite" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

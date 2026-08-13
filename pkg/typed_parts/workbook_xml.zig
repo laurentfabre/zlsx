@@ -257,12 +257,22 @@ fn collectDefinedNames(
             return error.MalformedXml;
         const formula = block[body_start..close_idx];
 
-        const local_sheet_id: ?u32 = if (getAttr(attrs, "localSheetId")) |s|
-            (std.fmt.parseInt(u32, s, 10) catch return error.InvalidLocalSheetId)
-        else
-            null;
+        // Semantic scalars decode before interpretation: XML resolves
+        // entity references in attribute values, so `hidden="&#49;"`
+        // IS `hidden="1"` — comparing the raw spelling would read it
+        // as false and the defined-names block re-emit would then
+        // silently drop the flag.
+        var lsid_buf: [32]u8 = undefined;
+        const local_sheet_id: ?u32 = if (getAttr(attrs, "localSheetId")) |s| blk: {
+            const dec = decodeScalarAttr(&lsid_buf, s) orelse return error.InvalidLocalSheetId;
+            break :blk std.fmt.parseInt(u32, dec, 10) catch return error.InvalidLocalSheetId;
+        } else null;
 
-        const hidden = if (getAttr(attrs, "hidden")) |s| isXmlTrue(s) else false;
+        var hid_buf: [32]u8 = undefined;
+        const hidden = if (getAttr(attrs, "hidden")) |s|
+            if (decodeScalarAttr(&hid_buf, s)) |dec| isXmlTrue(dec) else false
+        else
+            false;
 
         try out.append(allocator, .{
             .name = name,
@@ -279,6 +289,57 @@ fn collectDefinedNames(
 fn isXmlTrue(s: []const u8) bool {
     // OOXML allows "1"/"true" interchangeably for boolean attrs.
     return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
+}
+
+/// Decode a SEMANTIC scalar attribute value (bool / integer) into
+/// `buf`: the five named XML entities plus ASCII-range numeric
+/// character references. Scalars are tiny and pure ASCII, so a
+/// decoded byte outside 0..127 or an overflow of `buf` returns null
+/// — the value was never a valid scalar. Unknown named entities pass
+/// their `&` through verbatim, matching `store.decodeXmlEntities`'s
+/// lenient contract.
+fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        var c: u8 = s[i];
+        var consumed: usize = 1;
+        if (s[i] == '&') {
+            const rest = s[i..];
+            if (std.mem.startsWith(u8, rest, "&amp;")) {
+                c = '&';
+                consumed = 5;
+            } else if (std.mem.startsWith(u8, rest, "&lt;")) {
+                c = '<';
+                consumed = 4;
+            } else if (std.mem.startsWith(u8, rest, "&gt;")) {
+                c = '>';
+                consumed = 4;
+            } else if (std.mem.startsWith(u8, rest, "&quot;")) {
+                c = '"';
+                consumed = 6;
+            } else if (std.mem.startsWith(u8, rest, "&apos;")) {
+                c = '\'';
+                consumed = 6;
+            } else if (std.mem.startsWith(u8, rest, "&#")) {
+                const semi = std.mem.indexOfScalarPos(u8, s, i + 2, ';') orelse return null;
+                const digits = s[i + 2 .. semi];
+                if (digits.len == 0) return null;
+                const cp = if (digits[0] == 'x' or digits[0] == 'X')
+                    std.fmt.parseInt(u32, digits[1..], 16) catch return null
+                else
+                    std.fmt.parseInt(u32, digits, 10) catch return null;
+                if (cp > 127) return null;
+                c = @intCast(cp);
+                consumed = semi - i + 1;
+            }
+        }
+        if (n >= buf.len) return null;
+        buf[n] = c;
+        n += 1;
+        i += consumed;
+    }
+    return buf[0..n];
 }
 
 // ─── Calc properties ─────────────────────────────────────────────────
