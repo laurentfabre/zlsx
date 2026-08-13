@@ -259,10 +259,14 @@ fn collectDefinedNames(
             continue;
         }
 
-        // Locate the matching `</definedName>`. We scan from the byte
-        // after the opening tag.
+        // Locate the matching `</definedName>`, comment/CDATA-aware.
+        // A raw `indexOfPos` stopped at a decoy close inside a
+        // comment, which both truncated the recorded body AND left
+        // the scan resuming mid-comment — a fake element in the same
+        // comment then parsed as a real entry whose clean-looking
+        // body was eligible for rewriting (Codex #188 r9).
         const body_start = hit.after_tag_close;
-        const close_idx = std.mem.indexOfPos(u8, block, body_start, "</definedName>") orelse
+        const close_idx = (try findClosingTag(block, body_start, "</definedName>")) orelse
             return error.MalformedXml;
         const formula = block[body_start..close_idx];
 
@@ -297,6 +301,26 @@ fn collectDefinedNames(
         // Advance past `</definedName>`.
         cursor = close_idx + "</definedName>".len;
     }
+}
+
+/// Comment/CDATA/PI/DOCTYPE-aware search for a literal closing tag
+/// (`</definedName>`, …). Returns the index of its `<`, or null when
+/// the tag never occurs as real markup.
+pub fn findClosingTag(xml: []const u8, from: usize, close_tag: []const u8) Error!?usize {
+    assert(close_tag.len >= 3);
+    assert(close_tag[0] == '<' and close_tag[1] == '/');
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = try skipNonElement(xml, lt);
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], close_tag)) return lt;
+        i = lt + 1;
+    }
+    return null;
 }
 
 fn isXmlTrue(s: []const u8) bool {

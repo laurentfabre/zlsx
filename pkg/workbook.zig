@@ -8535,24 +8535,12 @@ const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 /// `Workbook.rewriteAllValidationsAndConditionalFormats`.
 /// Find the next occurrence of a literal closing tag (`</c>`,
 /// `</sheetData>`, …) that is REAL markup — comments, CDATA
-/// sections, PIs and DOCTYPE blocks are skipped via the workbook
-/// scanner's `skipNonElement`, so a decoy inside `<!-- … -->` can
-/// never terminate an element early. Returns the index of the `<`.
+/// sections, PIs and DOCTYPE blocks are skipped, so a decoy inside
+/// `<!-- … -->` can never terminate an element early. Thin wrapper
+/// over the workbook scanner's `findClosingTag` that folds its
+/// malformed-input error into "not found".
 fn findClosingTagAware(source: []const u8, from: usize, close_tag: []const u8) ?usize {
-    assert(close_tag.len >= 3);
-    assert(close_tag[0] == '<' and close_tag[1] == '/');
-    var i = from;
-    while (i < source.len) {
-        const lt = std.mem.indexOfScalarPos(u8, source, i, '<') orelse return null;
-        const skip_to = workbook_xml_mod.skipNonElement(source, lt) catch return null;
-        if (skip_to != lt) {
-            i = skip_to;
-            continue;
-        }
-        if (std.mem.startsWith(u8, source[lt..], close_tag)) return lt;
-        i = lt + 1;
-    }
-    return null;
+    return workbook_xml_mod.findClosingTag(source, from, close_tag) catch null;
 }
 
 /// Collect source-byte patches for rewritten CELL formula bodies:
@@ -13178,6 +13166,56 @@ test "Workbook.rewriteAllFormulas: stale cached view refuses instead of splicing
             null,
         ),
     );
+}
+
+test "Workbook.rewriteAllDefinedNames: fake element inside a decoy comment never parses or splices" {
+    // Codex #188 r9: after a raw close-tag search stopped at the
+    // decoy `</definedName>` inside the comment, the parser resumed
+    // MID-COMMENT and a fake element in the same comment became a
+    // real entry with a clean-looking body — rewriting it spliced
+    // inside the comment, and a legal `--`-bearing sheet name then
+    // made the whole part malformed. The comment-aware close search
+    // records the full body for the outer element (markup-bearing →
+    // skipped) and never sees the fake.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-fake-{d}.xlsx", .{prng.random().int(u32)});
+
+    const trap =
+        "<definedName name=\"Trap\">Sheet1:Sheet2!A1<!-- </definedName>" ++
+        "<definedName name=\"Fake\">Sheet1:Sheet2!B1</definedName> --></definedName>";
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(&wb, io, trap, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    // The fake never parses as an entry.
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+    try std.testing.expectEqualStrings("Trap", wb.definedNames()[0].name);
+
+    try wb.renameSheet(0, "A--B");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-fake-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    // The file reopens cleanly and the entire outer element is
+    // byte-identical.
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, bytes, trap) != null);
 }
 
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
