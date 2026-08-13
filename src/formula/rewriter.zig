@@ -23,6 +23,18 @@
 //!     expansion force-renamed names the new columns shadowed), so no
 //!     name-registry lookup is needed to disambiguate `Start:End`.
 //!   - Insert/delete rows/cols, sheet rename
+//!   - R1C1 atoms (`.r1c1_ref` tokens: `R1C1`, `R[-1]C[2]`, `R[2]`,
+//!     `C[2]`), bare and sheet-qualified, single and paired into
+//!     ranges, under EVERY edit. Absolute (digits) parts shift like
+//!     A1 anchors; relative (bracket / trailing-bare) parts spell
+//!     TARGET MINUS HOST and respell only against
+//!     `RewriteContext.host` — without a host they are left
+//!     untouched, never guessed. The formula itself still REFUSES
+//!     evaluation (the `.r1c1_reference` refusal is not lifted);
+//!     rewriting exists so a structural edit cannot silently
+//!     invalidate an R1C1 formula's meaning — pre-merge, fragment
+//!     tokenization let the A1 path shift the `C5` inside
+//!     `R[-1]C5` as if it were a live A1 cell.
 //!   - Structured table refs, for `rename_table_column` ONLY:
 //!     `Table1[Old]` → `Table1[New]` in every spelling the specifier
 //!     grammar admits (`[@Old]`, `[[#Data],[Old]]`, `[[A]:[B]]`,
@@ -33,11 +45,13 @@
 //!     through verbatim. For every OTHER edit the token stays opaque.
 //!
 //! Out of scope (deferred):
-//!   - R1C1, dynamic-array `#`/`@`, external-workbook brackets.
-//!     Since M1a the tokenizer gives each of these its own kind
-//!     rather than lumping them into `.unknown`;
-//!     `isOpaqueQualifier` is where the rewriter names the ones it
-//!     must not follow.
+//!   - Dynamic-array `#`/`@`, external-workbook brackets. Since M1a
+//!     the tokenizer gives each of these its own kind rather than
+//!     lumping them into `.unknown`; `isOpaqueQualifier` is where
+//!     the rewriter names the ones it must not follow.
+//!   - R1C1 toroidal wrap-around (an offset that runs past the grid
+//!     edge wraps in Excel): atoms whose host+offset leaves the
+//!     grid are left untouched.
 //!
 //! Rename/delete of a 3D span ENDPOINT is in scope when the caller
 //! supplies `RewriteContext.sheet_order` (the workbook's tab order,
@@ -60,6 +74,9 @@ const Token = tokenizer.Token;
 /// all four insert/delete variants so a single capture-group switch
 /// can reach `at` / `count` without per-variant duplication.
 pub const Span = struct { at: u32, count: u32 };
+
+/// A formula's own cell, 1-based — see `RewriteContext.host`.
+pub const Host = struct { row: u32, col: u32 };
 
 /// Old/new sheet name pair for `rename_sheet`. Comparison is
 /// byte-exact (matches Excel's sheet-name lookup once both sides
@@ -140,6 +157,14 @@ pub const RewriteContext = struct {
     /// (order-independent), delete leaves spans it cannot contract
     /// untouched, and mid-span targets conservatively don't match.
     sheet_order: ?[]const []const u8 = null,
+    /// The cell this formula lives in (1-based), when the caller can
+    /// know it — the per-cell sweep can; the defined-name and DV/CF
+    /// sweeps cannot. Relative R1C1 parts (`R[-1]`, trailing bare
+    /// `C`) spell TARGET MINUS HOST, so row/col edits can respell
+    /// them only against a host; with `null` they are conservatively
+    /// left untouched (absolute R1C1 parts still rewrite). The host
+    /// is a cell of `on_sheet`. A1 references never consult this.
+    host: ?Host = null,
     /// The table this formula's bare structured refs (`[Old]`,
     /// `[@Old]`) belong to, if any: the table part's own
     /// `calculatedColumnFormula` / `totalsRowFormula` bodies, or a
@@ -582,6 +607,495 @@ fn applyAxisShift(axis: AxisRange, edit: RewriteEdit) AxisOutcome {
     }
 }
 
+// ─── R1C1 shift application ──────────────────────────────────────
+
+const R1C1Axis = enum { rows, cols };
+
+/// Outcome of mapping one absolute axis position through a row/col
+/// edit. `.off_grid` mirrors the A1 policy for a position an insert
+/// would push past the grid edge: leave the whole reference alone.
+const AxisPosOutcome = union(enum) {
+    pos: u32,
+    deleted,
+    off_grid,
+};
+
+/// Map absolute 1-based `pos` on `axis` through `edit`. The identity
+/// arm covers the perpendicular axis and every non-row/col edit.
+fn mapAxisPos(pos: u32, edit: RewriteEdit, axis: R1C1Axis) AxisPosOutcome {
+    assert(pos >= 1);
+    switch (edit) {
+        .insert_rows, .insert_cols => |spec| {
+            const relevant = (edit == .insert_rows) == (axis == .rows);
+            if (!relevant or spec.count == 0 or pos < spec.at) return .{ .pos = pos };
+            const cap: u32 = if (axis == .rows) MAX_ROWS else MAX_COLS;
+            const shifted = std.math.add(u32, pos, spec.count) catch return .off_grid;
+            if (shifted > cap) return .off_grid;
+            return .{ .pos = shifted };
+        },
+        .delete_rows, .delete_cols => |spec| {
+            const relevant = (edit == .delete_rows) == (axis == .rows);
+            if (!relevant or spec.count == 0 or pos < spec.at) return .{ .pos = pos };
+            const zone_end = std.math.add(u32, spec.at, spec.count) catch return .deleted;
+            if (pos < zone_end) return .deleted;
+            return .{ .pos = pos - spec.count };
+        },
+        .rename_sheet, .delete_sheet, .rename_table_column => return .{ .pos = pos },
+    }
+}
+
+/// Whether a row/col edit moves cells on the sheet OWNING the formula
+/// (where its host cell lives). Same scoping rule as
+/// `bareEditApplies` — null means the permissive default — but
+/// without the edit-kind veto: the caller has already picked a
+/// row/col edit.
+///
+/// This is what makes relative R1C1 parts different from everything
+/// A1: the stored text is target MINUS host, so an edit that moves
+/// only the HOST (a row insert on the formula's own sheet, while the
+/// ref is qualified to another sheet) still changes the spelling.
+fn hostSheetMoves(ctx: RewriteContext) bool {
+    switch (ctx.edit) {
+        .insert_rows, .delete_rows, .insert_cols, .delete_cols => {},
+        else => return false,
+    }
+    if (ctx.target_sheet == null) return true;
+    if (ctx.on_sheet == null) return true;
+    return casefold.excelSheetNameEql(ctx.on_sheet.?, ctx.target_sheet.?);
+}
+
+/// True when every present part of `atom` provably denotes an
+/// in-grid position — or cannot be checked (relative with no host).
+/// Digits parts must sit in [1, cap]; relative parts with a known
+/// host must resolve into the grid.
+fn r1c1AtomInGrid(atom: tokenizer.R1C1Atom, host: ?Host) bool {
+    if (atom.row) |p| {
+        if (!r1c1PartInGrid(p, if (host) |h| h.row else null, MAX_ROWS)) return false;
+    }
+    if (atom.col) |p| {
+        if (!r1c1PartInGrid(p, if (host) |h| h.col else null, MAX_COLS)) return false;
+    }
+    return true;
+}
+
+fn r1c1PartInGrid(part: tokenizer.R1C1Part, host_pos: ?u32, cap: u32) bool {
+    switch (part.form) {
+        .digits => return part.value >= 1 and part.value <= cap,
+        .bracket, .bare => {
+            const h = host_pos orelse return true; // unresolvable ≠ invalid
+            if (h < 1 or h > cap) return false;
+            const t = @as(i64, h) + part.value;
+            return t >= 1 and t <= cap;
+        },
+    }
+}
+
+const R1C1TokenOutcome = union(enum) {
+    unchanged,
+    /// New token text, already registered in `owned`.
+    rewritten: []const u8,
+    deleted,
+};
+
+/// Apply a row/col edit to one `.r1c1_ref` token's text.
+///
+/// Absolute (digits) parts move exactly like A1 anchors and need only
+/// `target_moves`. Relative (bracket / trailing-bare) parts encode
+/// `target - host`, so they need the host cell and both motion flags:
+/// `new_offset = map(host + offset) - map(host)`. Conservative exits,
+/// each "leave the bytes alone, never guess":
+///   - relative part with no `host` (defined names, DV/CF sweeps);
+///   - a spelled absolute position outside the grid (`R0C1`);
+///   - `host + offset` outside the grid (Excel wraps these
+///     toroidally; v1 does not model wrapping);
+///   - the host itself dies with the deleted block (the cell — and
+///     this formula — are being dropped by the structural transform);
+///   - any position an insert would push off-grid (the A1 policy).
+fn shiftR1C1Text(
+    allocator: std.mem.Allocator,
+    owned: *std.ArrayListUnmanaged([]u8),
+    text: []const u8,
+    edit: RewriteEdit,
+    host: ?Host,
+    target_moves: bool,
+    host_moves: bool,
+) Error!R1C1TokenOutcome {
+    if (!target_moves and !host_moves) return .unchanged;
+    const axis: R1C1Axis = switch (edit) {
+        .insert_rows, .delete_rows => .rows,
+        .insert_cols, .delete_cols => .cols,
+        else => return .unchanged,
+    };
+    // Defensive: scanner output always re-parses; treat "doesn't"
+    // as "don't touch" rather than trusting and asserting.
+    const atom = tokenizer.parseR1C1AtomText(text) orelse return .unchanged;
+    // Whole-atom veto (Codex #192 F3): an atom with a PROVABLY
+    // out-of-grid component on EITHER axis (`R0C1`, a relative part
+    // whose known host resolves off-grid) is not a reference this
+    // rewriter understands — rewriting its other axis would mutate
+    // half of a construct main left untouched. A relative part with
+    // an UNKNOWN host is merely unresolvable, not invalid; the
+    // documented per-axis conservatism still applies to it.
+    if (!r1c1AtomInGrid(atom, host)) return .unchanged;
+    const part = (if (axis == .rows) atom.row else atom.col) orelse {
+        // Whole-axis atom on the perpendicular axis (`C[2]` under a
+        // row edit): the reference spans every position the edit
+        // could touch — nothing to respell.
+        return .unchanged;
+    };
+    const cap: u32 = if (axis == .rows) MAX_ROWS else MAX_COLS;
+
+    switch (part.form) {
+        .digits => {
+            if (!target_moves) return .unchanged;
+            if (part.value < 1 or part.value > cap) return .unchanged;
+            const pos: u32 = @intCast(part.value);
+            switch (mapAxisPos(pos, edit, axis)) {
+                .pos => |p| {
+                    if (p == pos) return .unchanged;
+                    const out = try reemitR1C1(allocator, text, atom, axis, .{
+                        .form = .digits,
+                        .value = p,
+                    });
+                    return .{ .rewritten = try registerOwned(allocator, owned, out) };
+                },
+                .deleted => return .deleted,
+                .off_grid => return .unchanged,
+            }
+        },
+        .bracket, .bare => {
+            const h = host orelse return .unchanged;
+            const h_pos: u32 = if (axis == .rows) h.row else h.col;
+            if (h_pos < 1 or h_pos > cap) return .unchanged;
+            const t_wide = @as(i64, h_pos) + part.value;
+            if (t_wide < 1 or t_wide > cap) return .unchanged;
+            const t_pos: u32 = @intCast(t_wide);
+
+            var new_h = h_pos;
+            if (host_moves) switch (mapAxisPos(h_pos, edit, axis)) {
+                .pos => |p| new_h = p,
+                .deleted => return .unchanged,
+                .off_grid => return .unchanged,
+            };
+            var new_t = t_pos;
+            if (target_moves) switch (mapAxisPos(t_pos, edit, axis)) {
+                .pos => |p| new_t = p,
+                .deleted => return .deleted,
+                .off_grid => return .unchanged,
+            };
+            const new_off = @as(i64, new_t) - @as(i64, new_h);
+            if (new_off == part.value) return .unchanged;
+            // A changed offset always re-emits bracketed — a bare
+            // letter can only spell 0, and bracketed `[0]` (unlike a
+            // freshly-minted bare `RC`) re-tokenizes as R1C1.
+            const out = try reemitR1C1(allocator, text, atom, axis, .{
+                .form = .bracket,
+                .value = new_off,
+            });
+            return .{ .rewritten = try registerOwned(allocator, owned, out) };
+        },
+    }
+}
+
+/// Rebuild an atom's text with the `axis` part respelled and the
+/// other part's bytes — spelling, letter case — verbatim. The part
+/// letter itself is also kept from the original text.
+fn reemitR1C1(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    atom: tokenizer.R1C1Atom,
+    axis: R1C1Axis,
+    new_part: tokenizer.R1C1Part,
+) Error![]u8 {
+    const row_bytes = text[0..atom.col_start];
+    const col_bytes = text[atom.col_start..];
+    // letter (1) + '[' + '-' + 7 digits + ']' = 11 bytes per part.
+    var part_buf: [11]u8 = undefined;
+    const changed = if (axis == .rows) row_bytes else col_bytes;
+    assert(changed.len >= 1);
+    part_buf[0] = changed[0];
+    var len: usize = 1;
+    switch (new_part.form) {
+        .digits => {
+            assert(new_part.value >= 1);
+            len += std.fmt.printInt(part_buf[len..], @as(u32, @intCast(new_part.value)), 10, .lower, .{});
+        },
+        .bracket => {
+            part_buf[len] = '[';
+            len += 1;
+            len += std.fmt.printInt(part_buf[len..], new_part.value, 10, .lower, .{});
+            part_buf[len] = ']';
+            len += 1;
+        },
+        // Never re-emitted: a bare spelling only survives by NOT
+        // being rewritten.
+        .bare => unreachable,
+    }
+    const keep = if (axis == .rows) col_bytes else row_bytes;
+    const out = try allocator.alloc(u8, len + keep.len);
+    if (axis == .rows) {
+        @memcpy(out[0..len], part_buf[0..len]);
+        @memcpy(out[len..], keep);
+    } else {
+        @memcpy(out[0..keep.len], keep);
+        @memcpy(out[keep.len..], part_buf[0..len]);
+    }
+    return out;
+}
+
+/// True when the atom references a whole row (no col part) or whole
+/// column (no row part) — the forms that pair into an axis span.
+fn r1c1AxisOnly(text: []const u8) ?R1C1Axis {
+    const atom = tokenizer.parseR1C1AtomText(text) orelse return null;
+    if (atom.row != null and atom.col == null) return .rows;
+    if (atom.col != null and atom.row == null) return .cols;
+    return null;
+}
+
+/// Apply a row/col edit to a single `.r1c1_ref` or an
+/// `r1c1 op_range r1c1` triple starting at `ref_start`.
+///
+/// Cell-atom pairs mirror the A1 cell-range policy: endpoints move
+/// independently and a deleted endpoint becomes `#REF!` (both dead →
+/// one collapsed `#REF!`). Same-axis whole-row/whole-col pairs
+/// (`R[1]:R[3]`) mirror the A1 axis-span policy instead: DELETE uses
+/// interval semantics — the span shrinks around the deleted block —
+/// because `R[1]:#REF!` is not a reference. Everything else (mixed
+/// pairs) is treated as independent singles.
+fn applyToR1C1Range(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    ctx: RewriteContext,
+    ref_start: usize,
+    is_range: bool,
+    target_moves: bool,
+) Error!void {
+    assert(work[ref_start].kind == .r1c1_ref);
+    const host_moves = hostSheetMoves(ctx);
+
+    if (is_range) {
+        assert(work[ref_start + 2].kind == .r1c1_ref);
+        // Same-axis whole-row/col pair + delete on that axis →
+        // interval semantics.
+        if (r1c1AxisOnly(work[ref_start].text)) |axis_a| {
+            if (r1c1AxisOnly(work[ref_start + 2].text)) |axis_b| {
+                const deleting = switch (ctx.edit) {
+                    .delete_rows => axis_a == .rows,
+                    .delete_cols => axis_a == .cols,
+                    else => false,
+                };
+                if (axis_a == axis_b and deleting) {
+                    try applyR1C1AxisPairDelete(
+                        allocator,
+                        work,
+                        owned,
+                        ctx,
+                        ref_start,
+                        axis_a,
+                        target_moves,
+                        host_moves,
+                    );
+                    return;
+                }
+            }
+        }
+
+        const a_out = try shiftR1C1Text(
+            allocator,
+            owned,
+            work[ref_start].text,
+            ctx.edit,
+            ctx.host,
+            target_moves,
+            host_moves,
+        );
+        const b_out = try shiftR1C1Text(
+            allocator,
+            owned,
+            work[ref_start + 2].text,
+            ctx.edit,
+            ctx.host,
+            target_moves,
+            host_moves,
+        );
+        if (a_out == .deleted and b_out == .deleted) {
+            work[ref_start] = .{ .kind = .error_lit, .text = "#REF!" };
+            work[ref_start + 1] = .{ .kind = .unknown, .text = "" };
+            work[ref_start + 2] = .{ .kind = .unknown, .text = "" };
+            return;
+        }
+        switch (a_out) {
+            .unchanged => {},
+            .rewritten => |t| work[ref_start].text = t,
+            .deleted => work[ref_start] = .{ .kind = .error_lit, .text = "#REF!" },
+        }
+        switch (b_out) {
+            .unchanged => {},
+            .rewritten => |t| work[ref_start + 2].text = t,
+            .deleted => work[ref_start + 2] = .{ .kind = .error_lit, .text = "#REF!" },
+        }
+        return;
+    }
+
+    switch (try shiftR1C1Text(
+        allocator,
+        owned,
+        work[ref_start].text,
+        ctx.edit,
+        ctx.host,
+        target_moves,
+        host_moves,
+    )) {
+        .unchanged => {},
+        .rewritten => |t| work[ref_start].text = t,
+        .deleted => work[ref_start] = .{ .kind = .error_lit, .text = "#REF!" },
+    }
+}
+
+/// Interval-semantics DELETE for a same-axis whole-row/col pair
+/// (`R[1]:R[3]`, `C2:C[0]`). Both endpoints must resolve to absolute
+/// positions — relative ones need the host — and the host must
+/// survive; otherwise the pair is left untouched (never corrupted).
+fn applyR1C1AxisPairDelete(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    ctx: RewriteContext,
+    ref_start: usize,
+    axis: R1C1Axis,
+    target_moves: bool,
+    host_moves: bool,
+) Error!void {
+    if (!target_moves and !host_moves) return;
+    const spec = switch (ctx.edit) {
+        .delete_rows, .delete_cols => |s| s,
+        else => unreachable,
+    };
+    if (spec.count == 0) return;
+    const cap: u32 = if (axis == .rows) MAX_ROWS else MAX_COLS;
+
+    const a_atom = tokenizer.parseR1C1AtomText(work[ref_start].text) orelse return;
+    const b_atom = tokenizer.parseR1C1AtomText(work[ref_start + 2].text) orelse return;
+    const a_part = (if (axis == .rows) a_atom.row else a_atom.col).?;
+    const b_part = (if (axis == .rows) b_atom.row else b_atom.col).?;
+
+    // Host position on this axis, mapped through the edit — needed
+    // to RESOLVE any relative endpoint and to RE-ENCODE it after.
+    var h_pos: ?u32 = null;
+    var new_h: ?u32 = null;
+    if (ctx.host) |h| {
+        const p: u32 = if (axis == .rows) h.row else h.col;
+        if (p >= 1 and p <= cap) {
+            h_pos = p;
+            if (host_moves) {
+                switch (mapAxisPos(p, ctx.edit, axis)) {
+                    .pos => |np| new_h = np,
+                    .deleted, .off_grid => return, // host doomed: leave alone
+                }
+            } else {
+                new_h = p;
+            }
+        }
+    }
+
+    const a_pos = resolveR1C1AxisPos(a_part, h_pos, cap) orelse return;
+    const b_pos = resolveR1C1AxisPos(b_part, h_pos, cap) orelse return;
+
+    if (!target_moves) {
+        // Only the host moved: positions stay, offsets respell.
+        try reencodeR1C1AxisBound(allocator, work, owned, ref_start, a_atom, axis, a_part, a_pos, new_h);
+        try reencodeR1C1AxisBound(allocator, work, owned, ref_start + 2, b_atom, axis, b_part, b_pos, new_h);
+        return;
+    }
+
+    const lo = @min(a_pos, b_pos);
+    const hi = @max(a_pos, b_pos);
+    const zone_end = std.math.add(u32, spec.at, spec.count) catch std.math.maxInt(u32);
+    if (spec.at > hi) {
+        // Zone entirely past the span: endpoint POSITIONS are
+        // unchanged, but a host sitting at or past the zone still
+        // slid down, so relative offsets may respell.
+        try reencodeR1C1AxisBound(allocator, work, owned, ref_start, a_atom, axis, a_part, a_pos, new_h);
+        try reencodeR1C1AxisBound(allocator, work, owned, ref_start + 2, b_atom, axis, b_part, b_pos, new_h);
+        return;
+    }
+    if (spec.at <= lo and zone_end > hi) {
+        work[ref_start] = .{ .kind = .error_lit, .text = "#REF!" };
+        work[ref_start + 1] = .{ .kind = .unknown, .text = "" };
+        work[ref_start + 2] = .{ .kind = .unknown, .text = "" };
+        return;
+    }
+    // Partial overlap or zone entirely before: surviving interval in
+    // post-delete positions (bounds inside the zone snap to its
+    // edge; bounds past it slide down).
+    const new_lo = if (zone_end <= lo)
+        lo - spec.count
+    else if (lo < spec.at) lo else spec.at;
+    const new_hi = if (zone_end <= lo)
+        hi - spec.count
+    else if (hi >= zone_end) hi - spec.count else spec.at - 1;
+    assert(new_lo >= 1 and new_lo <= new_hi);
+    const a_new = if (a_pos <= b_pos) new_lo else new_hi;
+    const b_new = if (a_pos <= b_pos) new_hi else new_lo;
+    try reencodeR1C1AxisBound(allocator, work, owned, ref_start, a_atom, axis, a_part, a_new, new_h);
+    try reencodeR1C1AxisBound(allocator, work, owned, ref_start + 2, b_atom, axis, b_part, b_new, new_h);
+}
+
+/// Absolute axis position an axis-pair endpoint denotes, or null when
+/// it cannot be known (relative without host, out-of-grid spelling).
+fn resolveR1C1AxisPos(part: tokenizer.R1C1Part, host_pos: ?u32, cap: u32) ?u32 {
+    switch (part.form) {
+        .digits => {
+            if (part.value < 1 or part.value > cap) return null;
+            return @intCast(part.value);
+        },
+        .bracket, .bare => {
+            const h = host_pos orelse return null;
+            const t = @as(i64, h) + part.value;
+            if (t < 1 or t > cap) return null;
+            return @intCast(t);
+        },
+    }
+}
+
+/// Re-encode one axis-pair endpoint at token `idx` to denote absolute
+/// `new_pos`, preserving its spelling form. Digits respell only when
+/// the position changed; relative forms respell when the offset
+/// against the (possibly moved) host changed.
+fn reencodeR1C1AxisBound(
+    allocator: std.mem.Allocator,
+    work: []Token,
+    owned: *std.ArrayListUnmanaged([]u8),
+    idx: usize,
+    atom: tokenizer.R1C1Atom,
+    axis: R1C1Axis,
+    part: tokenizer.R1C1Part,
+    new_pos: u32,
+    new_host: ?u32,
+) Error!void {
+    switch (part.form) {
+        .digits => {
+            if (part.value == new_pos) return;
+            const out = try reemitR1C1(allocator, work[idx].text, atom, axis, .{
+                .form = .digits,
+                .value = new_pos,
+            });
+            work[idx].text = try registerOwned(allocator, owned, out);
+        },
+        .bracket, .bare => {
+            const h = new_host orelse return;
+            const new_off = @as(i64, new_pos) - @as(i64, h);
+            if (new_off == part.value) return;
+            const out = try reemitR1C1(allocator, work[idx].text, atom, axis, .{
+                .form = .bracket,
+                .value = new_off,
+            });
+            work[idx].text = try registerOwned(allocator, owned, out);
+        },
+    }
+}
+
 // ─── sheet-name handling ─────────────────────────────────────────
 
 /// Decode a `.sheet_name` token's text (the borrowed slice including
@@ -834,6 +1348,23 @@ fn applyEdit(
             continue;
         }
 
+        // Bare R1C1 atom or atom pair. Runs AFTER the 3D matcher: a
+        // sheet legitimately named `R1C1` spells `R1C1:Sheet3!A1`,
+        // where the leading token is an endpoint name, not a
+        // reference. Same opaque-qualifier guard as cell refs.
+        if (work[i].kind == .r1c1_ref) {
+            if (i >= 2 and work[i - 1].kind == .bang and isOpaqueQualifier(work[i - 2].kind)) {
+                i += 1;
+                continue;
+            }
+            const is_range = i + 2 < work.len and
+                work[i + 1].kind == .op_range and work[i + 2].kind == .r1c1_ref;
+            const range_end = if (is_range) i + 3 else i + 1;
+            try applyToR1C1Range(allocator, work, owned, ctx, i, is_range, bareEditApplies(ctx));
+            i = range_end;
+            continue;
+        }
+
         // Bare full-column / full-row span (`A:A`, `1:5`) starting at
         // this token. Same opaque-qualifier guard as cell refs: a
         // span after `[..]!` or an unclassifiable `!` belongs to a
@@ -875,22 +1406,27 @@ fn isOpaqueQualifier(kind: Token.Kind) bool {
 fn endOfExternalReference(work: []const Token, start: usize) usize {
     assert(work[start].kind == .external_ref);
     var i = start + 1;
-    if (i < work.len and (work[i].kind == .name or work[i].kind == .sheet_name)) {
+    if (i < work.len and isSpanEndpointKind(work[i].kind)) {
         i += 1;
         // External 3D span: consume the second endpoint only when a
         // bang follows, so a genuine range operator after `[1]Name`
         // is left for the ordinary walk.
         if (i + 2 < work.len and work[i].kind == .op_range and
-            (work[i + 1].kind == .name or work[i + 1].kind == .sheet_name) and
+            isSpanEndpointKind(work[i + 1].kind) and
             work[i + 2].kind == .bang)
         {
             i += 2;
         }
     }
     if (i < work.len and work[i].kind == .bang) i += 1;
-    if (i < work.len and work[i].kind == .cell_ref) {
+    if (i < work.len and (work[i].kind == .cell_ref or work[i].kind == .r1c1_ref)) {
         i += 1;
-        if (i + 1 < work.len and work[i].kind == .op_range and work[i + 1].kind == .cell_ref) {
+        // Second endpoint: either notation (Codex #192 F4 — a mixed
+        // `[1]Sheet1!R5C3:A6` is still one external chain; leaving
+        // the A1 half for the walk would rewrite it as local).
+        if (i + 1 < work.len and work[i].kind == .op_range and
+            (work[i + 1].kind == .cell_ref or work[i + 1].kind == .r1c1_ref))
+        {
             i += 2;
         }
     } else if (matchAxisRange(work, i)) |_| {
@@ -915,6 +1451,9 @@ const SheetQualifierInfo = struct {
     /// Non-null when the ref part is a full-column / full-row span
     /// (`Sheet1!A:A`, `'My Sheet'!1:5`) rather than cell refs.
     axis: ?AxisRange = null,
+    /// True when the ref part is an R1C1 atom (or atom pair) rather
+    /// than A1 cell refs.
+    r1c1: bool = false,
 };
 
 fn matchSheetQualifier(work: []const Token, i: usize) ?SheetQualifierInfo {
@@ -922,6 +1461,28 @@ fn matchSheetQualifier(work: []const Token, i: usize) ?SheetQualifierInfo {
     const sheet_kind = work[i].kind;
     if (sheet_kind != .sheet_name and sheet_kind != .name) return null;
     if (work[i + 1].kind != .bang) return null;
+    if (work[i + 2].kind == .r1c1_ref) {
+        // R1C1 tail: `Sheet2!R5C3`, `'My Sheet'!R[1]C:R[3]C`. Pairs
+        // only with another atom — a mixed `Sheet2!R1C1:A5` leaves
+        // the A1 half to the ordinary walk.
+        var is_range = false;
+        var end: usize = i + 3;
+        if (i + 4 < work.len and work[i + 3].kind == .op_range and
+            work[i + 4].kind == .r1c1_ref)
+        {
+            is_range = true;
+            end = i + 5;
+        }
+        return .{
+            .sheet_idx = i,
+            .bang_idx = i + 1,
+            .ref_start = i + 2,
+            .ref_end = end,
+            .end = end,
+            .is_range = is_range,
+            .r1c1 = true,
+        };
+    }
     if (work[i + 2].kind != .cell_ref) {
         // Whole-axis tail: `Sheet1!A:A`, `Sheet1!$1:$5`.
         const axis = matchAxisRange(work, i + 2) orelse return null;
@@ -1001,6 +1562,8 @@ const ThreeDQualifierInfo = struct {
     /// Non-null when the ref part is a full-column / full-row span
     /// (`Sheet1:Sheet3!A:A`) rather than cell refs.
     axis: ?AxisRange = null,
+    /// True when the ref part is an R1C1 atom (or atom pair).
+    r1c1: bool = false,
 };
 
 /// Match a 3D span qualifier: (sheet_name | name) op_range
@@ -1008,12 +1571,36 @@ const ThreeDQualifierInfo = struct {
 /// disambiguates from a defined-name range (`Start:End` inside SUM)
 /// and from full-column refs (`A:A`), neither of which is followed
 /// by `!`.
+///
+/// An endpoint may also arrive as `.r1c1_ref`: a sheet legitimately
+/// named `R1C1` spells `R1C1:Mar!A5`, and only the bang two tokens
+/// later proves the lexeme was a name. (The SECOND endpoint is
+/// followed directly by `!`, which already lexes it as `.name`, but
+/// accept both positions rather than encode that asymmetry here.)
 fn matchThreeDQualifier(work: []const Token, i: usize) ?ThreeDQualifierInfo {
     if (i + 4 >= work.len) return null; // need sheet, :, sheet, !, ref
-    if (work[i].kind != .sheet_name and work[i].kind != .name) return null;
+    if (!isSpanEndpointKind(work[i].kind)) return null;
     if (work[i + 1].kind != .op_range) return null;
-    if (work[i + 2].kind != .sheet_name and work[i + 2].kind != .name) return null;
+    if (!isSpanEndpointKind(work[i + 2].kind)) return null;
     if (work[i + 3].kind != .bang) return null;
+    if (work[i + 4].kind == .r1c1_ref) {
+        var is_range = false;
+        var end: usize = i + 5;
+        if (i + 6 < work.len and work[i + 5].kind == .op_range and
+            work[i + 6].kind == .r1c1_ref)
+        {
+            is_range = true;
+            end = i + 7;
+        }
+        return .{
+            .first_idx = i,
+            .second_idx = i + 2,
+            .ref_start = i + 4,
+            .is_range = is_range,
+            .end = end,
+            .r1c1 = true,
+        };
+    }
     if (work[i + 4].kind != .cell_ref) {
         // Whole-axis tail: `Sheet1:Sheet3!A:A`, `Sheet1:Sheet3!1:5`.
         const axis = matchAxisRange(work, i + 4) orelse return null;
@@ -1038,6 +1625,16 @@ fn matchThreeDQualifier(work: []const Token, i: usize) ?ThreeDQualifierInfo {
         .ref_start = i + 4,
         .is_range = is_range,
         .end = end,
+    };
+}
+
+/// Token kinds that can spell a 3D-span endpoint name. `.r1c1_ref`
+/// belongs here because sheet names may collide with R1C1 shapes;
+/// position (a bang after the pair) is what disambiguates.
+fn isSpanEndpointKind(kind: Token.Kind) bool {
+    return switch (kind) {
+        .sheet_name, .name, .r1c1_ref => true,
+        else => false,
     };
 }
 
@@ -1289,6 +1886,22 @@ fn rewriteThreeD(
                 defer allocator.free(second);
                 break :blk spanContainsTarget(first, second, t, ctx.sheet_order);
             };
+
+            if (info.r1c1) {
+                // As in `rewriteSheetQualified`: relative parts may
+                // respell on host motion even when the span misses
+                // the edited sheet.
+                try applyToR1C1Range(
+                    allocator,
+                    work,
+                    owned,
+                    ctx,
+                    info.ref_start,
+                    info.is_range,
+                    target_match,
+                );
+                return;
+            }
             if (!target_match) return;
 
             if (info.axis) |axis| {
@@ -1426,6 +2039,23 @@ fn rewriteSheetQualified(
         if (ctx.target_sheet) |t| break :blk sheetTargetMatches(current_sheet, t, ctx.sheet_order);
         break :blk true;
     };
+
+    if (info.r1c1) {
+        // No early return on a target mismatch: a relative R1C1 part
+        // spells TARGET MINUS HOST, so a row/col edit on the
+        // formula's OWN sheet respells `OtherSheet!R[-1]C` even
+        // though the qualifier names an untouched sheet.
+        try applyToR1C1Range(
+            allocator,
+            work,
+            owned,
+            ctx,
+            info.ref_start,
+            info.is_range,
+            target_match,
+        );
+        return;
+    }
     if (!target_match) return;
 
     if (info.axis) |axis| {
@@ -2742,8 +3372,13 @@ test "compat: literals, names and operators survive every edit" {
         "",
         "50%",
         "1.5e+10",
-        "R1C1",
+        // Fully-relative R1C1 with no `RewriteContext.host`: the
+        // offsets cannot be resolved, so the bytes must not move.
+        // (Absolute R1C1 — `R1C1` — is NOT here anymore: it
+        // rewrites, see the R1C1 test block.)
         "R[-1]C[2]",
+        // An R1C1 lookalike that is really a name + bracket garbage.
+        "C[x]",
         "@SUM(MyRange)",
     }) |c| try expectIdentityUnderEveryEdit(c);
 }
@@ -3208,6 +3843,412 @@ test "rename_table_column: OOM-safe at every allocation site" {
                         .old = "Old",
                         .new = "New Col",
                     } },
+                },
+            );
+            allocator.free(out);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, helpers.run, .{});
+}
+
+// ─── R1C1 rewrite tests ──────────────────────────────────────────
+
+test "R1C1: absolute atoms shift like A1 anchors" {
+    // Row edits touch the row part only; the col part's bytes —
+    // including letter case — survive verbatim.
+    try expectRewrite(
+        "R1C1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R2C1",
+    );
+    try expectRewrite(
+        "SUM(r3c2,1)",
+        .{ .edit = .{ .insert_rows = .{ .at = 2, .count = 2 } } },
+        "SUM(r5c2,1)",
+    );
+    try expectRewrite(
+        "R1C5",
+        .{ .edit = .{ .insert_cols = .{ .at = 3, .count = 1 } } },
+        "R1C6",
+    );
+    // Above the edit point: untouched.
+    try expectRewrite(
+        "R1C1",
+        .{ .edit = .{ .insert_rows = .{ .at = 2, .count = 5 } } },
+        "R1C1",
+    );
+    // Deleted target → #REF! (the A1 single-ref policy).
+    try expectRewrite(
+        "R5C3+1",
+        .{ .edit = .{ .delete_rows = .{ .at = 4, .count = 3 } } },
+        "#REF!+1",
+    );
+    try expectRewrite(
+        "R9C3",
+        .{ .edit = .{ .delete_rows = .{ .at = 4, .count = 2 } } },
+        "R7C3",
+    );
+    // Insert that would push the position off-grid: leave alone
+    // (the A1 off-grid policy).
+    try expectRewrite(
+        "R1048576C1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R1048576C1",
+    );
+    // Out-of-grid SPELLING (`R0C1` — no such row): never reasoned
+    // about, never touched — on EITHER axis. A column edit must not
+    // rewrite the valid col part of an atom whose row part is
+    // invalid (Codex #192 F3).
+    try expectRewrite(
+        "R0C1",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R0C1",
+    );
+    try expectRewrite(
+        "R0C1",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "R0C1",
+    );
+    try expectRewrite(
+        "R1C0",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R1C0",
+    );
+    // A relative part whose KNOWN host resolves off-grid also vetoes
+    // the whole atom (wrap-around is not modeled).
+    try expectRewrite(
+        "R[-9]C5",
+        .{
+            .host = .{ .row = 5, .col = 3 },
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+        },
+        "R[-9]C5",
+    );
+}
+
+test "R1C1: a failed col attempt never leaves a live row prefix" {
+    // Codex #192 F2: `R[8]C[99999999]` (8-digit offset) must not
+    // merge `R[8]` alone and shift it inside a construct the
+    // rewriter couldn't read. The full fragment fallback keeps the
+    // bytes under every edit, host or no host.
+    try expectIdentityUnderEveryEdit("R[8]C[99999999]");
+    try expectRewrite(
+        "R[8]C[99999999]",
+        .{
+            .host = .{ .row = 1, .col = 1 },
+            .edit = .{ .insert_rows = .{ .at = 9, .count = 1 } },
+        },
+        "R[8]C[99999999]",
+    );
+    try expectIdentityUnderEveryEdit("R[1]C$2");
+}
+
+test "R1C1: the fragment-corruption class is closed" {
+    // On main these formulas' A1-looking FRAGMENTS were live cell
+    // refs: insert_rows turned `SUM(R[-2]C7,3)` into `SUM(R[-2]C8,3)`
+    // (the absolute COLUMN part row-shifted) and `R[-1]C5:B9` into
+    // `R[-1]C6:B10`. The merged atom is opaque to the A1 path.
+    try expectRewrite(
+        "SUM(R[-2]C7,3)",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "SUM(R[-2]C7,3)",
+    );
+    // A COLUMN insert on the same atom is a real R1C1 rewrite of the
+    // absolute col part — not the `R[-1]D5` main produced.
+    try expectRewrite(
+        "R[-1]C5",
+        .{ .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } } },
+        "R[-1]C6",
+    );
+}
+
+test "R1C1: relative parts respell against the host cell" {
+    const host = Host{ .row = 5, .col = 3 };
+    // Insert ABOVE both host and target: both slide, offset intact.
+    try expectRewrite(
+        "R[-1]C",
+        .{ .host = host, .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } } },
+        "R[-1]C",
+    );
+    // Insert BETWEEN target (row 4) and host (row 5): the host moves
+    // away from the target and the offset widens.
+    try expectRewrite(
+        "R[-1]C",
+        .{ .host = host, .edit = .{ .insert_rows = .{ .at = 5, .count = 1 } } },
+        "R[-2]C",
+    );
+    // Delete BETWEEN host and a below-target: the gap narrows. The
+    // bare col letter's bytes survive.
+    try expectRewrite(
+        "R[2]c",
+        .{ .host = host, .edit = .{ .delete_rows = .{ .at = 6, .count = 1 } } },
+        "R[1]c",
+    );
+    // Deleted target → #REF!.
+    try expectRewrite(
+        "R[2]C",
+        .{ .host = host, .edit = .{ .delete_rows = .{ .at = 7, .count = 1 } } },
+        "#REF!",
+    );
+    // Doomed HOST: the cell is being dropped with its rows — its
+    // formula must not be half-rewritten on the way out.
+    try expectRewrite(
+        "R[2]C",
+        .{ .host = host, .edit = .{ .delete_rows = .{ .at = 4, .count = 2 } } },
+        "R[2]C",
+    );
+    // Zero offsets name the host itself; host and target move as
+    // one, so the spelling can never change.
+    try expectRewrite(
+        "R[0]C[0]",
+        .{ .host = host, .edit = .{ .insert_rows = .{ .at = 1, .count = 9 } } },
+        "R[0]C[0]",
+    );
+    // Column axis, same rules. (Not `RC[2]` — bare `RC` is column
+    // 471 / a possible table name, outside the atom surface.)
+    try expectRewrite(
+        "R[0]C[2]",
+        .{ .host = host, .edit = .{ .insert_cols = .{ .at = 4, .count = 1 } } },
+        "R[0]C[3]",
+    );
+}
+
+test "R1C1: relative parts without a host are left untouched" {
+    // The row part cannot be resolved — but the ABSOLUTE col part in
+    // the same atom still rewrites under a col edit.
+    try expectRewrite(
+        "R[-1]C5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R[-1]C5",
+    );
+    try expectRewrite(
+        "R[3]",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 1 } } },
+        "R[3]",
+    );
+}
+
+test "R1C1: perpendicular whole-axis atoms are never reshaped" {
+    const host = Host{ .row = 5, .col = 3 };
+    // A whole-column ref spans every row; row edits cannot touch it.
+    try expectRewrite(
+        "C[2]",
+        .{ .host = host, .edit = .{ .insert_rows = .{ .at = 1, .count = 4 } } },
+        "C[2]",
+    );
+    try expectRewrite(
+        "R[2]",
+        .{ .host = host, .edit = .{ .delete_cols = .{ .at = 1, .count = 2 } } },
+        "R[2]",
+    );
+}
+
+test "R1C1: sheet-qualified atoms scope like A1 refs" {
+    // Qualifier matches the edited sheet: absolute part shifts.
+    try expectRewrite(
+        "Sheet2!R1C1",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet2!R2C1",
+    );
+    // Qualifier names an untouched sheet; host sheet untouched too.
+    try expectRewrite(
+        "Sheet3!R1C1",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Sheet3!R1C1",
+    );
+    // Bare atoms scope to on_sheet.
+    try expectRewrite(
+        "R1C1",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet2",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "R1C1",
+    );
+}
+
+test "R1C1: host motion respells a ref qualified to an UNTOUCHED sheet" {
+    // The formula lives on Sheet1 (host row 5); the ref points at
+    // Sheet2, which the edit does not touch. A1 would stop at the
+    // qualifier mismatch — but the R1C1 offset spells TARGET MINUS
+    // HOST, and the HOST moved.
+    try expectRewrite(
+        "Sheet2!R[-1]C",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet1",
+            .host = .{ .row = 5, .col = 3 },
+            .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } },
+        },
+        "Sheet2!R[-2]C",
+    );
+    // And the absolute part of the SAME shape stays put: nothing on
+    // Sheet2 moved.
+    try expectRewrite(
+        "Sheet2!R4C1",
+        .{
+            .on_sheet = "Sheet1",
+            .target_sheet = "Sheet1",
+            .host = .{ .row = 5, .col = 3 },
+            .edit = .{ .insert_rows = .{ .at = 3, .count = 1 } },
+        },
+        "Sheet2!R4C1",
+    );
+}
+
+test "R1C1: delete_sheet collapses and rename_sheet respells the qualifier" {
+    try expectRewrite(
+        "Doomed!R5C3+1",
+        .{ .edit = .{ .delete_sheet = "Doomed" } },
+        "#REF!+1",
+    );
+    try expectRewrite(
+        "Old!R5C3",
+        .{ .edit = .{ .rename_sheet = .{ .old = "Old", .new = "New" } } },
+        "New!R5C3",
+    );
+}
+
+test "R1C1: cell-atom pairs use the A1 per-endpoint range policy" {
+    try expectRewrite(
+        "R1C1:R5C1",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 2 } } },
+        "#REF!:R3C1",
+    );
+    try expectRewrite(
+        "R2C1:R3C1",
+        .{ .edit = .{ .delete_rows = .{ .at = 1, .count = 5 } } },
+        "#REF!",
+    );
+    try expectRewrite(
+        "R1C1:R5C1",
+        .{ .edit = .{ .insert_rows = .{ .at = 3, .count = 2 } } },
+        "R1C1:R7C1",
+    );
+}
+
+test "R1C1: same-axis pairs contract with interval semantics on delete" {
+    const host = Host{ .row = 5, .col = 3 };
+    // Targets rows 6..8. Deleting row 8 lands INSIDE the span: the
+    // per-endpoint policy would print `R[1]:#REF!`; a span survives
+    // as its surviving interval instead (the A1 axis-span rule).
+    try expectRewrite(
+        "R[1]:R[3]",
+        .{ .host = host, .edit = .{ .delete_rows = .{ .at = 8, .count = 2 } } },
+        "R[1]:R[2]",
+    );
+    // Whole span deleted → one #REF!.
+    try expectRewrite(
+        "R[1]:R[3]",
+        .{ .host = host, .edit = .{ .delete_rows = .{ .at = 6, .count = 3 } } },
+        "#REF!",
+    );
+    // Unresolvable endpoints (no host): untouched.
+    try expectRewrite(
+        "R[1]:R[3]",
+        .{ .edit = .{ .delete_rows = .{ .at = 8, .count = 2 } } },
+        "R[1]:R[3]",
+    );
+}
+
+test "R1C1: a mixed R1C1/A1 pair rewrites as independent singles" {
+    // Nonsense input (refused either way); each half follows its own
+    // notation's rules rather than corrupting the other's.
+    try expectRewrite(
+        "R1C1:A5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R2C1:A6",
+    );
+}
+
+test "R1C1: a sheet legitimately named R1C1 keeps working" {
+    // `R1C1` before `:Sheet!` is a span ENDPOINT name, not an atom —
+    // the trailing A1 ref shifts, the endpoint must not.
+    try expectRewrite(
+        "R1C1:Mar!A5",
+        .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } },
+        "R1C1:Mar!A6",
+    );
+    try expectRewrite(
+        "R1C1:Mar!A5",
+        .{ .edit = .{ .rename_sheet = .{ .old = "R1C1", .new = "Totals" } } },
+        "Totals:Mar!A5",
+    );
+}
+
+test "R1C1: 3D-qualified atoms shift and collapse like their A1 kin" {
+    const order = [_][]const u8{ "Jan", "Feb", "Mar" };
+    try expectRewrite(
+        "Jan:Mar!R5C3",
+        .{
+            .sheet_order = &order,
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Jan:Mar!R6C3",
+    );
+    // target_sheet outside the span: no shift.
+    try expectRewrite(
+        "Jan:Feb!R5C3",
+        .{
+            .on_sheet = "Other",
+            .target_sheet = "Mar",
+            .sheet_order = &order,
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+        },
+        "Jan:Feb!R5C3",
+    );
+}
+
+test "R1C1: external-workbook R1C1 tails stay untouchable" {
+    try expectIdentityUnderEveryEdit("[1]Sheet1!R5C3");
+    try expectIdentityUnderEveryEdit("'[Book.xlsx]Sheet1'!R1C1");
+    // Mixed-notation external range: the A1 endpoint is part of the
+    // same external chain, not a local ref (Codex #192 F4).
+    try expectIdentityUnderEveryEdit("[1]Sheet1!R5C3:A6");
+}
+
+test "R1C1: rewritten spellings re-tokenize as R1C1 atoms" {
+    // The formatter must never mint a spelling outside the refusal
+    // surface — a freshly-written bare `RC` would re-enter the
+    // tokenizer as column RC and shift as A1 on the NEXT edit.
+    const cases = [_]struct { in: []const u8, ctx: RewriteContext }{
+        .{ .in = "R1C1", .ctx = .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } } } },
+        .{ .in = "R[-1]C", .ctx = .{
+            .host = .{ .row = 5, .col = 3 },
+            .edit = .{ .insert_rows = .{ .at = 5, .count = 1 } },
+        } },
+        .{ .in = "r5c[2]", .ctx = .{ .edit = .{ .insert_rows = .{ .at = 1, .count = 3 } } } },
+    };
+    for (cases) |case| {
+        const out = try rewriteFormula(testing.allocator, case.in, case.ctx);
+        defer testing.allocator.free(out);
+        const toks = try tokenizer.tokenize(testing.allocator, out);
+        defer testing.allocator.free(toks);
+        try testing.expectEqual(@as(usize, 1), toks.len);
+        try testing.expectEqual(Token.Kind.r1c1_ref, toks[0].kind);
+    }
+}
+
+test "R1C1: OOM-safe at every allocation site" {
+    const helpers = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const out = try rewriteFormula(
+                allocator,
+                "SUM(Sheet2!R[-1]C[2],R1C1:R5C1,R[1]:R[3])",
+                .{
+                    .on_sheet = "Sheet1",
+                    .target_sheet = "Sheet1",
+                    .host = .{ .row = 5, .col = 3 },
+                    .edit = .{ .delete_rows = .{ .at = 4, .count = 1 } },
                 },
             );
             allocator.free(out);
