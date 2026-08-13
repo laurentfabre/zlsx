@@ -1321,6 +1321,9 @@ pub fn build(b: *std.Build) void {
     // tokenizer's. Sibling of formula_tokenizer_mod with its own
     // test target. Deps mirror the file's imports: refs/xid for
     // coordinates, casefold for Excel-rule sheet-name matching.
+    // The oracle fixtures ride along because `rename_table_column`
+    // imports `parser.zig` (the structured-ref grammar), which puts
+    // the parser's tests — oracle gate included — in this module.
     const formula_rewriter_mod = b.createModule(.{
         .root_source_file = b.path("src/formula/rewriter.zig"),
         .target = target,
@@ -1330,6 +1333,7 @@ pub fn build(b: *std.Build) void {
     formula_rewriter_mod.addImport("zlsx_refs", refs_mod);
     formula_rewriter_mod.addImport("zlsx_xid", xid_mod);
     formula_rewriter_mod.addImport("zlsx_casefold", unicode_mod);
+    addOracleFixtures(b, formula_rewriter_mod);
     const formula_rewriter_tests = b.addTest(.{ .root_module = formula_rewriter_mod });
     test_step.dependOn(&b.addRunArtifact(formula_rewriter_tests).step);
 
