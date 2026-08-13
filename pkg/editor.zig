@@ -780,13 +780,15 @@ pub const Editor = struct {
         };
     }
 
-    /// Delete a sheet (Phase 3e, iter-sheet-3). v1 contract:
+    /// Delete a sheet (Phase 3e, iter-sheet-3). Contract:
     ///   - Refuses if it's the only remaining sheet.
-    ///   - Refuses if there's pending mutation/append/rename state
-    ///     on ANY sheet (caller must `save` first then re-open).
-    ///   - Pending-new-sheet path: removes from `pending_new_sheets`.
-    ///   - Source sheet path: records the delete + drops the path
-    ///     from `sheet_paths`.
+    ///   - Refuses if there are staged setCell deltas or appended
+    ///     rows on ANY sheet (caller must `save` first then
+    ///     re-open) — the delete rebuilds `sheet_paths`, and queued
+    ///     mutations hold raw indices into it.
+    ///   - Delegates to `Workbook.deleteSheet` (workbook.xml, rels
+    ///     and Content_Types patched in-memory), then drops the
+    ///     path from `sheet_paths`.
     ///   - Cross-sheet formula refs to the deleted sheet collapse
     ///     to `#REF!` via the workbook rewriters; refs to
     ///     surviving sheets stay intact.
@@ -2971,6 +2973,52 @@ test "Editor: insertRow forwards formulas to the rewriter (C1 wiring proof)" {
     defer wb.deinit();
     const c = (try (try wb.sheet(0)).cellByRef("A4")).?;
     try std.testing.expectEqualStrings("A1+A3", c.formula.?);
+}
+
+test "Editor: insertRow scopes bare refs to the edited sheet (C1 wiring proof)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A row edit moves ONE sheet's grid. Bare refs in formulas on
+    // other sheets must stay put; refs qualified to the edited
+    // sheet must shift wherever they live. Codex r1 on this PR
+    // found the wiring passed no target sheet, so bare refs
+    // shifted workbook-wide.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const writer_mod = xlsx;
+    const src_path = try tt.path(std.testing.allocator, io, "fwd_scope_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tt.path(std.testing.allocator, io, "fwd_scope_dst.xlsx");
+    defer std.testing.allocator.free(dst_path);
+    {
+        var w = writer_mod.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s1 = try w.addSheet("Edited");
+        try s1.writeRow(&.{.{ .integer = 1 }});
+        try s1.writeRow(&.{.{ .integer = 2 }});
+        try s1.writeRowWithFormulas(&.{.{ .integer = 3 }}, &.{"A1+A2"});
+        var s2 = try w.addSheet("Other");
+        try s2.writeRowWithFormulas(
+            &.{ .{ .integer = 0 }, .{ .integer = 0 } },
+            &.{ "A2+1", "Edited!A2*2" },
+        );
+        try w.save(io, src_path);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src_path);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst_path);
+    defer wb.deinit();
+    const edited = (try (try wb.sheet(0)).cellByRef("A4")).?;
+    try std.testing.expectEqualStrings("A1+A3", edited.formula.?);
+    const other_bare = (try (try wb.sheet(1)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("A2+1", other_bare.formula.?);
+    const other_qualified = (try (try wb.sheet(1)).cellByRef("B1")).?;
+    try std.testing.expectEqualStrings("Edited!A3*2", other_qualified.formula.?);
 }
 
 test "Editor: deleteRow forwards formulas to the rewriter (C1 wiring proof)" {
