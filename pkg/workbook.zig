@@ -3636,13 +3636,30 @@ pub const Workbook = struct {
     /// first) for `RewriteContext.sheet_order` — what lets the
     /// rewriter contract a 3D span (`Sheet1:Sheet3!A1`) when an
     /// endpoint sheet is deleted, and decide mid-span membership.
-    /// Inner slices borrow from the parsed workbook view, so every
-    /// rewrite must finish before any workbook.xml re-parse. Caller
-    /// frees the outer slice only.
+    ///
+    /// Entries are entity-DECODED (`R&amp;D` in workbook.xml becomes
+    /// `R&D` here): the whole rewrite boundary operates on decoded
+    /// text — formulas decode on the way in, every splice/emit path
+    /// re-escapes on the way out (`appendXmlEscaped*`,
+    /// `setCell`'s delta emit). Free with `freeSheetOrder`.
     fn sheetOrderSnapshot(self: *Workbook) Error![]const []const u8 {
-        const order = try self.allocator.alloc([]const u8, self.workbook.sheets.len);
-        for (self.workbook.sheets, 0..) |s, i| order[i] = s.name;
+        const a = self.allocator;
+        const order = try a.alloc([]const u8, self.workbook.sheets.len);
+        var filled: usize = 0;
+        errdefer {
+            for (order[0..filled]) |n| a.free(n);
+            a.free(order);
+        }
+        for (self.workbook.sheets) |s| {
+            order[filled] = try store_mod.decodeXmlEntities(a, s.name);
+            filled += 1;
+        }
         return order;
+    }
+
+    fn freeSheetOrder(self: *Workbook, order: []const []const u8) void {
+        for (order) |n| self.allocator.free(n);
+        self.allocator.free(order);
     }
 
     pub fn rewriteAllValidationsAndConditionalFormats(
@@ -3653,13 +3670,14 @@ pub const Workbook = struct {
         var count: u32 = 0;
         const a = self.allocator;
         const sheet_order = try self.sheetOrderSnapshot();
-        defer a.free(sheet_order);
+        defer self.freeSheetOrder(sheet_order);
 
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
             const view = try ws.ensureParsed();
-            const ws_name = ws.name();
+            const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
+            defer a.free(ws_name);
             const part_name = ws.resolved_part_name.?;
 
             // Two phases. Phase A: rewrite each DV/CF formula body
@@ -3776,12 +3794,15 @@ pub const Workbook = struct {
         var count: u32 = 0;
         const a = self.allocator;
         const sheet_order = try self.sheetOrderSnapshot();
-        defer a.free(sheet_order);
+        defer self.freeSheetOrder(sheet_order);
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
             const view = try ws.ensureParsed();
-            const ws_name = ws.name();
+            // Decoded boundary: qualifiers inside decoded formulas
+            // must scope against a decoded owner name.
+            const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
+            defer a.free(ws_name);
 
             // Collect (ref, new_text) pairs first so we don't mutate
             // the Worksheet's delta map while iterating its parsed
@@ -3803,8 +3824,20 @@ pub const Workbook = struct {
                         .sheet_order = sheet_order,
                         .edit = edit,
                     };
-                    const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, f, ctx);
-                    if (std.mem.eql(u8, rewritten, f)) {
+                    // Decode-in: view formulas are raw XML bytes
+                    // (`&amp;` spelling `&`); the rewriter and the
+                    // edit names operate on decoded text, and
+                    // `setCell`'s delta emit re-escapes on save.
+                    // Rewriting the raw bytes double-escaped every
+                    // entity-bearing formula a rewrite touched.
+                    const decoded = try store_mod.decodeXmlEntities(a, f);
+                    const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
+                        a.free(decoded);
+                        return err;
+                    };
+                    const unchanged = std.mem.eql(u8, rewritten, decoded);
+                    a.free(decoded);
+                    if (unchanged) {
                         a.free(rewritten);
                         continue;
                     }
@@ -3864,7 +3897,7 @@ pub const Workbook = struct {
         // rewrite below finishes before `refreshWorkbookXmlView`
         // swaps that arena out.
         const sheet_order = try self.sheetOrderSnapshot();
-        defer a.free(sheet_order);
+        defer self.freeSheetOrder(sheet_order);
 
         // Owned strings for every defined name we plan to emit. Either
         // the rewritten formula (mutated) or a duplicated copy of the
@@ -3891,11 +3924,13 @@ pub const Workbook = struct {
         var changed: u32 = 0;
         for (self.workbook.defined_names) |dn| {
             // Resolve `on_sheet`: null for workbook-scope, sheet name
-            // for sheet-scope (via local_sheet_id index lookup).
+            // for sheet-scope (via local_sheet_id index lookup). The
+            // decoded order snapshot doubles as the decoded-name
+            // source — same indices, same lifetime.
             const on_sheet: ?[]const u8 = blk: {
                 if (dn.local_sheet_id) |sid| {
-                    if (sid < self.workbook.sheets.len) {
-                        break :blk self.workbook.sheets[sid].name;
+                    if (sid < sheet_order.len) {
+                        break :blk sheet_order[sid];
                     }
                     // Out-of-range localSheetId in source XML — treat
                     // as workbook-scope rather than crashing. Tolerant
@@ -3911,13 +3946,22 @@ pub const Workbook = struct {
                 .edit = edit,
             };
 
-            const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, dn.formula, ctx);
+            // Decode-in: `dn.formula` is raw XML inner text (still
+            // entity-escaped); the splice re-escapes every formula on
+            // emit, so raw input double-escaped entity bytes — for
+            // UNTOUCHED names too, since the splice re-emits the
+            // whole block. Decoded copies round-trip exactly.
+            const decoded = try store_mod.decodeXmlEntities(a, dn.formula);
+            const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
+                a.free(decoded);
+                return err;
+            };
+            if (!std.mem.eql(u8, rewritten, decoded)) changed += 1;
+            a.free(decoded);
             errdefer a.free(rewritten);
 
             const name_dup = try a.dupe(u8, dn.name);
             errdefer a.free(name_dup);
-
-            if (!std.mem.eql(u8, rewritten, dn.formula)) changed += 1;
 
             try owned_formulas.append(a, rewritten);
             try owned_names.append(a, name_dup);
@@ -3968,7 +4012,7 @@ pub const Workbook = struct {
         const a = self.allocator;
         var total_changed: u32 = 0;
         const sheet_order = try self.sheetOrderSnapshot();
-        defer a.free(sheet_order);
+        defer self.freeSheetOrder(sheet_order);
 
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
@@ -3976,7 +4020,8 @@ pub const Workbook = struct {
             const view = try ws.ensureParsed();
             if (view.hyperlinks.len == 0) continue;
 
-            const ws_name = ws.name();
+            const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
+            defer a.free(ws_name);
 
             // Per-sheet pending list: every hyperlink (preserved
             // verbatim) plus the rewritten location, owned. Empty
@@ -4023,10 +4068,16 @@ pub const Workbook = struct {
                     .sheet_order = sheet_order,
                     .edit = edit,
                 };
-                const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, loc_in, ctx);
+                // Decode-in: `location` is a raw attribute value and
+                // the block emit re-escapes every attribute.
+                const decoded_loc = try store_mod.decodeXmlEntities(a, loc_in);
+                const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded_loc, ctx) catch |err| {
+                    a.free(decoded_loc);
+                    return err;
+                };
+                if (!std.mem.eql(u8, rewritten, decoded_loc)) sheet_changed += 1;
+                a.free(decoded_loc);
                 errdefer a.free(rewritten);
-
-                if (!std.mem.eql(u8, rewritten, loc_in)) sheet_changed += 1;
                 try appendPendingHyperlink(a, &pending, h, rewritten);
             }
 
@@ -4065,22 +4116,27 @@ pub const Workbook = struct {
         h: sheet_xml_mod.Hyperlink,
         loc_override: ?[]u8,
     ) Error!void {
-        const ref_dup = try allocator.dupe(u8, h.ref);
+        // Passthrough fields decode on the way in: the parsed view
+        // holds raw attribute bytes, and the block emit re-escapes
+        // every attribute — duplicating the raw form would
+        // double-escape untouched hyperlinks whenever any sibling's
+        // location was rewritten.
+        const ref_dup = try store_mod.decodeXmlEntities(allocator, h.ref);
         errdefer allocator.free(ref_dup);
 
         const loc_dup: []u8 = if (loc_override) |lo|
             lo // takes ownership — caller's `errdefer free(rewritten)` is cancelled by successful append
         else
-            try allocator.dupe(u8, h.location orelse "");
+            try store_mod.decodeXmlEntities(allocator, h.location orelse "");
         errdefer if (loc_override == null) allocator.free(loc_dup);
 
-        const display_dup: ?[]u8 = if (h.display) |s| try allocator.dupe(u8, s) else null;
+        const display_dup: ?[]u8 = if (h.display) |s| try store_mod.decodeXmlEntities(allocator, s) else null;
         errdefer if (display_dup) |s| allocator.free(s);
 
-        const tooltip_dup: ?[]u8 = if (h.tooltip) |s| try allocator.dupe(u8, s) else null;
+        const tooltip_dup: ?[]u8 = if (h.tooltip) |s| try store_mod.decodeXmlEntities(allocator, s) else null;
         errdefer if (tooltip_dup) |s| allocator.free(s);
 
-        const r_id_dup: ?[]u8 = if (h.r_id) |s| try allocator.dupe(u8, s) else null;
+        const r_id_dup: ?[]u8 = if (h.r_id) |s| try store_mod.decodeXmlEntities(allocator, s) else null;
         errdefer if (r_id_dup) |s| allocator.free(s);
 
         try pending.append(allocator, .{
@@ -4440,14 +4496,21 @@ pub const Workbook = struct {
         @memcpy(old_buf[0..old_name.len], old_name);
         const old_name_owned = old_buf[0..old_name.len];
 
-        // No-op rename: identical bytes. Skip rewriter (would error
-        // .InvalidEdit on `old == new` is fine, but the cleaner contract
-        // is "asking to rename to the current name is a successful
-        // no-op").
-        if (std.mem.eql(u8, old_name_owned, new_name)) return;
+        // The view name is raw attribute bytes (`R&amp;D`); the
+        // rewriter's decode-in contract wants the decoded form. The
+        // raw copy stays alive for the workbook.xml patch below,
+        // which edits the source bytes in their own encoding.
+        const old_name_decoded = try store_mod.decodeXmlEntities(self.allocator, old_name_owned);
+        defer self.allocator.free(old_name_decoded);
+
+        // No-op rename: identical decoded names. Skip rewriter
+        // (would error .InvalidEdit on `old == new` is fine, but the
+        // cleaner contract is "asking to rename to the current name
+        // is a successful no-op").
+        if (std.mem.eql(u8, old_name_decoded, new_name)) return;
 
         const edit: zlsx.formula_rewriter.RewriteEdit = .{
-            .rename_sheet = .{ .old = old_name_owned, .new = new_name },
+            .rename_sheet = .{ .old = old_name_decoded, .new = new_name },
         };
 
         // B2 iter-er-5 lift (rename_sheet axis): walk every cross-
@@ -5103,7 +5166,10 @@ pub const Workbook = struct {
         // refs are unaffected (the deleted sheet's own formulas
         // are dropped with the sheet, not rewritten).
         const doomed_name_src = self.workbook.sheets[sheet_idx].name;
-        const doomed_name_owned = try self.allocator.dupe(u8, doomed_name_src);
+        // Decoded per the rewrite boundary's decode-in contract —
+        // formula qualifiers arrive decoded, so the edit name must
+        // match in decoded space.
+        const doomed_name_owned = try store_mod.decodeXmlEntities(self.allocator, doomed_name_src);
         defer self.allocator.free(doomed_name_owned);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
         _ = try self.rewriteAllFormulas(edit, null);
@@ -5307,7 +5373,9 @@ pub const Workbook = struct {
         // re-parses from the shifted bytes on next access, so
         // `emitWithDeltas` at save time merges shifted-ref text
         // with shifted-r-attr cells.
-        const target = self.workbook.sheets[sheet_idx].name;
+        // Decoded per the rewrite boundary's decode-in contract.
+        const target = try store_mod.decodeXmlEntities(self.allocator, self.workbook.sheets[sheet_idx].name);
+        defer self.allocator.free(target);
         const edit: zlsx.formula_rewriter.RewriteEdit = if (spec.row) |r|
             switch (spec.kind) {
                 .insert => .{ .insert_rows = .{ .at = r, .count = 1 } },
@@ -8373,8 +8441,18 @@ fn maybeRewrite(
         .sheet_order = sheet_order,
         .edit = edit,
     };
-    const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, body, ctx);
-    if (std.mem.eql(u8, rewritten, body)) {
+    // Decode-in: DV/CF bodies are raw XML inner text and the patch
+    // splice re-escapes on emit (`spliceFormulas`). A null return
+    // (no-op rewrite) leaves the source bytes — original entity
+    // spellings included — untouched.
+    const decoded = try store_mod.decodeXmlEntities(a, body);
+    const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
+        a.free(decoded);
+        return err;
+    };
+    const unchanged = std.mem.eql(u8, rewritten, decoded);
+    a.free(decoded);
+    if (unchanged) {
         a.free(rewritten);
         return null;
     }
@@ -12374,6 +12452,162 @@ test "Workbook.deleteSheet: 3D span endpoint contracts via the forwarded sheet o
     );
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     try std.testing.expectEqualStrings(expected, a1.formula.?);
+}
+
+test "Workbook.rewriteAllFormulas: entity-bearing formula survives a rewrite byte-clean" {
+    // Decode-in regression (Codex #188 r1/r2). The view hands the
+    // rewriter raw XML bytes while setCell's delta emit re-escapes;
+    // before the decode-in boundary, any rewrite that touched an
+    // entity-bearing formula double-escaped it: `"a"&Sheet2!B1`
+    // came back as `"a"&amp;amp;Sheet2!B2`.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-entity-shift-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-entity-shift-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("A1", .{ .formula = "\"a\"&Sheet2!B1" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const n = try wb.rewriteAllFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Sheet2");
+        try std.testing.expectEqual(@as(u32, 1), n);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    // The view is raw XML bytes: exactly ONE level of escaping.
+    try std.testing.expectEqualStrings("\"a\"&amp;Sheet2!B2", a1.formula.?);
+}
+
+test "Workbook.renameSheet: 3D endpoint rename keeps sibling entities byte-clean" {
+    // Codex #188 r2 trigger: on pre-3D main this formula was never
+    // staged (rename skipped the 3D matcher), so its `&amp;` stayed
+    // byte-identical; the new endpoint rewrite must not trade the
+    // rename for entity corruption.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-entity-3d-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-entity-3d-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("A1", .{ .formula = "\"a\"&Sheet1:Sheet2!B1" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(0, "New");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("\"a\"&amp;New:Sheet2!B1", a1.formula.?);
+}
+
+test "Workbook.deleteSheet: 3D contraction landing on an entity-named neighbor" {
+    // Codex #188 r1 trigger: the surviving neighbor's name carries
+    // an XML-special byte. The decoded order snapshot + escape-on-
+    // emit must produce exactly one level of escaping in the file.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-entity-contract-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-entity-contract-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        _ = try wb.addSheet("R&D");
+        try (try wb.sheet(1)).setCell("A1", .{ .formula = "SUM(Sheet1:'R&D'!B1)" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.deleteSheet(0);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("SUM('Sheet2:R&amp;D'!B1)", a1.formula.?);
+}
+
+test "Workbook.renameSheet: entity-named sheet renames across both qualifier spellings" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-entity-rename-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-entity-rename-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        _ = try wb.addSheet("R&D");
+        try (try wb.sheet(0)).setCell("A1", .{ .formula = "'R&D'!B1+Sheet2:'R&D'!C1" });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(2, "Test");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings("Test!B1+Sheet2:Test!C1", a1.formula.?);
 }
 
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
