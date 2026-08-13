@@ -619,7 +619,11 @@ fn findSectionOpen(xml: []const u8, section: []const u8) ?usize {
 }
 
 /// Find the start of `</section>` at or after `from`. Used to bound a
-/// wrapper section's contents.
+/// wrapper section's contents. Comment/CDATA/PI-aware like the rest
+/// of the scanner: a raw search truncated the section at a decoy
+/// close inside a comment, handing the aware entry walk a block that
+/// ends MID-COMMENT — which it then rejected as malformed, refusing
+/// a valid file (Codex #188 r10).
 fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
     assert(section.len > 0);
     // Allocate a small stack buffer for `</section>`. Section names in
@@ -632,7 +636,7 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
     @memcpy(buf[2 .. 2 + section.len], section);
     buf[2 + section.len] = '>';
     const needle = buf[0 .. 3 + section.len];
-    return std.mem.indexOfPos(u8, xml, from, needle);
+    return findClosingTag(xml, from, needle) catch null;
 }
 
 // ─── Attribute extraction ────────────────────────────────────────────

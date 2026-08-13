@@ -13218,6 +13218,50 @@ test "Workbook.rewriteAllDefinedNames: fake element inside a decoy comment never
     try std.testing.expect(std.mem.indexOf(u8, bytes, trap) != null);
 }
 
+test "Workbook.rewriteAllDefinedNames: section-close decoy in a comment neither refuses nor splices" {
+    // Codex #188 r10: a decoy `</definedNames>` inside the comment
+    // truncated the section block mid-comment via the raw section-
+    // close search, and the (r9) aware entry walk then rejected the
+    // whole file as malformed. Both boundary searches are now
+    // comment-aware: the file opens, the markup-bearing body is
+    // skipped, and every byte survives.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-defnames-secdecoy-{d}.xlsx", .{prng.random().int(u32)});
+
+    const trap =
+        "<definedName name=\"Trap\">Sheet1:Sheet2!A1<!-- </definedName> " ++
+        "</definedNames> --></definedName>";
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        try testInjectDefinedNames(&wb, io, trap, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wb.definedNames().len);
+
+    try wb.renameSheet(0, "A--B");
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-defnames-secdecoy-out-{d}.xlsx", .{prng.random().int(u32)});
+    try wb.save(io, tmp2_path);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const bytes = (try wb2.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, bytes, trap) != null);
+}
+
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
