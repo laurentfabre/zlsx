@@ -3632,6 +3632,19 @@ pub const Workbook = struct {
     /// **Body counting.** Each formula body that produces different
     /// bytes counts once. So a CF `D1+E1` rewritten to `E1+F1` (one
     /// body, two refs shifted) is one rewrite, not two.
+    /// Snapshot of the workbook tab order (sheet names, first tab
+    /// first) for `RewriteContext.sheet_order` — what lets the
+    /// rewriter contract a 3D span (`Sheet1:Sheet3!A1`) when an
+    /// endpoint sheet is deleted, and decide mid-span membership.
+    /// Inner slices borrow from the parsed workbook view, so every
+    /// rewrite must finish before any workbook.xml re-parse. Caller
+    /// frees the outer slice only.
+    fn sheetOrderSnapshot(self: *Workbook) Error![]const []const u8 {
+        const order = try self.allocator.alloc([]const u8, self.workbook.sheets.len);
+        for (self.workbook.sheets, 0..) |s, i| order[i] = s.name;
+        return order;
+    }
+
     pub fn rewriteAllValidationsAndConditionalFormats(
         self: *Workbook,
         edit: zlsx.formula_rewriter.RewriteEdit,
@@ -3639,6 +3652,8 @@ pub const Workbook = struct {
     ) Error!u32 {
         var count: u32 = 0;
         const a = self.allocator;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer a.free(sheet_order);
 
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
@@ -3673,13 +3688,13 @@ pub const Workbook = struct {
 
             for (view.validations, 0..) |dv, i| {
                 if (dv.formula1) |f| {
-                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
                         errdefer a.free(new);
                         try dv_f1_new.put(a, i, new);
                     }
                 }
                 if (dv.formula2) |f| {
-                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
                         errdefer a.free(new);
                         try dv_f2_new.put(a, i, new);
                     }
@@ -3687,7 +3702,7 @@ pub const Workbook = struct {
             }
             for (view.conditional_formats, 0..) |cf, j| {
                 if (cf.formula) |f| {
-                    if (try maybeRewrite(a, f, ws_name, target_sheet, edit)) |new| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
                         errdefer a.free(new);
                         try cf_f_new.put(a, j, new);
                     }
@@ -3760,6 +3775,8 @@ pub const Workbook = struct {
     ) Error!u32 {
         var count: u32 = 0;
         const a = self.allocator;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer a.free(sheet_order);
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
@@ -3783,6 +3800,7 @@ pub const Workbook = struct {
                     const ctx = zlsx.formula_rewriter.RewriteContext{
                         .on_sheet = ws_name,
                         .target_sheet = target_sheet,
+                        .sheet_order = sheet_order,
                         .edit = edit,
                     };
                     const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, f, ctx);
@@ -3842,6 +3860,12 @@ pub const Workbook = struct {
 
         if (self.workbook.defined_names.len == 0) return 0;
 
+        // Order snapshot borrows from the workbook arena; every
+        // rewrite below finishes before `refreshWorkbookXmlView`
+        // swaps that arena out.
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer a.free(sheet_order);
+
         // Owned strings for every defined name we plan to emit. Either
         // the rewritten formula (mutated) or a duplicated copy of the
         // original (unchanged). Owning every entry uniformly simplifies
@@ -3883,6 +3907,7 @@ pub const Workbook = struct {
             const ctx = zlsx.formula_rewriter.RewriteContext{
                 .on_sheet = on_sheet,
                 .target_sheet = target_sheet,
+                .sheet_order = sheet_order,
                 .edit = edit,
             };
 
@@ -3942,6 +3967,8 @@ pub const Workbook = struct {
     ) Error!u32 {
         const a = self.allocator;
         var total_changed: u32 = 0;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer a.free(sheet_order);
 
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
@@ -3993,6 +4020,7 @@ pub const Workbook = struct {
                 const ctx = zlsx.formula_rewriter.RewriteContext{
                     .on_sheet = ws_name,
                     .target_sheet = target_sheet,
+                    .sheet_order = sheet_order,
                     .edit = edit,
                 };
                 const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, loc_in, ctx);
@@ -8335,12 +8363,14 @@ fn maybeRewrite(
     body: []const u8,
     on_sheet: ?[]const u8,
     target_sheet: ?[]const u8,
+    sheet_order: ?[]const []const u8,
     edit: zlsx.formula_rewriter.RewriteEdit,
 ) Error!?[]u8 {
     if (body.len == 0) return null;
     const ctx = zlsx.formula_rewriter.RewriteContext{
         .on_sheet = on_sheet,
         .target_sheet = target_sheet,
+        .sheet_order = sheet_order,
         .edit = edit,
     };
     const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, body, ctx);
@@ -12236,6 +12266,114 @@ test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet fo
     try std.testing.expectEqualStrings("Renamed", (try wb2.sheet(1)).name());
     const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
     try std.testing.expectEqualStrings("Renamed!A1+1", a1.formula.?);
+}
+
+test "Workbook.renameSheet: 3D span endpoint follows the rename" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-rename-3d-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-rename-3d-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage the 3D span, save (setCell deltas only become visible to
+    // the rewriter through the parsed XML — same shape as the
+    // single-qualifier happy-path test above).
+    var first_buf: [64]u8 = undefined;
+    var first_name: []const u8 = undefined;
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        first_name = try std.fmt.bufPrint(&first_buf, "{s}", .{s0.name()});
+        var f_buf: [128]u8 = undefined;
+        const f = try std.fmt.bufPrint(
+            &f_buf,
+            "SUM({s}:{s}!B1)",
+            .{ first_name, (try wb.sheet(1)).name() },
+        );
+        try s0.setCell("A1", .{ .formula = f });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.renameSheet(1, "Renamed");
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    var out_buf: [160]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&out_buf, "SUM({s}:Renamed!B1)", .{first_name});
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings(expected, a1.formula.?);
+}
+
+test "Workbook.deleteSheet: 3D span endpoint contracts via the forwarded sheet order" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-delete-3d-in-{d}.xlsx", .{prng.random().int(u32)});
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-wb-delete-3d-out-{d}.xlsx", .{prng.random().int(u32)});
+
+    // Stage, save: the span endpoint contraction (`First:Second` →
+    // `First:First`) is decidable ONLY through
+    // `RewriteContext.sheet_order` — if the wiring stops forwarding
+    // the order, the span survives unchanged and this test fails.
+    // That is the forwarding proof. The single-qualifier ref
+    // alongside pins the pre-existing #REF! collapse.
+    var first_buf: [64]u8 = undefined;
+    var first_name: []const u8 = undefined;
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const s0 = try wb.sheet(0);
+        first_name = try std.fmt.bufPrint(&first_buf, "{s}", .{s0.name()});
+        const second_name = (try wb.sheet(1)).name();
+        var f_buf: [160]u8 = undefined;
+        const f = try std.fmt.bufPrint(
+            &f_buf,
+            "SUM({s}:{s}!B1)+{s}!C1",
+            .{ first_name, second_name, second_name },
+        );
+        try s0.setCell("A1", .{ .formula = f });
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.deleteSheet(1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    var out_buf: [160]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &out_buf,
+        "SUM({s}:{s}!B1)+#REF!",
+        .{ first_name, first_name },
+    );
+    const a1 = (try (try wb2.sheet(0)).cellByRef("A1")).?;
+    try std.testing.expectEqualStrings(expected, a1.formula.?);
 }
 
 test "Workbook.renameSheet: rejects forbidden character with InvalidSheetName" {
