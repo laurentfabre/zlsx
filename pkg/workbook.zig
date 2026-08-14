@@ -18991,6 +18991,159 @@ test "Workbook.renameTableColumn: end-to-end structured-ref rename" {
     try std.testing.expect(found);
 }
 
+// C1 — string literals are inert in EVERY formula carrier.
+//
+// `src/formula/rewriter.zig` pins the property against the rewriter
+// itself; these two pin it against the WORKBOOK, which is where a
+// regression would actually reach a user's file. The distinction
+// matters because the carriers do not share one code path: cell
+// formulas, defined names, DV/CF and the table part are each swept by
+// their own pass over their own bytes, so a change that started
+// rewriting literals in ONE of them would leave every rewriter test
+// green while saved workbooks were silently mutated.
+//
+// Each case pairs a live reference with a literal spelling the SAME
+// text, so the assertions state both halves: the reference moved, and
+// the identical bytes inside the quotes did not. `location=` on the
+// hyperlink is the deliberate contrast — a carrier whose whole value
+// is defined to be a reference, which therefore DOES get rewritten.
+
+test "C1: every carrier keeps its string literals under a sheet rename" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // `renameSheet` is the edit that drives all four carrier sweeps
+    // (formulas, defined names, hyperlinks, DV/CF) in one call.
+    const sheet = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\"><sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\"><f>Src!A5&amp;\"Src!A5\"</f><v>0</v></c>" ++
+            "<c r=\"B1\"><f>INDIRECT(\"Src!A5\")</f><v>0</v></c></row>" ++
+            "</sheetData>" ++
+            "<conditionalFormatting sqref=\"C1:C9\"><cfRule type=\"expression\" priority=\"1\">" ++
+            "<formula>Src!A5&amp;\"Src!A5\"</formula></cfRule></conditionalFormatting>" ++
+            // Two validations on purpose. The `list` one is the
+            // cascading-dropdown idiom — the reason INDIRECT appears in
+            // a DV at all — but it holds no live ref, so on its own it
+            // would still pass if formula1 were skipped entirely. The
+            // `between` one carries a live ref in BOTH formula slots,
+            // so each slot's rewrite branch has to run.
+            "<dataValidations count=\"2\"><dataValidation type=\"list\" sqref=\"D1:D9\">" ++
+            "<formula1>INDIRECT(\"Src!A5\")</formula1></dataValidation>" ++
+            "<dataValidation type=\"whole\" operator=\"between\" sqref=\"F1:F9\">" ++
+            "<formula1>Src!A5&amp;\"Src!A5\"</formula1>" ++
+            "<formula2>Src!A5&amp;\"Src!A5\"</formula2></dataValidation></dataValidations>" ++
+            "<hyperlinks><hyperlink ref=\"E1\" location=\"Src!A5\" display=\"go\"/></hyperlinks>" ++
+            "</worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "Src", .body = sheet }},
+        null,
+        "<definedNames><definedName name=\"Both\">Src!A5&amp;\"Src!A5\"</definedName></definedNames>",
+    );
+    defer wb.deinit();
+
+    try wb.renameSheet(0, "Dst");
+
+    const s = (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes;
+    // Cell formula: qualifier renamed, quoted spelling untouched.
+    try std.testing.expect(std.mem.indexOf(u8, s, "<f>Dst!A5&amp;\"Src!A5\"</f>") != null);
+    // INDIRECT's argument is the one piece of text this engine ever
+    // resolves as a reference, and it still says `Src!A5`.
+    try std.testing.expect(std.mem.indexOf(u8, s, "<f>INDIRECT(\"Src!A5\")</f>") != null);
+    // CF and DV carriers — including BOTH DV formula slots, each of
+    // which is rewritten by its own branch.
+    try std.testing.expect(std.mem.indexOf(u8, s, "<formula>Dst!A5&amp;\"Src!A5\"</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "<formula1>INDIRECT(\"Src!A5\")</formula1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "<formula1>Dst!A5&amp;\"Src!A5\"</formula1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "<formula2>Dst!A5&amp;\"Src!A5\"</formula2>") != null);
+    // The contrast: a location IS a reference, all of it, so it moves.
+    try std.testing.expect(std.mem.indexOf(u8, s, "location=\"Dst!A5\"") != null);
+
+    const wb_xml = (try wb.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, ">Dst!A5&amp;\"Src!A5\"<") != null);
+}
+
+test "C1: table formula carriers keep their string literals under a column rename" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // The one edit that reaches structured refs — and the one the
+    // rewriter's own `all_edits` sweep deliberately spells so it does
+    // NOT match, which is why the matching spelling is pinned here.
+    const sheet = try std.fmt.allocPrint(
+        ta,
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{s}\" " ++
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheetData>" ++
+            "<row r=\"1\"><c r=\"A1\"><v>0</v></c><c r=\"B1\"><v>0</v></c></row>" ++
+            "<row r=\"2\"><c r=\"B2\"><f>T[In]&amp;\"T[In]\"</f><v>0</v></c></row>" ++
+            "<row r=\"3\"><c r=\"B3\"><f>INDIRECT(\"T[In]\")</f><v>0</v></c></row>" ++
+            "</sheetData>" ++
+            "<tableParts count=\"1\"><tablePart r:id=\"rIdT1\"/></tableParts></worksheet>",
+        .{test_ns_main},
+    );
+    defer ta.free(sheet);
+
+    var wb = try testWorkbookFromPartsWithNames(
+        ta,
+        io,
+        &.{.{ .name = "S", .body = sheet }},
+        null,
+        "<definedNames><definedName name=\"Both\">T[In]&amp;\"T[In]\"</definedName></definedNames>",
+    );
+    defer wb.deinit();
+
+    try wb.store.addPart(
+        "xl/tables/table1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "<?xml version=\"1.0\"?><table xmlns=\"" ++ engine.decode.ns_main ++
+            "\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:B3\"><tableColumns count=\"2\">" ++
+            "<tableColumn id=\"1\" name=\"In\"/>" ++
+            "<tableColumn id=\"2\" name=\"Out\">" ++
+            "<calculatedColumnFormula>T[In]&amp;\"T[In]\"</calculatedColumnFormula></tableColumn>" ++
+            "</tableColumns></table>",
+    );
+    // `addPart` does not refresh the rels index, so the relationship
+    // has to arrive through `replacePart` on an already-added part —
+    // the same two-step the #190 end-to-end test uses.
+    try wb.store.addPart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>",
+    );
+    try wb.store.replacePart(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" ++
+            "<Relationship Id=\"rIdT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>" ++
+            "</Relationships>",
+    );
+
+    _ = try wb.renameTableColumn("T", "In", "Input");
+
+    const s = (try wb.store.part("xl/worksheets/sheet1.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, s, "<f>T[Input]&amp;\"T[In]\"</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "<f>INDIRECT(\"T[In]\")</f>") != null);
+
+    const tbl = (try wb.store.part("xl/tables/table1.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        tbl,
+        "<calculatedColumnFormula>T[Input]&amp;\"T[In]\"</calculatedColumnFormula>",
+    ) != null);
+
+    const wb_xml = (try wb.store.part("xl/workbook.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml, ">T[Input]&amp;\"T[In]\"<") != null);
+}
+
 test "Workbook.renameTableColumn: refusals precede any mutation" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

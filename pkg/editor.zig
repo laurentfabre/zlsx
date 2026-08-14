@@ -2955,6 +2955,80 @@ test "Editor: row edits with cross-sheet formulas rewrite refs (iter-er-5 lift)"
     }
 }
 
+test "C1: after a row insert the reference follows the cell, INDIRECT follows the coordinate" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ta = std.testing.allocator;
+
+    // The literal-inertness tests in `pkg/workbook.zig` stop at the
+    // rewritten bytes. This one runs the composition they imply —
+    // edit, then EVALUATE — because the decision being pinned is a
+    // claim about what a formula MEANS afterwards, not what it spells.
+    //
+    // A4=44 and A5=55; A1 reads `A5` and A2 reads `INDIRECT("A5")`, so
+    // both answer 55 to begin with. Inserting a row at the top slides
+    // the values down (44 lands on A5, 55 on A6) and the formulas to
+    // A2/A3:
+    //
+    //   * `A5` is rewritten to `A6` and still answers 55 — it followed
+    //     the CELL, which is what a reference does.
+    //   * `INDIRECT("A5")` is untouched, resolves A5 against the grid
+    //     as it now stands, and answers 44 — it followed the
+    //     COORDINATE, which is the whole reason the function is used.
+    //
+    // Same pair, same starting answer, different answers after.
+    // Rewriting the literal would collapse both onto 55 and erase the
+    // distinction this milestone decided to keep.
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(ta, io, "c1_indirect_eval_src.xlsx");
+    defer ta.free(src_path);
+    const dst_path = try tt.path(ta, io, "c1_indirect_eval_dst.xlsx");
+    defer ta.free(dst_path);
+
+    {
+        var w = xlsx.Writer.init(ta);
+        defer w.deinit();
+        var s = try w.addSheet("S");
+        try s.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"A5"});
+        try s.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"INDIRECT(\"A5\")"});
+        try s.writeRow(&.{.{ .integer = 0 }});
+        try s.writeRow(&.{.{ .integer = 44 }});
+        try s.writeRow(&.{.{ .integer = 55 }});
+        try w.save(io, src_path);
+    }
+
+    {
+        var wb = try Workbook.open(ta, io, src_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        var report = try wb.saveWithRecalc(ta, io, dst_path, .{
+            .now_utc_ms = 1_700_000_000_000,
+            .rng_seed = 0x5EED_5D3,
+            .limits = .{},
+        }, .{});
+        report.deinit(ta);
+    }
+
+    var wb2 = try Workbook.open(ta, io, dst_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+
+    const followed_cell = (try ws.cellByRef("A2")).?;
+    try std.testing.expectEqualStrings("A6", followed_cell.formula.?);
+    try std.testing.expectEqualStrings("55", followed_cell.raw_value.?);
+
+    // `Cell.formula` is the RAW `<f>` inner text, so the quotes around
+    // the literal arrive as `&quot;`; decode before comparing rather
+    // than pinning one escaping policy.
+    const followed_coordinate = (try ws.cellByRef("A3")).?;
+    const decoded = try store_mod.decodeXmlEntities(ta, followed_coordinate.formula.?);
+    defer ta.free(decoded);
+    try std.testing.expectEqualStrings("INDIRECT(\"A5\")", decoded);
+    try std.testing.expectEqualStrings("44", followed_coordinate.raw_value.?);
+}
+
 // C1 wiring — per-edit forwarding proofs. Each of the six
 // structural edits must reach `Workbook.rewriteAllFormulas`; the
 // byte transform alone moves `<c r=>` anchors but never rewrites

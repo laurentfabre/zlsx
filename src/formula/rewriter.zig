@@ -53,6 +53,27 @@
 //!     edge wraps in Excel): atoms whose host+offset leaves the
 //!     grid are left untouched.
 //!
+//! Decided, NOT deferred — reference-bearing text:
+//!   - The bytes inside a `.string` token are never rewritten, and
+//!     that includes `INDIRECT("A5")`, the one piece of text this
+//!     engine ever resolves as a reference (`referenceFromText`, whose
+//!     only caller is `fnIndirect`). A literal is a VALUE; INDIRECT
+//!     resolves it at EVALUATION time against the grid as it stands
+//!     then. Excel does not rewrite it either — pinning a reference
+//!     against exactly these edits is why the function gets used — and
+//!     rewriting only the directly-spelled case would make one intent
+//!     track edits or not depending on whether it was written
+//!     `INDIRECT("A5")`, `INDIRECT("A"&"5")` or `INDIRECT(D1)`.
+//!     This is about literals, not about carriers. Defined-name
+//!     bodies and DV/CF formulas are independently stored FORMULA
+//!     carriers: they run through this same rewriter, so their live
+//!     reference tokens move and their string literals do not, exactly
+//!     as in a cell formula. A hyperlink `location` is the one carrier
+//!     whose whole value is defined to be a reference, and it is
+//!     rewritten as a unit. Pinned by the `C1:` tests at the bottom of
+//!     this file, per carrier in `pkg/workbook.zig`, and through
+//!     evaluation in `pkg/editor.zig`.
+//!
 //! Rename/delete of a 3D span ENDPOINT is in scope when the caller
 //! supplies `RewriteContext.sheet_order` (the workbook's tab order,
 //! as of BEFORE the edit). Renaming an endpoint rewrites its
@@ -3381,6 +3402,209 @@ test "compat: literals, names and operators survive every edit" {
         "C[x]",
         "@SUM(MyRange)",
     }) |c| try expectIdentityUnderEveryEdit(c);
+}
+
+// ─── C1: reference-bearing TEXT inside formulas ──────────────────
+//
+// A string literal is a VALUE, not a reference. This engine reads one
+// AS a reference in exactly one place — `INDIRECT`'s first argument,
+// through `Evaluator.referenceFromText`, whose only caller in the repo
+// is `fnIndirect` — and even there the text is resolved at EVALUATION
+// time against the grid as it stands then, not at edit time.
+//
+// So a structural edit never touches bytes inside a `.string` token,
+// and that is a decision rather than an omission:
+//
+//   * Excel does not rewrite them either. `INDIRECT("A5")` still
+//     spells `A5` after rows move, and `INDIRECT("Sheet1!A5")` breaks
+//     when `Sheet1` is renamed. Pinning a reference against exactly
+//     these edits is the documented reason the function is used.
+//   * Only a DIRECT literal could ever be rewritten. `INDIRECT(D1)`,
+//     `INDIRECT("A"&"5")` and `INDIRECT(ADDRESS(...))` compute their
+//     text at evaluation time, so rewriting the literal spelling
+//     would make one user intent track edits or not depending on how
+//     it happened to be written.
+//   * The line is drawn at what the GRAMMAR says is a reference, not
+//     at text a function may later choose to read as one. Defined-name
+//     bodies and DV/CF formulas are independently stored FORMULA
+//     carriers — they run through this same rewriter, so their live
+//     reference tokens move and their literals do not, exactly as in a
+//     cell formula. A hyperlink `location` is the one carrier whose
+//     whole value is a reference, and it moves as a unit.
+//
+// The tests below pin the contract as a PROPERTY, not by example: the
+// sequence of string-literal bytes is invariant under every edit, and
+// stays invariant in formulas that legitimately change AROUND the
+// literal. `expectIdentityUnderEveryEdit` cannot state that — a
+// formula holding a live ref beside a literal must change — and that
+// blind spot is exactly where the analogous R1C1 defect lived, where
+// fragment tokenization let the A1 path rewrite the `C7` inside
+// `SUM(R[-2]C7,3)` while the formula around it changed for other
+// reasons.
+
+/// `all_edits` plus a table rename that MATCHES the table under test.
+/// The base list deliberately carries a NON-matching one, so on its
+/// own it proves nothing about the edit that does reach structured
+/// refs; a literal has to survive the matching spelling too.
+const all_edits_matching_table = all_edits ++ [_]RewriteEdit{
+    .{ .rename_table_column = .{ .table = "T", .old = "In", .new = "Input" } },
+};
+
+/// The `.string` token texts of `text`, in order. Slices borrow from
+/// `text`; caller frees the outer slice only.
+fn stringLiterals(allocator: std.mem.Allocator, text: []const u8) Error![][]const u8 {
+    const toks = try tokenizer.tokenize(allocator, text);
+    defer allocator.free(toks);
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (toks) |t| {
+        if (t.kind == .string) try out.append(allocator, t.text);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Rewrite `input` under `ctx` and assert every string literal came
+/// through byte-exact, in the same order and the same count. Says
+/// nothing about the rest of the formula, which is the point: it
+/// holds for inputs the edit legitimately rewrites.
+fn expectStringLiteralsInert(input: []const u8, ctx: RewriteContext) !void {
+    const out = try rewriteFormula(testing.allocator, input, ctx);
+    defer testing.allocator.free(out);
+
+    const before = try stringLiterals(testing.allocator, input);
+    defer testing.allocator.free(before);
+    const after = try stringLiterals(testing.allocator, out);
+    defer testing.allocator.free(after);
+
+    if (before.len != after.len) {
+        std.debug.print(
+            "edit {s} changed the NUMBER of string literals ({d} -> {d}):\n  in:  '{s}'\n  out: '{s}'\n",
+            .{ @tagName(ctx.edit), before.len, after.len, input, out },
+        );
+        return error.TestExpectedEqual;
+    }
+    for (before, after) |b, a| {
+        if (std.mem.eql(u8, b, a)) continue;
+        std.debug.print(
+            "edit {s} mutated a string literal ('{s}' -> '{s}'):\n  in:  '{s}'\n  out: '{s}'\n",
+            .{ @tagName(ctx.edit), b, a, input, out },
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "C1: string literals survive every edit byte-exact, formula changing or not" {
+    // Each case pairs a literal with something the edit is SUPPOSED to
+    // rewrite wherever that is possible, so a pass means "the literal
+    // held still while the rewriter was working", not "this edit did
+    // nothing here". The spellings inside the quotes deliberately
+    // cover every construct the rewriter knows how to move.
+    for ([_][]const u8{
+        // INDIRECT — the one function whose text resolution reads.
+        "INDIRECT(\"A5\")",
+        "INDIRECT(\"A5\",TRUE)",
+        "INDIRECT(\"$A$5\")",
+        "INDIRECT(\"Sheet1!A5\")",
+        "INDIRECT(\"'My Sheet'!A5\")",
+        "SUM(INDIRECT(\"A1:B5\"))",
+        "INDIRECT(\"B:B\")",
+        "INDIRECT(\"1:5\")",
+        "INDIRECT(\"Sheet1:Sheet3!A5\")",
+        "INDIRECT(\"R1C1\")",
+        "INDIRECT(\"T[In]\")",
+        "INDIRECT(\"[1]Sheet1!A1\")",
+        "INDIRECT(\"#REF!\")",
+        // Literal beside a live reference of the same spelling: the
+        // ref must be free to move while the literal does not.
+        "A5+INDIRECT(\"A5\")",
+        "Sheet1!A5&\"Sheet1!A5\"",
+        "T[In]&\"T[In]\"",
+        "[@In]&\"[@In]\"",
+        "Sheet1:Sheet3!A5&\"Sheet1:Sheet3!A5\"",
+        "A:A&\"A:A\"",
+        "R1C1&\"R1C1\"",
+        "IF(A5>0,\"A5\",\"B6\")",
+        "A1:B5&\"A1:B5\"",
+        // Text that only LOOKS resolvable, and text the engine could
+        // never resolve statically anyway.
+        "INDIRECT(\"A\"&\"5\")",
+        "INDIRECT(D1)",
+        "CONCAT(\"Sheet1!A5\")",
+        // Escapes and edges: a doubled quote is one literal, an empty
+        // literal has no bytes to move, and an unterminated literal
+        // runs to end-of-input as a single token.
+        "INDIRECT(\"say \"\"A5\"\" now\")",
+        "\"\"",
+        "\"\"\"A5\"\"\"",
+        "INDIRECT(\"A5",
+        "A5+\"tail",
+    }) |c| {
+        for (all_edits_matching_table) |edit| {
+            try expectStringLiteralsInert(c, .{
+                .on_sheet = "Sheet1",
+                .sheet_order = &.{ "Sheet1", "Sheet2", "Sheet3" },
+                // Present so the R1C1 and bare-structured paths are
+                // live rather than skipped for want of context — the
+                // literal has to survive the rewriter at full power.
+                .host = .{ .row = 10, .col = 10 },
+                .owning_table = "T",
+                .edit = edit,
+            });
+        }
+    }
+}
+
+test "C1: the reference moves and the identical literal does not" {
+    // The property test proves the literal held still; these pin what
+    // moved beside it, so a rewriter that quietly stopped rewriting
+    // ANYTHING could not pass the pair.
+    const base: RewriteContext = .{
+        .on_sheet = "Sheet1",
+        .sheet_order = &.{ "Sheet1", "Sheet2", "Sheet3" },
+        .host = .{ .row = 10, .col = 10 },
+        .owning_table = "T",
+        .edit = undefined,
+    };
+    const cases = [_]struct { in: []const u8, edit: RewriteEdit, out: []const u8 }{
+        .{
+            .in = "A5+INDIRECT(\"A5\")",
+            .edit = .{ .insert_rows = .{ .at = 1, .count = 1 } },
+            .out = "A6+INDIRECT(\"A5\")",
+        },
+        // The collapse case: the live ref becomes #REF!, and the
+        // literal — which would have spelled the same dead cell —
+        // survives to be resolved against the post-edit grid.
+        .{
+            .in = "A1+INDIRECT(\"A1\")",
+            .edit = .{ .delete_rows = .{ .at = 1, .count = 1 } },
+            .out = "#REF!+INDIRECT(\"A1\")",
+        },
+        .{
+            .in = "A5+INDIRECT(\"A5\")",
+            .edit = .{ .insert_cols = .{ .at = 1, .count = 1 } },
+            .out = "B5+INDIRECT(\"A5\")",
+        },
+        .{
+            .in = "Sheet1!A5&\"Sheet1!A5\"",
+            .edit = .{ .rename_sheet = .{ .old = "Sheet1", .new = "Renamed" } },
+            .out = "Renamed!A5&\"Sheet1!A5\"",
+        },
+        .{
+            .in = "Sheet1!A5&\"Sheet1!A5\"",
+            .edit = .{ .delete_sheet = "Sheet1" },
+            .out = "#REF!&\"Sheet1!A5\"",
+        },
+        .{
+            .in = "T[In]&\"T[In]\"",
+            .edit = .{ .rename_table_column = .{ .table = "T", .old = "In", .new = "Input" } },
+            .out = "T[Input]&\"T[In]\"",
+        },
+    };
+    for (cases) |c| {
+        var ctx = base;
+        ctx.edit = c.edit;
+        try expectRewrite(c.in, ctx, c.out);
+    }
 }
 
 test "compat: unicode names survive every edit" {
