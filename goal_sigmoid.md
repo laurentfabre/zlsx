@@ -14,7 +14,7 @@
 > Questions are asked when they are *necessary* — at semantic decision points —
 > exactly as directed.
 
-_Created: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0 · Status: **S0 done (gate answered 2026-08-26) · S1 done (gate open: the three numbers) · S2 next**_
+_Created: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0 · Status: **S0 done (gate answered 2026-08-26) · S1 done (gate open: the three numbers) · S2 done (no gate fired) · S3a or S6 next**_
 
 ---
 
@@ -35,7 +35,8 @@ Standing facts that shaped the frame (verified 2026-08-26):
   15.15 MiB / 3× figure stays a non-blocking research hypothesis (§9.1b–g of
   `goal_formula.md`). Every sigmoid row keeps the ordinary regression gates.
 - Refusal state on `main`: every row/col-edit axis with a rewriter is lifted;
-  **two guards remain** — pivots (#139) and `<xm:f>` sparkline formulas (#140).
+  **two guards remained** at creation — pivots (#139) and `<xm:f>` sparkline
+  formulas (#140); S2 lifted the second on 2026-08-26, pivots remain.
 - `src/writer.zig` excludes drawings/charts/pivots wholesale; README writer-matrix
   footnote ⁵ described an emission surface the fresh Writer does not have (fixed
   in S0). Doc truth-reconciliation is row zero, not a side effect.
@@ -64,7 +65,7 @@ Status vocabulary is ROADMAP's: `done` / `partial` / `planned` / `todo` /
 |---|---|---|---|---|---|
 | S0 | Doc truth + surface inventory | done | 3–5 d | — | Reconciled every stale claim (Writer image footnote ⁵, Python "structural edits are a follow-up" / "0.9.0+", `to_bytes()` queue note, the pivot-guard reach, the archive-defense wording, the fuzz platform and target list), and committed the four-surface capability matrix (`docs/plans/surface-matrix.md`) with `scripts/check_surface_matrix.py` in CI. Three Codex rounds; owner gate answered 2026-08-26 (§5). |
 | S1 | Core reader decompression defenses | done | 1 wk | — | The three limits (per-part cap, ratio cap, **new** whole-archive aggregate) live once, in `pkg/control.zig::decompress_limits`, and every opener admits every central-directory entry against them before anything is inflated: the core reader's walk (`Book.openLazyWithSst`, with a per-part re-check in `extractEntryToBuffer`), the editor's own structural scan (so `Editor.open` refuses before `Book.open` runs — the S0 hole), and `PartStore.scanCentralDirectory` (which had per-part + ratio at decompress time only, no aggregate). One error, `ZipBombSuspected`, on every surface; CLI exit 4 on the read, edit and embed families (`openFailureExit`). Hostile-archive tests on all three openers via `zlsx.zip_probe`. Owner gate (§5): confirm or move the three numbers. |
-| S2 | `<xm:f>` sparkline refusal lift | planned | 1–2 wk | — | Route `<xm:f>` through the formula rewriter with the sheet-name context `sheet_edit.zig` lacks; all-or-nothing preflight; removes #140's `ExtensionEditUnsafe`. ROADMAP's named highest-value lift, pullable since D1 shipped the parser. |
+| S2 | `<xm:f>` sparkline refusal lift | done | 1–2 wk | — | `Workbook.rewriteAllExtensionFormulas` routes every `<xm:f>` carrier (sparkline data ranges and date axes, `x14:` CF / DV formulas; walked by `sheet_edit.nextXmFormula`, matched by leaf name like `xm:sqref`) through the formula rewriter with `on_sheet` = host sheet and `target_sheet` = edited sheet — the context `sheet_edit.zig` lacked — under every row / col / sheet-rename / sheet-delete / table-column-rename edit. All-or-nothing: `preflightExtensionFormulas` scans every sheet before an edit's first mutation and refuses (`MalformedExtensionXml` → `Row`/`ColEditUnsafeForSheet`) on a carrier it cannot read. #140's `ExtensionEditUnsafe` is gone. No owner gate fired: the corpus carries no `<xm:f>`, and a deleted source range collapses to `#REF!` by the same convention as cell formulas. |
 | S3a | Parity: structural edits → C + Python | planned | 2–3 wk | S0 | Row/col insert–delete and sheet-level edits reach the C ABI (three-file transaction) and py-zlsx `Editor`; refusals surface as typed statuses in both. |
 | S3b | Parity: typed reads → all surfaces | planned | 1–2 wk | S0 | Widened at the S0 gate. CLI: merged ranges, defined names, conditional formats, drawing anchors, document properties as typed reads (NDJSON, `docs/cli.md` contract). C + Python: defined names, conditional formats, anchors, panes / dimension / calc properties, sheet visibility, formula text and error tags — the C reader has no error tag and no formula text today. |
 | S3c | Parity: embedding mutation → C + Python | planned | 1 wk | S0 | The Zig/CLI embedding write/prune/strip surface reaches the C ABI and Python; read-only handles retire. Also: `recovery_in_cells` on C + Python + CLI, a CLI vector / state dump, and a control-byte check on embedding metadata (S0 found `setEmbeddingsOpts` escapes `& < > "` only). |
@@ -114,7 +115,7 @@ roadmap rows.
 |---|---|
 | S0 | **Answered 2026-08-26.** (1) Surface-matrix format + CI lint — approved as is. (2) Six `n/a` rulings — all accepted (each amends strict four-way parity for that cell only; recorded in `docs/plans/surface-matrix.md` §Rulings). (3) Rows S3d, S3e, S5b, S11 adopted; S3b widened to all four surfaces; S11 in the spine ahead of S10. (4) S1's corrected text confirmed. (5) The `zlsx_writer` module export rides S5. |
 | S1 | Confirm the three limits (per-part cap, ratio, aggregate budget) and their values. **Shipped with defaults pending the answer:** 512 MiB per part and 4096:1 (the package path's numbers, unchanged) plus a new 2 GiB whole-archive aggregate — chosen as ~5× the corpus' largest legitimate total (379 MiB, `wdi_excel.xlsx`; largest part 274 MiB, highest real ratio 40:1). All three are one struct literal in `pkg/control.zig::decompress_limits`; moving any of them is a one-line change with no other code to touch. Two things only the owner can decide: (1) keep, raise or lower each number; (2) whether `eval` / `recalc` should report a breach as 3 (typed refusal — "limits are refusals at every layer") rather than the 2 (open/parse) they emit today. |
-| S2 | None expected — pure lift; gate fires only if the corpus surfaces a semantic choice. |
+| S2 | **None fired (2026-08-26).** The corpus carries no `<xm:f>`, so the row shipped on the rewriter's existing conventions: a deleted source range collapses to `#REF!` (as for a cell formula), an unreadable carrier refuses the whole edit. Both are one-line changes if the owner wants a different posture. |
 | S3a–e | Confirm C ABI naming/versioning for the new exports (v1 pattern vs v2 suffix, per `c-abi-status-v1.md`). S3d: which authoring methods reach the CLI edit family as sub-commands vs a spec file. |
 | S4 | The color contract: raw provenance + effective ARGB (recommended) vs effective-only; tint rounding + alpha rules. |
 | S5 | Confirm Writer API shape (mirror `addImage`/`addImageRange`/`addImageAnchored` or a reduced set); the public module name (`zlsx_writer`). |

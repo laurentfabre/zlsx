@@ -26,6 +26,9 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 const coords = @import("zlsx_refs");
+// Only for `skipNonElement` — the decoy-aware step the `<xm:f>` scan
+// shares with the workbook-part walkers. std-only, so no cycle.
+const workbook_xml = @import("typed_parts/workbook_xml.zig");
 
 const Allocator = std.mem.Allocator;
 const TagOpen = xlsx.TagOpen;
@@ -1518,6 +1521,88 @@ fn processXmSqrefTag(
     i.* = close_at + CLOSE.len;
 }
 
+/// One `<xm:f>` formula carrier inside a worksheet's `<extLst>`:
+/// a sparkline's data range or date axis (`x14:sparkline`,
+/// `x14:sparklineGroup`), an `x14:cfRule` / `x14:cfvo` expression, an
+/// `x14:formula1` / `x14:formula2` validation body. Byte offsets into
+/// the source; `body` is the element's raw inner text (still
+/// entity-encoded — the rewrite boundary decodes on the way in and
+/// re-escapes on the way out), `next` is where the scan resumes.
+pub const XmFormula = struct { body_start: usize, body_end: usize, next: usize };
+
+/// Locate the `<xm:f>` element at or after `from`, or `null` when the
+/// rest of `src` carries none.
+///
+/// This is the carrier walk behind S2's lift: `<xm:f>` holds a
+/// *formula*, not a plain range like `<xm:sqref>`, so the byte
+/// transform above cannot shift it — it needs the formula rewriter
+/// and a sheet-name context only the workbook layer has
+/// (`Workbook.rewriteAllExtensionFormulas`). As with `xm:sqref`, the
+/// leaf is matched by name rather than by walking into `<extLst>`:
+/// `xm:f` means "a formula" in every extension that carries it and
+/// appears nowhere else, so a future `x14:` element carrying one is
+/// rewritten for free.
+///
+/// Unlike every other handler in this file, a malformed carrier is an
+/// **error**, not a pass-through: an `<xm:f>` with no `</xm:f>`, or
+/// one whose text holds markup, cannot be rewritten wholly, and the
+/// edit's contract is all-or-nothing — `Workbook` preflights every
+/// sheet with this scan before its first mutation and refuses the
+/// whole edit on `MalformedExtensionXml`. A self-closing `<xm:f/>`
+/// is an empty formula and is returned with an empty body.
+///
+/// Prefix-literal, like every scanner in this file: the element is
+/// matched as `xm:f`, not resolved through its namespace binding, so
+/// a producer that binds `…/excel/2006/main` to another prefix
+/// (`<m:f xmlns:m=…>`) has no carrier here and its formula passes
+/// through unmaintained — the same gap `xm:sqref` (#140) and every
+/// `x14:` match carry, and the one #140's guard had too (it scanned
+/// for the literal `<xm:f`). Excel and LibreOffice both write `xm`;
+/// namespace-aware scanning is the tracked backlog item
+/// (`goal_formula.md`, M10+), not an S2 concern.
+pub fn nextXmFormula(src: []const u8, from: usize) error{MalformedExtensionXml}!?XmFormula {
+    const OPEN = "<xm:f";
+    const CLOSE = "</xm:f>";
+    // No carrier text anywhere ahead: done, whatever else the XML
+    // holds. Only a sheet that does spell `<xm:f` pays for the
+    // decoy-aware walk below.
+    if (std.mem.indexOfPos(u8, src, from, OPEN) == null) return null;
+    var i = from;
+    while (std.mem.indexOfScalarPos(u8, src, i, '<')) |lt| {
+        // A comment, CDATA section, PI or DOCTYPE may spell `<xm:f>`
+        // without carrying one (Codex, S2 r1). Step over the whole
+        // construct so a decoy is neither spliced nor refused; an
+        // unterminated construct leaves the live/decoy question
+        // undecidable, and this sheet does hold `<xm:f` text, so
+        // refuse rather than guess.
+        const past = workbook_xml.skipNonElement(src, lt) catch return error.MalformedExtensionXml;
+        if (past != lt) {
+            i = past;
+            continue;
+        }
+        // `<xm:f` is a prefix of nothing else in the `xm:` namespace
+        // today, but `matchTagAt` insists on a delimiter after the
+        // name so that stays true by construction.
+        const t = matchTagAt(src, lt, "xm:f") orelse {
+            i = lt + 1;
+            continue;
+        };
+        std.debug.assert(t.after_open >= 2);
+        if (src[t.after_open - 2] == '/') {
+            return .{ .body_start = t.after_open, .body_end = t.after_open, .next = t.after_open };
+        }
+        const close_at = std.mem.indexOfPos(u8, src, t.after_open, CLOSE) orelse
+            return error.MalformedExtensionXml;
+        const body = src[t.after_open..close_at];
+        // ST_Formula is a simple type: element text only. A `<` in
+        // the body is a nested element, a comment or a CDATA section
+        // — none of which the rewriter can carry through a splice.
+        if (std.mem.indexOfScalar(u8, body, '<') != null) return error.MalformedExtensionXml;
+        return .{ .body_start = t.after_open, .body_end = close_at, .next = close_at + CLOSE.len };
+    }
+    return null;
+}
+
 fn shiftRefOrRange(
     ref: []const u8,
     axis: Axis,
@@ -2473,4 +2558,84 @@ test "xm:sqref: a sheet with no extLst is byte-identical" {
     // The new branch must not perturb sheets that never had one.
     try testing.expect(std.mem.indexOf(u8, with, "xm:sqref") == null);
     try testing.expect(std.mem.indexOf(u8, with, "<autoFilter ref=\"B3:D6\"/>") != null);
+}
+
+// ─── extLst / xm:f (the formula carrier the workbook sweep rewrites) ─
+
+test "xm:f: the byte transform leaves the formula body untouched" {
+    // Division of labour: this file shifts `xm:sqref`; the workbook
+    // sweep rewrites `xm:f`. Both edit the same `<extLst>`, so the
+    // transform must not perturb the body the sweep splices.
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>Data!A5:A9</xm:f><xm:sqref>B5</xm:sqref></x14:sparkline>" ++
+        "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:f>Data!A5:A9</xm:f>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<xm:sqref>B6</xm:sqref>") != null);
+}
+
+test "xm:f: the scan walks every carrier in document order" {
+    const src = "<a><xm:f>Data!A1:A5</xm:f><xm:sqref>B1</xm:sqref><xm:f>C1&gt;0</xm:f></a>";
+    const first = (try nextXmFormula(src, 0)).?;
+    try testing.expectEqualStrings("Data!A1:A5", src[first.body_start..first.body_end]);
+    const second = (try nextXmFormula(src, first.next)).?;
+    try testing.expectEqualStrings("C1&gt;0", src[second.body_start..second.body_end]);
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula(src, second.next));
+}
+
+test "xm:f: a sheet without the element yields null, not an error" {
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<worksheet/>", 0));
+    // `xm:sqref` is the sibling leaf; `<xm:f` must not match a
+    // longer name that happens to share the prefix.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<xm:fx>1</xm:fx><xm:sqref>A1</xm:sqref>", 0));
+}
+
+test "xm:f: a self-closing element is an empty body" {
+    const src = "<x14:sparkline><xm:f/><xm:sqref>B1</xm:sqref></x14:sparkline>";
+    const f = (try nextXmFormula(src, 0)).?;
+    try testing.expectEqual(f.body_start, f.body_end);
+    try testing.expectEqual(f.body_end, f.next);
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula(src, f.next));
+}
+
+test "xm:f: an unterminated element refuses" {
+    // All-or-nothing: unlike `xm:sqref`, a carrier that cannot be
+    // rewritten wholly is an error the workbook turns into a refusal
+    // of the whole edit, never a silent pass-through.
+    try testing.expectError(error.MalformedExtensionXml, nextXmFormula("<xm:f>Data!A1:A5</ext>", 0));
+}
+
+test "xm:f: markup inside the body refuses" {
+    try testing.expectError(error.MalformedExtensionXml, nextXmFormula("<xm:f>A1<!-- x --></xm:f>", 0));
+    try testing.expectError(error.MalformedExtensionXml, nextXmFormula("<xm:f><![CDATA[A1]]></xm:f>", 0));
+}
+
+test "xm:f: a truncated open tag at end of input is not a carrier" {
+    // `matchTagAt` refuses to read past the end (fuzz finding,
+    // 2026-07-27); the scan must inherit that and terminate.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<xm:f", 0));
+}
+
+test "xm:f: carrier text inside a comment, CDATA or PI is neither a carrier nor a refusal" {
+    // Codex S2 r1: a raw substring walk would splice the comment's
+    // bytes or refuse on the unclosed decoy. Each construct is
+    // stepped over whole; the live carrier after it is found.
+    const src = "<!-- <xm:f>Doomed!A1 --><![CDATA[<xm:f>Doomed!A1</xm:f>]]><?pi <xm:f> ?>" ++
+        "<xm:f>Data!A1:A5</xm:f>";
+    const f = (try nextXmFormula(src, 0)).?;
+    try testing.expectEqualStrings("Data!A1:A5", src[f.body_start..f.body_end]);
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula(src, f.next));
+    // Decoys only: nothing to rewrite, nothing to refuse.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<!-- <xm:f>x --><a/>", 0));
+}
+
+test "xm:f: an unterminated comment on a sheet that spells <xm:f refuses" {
+    // Live or decoy is undecidable once the comment never closes.
+    try testing.expectError(error.MalformedExtensionXml, nextXmFormula("<!-- <xm:f>Data!A1</xm:f>", 0));
+    // …but a sheet with no `<xm:f` text at all never pays for, or
+    // refuses on, its comments.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<!-- open forever <a/>", 0));
 }
