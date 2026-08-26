@@ -33,6 +33,31 @@ pub const casefold = @import("zlsx_casefold");
 const coords = @import("zlsx_refs");
 const Allocator = std.mem.Allocator;
 
+// ─── Decompression limits (S1) ───────────────────────────────────────
+//
+// Re-exported from `zlsx_control` (the `control` re-export sits with
+// the other cancellation names near the end of this file) so a caller
+// of this module can read the numbers every opener enforces without
+// naming a second module.
+// The checks themselves live on the central-directory walk in
+// `Book.openLazyWithSst` (every entry, extracted or not) and, as a
+// second line, in `extractEntryToBuffer` (the one entry it is handed).
+pub const DecompressLimits = control.DecompressLimits;
+pub const decompress_limits = control.decompress_limits;
+pub const DecompressBudget = control.DecompressBudget;
+
+/// Test support — see the file's doc comment. Public so `pkg/` tests
+/// can build hostile archives through the `zlsx` module.
+pub const zip_probe = @import("zip_probe.zig");
+
+test {
+    // No dispatch the unit step compiles reaches the probe, so its own
+    // tests only run through this reference. (`zlsx_control`'s run as
+    // their own `zig build test` step — dependency-module tests are
+    // never collected by this binary.)
+    _ = zip_probe;
+}
+
 // ─── Public types ────────────────────────────────────────────────────
 
 /// A date/time decoded from an Excel serial-date number. Columns in
@@ -461,6 +486,10 @@ pub const DomainError = error{
     MissingSheet,
     UnsupportedCompression,
     MalformedXml,
+    /// A declared size in the central directory breaks one of
+    /// `decompress_limits` — the archive is treated as hostile, not
+    /// merely broken. See `zlsx_control.DecompressLimits`.
+    ZipBombSuspected,
 };
 
 // ─── Book ────────────────────────────────────────────────────────────
@@ -499,6 +528,10 @@ const ZipArchive = struct {
 
     const Entry = struct {
         file_offset: u64,
+        /// Both sizes are kept: the ratio half of `decompress_limits`
+        /// needs the compressed one when `extractByKey` re-fabricates
+        /// an `Iterator.Entry` for `extractEntryToBuffer`.
+        compressed_size: u64,
         uncompressed_size: u64,
         compression_method: std.zip.CompressionMethod,
     };
@@ -611,8 +644,8 @@ const ZipArchive = struct {
             self.vml_offsets.get(key) orelse return null;
 
         // Fabricate a minimal `std.zip.Iterator.Entry` so the existing
-        // `extractEntryToBuffer` helper is re-usable. Only three fields
-        // are read by the extractor (file_offset, uncompressed_size,
+        // `extractEntryToBuffer` helper is re-usable. Only four fields
+        // are read by the extractor (file_offset, both sizes,
         // compression_method) — the rest stay zero-valued.
         const entry = std.zip.Iterator.Entry{
             .version_needed_to_extract = 0,
@@ -623,7 +656,7 @@ const ZipArchive = struct {
             .header_zip_offset = 0,
             .crc32 = 0,
             .filename_len = 0,
-            .compressed_size = 0,
+            .compressed_size = cached.compressed_size,
             .uncompressed_size = cached.uncompressed_size,
             .file_offset = cached.file_offset,
         };
@@ -921,7 +954,18 @@ pub const Book = struct {
         const archive = book.archive.?;
         const file_reader = &archive.reader;
 
+        // S1: admit every entry against `decompress_limits` before
+        // anything is inflated — parts this walk never extracts too,
+        // since the aggregate is a property of the archive. Ahead of
+        // the filename filter for the same reason: an entry with an
+        // unreadable name still counts. Once every entry is admitted
+        // the per-part re-check inside `extractEntryToBuffer` cannot
+        // fire on this archive, which is what lets the lazy paths
+        // (`rows`, `preloadSheet`) never surface a limit mid-stream.
+        var budget: control.DecompressBudget = .init(control.decompress_limits);
+
         while (iter.next() catch return error.BadZip) |entry| {
+            try budget.admit(entry.compressed_size, entry.uncompressed_size);
             if (entry.filename_len == 0 or entry.filename_len > filename_buf.len) continue;
 
             // Read filename (lives in the CDFH after the fixed-size header).
@@ -931,6 +975,7 @@ pub const Book = struct {
 
             const cached: ZipArchive.Entry = .{
                 .file_offset = entry.file_offset,
+                .compressed_size = entry.compressed_size,
                 .uncompressed_size = entry.uncompressed_size,
                 .compression_method = entry.compression_method,
             };
@@ -4565,6 +4610,21 @@ pub fn extractEntryToBuffer(
         else => return error.UnsupportedCompression,
     }
 
+    // S1: the per-part half of `decompress_limits`, on the one entry
+    // this call is handed. The output buffer below is sized by the
+    // declaration, so this is the last point a bound can be enforced
+    // before the allocation. The aggregate half lives on the
+    // central-directory walk in `Book.openLazyWithSst`, which is where
+    // every archive that reaches this function has already been
+    // admitted; this check exists for callers that hand in an entry of
+    // their own.
+    try control.decompress_limits.checkPart(entry.compressed_size, entry.uncompressed_size);
+    // A stored entry's two sizes are the same number by definition;
+    // reading `uncompressed_size` bytes off a shorter payload would
+    // run into the next entry's header.
+    if (entry.compression_method == .store and entry.compressed_size != entry.uncompressed_size)
+        return error.BadZip;
+
     // Read + verify LocalFileHeader.
     try stream.seekTo(entry.file_offset);
     const local = stream.interface.takeStruct(std.zip.LocalFileHeader, .little) catch return error.BadZip;
@@ -4885,6 +4945,77 @@ test "Book.openBuffer: garbage, empty, and truncated buffers error without panic
     defer std.testing.allocator.free(bytes);
     const truncated = Book.openBuffer(std.testing.allocator, io, bytes[0 .. bytes.len / 2]);
     try std.testing.expectError(error.BadZip, truncated);
+}
+
+test "S1: Book.openBuffer refuses a part declared past the per-part cap before inflating it" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try zip_probe.hostile.oversizedPart(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    // The payload is zeros, not a deflate stream: had the reader tried
+    // to inflate it the error would be `BadZip`, not the limit.
+    try std.testing.expectError(error.ZipBombSuspected, Book.openBuffer(std.testing.allocator, io, bytes));
+}
+
+test "S1: Book.openBuffer refuses a part whose declared ratio is absurd" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try zip_probe.hostile.absurdRatio(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(error.ZipBombSuspected, Book.openBuffer(std.testing.allocator, io, bytes));
+}
+
+test "S1: Book.openBuffer refuses on the aggregate even when every part is admissible" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const over = try zip_probe.hostile.fullSizedParts(std.testing.allocator, zip_probe.hostile.partsOverBudget());
+    defer std.testing.allocator.free(over);
+    try std.testing.expectError(error.ZipBombSuspected, Book.openBuffer(std.testing.allocator, io, over));
+
+    // Control: one part fewer sits exactly on the budget and is
+    // admitted — the walk then fails on the missing workbook part,
+    // which is the first thing after the limits that can object. The
+    // parts live under `xl/media/`, a prefix the walk never extracts,
+    // so nothing was inflated on either arm.
+    const within = try zip_probe.hostile.fullSizedParts(std.testing.allocator, zip_probe.hostile.partsWithinBudget());
+    defer std.testing.allocator.free(within);
+    try std.testing.expectError(error.MissingWorkbook, Book.openBuffer(std.testing.allocator, io, within));
+}
+
+test "S1: extractEntryToBuffer refuses a hand-built entry on the per-part checks before allocating" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A real archive whose one entry is fine, walked to obtain a
+    // genuine `Iterator.Entry`; the test then lies about its sizes.
+    const bytes = try zip_probe.build(std.testing.allocator, &.{
+        .{ .name = "a.bin", .payload = "\x03\x00", .method = 8, .declared_uncompressed = 0 },
+    });
+    defer std.testing.allocator.free(bytes);
+    var arch = try ZipArchive.openFromMemory(std.testing.allocator, io, bytes);
+    defer arch.deinit(std.testing.allocator);
+    var it = try std.zip.Iterator.init(&arch.reader);
+    var entry = (try it.next()).?;
+
+    // Honest entry: an empty deflate stream inflates to nothing.
+    const ok = try extractEntryToBuffer(std.testing.allocator, entry, &arch.reader);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqual(@as(usize, 0), ok.len);
+
+    // Same bytes, a declaration past the per-part cap: refused with the
+    // limit, and with a failing allocator behind it, so a refusal that
+    // came *after* an allocation would surface as OutOfMemory instead.
+    entry.uncompressed_size = decompress_limits.max_part_size + 1;
+    entry.compressed_size = decompress_limits.max_part_size; // ratio fine
+    try std.testing.expectError(error.ZipBombSuspected, extractEntryToBuffer(std.testing.failing_allocator, entry, &arch.reader));
+
+    // Ratio only.
+    entry.uncompressed_size = decompress_limits.max_deflate_ratio + 1;
+    entry.compressed_size = 1;
+    try std.testing.expectError(error.ZipBombSuspected, extractEntryToBuffer(std.testing.failing_allocator, entry, &arch.reader));
 }
 
 test "fuzz Book.openBuffer: mutated workbook bytes never panic or leak" {

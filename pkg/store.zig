@@ -132,6 +132,10 @@ pub const Relationship = struct {
 pub const Error = error{
     NotPkzip,
     BadZip,
+    /// A declared size in the central directory breaks one of
+    /// `zlsx_control.decompress_limits` (S1). Distinct from `BadZip` so
+    /// a caller can tell hostile from broken; the CLI maps it to exit 4.
+    ZipBombSuspected,
     UnsupportedCompression,
     Zip64NotSupported,
     EncryptedNotSupported,
@@ -1753,6 +1757,12 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
     var out: std.ArrayListUnmanaged(ZipEntry) = .empty;
     try out.ensureTotalCapacity(arena, total_records);
 
+    // S1: every entry is admitted against `decompress_limits` here,
+    // whether or not it is ever materialized — the aggregate is a
+    // property of the archive, and this is the one place the whole
+    // directory is in hand before any part is inflated.
+    var budget: control.DecompressBudget = .init(control.decompress_limits);
+
     var cur: usize = cd_off_us;
     // Safe: `cd_off_us +| cd_size_us > buf.len` was just rejected,
     // so the non-saturating sum fits usize.
@@ -1784,6 +1794,7 @@ fn scanCentralDirectory(arena: std.mem.Allocator, buf: []const u8) ![]ZipEntry {
         if (compression_method != 0 and compression_method != 8) {
             return Error.UnsupportedCompression;
         }
+        try budget.admit(compressed_size, uncompressed_size);
 
         const name_start = cur + 46;
         if (name_start +| filename_len > cd_end) return Error.BadZip;
@@ -1965,27 +1976,14 @@ fn readChunked(backing: *SourceBacking, offset: u64, dest: []u8, poller: Poller)
     }
 }
 
-// ZIP-bomb defenses for `decompressPayload`. Both checks fire BEFORE
-// the upfront `arena.alloc(declared_uncompressed)` so a crafted CDFH
-// declaring multi-GB uncompressed size can't OOM the process.
-//
-//  - max_part_size: per-part hard cap. 512 MiB is ~4× larger than the
-//    biggest legitimate part observed in our corpus (~120 MiB SST in
-//    a 76 MiB workbook). xlsx files exceeding this almost certainly
-//    aren't legitimate single-file workbooks.
-//
-//  - max_deflate_ratio: sanity cap on declared_uncompressed /
-//    compressed. Real-world deflate hits ~1000:1 only on highly
-//    redundant payloads (long runs of zeros). 4096:1 is a generous
-//    margin that still blocks classic ZIP bombs (10MB compressed
-//    declaring 4GB uncompressed = 400:1 — far below the cap, so
-//    intentionally narrower bombs that fit within 4096:1 just have
-//    to actually contain ~250KB of plausible compressed data per
-//    1GB declared, at which point they're already being rate-limited
-//    by the LFH/CDFH signature and decompression cost themselves).
-const max_part_size: usize = 512 * 1024 * 1024;
-const max_deflate_ratio: usize = 4096;
-
+// ZIP-bomb defenses for `decompressPayload`: the per-part half of
+// `zlsx_control.decompress_limits`, checked BEFORE the upfront
+// `arena.alloc(declared_uncompressed)` so a crafted CDFH declaring a
+// multi-GB size can't OOM the process. Every archive that reaches this
+// function was already admitted entry-by-entry (aggregate included) by
+// `scanCentralDirectory`; the re-check here is the last line for the
+// one part in hand. The numbers and their rationale live in
+// `pkg/control.zig` (S1) so all three decompression paths agree.
 fn decompressPayload(
     arena: std.mem.Allocator,
     payload: []const u8,
@@ -1993,12 +1991,7 @@ fn decompressPayload(
     declared_uncompressed: u32,
     poller: Poller,
 ) ![]u8 {
-    if (declared_uncompressed > max_part_size) return Error.BadZip;
-    // Saturating multiply guards against `payload.len * ratio`
-    // overflow on pathological inputs. usize @ 64-bit can't reach
-    // saturation in practice, but this stays correct on 32-bit too.
-    const ratio_cap = std.math.mul(usize, payload.len, max_deflate_ratio) catch std.math.maxInt(usize);
-    if (declared_uncompressed > ratio_cap) return Error.BadZip;
+    try control.decompress_limits.checkPart(payload.len, declared_uncompressed);
 
     if (method == 0) {
         if (payload.len != declared_uncompressed) return Error.BadZip;
@@ -3486,30 +3479,62 @@ test "attrAtSlice tolerates single-quoted XML attributes" {
 }
 
 test "decompressPayload: rejects ZIP-bomb declared sizes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // A failing allocator: a refusal that came *after* the output
+    // allocation would surface as OutOfMemory, not the limit.
+    const a = std.testing.failing_allocator;
+    const limits = control.decompress_limits;
+    const part_cap: u32 = @intCast(limits.max_part_size);
+    const ratio: u32 = @intCast(limits.max_deflate_ratio);
 
-    // Tiny payload, declared > 512 MiB hard cap → BadZip.
+    // Tiny payload, declared > per-part cap → ZipBombSuspected.
     const tiny = "x";
     try std.testing.expectError(
-        Error.BadZip,
-        decompressPayload(a, tiny, 8, max_part_size + 1, .none),
+        Error.ZipBombSuspected,
+        decompressPayload(a, tiny, 8, part_cap + 1, .none),
     );
 
-    // Tiny payload, declared within hard cap but ratio > 4096:1 → BadZip.
-    // tiny is 1 byte so the ratio cap is 4096; declared = 8192 trips it.
+    // Tiny payload, declared within the cap but one past the ratio.
     try std.testing.expectError(
-        Error.BadZip,
-        decompressPayload(a, tiny, 8, 8192, .none),
+        Error.ZipBombSuspected,
+        decompressPayload(a, tiny, 8, ratio + 1, .none),
     );
 
-    // Stored (method 0) entries are still validated against the cap so
-    // a CDFH claiming 4 GiB stored can't allocate it.
+    // Stored (method 0) entries are validated against the cap too, so
+    // a CDFH claiming a stored multi-GB part can't allocate it.
     try std.testing.expectError(
-        Error.BadZip,
-        decompressPayload(a, tiny, 0, max_part_size + 1, .none),
+        Error.ZipBombSuspected,
+        decompressPayload(a, tiny, 0, part_cap + 1, .none),
     );
+}
+
+test "S1: PartStore.openBuffer refuses the three hostile shapes on the directory walk and admits the control" {
+    const zlsx = @import("zlsx");
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const oversized = try zlsx.zip_probe.hostile.oversizedPart(a);
+    defer a.free(oversized);
+    try std.testing.expectError(Error.ZipBombSuspected, PartStore.openBuffer(a, io, oversized));
+
+    const ratio = try zlsx.zip_probe.hostile.absurdRatio(a);
+    defer a.free(ratio);
+    try std.testing.expectError(Error.ZipBombSuspected, PartStore.openBuffer(a, io, ratio));
+
+    const over = try zlsx.zip_probe.hostile.fullSizedParts(a, zlsx.zip_probe.hostile.partsOverBudget());
+    defer a.free(over);
+    try std.testing.expectError(Error.ZipBombSuspected, PartStore.openBuffer(a, io, over));
+
+    // Control: exactly on the aggregate, every part admissible — the
+    // store opens (its entries are lazy, non-structural parts under
+    // `xl/media/`, so nothing was inflated) and simply has no
+    // `[Content_Types].xml` to resolve against.
+    const within = try zlsx.zip_probe.hostile.fullSizedParts(a, zlsx.zip_probe.hostile.partsWithinBudget());
+    defer a.free(within);
+    var store = try PartStore.openBuffer(a, io, within);
+    defer store.deinit();
+    try std.testing.expectEqual(zlsx.zip_probe.hostile.partsWithinBudget(), (try store.partNames()).len);
 }
 
 test "PartStore.addPart + save: new part survives round-trip with content type" {

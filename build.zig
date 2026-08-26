@@ -413,6 +413,13 @@ pub fn build(b: *std.Build) void {
     const writer_tests = b.addTest(.{ .root_module = writer_mod });
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
 
+    // Standalone tests for the control substrate. Tests in a dependency
+    // module are never collected by the root's test binary, so until S1
+    // wired this step `pkg/control.zig`'s tests — the poll seam, the
+    // injected clock and now the decompression limits — ran nowhere.
+    const control_tests = b.addTest(.{ .root_module = control_mod });
+    test_step.dependOn(&b.addRunArtifact(control_tests).step);
+
     // Standalone tests for the SST plan substrate (it's tiny but the
     // dedup invariants pin Writer's hot path; cover them in their own
     // step rather than rely on the in-tree Workbook tests touching

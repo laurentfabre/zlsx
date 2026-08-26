@@ -164,13 +164,14 @@ The four surfaces:
 
 | Capability | Zig | C | Py | CLI | Row |
 |---|---|---|---|---|---|
-| Archive defenses on the package path — 512 MiB per-part cap, 4096:1 ratio cap, Zip64 / split / encrypted refused | ~ `PartStore.open` ¹⁵ | — S1 ¹⁶ | — S1 ¹⁶ | — S1 ¹⁶ | S1 |
-| Decompression caps on the core reader (`Book.open`) | — S1 | — S1 | — S1 | — S1 ¹⁷ | S1 |
-| Aggregate decompression budget (whole archive) | — S1 | — S1 | — S1 | — S1 | S1 |
+| Archive defenses on the package path — per-part cap, ratio cap, Zip64 / split / encrypted refused | ✓ `PartStore.open`, `PartStore.openBuffer` ¹⁵ | ✓ `zlsx_editor_open`, `zlsx_open_buffer` ¹⁶ | ✓ `zlsx.edit`, `Editor.from_bytes` ¹⁶ | ✓ `append-rows` ¹⁶ | |
+| Decompression caps on the core reader (`Book.open`) — per-part cap, ratio cap | ✓ `Book.open`, `Book.openBuffer`, `zlsx.extractEntryToBuffer` | ✓ `zlsx_book_open`, `zlsx_book_open_buffer` | ✓ `zlsx.open`, `zlsx.open_bytes` | ✓ `rows` ¹⁷ | |
+| Aggregate decompression budget (whole archive) | ✓ `zlsx.decompress_limits`, `DecompressBudget.admit` ¹⁸ | ✓ `zlsx_book_open`, `zlsx_editor_open` | ✓ `zlsx.open`, `zlsx.edit` | ✓ `rows`, `append-rows` ¹⁷ | |
 
-¹⁵ `PartStore` checks each part's declared size against the per-part cap and the ratio cap *before allocating that part's decompressed output* (`pkg/store.zig`, `max_part_size` / `max_deflate_ratio`); the file-backed open reads the whole archive into a scratch buffer first, so the caps bound decompression, not the archive read. It has no aggregate budget and accepts data-descriptor entries (sizes come from the central directory). `Workbook.open` goes through `PartStore` and inherits this.
-¹⁶ `Editor.open` — the path under `zlsx_editor_open`, `zlsx.edit` and every CLI edit sub-command — runs its own structural scan first (Zip64 / split / encrypted / data-descriptor entries refused; no size or ratio check at that point), then opens the **core reader** (`Book.open` / `Book.openBuffer`), which decompresses every sheet uncapped. The editor's per-part + ratio caps apply only to its own later `readEntry` decompressions.
-¹⁷ Exit code 4 is reserved on the read sub-commands for the day the caps exist.
+¹⁵ `PartStore` admits every central-directory entry against `zlsx_control.decompress_limits` on the scan (`scanCentralDirectory`) — the per-part cap, the ratio cap and the whole-archive aggregate, before any part is inflated — and re-checks the per-part half in `decompressPayload` before allocating that part's output; the file-backed open reads the whole archive into a scratch buffer first, so the limits bound decompression, not the archive read. Data-descriptor entries are accepted (sizes come from the central directory). `Workbook.open` goes through `PartStore` and inherits this.
+¹⁶ `Editor.open` — the path under `zlsx_editor_open`, `zlsx.edit` and every CLI edit sub-command — admits every entry on its own structural scan (Zip64 / split / encrypted / data-descriptor refused on the same pass), *then* opens the core reader (`Book.open` / `Book.openBuffer`), which admits every entry again on its own walk; the archive is refused before any part is inflated whichever layer sees it first, and the editor's later `readEntry` decompressions re-check the per-part half. On C the refusal is `ZLSX_ERROR` with `ZipBombSuspected` in the error buffer; on Python it is `ZlsxError("ZipBombSuspected")`; every CLI edit sub-command exits 4.
+¹⁷ Exit code 4 (`ZipBombSuspected`) on the read family and the edit family — `src/cli.zig::openFailureExit`. `eval` / `recalc` keep their own table (`docs/cli.md`) and report a breach at open as 2.
+¹⁸ The three numbers live in `pkg/control.zig` (`decompress_limits`: 512 MiB per part, 4096:1, 2 GiB aggregate — the S1 owner gate's to confirm or move) and are re-exported as `zlsx.decompress_limits` and `zlsx_pkg.decompress_limits`. `DecompressBudget.admit` is the one implementation of the arithmetic all three openers run.
 
 ## 6 · Cross-cutting properties
 
@@ -201,7 +202,6 @@ gate (2026-08-26).
 
 | Row | Cells it closes |
 |---|---|
-| S1 | §5 all three lines — core-reader caps, the aggregate budget, and the editor path that decompresses through the core reader before its own caps. |
 | S2 | §3 `ExtensionEditUnsafe` lifts in the shared code; C and Py *observe* the lift only once S3a gives them structural edits — the row's four-way `done` is transitive through S3a. |
 | S3a | §3 sheet-level edits, row / col edits, table-column rename and the rewriters → C + Py; table-column rename → CLI. |
 | S3b | The ladder text says merged ranges, defined names, conditional formats, anchors → **CLI**; §1 adds document properties to that CLI list. §1 also shows defined names, conditional formats, anchors, panes / dimension / calc properties, sheet visibility, formula text and error tags missing on **C and Py** (merged ranges and document properties are already there). Widened at the gate: one typed-read parity row covering all four surfaces. |

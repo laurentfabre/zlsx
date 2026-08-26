@@ -395,8 +395,11 @@ family (`eval` / `recalc`) has its own, richer table — see
 and dbx families reuse the same codes with per-command meanings — e.g.
 `dbx push` returns 3 when the upload preflight refuses a non-workbook, edit
 sub-commands return 3 on a refused structural edit, and the embed family
-returns 4 on a vector-buffer allocation failure. Scripts branching on exact
-codes for non-read sub-commands should test the specific command they use.
+returns 4 on a vector-buffer allocation failure. Exit 4 for a breached
+decompression limit is shared by every family that opens through the core
+reader or the editor (read, edit, embed); `eval` / `recalc` report it as 2.
+Scripts branching on exact codes for non-read sub-commands should test the
+specific command they use.
 
 | Code | Meaning (read family) |
 |---|---|
@@ -404,7 +407,7 @@ codes for non-read sub-commands should test the specific command they use.
 | 1 | Bad CLI arguments |
 | 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
-| 4 | Reserved for reader decompression limits (`ZipBombSuspected`); today emitted only by the embed family on allocation failure |
+| 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
 | 130 | SIGINT (POSIX) |
 | 143 | SIGTERM (POSIX) |

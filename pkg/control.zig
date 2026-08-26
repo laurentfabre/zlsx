@@ -66,6 +66,96 @@ pub const chunk_bytes: usize = 64 * 1024;
 /// what §12.2 maps to C `-5` and CLI 130/143.
 pub const Error = error{Cancelled};
 
+// ─── ZIP decompression limits (S1, `goal_sigmoid.md`) ───────────────────
+//
+// Three numbers, one home. Before S1 the package path (`pkg/store.zig`)
+// and the editor's own reads (`pkg/editor.zig`) each carried a private
+// copy of a per-part cap and a ratio cap, the core reader
+// (`src/xlsx.zig::extractEntryToBuffer`) carried none, and nothing
+// anywhere bounded the archive as a whole. The values live here because
+// this is the one std-only leaf every archive-touching module already
+// imports, so a single edit moves every surface at once — which is what
+// the S1 owner gate ("confirm the three limits and their values") needs.
+//
+// Semantics are *declared*-size semantics, checked on the central
+// directory before the first output byte is allocated. That is the only
+// place a bound can be enforced cheaply: every decompressor in this
+// tree allocates the declared uncompressed size up front and inflates
+// exactly that many bytes, so the declaration bounds the allocation and
+// the checks below bound the declaration. A stream that lies *low* is
+// harmless (it inflates to the smaller declared size and then fails its
+// CRC or its XML parse); a stream that lies *high* is what these catch.
+
+/// The one error a decompression limit produces. Spelled the way
+/// `docs/cli.md` reserved it (exit code 4 on the CLI); every layer that
+/// refuses on a limit uses this name, never `BadZip`, so a caller can
+/// tell "this archive is hostile" from "this archive is broken".
+pub const LimitError = error{ZipBombSuspected};
+
+/// The three limits, as a value so a test or a future caller-supplied
+/// policy can carry different numbers without touching the checks.
+pub const DecompressLimits = struct {
+    /// Largest declared uncompressed size any single part may carry.
+    max_part_size: u64,
+    /// Largest `declared_uncompressed / compressed_size` quotient any
+    /// single part may carry. A stored (method 0) part has quotient 1;
+    /// a compressed part with a zero-length payload and a non-zero
+    /// declaration has an infinite one and is refused.
+    max_deflate_ratio: u64,
+    /// Largest sum of declared uncompressed sizes across every entry of
+    /// the central directory — parts the reader never touches included,
+    /// because the sum is a property of the archive, not of one access
+    /// pattern, and so gives every surface the same verdict.
+    max_total_decompressed: u64,
+
+    /// The per-part half of the contract. Standalone so a decompressor
+    /// handed one entry (rather than a whole directory) can still refuse
+    /// before it allocates.
+    pub fn checkPart(self: DecompressLimits, compressed_size: u64, declared_uncompressed: u64) LimitError!void {
+        if (declared_uncompressed > self.max_part_size) return error.ZipBombSuspected;
+        // Saturate rather than overflow: a 64-bit product of two u32
+        // fields cannot overflow, but the fields are u64 on the Zip64-
+        // aware `std.zip` path and the check must stay correct there.
+        const ratio_cap = std.math.mul(u64, compressed_size, self.max_deflate_ratio) catch std.math.maxInt(u64);
+        if (declared_uncompressed > ratio_cap) return error.ZipBombSuspected;
+    }
+};
+
+/// The limits every opener applies. The per-part numbers are the ones
+/// the package path shipped with (512 MiB is ~2× the largest legitimate
+/// part in the corpus — the 274 MiB WDI shared-string table; 4096:1 is
+/// ~100× the corpus' highest real ratio of 40:1). The aggregate is new
+/// in S1: 2 GiB is ~5× the largest legitimate whole-archive total in
+/// the corpus (379 MiB, same file) and four full-size parts. All three
+/// are the S1 owner gate's to confirm or move.
+pub const decompress_limits: DecompressLimits = .{
+    .max_part_size = 512 * 1024 * 1024,
+    .max_deflate_ratio = 4096,
+    .max_total_decompressed = 2 * 1024 * 1024 * 1024,
+};
+
+/// Running admission over one central directory. Each opener creates
+/// one per open, admits every entry it walks — including the ones it
+/// will never extract — and drops it when the walk ends; the limits it
+/// carries are the *policy*, the total is the *state*.
+pub const DecompressBudget = struct {
+    limits: DecompressLimits,
+    total: u64 = 0,
+
+    pub fn init(limits: DecompressLimits) DecompressBudget {
+        return .{ .limits = limits };
+    }
+
+    /// Admit one entry: the per-part checks, then the aggregate. Order
+    /// matters only for which check a test can attribute a refusal to;
+    /// the verdict is the same either way.
+    pub fn admit(self: *DecompressBudget, compressed_size: u64, declared_uncompressed: u64) LimitError!void {
+        try self.limits.checkPart(compressed_size, declared_uncompressed);
+        self.total = std.math.add(u64, self.total, declared_uncompressed) catch return error.ZipBombSuspected;
+        if (self.total > self.limits.max_total_decompressed) return error.ZipBombSuspected;
+    }
+};
+
 /// Cooperative cancellation, as a no-alloc union over the two storage
 /// kinds a caller can actually have: an atomic for multi-threaded hosts,
 /// and a plain volatile flag for a signal handler in a single-threaded
@@ -428,4 +518,40 @@ test "inject: the counting clock arms a cancel flag mid-run" {
         w.poller().check() catch break;
     }
     try testing.expectEqual(@as(usize, 3), polls);
+}
+
+test "DecompressLimits.checkPart: per-part cap and ratio cap are independent, inclusive bounds" {
+    const l: DecompressLimits = .{ .max_part_size = 1000, .max_deflate_ratio = 10, .max_total_decompressed = 10_000 };
+    // At the caps: admitted.
+    try l.checkPart(100, 1000);
+    try l.checkPart(1, 10);
+    // One past the part cap, ratio fine.
+    try testing.expectError(error.ZipBombSuspected, l.checkPart(101, 1001));
+    // One past the ratio cap, part cap fine.
+    try testing.expectError(error.ZipBombSuspected, l.checkPart(1, 11));
+    // Zero-length payload with a non-zero declaration: infinite ratio.
+    try testing.expectError(error.ZipBombSuspected, l.checkPart(0, 1));
+    // Empty entry: fine.
+    try l.checkPart(0, 0);
+    // The saturating product: a huge payload never wraps into a refusal.
+    try l.checkPart(std.math.maxInt(u64), 1000);
+}
+
+test "DecompressBudget.admit: the aggregate is inclusive and counts every admitted entry" {
+    const l: DecompressLimits = .{ .max_part_size = 1000, .max_deflate_ratio = 10, .max_total_decompressed = 2500 };
+    var b: DecompressBudget = .init(l);
+    try b.admit(100, 1000);
+    try b.admit(100, 1000);
+    try b.admit(50, 500); // exactly 2500: admitted
+    try testing.expectEqual(@as(u64, 2500), b.total);
+    try testing.expectError(error.ZipBombSuspected, b.admit(1, 1));
+    // A per-part refusal does not charge the total.
+    var c: DecompressBudget = .init(l);
+    try testing.expectError(error.ZipBombSuspected, c.admit(1, 1001));
+    try testing.expectEqual(@as(u64, 0), c.total);
+    // The sum saturates into a refusal rather than wrapping.
+    const wide: DecompressLimits = .{ .max_part_size = std.math.maxInt(u64), .max_deflate_ratio = std.math.maxInt(u64), .max_total_decompressed = std.math.maxInt(u64) };
+    var d: DecompressBudget = .init(wide);
+    try d.admit(std.math.maxInt(u64), std.math.maxInt(u64));
+    try testing.expectError(error.ZipBombSuspected, d.admit(1, 1));
 }
