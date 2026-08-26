@@ -85,7 +85,7 @@ if printf '%s\n' "$changed" | grep -qE '^pkg/'; then
 fi
 
 if printf '%s\n' "$changed" | grep -qE '^src/c_abi\.zig$'; then
-  add "\`bindings/python/zlsx/test_basic.py\` — Python binding pytest suite (exercises every C ABI export)"
+  add "\`bindings/python/tests/test_basic.py\` — Python binding pytest suite (exercises every C ABI export)"
   add "Verify \`include/zlsx.h\` and \`bindings/python/zlsx/_ffi.py\` are updated in lockstep (the C-ABI 3-file gate enforces this)"
 fi
 
@@ -94,7 +94,7 @@ if printf '%s\n' "$changed" | grep -qE '^src/cli\.zig$|^src/extract_images_main\
 fi
 
 if printf '%s\n' "$changed" | grep -qE '^bindings/python/'; then
-  add "\`bindings/python/zlsx/test_basic.py\` — Python binding pytest suite"
+  add "\`bindings/python/tests/test_basic.py\` — Python binding pytest suite"
   add "\`windows-runtime\` CI job — wheel install + import + reader smoke + pytest"
 fi
 

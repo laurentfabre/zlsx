@@ -1241,11 +1241,14 @@ int32_t zlsx_sheet_writer_add_conditional_format_data_bar(
     size_t                err_buf_len);
 
 /* ── Editor (load-modify-save) ──────────────────────────────────────
- * Open an existing xlsx, append rows, save. Append-only v1: numeric /
- * integer / boolean / empty / string cells supported; the source must
- * already carry an `xl/sharedStrings.xml` part for string appends to
- * work. Refuses ZIP64 / multi-disk / encrypted / data-descriptor
- * archives up front. See docs/plans/load-modify-save.md.
+ * Open an existing xlsx; append rows, set cells, read / strip docProps,
+ * recalculate / evaluate, save to a path or a buffer. Numeric / integer /
+ * boolean / empty / string cells; a source with no `xl/sharedStrings.xml`
+ * part gets one created on the first string append. The editor's
+ * own scanner refuses ZIP64 / multi-disk / encrypted / data-descriptor
+ * archives up front. Structural edits (rows, columns, sheets) are not
+ * exported yet — docs/plans/surface-matrix.md, row S3a. History:
+ * docs/plans/archive/load-modify-save.md.
  */
 
 /* Open an xlsx for editing. Returns NULL on failure with `err_buf`

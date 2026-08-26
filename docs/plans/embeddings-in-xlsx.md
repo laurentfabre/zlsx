@@ -968,7 +968,7 @@ the longest pole because each tool needs hand-driving.
 - `pkg/store.zig` — PartStore is where `addPart` was added (B0
   addPart) and is the substrate for emb-3.
 - `unicode/nfc.zig` — reused for canonical hash input.
-- `docs/plans/post-0.2.9-roadmap.md` — this work slots after Tier C
+- `docs/plans/archive/post-0.2.9-roadmap.md` — this work slots after Tier C
   closes; not on the current critical path.
 - `docs/plans/saas-v1-plan.md` — the SaaS arc has a separate
   embedding story (server-side vector store); on-disk embeddings

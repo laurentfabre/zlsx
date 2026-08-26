@@ -27,13 +27,13 @@
   - [ ] `src/c_abi.zig` updated
   - [ ] `include/zlsx.h` updated (matching `pub fn` and `extern struct` order)
   - [ ] `bindings/python/zlsx/_ffi.py` updated
-  - [ ] `bindings/python/zlsx/test_basic.py` exercises the new surface
+  - [ ] `bindings/python/tests/test_basic.py` exercises the new surface
   - [ ] Older-dylib feature-probe / skip in place
   - [ ] Python-side integer arguments are bounded before ctypes narrowing
 
 ## Roadmap link
 
-<!-- Item from docs/plans/post-0.2.9-roadmap.md or per-phase plan. -->
+<!-- Item from docs/ROADMAP.md or a live plan in docs/plans/. -->
 
 ## Agent attribution (optional)
 

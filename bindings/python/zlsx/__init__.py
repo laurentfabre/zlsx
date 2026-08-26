@@ -1589,7 +1589,7 @@ class SheetWriter:
         plain-``str`` formula in the row (``"cse"`` is per-cell only —
         it needs a ref). Plain-``str`` rows keep the legacy ABI path,
         so they still work against an older dylib; FormulaSpec or
-        ``dialect=`` requires libzlsx 0.9.0+.
+        ``dialect=`` requires libzlsx 0.8.0+.
 
         Requires libzlsx 0.2.7+. Raises :class:`RuntimeError` against
         an older dylib that doesn't ship the symbol.
@@ -1686,7 +1686,7 @@ class SheetWriter:
         if not _ffi._HAS_FORMULAS_V2:
             raise RuntimeError(
                 "loaded libzlsx does not expose write_row_with_formulas_v2 "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         if dialect is not None:
             if dialect not in ("scalar", "dynamic_array"):
@@ -2582,8 +2582,7 @@ class Writer:
     ``add_conditional_format_{cell_is,expression,color_scale,data_bar}``,
     ``write_rich_row`` for inline rich-text runs, and
     ``write_row_with_formulas`` for formula cells with cached values.
-    Load → modify → save round-trip remains out of scope until
-    Phase 3c.
+    Editing an existing workbook is :class:`Editor` / :func:`edit`.
     """
 
     def __init__(self, path: Union[str, Path, None] = None):
@@ -2850,7 +2849,7 @@ class Writer:
         memory, opened, recalculated, and committed atomically — every
         cached formula value in the destination is one the engine
         computed. Returns the :class:`RecalcReport` then, ``None``
-        otherwise. Requires libzlsx 0.9.0+."""
+        otherwise. Requires libzlsx 0.8.0+."""
         target = Path(path) if path is not None else self._path
         if target is None:
             raise ValueError("no save path: pass one to zlsx.write() or Writer.save()")
@@ -2865,7 +2864,7 @@ class Writer:
         if not _ffi._HAS_WRITER_RECALC:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_writer_save_with_recalc "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         opts = recalculate
         token = _new_cancel_token(self._err)
@@ -3190,7 +3189,7 @@ def engine_fingerprint() -> str:
     if not _ffi._HAS_FINGERPRINT:
         raise RuntimeError(
             "loaded libzlsx does not expose zlsx_engine_fingerprint "
-            "(requires 0.9.0+); upgrade libzlsx"
+            "(requires 0.8.0+); upgrade libzlsx"
         )
     return _ffi.lib.zlsx_engine_fingerprint().decode("utf-8")
 
@@ -3608,7 +3607,7 @@ class Editor:
         if not _ffi._HAS_SAVE_BUFFER:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_open_buffer "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         obj = cls.__new__(cls)
         obj._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
@@ -3631,7 +3630,7 @@ class Editor:
         if not _ffi._HAS_SAVE_BUFFER:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_editor_save_to_buffer "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
         out_len = ctypes.c_size_t(0)
@@ -3656,7 +3655,7 @@ class Editor:
         if not _ffi._HAS_MARK_RECALC:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_editor_mark_recalc_on_load "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         _report, diag = _fresh_report_and_diag()
         rc = _ffi.lib.zlsx_editor_mark_recalc_on_load(
@@ -3692,7 +3691,7 @@ class Editor:
         if not _ffi._HAS_RECALC:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_editor_recalculate "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         token = _new_cancel_token(self._err)
         try:
@@ -3735,7 +3734,7 @@ class Editor:
         if not _ffi._HAS_SAVE_WITH_RECALC:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_editor_save_with_recalc "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         pbytes = str(path).encode("utf-8")
         token = _new_cancel_token(self._err)
@@ -3786,7 +3785,7 @@ class Editor:
         if not _ffi._HAS_EVAL:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_editor_evaluate "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "(requires 0.8.0+); upgrade libzlsx"
             )
         fbytes = formula.encode("utf-8")
         fptr, fkeep = _path_as_ubyte(fbytes) if fbytes else (None, None)

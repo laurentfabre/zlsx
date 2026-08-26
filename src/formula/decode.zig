@@ -1662,7 +1662,7 @@ pub const RowSlot = struct {
 /// and only through these coordinates. Recorded whether or not any
 /// mutation will need it; interpretation waits for the patcher, because
 /// a stale dimension is tolerated everywhere EXCEPT under a spill that
-/// extends the used range (`docs/plans/structural-edits.md:100`).
+/// extends the used range (`docs/plans/archive/structural-edits.md:100`).
 pub const DimensionSpans = struct {
     /// The start tag, `<dimension` through its `>`.
     element: Span,

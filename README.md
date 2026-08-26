@@ -87,6 +87,9 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   cell refs, formulas, merged ranges, panes, tables, drawings, and comments
   together; anything the rewriter cannot shift safely is **refused with a
   typed error instead of corrupting the file** ([refusal audit](docs/plans/refusal-audit.md)).
+  Two guards remain: sheets that *host* a pivot, and `<xm:f>` sparkline
+  formulas. A sheet a pivot only *reads from* is not detected yet — that
+  audit is row S6 of `goal_sigmoid.md`.
 - **In-workbook embeddings** — store embedding vectors *inside* the workbook
   as OPC parts invisible to Excel; extract / write / prune / strip via
   [`zlsx embed`](docs/cli.md#embeddings-embed). A spreadsheet that carries its
@@ -94,9 +97,11 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
 - **Metadata scrub** — `zlsx scrub-metadata` removes `docProps` identity
   (author, company, …) outright rather than blanking it.
 - **Fuzzed like it matters** — random-byte + mutation-driven fuzz harnesses
-  over every parser and the byte-splicing edit path, plus a nightly
-  coverage-guided run (`zig build fuzz --fuzz`); no crashes / panics / OOM
-  tolerated.
+  over the reader, the package layer, the byte-splicing edit path and the
+  formula engine (the exact target list is in
+  [`docs/plans/surface-matrix.md`](docs/plans/surface-matrix.md) §6), plus a
+  nightly coverage-guided run (`zig build fuzz --fuzz`); no crashes / panics /
+  OOM tolerated.
 
 ---
 
@@ -155,8 +160,10 @@ zlsx_book_close(book);
 ```
 
 Link the released library from any tarball — `cc app.c -Iinclude -Llib
--lzlsx`. The reader and writer surfaces are fully exported, plus an editor
-subset (append rows, `set_cell`, save, docProps read/strip); in-memory
+-lzlsx`. The row reader and the fresh writer are exported nearly one-for-one,
+plus an editor subset (append rows, `set_cell`, save, docProps read/strip,
+recalc / evaluate) — what each surface has and lacks, per entry point, is
+[`docs/plans/surface-matrix.md`](docs/plans/surface-matrix.md); in-memory
 workbooks come in via `zlsx_book_open_buffer` (that's what SQL UDFs over
 `BINARY` columns use) and go back out via `zlsx_writer_save_to_buffer`
 (`Writer.to_bytes()` in Python) for callers with no usable filesystem —
@@ -312,15 +319,20 @@ detected and byte-preserved through edits, not parsed into a typed object.
 | Formulas, defined names | ✓ | ✓ | ✓ |
 | Caller-supplied cached formula result | ✓ | ✓ | — |
 | Rich-text runs per cell | ✓ | ✓ | ✓ |
-| Images (PNG / JPEG embed) | ~⁵ | ✓ | ✓ |
+| Images (PNG / JPEG embed) | —⁵ | ✓ | ✓ |
 | Charts | — | ✓ | ✓ |
 | **Load-modify-save** (edit existing workbooks) | ✓ | — | ✓ |
 | Sheet-name validation (Unicode-aware dedup) | ✓ | ~ | ~ |
 
 ⁴ `cellIs` / `expression` / `colorScale` / `dataBar` rule types with
 differential formats (`addDxf`).
-⁵ Minimal emission: `oneCellAnchor`, fixed 1″×1″ extent, drawingless sheets
-only. Typed chart emit is deferred.
+⁵ Image authoring lives on the *editing* layer, not the fresh `Writer`:
+`Workbook.addImage` (native size read from the PNG / JPEG / GIF header),
+`addImageRange` (`twoCellAnchor`), `addImageAnchored` (explicit extent), with
+pixel offsets and appends into a sheet's existing drawing — Zig only today.
+The fresh `Writer` has no image API; routing it through that one emitter and
+reaching C / Python / CLI is row S5 of `goal_sigmoid.md`. Typed chart emit is
+deferred (D2 / S9).
 
 ### Spark / Databricks
 
@@ -405,7 +417,8 @@ contract: [docs/cli.md](docs/cli.md).**
 | Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` |
 | Privacy | `scrub-metadata` · `embed --strip` · `embed --prune` |
 | Embeddings | `embed --extract` · `embed --vectors` |
-| Databricks | `dbx push` · `dbx pull` · `dbx genie` |
+| Formula | `eval` · `recalc` |
+| Databricks | `dbx push` · `dbx pull` · `dbx genie` · `dbx audit` |
 
 ```bash
 # All string cells across every sheet.
@@ -458,11 +471,15 @@ are preinstalled).
 ## Scope: in / out
 
 **In** — everything in the [feature matrix](#feature-matrix) above, plus:
-UTF-8 throughout, XML entity decoding/escaping both directions, ZIP-bomb /
-Zip64 / split-archive defenses on the package/editor path (the core reader's
-decompression caps are still queued — exit code 4 is reserved for them),
-control-byte rejection on every user-text channel (a stray NUL never
-produces an unreadable workbook), Unicode-aware sheet-name dedup (NFC +
+UTF-8 throughout, XML entity decoding/escaping both directions, archive
+defenses on the package path (`Workbook.open`: 512 MiB per-part cap, 4096:1
+ratio cap checked before the decompressed output is allocated, Zip64 / split /
+encrypted refused; no aggregate budget yet, and the core reader `Book.open` —
+which `Editor.open` also runs, after its own structural scan and before its
+own capped reads — has no caps at all: row S1 of `goal_sigmoid.md`, exit code
+4 reserved), control-byte rejection on every cell-text, sheet-name, comment,
+defined-name and hyperlink channel (a stray NUL never produces an unreadable
+workbook; embedding metadata is the one channel not yet checked — S3c), Unicode-aware sheet-name dedup (NFC +
 casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 `zlsx_pkg` OPC package layer for raw part access.
 
@@ -476,12 +493,14 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
   package layer (see [`docs/cli.md`](docs/cli.md)).
 - **Automatic date decoding** — dates surface as Excel serials; opt in via
   `Rows.parseDate` / `xlsx.fromExcelSerial`.
-- **Pivot-aware edits** — pivots round-trip byte-preserved, but row/col edits
-  on sheets a pivot reads from are refused rather than silently breaking the
-  pivot.
+- **Pivot-aware edits** — pivots round-trip byte-preserved, and row/col edits
+  on sheets that *host* a pivot are refused rather than silently breaking it.
+  The guard walks the edited sheet's relationships, so a sheet a pivot only
+  *reads from* is not detected yet — that audit opens the pivot programme
+  (S6 in `goal_sigmoid.md`).
 - **Chart authoring** — extraction is in; typed chart emission is not. Image
-  authoring is limited to the fixed one-cell-anchor surface noted in the
-  writer matrix.
+  authoring exists on the `Workbook` editing layer only (writer matrix
+  footnote ⁵); the fresh `Writer` has none yet.
 - `.xls`, `.xlsb`, `.ods` — different formats, out of scope permanently.
 
 ---
@@ -494,8 +513,12 @@ Every PR and push to `main` is gated in CI on the full suite:
   counted by the test runner), including PRNG mutation harnesses over the
   byte-splicing edit path.
 - **Fuzzing** — dedicated fuzz build targets (`zig build fuzz`; random-byte
-  + mutation-driven) against every internal parser and the public
-  `Book.open`, plus a nightly coverage-guided run (`--fuzz`); deep manual
+  + mutation-driven) against the reader, the package layer, the byte-splicing
+  edit path and the formula engine — target list in
+  [`docs/plans/surface-matrix.md`](docs/plans/surface-matrix.md) §6 (the
+  drawing-anchor and typed-part parsers have no fuzz target; they get ordinary
+  `Workbook` and corpus test coverage) — plus a nightly coverage-guided run
+  (`--fuzz`, on macOS under Zig 0.16.0); deep manual
   runs crank iterations via `XLSX_FUZZ_ITERS`. Standing constraint: no
   crashes, no panics, no OOM.
 - **Corpus integration** — [real public workbooks](docs/xlsx_test_corpus.md)
@@ -515,6 +538,7 @@ Every PR and push to `main` is gated in CI on the full suite:
 | [docs/jq-for-excel.md](docs/jq-for-excel.md) | CLI design doc (historical — [docs/cli.md](docs/cli.md) is the current contract) |
 | [docs/vs_calamine.md](docs/vs_calamine.md) | Feature gap vs calamine (historical snapshot — the [matrix](#feature-matrix) above is current) |
 | [include/zlsx.h](include/zlsx.h) | C ABI header |
+| [docs/plans/surface-matrix.md](docs/plans/surface-matrix.md) | What each of Zig / C / Python / CLI has, per entry point — the parity truth |
 | [docs/plans/](docs/plans/) | Design plans for queued work |
 
 Built against **Zig 0.16.0** (`std.Io` writer-gate APIs, `std.zip.Iterator`,

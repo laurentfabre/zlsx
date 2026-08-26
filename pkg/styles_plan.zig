@@ -19,7 +19,7 @@
 //!   pre-iter-wr-2 emitter from `src/writer.zig`'s `emitStylesXml`
 //!   was lifted verbatim).
 //!
-//! Byte-stability invariants — see `docs/plans/writer-rebase.md` §1.10.
+//! Byte-stability invariants — see `docs/plans/archive/writer-rebase.md` §1.10.
 //! The schema element order is rigid (`numFmts → fonts → fills →
 //! borders → cellStyleXfs → cellXfs → cellStyles → dxfs`). Every
 //! attribute order in `<xf>` and `<dxf>` blocks is fixed. Color

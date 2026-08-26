@@ -1,8 +1,8 @@
 name: Fuzz Nightly
 
 # B-fuzz from the post-0.2.9 roadmap. Runs the coverage-guided fuzz
-# targets on a Linux x64 runner once per day. Crash artefacts are
-# uploaded so a regression can be reproduced + replayed locally.
+# targets once per day — on macos-14 today, see PLATFORM below. Crash
+# artefacts are uploaded so a regression can be reproduced + replayed locally.
 #
 # THREE BUGS WERE FIXED TO GET THIS WORKING — read before editing:
 #

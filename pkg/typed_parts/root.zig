@@ -18,7 +18,7 @@
 //!
 //! These parsers are read-only in iter-wb-1. Emit / mutate paths
 //! land in iter-wb-4 (Worksheet.setCell + delta-emit save). See
-//! `docs/plans/workbook-overlay.md`.
+//! `docs/plans/archive/workbook-overlay.md`.
 
 pub const workbook_xml = @import("workbook_xml.zig");
 pub const sheet_xml = @import("sheet_xml.zig");

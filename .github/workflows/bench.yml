@@ -10,7 +10,7 @@ name: Bench Regression
 #   1. ≥ 20 main-branch samples showing per-fixture variance < 7%.
 #   2. Pinned runner class.
 #   3. Manual override (PR label / commit-trailer).
-# See docs/plans/post-0.2.9-roadmap.md, A3 walk-away gate.
+# See docs/plans/archive/post-0.2.9-roadmap.md, A3 walk-away gate.
 
 on:
   pull_request:

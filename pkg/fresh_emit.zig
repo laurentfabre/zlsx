@@ -9,7 +9,7 @@
 //! ZIP CD + EOCD).
 //!
 //! Byte-stability: this module is the canonical home for every
-//! catalogued §2 invariant in `docs/plans/writer-rebase.md`. The
+//! catalogued §2 invariant in `docs/plans/archive/writer-rebase.md`. The
 //! pre-iter-wr-7 emit branch in `src/writer.zig::save` is preserved
 //! verbatim — only its location moves.
 //!

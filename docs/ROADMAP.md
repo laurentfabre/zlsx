@@ -1,25 +1,49 @@
-# goal_plan.md — zlsx plan of record
+# ROADMAP — zlsx plan of record
 
-> **Authoritative source for knowledge-base section 08, "the plan"**
-> (`Built, next, and what depends on what.`). `docs/kb/build_site.py`
-> parses the table below at build time — it is no longer hardcoded in
-> the generator. Edit this file, re-run `python3 docs/kb/build_site.py`,
-> and the site follows.
+> **The single plan of record.** This file supersedes and replaces three
+> overlapping predecessors, retired 2026-08-14: `goal.md` (north star +
+> active track), `goal_plan.md` (the status table), and the post-0.2.9
+> roadmap (the shipped-work ledger, kept at
+> `docs/plans/archive/post-0.2.9-roadmap.md` for its per-PR detail).
+>
+> **Authoritative source for knowledge-base section 08, "the plan."**
+> `docs/kb/build_site.py` parses the table below at build time. Edit this
+> file, re-run `python3 docs/kb/build_site.py`, and the site follows.
 
-_Last updated: 2026-07-26 · `main` at `b3a34ea` (v0.5.0, Zig 0.16.0) ·
-embedding arc + E4B on `feat/emb-0.16-forward-port` → PR #123_
-
-Sibling goal files: `goal.md` (north star + active track),
-`goal_evol.md` (2026-07-25 nemonym work order — CLOSED).
+_Last updated: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0_
 
 ---
 
-## How to read this
+## North star
+
+> **The fastest, safest `.xlsx` library — read *and* mutate-in-place — usable from Zig, C,
+> and Python, stdlib-only.** Every row/col edit either rewrites all coordinate-bearing
+> parts correctly or refuses with a typed error. Never silently corrupt a workbook.
+
+Performance posture (the bar to hold): 1.7–12× over calamine, 38× over openpyxl,
+4× less RAM at MB scale. Write-path strict gate ≤ 7.4 ms.
+
+## Where the truth lives
+
+| For… | Look at |
+|---|---|
+| The work queue (authoritative) | **this file**, plus `docs/plans/refusal-audit.md` for the refusal axes |
+| Rules for agents editing code | `AGENTS.md` |
+| The formula engine (shipped, normative) | `goal_formula.md` — cited by 33 source files; §-numbers are load-bearing |
+| The missing-features ladder (S0–S11) | `goal_sigmoid.md` — rows graduate into the table below as they start; owner gates per row |
+| What each surface (Zig / C / Python / CLI) has, per entry point | `docs/plans/surface-matrix.md` — every capability PR updates it |
+| Live plan detail | `docs/plans/` — see the index at the bottom of this file |
+| Shipped-work detail, per PR | `docs/plans/archive/` |
+| Narrated architecture / conventions / gotchas | `docs/kb/` → `kb.html` (gitignored, private) |
+
+---
+
+## How to read the table
 
 Every piece of work gets a row: what it is, whether it is built, what it
 cost, and **what had to exist before it could start**. The dependency
-column is the point of the file — it is what makes "what's next"
-answerable without re-deriving the graph each time.
+column is the point — it is what makes "what's next" answerable without
+re-deriving the graph each time.
 
 Estimates are the **originals**, kept deliberately so they can be checked
 against what actually happened. Where a row is new and unestimated the
@@ -69,7 +93,8 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | E5 | Embeddings from Python | done | 2-3 wk | ER | Reach the vectors from Python. `zlsx.embeddings(path)` → present / stripped / absent; vectors as NumPy float32, `valid_mask` for tombstones, provenance recovered on a stripped workbook. |
 | E6 | Embeddings from the command line | done | 2-3 wk | E5 | Add, prune and strip vectors without writing code. `zlsx embed` ships four mutually exclusive modes: `--extract` (rows needing embedding, as NDJSON), `--vectors PATH` (write them back), `--prune` (tombstone stale slots), `--strip` (remove parts *and* the recovery record, so the result reports `absent`). |
 | D1 | Compute formulas | done | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; **v1 complete 2026-08-07** — all 175 frozen names registered, the §13 release gate and §9 perf checks run at M9d. |
-| D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning. |
+| D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning — until row S9 of `goal_sigmoid.md` reverses it for fresh workbooks (needs S5). |
+| S0 | Doc truth + surface inventory | done | 3–5 d | — | The first row of the `goal_sigmoid.md` ladder. Reconciled every stale surface claim (the README writer-image footnote described an emission surface the fresh `Writer` never had — image authoring is `Workbook.addImage*`, Zig-only; the Python README called structural edits "a follow-up plan" and the engine "0.9.0+" when both shipped in 0.8.0; this file queued `to_bytes()` after #152 shipped it) and froze the four-surface capability matrix, `docs/plans/surface-matrix.md`, that every later row updates (lint in CI). The inventory also found the pivot guard sees hosting sheets only, no aggregate ZIP budget on any path, the fresh `Writer` a private build module, and four Zig-only surfaces no row covered — the S0 gate (2026-08-26) added rows S3d, S3e, S5b, S11, widened S3b, and recorded six `n/a` rulings. |
 
 <!-- ROADMAP:END -->
 
@@ -86,6 +111,7 @@ graph TD
     B0 --> C2a["C2a extract objects ✅"]
     C2a --> C2b["C2b create images ✅"]
     B1 --> C1["C1 formulas ✅"]
+    C1 --> D1["D1 compute formulas ✅"]
 
     B0 --> E1["E1 wire format ✅"]
     E1 --> E2["E2 read side ✅"]
@@ -111,15 +137,43 @@ graph TD
 
 ## The critical path, stated plainly
 
-Everything structural is built. `B0→B1→B2→B3` closed the archive model,
-the checked structures, and the unified read/write path; that is the
-product and it is done.
+**Everything on the table is `done` except two rows: `E4W` is `blocked`
+on a Windows host, and `D2` is `deferred` until S9.** `B0→B1→B2→B3`
+closed the archive model, the checked structures, and the unified
+read/write path; `C1` closed formula rewriting; `D1` shipped the
+evaluator. That is the product, and it is built.
 
-**The only live arc is embeddings. It was stalled on a decision; that
-decision is made (2026-07-26) and the arc is unblocked.**
+What comes next is the `goal_sigmoid.md` ladder (S0–S11, owner-locked
+2026-08-26): mostly parity — closing every `—` the README matrices and
+`docs/plans/surface-matrix.md` still show against openpyxl / xlsxwriter /
+calamine, with a row `done` only when the capability reaches Zig, the C ABI,
+Python *and* the CLI — plus two deliberate reversals of earlier "different
+product" rulings, pivot authoring (S8) and chart authoring (S9), both for
+fresh workbooks only. Rows join this table as they start; S0 is the first.
 
-> **The contract: Excel-durable vectors; evidence that survives every
-> measured consumer except Apple Numbers.**
+### `E4W` — the one blocked row
+
+Excel for Windows is the largest install base and is the only untested
+consumer. If it preserves, "Excel-durable" is a real promise. If it
+strips, the promise is "durable in zlsx and Excel-for-Mac", which is a
+materially weaker product.
+
+It cannot be closed by CI: a GitHub Actions `windows-latest` runner
+proves the binary runs on Windows, not that Excel preserves anything,
+and Excel is not installed on hosted runners. **It needs a human at a
+Windows machine with Excel.** The protocol — generate the six-carrier
+fixture here, save it there, verify it back here — is in
+`docs/plans/emb-4b-carrier-matrix.md` under "Method"; the verifier's
+exit code is the carrier-loss count.
+
+`E4W` gates nothing downstream. It settles how strong clause 2a of the
+durability contract is, which is a documentation question about an
+already-decided contract.
+
+### The durability contract (decided 2026-07-26)
+
+> **Excel-durable vectors; evidence that survives every measured
+> consumer except Apple Numbers.**
 > zlsx guarantees that a workbook which loses its vectors *says so*. It
 > does not guarantee every tool keeps them — two of the four v1 targets
 > provably do not.
@@ -156,75 +210,124 @@ decision is made (2026-07-26) and the arc is unblocked.**
 > rather have a visible sheet than a silent loss. Verified against a
 > real Numbers 15.3 export in both configurations.
 
-`E4` did its job: it measured, and the measurement was bad news. Of the
-three reachable targets, only Excel for Mac preserves the vectors on
-save. Numbers and LibreOffice **delete** them — parts removed, not merely
-unreferenced, so nothing recovers them afterwards. The matrix's own bar
-was *PASS on all four*; that bar is not met.
+---
 
-Two measurements would make the decision straightforward, and neither is
-expensive:
+## Pro track — Databricks interface
 
-- **`E4W`** — Excel for Windows is the largest install base and is
-  untested. If it preserves, "Excel-durable" is a real promise. If it
-  strips, the promise is "durable in zlsx and Excel-for-Mac", which is a
-  materially weaker product. One Windows CI runner closes this; the
-  `emb4-*` steps already cross-compile to `x86_64-windows-gnu`.
-- **`E4B`** — the vectors live in a custom package part because that
-  part is invisible to Excel's Document Inspector. Cell data survives the
-  apps that rebuild archives, but *is* enumerated by the Inspector. The
-  two failure modes do not overlap, which is the argument for carrying a
-  small recovery record in a second place rather than choosing one
-  hiding spot. `E4B` measures which second places actually survive
-  instead of guessing.
+First pro feature: interface zlsx with Databricks, whose native Excel support is
+weak (JVM/POI-based `spark-excel` or driver-side pandas+openpyxl). The verified
+experiments are in-tree at `integrations/databricks/` (#143); ideation lives in
+the private KB (`docs/kb/`, gitignored) alongside the SaaS arc.
 
-  **Measured 2026-07-26 (openpyxl + LibreOffice legs).** Three carriers
-  survive both rebuilders: `docProps/custom.xml`, cell data, and
-  `<definedName>`. A recovery record — model id, dim, dtype, coverage
-  ranges, content hash, ~100–200 bytes, *not* the vectors — can
-  therefore be carried durably through a tool that erases the vectors.
-  `<extLst>`, the ECMA-sanctioned vendor extension point and the
-  intuitive first choice, is stripped by both; `customXml/` survives
-  LibreOffice but not openpyxl, so it is strictly worse than the top
-  three on durability *and* on Inspector exposure. `defined_name` ranks
-  first — it survives both and no Document Inspector module enumerates
-  it — and it was never considered in the design doc's "Why NOT"
-  section. Numbers and Excel legs are still manual; Numbers could
-  change the ranking. Full matrix:
-  `docs/plans/emb-4b-carrier-matrix.md`.
+Proven end-to-end on a live workspace, using released artifacts only: both
+directions (xlsx → Volume → Delta → SQL aggregates, and warehouse table → styled
+report xlsx); `spark.read.format("zlsx")` on serverless compute over a Volume
+workbook with no Delta copy; a `read_xlsx()` UC Python UDF in pure DBSQL where
+the `wb_sales_live` view parses the workbook *file* at query time (edit the file,
+the next query reflects it — zero re-ingestion); and Genie answering
+natural-language questions against that live view (2026-08-01).
 
-`E5` was `blocked` on purpose: the Python surface has to *express* the
-durability contract — what an absent vector set means, whether there is
-a recompute entry point — and building it first would mean reworking a
-public API after it shipped.
+Shipped since: Data Source hardening (per-file×sheet partitions, row-range
+splits, type widening, the writer half) in #146, the `zlsx dbx` CLI family
+(push / pull / genie) over std.http in #147, the streaming source — Auto Loader
+for Excel — in #148, and `zlsx dbx audit` (#149–#154, live-verified against
+`workspace.default.zlsx_sales`). The relicense (#102) is load-bearing here: the
+proprietary boundary is the pro tier.
 
-**That reason is discharged.** The contract is decided, so `E5` is now
-`planned`, behind one new piece: `ER`, the recovery record itself. `ER`
-is what gives `E5` something to express. The Python surface can now
-distinguish three states that were previously indistinguishable —
-vectors present, vectors stripped *with known provenance*, and never
-embedded — where before it could only say "nothing here".
+**Track queue is empty as of 2026-08-14** — the next Databricks item needs a
+fresh scoping decision, not a pull from this list.
 
-`E4W` no longer gates `E5`. It settles how strong clause 2a is
-("Excel-durable" vs "zlsx-durable"), which is a documentation question
-about an already-decided contract, not an API-shape question.
+The one piece that was scoped outside the track's numbered list also shipped:
+**`Writer.saveToOwnedBuffer` → `zlsx_writer_save_to_buffer` → `to_bytes()`**
+landed in #152 together with the Spark inference hardening, so a workbook can be
+produced without a filesystem on all three library surfaces. Spark parts
+serialise in memory and land by rename, so no reader sees a partial workbook.
+
+---
+
+## Candidate follow-ups (value/effort order)
+
+1. **Route `<xm:f>` through the formula rewriter** — removes #140's
+   `ExtensionEditUnsafe` guard, which today refuses row/col edits on any sheet
+   carrying a sparkline formula. Needs a sheet-name context `sheet_edit.zig`
+   does not have. The highest-value remaining lift. The D1 ladder shipped the
+   parser and name-resolution layer this needs (2026-08-07), so the
+   route-through is now pullable. **Queued as row S2 of `goal_sigmoid.md`.**
+2. **Cross-part pivot rewriter** — removes #139's refusal. Bigger lift:
+   `<location ref>` + cache field ranges across `xl/pivotTables/*` and
+   `xl/pivotCache/*`, a ref graph zlsx has never walked. **Queued as rows
+   S6 → S7a/b/c of `goal_sigmoid.md`** (typed read first, then staged lifts).
+3. **CDATA-aware shared tag scanner** — candidate for extraction to `ziglib`.
+
+Refusal state: **every row/col-edit refusal axis with a rewriter is lifted** on
+`main` (panes, autoFilter, picture, xdr, VML+comments, structured tables, extLst
+`xm:sqref` #140). Two axes stay refused, with actual guards: **pivots** (#139)
+and **`<xm:f>`** sparkline formulas (#140). The pivot guard walks the edited
+sheet's relationships, so it catches sheets that *host* a pivot; a sheet a
+pivot only *reads from* (`worksheetSource` in the cache definition) is not
+detected today — auditing that is S6's first job. Full axis table:
+`docs/plans/refusal-audit.md`.
 
 ---
 
 ## Deliberately not on this list
 
-`D2` (author charts) is `deferred`, not backlog. Reading and editing is
-the product; chart authoring is a different product. It appears here so
-the question stops being re-asked, not because it is queued.
+`D2` (author charts) was `deferred`, not backlog, on the reasoning that
+reading and editing is the product and chart authoring a different one. The
+owner reversed that on 2026-08-26 for *fresh workbooks only*: row S9 of
+`goal_sigmoid.md` (needs S5, the image-authoring parity row). Editing an
+existing unknown chart stays out; the D2 row above keeps `deferred` until S9
+starts.
 
 `D1` (compute formulas) **used to sit here on the same reasoning, and no
-longer does.** It was reversed on 2026-08-02 and is now `planned`, with
+longer does.** It was reversed on 2026-08-02 and shipped 2026-08-07, with
 its own ladder in `goal_formula.md`. The old argument — "evaluation is a
 different product" — was answered by scoping the evaluator as a bounded,
 oracle-gated tier that refuses rather than half-computes, not by
 loosening the product line.
 
+**PyPI publishing** is deferred pending the owner's PyPI login, not
+forgotten — `docs/plans/pypi-publishing.md`. **Formula literal masking**
+is deferred deliberately — `docs/plans/formula-literal-masking.md`.
+
 Loose ends that are not plan items — the stale Homebrew recipe, the
 unpublished Python package, the unverified benchmark columns, the
 vendored compiler file — live in knowledge-base section 09, "open work",
 sourced from `OPEN_ITEMS` in `docs/kb/build_site.py`.
+
+---
+
+## Plan index
+
+**Live plans** — `docs/plans/`:
+
+| Plan | What it covers |
+|---|---|
+| `surface-matrix.md` | The four-surface (Zig / C / Python / CLI) capability truth, per entry point; every capability PR updates it |
+| `embeddings-in-xlsx.md` | Embedding design doc + the durability contract in full |
+| `emb-4-compat-matrix.md` | Tool-survival matrix (E4). Excel-for-Windows column pending |
+| `emb-4b-carrier-matrix.md` | Carrier-survival matrix (E4B) + the E4W protocol |
+| `refusal-audit.md` | Every row/col-edit refusal axis and its lift status |
+| `c-abi-status-v1.md` | Normative for the M9a1 C ABI exports; pins every field offset |
+| `pypi-publishing.md` | Deferred — needs the owner's PyPI login |
+| `formula-literal-masking.md` | Deferred deliberately; recorded so the gap stays visible |
+
+**Archived** — `docs/plans/archive/`, kept for per-PR traceability:
+
+| Plan | Shipped as |
+|---|---|
+| `post-0.2.9-roadmap.md` | The full A/B/C-tier ledger, per PR |
+| `workbook-overlay.md` | B1 — Workbook typed overlay |
+| `editor-rebase.md` | B2 — Editor onto Workbook |
+| `writer-rebase.md` | B3 — Writer onto Workbook |
+| `load-modify-save.md` | Phase 3c — append-only LMS |
+| `streaming-sst.md` | Lazy SST backend (`--sst-lazy`) |
+| `cell-mutate.md` | Phase 3d draft — superseded by the B-tier overlay |
+| `structural-edits.md` | Phase 3e draft — superseded by the C1 rewriters |
+| `goal_evol.md` | The 2026-07-25 nemonym work order — closed |
+
+Also normative, at the repo root: **`goal_formula.md`** — the tier-D1
+formula-engine ladder, shipped 2026-08-07. It stays at the root because
+33 source files cite its section numbers directly. Beside it,
+**`goal_sigmoid.md`** — the live S0–S11 missing-features ladder, kept at the
+root the way `goal_formula.md` was while D1 was in flight.

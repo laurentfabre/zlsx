@@ -2,10 +2,11 @@
 
 The `zlsx` binary is "jq for Excel": the read/query sub-commands emit a
 uniform NDJSON envelope by default, composing cleanly with `jq`, `rg`,
-`awk`, `duckdb read_ndjson`, or an LLM ingest harness. Two deliberate
-exceptions: `rows` offers CSV/TSV/legacy escape hatches via `--format`, and
+`awk`, `duckdb read_ndjson`, or an LLM ingest harness. Three deliberate
+exceptions: `rows` offers CSV/TSV/legacy escape hatches via `--format`,
 `meta` / `list-sheets` offer a single collapsed JSON object via
-`--output pretty-json`.
+`--output pretty-json`, and the formula commands `eval` / `recalc` speak
+their own versioned NDJSON grammars (below), not the row envelope.
 Mutation sub-commands (the edit family, `scrub-metadata`, `embed --strip` /
 `--vectors`) write the output workbook and stay silent on stdout on success —
 except `embed --prune`, which emits one NDJSON summary. Design rationale
@@ -49,7 +50,10 @@ Every edit sub-command reads `<file>`, applies the change, and atomic-renames
 the result to `--out PATH` — the input is never modified in place. A refused
 edit (a construct the rewriter cannot shift safely yet — see
 [`plans/refusal-audit.md`](plans/refusal-audit.md)) exits with a diagnostic
-instead of writing a corrupt workbook; a successful save is byte-safe.
+instead of writing a corrupt workbook; a successful save is byte-safe. One
+known hole in that promise: the pivot guard detects sheets that *host* a
+pivot, not sheets a pivot only *reads from* — a row/col edit on a source-only
+sheet is not refused today (the S6 audit in `goal_sigmoid.md` closes it).
 
 | Command | Required flags | What it does |
 |---|---|---|

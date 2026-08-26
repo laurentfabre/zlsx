@@ -1584,7 +1584,7 @@ fn planTailInsert(
 
 /// The `<dimension ref>` expansion created tails require. Absent
 /// dimension: nothing to maintain — the OOXML spec lets a consumer
-/// rescan `<sheetData>` (`docs/plans/structural-edits.md:100`). Present
+/// rescan `<sheetData>` (`docs/plans/archive/structural-edits.md:100`). Present
 /// but unparseable WHEN expansion is needed: the spill refuses, §5.8b's
 /// "refuse until this mutation is proven possible" arm.
 fn planDimension(

@@ -515,7 +515,7 @@ pub const Writer = struct {
     /// the registered `SheetWriter` list and forwards to the shared
     /// `pkg/fresh_emit.zig` archive substrate. Same byte format,
     /// same byte-stability invariants — they all live on the substrate
-    /// now (see `docs/plans/writer-rebase.md` §1 + §2). Writer-local
+    /// now (see `docs/plans/archive/writer-rebase.md` §1 + §2). Writer-local
     /// state remains the source of truth: the registries (sst_plan,
     /// styles_plan, workbook_xml_plan, sst_count) plus per-sheet
     /// (name, body, state) are projected onto `fresh_emit.ArchiveInputs`

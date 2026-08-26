@@ -206,7 +206,7 @@ def main() -> int:
     else:
         md_lines.append(
             "Report-only — comparison on means; warnings do not fail CI "
-            "(see docs/plans/post-0.2.9-roadmap.md, A3)."
+            "(see docs/plans/archive/post-0.2.9-roadmap.md, A3)."
         )
     md_lines += [
         "",

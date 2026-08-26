@@ -1,6 +1,6 @@
 //! B1 iter-wb-6 RSS gate — orchestration test.
 //!
-//! Walk-away gate from `docs/plans/workbook-overlay.md`:
+//! Walk-away gate from `docs/plans/archive/workbook-overlay.md`:
 //!
 //! > "100k-row × 10-sheet workbook needs ≤ 2× current `Book.openLazy`
 //! >  RSS before any sheet is touched."
