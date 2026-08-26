@@ -1,6 +1,10 @@
 # Enforcement plan — worktrees, subagents, TDD, merge guards, review
 
-Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.15.2.
+Originally written 2026-04-30 against Zig 0.15.2, when the repo was
+MIT-licensed. **Refreshed 2026-08-14.** Single-author repository
+(`laurentfabre/zlsx`) — public for reading but **proprietary** since #102;
+Zig **0.16.0**. Phases 1–3 and the phase-5 TDAD map still describe live
+gates. Phase 4 is retired: see the note below.
 
 ## Status table
 
@@ -9,7 +13,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 | 1 | Free wins: branch protection, repo merge settings, CODEOWNERS, PR template | **Done (2026-04-30)** |
 | 2 | TDD CI gates: test-presence, C-ABI 3-file-transaction, monotonic test count | **Done (2026-04-30, advisory)** |
 | 3 | Worktree + subagent conventions: helper script, commit-msg trailer, PR template fields | **Done (2026-04-30)** |
-| 4 | Agent-as-reviewer CI job (codex-review-on-PR) | **Done (2026-04-30, requires `OPENAI_API_KEY` secret)** |
+| 4 | Agent-as-reviewer CI job (codex-review-on-PR) | **Retired 2026-08-14** — see below |
 | 5 | Optional: coverage gate (deferred), TDAD map (**done 2026-04-30**), mutation testing (deferred) | **Partial** |
 
 ---
@@ -22,7 +26,7 @@ Status as of 2026-04-30. Single-author public repo (`laurentfabre/zlsx`), Zig 0.
 | Required status checks | None. CI runs but does not gate merges. |
 | Required reviews | None. |
 | CODEOWNERS / PR template / Dependabot | Absent. |
-| Pre-commit hook | Installed via `scripts/githooks/install-hooks.sh`. Gates: merge markers, CLAUDE.md size cap (vestigial here), 21-pattern secret scan, `zig fmt --check`. Bypassable with `--no-verify` and opt-in per dev. |
+| Pre-commit hook | Installed via `scripts/install-hooks.sh`. Gates: merge markers, CLAUDE.md size cap (vestigial here), 21-pattern secret scan, `zig fmt --check`. Bypassable with `--no-verify` and opt-in per dev. |
 | Pre-push hook | None. |
 | CI workflow | `ci.yml`: fmt, build (Debug + ReleaseFast), unit + corpus tests on macOS-14 / Ubuntu-22.04 / Windows (`continue-on-error`), cross-compile to 4 targets, single-threaded compile. |
 | Worktree convention | None. Single worktree on `main`. |
@@ -212,9 +216,23 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD LABELS='["abi-no-3file
 - The `commit-msg` hook intentionally never blocks. If the convention sticks (i.e. trailers appear consistently), promote to a hard fail later.
 - `wt-new` slug-escapes `/` in branch names (`feat/streaming-sst` → `zlsx-feat-streaming-sst/`) to avoid filesystem nesting surprises.
 
-## Phase 4 — implementation log
+## Phase 4 — RETIRED 2026-08-14
 
-- [x] `.github/workflows/codex-review.yml` created (2026-04-30)
+**Automated Codex review on GitHub Actions is not the workflow in use.** The
+`OPENAI_API_KEY` secret was never set, so the job no-op'd on every PR from
+2026-04-30 onward; it was later `disabled_manually` on GitHub, and
+`.github/workflows/codex-review.yml` was deleted on 2026-08-14.
+
+What replaced it is **manual, local, and higher-signal**: `/repo-review` and
+`/pr-cycle` drive the Codex CLI against the working tree or a PR diff, with a
+schema-strict prompt and a multi-round convergence loop. That loop routinely
+finds MAJOR defects three in-house review agents miss — which is exactly the
+reviewer signal phase 4 was reaching for, without the per-PR CI cost or the
+moving-target `@latest` CLI pin.
+
+The rest of this section is kept as the historical record of what was built.
+
+- [x] `.github/workflows/codex-review.yml` created (2026-04-30), deleted 2026-08-14
 - [x] `codex-review` PR label created on GitHub (forces a review run; also re-runs on draft PRs).
 - [ ] **Deferred (2026-04-30)**: add `OPENAI_API_KEY` as a repository secret under Settings → Secrets → Actions. Until set, the workflow gracefully no-ops with a CI warning. Picking this back up is a one-time action; the workflow itself is already in place.
 - [ ] **Deferred (2026-04-30)**: promoting `Codex review` to `required_status_checks`. Gating on a third-party AI review on every PR isn't worth the merge friction yet; the comment-posting flow gives the same reviewer signal without blocking. Promote later if/when both the secret is set and signal-to-noise has been observed across ~5+ real PRs.

@@ -59,7 +59,7 @@ Three structural problems fall out:
    Two byte-preserving emit paths through the same ZIP layer is the
    primary duplicate-source-of-truth risk flagged in the B1 plan
    ("`Workbook.save` divergence from `Editor.save`",
-   `docs/plans/workbook-overlay.md:265`). B2 collapses them.
+   `docs/plans/archive/workbook-overlay.md:265`). B2 collapses them.
 2. **Per-category guard sprawl.** Every new structural-edit
    capability (insertRow, deleteCol, renameSheet) bolts a new guard
    onto the existing surface. Workbook centralises mutation in

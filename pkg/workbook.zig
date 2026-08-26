@@ -22,7 +22,7 @@
 //! `pkg/typed_parts/*.zig` contract. `Workbook.deinit` walks
 //! all of them and reclaims.
 //!
-//! See `docs/plans/workbook-overlay.md` for the full plan.
+//! See `docs/plans/archive/workbook-overlay.md` for the full plan.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16688,7 +16688,7 @@ test "SstExtensionPlan: indexOf vs indexOfRich" {
 // ─── B3 iter-wr-2: byte-equivalence gate ─────────────────────────────
 //
 // The styles axis is the most byte-fragile surface in the entire
-// OOXML emit (`docs/plans/writer-rebase.md` §1.10 catalogues every
+// OOXML emit (`docs/plans/archive/writer-rebase.md` §1.10 catalogues every
 // rigid invariant). This test pins that the StylesPlan emitted via
 // `Workbook.addStyle` / `Workbook.addDxf` / `Workbook.internNumFmt`
 // produces byte-identical `xl/styles.xml` to `xlsx.Writer.addStyle` /

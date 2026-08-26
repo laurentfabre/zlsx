@@ -643,7 +643,7 @@ pub const SstStrategy = enum { eager, lazy };
 /// offset/length index into `shared_strings_xml` and a sparse map of
 /// already-resolved entries. The cell hot path branches on the union
 /// tag exactly once per access, then falls into a per-variant fast
-/// path. See docs/plans/streaming-sst.md for the full design.
+/// path. See docs/plans/archive/streaming-sst.md for the full design.
 pub const SstBackend = union(enum) {
     /// Pre-decoded entries; valid for the Book's lifetime.
     eager: [][]const u8,
@@ -852,7 +852,7 @@ pub const Book = struct {
     /// blow-up on workbooks with millions of unique strings: at open
     /// time the SST is walked once to build a per-entry offset/length
     /// index, but plain text is not decoded until `sharedStringAt` is
-    /// called for that index. See docs/plans/streaming-sst.md for the
+    /// called for that index. See docs/plans/archive/streaming-sst.md for the
     /// full design.
     ///
     /// Rich-text runs are eagerly captured on the lazy backend too:
@@ -1349,7 +1349,7 @@ pub const Book = struct {
 
     /// Resolved shared string at `idx`. Errors with `MalformedXml`
     /// when `idx` is past the end of the SST. Eager-backend accessor;
-    /// the streaming-SST plan (docs/plans/streaming-sst.md) introduces
+    /// the streaming-SST plan (docs/plans/archive/streaming-sst.md) introduces
     /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
     /// centralises the lookup so future migration touches one site.
     pub fn sharedStringAt(self: *Book, idx: usize) ![]const u8 {
@@ -4539,7 +4539,7 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
 // ─── Editor (load-modify-save, Phase 3c) ────────────────────────────
 
 /// Read an existing xlsx, mutate, save. Phase 3c append-only v1 per
-/// docs/plans/load-modify-save.md.
+/// docs/plans/archive/load-modify-save.md.
 ///
 /// Walks the source archive at `open` time to capture per-entry byte
 /// spans (LFH + payload + central-directory record + EOCD comment).

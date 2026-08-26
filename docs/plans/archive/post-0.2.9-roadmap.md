@@ -72,7 +72,7 @@ Test surface extended:
   PR #42
 
 Plans authored:
-- `docs/plans/editor-rebase.md` — B2 plan (PR #41)
+- `docs/plans/archive/editor-rebase.md` — B2 plan (PR #41)
 
 Re-authored on stable main and in flight as draft PRs (2026-05-04),
 all locally verified via `zig test -target aarch64-macos-none …`

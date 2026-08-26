@@ -19,7 +19,7 @@
 //! Lives as a separate binary instead of a `zlsx` subcommand
 //! because Zig 0.15.2's module-graph computation rejects
 //! cli_mod + zlsx_pkg + writer in one compilation. See
-//! docs/plans/post-0.2.9-roadmap.md for the constraint write-up.
+//! docs/plans/archive/post-0.2.9-roadmap.md for the constraint write-up.
 
 const std = @import("std");
 const pkg = @import("zlsx_pkg");

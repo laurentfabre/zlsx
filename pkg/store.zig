@@ -12,7 +12,7 @@
 //!
 //! Out of scope for this milestone: `save`, `replacePart`, `addPart`,
 //! dirty flags, typed overlays for known parts. Those land in B0 M2/M3
-//! per docs/plans/post-0.2.9-roadmap.md.
+//! per docs/plans/archive/post-0.2.9-roadmap.md.
 //!
 //! Relationship to `Editor` (src/xlsx.zig): the Editor has a battle-
 //! tested ZIP scanner that supports the byte-preserving save path; we

@@ -42,14 +42,16 @@ zlsx/
 ├── include/zlsx.h                  # PUBLIC C header — must track src/c_abi.zig
 ├── bindings/python/                # py-zlsx
 │   ├── pyproject.toml              # version mirrors build.zig.zon
-│   └── zlsx/{__init__.py,_ffi.py,test_basic.py}
+│   ├── zlsx/{__init__.py,_ffi.py}
+│   └── tests/{test_basic,test_embeddings,test_spark_core}.py
 ├── tests/
 │   ├── xlsx_corpus.zig             # reader integration tests (corpus-driven)
 │   ├── package_corpus.zig          # package-layer integration tests
 │   ├── corpus/                     # fixtures — populated by scripts/fetch_test_corpus.sh
 │   ├── fuzz/                       # fuzz corpus seeds
 │   └── bench/                      # bench harness vs other xlsx libraries
-├── docs/plans/                     # roadmap + per-phase plans (authoritative work queue)
+├── docs/ROADMAP.md                 # the plan of record (authoritative work queue)
+├── docs/plans/                     # live per-phase plans (archive/ holds shipped ones)
 ├── scripts/                        # corpus fetch, bench CI, Homebrew tap publish, unicode tables
 └── packaging/                      # Homebrew formula tap
 ```
@@ -86,7 +88,7 @@ scripts/fetch_test_corpus.sh         # fetches tests/corpus/*.xlsx
 `src/c_abi.zig` exports `extern struct` types (`CCell`, `CMergeRange`, `CHyperlink`, `CComment`, `CDataValidation`, `CDateTime`, `CFont`, `CFill`, `CBorderSide`, `CCellBorder`, `CCellAlignment`, …). Once shipped:
 
 - **Reordering or resizing fields is a breaking ABI change.** Add new fields at the end, never in the middle.
-- A C ABI change is a **3-file transaction**: `src/c_abi.zig` + `include/zlsx.h` + `bindings/python/zlsx/_ffi.py`. Plus tests in `bindings/python/zlsx/test_basic.py`.
+- A C ABI change is a **3-file transaction**: `src/c_abi.zig` + `include/zlsx.h` + `bindings/python/zlsx/_ffi.py`. Plus tests in `bindings/python/tests/test_basic.py`.
 
 ### 2. include/zlsx.h is hand-maintained
 
@@ -189,7 +191,9 @@ A version bump touches multiple files, but only `build.zig.zon` is the source.
 
 ### Roadmap is the authoritative work queue
 
-`docs/plans/post-0.2.9-roadmap.md` is what next-PR tooling reads. Per-phase plans live in `docs/plans/{streaming-sst,cell-mutate,load-modify-save,structural-edits}.md`. Don't pick "the next thing" from intuition — read the roadmap.
+`docs/ROADMAP.md` is the plan of record and what next-PR tooling reads. It carries the status table, the dependency graph, and the candidate follow-ups. Live per-phase plans live in `docs/plans/`; plans for shipped work are in `docs/plans/archive/`, kept for per-PR traceability but **not** a work queue. Don't pick "the next thing" from intuition — read the roadmap.
+
+`goal_formula.md` (repo root) is normative for the D1 formula engine and is cited by section number from 33 source files. It is shipped, not a queue.
 
 ---
 
@@ -244,7 +248,7 @@ Most tests live in the same file as the code under test, as `test "<name>" { ...
 Built-in via `std.testing.fuzz(...)` inside a `test` block; run with `zig build fuzz`. Linux x64 only. Use on parsers, deserializers, anything that takes untrusted input.
 
 ### Layer 4: Python binding
-`bindings/python/zlsx/test_basic.py` exercises the C ABI through ctypes. Add a feature-probe + skip when introducing a new ABI export.
+`bindings/python/tests/test_basic.py` exercises the C ABI through ctypes. Add a feature-probe + skip when introducing a new ABI export.
 
 ### Layer 5: cross-target
 For portable code, periodic `zig build -Dtarget=aarch64-linux-musl` (compile-only) keeps host-only assumptions honest.
@@ -352,7 +356,7 @@ Installed as a `commit-msg` hook (run `scripts/install-hooks.sh` once after clon
 ## Process when making changes
 
 1. **Confirm the toolchain**: `zig version` should print `0.16.0`. If not, fix that before anything else.
-2. **Read the roadmap**: `docs/plans/post-0.2.9-roadmap.md` and any per-phase plan in `docs/plans/`.
+2. **Read the roadmap**: `docs/ROADMAP.md` and any live per-phase plan in `docs/plans/`.
 3. **Write the test first**: add a `test "<name>"` block, watch it fail with `zig build test`, then implement.
 4. **Verify the file is in the test graph**: a new file's tests don't run unless the file is `@import`-ed from something already wired in `build.zig`.
 5. **Allocator threading**: if your function allocates, take `allocator: std.mem.Allocator`. No globals.
@@ -371,7 +375,8 @@ zig build --help                          # auto-generated step list
 git log --oneline -20                     # recent commit thread
 grep -n "^pub fn zlsx_" src/c_abi.zig    # exported C ABI functions
 grep -n "^pub const C"  src/c_abi.zig    # exported extern structs
-ls docs/plans/                            # roadmap + phase plans
+cat docs/ROADMAP.md                       # the plan of record
+ls docs/plans/                            # live phase plans (archive/ = shipped)
 ```
 
 ---

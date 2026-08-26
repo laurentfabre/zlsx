@@ -5,7 +5,7 @@
 // on the Workbook overlay) MUST stay within 1.10× of the legacy
 // substring-and-substitute fast-path on this fixture.
 // Above 1.10× → keep the legacy path indefinitely (per
-// docs/plans/editor-rebase.md).
+// docs/plans/archive/editor-rebase.md).
 //
 // Fixture: 100k rows × 5 cells per row, written into a synthetic
 // base xlsx (zero pre-existing rows), then read back via `Editor.open`

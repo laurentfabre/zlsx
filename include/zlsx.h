@@ -1245,7 +1245,7 @@ int32_t zlsx_sheet_writer_add_conditional_format_data_bar(
  * integer / boolean / empty / string cells supported; the source must
  * already carry an `xl/sharedStrings.xml` part for string appends to
  * work. Refuses ZIP64 / multi-disk / encrypted / data-descriptor
- * archives up front. See docs/plans/load-modify-save.md.
+ * archives up front. See docs/plans/archive/load-modify-save.md.
  */
 
 /* Open an xlsx for editing. Returns NULL on failure with `err_buf`

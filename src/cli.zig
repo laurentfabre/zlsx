@@ -219,7 +219,7 @@ const Args = struct {
     /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
     /// Workbooks with millions of unique strings skip the eager
     /// decode arena; resolution happens on first cell access. See
-    /// docs/plans/streaming-sst.md for the trade-off (sparse access
+    /// docs/plans/archive/streaming-sst.md for the trade-off (sparse access
     /// wins; full sweeps cost slightly more than eager). Accepted on
     /// every sub-command for wrapper-friendly setting; ignored by
     /// `meta` / `list-sheets` / `styles` / `sst` (those are
