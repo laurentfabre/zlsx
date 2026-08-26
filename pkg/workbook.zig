@@ -13053,6 +13053,36 @@ test "Workbook.rewriteAllExtensionFormulas: no-op count == 0 on a workbook witho
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 
+test "Workbook.rewriteAllExtensionFormulas: a comment decoy is neither spliced nor refused" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [256]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-xmf-decoy-{d}.xlsx", .{prng.random().int(u32)});
+    try writeXmFixtureWorkbook(io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(a, io, src_path);
+    defer wb.deinit();
+    // Codex S2 r1: an unclosed `<xm:f>` inside a comment, followed by
+    // a live carrier. The substring scan of the first cut refused the
+    // whole workbook on the comment; the live carrier must shift and
+    // the comment must survive byte-for-byte.
+    try appendExtLstToSheet(&wb, 0, "<!-- legacy: <xm:f>Data!A1:A5 -->" ++
+        "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>Data!A1:A5</xm:f><xm:sqref>B1</xm:sqref></x14:sparkline>" ++
+        "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>");
+    try wb.preflightExtensionFormulas();
+    const count = try wb.rewriteAllExtensionFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Data");
+    try std.testing.expectEqual(@as(u32, 1), count);
+    const report = try dupeSheetPart(&wb, 0);
+    defer a.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<!-- legacy: <xm:f>Data!A1:A5 -->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!A2:A6</xm:f>") != null);
+}
+
 test "Workbook: a malformed xm:f on any sheet refuses every structural edit before its first mutation" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

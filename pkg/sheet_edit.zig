@@ -26,6 +26,9 @@
 const std = @import("std");
 const xlsx = @import("zlsx");
 const coords = @import("zlsx_refs");
+// Only for `skipNonElement` — the decoy-aware step the `<xm:f>` scan
+// shares with the workbook-part walkers. std-only, so no cycle.
+const workbook_xml = @import("typed_parts/workbook_xml.zig");
 
 const Allocator = std.mem.Allocator;
 const TagOpen = xlsx.TagOpen;
@@ -1550,13 +1553,28 @@ pub const XmFormula = struct { body_start: usize, body_end: usize, next: usize }
 pub fn nextXmFormula(src: []const u8, from: usize) error{MalformedExtensionXml}!?XmFormula {
     const OPEN = "<xm:f";
     const CLOSE = "</xm:f>";
+    // No carrier text anywhere ahead: done, whatever else the XML
+    // holds. Only a sheet that does spell `<xm:f` pays for the
+    // decoy-aware walk below.
+    if (std.mem.indexOfPos(u8, src, from, OPEN) == null) return null;
     var i = from;
-    while (std.mem.indexOfPos(u8, src, i, OPEN)) |at| {
+    while (std.mem.indexOfScalarPos(u8, src, i, '<')) |lt| {
+        // A comment, CDATA section, PI or DOCTYPE may spell `<xm:f>`
+        // without carrying one (Codex, S2 r1). Step over the whole
+        // construct so a decoy is neither spliced nor refused; an
+        // unterminated construct leaves the live/decoy question
+        // undecidable, and this sheet does hold `<xm:f` text, so
+        // refuse rather than guess.
+        const past = workbook_xml.skipNonElement(src, lt) catch return error.MalformedExtensionXml;
+        if (past != lt) {
+            i = past;
+            continue;
+        }
         // `<xm:f` is a prefix of nothing else in the `xm:` namespace
         // today, but `matchTagAt` insists on a delimiter after the
         // name so that stays true by construction.
-        const t = matchTagAt(src, at, "xm:f") orelse {
-            i = at + OPEN.len;
+        const t = matchTagAt(src, lt, "xm:f") orelse {
+            i = lt + 1;
             continue;
         };
         std.debug.assert(t.after_open >= 2);
@@ -2589,4 +2607,25 @@ test "xm:f: a truncated open tag at end of input is not a carrier" {
     // `matchTagAt` refuses to read past the end (fuzz finding,
     // 2026-07-27); the scan must inherit that and terminate.
     try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<xm:f", 0));
+}
+
+test "xm:f: carrier text inside a comment, CDATA or PI is neither a carrier nor a refusal" {
+    // Codex S2 r1: a raw substring walk would splice the comment's
+    // bytes or refuse on the unclosed decoy. Each construct is
+    // stepped over whole; the live carrier after it is found.
+    const src = "<!-- <xm:f>Doomed!A1 --><![CDATA[<xm:f>Doomed!A1</xm:f>]]><?pi <xm:f> ?>" ++
+        "<xm:f>Data!A1:A5</xm:f>";
+    const f = (try nextXmFormula(src, 0)).?;
+    try testing.expectEqualStrings("Data!A1:A5", src[f.body_start..f.body_end]);
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula(src, f.next));
+    // Decoys only: nothing to rewrite, nothing to refuse.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<!-- <xm:f>x --><a/>", 0));
+}
+
+test "xm:f: an unterminated comment on a sheet that spells <xm:f refuses" {
+    // Live or decoy is undecidable once the comment never closes.
+    try testing.expectError(error.MalformedExtensionXml, nextXmFormula("<!-- <xm:f>Data!A1</xm:f>", 0));
+    // …but a sheet with no `<xm:f` text at all never pays for, or
+    // refuses on, its comments.
+    try testing.expectEqual(@as(?XmFormula, null), try nextXmFormula("<!-- open forever <a/>", 0));
 }
