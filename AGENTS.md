@@ -25,7 +25,7 @@ zlsx is **stdlib-only**: zero third-party Zig runtime dependencies. `build.zig.z
 
 ```
 zlsx/
-├── build.zig                       # 5 build steps: default, test, test-corpus, fuzz, run
+├── build.zig                       # build steps — `zig build --help` lists them (default, test, test-corpus, fuzz, run, the oracle / bench / emb4 families, …)
 ├── build.zig.zon                   # version is the single source of truth (propagated everywhere)
 ├── src/
 │   ├── xlsx.zig                    # reader + the public Zig module root
@@ -64,7 +64,7 @@ zlsx/
 zig build                            # default — builds CLI, zlsx-extract-images, libzlsx (.dylib + .a)
 zig build test                       # all unit + writer + unicode + nfc + formula + cli + c_abi + pkg + corpus
 zig build test-corpus                # corpus integration only
-zig build fuzz                       # coverage-guided fuzz (Linux x64 only — see notes below)
+zig build fuzz --fuzz                # coverage-guided fuzz (macOS on 0.16.0; Linux build-runner panics — see notes below)
 zig build run -- <args>              # build + run the CLI
 zig build -Doptimize=ReleaseSafe     # production-shape build
 zig build -Dtarget=aarch64-linux-musl  # cross-compile (compile-only — execution requires QEMU)
@@ -130,16 +130,20 @@ When new ABI exports land but older `libzlsx` versions are still installed, `_ff
 
 ## Build / module quirks to know
 
-### Two fuzz binaries, Linux x64 only
+### Fuzz binaries — macOS on 0.16.0, Linux when upstream fixes the build runner
 
-`zig build fuzz` runs:
+`zig build fuzz` runs one `-ffuzz` binary per fuzzed module — the two originals plus the formula-engine and byte-walker targets added since (`build.zig`, every `*_fuzz_tests` / `walker_fuzz`):
 
 - `unit_fuzz_tests` — fuzz targets in `src/xlsx.zig` (reader / parser surface).
-- `package_fuzz_tests` — fuzz targets in `pkg/store.zig` (`decodeXmlEntities`, `looksExternal`).
+- `package_fuzz_tests` — fuzz targets in `pkg/store.zig` (`decodeXmlEntities`, `looksExternal`, relationship parsing, backing refcounts).
+- `formula_*_fuzz_tests` — one per `src/formula/{tokenizer,numfmt,parser,value,spill,resolved,criteria,metadata,calc,names,decode,eval}.zig`.
+- the byte-walker targets, one per `pkg/{sheet_edit,table_edit,drawing_edit,vml_edit}.zig`.
+
+`pkg/workbook.zig` carries `std.testing.fuzz` blocks but is wired only as an ordinary test module, so they run as smoke tests, not coverage-guided; `pkg/drawings.zig` and `pkg/typed_parts/*` have no target at all (see `docs/plans/surface-matrix.md` §6).
 
 **Coverage-guided fuzzing works**, but only because `vendor/zig-test-runner/` exists.
 
-Zig 0.16.0 ships two bugs that make `-ffuzz` builds unusable out of the box: its own `lib/compiler/test_runner.zig` fails to compile (`writeStackTrace` receives a `*builtin.StackTrace` where a `*const debug.StackTrace` is required), and even once that is fixed the runner calls the fuzzer ABI during the test-discovery pass, when `fuzzer.test_i` is still `undefined` — segfaulting on every target that supplies a seed corpus. `vendor/zig-test-runner/` is upstream's runner with those two hunks patched, wired into the two fuzz binaries only via `.test_runner` in `build.zig`. **Read `vendor/zig-test-runner/README.md` before touching it, and delete the whole directory as soon as a Zig release fuzzes without it.**
+Zig 0.16.0 ships two bugs that make `-ffuzz` builds unusable out of the box: its own `lib/compiler/test_runner.zig` fails to compile (`writeStackTrace` receives a `*builtin.StackTrace` where a `*const debug.StackTrace` is required), and even once that is fixed the runner calls the fuzzer ABI during the test-discovery pass, when `fuzzer.test_i` is still `undefined` — segfaulting on every target that supplies a seed corpus. `vendor/zig-test-runner/` is upstream's runner with those two fixes patched in, wired into every `-ffuzz` binary (and only those) via `.test_runner` in `build.zig`. **Read `vendor/zig-test-runner/README.md` before touching it, and delete the whole directory as soon as a Zig release fuzzes without it.**
 
 The correct invocation is:
 
@@ -151,7 +155,7 @@ zig build fuzz --fuzz --webui=127.0.0.1:0
 
 Verified locally: a 100 s session completes with 226/226 tests and writes fuzzer state under `.zig-cache/v/`.
 
-Linux x64 remains the only supported target; macOS (Mach-O `addEntryPoint`) and Windows (shared-memory + COFF/PE debug info) are separately broken upstream.
+Platform, 0.16.0: **macOS runs a full session cleanly** (the nightly is `macos-14`); on ubuntu-22.04 the *build runner* panics in `std/Build/Fuzz.zig addEntryPoint` while collecting coverage, which cannot be patched from here; Windows (shared-memory + COFF/PE debug info) is separately broken upstream. Linux x64 is the intended long-term home — switch back when a Zig release fixes the panic (`.github/workflows/fuzz-nightly.yml`, PLATFORM).
 
 ### Three-module collision
 
@@ -194,6 +198,8 @@ A version bump touches multiple files, but only `build.zig.zon` is the source.
 `docs/ROADMAP.md` is the plan of record and what next-PR tooling reads. It carries the status table, the dependency graph, and the candidate follow-ups. Live per-phase plans live in `docs/plans/`; plans for shipped work are in `docs/plans/archive/`, kept for per-PR traceability but **not** a work queue. Don't pick "the next thing" from intuition — read the roadmap.
 
 `goal_formula.md` (repo root) is normative for the D1 formula engine and is cited by section number from 33 source files. It is shipped, not a queue.
+
+`goal_sigmoid.md` (repo root) is the missing-features ladder (S0–S11); its rows graduate into the roadmap table as they start, and each row has a named owner gate. `docs/plans/surface-matrix.md` is the four-surface capability truth: **a PR that adds, lifts or refuses a capability on Zig, the C ABI, Python or the CLI updates the matrix in the same PR** — cells name entry points, a `—` names the row that closes it, and `n/a` needs a recorded owner ruling.
 
 ---
 
@@ -245,7 +251,7 @@ Most tests live in the same file as the code under test, as `test "<name>" { ...
 `tests/xlsx_corpus.zig` and `tests/package_corpus.zig` walk every fixture in `tests/corpus/`. Run with `zig build test-corpus`. The corpus must be populated first — see `scripts/fetch_test_corpus.sh`.
 
 ### Layer 3: fuzz
-Built-in via `std.testing.fuzz(...)` inside a `test` block; run with `zig build fuzz`. Linux x64 only. Use on parsers, deserializers, anything that takes untrusted input.
+Built-in via `std.testing.fuzz(...)` inside a `test` block; run with `zig build fuzz --fuzz` (macOS on 0.16.0 — see "Fuzz binaries" above). A `std.testing.fuzz` block is only coverage-guided when its module is wired as a `-ffuzz` binary in `build.zig`; elsewhere it runs as a smoke test. Use on parsers, deserializers, anything that takes untrusted input.
 
 ### Layer 4: Python binding
 `bindings/python/tests/test_basic.py` exercises the C ABI through ctypes. Add a feature-probe + skip when introducing a new ABI export.

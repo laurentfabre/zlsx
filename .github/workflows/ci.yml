@@ -114,6 +114,12 @@ jobs:
       - name: compare_bench exit contracts
         run: scripts/ci/check_compare_bench.sh
 
+      # The four-surface capability matrix names an entry point per cell;
+      # a renamed or never-shipped symbol fails here instead of rotting.
+      # No toolchain, no network.
+      - name: Surface matrix symbols resolve
+        run: python3 scripts/check_surface_matrix.py
+
   cross-compile:
     name: cross / ${{ matrix.target }}
     runs-on: ubuntu-22.04

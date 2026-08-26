@@ -52,7 +52,7 @@ Requires libzlsx 0.6.0+ (`zlsx_book_open_buffer` in the C ABI).
 
 ## Write
 
-The writer produces fresh workbooks (load-modify-save round-trip lands in Phase 3c). Cell styles registered via `Writer.add_style` get a 1-based index; pass those indices alongside values in `write_row(styles=[…])`.
+The writer produces fresh workbooks; editing an existing one is `zlsx.edit` / `Editor`, below. Cell styles registered via `Writer.add_style` get a 1-based index; pass those indices alongside values in `write_row(styles=[…])`.
 
 ```python
 import zlsx
@@ -124,7 +124,7 @@ The `Style` dataclass covers every openpyxl-parity style field shipped in Phase 
 
 ## Recalculate & evaluate
 
-libzlsx 0.9.0+ ships the formula engine across the C ABI. The binding
+libzlsx 0.8.0+ ships the formula engine across the C ABI. The binding
 feature-probes every symbol group, so py-zlsx keeps importing against an
 older dylib — the methods below then raise `RuntimeError`.
 
@@ -356,11 +356,12 @@ with zlsx.write("out.xlsx") as w:
 - Per-sheet layout: column widths, freeze panes, auto-filter
 - Merged cells, external + internal hyperlinks, comments
 - Rich-text runs on write (`write_rich_row`)
-- Append-only load-modify-save via `zlsx.edit(path)` — append rows
-  to existing sheets (numeric / int / float / bool / str cells)
-  with atomic save
+- Load-modify-save via `zlsx.edit(path)` — append rows to existing sheets
+  (numeric / int / float / bool / str cells), `set_cell` / `set_cells`,
+  `doc_props` read + `strip_doc_props` scrub, atomic save, `save_to_buffer` /
+  `Editor.from_bytes` for filesystem-less callers
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
-- Formula engine (0.9.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
+- Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
 - Refcounted handles — close the book while rows are still being consumed, the C ABI keeps the state alive until the last reference drops
 - PySpark Data Source (`zlsx.spark`) — batch read with per-(file×sheet) partitions and optional row-range splits, batch write to single-file or `part-*.xlsx` targets
@@ -368,9 +369,9 @@ with zlsx.write("out.xlsx") as w:
 **Out** (by design, or queued)
 
 - `.xls` / `.xlsb` / `.ods` — never
-- Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.9.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
-- Cell mutate / structural edits (insert column, delete row, etc.) on existing workbooks — append-only is shipped via `zlsx.edit(path)`; full round-trip is its own follow-up plan
-- Pictures / charts / pivots — out of scope
+- Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.8.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
+- Structural edits (insert / delete row or column, add / rename / delete sheet) on existing workbooks — shipped in Zig and the CLI with the full cross-part rewriters (table-column rename is Zig-only); they do not reach Python yet. Row S3a of `goal_sigmoid.md`; the per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
+- Pictures — image anchors (read) and image authoring are Zig-only today (S3b / S5); charts and pivots are byte-preserved through edits but not exposed, with chart authoring deferred (D2 → S9) and pivots a later ladder row (S6)
 
 ## Thread safety
 
