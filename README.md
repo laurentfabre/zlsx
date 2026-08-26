@@ -472,12 +472,12 @@ are preinstalled).
 
 **In** — everything in the [feature matrix](#feature-matrix) above, plus:
 UTF-8 throughout, XML entity decoding/escaping both directions, archive
-defenses on the package path (`Workbook.open`: 512 MiB per-part cap, 4096:1
-ratio cap checked before the decompressed output is allocated, Zip64 / split /
-encrypted refused; no aggregate budget yet, and the core reader `Book.open` —
-which `Editor.open` also runs, after its own structural scan and before its
-own capped reads — has no caps at all: row S1 of `goal_sigmoid.md`, exit code
-4 reserved), control-byte rejection on every cell-text, sheet-name, comment,
+defenses on every opener (`Book.open`, `Editor.open`, `Workbook.open` and
+their buffer variants: 512 MiB per-part cap, 4096:1 ratio cap and a 2 GiB
+whole-archive budget, all checked against the central directory before
+anything is inflated — `error.ZipBombSuspected`, CLI exit 4; Zip64 / split /
+encrypted refused on the package and editor paths; the three numbers live in
+`pkg/control.zig`), control-byte rejection on every cell-text, sheet-name, comment,
 defined-name and hyperlink channel (a stray NUL never produces an unreadable
 workbook; embedding metadata is the one channel not yet checked — S3c), Unicode-aware sheet-name dedup (NFC +
 casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the

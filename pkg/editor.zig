@@ -298,6 +298,7 @@ pub const Editor = struct {
         var entries: std.ArrayListUnmanaged(ZipEntry) = .empty;
         errdefer entries.deinit(allocator);
         try entries.ensureTotalCapacity(allocator, eocd.record_count_total);
+        var budget: xlsx.DecompressBudget = .init(xlsx.decompress_limits);
 
         var p: usize = cd_offset;
         const cd_end: usize = @as(usize, cd_offset) + cd_size;
@@ -325,6 +326,12 @@ pub const Editor = struct {
             if ((flags_word & 0x0008) != 0) return error.ZipDataDescriptorNotSupported;
             if ((flags_word & 0x0001) != 0) return error.ZipEncryptedNotSupported;
             if (cdfh_ptr.disk_number != 0) return error.ZipSplitNotSupported;
+            // S1: the decompression limits, on this scan rather than
+            // only in `readEntry` below — `Book.open` follows this
+            // walk and inflates every sheet, so the scan is the first
+            // point where a hostile declaration can be refused before
+            // anything at all is allocated for it.
+            try budget.admit(cdfh_ptr.compressed_size, cdfh_ptr.uncompressed_size);
 
             const filename_len = cdfh_ptr.filename_len;
             const extra_len = cdfh_ptr.extra_len;
@@ -1222,22 +1229,18 @@ fn findEntryByName(entries: []const ZipEntry, name: []const u8) ?usize {
     return null;
 }
 
-// ZIP-bomb defenses for `decompressZipPayload`. Mirror the caps in
-// pkg/store.zig: per-part 512 MiB hard cap + 4096:1 ratio. Both
-// checks fire BEFORE any allocation so a crafted CDFH declaring
-// multi-GB uncompressed size can't OOM the reader.
-const max_reader_part_size: usize = 512 * 1024 * 1024;
-const max_reader_deflate_ratio: usize = 4096;
-
+// ZIP-bomb defenses for `decompressZipPayload`: the per-part half of
+// `zlsx_control.decompress_limits`, the same numbers `pkg/store.zig`
+// and the core reader apply, checked BEFORE any allocation. Every
+// entry was already admitted (aggregate included) by the scan in
+// `fromOwnedSource`; this is the last line for the one part in hand.
 fn decompressZipPayload(
     allocator: Allocator,
     payload: []const u8,
     method: u16,
     declared_uncompressed: u32,
 ) ![]u8 {
-    if (declared_uncompressed > max_reader_part_size) return error.BadZip;
-    const ratio_cap = std.math.mul(usize, payload.len, max_reader_deflate_ratio) catch std.math.maxInt(usize);
-    if (declared_uncompressed > ratio_cap) return error.BadZip;
+    try xlsx.decompress_limits.checkPart(payload.len, declared_uncompressed);
 
     if (method == 0) {
         if (payload.len != declared_uncompressed) return error.BadZip;
@@ -4111,6 +4114,105 @@ fn buildIterEr1Fixture(io: std.Io, tt: *TestTmp, alloc: std.mem.Allocator) ![:0]
     try s2.writeRow(&.{ .{ .string = "x" }, .{ .number = 2.5 } });
     try w.save(io, path);
     return path;
+}
+
+test "S1: Editor.openBuffer refuses the three hostile shapes on its own scan, before the core reader runs" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const hostile = xlsx.zip_probe.hostile;
+
+    const oversized = try hostile.oversizedPart(a);
+    defer a.free(oversized);
+    try std.testing.expectError(error.ZipBombSuspected, Editor.openBuffer(a, io, oversized));
+
+    const ratio = try hostile.absurdRatio(a);
+    defer a.free(ratio);
+    try std.testing.expectError(error.ZipBombSuspected, Editor.openBuffer(a, io, ratio));
+
+    const over = try hostile.fullSizedParts(a, hostile.partsOverBudget());
+    defer a.free(over);
+    try std.testing.expectError(error.ZipBombSuspected, Editor.openBuffer(a, io, over));
+
+    // Control: exactly on the aggregate — the scan admits it and the
+    // open proceeds into `Book.openBuffer`, which fails on the missing
+    // workbook part. That the error is the *reader's* proves the scan
+    // let it through; that it is not `ZipBombSuspected` proves the
+    // reader's own admission agrees with the editor's.
+    const within = try hostile.fullSizedParts(a, hostile.partsWithinBudget());
+    defer a.free(within);
+    try std.testing.expectError(error.MissingWorkbook, Editor.openBuffer(a, io, within));
+}
+
+test "S1: the editor's scan refuses before the core reader is even constructed" {
+    // Both layers admit every entry, so a hostile archive is refused by
+    // whichever runs first and the error alone cannot say which. The
+    // ordering is made observable with an allocator that serves the
+    // scan's two allocations (the source dupe, the entry table) and
+    // fails the third — which is the core reader's first. A refusal
+    // from the scan is `ZipBombSuspected`; a refusal that had waited
+    // for `Book.openBuffer` would surface as `OutOfMemory`.
+    //
+    // The archive is a real one-sheet workbook re-emitted entry by
+    // entry through the probe builder with one lie: sheet1 declares
+    // one byte past the per-part cap behind a zero-filled payload long
+    // enough for the ratio. If anything inflated it, the error would
+    // be `BadZip`.
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var w = xlsx.Writer.init(a);
+    defer w.deinit();
+    var s1 = try w.addSheet("Alpha");
+    try s1.writeRow(&.{ .{ .string = "h" }, .{ .integer = 1 } });
+    const real = try w.saveToOwnedBuffer(a, io);
+    defer a.free(real);
+
+    var entries: std.ArrayListUnmanaged(xlsx.zip_probe.Entry) = .empty;
+    defer entries.deinit(a);
+    var owned: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (owned.items) |o| a.free(o);
+        owned.deinit(a);
+    }
+    const limits = xlsx.decompress_limits;
+    {
+        var src = try Editor.openBuffer(a, io, real);
+        defer src.deinit();
+        for (src.entries) |e| {
+            const name = try a.dupe(u8, e.name);
+            try owned.append(a, name);
+            const is_sheet = std.mem.eql(u8, e.name, "xl/worksheets/sheet1.xml");
+            const payload = if (is_sheet) blk: {
+                const pl = try a.alloc(u8, @intCast(limits.max_part_size / limits.max_deflate_ratio + 1));
+                @memset(pl, 0);
+                break :blk pl;
+            } else try a.dupe(u8, src.src_buf[e.lfh_offset + e.lfh_total_len ..][0..e.payload_len]);
+            try owned.append(a, payload);
+            try entries.append(a, .{
+                .name = name,
+                .payload = payload,
+                .method = e.compression_method,
+                .declared_uncompressed = if (is_sheet) @intCast(limits.max_part_size + 1) else e.uncompressed_size,
+            });
+        }
+    }
+    const hostile_bytes = try xlsx.zip_probe.build(a, entries.items);
+    defer a.free(hostile_bytes);
+
+    var starved = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
+    try std.testing.expectError(error.ZipBombSuspected, Editor.openBuffer(starved.allocator(), io, hostile_bytes));
+    // The scan's own two allocations were served — the third was never
+    // asked for, because the refusal came first.
+    try std.testing.expectEqual(@as(usize, 2), starved.alloc_index);
+
+    // The same allocator budget against the untouched workbook proves
+    // the third allocation *is* the reader's: it fails there.
+    var starved2 = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, Editor.openBuffer(starved2.allocator(), io, real));
 }
 
 test "iter-er-1: Editor.open populates a Workbook view (sheet count + names match)" {

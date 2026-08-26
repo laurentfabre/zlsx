@@ -169,11 +169,11 @@ Explicit behavior for the rough edges of real workbooks and real pipelines:
 
 ### ZIP decompression limits
 
-All three thresholds below are **fatal and consistent**: on breach, zlsx emits one `kind:"error"` record on stderr, flushes in-flight stdout, closes the archive, and exits with code 4 (`ZipBombSuspected`). No partial output is "salvaged" from a suspected bomb — that would defeat the guarantee.
+All three thresholds below are **fatal and consistent**: they are checked against the *declared* sizes in the central directory when the archive is opened — every entry, whether or not it is ever read — so a breach is refused before anything is inflated: one `zlsx: cannot open …: ZipBombSuspected` line on stderr, no stdout output at all, exit code 4. There is no partial output to salvage from a suspected bomb, by construction. The same three numbers gate the editor (`append-rows`, `set-cell`, the structural edits, `embed` — exit 4) and every library surface (`error.ZipBombSuspected` / `ZLSX_ERROR` + `ZipBombSuspected` / `ZlsxError`). They live in one place, `pkg/control.zig::decompress_limits`, and are the S1 owner gate's to confirm or move (`goal_sigmoid.md` §5):
 
-- **Hard cap on any decompressed part**: `2^32` bytes (4 GB).
-- **Per-entry compression ratio**: capped at 10,000:1 (matches zlib's recommendation for bomb detection).
-- **Total decompressed size across the archive**: `2^34` bytes (16 GB).
+- **Hard cap on any decompressed part**: 512 MiB (~2× the largest legitimate part in the corpus, a 274 MiB shared-string table).
+- **Per-entry compression ratio**: 4096:1 (~100× the corpus' highest real ratio, 40:1).
+- **Total declared decompressed size across the archive**: 2 GiB (~5× the largest legitimate whole-archive total in the corpus, 379 MiB).
 
 ### Backpressure & signal handling
 

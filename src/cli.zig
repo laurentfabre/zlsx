@@ -1753,8 +1753,23 @@ const signals = struct {
 fn classifyTopLevelError(e: anyerror) u8 {
     return switch (e) {
         error.WriteFailed, error.Unexpected, error.BrokenPipe => 5,
+        // S1: unreachable in practice — every entry is admitted on the
+        // open-time directory walk, so a lazy sheet extraction cannot
+        // trip a limit mid-stream — but the mapping exists so the
+        // contract holds if a future path decompresses without the walk.
+        error.ZipBombSuspected => 4,
         else => 1,
     };
+}
+
+/// S1: the one open-time failure that is not exit 2. A decompression
+/// limit (`ZipBombSuspected`) means the archive is hostile, not
+/// unreadable, and `docs/cli.md` reserved exit 4 for it on every family
+/// that opens through the core reader or the editor. Every "cannot
+/// open" site routes through here so the read and edit families cannot
+/// drift apart.
+fn openFailureExit(e: anyerror) u8 {
+    return if (e == error.ZipBombSuspected) 4 else 2;
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -1923,12 +1938,12 @@ fn runMain(init: std.process.Init) !u8 {
     var book = if (args.sst_lazy)
         xlsx.Book.openSstLazy(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
-            return 2;
+            return openFailureExit(e);
         }
     else
         xlsx.Book.open(alloc, proc_io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
-            return 2;
+            return openFailureExit(e);
         };
     defer book.deinit();
 
@@ -3119,7 +3134,7 @@ fn runScrubMetadataCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -3170,7 +3185,7 @@ fn runEmbedExtract(
     var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer wb.deinit();
 
@@ -3247,7 +3262,7 @@ fn runEmbedApply(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -3475,7 +3490,7 @@ fn runEmbedCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4248,7 +4263,7 @@ fn runAppendRowsCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4403,7 +4418,7 @@ fn runSetCellCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4470,7 +4485,7 @@ fn runRowEditCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4525,7 +4540,7 @@ fn runColEditCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4570,7 +4585,7 @@ fn runAddSheetCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4608,7 +4623,7 @@ fn runRenameSheetCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 
@@ -4641,7 +4656,7 @@ fn runDeleteSheetCommand(
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
-        return 2;
+        return openFailureExit(e);
     };
     defer ed.deinit();
 

@@ -33,6 +33,12 @@ pub const Part = store_mod.Part;
 pub const Relationship = store_mod.Relationship;
 pub const TargetMode = store_mod.TargetMode;
 pub const Error = store_mod.Error;
+/// S1: the decompression limits every opener in this tree enforces
+/// (`PartStore.open`, `Editor.open`, and the core reader behind both).
+/// One home in `zlsx_control`; re-exported here and from `zlsx` so a
+/// caller of either module can read the numbers without a third import.
+pub const DecompressLimits = @import("zlsx_control").DecompressLimits;
+pub const decompress_limits = @import("zlsx_control").decompress_limits;
 
 pub const ImageAnchor = drawings_mod.ImageAnchor;
 pub const CellAnchor = drawings_mod.CellAnchor;
