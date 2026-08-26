@@ -247,12 +247,14 @@ serialise in memory and land by rename, so no reader sees a partial workbook.
 
 ## Candidate follow-ups (value/effort order)
 
-1. **Route `<xm:f>` through the formula rewriter** — removes #140's
-   `ExtensionEditUnsafe` guard, which today refuses row/col edits on any sheet
-   carrying a sparkline formula. Needs a sheet-name context `sheet_edit.zig`
-   does not have. The highest-value remaining lift. The D1 ladder shipped the
-   parser and name-resolution layer this needs (2026-08-07), so the
-   route-through is now pullable. **Queued as row S2 of `goal_sigmoid.md`.**
+1. ~~**Route `<xm:f>` through the formula rewriter**~~ — **shipped 2026-08-26
+   as row S2 of `goal_sigmoid.md`.** `Workbook.rewriteAllExtensionFormulas`
+   walks every sheet's `<xm:f>` carriers (sparkline data ranges and date
+   axes, `x14:` CF / DV formulas) with the host-sheet / target-sheet context
+   `sheet_edit.zig` lacked, under every row / col / sheet edit;
+   `preflightExtensionFormulas` refuses the whole edit before its first
+   mutation when a carrier cannot be read. #140's `ExtensionEditUnsafe` is
+   gone.
 2. **Cross-part pivot rewriter** — removes #139's refusal. Bigger lift:
    `<location ref>` + cache field ranges across `xl/pivotTables/*` and
    `xl/pivotCache/*`, a ref graph zlsx has never walked. **Queued as rows
@@ -261,12 +263,11 @@ serialise in memory and land by rename, so no reader sees a partial workbook.
 
 Refusal state: **every row/col-edit refusal axis with a rewriter is lifted** on
 `main` (panes, autoFilter, picture, xdr, VML+comments, structured tables, extLst
-`xm:sqref` #140). Two axes stay refused, with actual guards: **pivots** (#139)
-and **`<xm:f>`** sparkline formulas (#140). The pivot guard walks the edited
-sheet's relationships, so it catches sheets that *host* a pivot; a sheet a
-pivot only *reads from* (`worksheetSource` in the cache definition) is not
-detected today — auditing that is S6's first job. Full axis table:
-`docs/plans/refusal-audit.md`.
+`xm:sqref` #140 and `<xm:f>` S2). One axis stays refused, with an actual guard:
+**pivots** (#139). The pivot guard walks the edited sheet's relationships, so
+it catches sheets that *host* a pivot; a sheet a pivot only *reads from*
+(`worksheetSource` in the cache definition) is not detected today — auditing
+that is S6's first job. Full axis table: `docs/plans/refusal-audit.md`.
 
 ---
 

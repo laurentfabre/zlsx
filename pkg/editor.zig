@@ -852,11 +852,12 @@ pub const Editor = struct {
     ///   - Worksheet XML rewrites: <row r="N"> renumber, <c r="A1">
     ///     row component, <mergeCells> rect bounds, <dimension>.
     ///   - Formulas, defined names, hyperlink locations, DV/CF
-    ///     formulas, drawings (xdr + VML), panes, autoFilter and
-    ///     table parts are rewritten in step (iter-er-5, dr-1/dr-2).
-    ///     Still refused: sheets with pivot tables, `<xm:f>`
-    ///     extension formulas, and unsafe table edits (collapse /
-    ///     header-row delete).
+    ///     formulas, `<extLst>` `<xm:f>` formulas (sparklines, x14
+    ///     CF / DV), drawings (xdr + VML), panes, autoFilter and
+    ///     table parts are rewritten in step (iter-er-5, dr-1/dr-2,
+    ///     S2). Still refused: sheets with pivot tables, unsafe
+    ///     table edits (collapse / header-row delete), and an
+    ///     `<xm:f>` carrier the scan cannot read.
     ///   - The sheet must not have other pending mutations
     ///     (setCell / appendRows / row inserts/deletes); save
     ///     first to apply those.
@@ -998,11 +999,12 @@ pub const Editor = struct {
             else => |e| return e,
         };
 
-        // `<xm:sqref>` is shifted by sheet_edit; `<xm:f>` is not
-        // routed through the formula rewriter yet, so refuse
-        // rather than half-maintain the sheet.
-        self.workbook.preflightExtensionEditsForSheet(path) catch |err| switch (err) {
-            error.ExtensionEditUnsafe => return error.ColEditUnsafeForSheet,
+        // `<extLst>` `<xm:f>` formulas (sparklines, x14 CF / DV) are
+        // rewritten by `Workbook.rewriteAllExtensionFormulas` (S2);
+        // the only refusal left on that axis is a carrier the scan
+        // cannot read, folded into the same user-facing error.
+        self.workbook.preflightExtensionFormulas() catch |err| switch (err) {
+            error.MalformedExtensionXml => return error.ColEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -1065,11 +1067,9 @@ pub const Editor = struct {
             else => |e| return e,
         };
 
-        // `<xm:sqref>` is shifted by sheet_edit; `<xm:f>` is not
-        // routed through the formula rewriter yet, so refuse
-        // rather than half-maintain the sheet.
-        self.workbook.preflightExtensionEditsForSheet(path) catch |err| switch (err) {
-            error.ExtensionEditUnsafe => return error.RowEditUnsafeForSheet,
+        // Same `<xm:f>` gate as `recordColEdit` — see the note there.
+        self.workbook.preflightExtensionFormulas() catch |err| switch (err) {
+            error.MalformedExtensionXml => return error.RowEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -5376,7 +5376,7 @@ test "Editor: the pivot guard does not refuse sheets without one" {
     try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
 }
 
-// ─── extLst: xm:sqref shifts, xm:f refuses ──────────────────────────
+// ─── extLst: xm:sqref shifts (#140), xm:f rewrites (S2) ─────────────
 
 /// Sheet fixture carrying an `<extLst>` extension.
 fn writeExtLstFixture(io: std.Io, path: []const u8, ext_body: []const u8) !void {
@@ -5401,25 +5401,242 @@ fn writeExtLstFixture(io: std.Io, path: []const u8, ext_body: []const u8) !void 
     try store.save(io, path);
 }
 
-test "Editor: insertRow refuses on an extLst carrying xm:f" {
+/// Two-sheet fixture — `Report` (index 0, sheet1.xml) and `Data`
+/// (index 1, sheet2.xml), two numeric rows each — with an `<extLst>`
+/// body appended to either sheet (empty = leave that sheet alone).
+/// The cross-sheet shape is the point: a sparkline on `Report`
+/// reading `Data!…` is what the S2 lift exists for.
+fn writeTwoSheetExtLstFixture(io: std.Io, path: []const u8, report_ext: []const u8, data_ext: []const u8) !void {
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var report = try w.addSheet("Report");
+        try report.writeRow(&.{.{ .integer = 1 }});
+        try report.writeRow(&.{.{ .integer = 2 }});
+        var data = try w.addSheet("Data");
+        try data.writeRow(&.{.{ .integer = 10 }});
+        try data.writeRow(&.{.{ .integer = 20 }});
+        try w.save(io, path);
+    }
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
+    defer store.deinit();
+    const parts = [_]struct { name: []const u8, ext: []const u8 }{
+        .{ .name = "xl/worksheets/sheet1.xml", .ext = report_ext },
+        .{ .name = "xl/worksheets/sheet2.xml", .ext = data_ext },
+    };
+    for (parts) |p| {
+        if (p.ext.len == 0) continue;
+        const sheet = (try store.part(p.name)).?;
+        const close = "</worksheet>";
+        const at = std.mem.lastIndexOf(u8, sheet.bytes, close).?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{
+            sheet.bytes[0..at], p.ext, close,
+        });
+        defer std.testing.allocator.free(patched);
+        try store.replacePart(p.name, patched);
+    }
+    try store.save(io, path);
+}
+
+/// Sparkline group whose one sparkline reads `f` and sits at `sqref`.
+fn sparklineExt(comptime f: []const u8, comptime sqref: []const u8) []const u8 {
+    return "<extLst><ext uri=\"{05C60535-1F16-4fd2-B633-F4F36F0B64E0}\">" ++
+        "<x14:sparklineGroups><x14:sparklineGroup displayEmptyCellsAs=\"gap\"><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>" ++ f ++ "</xm:f><xm:sqref>" ++ sqref ++ "</xm:sqref>" ++
+        "</x14:sparkline></x14:sparklines></x14:sparklineGroup>" ++
+        "</x14:sparklineGroups></ext></extLst>";
+}
+
+/// The saved sheet part, owned by the caller.
+fn readSavedPart(io: std.Io, path: []const u8, part_name: []const u8) ![]u8 {
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, path);
+    defer store.deinit();
+    const part = (try store.part(part_name)).?;
+    return std.testing.allocator.dupe(u8, part.bytes);
+}
+
+test "Editor: row/col edits rewrite a sparkline's cross-sheet xm:f with sheet-name context (S2)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src = try tt.path(std.testing.allocator, io, "xmf.xlsx");
+    const src = try tt.path(std.testing.allocator, io, "xmf_src.xlsx");
     defer std.testing.allocator.free(src);
-    try writeExtLstFixture(io, src, "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
-        "<x14:sparkline><xm:f>Sheet1!A1:A5</xm:f><xm:sqref>B1</xm:sqref>" ++
-        "</x14:sparkline></x14:sparklines></x14:sparklineGroup>" ++
-        "</x14:sparklineGroups></ext></extLst>");
+    const dst = try tt.path(std.testing.allocator, io, "xmf_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    // Pre-S2 this fixture refused with `RowEditUnsafeForSheet` /
+    // `ColEditUnsafeForSheet` (#140's `ExtensionEditUnsafe`).
+    try writeTwoSheetExtLstFixture(io, src, sparklineExt("Data!A2:A5", "B1"), "");
 
     var ed = try Editor.open(std.testing.allocator, io, src);
     defer ed.deinit();
-    // Shifting the xm:sqref while leaving xm:f stale would leave the
-    // workbook looking maintained but pointing at the old grid.
+    // The sheet-name context is the whole point: an edit on `Data`
+    // moves the formula and not the sqref; an edit on `Report` moves
+    // the sqref and not the formula. `pkg/sheet_edit.zig` alone
+    // could not tell the two apart.
+    try ed.insertRow(1, 3); // Data: A2:A5 → A2:A6
+    try ed.insertRow(0, 1); // Report: sqref B1 → B2, formula untouched
+    try ed.insertColumn(1, 1); // Data: A2:A6 → B2:B6
+    // An interior row: the span shrinks. (Deleting an endpoint row
+    // is the rewriter's own A1 policy — `B2:B6` minus row 2 spells
+    // `#REF!:B5`, endpoints moving independently, exactly as a cell
+    // formula or DV/CF body would; S2 carries that convention, it
+    // does not choose one.)
+    try ed.deleteRow(1, 4); // Data: B2:B6 → B2:B5
+    try ed.save(io, dst);
+
+    const report = try readSavedPart(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!B2:B5</xm:f><xm:sqref>B2</xm:sqref>") != null);
+    // Attributes around the carrier survive the splice verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, report, "displayEmptyCellsAs=\"gap\"") != null);
+}
+
+test "Editor: every x14 xm:f shape rewrites — date axis, cfRule, cfvo, formula1 — entities intact (S2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmf_shapes_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "xmf_shapes_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    // Every `<xm:f>` carrier Excel writes into a worksheet: a
+    // sparkline group's date axis (a direct child of the group), the
+    // sparkline's own range, an `x14:cfRule` expression and its
+    // `x14:cfvo` thresholds, an `x14:dataValidation` `formula1`.
+    // The CF expression carries a bare ref (host = Report) beside a
+    // qualified one, and an entity the splice must re-escape.
+    try writeTwoSheetExtLstFixture(io, src, "<extLst><ext uri=\"{78C0D931-6437-407d-A8EE-F0AAD7539E65}\">" ++
+        "<x14:conditionalFormattings><x14:conditionalFormatting>" ++
+        "<x14:cfRule type=\"expression\" priority=\"1\"><xm:f>A1&gt;Data!$B$2</xm:f><x14:dxf/></x14:cfRule>" ++
+        "<x14:cfRule type=\"iconSet\" priority=\"2\"><x14:iconSet><x14:cfvo type=\"num\"><xm:f>0</xm:f></x14:cfvo>" ++
+        "<x14:cfvo type=\"formula\"><xm:f>Data!$C$3*2</xm:f></x14:cfvo></x14:iconSet></x14:cfRule>" ++
+        "<xm:sqref>A1:A2</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext>" ++
+        "<ext uri=\"{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}\"><x14:dataValidations count=\"1\">" ++
+        "<x14:dataValidation type=\"list\" allowBlank=\"1\"><x14:formula1><xm:f>Data!$A$2:$A$5</xm:f></x14:formula1>" ++
+        "<xm:sqref>C1</xm:sqref></x14:dataValidation></x14:dataValidations></ext>" ++
+        "<ext uri=\"{05C60535-1F16-4fd2-B633-F4F36F0B64E0}\"><x14:sparklineGroups>" ++
+        "<x14:sparklineGroup dateAxis=\"1\"><xm:f>Data!A1:E1</xm:f><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>Data!A2:E2</xm:f><xm:sqref>F2</xm:sqref></x14:sparkline>" ++
+        "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>", "");
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try ed.insertRow(1, 1); // Data: every Data-qualified row ref +1
+    try ed.save(io, dst);
+
+    const report = try readSavedPart(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(report);
+    // Bare `A1` is Report's and stays; `Data!$B$2` shifts; `&gt;`
+    // round-trips as an entity, not a raw `>`.
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>A1&gt;Data!$B$3</xm:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>0</xm:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!$C$4*2</xm:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!$A$3:$A$6</xm:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!A2:E2</xm:f><x14:sparklines>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!A3:E3</xm:f><xm:sqref>F2</xm:sqref>") != null);
+    // Report's own sqrefs did not move — the edit was on Data.
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:sqref>A1:A2</xm:sqref>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:sqref>C1</xm:sqref>") != null);
+}
+
+test "Editor: deleting a sparkline's whole source range collapses its xm:f to #REF! (S2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmf_ref_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "xmf_ref_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try writeTwoSheetExtLstFixture(io, src, sparklineExt("Data!A2:C2", "B1"), "");
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    // Same convention as a cell formula whose range is deleted: the
+    // reference collapses to `#REF!` and the element stays, so Excel
+    // shows an empty sparkline rather than a stale one.
+    try ed.deleteRow(1, 2);
+    try ed.save(io, dst);
+
+    const report = try readSavedPart(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>Data!#REF!</xm:f><xm:sqref>B1</xm:sqref>") != null);
+}
+
+test "Editor: renameSheet and deleteSheet rewrite a sparkline's xm:f qualifier (S2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmf_sheet_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const renamed = try tt.path(std.testing.allocator, io, "xmf_sheet_renamed.xlsx");
+    defer std.testing.allocator.free(renamed);
+    const deleted = try tt.path(std.testing.allocator, io, "xmf_sheet_deleted.xlsx");
+    defer std.testing.allocator.free(deleted);
+    try writeTwoSheetExtLstFixture(io, src, sparklineExt("Data!A2:A5", "B1"), "");
+
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.renameSheet(1, "Raw Data");
+        try ed.save(io, renamed);
+        const report = try readSavedPart(io, renamed, "xl/worksheets/sheet1.xml");
+        defer std.testing.allocator.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>'Raw Data'!A2:A5</xm:f>") != null);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, renamed);
+        defer ed.deinit();
+        try ed.deleteSheet(1);
+        try ed.save(io, deleted);
+        const report = try readSavedPart(io, deleted, "xl/worksheets/sheet1.xml");
+        defer std.testing.allocator.free(report);
+        try std.testing.expect(std.mem.indexOf(u8, report, "<xm:f>#REF!</xm:f>") != null);
+    }
+}
+
+test "Editor: a malformed xm:f refuses the whole edit before any part is touched (S2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "xmf_bad_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "xmf_bad_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    // The unreadable carrier sits on Data; the edit targets Report.
+    // All-or-nothing means Report's bytes — sqref included — must not
+    // move either: the refusal is a property of the workbook, raised
+    // before the first mutation, not of the edited sheet.
+    try writeTwoSheetExtLstFixture(
+        io,
+        src,
+        sparklineExt("Data!A2:A5", "B1"),
+        "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+            "<x14:sparkline><xm:f>Report!A1:A2</x14:sparkline>" ++
+            "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>",
+    );
+    const before = try readSavedPart(io, src, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(before);
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
     try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 1));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 1));
+    try ed.save(io, dst);
+
+    const after = try readSavedPart(io, dst, "xl/worksheets/sheet1.xml");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "Editor: an extLst with only xm:sqref still edits, and shifts" {

@@ -345,15 +345,17 @@ pub const Error = error{
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`. Surfaces
     /// from `Workbook.preflightPivotEditsForSheet`.
     PivotEditUnsafe,
-    /// A row/col edit targets a sheet whose `<extLst>` carries an
-    /// `<xm:f>` formula reference (sparkline groups). `<xm:sqref>` is
-    /// shifted by `pkg/sheet_edit.zig`, but `<xm:f>` holds a formula
-    /// zlsx does not route through the formula rewriter yet, so the
-    /// edit refuses rather than leaving it stale. The Editor
-    /// pre-flight remaps this to `RowEditUnsafeForSheet` /
-    /// `ColEditUnsafeForSheet`. Surfaces from
-    /// `Workbook.preflightExtensionEditsForSheet`.
-    ExtensionEditUnsafe,
+    /// A structural edit found an `<extLst>` `<xm:f>` formula carrier
+    /// it cannot rewrite wholly — no `</xm:f>`, or markup inside the
+    /// body — on some sheet of the workbook. `<xm:f>` (sparkline data
+    /// ranges and date axes, `x14:` conditional-format and validation
+    /// formulas) is routed through the formula rewriter under every
+    /// row / col / sheet edit (S2 lift, `rewriteAllExtensionFormulas`);
+    /// the contract is all-or-nothing, so `preflightExtensionFormulas`
+    /// refuses the whole edit BEFORE its first mutation rather than
+    /// leave one carrier stale. The Editor remaps this to
+    /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
+    MalformedExtensionXml,
     /// `Workbook.deleteRow` would remove a structured table's header
     /// row (top of `<table ref>` when `headerRowCount >= 1`, the
     /// default). Like `TableCollapseUnsafe`, the Editor pre-flight
@@ -3780,6 +3782,115 @@ pub const Workbook = struct {
         return count;
     }
 
+    /// All-or-nothing gate for the `<xm:f>` sweep: walk every sheet's
+    /// `<xm:f>` carriers with `sheet_edit.nextXmFormula` and refuse
+    /// (`MalformedExtensionXml`) on the first one that cannot be
+    /// rewritten wholly. Pure — reads part bytes, mutates nothing.
+    ///
+    /// Every structural edit calls this BEFORE its first mutation.
+    /// The sweeps below persist part-by-part, so a refusal raised
+    /// from inside `rewriteAllExtensionFormulas` would land after the
+    /// cell-formula, defined-name, hyperlink and DV/CF sweeps had
+    /// already replaced parts — exactly the half-maintained workbook
+    /// #140's guard existed to prevent. Running the same scan up front
+    /// means the sweep itself can only fail on `OutOfMemory`.
+    pub fn preflightExtensionFormulas(self: *Workbook) Error!void {
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const part_name = try ws.resolvePartName();
+            const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+            var pos: usize = 0;
+            while (try sheet_edit.nextXmFormula(part.bytes, pos)) |f| pos = f.next;
+        }
+    }
+
+    /// Apply a structural-edit rewrite to every `<extLst>` `<xm:f>`
+    /// formula across every sheet, persisting in place via
+    /// `store.replacePart`. Returns the count of bodies whose rewrite
+    /// produced different bytes.
+    ///
+    /// This is the S2 lift. `<xm:f>` is the formula leaf of the
+    /// `x14:` extensions: a sparkline's data range (`Data!A1:A5`
+    /// under `x14:sparkline`) and its group's date axis, an
+    /// `x14:cfRule` expression or `x14:cfvo` threshold, an
+    /// `x14:formula1` / `x14:formula2` validation body. `<xm:sqref>`
+    /// beside it is a plain range and is shifted by the byte
+    /// transform in `pkg/sheet_edit.zig`; `<xm:f>` is a formula, so
+    /// it needs the rewriter and the sheet-name context that layer
+    /// lacks — a sparkline on `Report` pointing at `Data!A1:A5` must
+    /// shift when `Data` gains a row and stay put when `Report` does.
+    /// Until this sweep existed, any `<xm:f>` refused the edit
+    /// (`ExtensionEditUnsafe`, #140).
+    ///
+    /// Same contract as `rewriteAllValidationsAndConditionalFormats`:
+    /// `on_sheet` is the host sheet, `target_sheet` scopes the edit,
+    /// bodies decode on the way in and re-escape on the way out
+    /// (`spliceFormulas`), no host (relative R1C1 is left alone), and
+    /// a no-op rewrite leaves the source bytes — entity spellings
+    /// included — untouched. No typed view exists for `<extLst>`, so
+    /// the carrier walk is the byte scan itself; a carrier the scan
+    /// cannot read is refused by `preflightExtensionFormulas` before
+    /// any sweep runs, so an error here is `OutOfMemory` or a
+    /// `replacePart`-ordering bug.
+    pub fn rewriteAllExtensionFormulas(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!u32 {
+        var count: u32 = 0;
+        const a = self.allocator;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer self.freeSheetOrder(sheet_order);
+
+        var sheet_idx: u32 = 0;
+        while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
+            const ws = try self.sheet(sheet_idx);
+            const part_name = try ws.resolvePartName();
+            const source = blk: {
+                const p = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+                break :blk p.bytes;
+            };
+            // Cheap exit for the common sheet: no extension formula,
+            // nothing to decode.
+            if (std.mem.indexOf(u8, source, "<xm:f") == null) continue;
+            const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
+            defer a.free(ws_name);
+
+            var patches: std.ArrayList(SourcePatch) = .empty;
+            defer {
+                for (patches.items) |p| a.free(@constCast(p.new));
+                patches.deinit(a);
+            }
+
+            var pos: usize = 0;
+            while (try sheet_edit.nextXmFormula(source, pos)) |f| : (pos = f.next) {
+                const body = source[f.body_start..f.body_end];
+                if (try maybeRewrite(a, body, ws_name, target_sheet, sheet_order, edit)) |new| {
+                    errdefer a.free(new);
+                    try patches.append(a, .{ .start = f.body_start, .end = f.body_end, .new = new });
+                }
+            }
+            if (patches.items.len == 0) continue;
+
+            const new_xml = try spliceFormulas(a, source, patches.items);
+            defer a.free(new_xml);
+            try self.store.replacePart(part_name, new_xml);
+            count += @intCast(patches.items.len);
+
+            // The cached parsed view (if any) borrowed from the old
+            // part bytes `replacePart` just swapped. Same invalidation
+            // as `applySheetEditTransform`.
+            if (ws.parsed) |*v| {
+                var view = v.*;
+                view.deinit(a);
+                ws.parsed = null;
+            }
+        }
+
+        return count;
+    }
+
     /// Apply a structural-edit rewrite to every formula in every
     /// sheet. Walks each worksheet, materializes its SheetXml, runs
     /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
@@ -4628,11 +4739,15 @@ pub const Workbook = struct {
         // until the next manual save in Excel. Each rewriter is
         // tolerant of "no carriers in the workbook" — they short-
         // circuit on empty workbooks rather than erroring, so
-        // calling all four unconditionally is cheap.
+        // calling all five unconditionally is cheap. The `<xm:f>`
+        // gate runs first: it is the one sweep with a refusal, and
+        // the refusal must land before the first `replacePart`.
+        try self.preflightExtensionFormulas();
         _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
+        _ = try self.rewriteAllExtensionFormulas(edit, null);
 
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
@@ -4746,10 +4861,12 @@ pub const Workbook = struct {
             .br_col = renamed.br_col,
             .table = renamed.display_name,
         };
+        try self.preflightExtensionFormulas();
         const count = try self.rewriteAllFormulas(edit, null, scope);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
+        _ = try self.rewriteAllExtensionFormulas(edit, null);
 
         // Step 4: commit the part and sync the header cell.
         if (!std.mem.eql(u8, table_part.bytes, renamed.bytes)) {
@@ -5406,10 +5523,12 @@ pub const Workbook = struct {
         const doomed_name_owned = try store_mod.decodeXmlEntities(self.allocator, doomed_name_src);
         defer self.allocator.free(doomed_name_owned);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
+        try self.preflightExtensionFormulas();
         _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
+        _ = try self.rewriteAllExtensionFormulas(edit, null);
 
         try patchWorkbookXmlRemoveSheet(self, sheet_idx);
         try patchWorkbookRelsRemoveRelationship(self, r_id_owned);
@@ -5566,7 +5685,11 @@ pub const Workbook = struct {
         // sweep only rewrites `<f>` inner text, so a transform that
         // passes preflight cannot newly refuse on the swept bytes;
         // an error there anyway falls under the documented
-        // post-validation contract (discard, reopen).
+        // post-validation contract (discard, reopen). The `<xm:f>`
+        // gate is the same shape one level up: every sheet's
+        // extension formulas must be readable before any sweep
+        // replaces a part (all-or-nothing, S2).
+        try self.preflightExtensionFormulas();
         {
             const pre = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
             const probe = if (spec.row) |r|
@@ -5641,14 +5764,18 @@ pub const Workbook = struct {
         }
 
         // B2 iter-er-5 lift (row/col axes), remaining carriers:
-        // defined names, internal hyperlink locations, and DV/CF
-        // formulas. All three splice text in place and carry no
-        // host, so they compose with the byte transform in either
-        // order; the formula sweep already ran ABOVE the transform
-        // (see there for why).
+        // defined names, internal hyperlink locations, DV/CF
+        // formulas and (S2) `<extLst>` `<xm:f>` formulas. All four
+        // splice text in place and carry no host, so they compose
+        // with the byte transform in either order; the formula sweep
+        // already ran ABOVE the transform (see there for why). The
+        // `<xm:f>` sweep and the transform touch the same `<extLst>`
+        // — the transform shifts `<xm:sqref>`, the sweep splices
+        // `<xm:f>` bodies — on disjoint bytes.
         _ = try self.rewriteAllDefinedNames(edit, target);
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
+        _ = try self.rewriteAllExtensionFormulas(edit, target);
     }
 
     /// dr-1: rewrite the modern xdr drawing part referenced by the
@@ -5817,32 +5944,6 @@ pub const Workbook = struct {
     ) Error!void {
         for (self.store.rels(sheet_part_name)) |rel| {
             if (isPivotRelType(rel.type)) return error.PivotEditUnsafe;
-        }
-    }
-
-    /// Refuse a row/col edit on a sheet whose `<extLst>` carries an
-    /// `<xm:f>` reference.
-    ///
-    /// `<extLst>` was the last surface passing through verbatim.
-    /// `<xm:sqref>` — the range an `x14:` extension applies to, and by
-    /// far the common case — is now shifted in `pkg/sheet_edit.zig`.
-    /// `<xm:f>` is the remainder: a formula reference (sparkline
-    /// groups) that needs the formula rewriter and a sheet-name
-    /// context this layer does not have.
-    ///
-    /// Refusing is the point. Half-closing the gap — shifting
-    /// `xm:sqref` and leaving `xm:f` silently stale — would be worse
-    /// than the original bug, because the workbook would now look
-    /// partially maintained. Either the edit is wholly correct or it
-    /// errors; routing `<xm:f>` through the rewriter is the lift that
-    /// lets this guard come out.
-    pub fn preflightExtensionEditsForSheet(
-        self: *Workbook,
-        sheet_part_name: []const u8,
-    ) Error!void {
-        const part = (try self.store.part(sheet_part_name)) orelse return;
-        if (std.mem.indexOf(u8, part.bytes, "<xm:f") != null) {
-            return error.ExtensionEditUnsafe;
         }
     }
 
@@ -12843,6 +12944,161 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: no-op count == 0 on w
         null,
     );
     try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+// ─── extLst `<xm:f>` sweep (S2) ─────────────────────────────────────
+
+/// Two-sheet fixture for the `<xm:f>` sweep: `Report` (index 0) holds
+/// one cross-sheet cell formula — the canary that proves the row/col
+/// pipeline never reached `rewriteAllFormulas` when the preflight
+/// refuses — and `Data` (index 1) holds numbers.
+fn writeXmFixtureWorkbook(io: std.Io, path: []const u8) !void {
+    var w = zlsx.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    var report = try w.addSheet("Report");
+    try report.writeRowWithFormulas(&.{.{ .integer = 0 }}, &.{"SUM(Data!A1:A2)"});
+    var data = try w.addSheet("Data");
+    try data.writeRow(&.{.{ .integer = 10 }});
+    try data.writeRow(&.{.{ .integer = 20 }});
+    try w.save(io, path);
+}
+
+/// Append `block` before `</worksheet>` on sheet `sheet_idx` without
+/// parsing the sheet — the malformed-carrier test needs a part the
+/// typed parser may not accept.
+fn appendExtLstToSheet(wb: *Workbook, sheet_idx: u32, block: []const u8) !void {
+    const a = std.testing.allocator;
+    const ws = try wb.sheet(sheet_idx);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb.store.part(part_name)) orelse return error.MissingSheetPart;
+    const close_idx = std.mem.lastIndexOf(u8, part.bytes, "</worksheet>") orelse return error.NoSheetData;
+    const patched = try std.mem.concat(a, u8, &.{ part.bytes[0..close_idx], block, part.bytes[close_idx..] });
+    defer a.free(patched);
+    try wb.store.replacePart(part_name, patched);
+    if (ws.parsed) |*v| {
+        var view = v.*;
+        view.deinit(a);
+        ws.parsed = null;
+    }
+}
+
+fn dupeSheetPart(wb: *Workbook, sheet_idx: u32) ![]u8 {
+    const part_name = try (try wb.sheet(sheet_idx)).resolvePartName();
+    const part = (try wb.store.part(part_name)) orelse return error.MissingSheetPart;
+    return std.testing.allocator.dupe(u8, part.bytes);
+}
+
+const xm_two_sparklines_block =
+    "<extLst><ext uri=\"{05C60535-1F16-4fd2-B633-F4F36F0B64E0}\"><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+    "<x14:sparkline><xm:f>A1:A5</xm:f><xm:sqref>B1</xm:sqref></x14:sparkline>" ++
+    "<x14:sparkline><xm:f>Data!A1:A5</xm:f><xm:sqref>B2</xm:sqref></x14:sparkline>" ++
+    "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>";
+
+test "Workbook.rewriteAllExtensionFormulas: target_sheet scopes bare refs to the host and qualified refs to the target" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [256]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-xmf-scope-src-{d}.xlsx", .{prng.random().int(u32)});
+    var out_buf: [256]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/test-xmf-scope-out-{d}.xlsx", .{prng.random().int(u32)});
+    try writeXmFixtureWorkbook(io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    {
+        var wb = try Workbook.open(a, io, src_path);
+        defer wb.deinit();
+        try appendExtLstToSheet(&wb, 0, xm_two_sparklines_block);
+
+        // Edit on `Data`: the bare ref belongs to `Report` and stays;
+        // the qualified one moves. This is the sheet-name context
+        // `pkg/sheet_edit.zig` could not supply.
+        const on_data = try wb.rewriteAllExtensionFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Data");
+        try std.testing.expectEqual(@as(u32, 1), on_data);
+        const after_data = try dupeSheetPart(&wb, 0);
+        defer a.free(after_data);
+        try std.testing.expect(std.mem.indexOf(u8, after_data, "<xm:f>A1:A5</xm:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, after_data, "<xm:f>Data!A2:A6</xm:f>") != null);
+
+        // Edit on `Report`: now the bare ref moves and the qualified
+        // one stays.
+        const on_report = try wb.rewriteAllExtensionFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, "Report");
+        try std.testing.expectEqual(@as(u32, 1), on_report);
+        try wb.save(io, out_path);
+    }
+
+    // Persisted through save, not just patched in memory.
+    var wb2 = try Workbook.open(a, io, out_path);
+    defer wb2.deinit();
+    const saved = try dupeSheetPart(&wb2, 0);
+    defer a.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "<xm:f>A2:A6</xm:f><xm:sqref>B1</xm:sqref>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "<xm:f>Data!A2:A6</xm:f><xm:sqref>B2</xm:sqref>") != null);
+}
+
+test "Workbook.rewriteAllExtensionFormulas: no-op count == 0 on a workbook without xm:f" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
+    defer wb.deinit();
+    try wb.preflightExtensionFormulas();
+    const count = try wb.rewriteAllExtensionFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, null);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "Workbook: a malformed xm:f on any sheet refuses every structural edit before its first mutation" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [256]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-xmf-malformed-{d}.xlsx", .{prng.random().int(u32)});
+    try writeXmFixtureWorkbook(io, src_path);
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+
+    var wb = try Workbook.open(a, io, src_path);
+    defer wb.deinit();
+    // The unreadable carrier sits on `Data`; `Report` is pristine
+    // apart from its cell formula into `Data`.
+    try appendExtLstToSheet(&wb, 1, "<extLst><ext><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines>" ++
+        "<x14:sparkline><xm:f>Report!A1:A2</x14:sparkline>" ++
+        "</x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst>");
+    const report_before = try dupeSheetPart(&wb, 0);
+    defer a.free(report_before);
+    const data_before = try dupeSheetPart(&wb, 1);
+    defer a.free(data_before);
+    try std.testing.expectError(error.MalformedExtensionXml, wb.preflightExtensionFormulas());
+
+    // Every edit that runs the sweeps refuses up front — the edited
+    // sheet may be either one.
+    try std.testing.expectError(error.MalformedExtensionXml, wb.insertRow(1, 1));
+    try std.testing.expectError(error.MalformedExtensionXml, wb.deleteRow(0, 1));
+    try std.testing.expectError(error.MalformedExtensionXml, wb.insertColumn(0, 1));
+    try std.testing.expectError(error.MalformedExtensionXml, wb.deleteColumn(1, 1));
+    try std.testing.expectError(error.MalformedExtensionXml, wb.renameSheet(1, "Renamed"));
+    try std.testing.expectError(error.MalformedExtensionXml, wb.deleteSheet(1));
+
+    // Nothing moved: `Report`'s `SUM(Data!A1:A2)` was never rewritten
+    // (the cell-formula sweep runs BEFORE the byte transform, so a
+    // late refusal would have stranded it) and `Data`'s rows never
+    // shifted; the sheet list is intact.
+    const report_after = try dupeSheetPart(&wb, 0);
+    defer a.free(report_after);
+    const data_after = try dupeSheetPart(&wb, 1);
+    defer a.free(data_after);
+    try std.testing.expectEqualStrings(report_before, report_after);
+    try std.testing.expectEqualStrings(data_before, data_after);
+    try std.testing.expect(std.mem.indexOf(u8, report_after, "SUM(Data!A1:A2)") != null);
+    try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+    try std.testing.expectEqualStrings("Data", (try wb.sheet(1)).name());
 }
 
 test "Workbook.renameSheet: happy path renames sheet and rewrites cross-sheet formula" {
