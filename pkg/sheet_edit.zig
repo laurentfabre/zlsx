@@ -1550,6 +1550,16 @@ pub const XmFormula = struct { body_start: usize, body_end: usize, next: usize }
 /// sheet with this scan before its first mutation and refuses the
 /// whole edit on `MalformedExtensionXml`. A self-closing `<xm:f/>`
 /// is an empty formula and is returned with an empty body.
+///
+/// Prefix-literal, like every scanner in this file: the element is
+/// matched as `xm:f`, not resolved through its namespace binding, so
+/// a producer that binds `…/excel/2006/main` to another prefix
+/// (`<m:f xmlns:m=…>`) has no carrier here and its formula passes
+/// through unmaintained — the same gap `xm:sqref` (#140) and every
+/// `x14:` match carry, and the one #140's guard had too (it scanned
+/// for the literal `<xm:f`). Excel and LibreOffice both write `xm`;
+/// namespace-aware scanning is the tracked backlog item
+/// (`goal_formula.md`, M10+), not an S2 concern.
 pub fn nextXmFormula(src: []const u8, from: usize) error{MalformedExtensionXml}!?XmFormula {
     const OPEN = "<xm:f";
     const CLOSE = "</xm:f>";
