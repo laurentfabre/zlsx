@@ -50,10 +50,11 @@ zlsx meta file.xlsx --output pretty-json
 `zlsx pivots <file>` walks the pivot graph (`xl/workbook.xml` `<pivotCaches>` →
 cache definitions → records parts; every sheet's relationships → pivot-table
 definitions) and emits one record per **pivot table**, in host-sheet order,
-followed by one `pivot_cache` record per cache **no pivot table reads** (only
-when no sheet is selected — an orphan cache belongs to no sheet). Nothing is
-modified; this is the read half of `goal_sigmoid.md` row S6, and the shape
-below is the S6 owner-gate contract.
+followed by one `pivot_cache` record per cache **no pivot table reads**. Orphan
+caches belong to no sheet, so they ride along by default and under
+`--all-sheets`, and a concrete selector — `--sheet`, `--name`, `--sheet-glob` —
+suppresses them. Nothing is modified; this is the read half of
+`goal_sigmoid.md` row S6, and the shape below is the S6 owner-gate contract.
 
 ```jsonl
 {"kind":"pivot","sheet":"Report","sheet_idx":1,"name":"PivotTable1","part":"xl/pivotTables/pivotTable1.xml",
@@ -85,7 +86,7 @@ below is the S6 owner-gate contract.
 | `cache.records_part`, `cache.record_count` | The `pivotCacheRecords` part and its declared `recordCount`. Records are never parsed. |
 | `cache.refreshed_by`, `refreshed_date`, `refresh_on_load`, `save_data` | Refresh facts as written. `refreshed_date` is the `refreshedDate` serial, or the `refreshedDateIso` string when a producer wrote only that; `null` with neither. |
 | `cache.source` | `{"type":"worksheet",…}`, `{"type":"consolidation","range_sets":[…]}`, `{"type":"external","connection_id":N}`, `{"type":"scenario"}` or `{"type":"unknown","raw":"…"}`. |
-| `cache.source.sheet`, `.ref`, `.name` | The `worksheetSource` spellings, decoded. A worksheet source is spelled either as `sheet` + `ref`, or as `name` — a table or a defined name. |
+| `cache.source.sheet`, `.ref`, `.name` | The `worksheetSource` spellings, decoded (`sheet` and `name` by their string carrier, `ref` entity-decoded). A worksheet source is spelled either as `sheet` + `ref`, or as `name` — a table or a defined name. |
 | `cache.source.resolved` | **What the spelling led to** — the surface-matrix footnote-¹⁰ answer: `{"sheet":…,"sheet_idx":N,"via":"sheet_attr"|"table"|"defined_name"}` for a sheet of this workbook; `{"external":TARGET}` when the source lives in another workbook (the `r:id` relationship target); `null` when the spelling names nothing the workbook has (a dangling sheet name, a defined name with a dynamic or 3D body). Each consolidation `range_sets[]` entry carries the same four keys. |
 | `cache.fields` | The cache-field schema in ordinal order: decoded `name`, `num_fmt_id`, `formula` (calculated fields; `null` otherwise), `items` (`sharedItems@count`; `null` when absent), `types` (the `contains*` inventory as a list drawn from `string`, `number`, `integer`, `blank`, `date`, `mixed`; `null` without `<sharedItems>`), `min` / `max` (`minValue` / `maxValue`, else `minDate` / `maxDate`, raw). |
 
@@ -377,8 +378,8 @@ stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
 --output ndjson               # default: invariant-envelope stream
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
-                              # validations / hyperlinks — a no-op on workbook-scoped
-                              # sub-commands
+                              # validations / hyperlinks / pivots — a no-op on
+                              # workbook-scoped sub-commands
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```

@@ -899,7 +899,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     sheet; subsequent records OMIT
         \\                                     `sheet`/`sheet_idx`. Applies to
         \\                                     cells / rows / comments /
-        \\                                     validations / hyperlinks.
+        \\                                     validations / hyperlinks / pivots.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
@@ -8770,6 +8770,54 @@ test "runPivotsCommand: orphan caches follow the pivots, only when no sheet is s
         try std.testing.expectEqual(@as(u8, 0), rc);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "pivot_cache") == null);
+    }
+}
+
+test "runPivotsCommand: --sheet-glob suppresses orphans, an ISO-only refresh date shows, an unreadable part is exit 2 with no stdout" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_glob.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.writeWithOrphanCache(std.testing.allocator, io, path, .sheet_ref);
+    try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "refreshedDate=\"45000.5\"", "refreshedDateIso=\"2023-03-15T12:00:00Z\"");
+
+    // A glob is a selection: the host matches, the orphan is not emitted.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_glob = "Rep*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "pivot_cache") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"refreshed_date\":\"2023-03-15T12:00:00Z\"") != null);
+    }
+    // A glob matching no host: an empty, successful stream.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_glob = "Nope*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // A pivot part that cannot be read: exit 2, a diagnostic, nothing on stdout.
+    try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/pivotTables/pivotTable1.xml", "<location ref=\"A3:B6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>", "");
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 2), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedPivotXml") != null);
     }
 }
 

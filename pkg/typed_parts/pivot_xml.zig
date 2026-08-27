@@ -805,6 +805,12 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         // the default, or two prefixes) would let children hide under
         // the one this parser is not matching.
         if (countBindings(attrs, &main_ns_uris) > 1) return error.MalformedXml;
+        // And the root's own binding must be it: a `<v:pivotCacheDefinition
+        // xmlns:v="urn:vendor">` is a vendor's element, whatever else the
+        // root declares. Undeclared is tolerated (a hand-rolled part).
+        if (declaredBinding(attrs, prefix)) |uri| {
+            if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
+        }
         const rel_prefix = bindingPrefix(attrs, &rel_ns_uris);
         if (rel_prefix) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const body_end = try endOf(xml, hit, prefix, local);
@@ -813,25 +819,53 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
     return error.MalformedXml;
 }
 
-/// One pass over the markup with quote state: every `<` opens a tag or
-/// a construct the scanner knows how to skip, every tag closes, and no
-/// attribute value carries a raw `<`. XML forbids all three, and each
-/// is a way to make a decoy-aware scanner see an element that is not
-/// one (Codex #199 r1 REL-002).
+/// Deepest element nesting the preflight follows. Pivot parts nest
+/// about eight deep; a part past this is refused rather than tracked
+/// on the heap.
+const max_depth = 64;
+
+/// One decoy-aware pass over the markup that refuses what would let a
+/// tag search see an element that is not one (Codex #199 r1 REL-002,
+/// r2 REL-009): bytes that are not UTF-8; a `<` that opens neither a
+/// tag nor a construct the scanner skips; a raw `<` anywhere inside a
+/// tag, quoted or not; a tag that never closes; a close tag that does
+/// not match the innermost open one (so `<a><b></a></b>` and a child
+/// closing after its root are refused); an element after the root has
+/// closed; an element still open at the end.
 fn preflight(xml: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedXml;
+    var stack: [max_depth][]const u8 = undefined;
+    var depth: usize = 0;
+    var root_closed = false;
     var i: usize = 0;
     while (i < xml.len) {
-        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return;
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
         const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
         if (skip_to != lt) {
             i = skip_to;
             continue;
         }
         if (lt + 1 >= xml.len) return error.MalformedXml;
+        if (xml[lt + 1] == '/') {
+            var j = lt + 2;
+            while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
+            const qname = xml[lt + 2 .. j];
+            while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
+            if (qname.len == 0 or j >= xml.len or xml[j] != '>') return error.MalformedXml;
+            if (depth == 0 or !std.mem.eql(u8, stack[depth - 1], qname)) return error.MalformedXml;
+            depth -= 1;
+            if (depth == 0) root_closed = true;
+            i = j + 1;
+            continue;
+        }
         const c = xml[lt + 1];
-        if (!(std.ascii.isAlphabetic(c) or c == '_' or c == ':' or c == '/')) return error.MalformedXml;
+        if (!(std.ascii.isAlphabetic(c) or c == '_' or c == ':')) return error.MalformedXml;
+        if (root_closed) return error.MalformedXml;
         var j = lt + 1;
+        while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
+        const qname = xml[lt + 1 .. j];
         var quote: ?u8 = null;
+        var self_closing = false;
         while (j < xml.len) : (j += 1) {
             const b = xml[j];
             if (quote) |q| {
@@ -842,13 +876,22 @@ fn preflight(xml: []const u8) Error!void {
                 }
             } else if (b == '"' or b == '\'') {
                 quote = b;
+            } else if (b == '<') {
+                return error.MalformedXml;
             } else if (b == '>') {
+                self_closing = xml[j - 1] == '/';
                 break;
             }
         }
         if (j >= xml.len) return error.MalformedXml;
+        if (!self_closing) {
+            if (depth >= max_depth) return error.MalformedXml;
+            stack[depth] = qname;
+            depth += 1;
+        }
         i = j + 1;
     }
+    if (depth != 0) return error.MalformedXml;
 }
 
 fn isNameBoundary(c: u8) bool {
@@ -985,12 +1028,35 @@ fn isXmlnsDecl(name: []const u8) bool {
     return std.mem.eql(u8, name, "xmlns") or std.mem.startsWith(u8, name, "xmlns:");
 }
 
-/// A relationships-namespace attribute (`r:id`) on an element. The
-/// prefix is the one the element itself binds to the relationships
-/// namespace, else the root's (`Root.rel_prefix`); with neither
-/// declared the attribute is matched under any prefix, which tolerates
-/// a producer that left the declaration out. `xmlns:*` declarations
-/// never match.
+/// The URI this element binds `prefix` to (`xmlns:PREFIX`, or `xmlns`
+/// for the empty prefix), or null when it declares no such binding.
+fn declaredBinding(attrs: []const u8, prefix: []const u8) ?[]const u8 {
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        const declared: []const u8 = if (std.mem.eql(u8, a.name, "xmlns"))
+            ""
+        else if (std.mem.startsWith(u8, a.name, "xmlns:"))
+            a.name["xmlns:".len..]
+        else
+            continue;
+        if (std.mem.eql(u8, declared, prefix)) return a.value;
+    }
+    return null;
+}
+
+fn isOneOf(uri: []const u8, uris: []const []const u8) bool {
+    for (uris) |u| if (std.mem.eql(u8, uri, u)) return true;
+    return false;
+}
+
+/// A relationships-namespace attribute (`r:id`) on an element. A
+/// prefix the element itself declares counts only if it declares it
+/// to the relationships namespace — `xmlns:r="urn:vendor" r:id="…"`
+/// is a vendor's attribute even under the root's `r`. Otherwise the
+/// prefix must be the one the element or the root binds to that
+/// namespace (`Root.rel_prefix`); with none declared anywhere the
+/// attribute is matched under any prefix, which tolerates a producer
+/// that left the declaration out. `xmlns:*` declarations never match.
 pub fn nsAttr(attrs: []const u8, root_rel_prefix: ?[]const u8, local: []const u8) ?[]const u8 {
     const bound = bindingPrefix(attrs, &rel_ns_uris) orelse root_rel_prefix;
     var it: AttrIter = .{ .attrs = attrs };
@@ -999,6 +1065,10 @@ pub fn nsAttr(attrs: []const u8, root_rel_prefix: ?[]const u8, local: []const u8
         const prefix = a.name[0..c];
         if (prefix.len == 0 or std.mem.eql(u8, prefix, "xmlns")) continue;
         if (!std.mem.eql(u8, a.name[c + 1 ..], local)) continue;
+        if (declaredBinding(attrs, prefix)) |uri| {
+            if (isOneOf(uri, &rel_ns_uris)) return a.value;
+            continue;
+        }
         if (bound) |b| {
             if (std.mem.eql(u8, prefix, b)) return a.value;
         } else {
@@ -1245,6 +1315,44 @@ test "parseCacheDefinition: a raw `<` inside an attribute value cannot spoof an 
     try testing.expectEqualStrings("S", ok.source.worksheet.?.sheet.?);
 }
 
+test "preflight: crossed and out-of-root closures, a raw `<` in a tag, bad UTF-8 are refused" {
+    // A child that closes after its root.
+    try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"></pivotTableDefinition></location>
+    ));
+    // Crossed: `<cacheSource><worksheetSource></cacheSource></worksheetSource>`.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"></cacheSource></worksheetSource></pivotCacheDefinition>
+    ));
+    // Markup after the root has closed.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition><cacheSource type="external"/>
+    ));
+    // A raw `<` inside a tag, outside quotes.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition bad=<x><cacheSource type="worksheet"/></pivotCacheDefinition>
+    ));
+    // Not UTF-8.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator, "<pivotCacheDefinition refreshedBy=\"z\xff\"><cacheSource type=\"worksheet\"/></pivotCacheDefinition>"));
+    // A comment after the root, and `>` in text, are fine.
+    var ok = try parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"/></cacheSource>a > b</pivotCacheDefinition><!-- trailing -->
+    );
+    defer ok.deinit(testing.allocator);
+    try testing.expectEqualStrings("S", ok.source.worksheet.?.sheet.?);
+}
+
+test "scanRoot: a root bound to a foreign namespace is not a pivot part" {
+    // Prefixed root under a vendor URI, even with the main URI as default.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<v:pivotCacheDefinition xmlns:v="urn:vendor" xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><v:cacheSource type="worksheet"/></v:pivotCacheDefinition>
+    ));
+    // Default namespace bound to a vendor URI.
+    try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition xmlns="urn:vendor" name="P" cacheId="0"><location ref="A1"/></pivotTableDefinition>
+    ));
+}
+
 test "scanRoot: two bindings of the main namespace on the root are refused" {
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"/></pivotCacheDefinition>
@@ -1389,4 +1497,7 @@ test "nsAttr: bound prefix wins, xmlns declarations never match, bare name never
     try testing.expectEqualStrings("rId7", nsAttr(attrs, null, "id").?);
     try testing.expect(nsAttr(attrs, "r", "id") == null);
     try testing.expect(nsAttr(" id=\"bare\" xmlns:id=\"u\"", null, "id") == null);
+    // An element that rebinds the root's `r` to a vendor URI: its `r:id`
+    // is the vendor's, not the relationship's.
+    try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", "r", "id") == null);
 }

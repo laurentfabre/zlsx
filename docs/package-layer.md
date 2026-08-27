@@ -164,7 +164,8 @@ function pointer to keep the graph a DAG.
   patterns inside `<c:f>`) — surfaced verbatim in `series_refs`;
   no path-resolution or external-part fetching.
 - **Pivot tables** — read as a typed graph (`Workbook.pivotTables`;
-  `zlsx_pkg.pivots.collect` over a bare `PartStore`): tables with host
+  `zlsx_pkg.pivots.collect` over a `PartStore` plus its parsed
+  `typed_parts.workbook_xml` view): tables with host
   sheet and output rectangle, caches with their source resolved to the
   sheet it reads from, field schema, records part. Never emitted or
   rewritten; the parts stay byte-preserved through every edit.
