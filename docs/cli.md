@@ -98,9 +98,9 @@ pivots is an empty, successful stream. The graph is read whole or not at all
 names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
 without its `cacheId` or `r:id`, a cache whose identity disagrees between
 `xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
-with two cache edges, a records part that is named but absent, a `<tablePart>`
-that attaches nothing or a defined-name inventory the engine refuses (both
-checked when a source is spelled by name) all fail the command rather than listing the pivots
+with two cache edges, a records part that is named but absent, a defined-name
+inventory the engine refuses or a `<tablePart>` that attaches nothing (checked,
+in that order, when a source is spelled by name and no defined name has it) all fail the command rather than listing the pivots
 that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
 chart formats, hierarchies and every OLAP-only element are not exposed; the
 parts stay byte-preserved for callers that need them raw

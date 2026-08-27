@@ -56,9 +56,10 @@
 //! root that binds the main namespace twice (a prefix *and* the
 //! default, or two prefixes) is refused rather than half-read under one
 //! of them. The relationships namespace is resolved from its `xmlns`
-//! declaration on the root (or the element itself) so `r:id` cannot be
-//! shadowed by a foreign `vendor:id`, nor claimed by an element that
-//! rebinds `r`. Comments, CDATA and processing instructions are skipped
+//! declaration wherever XML scopes it — the root, an ancestor, or the
+//! element itself — so `r:id` cannot be shadowed by a foreign
+//! `vendor:id`, nor claimed by an element that rebinds `r`, and a
+//! `q:id` under an ancestor's `xmlns:q` is the relationship it names. Comments, CDATA and processing instructions are skipped
 //! through the shared decoy-aware scanner in `workbook_xml.zig`.
 
 const std = @import("std");
@@ -211,7 +212,7 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
     const attrs = xml[root.hit.attrs_start..root.hit.attrs_end];
 
     var def: CacheDefinition = .{
-        .r_id = nsAttr(attrs, root.rel_prefix, "id"),
+        .r_id = nsAttr(attrs, root.env, "id"),
         .record_count = try u32Attr(attrs, "recordCount"),
         .refreshed_by = wbxml.getAttr(attrs, "refreshedBy"),
         .refreshed_date = wbxml.getAttr(attrs, "refreshedDate"),
@@ -233,7 +234,7 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
 
     var have_source = false;
     var have_fields = false;
-    var kids = Children.init(xml, root.hit, root.body_end, root.prefix);
+    var kids = Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
     while (try kids.next()) |k| {
         if (std.mem.eql(u8, k.local, "cacheSource")) {
             // Required, and one: a definition without a source describes
@@ -264,28 +265,28 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
     }
     errdefer allocator.free(src.range_sets);
     var have_consolidation = false;
-    var kids = Children.init(xml, el.hit, el.end, root.prefix);
+    var kids = Children.init(xml, el.hit, el.end, root.prefix, el.env);
     while (try kids.next()) |k| {
         if (std.mem.eql(u8, k.local, "worksheetSource")) {
             if (src.worksheet != null) return error.MalformedXml;
-            src.worksheet = parseWorksheetSource(xml, k, root.rel_prefix);
+            src.worksheet = parseWorksheetSource(xml, k);
         } else if (std.mem.eql(u8, k.local, "consolidation")) {
             // One consolidation, one range-set list: a second of either
             // is refused, never read over the first.
             if (have_consolidation) return error.MalformedXml;
             have_consolidation = true;
             var have_range_sets = false;
-            var cons = Children.init(xml, k.hit, k.end, root.prefix);
+            var cons = Children.init(xml, k.hit, k.end, root.prefix, k.env);
             while (try cons.next()) |c| {
                 if (!std.mem.eql(u8, c.local, "rangeSets")) continue;
                 if (have_range_sets) return error.MalformedXml;
                 have_range_sets = true;
                 var sets: std.ArrayListUnmanaged(WorksheetSource) = .empty;
                 errdefer sets.deinit(allocator);
-                var rs = Children.init(xml, c.hit, c.end, root.prefix);
+                var rs = Children.init(xml, c.hit, c.end, root.prefix, c.env);
                 while (try rs.next()) |set| {
                     if (!std.mem.eql(u8, set.local, "rangeSet")) continue;
-                    try sets.append(allocator, parseWorksheetSource(xml, set, root.rel_prefix));
+                    try sets.append(allocator, parseWorksheetSource(xml, set));
                 }
                 src.range_sets = try sets.toOwnedSlice(allocator);
             }
@@ -294,12 +295,12 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
     return src;
 }
 
-fn parseWorksheetSource(xml: []const u8, el: Child, rel_prefix: ?[]const u8) WorksheetSource {
+fn parseWorksheetSource(xml: []const u8, el: Child) WorksheetSource {
     const attrs = el.attrs(xml);
     var ws: WorksheetSource = .{
         .name = wbxml.getAttr(attrs, "name"),
         .sheet = wbxml.getAttr(attrs, "sheet"),
-        .r_id = nsAttr(attrs, rel_prefix, "id"),
+        .r_id = nsAttr(attrs, el.env, "id"),
     };
     if (wbxml.getAttr(attrs, "ref")) |r| {
         ws.ref = r;
@@ -311,7 +312,7 @@ fn parseWorksheetSource(xml: []const u8, el: Child, rel_prefix: ?[]const u8) Wor
 fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]CacheField {
     var out: std.ArrayListUnmanaged(CacheField) = .empty;
     errdefer out.deinit(allocator);
-    var kids = Children.init(xml, el.hit, el.end, p);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "cacheField")) continue;
         const attrs = k.attrs(xml);
@@ -322,7 +323,7 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .formula = wbxml.getAttr(attrs, "formula"),
             .database_field = try boolAttr(attrs, "databaseField", true),
         };
-        var inner = Children.init(xml, k.hit, k.end, p);
+        var inner = Children.init(xml, k.hit, k.end, p, k.env);
         while (try inner.next()) |c| {
             if (!std.mem.eql(u8, c.local, "sharedItems")) continue;
             if (field.shared_items != null) return error.MalformedXml;
@@ -563,7 +564,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
 
     var have_location = false;
     var seen = std.enums.EnumSet(enum { fields, rows, cols, pages, data, style }).initEmpty();
-    var kids = Children.init(xml, root.hit, root.body_end, p);
+    var kids = Children.init(xml, root.hit, root.body_end, p, root.env);
     while (try kids.next()) |k| {
         if (std.mem.eql(u8, k.local, "location")) {
             if (have_location) return error.MalformedXml;
@@ -624,7 +625,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
 fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PivotField {
     var out: std.ArrayListUnmanaged(PivotField) = .empty;
     errdefer out.deinit(allocator);
-    var kids = Children.init(xml, el.hit, el.end, p);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "pivotField")) continue;
         const attrs = k.attrs(xml);
@@ -641,10 +642,10 @@ fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             f.axis = if (wbxml.decodeScalarAttr(&buf, ax)) |d| axisFromXml(d) else null;
             if (f.axis == null) f.axis_raw = ax;
         }
-        var inner = Children.init(xml, k.hit, k.end, p);
+        var inner = Children.init(xml, k.hit, k.end, p, k.env);
         while (try inner.next()) |c| {
             if (!std.mem.eql(u8, c.local, "items")) continue;
-            var items = Children.init(xml, c.hit, c.end, p);
+            var items = Children.init(xml, c.hit, c.end, p, c.env);
             while (try items.next()) |it| {
                 if (std.mem.eql(u8, it.local, "item")) f.item_count += 1;
             }
@@ -665,7 +666,7 @@ fn axisFromXml(s: []const u8) ?Axis {
 fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]AxisField {
     var out: std.ArrayListUnmanaged(AxisField) = .empty;
     errdefer out.deinit(allocator);
-    var kids = Children.init(xml, el.hit, el.end, p);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "field")) continue;
         const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
@@ -685,7 +686,7 @@ fn ordinalOrValues(x: i32) Error!AxisField {
 fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PageField {
     var out: std.ArrayListUnmanaged(PageField) = .empty;
     errdefer out.deinit(allocator);
-    var kids = Children.init(xml, el.hit, el.end, p);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "pageField")) continue;
         const attrs = k.attrs(xml);
@@ -704,7 +705,7 @@ fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
 fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]DataField {
     var out: std.ArrayListUnmanaged(DataField) = .empty;
     errdefer out.deinit(allocator);
-    var kids = Children.init(xml, el.hit, el.end, p);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "dataField")) continue;
         const attrs = k.attrs(xml);
@@ -735,24 +736,45 @@ fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
 // is the class of bug this file exists to avoid.
 
 /// Longest namespace prefix this parser will bind. Prefixes in real
-/// parts are one to three characters; the bound exists so the tag-name
-/// scratch buffers are fixed-size, and a part that exceeds it is
-/// refused rather than truncated into a wrong match.
+/// parts are one to three characters; a part past the bound is
+/// refused rather than matched by a truncated spelling.
 pub const max_prefix_len = 32;
-const max_local_len = 40;
 /// Deepest element nesting the preflight follows. Pivot parts nest
 /// about eight deep; a part past this is refused rather than tracked
 /// on the heap.
 const max_depth = 64;
+
+/// What an element's ancestors say about the relationships namespace —
+/// the environment XML scopes `xmlns` declarations through.
+pub const NsEnv = struct {
+    /// The prefix bound to the relationships namespace in scope, or
+    /// null when none is (never declared, or the inherited one rebound
+    /// to a foreign URI on the way down).
+    rel_prefix: ?[]const u8 = null,
+    /// Whether anything in scope has said something about it. Only a
+    /// document that never declares the relationships namespace at all
+    /// gets the any-prefix tolerance for `r:id`.
+    declared: bool = false,
+
+    /// The environment a child sees: its own relationships binding
+    /// wins; rebinding the inherited prefix to a foreign URI unbinds
+    /// it; otherwise the parent's environment carries down.
+    pub fn forChild(self: NsEnv, child_attrs: []const u8) NsEnv {
+        if (bindingPrefix(child_attrs, &rel_ns_uris)) |p| return .{ .rel_prefix = p, .declared = true };
+        if (self.rel_prefix) |p| {
+            if (declaredBinding(child_attrs, p) != null) return .{ .rel_prefix = null, .declared = true };
+        }
+        return self;
+    }
+};
 
 pub const Root = struct {
     hit: wbxml.TagHit,
     /// The root element's namespace prefix, without the colon; empty
     /// when the main namespace is the default.
     prefix: []const u8,
-    /// The prefix bound to the relationships namespace on the root,
-    /// without the colon, or null when the root declares none.
-    rel_prefix: ?[]const u8,
+    /// The relationships-namespace environment the root establishes.
+    env: NsEnv,
     /// Index of the `<` of the root's closing tag — the bound every
     /// child walk runs under. For a self-closing root, the end of the
     /// root tag itself.
@@ -795,10 +817,13 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         if (declaredBinding(attrs, prefix)) |uri| {
             if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
         }
-        const rel_prefix = bindingPrefix(attrs, &rel_ns_uris);
-        if (rel_prefix) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
+        const env: NsEnv = if (bindingPrefix(attrs, &rel_ns_uris)) |rp|
+            .{ .rel_prefix = rp, .declared = true }
+        else
+            .{};
+        if (env.rel_prefix) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const body_end = try endOfQ(xml, hit, qname);
-        return .{ .hit = hit, .prefix = prefix, .rel_prefix = rel_prefix, .body_end = body_end };
+        return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = body_end };
     }
     return error.MalformedXml;
 }
@@ -915,6 +940,8 @@ pub const Child = struct {
     /// One past the child: the byte after its `/>`, or the `<` of its
     /// close tag.
     end: usize,
+    /// The relationships-namespace environment inside this child.
+    env: NsEnv,
 
     pub fn attrs(self: Child, xml: []const u8) []const u8 {
         return xml[self.hit.attrs_start..self.hit.attrs_end];
@@ -928,13 +955,16 @@ pub const Child = struct {
 pub const Children = struct {
     xml: []const u8,
     prefix: []const u8,
+    /// The parent's environment, which each child refines.
+    env: NsEnv,
     cursor: usize,
     end: usize,
 
-    pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8) Children {
+    pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8, env: NsEnv) Children {
         return .{
             .xml = xml,
             .prefix = prefix,
+            .env = env,
             .cursor = if (parent.self_closing) parent_end else parent.after_tag_close,
             .end = parent_end,
         };
@@ -960,7 +990,12 @@ pub const Children = struct {
             const child_end = try endOfQ(xml, hit, qname);
             self.cursor = if (hit.self_closing) child_end else child_end + "</".len + qname.len + ">".len;
             if (localUnder(qname, self.prefix)) |local| {
-                return .{ .local = local, .hit = hit, .end = child_end };
+                return .{
+                    .local = local,
+                    .hit = hit,
+                    .end = child_end,
+                    .env = self.env.forChild(xml[hit.attrs_start..hit.attrs_end]),
+                };
             }
         }
         return null;
@@ -1036,17 +1071,6 @@ fn narrow(err: wbxml.Error) Error {
         error.OutOfMemory => error.OutOfMemory,
         else => error.MalformedXml,
     };
-}
-
-fn qualify(buf: []u8, prefix: []const u8, local: []const u8) []const u8 {
-    if (prefix.len == 0) {
-        @memcpy(buf[0..local.len], local);
-        return buf[0..local.len];
-    }
-    @memcpy(buf[0..prefix.len], prefix);
-    buf[prefix.len] = ':';
-    @memcpy(buf[prefix.len + 1 .. prefix.len + 1 + local.len], local);
-    return buf[0 .. prefix.len + 1 + local.len];
 }
 
 /// Walks `name="value"` pairs of a preflighted attributes region.
@@ -1127,16 +1151,18 @@ fn isOneOf(uri: []const u8, uris: []const []const u8) bool {
     return false;
 }
 
-/// A relationships-namespace attribute (`r:id`) on an element, raw. A
-/// prefix the element itself declares counts only if it declares it
-/// to the relationships namespace — `xmlns:r="urn:vendor" r:id="…"`
-/// is a vendor's attribute even under the root's `r`. Otherwise the
-/// prefix must be the one the element or the root binds to that
-/// namespace (`Root.rel_prefix`); with none declared anywhere the
-/// attribute is matched under any prefix, which tolerates a producer
-/// that left the declaration out. `xmlns:*` declarations never match.
-pub fn nsAttr(attrs: []const u8, root_rel_prefix: ?[]const u8, local: []const u8) ?[]const u8 {
-    const bound = bindingPrefix(attrs, &rel_ns_uris) orelse root_rel_prefix;
+/// A relationships-namespace attribute (`r:id`) on an element, raw,
+/// resolved in the environment its ancestors scope (`env`, the parent's
+/// — the element's own declarations are read here). A prefix the
+/// element itself declares counts only if it declares it to the
+/// relationships namespace — `xmlns:r="urn:vendor" r:id="…"` is a
+/// vendor's attribute even under an ancestor's `r`. Otherwise the
+/// prefix must be the one in scope; when nothing in the document has
+/// ever declared the namespace the attribute is matched under any
+/// prefix, which tolerates a producer that left the declaration out.
+/// `xmlns:*` declarations never match.
+pub fn nsAttr(attrs: []const u8, env: NsEnv, local: []const u8) ?[]const u8 {
+    const here = env.forChild(attrs);
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
         const c = std.mem.indexOfScalar(u8, a.name, ':') orelse continue;
@@ -1147,9 +1173,9 @@ pub fn nsAttr(attrs: []const u8, root_rel_prefix: ?[]const u8, local: []const u8
             if (isOneOf(uri, &rel_ns_uris)) return a.value;
             continue;
         }
-        if (bound) |b| {
+        if (here.rel_prefix) |b| {
             if (std.mem.eql(u8, prefix, b)) return a.value;
-        } else {
+        } else if (!here.declared) {
             return a.value;
         }
     }
@@ -1653,7 +1679,7 @@ test "Children: a same-name element nested inside is a descendant; closes pair b
     try testing.expectEqual(@as(u32, 2), def.fields[0].item_count);
 
     const root = try scanRoot(xml, "pivotTableDefinition");
-    var kids = Children.init(xml, root.hit, root.body_end, "");
+    var kids = Children.init(xml, root.hit, root.body_end, "", root.env);
     const loc = (try kids.next()).?;
     try testing.expectEqualStrings("location", loc.local);
     const pf = (try kids.next()).?;
@@ -1666,10 +1692,35 @@ test "nsAttr: bound prefix wins, xmlns declarations never match, bare name never
     const attrs =
         \\ xmlns:r="urn:r" id="bare" xmlns:id="urn:id" rel:id="rId7"
     ;
-    try testing.expectEqualStrings("rId7", nsAttr(attrs, null, "id").?);
-    try testing.expect(nsAttr(attrs, "r", "id") == null);
-    try testing.expect(nsAttr(" id=\"bare\" xmlns:id=\"u\"", null, "id") == null);
-    try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", "r", "id") == null);
+    try testing.expectEqualStrings("rId7", nsAttr(attrs, .{}, "id").?);
+    try testing.expect(nsAttr(attrs, .{ .rel_prefix = "r", .declared = true }, "id") == null);
+    try testing.expect(nsAttr(" id=\"bare\" xmlns:id=\"u\"", .{}, "id") == null);
+    try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", .{ .rel_prefix = "r", .declared = true }, "id") == null);
+}
+
+test "nsAttr: the relationships prefix scopes through ancestors" {
+    // Declared on the parent (`cacheSource`), used on the child.
+    const inherited =
+        \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet" xmlns:q="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><worksheetSource q:id="rIdExt" sheet="Data" ref="A1:C4"/></cacheSource></pivotCacheDefinition>
+    ;
+    var a = try parseCacheDefinition(testing.allocator, inherited);
+    defer a.deinit(testing.allocator);
+    try testing.expectEqualStrings("rIdExt", a.source.worksheet.?.r_id.?);
+    // The root's `r` rebound to a vendor URI on the parent: the child's
+    // `r:id` is the vendor's.
+    const rebound =
+        \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet" xmlns:r="urn:vendor"><worksheetSource r:id="rIdExt" sheet="Data" ref="A1:C4"/></cacheSource></pivotCacheDefinition>
+    ;
+    var b = try parseCacheDefinition(testing.allocator, rebound);
+    defer b.deinit(testing.allocator);
+    try testing.expect(b.source.worksheet.?.r_id == null);
+    // Rebinding does not unlock the any-prefix tolerance either.
+    const rebound_other =
+        \\<pivotCacheDefinition xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet" xmlns:r="urn:vendor"><worksheetSource v:id="rIdExt" sheet="Data" ref="A1:C4"/></cacheSource></pivotCacheDefinition>
+    ;
+    var c = try parseCacheDefinition(testing.allocator, rebound_other);
+    defer c.deinit(testing.allocator);
+    try testing.expect(c.source.worksheet.?.r_id == null);
 }
 
 fn parseCacheForFailures(allocator: Allocator, xml: []const u8) !void {

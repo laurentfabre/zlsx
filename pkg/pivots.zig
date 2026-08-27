@@ -227,9 +227,10 @@ pub const Pivots = struct {
 /// already holds (a `Workbook` has one); the walk reads the part bytes
 /// again only for `<pivotCaches>`, which the typed view does not carry.
 ///
-/// Leaf strings in the result either borrow from the store's arena or
-/// live in the result's own arena; both outlive the `Pivots` for as
-/// long as the store does.
+/// Raw slices in the result (`raw_xml`, part names, the definitions'
+/// fields) borrow from the store's arena and live as long as the store;
+/// decoded strings (names, captions, spellings) live in the result's
+/// own arena and end with `Pivots.deinit`.
 pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.WorkbookXml) Error!Pivots {
     var out: Pivots = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -444,17 +445,17 @@ fn collectWorkbookCaches(
     caches: *std.ArrayListUnmanaged(CacheSlot),
 ) Error!void {
     const root = pivot_xml.scanRoot(wb_xml, "workbook") catch |e| return mapParse(e);
-    var kids = pivot_xml.Children.init(wb_xml, root.hit, root.body_end, root.prefix);
+    var kids = pivot_xml.Children.init(wb_xml, root.hit, root.body_end, root.prefix, root.env);
     var seen_container = false;
     while (kids.next() catch |e| return mapParse(e)) |k| {
         if (!std.mem.eql(u8, k.local, "pivotCaches")) continue;
         if (seen_container) return error.MalformedPivotXml;
         seen_container = true;
-        var entries = pivot_xml.Children.init(wb_xml, k.hit, k.end, root.prefix);
+        var entries = pivot_xml.Children.init(wb_xml, k.hit, k.end, root.prefix, k.env);
         while (entries.next() catch |e| return mapParse(e)) |c| {
             if (!std.mem.eql(u8, c.local, "pivotCache")) continue;
             const attrs = c.attrs(wb_xml);
-            const rid = pivot_xml.nsAttr(attrs, root.rel_prefix, "id") orelse return error.MalformedPivotXml;
+            const rid = pivot_xml.nsAttr(attrs, c.env, "id") orelse return error.MalformedPivotXml;
             const cache_id = (pivot_xml.u32Attr(attrs, "cacheId") catch |e| return mapParse(e)) orelse
                 return error.MalformedPivotXml;
             const rel = try requiredRel(wb_rels, rid, &.{"pivotCacheDefinition"});
@@ -1601,6 +1602,17 @@ test "collect: relationships are typed, decoded, and singular; sheet roots must 
     try testing.expectEqual(@as(usize, 1), oe.pivots.caches.len);
     try testing.expectEqualStrings("xl/pivotCache/pivotCacheRecords1.xml", oe.pivots.caches[0].records_part_name.?);
     try testing.expectEqualStrings("file:///C:/data/other.xlsx", oe.pivots.caches[0].resolution.external);
+
+    // A relationships prefix declared on `<cacheSource>` and used on the
+    // `<worksheetSource>` below it is the same relationship — the source
+    // is the other workbook, not the local `sheet` it also spells.
+    const scoped = try tt.path(testing.allocator, io, "scoped_rid.xlsx");
+    defer testing.allocator.free(scoped);
+    try fixture.write(testing.allocator, io, scoped, .external);
+    try patchPart(io, scoped, "xl/pivotCache/pivotCacheDefinition1.xml", "<cacheSource type=\"worksheet\"><worksheetSource r:id=\"rIdExt\"", "<cacheSource type=\"worksheet\" xmlns:q=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><worksheetSource q:id=\"rIdExt\"");
+    var osc = try Opened.open(testing.allocator, io, scoped);
+    defer osc.deinit(testing.allocator);
+    try testing.expectEqualStrings("file:///C:/data/other.xlsx", osc.pivots.caches[0].resolution.external);
 
     // An external-source relationship of the wrong type is not a workbook.
     const wrong_ext = try tt.path(testing.allocator, io, "wrong_ext_type.xlsx");

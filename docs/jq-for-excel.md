@@ -23,7 +23,7 @@ Turn `zlsx` into the thing you reach for when piping an xlsx into a Unix pipelin
 
 The invariant is precise:
 
-1. **Every record has a `kind` field** that picks the schema (`"cell"`, `"row"`, `"comment"`, `"validation"`, `"hyperlink"`, `"style"`, `"sst"`, `"sheet"`, `"workbook"`, `"error"`).
+1. **Every record has a `kind` field** that picks the schema (`"cell"`, `"row"`, `"comment"`, `"validation"`, `"hyperlink"`, `"pivot"`, `"pivot_cache"`, `"style"`, `"sst"`, `"sheet"`, `"workbook"`, `"error"`).
 2. **Sheet-scoped records additionally have `sheet` and `sheet_idx`** (all except `workbook`, `style`, `sst` — which are workbook-wide and have no sheet).
 3. **The invariant never varies by flag.** No flag ever drops `kind`, `sheet`, or `sheet_idx` from records that carry them.
 
@@ -144,7 +144,7 @@ Emitted inline when a non-fatal parse error hits. Fatal errors exit non-zero wit
 - `--sheet N` — select by 0-based index. Escape hatch for scripting where sheet names aren't known.
 - `--all-sheets` — stream every sheet concatenated.
 - `--sheet-glob 'Data*'` — match sheet names against a simple glob.
-- **Default (no `--sheet*` flag)**: first sheet only. Users who want all sheets pass `--all-sheets` explicitly. This mirrors Excel's "open the first sheet" default and avoids surprising large outputs.
+- **Default (no `--sheet*` flag)**: first sheet only for `rows` / `cells`. Users who want all sheets pass `--all-sheets` explicitly. This mirrors Excel's "open the first sheet" default and avoids surprising large outputs. The per-object sub-commands (`comments`, `validations`, `hyperlinks`, `pivots`) stream every sheet by default — their output is bounded by the objects, not the grid.
 - `--range A1:Z100` — bounding rectangle for `cells` / `rows`. A1-style, scoped to the current sheet.
 - `--header` — on `rows`, treat the first row (1-based `row:1`) as keys and emit `fields` dict per data row. Consistent with `row:1` / `--start-row` elsewhere; no 0-based row addressing exists in the surface.
 - `--with-styles` — opt-in metadata on `cells` / `rows`. Off by default.

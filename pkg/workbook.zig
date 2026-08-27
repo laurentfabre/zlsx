@@ -1513,8 +1513,9 @@ pub const Workbook = struct {
     /// field roles and axes, and every pivot cache with its source —
     /// resolved to the sheet it reads from when the source is local —
     /// its field schema and its records part. Read-only; the parts
-    /// stay byte-preserved. Caller owns the result (`deinit`); leaf
-    /// strings stay valid for the `Workbook`'s lifetime.
+    /// stay byte-preserved. Caller owns the result (`deinit`); its raw
+    /// slices borrow from this workbook's store, its decoded strings
+    /// live in the result and end with its `deinit`.
     ///
     /// Not cached on the workbook: the walk is a handful of small
     /// parts and no accessor on this type mutates a pivot, so there is
