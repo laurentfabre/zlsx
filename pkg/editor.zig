@@ -5376,6 +5376,138 @@ test "Editor: the pivot guard does not refuse sheets without one" {
     try std.testing.expectEqual(@as(i64, 1), r1[0].integer);
 }
 
+// ─── S6 audit: what the pivot guard sees (surface-matrix footnote ¹⁰) ──
+//
+// `preflightPivotEditsForSheet` walks the EDITED sheet's relationships,
+// so it refuses the sheet a pivot renders on: the host's rels name the
+// pivot part. A sheet a pivot only READS from carries no relationship
+// to any pivot part — the edge runs the other way, from the cache
+// definition's `worksheetSource` to the sheet — so the guard admits
+// the edit. The typed read (`Workbook.pivotTables`) is what sees that
+// edge. These tests pin BOTH halves as they stand on `main` today: the
+// refusal on the host, the admission on the source. The second half is
+// the finding, not the goal; S7b is the row that flips it, and these
+// are the tests it will flip.
+
+const pivots_mod = @import("pivots.zig");
+
+/// Both paths live in the caller's temp dir: `std.testing.tmpDir` is
+/// per-test state, and a second one inside a helper does not coexist
+/// with the first.
+fn expectSourceOnlyFinding(
+    io: std.Io,
+    kind: pivots_mod.fixture.SourceKind,
+    src: []const u8,
+    dst: []const u8,
+) !void {
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, kind);
+
+    // The typed read: `Data` (0) is source-only, `Report` (1) hosts.
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        var p = try wb.pivotTables();
+        defer p.deinit();
+        try std.testing.expect(p.readsFromSheet(0) and !p.hostsPivot(0));
+        try std.testing.expect(p.hostsPivot(1) and !p.readsFromSheet(1));
+    }
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    // The host refuses (#139) …
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(1, 1));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(1, 1));
+    // … and the source-only sheet is admitted: the guard cannot see it.
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+}
+
+test "S6 audit: a sheet+ref source sheet is admitted, and worksheetSource@ref goes stale" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s6_sheet_ref_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s6_sheet_ref_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try expectSourceOnlyFinding(io, .sheet_ref, src, dst);
+
+    // The data now spans A1:C5; the cache still reads A1:C4. That stale
+    // `ref` is the silent-corruption class #139 closed for hosts, open
+    // for sources, and S7b's splice target (`WorksheetSource.ref_span`).
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>") != null);
+}
+
+test "S6 audit: a table-named source stays valid because the table rewriter moves the table" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s6_table_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s6_table_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try expectSourceOnlyFinding(io, .table_name, src, dst);
+
+    // Same admission, different consequence: `worksheetSource@name`
+    // still names the table, and the table part's own `ref` followed
+    // the insert — the source is spelled through a carrier that has a
+    // rewriter. Excel re-reads the (moved) table on refresh; only the
+    // cached records are stale, as after any cell edit.
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource name=\"SalesTbl\"/>") != null);
+    const tbl = (try store.part("xl/tables/table1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C4\"") == null);
+}
+
+test "S6 audit: the corpus fixture — both hosts refuse, the source-only sheet is admitted" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, src, .{}) catch return error.SkipZigTest;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const dst = try tt.path(std.testing.allocator, io, "s6_corpus_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+
+    // `IrisSample` (0) hosts PivotTable1 and is read by it through
+    // `Table2`; `mtcars` (2) is read by PivotTable3 through `Table3` and
+    // hosts nothing; `mtCars Pivot` (3) hosts PivotTable3.
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        var p = try wb.pivotTables();
+        defer p.deinit();
+        try std.testing.expect(p.hostsPivot(0) and p.readsFromSheet(0));
+        try std.testing.expect(!p.hostsPivot(2) and p.readsFromSheet(2));
+        try std.testing.expect(p.hostsPivot(3) and !p.readsFromSheet(3));
+    }
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(3, 2));
+    try ed.insertRow(2, 2);
+    try ed.save(io, dst);
+
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const cd = (try store.part("xl/pivotCache/pivotCacheDefinition2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource name=\"Table3\"/>") != null);
+    const tbl = (try store.part("xl/tables/table2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:K31\"") != null);
+}
+
 // ─── extLst: xm:sqref shifts (#140), xm:f rewrites (S2) ─────────────
 
 /// Sheet fixture carrying an `<extLst>` extension.

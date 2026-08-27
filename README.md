@@ -88,8 +88,9 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   sparkline / extension formulas together; anything the rewriter cannot shift
   safely is **refused with a typed error instead of corrupting the file**
   ([refusal audit](docs/plans/refusal-audit.md)). One guard remains: sheets
-  that *host* a pivot. A sheet a pivot only *reads from* is not detected yet —
-  that audit is row S6 of `goal_sigmoid.md`.
+  that *host* a pivot. A sheet a pivot only *reads from* is not detected — the
+  S6 audit pinned that with tests, and `zlsx pivots` / `Workbook.pivotTables`
+  now name every source sheet; row S7b of `goal_sigmoid.md` closes it.
 - **In-workbook embeddings** — store embedding vectors *inside* the workbook
   as OPC parts invisible to Excel; extract / write / prune / strip via
   [`zlsx embed`](docs/cli.md#embeddings-embed). A spreadsheet that carries its
@@ -299,8 +300,10 @@ than the `(mtime, size)` fingerprint streaming uses.
 decoding; the raw pieces (`styleIndices`/`isDateFormat`/`fromExcelSerial`) stay
 exposed. Serials ≤ 60 return `null` (Excel 1900 leap-bug window).
 ³ Via the `zlsx_pkg` package layer: `imageAnchors` / `chartAnchors` with
-per-sheet anchor coordinates (Strict + Transitional OOXML). Pivots are
-detected and byte-preserved through edits, not parsed into a typed object.
+per-sheet anchor coordinates (Strict + Transitional OOXML). Pivots are read as
+a typed graph (`Workbook.pivotTables`: tables, caches, sources resolved to their
+sheets, field schema; `zlsx pivots` on the CLI) and byte-preserved through
+edits; nothing writes them.
 ⁴ Theme colors are resolved via the workbook palette; the legacy
 `indexed="N"` palette and `tint` modifiers are not resolved.
 
@@ -413,7 +416,7 @@ contract: [docs/cli.md](docs/cli.md).**
 
 | Family | Commands |
 |---|---|
-| Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `styles` · `sst` |
+| Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `pivots` · `styles` · `sst` |
 | Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` |
 | Privacy | `scrub-metadata` · `embed --strip` · `embed --prune` |
 | Embeddings | `embed --extract` · `embed --vectors` |
@@ -496,8 +499,9 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 - **Pivot-aware edits** — pivots round-trip byte-preserved, and row/col edits
   on sheets that *host* a pivot are refused rather than silently breaking it.
   The guard walks the edited sheet's relationships, so a sheet a pivot only
-  *reads from* is not detected yet — that audit opens the pivot programme
-  (S6 in `goal_sigmoid.md`).
+  *reads from* is admitted — pinned by S6's audit, closed by S7b
+  (`goal_sigmoid.md`). The typed read, `Workbook.pivotTables` / `zlsx pivots`,
+  names every host and source sheet.
 - **Chart authoring** — extraction is in; typed chart emission is not. Image
   authoring exists on the `Workbook` editing layer only (writer matrix
   footnote ⁵); the fresh `Writer` has none yet.

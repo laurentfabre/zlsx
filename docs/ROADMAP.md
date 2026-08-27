@@ -95,6 +95,7 @@ Status vocabulary is fixed by the site's pill styling — use only these:
 | D1 | Compute formulas | done | 41 PRs | C1 | Work out what the formulas in a workbook come to, and write the answers back where Excel would. Reversed 2026-08-02 — no longer out of scope. The whole ladder, M-1 to M9d, is in `goal_formula.md`; **v1 complete 2026-08-07** — all 175 frozen names registered, the §13 release gate and §9 perf checks run at M9d. |
 | D2 | Author charts | deferred | — | B1 | Deferred on the same reasoning — until row S9 of `goal_sigmoid.md` reverses it for fresh workbooks (needs S5). |
 | S0 | Doc truth + surface inventory | done | 3–5 d | — | The first row of the `goal_sigmoid.md` ladder. Reconciled every stale surface claim (the README writer-image footnote described an emission surface the fresh `Writer` never had — image authoring is `Workbook.addImage*`, Zig-only; the Python README called structural edits "a follow-up plan" and the engine "0.9.0+" when both shipped in 0.8.0; this file queued `to_bytes()` after #152 shipped it) and froze the four-surface capability matrix, `docs/plans/surface-matrix.md`, that every later row updates (lint in CI). The inventory also found the pivot guard sees hosting sheets only, no aggregate ZIP budget on any path, the fresh `Writer` a private build module, and four Zig-only surfaces no row covered — the S0 gate (2026-08-26) added rows S3d, S3e, S5b, S11, widened S3b, and recorded six `n/a` rulings. |
+| S6 | Pivot topology + typed read | partial | 3–4 wk | S1 | Read every pivot as a typed graph — tables with their host sheet and output rectangle, caches with their source resolved to the sheet it reads from (a `sheet` attribute, a table's host, or a defined name's body), field schema, records part — on Zig (`Workbook.pivotTables`) and the CLI (`zlsx pivots`, contract in `docs/cli.md`); the parts stay byte-preserved. Answered the pivot-guard audit: a sheet a pivot only *reads from* is admitted by the edit guard, pinned by tests; S7b closes it. The C and Python legs follow the S6 owner gate (the NDJSON shape). |
 
 <!-- ROADMAP:END -->
 
@@ -266,8 +267,10 @@ Refusal state: **every row/col-edit refusal axis with a rewriter is lifted** on
 `xm:sqref` #140 and `<xm:f>` S2). One axis stays refused, with an actual guard:
 **pivots** (#139). The pivot guard walks the edited sheet's relationships, so
 it catches sheets that *host* a pivot; a sheet a pivot only *reads from*
-(`worksheetSource` in the cache definition) is not detected today — auditing
-that is S6's first job. Full axis table: `docs/plans/refusal-audit.md`.
+(`worksheetSource` in the cache definition) is not detected — S6's audit
+pinned that (tests in `pkg/editor.zig`), and `Workbook.pivotTables` now
+resolves every source sheet, which is what S7b guards on. Full axis table:
+`docs/plans/refusal-audit.md`.
 
 ---
 

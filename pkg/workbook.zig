@@ -51,6 +51,8 @@ const coords = @import("zlsx_refs");
 const drawing_edit = @import("drawing_edit.zig");
 const vml_edit = @import("vml_edit.zig");
 const table_edit = @import("table_edit.zig");
+/// S6: the pivot graph, read-only (`Workbook.pivotTables`).
+const pivots_mod = @import("pivots.zig");
 const sst_plan_mod = @import("zlsx_sst_plan");
 const styles_plan_mod = @import("zlsx_styles_plan");
 const workbook_xml_plan_mod = @import("zlsx_workbook_xml_plan");
@@ -446,6 +448,10 @@ pub const Error = error{
     FormulaResultNotRepresentable,
     /// Any §9 limit, including §5.7.4's counted retention.
     FormulaLimitExceeded,
+    /// S6: a pivot part reached through the relationship graph cannot
+    /// be read (`Workbook.pivotTables`). The typed read refuses whole
+    /// rather than listing the pivots it could parse.
+    MalformedPivotXml,
 } || workbook_xml_mod.Error || sheet_xml_mod.ParseError || sst_xml_mod.Error || styles_xml_mod.Error || store_mod.Error ||
     workbook_xml_plan_mod.Error ||
     embedding_part.Error ||
@@ -1501,6 +1507,21 @@ pub const Workbook = struct {
     /// Calc properties from `xl/workbook.xml`.
     pub fn calcProperties(self: *const Workbook) workbook_xml_mod.CalcProperties {
         return self.workbook.calc;
+    }
+
+    /// S6: every pivot table with its host sheet, output rectangle,
+    /// field roles and axes, and every pivot cache with its source —
+    /// resolved to the sheet it reads from when the source is local —
+    /// its field schema and its records part. Read-only; the parts
+    /// stay byte-preserved. Caller owns the result (`deinit`); leaf
+    /// strings stay valid for the `Workbook`'s lifetime.
+    ///
+    /// Not cached on the workbook: the walk is a handful of small
+    /// parts and no accessor on this type mutates a pivot, so there is
+    /// no invalidation to get wrong. `MalformedPivotXml` when a pivot
+    /// part the graph reaches cannot be read.
+    pub fn pivotTables(self: *Workbook) Error!pivots_mod.Pivots {
+        return pivots_mod.collect(self.allocator, &self.store, &self.workbook);
     }
 
     /// **Internal (§5.6f).** Evaluate one formula against this
