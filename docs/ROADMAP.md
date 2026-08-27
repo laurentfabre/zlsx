@@ -10,7 +10,7 @@
 > `docs/kb/build_site.py` parses the table below at build time. Edit this
 > file, re-run `python3 docs/kb/build_site.py`, and the site follows.
 
-_Last updated: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0_
+_Last updated: 2026-08-28 · `main` at `833b305` · v0.8.0, Zig 0.16.0_
 
 ---
 

@@ -1954,7 +1954,9 @@ fn runMain(init: std.process.Init) !u8 {
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
         .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
         .embed => return try runEmbedCommand(alloc, proc_io, args, out, err),
-        .pivots => return try runPivotsCommand(alloc, proc_io, args, out, err),
+        // The legacy --list-sheets flag overrides every read
+        // sub-command, this one included: it takes the Book path below.
+        .pivots => if (!args.list_sheets) return try runPivotsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -8828,6 +8830,14 @@ test "parseArgs routes 'pivots' and rejects row-keyed flags on it" {
         const a = try parseArgs(&argv);
         try std.testing.expectEqual(Subcommand.pivots, a.subcommand);
         try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    {
+        // The legacy override parses alongside the sub-command; the
+        // dispatch honours it before the pivot path.
+        const argv = [_][]const u8{ "pivots", "f.xlsx", "--list-sheets" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.pivots, a.subcommand);
+        try std.testing.expect(a.list_sheets);
     }
     {
         const argv = [_][]const u8{ "pivots", "f.xlsx", "--range", "A1:B2" };

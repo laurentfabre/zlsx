@@ -744,27 +744,62 @@ pub const max_prefix_len = 32;
 /// on the heap.
 const max_depth = 64;
 
+/// Most prefixes one document may bind to the relationships namespace
+/// at once. Office binds one (`r`); a conforming producer may alias it,
+/// and past this many the part is refused rather than an alias dropped.
+pub const max_rel_aliases = 4;
+
 /// What an element's ancestors say about the relationships namespace —
 /// the environment XML scopes `xmlns` declarations through.
 pub const NsEnv = struct {
-    /// The prefix bound to the relationships namespace in scope, or
-    /// null when none is (never declared, or the inherited one rebound
-    /// to a foreign URI on the way down).
-    rel_prefix: ?[]const u8 = null,
+    /// Every prefix bound to the relationships namespace in scope.
+    /// Empty when none is (never declared, or every inherited one
+    /// rebound to a foreign URI on the way down).
+    prefixes: [max_rel_aliases][]const u8 = undefined,
+    count: u8 = 0,
     /// Whether anything in scope has said something about it. Only a
     /// document that never declares the relationships namespace at all
     /// gets the any-prefix tolerance for `r:id`.
     declared: bool = false,
 
-    /// The environment a child sees: its own relationships binding
-    /// wins; rebinding the inherited prefix to a foreign URI unbinds
-    /// it; otherwise the parent's environment carries down.
-    pub fn forChild(self: NsEnv, child_attrs: []const u8) NsEnv {
-        if (bindingPrefix(child_attrs, &rel_ns_uris)) |p| return .{ .rel_prefix = p, .declared = true };
-        if (self.rel_prefix) |p| {
-            if (declaredBinding(child_attrs, p) != null) return .{ .rel_prefix = null, .declared = true };
+    /// By pointer: a slice into a by-value copy would dangle.
+    pub fn inScope(self: *const NsEnv) []const []const u8 {
+        return self.prefixes[0..self.count];
+    }
+
+    fn has(self: *const NsEnv, prefix: []const u8) bool {
+        for (self.inScope()) |p| if (std.mem.eql(u8, p, prefix)) return true;
+        return false;
+    }
+
+    /// The environment a child sees: every `xmlns:X` the child declares
+    /// to the relationships namespace joins the set, every in-scope
+    /// prefix the child rebinds to a foreign URI leaves it, and the
+    /// rest carries down. Declaration order never matters.
+    pub fn forChild(self: NsEnv, child_attrs: []const u8) Error!NsEnv {
+        var out = self;
+        var it: AttrIter = .{ .attrs = child_attrs };
+        while (it.next()) |a| {
+            if (!std.mem.startsWith(u8, a.name, "xmlns:")) continue;
+            const prefix = a.name["xmlns:".len..];
+            if (isOneOf(a.value, &rel_ns_uris)) {
+                out.declared = true;
+                if (out.has(prefix)) continue;
+                if (out.count == max_rel_aliases) return error.MalformedXml;
+                out.prefixes[out.count] = prefix;
+                out.count += 1;
+            } else if (out.has(prefix)) {
+                out.declared = true;
+                var kept: NsEnv = .{ .declared = true };
+                for (out.inScope()) |p| {
+                    if (std.mem.eql(u8, p, prefix)) continue;
+                    kept.prefixes[kept.count] = p;
+                    kept.count += 1;
+                }
+                out = kept;
+            }
         }
-        return self;
+        return out;
     }
 };
 
@@ -817,11 +852,8 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         if (declaredBinding(attrs, prefix)) |uri| {
             if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
         }
-        const env: NsEnv = if (bindingPrefix(attrs, &rel_ns_uris)) |rp|
-            .{ .rel_prefix = rp, .declared = true }
-        else
-            .{};
-        if (env.rel_prefix) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
+        const env = try (NsEnv{}).forChild(attrs);
+        for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const body_end = try endOfQ(xml, hit, qname);
         return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = body_end };
     }
@@ -994,7 +1026,7 @@ pub const Children = struct {
                     .local = local,
                     .hit = hit,
                     .end = child_end,
-                    .env = self.env.forChild(xml[hit.attrs_start..hit.attrs_end]),
+                    .env = try self.env.forChild(xml[hit.attrs_start..hit.attrs_end]),
                 };
             }
         }
@@ -1114,18 +1146,6 @@ fn countBindings(attrs: []const u8, uris: []const []const u8) usize {
     return n;
 }
 
-/// The prefix `xmlns:PREFIX` binds to one of `uris` on this element,
-/// or null. A default binding (`xmlns="…"`) does not apply to
-/// attributes and is not returned.
-fn bindingPrefix(attrs: []const u8, uris: []const []const u8) ?[]const u8 {
-    var it: AttrIter = .{ .attrs = attrs };
-    while (it.next()) |a| {
-        if (!std.mem.startsWith(u8, a.name, "xmlns:")) continue;
-        if (isOneOf(a.value, uris)) return a.name["xmlns:".len..];
-    }
-    return null;
-}
-
 fn isXmlnsDecl(name: []const u8) bool {
     return std.mem.eql(u8, name, "xmlns") or std.mem.startsWith(u8, name, "xmlns:");
 }
@@ -1153,31 +1173,24 @@ fn isOneOf(uri: []const u8, uris: []const []const u8) bool {
 
 /// A relationships-namespace attribute (`r:id`) on an element, raw,
 /// resolved in the environment its ancestors scope (`env`, the parent's
-/// — the element's own declarations are read here). A prefix the
-/// element itself declares counts only if it declares it to the
-/// relationships namespace — `xmlns:r="urn:vendor" r:id="…"` is a
-/// vendor's attribute even under an ancestor's `r`. Otherwise the
-/// prefix must be the one in scope; when nothing in the document has
-/// ever declared the namespace the attribute is matched under any
-/// prefix, which tolerates a producer that left the declaration out.
-/// `xmlns:*` declarations never match.
+/// — the element's own declarations are folded in here). The prefix
+/// must be one bound to the relationships namespace in scope;
+/// `xmlns:r="urn:vendor" r:id="…"` is a vendor's attribute even under
+/// an ancestor's `r`. When nothing in the document has ever declared
+/// the namespace the attribute is matched under any prefix, which
+/// tolerates a producer that left the declaration out. `xmlns:*`
+/// declarations never match. An element binding more aliases than
+/// `max_rel_aliases` matches nothing, as its part is refused.
 pub fn nsAttr(attrs: []const u8, env: NsEnv, local: []const u8) ?[]const u8 {
-    const here = env.forChild(attrs);
+    const here = env.forChild(attrs) catch return null;
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
         const c = std.mem.indexOfScalar(u8, a.name, ':') orelse continue;
         const prefix = a.name[0..c];
         if (prefix.len == 0 or std.mem.eql(u8, prefix, "xmlns")) continue;
         if (!std.mem.eql(u8, a.name[c + 1 ..], local)) continue;
-        if (declaredBinding(attrs, prefix)) |uri| {
-            if (isOneOf(uri, &rel_ns_uris)) return a.value;
-            continue;
-        }
-        if (here.rel_prefix) |b| {
-            if (std.mem.eql(u8, prefix, b)) return a.value;
-        } else if (!here.declared) {
-            return a.value;
-        }
+        if (here.has(prefix)) return a.value;
+        if (here.count == 0 and !here.declared) return a.value;
     }
     return null;
 }
@@ -1360,9 +1373,9 @@ test "parseCacheDefinition: r:id is bound to the relationships namespace, not an
     defer s.deinit(testing.allocator);
     try testing.expectEqualStrings("rId1", s.r_id.?);
     try testing.expectEqualStrings("rId2", s.source.worksheet.?.r_id.?);
-    // … a binding on the element itself wins over the root's …
+    // … a binding on the element itself is as good as the root's …
     const local =
-        \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet"><worksheetSource xmlns:q="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="wrong" q:id="rId7" sheet="S" ref="A1"/></cacheSource></pivotCacheDefinition>
+        \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet"><worksheetSource xmlns:q="http://schemas.openxmlformats.org/officeDocument/2006/relationships" q:id="rId7" sheet="S" ref="A1"/></cacheSource></pivotCacheDefinition>
     ;
     var l = try parseCacheDefinition(testing.allocator, local);
     defer l.deinit(testing.allocator);
@@ -1693,9 +1706,37 @@ test "nsAttr: bound prefix wins, xmlns declarations never match, bare name never
         \\ xmlns:r="urn:r" id="bare" xmlns:id="urn:id" rel:id="rId7"
     ;
     try testing.expectEqualStrings("rId7", nsAttr(attrs, .{}, "id").?);
-    try testing.expect(nsAttr(attrs, .{ .rel_prefix = "r", .declared = true }, "id") == null);
+    try testing.expect(nsAttr(attrs, try (NsEnv{}).forChild(" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\""), "id") == null);
     try testing.expect(nsAttr(" id=\"bare\" xmlns:id=\"u\"", .{}, "id") == null);
-    try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", .{ .rel_prefix = "r", .declared = true }, "id") == null);
+    try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", try (NsEnv{}).forChild(" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\""), "id") == null);
+}
+
+test "NsEnv: several aliases of the relationships namespace, in either order, and one rebound" {
+    const rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const orders = [_][]const u8{
+        " xmlns:r=\"" ++ rel ++ "\" xmlns:q=\"" ++ rel ++ "\"",
+        " xmlns:q=\"" ++ rel ++ "\" xmlns:r=\"" ++ rel ++ "\"",
+    };
+    for (orders) |root_attrs| {
+        const env = try (NsEnv{}).forChild(root_attrs);
+        try testing.expectEqual(@as(u8, 2), env.count);
+        try testing.expectEqualStrings("rIdQ", nsAttr(" q:id=\"rIdQ\"", env, "id").?);
+        try testing.expectEqualStrings("rIdR", nsAttr(" r:id=\"rIdR\"", env, "id").?);
+        // Rebinding `q` alone leaves `r` in scope.
+        const child = try env.forChild(" xmlns:q=\"urn:vendor\"");
+        try testing.expectEqual(@as(u8, 1), child.count);
+        try testing.expect(nsAttr(" q:id=\"bad\"", child, "id") == null);
+        try testing.expectEqualStrings("rIdR", nsAttr(" r:id=\"rIdR\"", child, "id").?);
+    }
+    // Past the alias bound the part is refused.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator, "<pivotCacheDefinition xmlns:a=\"" ++ rel ++ "\" xmlns:b=\"" ++ rel ++ "\" xmlns:c=\"" ++ rel ++ "\" xmlns:d=\"" ++ rel ++ "\" xmlns:e=\"" ++ rel ++ "\"><cacheSource type=\"worksheet\"/></pivotCacheDefinition>"));
+    // A second alias declared on an ancestor, used below it.
+    const two =
+        \\<pivotCacheDefinition xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:q="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cacheSource type="worksheet"><worksheetSource q:id="rIdExt" sheet="Data" ref="A1"/></cacheSource></pivotCacheDefinition>
+    ;
+    var d = try parseCacheDefinition(testing.allocator, two);
+    defer d.deinit(testing.allocator);
+    try testing.expectEqualStrings("rIdExt", d.source.worksheet.?.r_id.?);
 }
 
 test "nsAttr: the relationships prefix scopes through ancestors" {

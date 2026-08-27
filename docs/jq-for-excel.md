@@ -63,7 +63,7 @@ This is a **different schema** that consumers opt into explicitly — not a sile
 | `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
 | `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
 | `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
-| `zlsx pivots <file>` | `"pivot"`, `"pivot_cache"` | `sheet, sheet_idx, name, part, location, rows, cols, pages, values, data_caption, grand_totals, style, cache` — contract in [cli.md](cli.md#pivots--the-typed-pivot-read) |
+| `zlsx pivots <file>` | `"pivot"`, `"pivot_cache"` | `sheet, sheet_idx, name, part, location, rows, cols, pages, values, data_caption, grand_totals, style, cache` — contract in [cli.md](cli.md#pivots--the-typed-pivot-read). `pivot_cache` records (caches no pivot reads) are workbook-scoped: no `sheet` |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` *(no sheet — workbook-wide)* |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` *(no sheet — workbook-wide)* |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then one per sheet |
