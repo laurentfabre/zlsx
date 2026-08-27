@@ -6017,13 +6017,13 @@ pub const Workbook = struct {
 /// Iterator over `<tablePart r:id>` elements inside a worksheet's
 /// `<tableParts>` block. Yields the rid string for each child.
 /// Allocator-free, single-pass.
-const TablePartRidIterator = struct {
+pub const TablePartRidIterator = struct {
     sheet_xml: []const u8,
     cursor: usize,
     block_end: usize,
     found_block: bool,
 
-    fn init(sheet_xml: []const u8) TablePartRidIterator {
+    pub fn init(sheet_xml: []const u8) TablePartRidIterator {
         // Locate `<tableParts>` open + matching close. Leave
         // cursor inside the block; on absence, set cursor == end.
         // Comment/CDATA/PI decoys are skipped on both the open and
@@ -6064,7 +6064,7 @@ const TablePartRidIterator = struct {
         return .{ .sheet_xml = sheet_xml, .cursor = 0, .block_end = 0, .found_block = false };
     }
 
-    fn next(self: *TablePartRidIterator) ?[]const u8 {
+    pub fn next(self: *TablePartRidIterator) ?[]const u8 {
         if (!self.found_block) return null;
         while (self.cursor < self.block_end) {
             const lt = std.mem.indexOfScalarPos(u8, self.sheet_xml, self.cursor, '<') orelse return null;

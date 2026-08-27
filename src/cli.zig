@@ -836,7 +836,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  --skip N          drop the first N emitted records (iter59a).
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
-        \\                    hyperlinks / styles / sst. Ignored by meta
+        \\                    hyperlinks / pivots / styles / sst. Ignored by meta
         \\                    and list-sheets.
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
@@ -4078,7 +4078,7 @@ fn writePivotRecord(
     try out.writeAll(",\"part\":");
     try writeJsonString(out, pt.part_name);
     try out.writeAll(",\"location\":{\"ref\":");
-    try writeJsonString(out, def.location.ref);
+    try writeJsonString(out, pt.location_ref);
     try out.writeAll(",\"first_header_row\":");
     try writeJsonOptU32(out, def.location.first_header_row);
     try out.writeAll(",\"first_data_row\":");

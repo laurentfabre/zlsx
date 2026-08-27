@@ -335,7 +335,7 @@ fn isXmlTrue(s: []const u8) bool {
 /// — the value was never a valid scalar. Unknown named entities pass
 /// their `&` through verbatim, matching `store.decodeXmlEntities`'s
 /// lenient contract.
-fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
+pub fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
     var n: usize = 0;
     var i: usize = 0;
     while (i < s.len) {

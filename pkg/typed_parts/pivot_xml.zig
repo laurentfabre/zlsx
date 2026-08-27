@@ -24,14 +24,16 @@
 //! a parser's indexing with a second scanner is how a decoy becomes a
 //! corruption (the `<tableParts>` lesson, Codex #190 r1).
 //!
-//! **Strict where a lie would be cheap.** A part is either read whole
-//! or refused (`MalformedXml`): every element the parser consumes must
-//! close (`<location ref="A1">` with no `</location>` is not a
-//! location), a raw `<` inside an attribute value cannot spoof a tag,
-//! an attribute that is present but unreadable (`cacheId="abc"`,
+//! **One tree, read by its direct children.** `preflight` checks the
+//! part is one balanced element tree (UTF-8, every tag closed, closes
+//! matching opens, attributes well formed, nothing after the root), and
+//! every parser walks the DIRECT children of the element it is reading
+//! (`Children`) — a `<location>` nested inside some extension is not
+//! the pivot's location, and a second `<cacheSource>` is a refusal. An
+//! attribute that is present but unreadable (`cacheId="abc"`,
 //! `rowGrandTotals="maybe"`) is a refusal rather than an absence or a
-//! default, and a same-name element nested inside another (which these
-//! schemas never do) closes by depth, not by the first `</…>`.
+//! default; scalar attributes are entity-decoded first, so
+//! `recordCount="&#51;"` is 3 and `"1_0"` is nothing.
 //!
 //! Lifetime contract: every `[]const u8` field borrows from the `xml`
 //! handed to the parser and is **not decoded** — attribute values are
@@ -49,13 +51,15 @@
 //! a prefix (`<x:pivotCacheDefinition xmlns:x="…">`), and Strict OOXML
 //! binds a different URI to it. The parser reads the root element's
 //! prefix once and matches every child under it; it never matches on
-//! the URI, so Strict and Transitional parts parse alike. A root that
-//! binds the main namespace twice (a prefix *and* the default, or two
-//! prefixes) is refused rather than half-read under one of them. The
-//! relationships namespace is resolved from its `xmlns` declaration on
-//! the root (or the element itself) so `r:id` cannot be shadowed by a
-//! foreign `vendor:id`. Comments, CDATA and processing instructions are
-//! skipped through the shared decoy-aware scanner in `workbook_xml.zig`.
+//! the URI, so Strict and Transitional parts parse alike. A root whose
+//! own binding is declared to a foreign URI is not a pivot part, and a
+//! root that binds the main namespace twice (a prefix *and* the
+//! default, or two prefixes) is refused rather than half-read under one
+//! of them. The relationships namespace is resolved from its `xmlns`
+//! declaration on the root (or the element itself) so `r:id` cannot be
+//! shadowed by a foreign `vendor:id`, nor claimed by an element that
+//! rebinds `r`. Comments, CDATA and processing instructions are skipped
+//! through the shared decoy-aware scanner in `workbook_xml.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -66,7 +70,7 @@ pub const Error = error{
     OutOfMemory,
     /// The part is not the pivot part it was handed as, a required
     /// element or attribute is missing or unreadable, an element does
-    /// not close, or the markup is not well formed.
+    /// not close, or the markup is not one well-formed tree.
     MalformedXml,
 };
 
@@ -166,6 +170,7 @@ pub const CacheField = struct {
 
 pub const CacheDefinition = struct {
     /// `r:id` on the root — the relationship to `pivotCacheRecordsN.xml`.
+    /// Raw (entity-encoded as written).
     r_id: ?[]const u8,
     record_count: ?u32,
     refreshed_by: ?[]const u8,
@@ -204,7 +209,6 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
     assert(xml.len < (1 << 31));
     const root = try scanRoot(xml, "pivotCacheDefinition");
     const attrs = xml[root.hit.attrs_start..root.hit.attrs_end];
-    const p = root.prefix;
 
     var def: CacheDefinition = .{
         .r_id = nsAttr(attrs, root.rel_prefix, "id"),
@@ -225,68 +229,66 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
         .fields = &.{},
         .fields_count_attr = null,
     };
-    const body_end = root.body_end;
+    errdefer def.deinit(allocator);
 
-    // `<cacheSource>` is required by the schema; a definition without
-    // one describes no data and cannot be a pivot's cache.
-    const src_hit = (try findTag(xml[0..body_end], root.hit.after_tag_close, p, "cacheSource")) orelse
-        return error.MalformedXml;
-    def.source = try parseCacheSource(allocator, xml, src_hit, root);
-    errdefer allocator.free(def.source.range_sets);
-
-    if (try findTag(xml[0..body_end], root.hit.after_tag_close, p, "cacheFields")) |cf_hit| {
-        const cf_attrs = xml[cf_hit.attrs_start..cf_hit.attrs_end];
-        def.fields_count_attr = try u32Attr(cf_attrs, "count");
-        const cf_end = try endOf(xml, cf_hit, p, "cacheFields");
-        if (!cf_hit.self_closing) {
-            def.fields = try parseCacheFields(allocator, xml, cf_hit.after_tag_close, cf_end, p);
+    var have_source = false;
+    var have_fields = false;
+    var kids = Children.init(xml, root.hit, root.body_end, root.prefix);
+    while (try kids.next()) |k| {
+        if (std.mem.eql(u8, k.local, "cacheSource")) {
+            // Required, and one: a definition without a source describes
+            // no data, and one with two describes two.
+            if (have_source) return error.MalformedXml;
+            have_source = true;
+            def.source = try parseCacheSource(allocator, xml, k, root);
+        } else if (std.mem.eql(u8, k.local, "cacheFields")) {
+            if (have_fields) return error.MalformedXml;
+            have_fields = true;
+            def.fields_count_attr = try u32Attr(k.attrs(xml), "count");
+            def.fields = try parseCacheFields(allocator, xml, k, root.prefix);
         }
     }
-
+    if (!have_source) return error.MalformedXml;
     return def;
 }
 
-fn parseCacheSource(
-    allocator: Allocator,
-    xml: []const u8,
-    hit: wbxml.TagHit,
-    root: Root,
-) Error!CacheSource {
-    const p = root.prefix;
-    const attrs = xml[hit.attrs_start..hit.attrs_end];
+fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root) Error!CacheSource {
+    const attrs = el.attrs(xml);
     var src: CacheSource = .{
         .connection_id = try u32Attr(attrs, "connectionId"),
     };
     if (wbxml.getAttr(attrs, "type")) |t| {
-        src.type = std.meta.stringToEnum(SourceType, t) orelse .unknown;
+        var buf: [32]u8 = undefined;
+        src.type = if (wbxml.decodeScalarAttr(&buf, t)) |d| std.meta.stringToEnum(SourceType, d) orelse .unknown else .unknown;
         if (src.type == .unknown) src.type_raw = t;
     }
-    const end = try endOf(xml, hit, p, "cacheSource");
-    if (hit.self_closing) return src;
-    const region = xml[0..end];
-
-    if (try findTag(region, hit.after_tag_close, p, "worksheetSource")) |ws| {
-        _ = try endOf(xml, ws, p, "worksheetSource");
-        src.worksheet = parseWorksheetSource(xml, ws, root.rel_prefix);
-    }
-    if (try findTag(region, hit.after_tag_close, p, "rangeSets")) |rs| {
-        const rs_end = try endOf(xml, rs, p, "rangeSets");
-        if (!rs.self_closing) {
-            var sets: std.ArrayListUnmanaged(WorksheetSource) = .empty;
-            errdefer sets.deinit(allocator);
-            var cursor = rs.after_tag_close;
-            while (try findTag(xml[0..rs_end], cursor, p, "rangeSet")) |set_hit| {
-                cursor = try endOf(xml, set_hit, p, "rangeSet");
-                try sets.append(allocator, parseWorksheetSource(xml, set_hit, root.rel_prefix));
+    var kids = Children.init(xml, el.hit, el.end, root.prefix);
+    while (try kids.next()) |k| {
+        if (std.mem.eql(u8, k.local, "worksheetSource")) {
+            if (src.worksheet != null) return error.MalformedXml;
+            src.worksheet = parseWorksheetSource(xml, k, root.rel_prefix);
+        } else if (std.mem.eql(u8, k.local, "consolidation")) {
+            if (src.range_sets.len != 0) return error.MalformedXml;
+            var cons = Children.init(xml, k.hit, k.end, root.prefix);
+            while (try cons.next()) |c| {
+                if (!std.mem.eql(u8, c.local, "rangeSets")) continue;
+                var sets: std.ArrayListUnmanaged(WorksheetSource) = .empty;
+                errdefer sets.deinit(allocator);
+                var rs = Children.init(xml, c.hit, c.end, root.prefix);
+                while (try rs.next()) |set| {
+                    if (!std.mem.eql(u8, set.local, "rangeSet")) continue;
+                    try sets.append(allocator, parseWorksheetSource(xml, set, root.rel_prefix));
+                }
+                allocator.free(src.range_sets);
+                src.range_sets = try sets.toOwnedSlice(allocator);
             }
-            src.range_sets = try sets.toOwnedSlice(allocator);
         }
     }
     return src;
 }
 
-fn parseWorksheetSource(xml: []const u8, hit: wbxml.TagHit, rel_prefix: ?[]const u8) WorksheetSource {
-    const attrs = xml[hit.attrs_start..hit.attrs_end];
+fn parseWorksheetSource(xml: []const u8, el: Child, rel_prefix: ?[]const u8) WorksheetSource {
+    const attrs = el.attrs(xml);
     var ws: WorksheetSource = .{
         .name = wbxml.getAttr(attrs, "name"),
         .sheet = wbxml.getAttr(attrs, "sheet"),
@@ -299,18 +301,13 @@ fn parseWorksheetSource(xml: []const u8, hit: wbxml.TagHit, rel_prefix: ?[]const
     return ws;
 }
 
-fn parseCacheFields(
-    allocator: Allocator,
-    xml: []const u8,
-    from: usize,
-    end: usize,
-    p: []const u8,
-) Error![]CacheField {
+fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]CacheField {
     var out: std.ArrayListUnmanaged(CacheField) = .empty;
     errdefer out.deinit(allocator);
-    var cursor = from;
-    while (try findTag(xml[0..end], cursor, p, "cacheField")) |hit| {
-        const attrs = xml[hit.attrs_start..hit.attrs_end];
+    var kids = Children.init(xml, el.hit, el.end, p);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "cacheField")) continue;
+        const attrs = k.attrs(xml);
         var field: CacheField = .{
             .name = wbxml.getAttr(attrs, "name") orelse return error.MalformedXml,
             .caption = wbxml.getAttr(attrs, "caption"),
@@ -318,14 +315,12 @@ fn parseCacheFields(
             .formula = wbxml.getAttr(attrs, "formula"),
             .database_field = try boolAttr(attrs, "databaseField", true),
         };
-        const field_end = try endOf(xml, hit, p, "cacheField");
-        if (!hit.self_closing) {
-            if (try findTag(xml[0..field_end], hit.after_tag_close, p, "sharedItems")) |si| {
-                _ = try endOf(xml, si, p, "sharedItems");
-                field.shared_items = try parseSharedItems(xml[si.attrs_start..si.attrs_end]);
-            }
+        var inner = Children.init(xml, k.hit, k.end, p);
+        while (try inner.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "sharedItems")) continue;
+            if (field.shared_items != null) return error.MalformedXml;
+            field.shared_items = try parseSharedItems(c.attrs(xml));
         }
-        cursor = field_end;
         try out.append(allocator, field);
     }
     return out.toOwnedSlice(allocator);
@@ -354,7 +349,7 @@ fn parseSharedItems(attrs: []const u8) Error!SharedItems {
 
 /// `CT_Location` — where the pivot renders on its host sheet.
 pub const Location = struct {
-    /// `ref` (ST_Ref, required) — the output rectangle.
+    /// `ref` (ST_Ref, required) — the output rectangle. Raw.
     ref: []const u8,
     /// Where `ref`'s value sits in the input. S7a's splice target.
     ref_span: Span,
@@ -388,8 +383,8 @@ pub const PivotField = struct {
     default_subtotal: bool = true,
     num_fmt_id: ?u32 = null,
     subtotal_caption: ?[]const u8 = null,
-    /// Number of `<item>` children — the field's distinct items as the
-    /// pivot last saw them.
+    /// Number of `<item>` children of `<items>` — the field's distinct
+    /// items as the pivot last saw them.
     item_count: u32 = 0,
 };
 
@@ -532,18 +527,6 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
     const root = try scanRoot(xml, "pivotTableDefinition");
     const attrs = xml[root.hit.attrs_start..root.hit.attrs_end];
     const p = root.prefix;
-    const body_end = root.body_end;
-    const from = root.hit.after_tag_close;
-
-    // `<location>` is required: without it the pivot has no output
-    // rectangle, and the output rectangle is the one thing every
-    // consumer of this part — the S7a lift included — exists for.
-    const loc_hit = (try findTag(xml[0..body_end], from, p, "location")) orelse
-        return error.MalformedXml;
-    _ = try endOf(xml, loc_hit, p, "location");
-    const loc_attrs = xml[loc_hit.attrs_start..loc_hit.attrs_end];
-    const loc_ref = wbxml.getAttr(loc_attrs, "ref") orelse return error.MalformedXml;
-    if (loc_ref.len == 0) return error.MalformedXml;
 
     var def: TableDefinition = .{
         .name = wbxml.getAttr(attrs, "name") orelse return error.MalformedXml,
@@ -561,15 +544,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
         .created_version = try u32Attr(attrs, "createdVersion"),
         .updated_version = try u32Attr(attrs, "updatedVersion"),
         .min_refreshable_version = try u32Attr(attrs, "minRefreshableVersion"),
-        .location = .{
-            .ref = loc_ref,
-            .ref_span = spanOf(xml, loc_ref),
-            .first_header_row = try u32Attr(loc_attrs, "firstHeaderRow"),
-            .first_data_row = try u32Attr(loc_attrs, "firstDataRow"),
-            .first_data_col = try u32Attr(loc_attrs, "firstDataCol"),
-            .row_page_count = try u32Attr(loc_attrs, "rowPageCount"),
-            .col_page_count = try u32Attr(loc_attrs, "colPageCount"),
-        },
+        .location = undefined,
         .fields = &.{},
         .row_fields = &.{},
         .col_fields = &.{},
@@ -579,53 +554,73 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
     };
     errdefer def.deinit(allocator);
 
-    if (try findTag(xml[0..body_end], from, p, "pivotFields")) |hit| {
-        const end = try endOf(xml, hit, p, "pivotFields");
-        if (!hit.self_closing) {
-            def.fields = try parsePivotFields(allocator, xml, hit.after_tag_close, end, p);
+    var have_location = false;
+    var seen = std.enums.EnumSet(enum { fields, rows, cols, pages, data, style }).initEmpty();
+    var kids = Children.init(xml, root.hit, root.body_end, p);
+    while (try kids.next()) |k| {
+        if (std.mem.eql(u8, k.local, "location")) {
+            if (have_location) return error.MalformedXml;
+            have_location = true;
+            const la = k.attrs(xml);
+            const ref = wbxml.getAttr(la, "ref") orelse return error.MalformedXml;
+            if (ref.len == 0) return error.MalformedXml;
+            def.location = .{
+                .ref = ref,
+                .ref_span = spanOf(xml, ref),
+                .first_header_row = try u32Attr(la, "firstHeaderRow"),
+                .first_data_row = try u32Attr(la, "firstDataRow"),
+                .first_data_col = try u32Attr(la, "firstDataCol"),
+                .row_page_count = try u32Attr(la, "rowPageCount"),
+                .col_page_count = try u32Attr(la, "colPageCount"),
+            };
+        } else if (std.mem.eql(u8, k.local, "pivotFields")) {
+            if (seen.contains(.fields)) return error.MalformedXml;
+            seen.insert(.fields);
+            def.fields = try parsePivotFields(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "rowFields")) {
+            if (seen.contains(.rows)) return error.MalformedXml;
+            seen.insert(.rows);
+            def.row_fields = try parseAxisFields(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "colFields")) {
+            if (seen.contains(.cols)) return error.MalformedXml;
+            seen.insert(.cols);
+            def.col_fields = try parseAxisFields(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "pageFields")) {
+            if (seen.contains(.pages)) return error.MalformedXml;
+            seen.insert(.pages);
+            def.page_fields = try parsePageFields(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "dataFields")) {
+            if (seen.contains(.data)) return error.MalformedXml;
+            seen.insert(.data);
+            def.data_fields = try parseDataFields(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "pivotTableStyleInfo")) {
+            if (seen.contains(.style)) return error.MalformedXml;
+            seen.insert(.style);
+            const s = k.attrs(xml);
+            def.style = .{
+                .name = wbxml.getAttr(s, "name"),
+                .show_row_headers = try boolAttr(s, "showRowHeaders", false),
+                .show_col_headers = try boolAttr(s, "showColHeaders", false),
+                .show_row_stripes = try boolAttr(s, "showRowStripes", false),
+                .show_col_stripes = try boolAttr(s, "showColStripes", false),
+                .show_last_column = try boolAttr(s, "showLastColumn", false),
+            };
         }
     }
-    def.row_fields = try parseAxisFields(allocator, xml, body_end, from, p, "rowFields");
-    def.col_fields = try parseAxisFields(allocator, xml, body_end, from, p, "colFields");
-    if (try findTag(xml[0..body_end], from, p, "pageFields")) |hit| {
-        const end = try endOf(xml, hit, p, "pageFields");
-        if (!hit.self_closing) {
-            def.page_fields = try parsePageFields(allocator, xml, hit.after_tag_close, end, p);
-        }
-    }
-    if (try findTag(xml[0..body_end], from, p, "dataFields")) |hit| {
-        const end = try endOf(xml, hit, p, "dataFields");
-        if (!hit.self_closing) {
-            def.data_fields = try parseDataFields(allocator, xml, hit.after_tag_close, end, p);
-        }
-    }
-    if (try findTag(xml[0..body_end], from, p, "pivotTableStyleInfo")) |hit| {
-        _ = try endOf(xml, hit, p, "pivotTableStyleInfo");
-        const s = xml[hit.attrs_start..hit.attrs_end];
-        def.style = .{
-            .name = wbxml.getAttr(s, "name"),
-            .show_row_headers = try boolAttr(s, "showRowHeaders", false),
-            .show_col_headers = try boolAttr(s, "showColHeaders", false),
-            .show_row_stripes = try boolAttr(s, "showRowStripes", false),
-            .show_col_stripes = try boolAttr(s, "showColStripes", false),
-            .show_last_column = try boolAttr(s, "showLastColumn", false),
-        };
-    }
+    // `<location>` is required: without it the pivot has no output
+    // rectangle, and the output rectangle is the one thing every
+    // consumer of this part — the S7a lift included — exists for.
+    if (!have_location) return error.MalformedXml;
     return def;
 }
 
-fn parsePivotFields(
-    allocator: Allocator,
-    xml: []const u8,
-    from: usize,
-    end: usize,
-    p: []const u8,
-) Error![]PivotField {
+fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PivotField {
     var out: std.ArrayListUnmanaged(PivotField) = .empty;
     errdefer out.deinit(allocator);
-    var cursor = from;
-    while (try findTag(xml[0..end], cursor, p, "pivotField")) |hit| {
-        const attrs = xml[hit.attrs_start..hit.attrs_end];
+    var kids = Children.init(xml, el.hit, el.end, p);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "pivotField")) continue;
+        const attrs = k.attrs(xml);
         var f: PivotField = .{
             .name = wbxml.getAttr(attrs, "name"),
             .data_field = try boolAttr(attrs, "dataField", false),
@@ -635,18 +630,18 @@ fn parsePivotFields(
             .subtotal_caption = wbxml.getAttr(attrs, "subtotalCaption"),
         };
         if (wbxml.getAttr(attrs, "axis")) |ax| {
-            f.axis = axisFromXml(ax);
+            var buf: [32]u8 = undefined;
+            f.axis = if (wbxml.decodeScalarAttr(&buf, ax)) |d| axisFromXml(d) else null;
             if (f.axis == null) f.axis_raw = ax;
         }
-        const field_end = try endOf(xml, hit, p, "pivotField");
-        if (!hit.self_closing) {
-            var item_cursor = hit.after_tag_close;
-            while (try findTag(xml[0..field_end], item_cursor, p, "item")) |item| {
-                f.item_count += 1;
-                item_cursor = try endOf(xml, item, p, "item");
+        var inner = Children.init(xml, k.hit, k.end, p);
+        while (try inner.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "items")) continue;
+            var items = Children.init(xml, c.hit, c.end, p);
+            while (try items.next()) |it| {
+                if (std.mem.eql(u8, it.local, "item")) f.item_count += 1;
             }
         }
-        cursor = field_end;
         try out.append(allocator, f);
     }
     return out.toOwnedSlice(allocator);
@@ -660,25 +655,14 @@ fn axisFromXml(s: []const u8) ?Axis {
     return null;
 }
 
-fn parseAxisFields(
-    allocator: Allocator,
-    xml: []const u8,
-    body_end: usize,
-    from: usize,
-    p: []const u8,
-    block: []const u8,
-) Error![]AxisField {
-    const hit = (try findTag(xml[0..body_end], from, p, block)) orelse return &.{};
-    const end = try endOf(xml, hit, p, block);
-    if (hit.self_closing) return &.{};
+fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]AxisField {
     var out: std.ArrayListUnmanaged(AxisField) = .empty;
     errdefer out.deinit(allocator);
-    var cursor = hit.after_tag_close;
-    while (try findTag(xml[0..end], cursor, p, "field")) |f| {
-        const attrs = xml[f.attrs_start..f.attrs_end];
-        const x = (try i32Attr(attrs, "x")) orelse return error.MalformedXml;
+    var kids = Children.init(xml, el.hit, el.end, p);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "field")) continue;
+        const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
         try out.append(allocator, try ordinalOrValues(x));
-        cursor = try endOf(xml, f, p, "field");
     }
     return out.toOwnedSlice(allocator);
 }
@@ -691,18 +675,13 @@ fn ordinalOrValues(x: i32) Error!AxisField {
     return error.MalformedXml;
 }
 
-fn parsePageFields(
-    allocator: Allocator,
-    xml: []const u8,
-    from: usize,
-    end: usize,
-    p: []const u8,
-) Error![]PageField {
+fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PageField {
     var out: std.ArrayListUnmanaged(PageField) = .empty;
     errdefer out.deinit(allocator);
-    var cursor = from;
-    while (try findTag(xml[0..end], cursor, p, "pageField")) |hit| {
-        const attrs = xml[hit.attrs_start..hit.attrs_end];
+    var kids = Children.init(xml, el.hit, el.end, p);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "pageField")) continue;
+        const attrs = k.attrs(xml);
         const fld = (try i32Attr(attrs, "fld")) orelse return error.MalformedXml;
         try out.append(allocator, .{
             .fld = try ordinalOrValues(fld),
@@ -711,23 +690,17 @@ fn parsePageFields(
             .name = wbxml.getAttr(attrs, "name"),
             .cap = wbxml.getAttr(attrs, "cap"),
         });
-        cursor = try endOf(xml, hit, p, "pageField");
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn parseDataFields(
-    allocator: Allocator,
-    xml: []const u8,
-    from: usize,
-    end: usize,
-    p: []const u8,
-) Error![]DataField {
+fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]DataField {
     var out: std.ArrayListUnmanaged(DataField) = .empty;
     errdefer out.deinit(allocator);
-    var cursor = from;
-    while (try findTag(xml[0..end], cursor, p, "dataField")) |hit| {
-        const attrs = xml[hit.attrs_start..hit.attrs_end];
+    var kids = Children.init(xml, el.hit, el.end, p);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "dataField")) continue;
+        const attrs = k.attrs(xml);
         var df: DataField = .{
             .name = wbxml.getAttr(attrs, "name"),
             .fld = (try u32Attr(attrs, "fld")) orelse return error.MalformedXml,
@@ -737,11 +710,11 @@ fn parseDataFields(
             .num_fmt_id = try u32Attr(attrs, "numFmtId"),
         };
         if (wbxml.getAttr(attrs, "subtotal")) |s| {
-            df.subtotal = ConsolidateFunction.fromXml(s);
+            var buf: [32]u8 = undefined;
+            df.subtotal = if (wbxml.decodeScalarAttr(&buf, s)) |d| ConsolidateFunction.fromXml(d) else .unknown;
             if (df.subtotal == .unknown) df.subtotal_raw = s;
         }
         try out.append(allocator, df);
-        cursor = try endOf(xml, hit, p, "dataField");
     }
     return out.toOwnedSlice(allocator);
 }
@@ -750,9 +723,9 @@ fn parseDataFields(
 //
 // Public below the parsers because `pkg/pivots.zig` reads
 // `<pivotCaches>` out of `xl/workbook.xml` with the same rules —
-// the root's prefix, the root's relationships binding, elements that
-// must close — and a second scanner with slightly different rules is
-// the class of bug this file exists to avoid.
+// the root's prefix, the root's relationships binding, direct
+// children only — and a second scanner with slightly different rules
+// is the class of bug this file exists to avoid.
 
 /// Longest namespace prefix this parser will bind. Prefixes in real
 /// parts are one to three characters; the bound exists so the tag-name
@@ -760,6 +733,10 @@ fn parseDataFields(
 /// refused rather than truncated into a wrong match.
 pub const max_prefix_len = 32;
 const max_local_len = 40;
+/// Deepest element nesting the preflight follows. Pivot parts nest
+/// about eight deep; a part past this is refused rather than tracked
+/// on the heap.
+const max_depth = 64;
 
 pub const Root = struct {
     hit: wbxml.TagHit,
@@ -770,14 +747,14 @@ pub const Root = struct {
     /// without the colon, or null when the root declares none.
     rel_prefix: ?[]const u8,
     /// Index of the `<` of the root's closing tag — the bound every
-    /// child search runs under. For a self-closing root, the end of
-    /// the root tag itself.
+    /// child walk runs under. For a self-closing root, the end of the
+    /// root tag itself.
     body_end: usize,
 };
 
-/// Check the part's markup is well formed enough to scan, locate the
-/// root element, check its local name, and learn its prefixes.
-/// Anything before the root (XML declaration, comments) is skipped.
+/// Check the part is one well-formed tree, locate the root element,
+/// check its local name, and learn its prefixes. Anything before the
+/// root (XML declaration, comments) is skipped.
 pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
     try preflight(xml);
     var i: usize = 0;
@@ -813,25 +790,21 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         }
         const rel_prefix = bindingPrefix(attrs, &rel_ns_uris);
         if (rel_prefix) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
-        const body_end = try endOf(xml, hit, prefix, local);
+        const body_end = try endOfQ(xml, hit, qname);
         return .{ .hit = hit, .prefix = prefix, .rel_prefix = rel_prefix, .body_end = body_end };
     }
     return error.MalformedXml;
 }
 
-/// Deepest element nesting the preflight follows. Pivot parts nest
-/// about eight deep; a part past this is refused rather than tracked
-/// on the heap.
-const max_depth = 64;
-
 /// One decoy-aware pass over the markup that refuses what would let a
 /// tag search see an element that is not one (Codex #199 r1 REL-002,
-/// r2 REL-009): bytes that are not UTF-8; a `<` that opens neither a
-/// tag nor a construct the scanner skips; a raw `<` anywhere inside a
-/// tag, quoted or not; a tag that never closes; a close tag that does
-/// not match the innermost open one (so `<a><b></a></b>` and a child
-/// closing after its root are refused); an element after the root has
-/// closed; an element still open at the end.
+/// r2 REL-009, r3 REL-017): bytes that are not UTF-8; a `<` that opens
+/// neither a tag nor a construct the scanner skips; a tag whose
+/// attributes are not `name="value"` pairs, or that never closes; a
+/// raw `<` anywhere inside a tag; a close tag that does not match the
+/// innermost open one (so `<a><b></a></b>` and a child closing after
+/// its root are refused); a second element once the root — explicit
+/// or self-closing — has closed; an element still open at the end.
 fn preflight(xml: []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedXml;
     var stack: [max_depth][]const u8 = undefined;
@@ -858,62 +831,145 @@ fn preflight(xml: []const u8) Error!void {
             i = j + 1;
             continue;
         }
-        const c = xml[lt + 1];
-        if (!(std.ascii.isAlphabetic(c) or c == '_' or c == ':')) return error.MalformedXml;
+        if (!isNameStart(xml[lt + 1])) return error.MalformedXml;
         if (root_closed) return error.MalformedXml;
         var j = lt + 1;
         while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
         const qname = xml[lt + 1 .. j];
-        var quote: ?u8 = null;
-        var self_closing = false;
-        while (j < xml.len) : (j += 1) {
-            const b = xml[j];
-            if (quote) |q| {
-                if (b == q) {
-                    quote = null;
-                } else if (b == '<') {
-                    return error.MalformedXml;
-                }
-            } else if (b == '"' or b == '\'') {
-                quote = b;
-            } else if (b == '<') {
-                return error.MalformedXml;
-            } else if (b == '>') {
-                self_closing = xml[j - 1] == '/';
-                break;
-            }
-        }
-        if (j >= xml.len) return error.MalformedXml;
-        if (!self_closing) {
+        const tag_end = try attributesEnd(xml, j);
+        if (!tag_end.self_closing) {
             if (depth >= max_depth) return error.MalformedXml;
             stack[depth] = qname;
             depth += 1;
+        } else if (depth == 0) {
+            root_closed = true;
         }
-        i = j + 1;
+        i = tag_end.after_gt;
     }
     if (depth != 0) return error.MalformedXml;
+}
+
+const TagEnd = struct { after_gt: usize, self_closing: bool };
+
+/// Walk a start tag's attribute region from just past its name to its
+/// `>`, requiring `name = "value"` pairs (either quote, `=` with
+/// optional whitespace on both sides) and nothing else. A raw `<`
+/// anywhere is refused. Returns where the tag ends.
+fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
+    var j = from;
+    while (true) {
+        while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
+        if (j >= xml.len) return error.MalformedXml;
+        if (xml[j] == '>') return .{ .after_gt = j + 1, .self_closing = false };
+        if (xml[j] == '/') {
+            if (j + 1 < xml.len and xml[j + 1] == '>') return .{ .after_gt = j + 2, .self_closing = true };
+            return error.MalformedXml;
+        }
+        if (!isNameStart(xml[j])) return error.MalformedXml;
+        while (j < xml.len and xml[j] != '=' and !std.ascii.isWhitespace(xml[j]) and xml[j] != '<' and xml[j] != '>' and xml[j] != '/') j += 1;
+        while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
+        if (j >= xml.len or xml[j] != '=') return error.MalformedXml;
+        j += 1;
+        while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
+        if (j >= xml.len or (xml[j] != '"' and xml[j] != '\'')) return error.MalformedXml;
+        const quote = xml[j];
+        j += 1;
+        while (j < xml.len and xml[j] != quote) : (j += 1) {
+            if (xml[j] == '<') return error.MalformedXml;
+        }
+        if (j >= xml.len) return error.MalformedXml;
+        j += 1;
+    }
+}
+
+fn isNameStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c == ':';
 }
 
 fn isNameBoundary(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>';
 }
 
-/// `<prefix:local` search bounded by `region.len`, decoy-aware.
-pub fn findTag(region: []const u8, from: usize, prefix: []const u8, local: []const u8) Error!?wbxml.TagHit {
-    assert(local.len <= max_local_len);
-    if (from >= region.len) return null;
-    var buf: [max_prefix_len + 1 + max_local_len]u8 = undefined;
-    const tag = qualify(&buf, prefix, local);
-    return wbxml.findTagOpen(region, from, tag) catch |e| return narrow(e);
+/// One direct child of an element, as `Children` yields it.
+pub const Child = struct {
+    /// The child's local name under the parent's prefix.
+    local: []const u8,
+    hit: wbxml.TagHit,
+    /// One past the child: the byte after its `/>`, or the `<` of its
+    /// close tag.
+    end: usize,
+
+    pub fn attrs(self: Child, xml: []const u8) []const u8 {
+        return xml[self.hit.attrs_start..self.hit.attrs_end];
+    }
+};
+
+/// The direct children of an element, in order — never a descendant,
+/// and only the ones in the parent's namespace prefix: a child under
+/// another prefix (an `x14:` extension body) is stepped over whole.
+/// Runs on preflighted markup, where every open has its close.
+pub const Children = struct {
+    xml: []const u8,
+    prefix: []const u8,
+    cursor: usize,
+    end: usize,
+
+    pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8) Children {
+        return .{
+            .xml = xml,
+            .prefix = prefix,
+            .cursor = if (parent.self_closing) parent_end else parent.after_tag_close,
+            .end = parent_end,
+        };
+    }
+
+    pub fn next(self: *Children) Error!?Child {
+        const xml = self.xml;
+        while (self.cursor < self.end) {
+            const lt = std.mem.indexOfScalarPos(u8, xml, self.cursor, '<') orelse return null;
+            if (lt >= self.end) return null;
+            const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
+            if (skip_to != lt) {
+                self.cursor = skip_to;
+                continue;
+            }
+            // The parent's own close tag ends the walk.
+            if (lt + 1 >= xml.len or xml[lt + 1] == '/') return null;
+            var j = lt + 1;
+            while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
+            const qname = xml[lt + 1 .. j];
+            const hit = (wbxml.findTagOpen(xml, lt, qname) catch |e| return narrow(e)) orelse
+                return error.MalformedXml;
+            const child_end = try endOfQ(xml, hit, qname);
+            self.cursor = if (hit.self_closing) child_end else child_end + "</".len + qname.len + ">".len;
+            if (localUnder(qname, self.prefix)) |local| {
+                return .{ .local = local, .hit = hit, .end = child_end };
+            }
+        }
+        return null;
+    }
+};
+
+/// `qname`'s local name when its prefix is `prefix` (empty = none).
+fn localUnder(qname: []const u8, prefix: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, qname, ':')) |c| {
+        if (prefix.len == 0) return null;
+        if (!std.mem.eql(u8, qname[0..c], prefix)) return null;
+        return qname[c + 1 ..];
+    }
+    return if (prefix.len == 0) qname else null;
 }
 
 /// One past the element opened at `hit`: the byte after its `/>`, or
-/// the `<` of its matching close tag — which must exist. An element
-/// that never closes is refused, so a reader cannot take the
-/// attributes of `<location ref="A1">` from a part that ends there.
+/// the `<` of its matching close tag — which must exist.
 pub fn endOf(xml: []const u8, hit: wbxml.TagHit, prefix: []const u8, local: []const u8) Error!usize {
+    var buf: [max_prefix_len + 1 + max_local_len]u8 = undefined;
+    return endOfQ(xml, hit, qualify(&buf, prefix, local));
+}
+
+fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
     if (hit.self_closing) return hit.after_tag_close;
-    return closeOf(xml, hit, prefix, local);
+    return closeOfQ(xml, hit, qname);
 }
 
 /// The `<` of the close tag matching the open tag at `hit`, by depth:
@@ -921,16 +977,15 @@ pub fn endOf(xml: []const u8, hit: wbxml.TagHit, prefix: []const u8, local: []co
 /// is. None of these schemas nest an element in itself, but a scanner
 /// that took the first `</…>` would pair the wrong tags on a part that
 /// does, and read the outer element's children as the inner one's.
-fn closeOf(xml: []const u8, hit: wbxml.TagHit, prefix: []const u8, local: []const u8) Error!usize {
+fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
     assert(!hit.self_closing);
-    var open_buf: [max_prefix_len + 1 + max_local_len]u8 = undefined;
-    const open_tag = qualify(&open_buf, prefix, local);
+    if (qname.len > max_prefix_len + 1 + max_local_len) return error.MalformedXml;
     var close_buf: [2 + max_prefix_len + 1 + max_local_len + 1]u8 = undefined;
     close_buf[0] = '<';
     close_buf[1] = '/';
-    const q = qualify(close_buf[2..], prefix, local);
-    close_buf[2 + q.len] = '>';
-    const close_tag = close_buf[0 .. 2 + q.len + 1];
+    @memcpy(close_buf[2 .. 2 + qname.len], qname);
+    close_buf[2 + qname.len] = '>';
+    const close_tag = close_buf[0 .. 2 + qname.len + 1];
 
     var depth: usize = 1;
     var cursor = hit.after_tag_close;
@@ -938,7 +993,7 @@ fn closeOf(xml: []const u8, hit: wbxml.TagHit, prefix: []const u8, local: []cons
         const close = (wbxml.findClosingTag(xml, cursor, close_tag) catch |e| return narrow(e)) orelse
             return error.MalformedXml;
         var scan = cursor;
-        while (wbxml.findTagOpen(xml[0..close], scan, open_tag) catch |e| return narrow(e)) |inner| {
+        while (wbxml.findTagOpen(xml[0..close], scan, qname) catch |e| return narrow(e)) |inner| {
             if (!inner.self_closing) depth += 1;
             scan = inner.after_tag_close;
         }
@@ -968,7 +1023,7 @@ fn qualify(buf: []u8, prefix: []const u8, local: []const u8) []const u8 {
     return buf[0 .. prefix.len + 1 + local.len];
 }
 
-/// Walks `name="value"` pairs of an attributes region.
+/// Walks `name="value"` pairs of a preflighted attributes region.
 const AttrIter = struct {
     attrs: []const u8,
     i: usize = 0,
@@ -1004,10 +1059,7 @@ fn countBindings(attrs: []const u8, uris: []const []const u8) usize {
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
         if (!isXmlnsDecl(a.name)) continue;
-        for (uris) |u| if (std.mem.eql(u8, a.value, u)) {
-            n += 1;
-            break;
-        };
+        if (isOneOf(a.value, uris)) n += 1;
     }
     return n;
 }
@@ -1019,7 +1071,7 @@ fn bindingPrefix(attrs: []const u8, uris: []const []const u8) ?[]const u8 {
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
         if (!std.mem.startsWith(u8, a.name, "xmlns:")) continue;
-        for (uris) |u| if (std.mem.eql(u8, a.value, u)) return a.name["xmlns:".len..];
+        if (isOneOf(a.value, uris)) return a.name["xmlns:".len..];
     }
     return null;
 }
@@ -1049,7 +1101,7 @@ fn isOneOf(uri: []const u8, uris: []const []const u8) bool {
     return false;
 }
 
-/// A relationships-namespace attribute (`r:id`) on an element. A
+/// A relationships-namespace attribute (`r:id`) on an element, raw. A
 /// prefix the element itself declares counts only if it declares it
 /// to the relationships namespace — `xmlns:r="urn:vendor" r:id="…"`
 /// is a vendor's attribute even under the root's `r`. Otherwise the
@@ -1078,23 +1130,39 @@ pub fn nsAttr(attrs: []const u8, root_rel_prefix: ?[]const u8, local: []const u8
     return null;
 }
 
+/// Longest scalar attribute value this parser decodes. Every scalar
+/// here is a small integer or a boolean token.
+const max_scalar_len = 32;
+
 /// An optional unsigned attribute: null when absent, `MalformedXml`
-/// when present but not a decimal integer. A number that cannot be
-/// read is not a number that is missing.
+/// when present but not an xsd decimal — entity-decoded first, so
+/// `&#51;` is 3, and digits only, so `1_0` and `+1` are nothing. A
+/// number that cannot be read is not a number that is missing.
 pub fn u32Attr(attrs: []const u8, name: []const u8) Error!?u32 {
-    const v = wbxml.getAttr(attrs, name) orelse return null;
+    const raw = wbxml.getAttr(attrs, name) orelse return null;
+    var buf: [max_scalar_len]u8 = undefined;
+    const v = wbxml.decodeScalarAttr(&buf, raw) orelse return error.MalformedXml;
+    if (v.len == 0) return error.MalformedXml;
+    for (v) |d| if (!std.ascii.isDigit(d)) return error.MalformedXml;
     return std.fmt.parseInt(u32, v, 10) catch error.MalformedXml;
 }
 
 fn i32Attr(attrs: []const u8, name: []const u8) Error!?i32 {
-    const v = wbxml.getAttr(attrs, name) orelse return null;
+    const raw = wbxml.getAttr(attrs, name) orelse return null;
+    var buf: [max_scalar_len]u8 = undefined;
+    const v = wbxml.decodeScalarAttr(&buf, raw) orelse return error.MalformedXml;
+    const digits = if (v.len > 0 and v[0] == '-') v[1..] else v;
+    if (digits.len == 0) return error.MalformedXml;
+    for (digits) |d| if (!std.ascii.isDigit(d)) return error.MalformedXml;
     return std.fmt.parseInt(i32, v, 10) catch error.MalformedXml;
 }
 
-/// xsd:boolean: `1`/`true` and `0`/`false`; absent → the schema
-/// default; anything else is refused rather than defaulted.
+/// xsd:boolean: `1`/`true` and `0`/`false` (entity-decoded); absent →
+/// the schema default; anything else is refused rather than defaulted.
 fn boolAttr(attrs: []const u8, name: []const u8, default: bool) Error!bool {
-    const v = wbxml.getAttr(attrs, name) orelse return default;
+    const raw = wbxml.getAttr(attrs, name) orelse return default;
+    var buf: [max_scalar_len]u8 = undefined;
+    const v = wbxml.decodeScalarAttr(&buf, raw) orelse return error.MalformedXml;
     if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) return true;
     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) return false;
     return error.MalformedXml;
@@ -1256,6 +1324,25 @@ test "parseCacheDefinition: decoys in comments and CDATA are not elements" {
     try testing.expectEqualStrings("Real", def.fields[0].name);
 }
 
+test "parseCacheDefinition: only direct children count — a nested or extension-held source is not the source" {
+    // A `<worksheetSource>` inside a same-namespace extension body is a
+    // descendant, not the cache's source; the direct child wins, and a
+    // second direct child is a refusal.
+    const nested =
+        \\<pivotCacheDefinition><cacheSource type="worksheet"><extLst><ext><worksheetSource sheet="Decoy" ref="Z1"/></ext></extLst><worksheetSource sheet="Real" ref="A1"/></cacheSource><extLst><ext><cacheFields count="1"><cacheField name="Decoy"/></cacheFields></ext></extLst></pivotCacheDefinition>
+    ;
+    var def = try parseCacheDefinition(testing.allocator, nested);
+    defer def.deinit(testing.allocator);
+    try testing.expectEqualStrings("Real", def.source.worksheet.?.sheet.?);
+    try testing.expectEqual(@as(usize, 0), def.fields.len);
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"/><cacheSource type="external"/></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="A" ref="A1"/><worksheetSource sheet="B" ref="A1"/></cacheSource></pivotCacheDefinition>
+    ));
+}
+
 test "parseCacheDefinition: refuses the wrong part, a missing cacheSource, an unclosed root" {
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>
@@ -1273,23 +1360,26 @@ test "parseCacheDefinition: refuses the wrong part, a missing cacheSource, an un
 }
 
 test "parseCacheDefinition: an element that does not close is refused" {
-    // `<worksheetSource …>` with no `</worksheetSource>`.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"></cacheSource></pivotCacheDefinition>
     ));
-    // `<sharedItems>` left open inside a cacheField.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"/><cacheFields><cacheField name="A"><sharedItems count="1"></cacheField></cacheFields></pivotCacheDefinition>
     ));
-    // `<cacheSource>` left open: the root closes, the source does not.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"/></pivotCacheDefinition>
     ));
 }
 
-test "parseCacheDefinition: unreadable scalars and booleans are refused, not defaulted" {
+test "parseCacheDefinition: scalars are xsd lexical values, entity-decoded" {
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition recordCount="lots"><cacheSource type="worksheet"/></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition recordCount="1_0"><cacheSource type="worksheet"/></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition recordCount="+3"><cacheSource type="worksheet"/></pivotCacheDefinition>
     ));
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition refreshOnLoad="maybe"><cacheSource type="worksheet"/></pivotCacheDefinition>
@@ -1300,9 +1390,17 @@ test "parseCacheDefinition: unreadable scalars and booleans are refused, not def
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"/><cacheFields><cacheField name="A"><sharedItems containsNumber="yes"/></cacheField></cacheFields></pivotCacheDefinition>
     ));
+    // Character references are the same value.
+    var ok = try parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition recordCount="&#51;" refreshOnLoad="&#49;"><cacheSource type="work&#115;heet"/></pivotCacheDefinition>
+    );
+    defer ok.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, 3), ok.record_count);
+    try testing.expect(ok.refresh_on_load);
+    try testing.expectEqual(SourceType.worksheet, ok.source.type);
 }
 
-test "parseCacheDefinition: a raw `<` inside an attribute value cannot spoof an element" {
+test "preflight: a raw `<` inside an attribute value cannot spoof an element" {
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet" bad="<worksheetSource sheet='Decoy' ref='Z1'/>"><worksheetSource sheet="Real" ref="A1"/></cacheSource></pivotCacheDefinition>
     ));
@@ -1315,7 +1413,7 @@ test "parseCacheDefinition: a raw `<` inside an attribute value cannot spoof an 
     try testing.expectEqualStrings("S", ok.source.worksheet.?.sheet.?);
 }
 
-test "preflight: crossed and out-of-root closures, a raw `<` in a tag, bad UTF-8 are refused" {
+test "preflight: crossed and out-of-root closures, a raw `<` in a tag, bad UTF-8, bad attributes are refused" {
     // A child that closes after its root.
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"></pivotTableDefinition></location>
@@ -1324,30 +1422,38 @@ test "preflight: crossed and out-of-root closures, a raw `<` in a tag, bad UTF-8
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"></cacheSource></worksheetSource></pivotCacheDefinition>
     ));
-    // Markup after the root has closed.
+    // Markup after the root has closed — explicitly, or self-closing.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition><cacheSource type="external"/>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition/><pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition>
     ));
     // A raw `<` inside a tag, outside quotes.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<pivotCacheDefinition bad=<x><cacheSource type="worksheet"/></pivotCacheDefinition>
     ));
+    // A bare attribute (no `=`), which would otherwise hide the bindings after it.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition bare xmlns="urn:vendor"><cacheSource type="worksheet"/></pivotCacheDefinition>
+    ));
     // Not UTF-8.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator, "<pivotCacheDefinition refreshedBy=\"z\xff\"><cacheSource type=\"worksheet\"/></pivotCacheDefinition>"));
-    // A comment after the root, and `>` in text, are fine.
+    // A comment after the root, `>` in text, an attribute spanning
+    // lines, whitespace around `=`, and a PI are all fine.
     var ok = try parseCacheDefinition(testing.allocator,
-        \\<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"/></cacheSource>a > b</pivotCacheDefinition><!-- trailing -->
+        \\<?xml version="1.0"?><pivotCacheDefinition refreshedBy = "two
+        \\lines"><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"/></cacheSource>a > b</pivotCacheDefinition><!-- trailing -->
     );
     defer ok.deinit(testing.allocator);
     try testing.expectEqualStrings("S", ok.source.worksheet.?.sheet.?);
+    try testing.expectEqualStrings("two\nlines", ok.refreshed_by.?);
 }
 
 test "scanRoot: a root bound to a foreign namespace is not a pivot part" {
-    // Prefixed root under a vendor URI, even with the main URI as default.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
         \\<v:pivotCacheDefinition xmlns:v="urn:vendor" xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><v:cacheSource type="worksheet"/></v:pivotCacheDefinition>
     ));
-    // Default namespace bound to a vendor URI.
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotTableDefinition xmlns="urn:vendor" name="P" cacheId="0"><location ref="A1"/></pivotTableDefinition>
     ));
@@ -1426,7 +1532,7 @@ test "parseTableDefinition: unknown subtotal / axis spellings are carried raw; t
     try testing.expectEqualStrings("countNums", ConsolidateFunction.count_nums.xmlName());
 }
 
-test "parseTableDefinition: refuses a missing location, name or cacheId, and a bad ordinal" {
+test "parseTableDefinition: refuses a missing location, name or cacheId, a bad ordinal, a doubled block" {
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotTableDefinition name="P" cacheId="0"><pivotFields count="0"/></pivotTableDefinition>
     ));
@@ -1449,17 +1555,26 @@ test "parseTableDefinition: refuses a missing location, name or cacheId, and a b
         \\<pivotTableDefinition name="P" cacheId="0" rowGrandTotals="maybe"><location ref="A1"/></pivotTableDefinition>
     ));
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"/><location ref="B2"/></pivotTableDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"/><dataFields/><dataFields/></pivotTableDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition>
     ));
 }
 
-test "parseTableDefinition: an unclosed location is not a location" {
+test "parseTableDefinition: an unclosed location is not a location, nor is a nested one" {
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"></pivotTableDefinition>
     ));
-    // Nor is one spelled inside an attribute value.
     try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
         \\<pivotTableDefinition name="P" cacheId="0" bad="<location ref='Z9'/>"></pivotTableDefinition>
+    ));
+    // A `<location>` inside an extension is a descendant, not the location.
+    try testing.expectError(error.MalformedXml, parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition name="P" cacheId="0"><extLst><ext><location ref="Z9"/></ext></extLst></pivotTableDefinition>
     ));
 }
 
@@ -1473,31 +1588,52 @@ test "parseTableDefinition: a location ref inside a comment is not the location"
     try testing.expectEqualStrings("B2:C3", xml[def.location.ref_span.start..def.location.ref_span.end]);
 }
 
-test "closeOf: a same-name element nested inside closes by depth" {
-    // No pivot schema nests an element in itself; a part that does must
-    // still pair the outer open with the outer close, so the outer
-    // element's children are not read as the inner one's.
+test "Children: a same-name element nested inside is a descendant; closes pair by depth" {
+    // Items are counted under `<items>` only; an `<items>` nested in an
+    // `<item>` is a descendant of that item, not a second list.
     const xml =
-        \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"/><pivotFields count="1"><pivotField axis="axisRow"><items count="2"><item x="0"/><items><item x="9"/></items><item x="1"/></items></pivotField></pivotFields></pivotTableDefinition>
+        \\<pivotTableDefinition name="P" cacheId="0"><location ref="A1"/><pivotFields count="1"><pivotField axis="axisRow"><items count="2"><item x="0"><items><item x="9"/></items></item><item x="1"/></items></pivotField></pivotFields></pivotTableDefinition>
     ;
     var def = try parseTableDefinition(testing.allocator, xml);
     defer def.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), def.fields.len);
-    try testing.expectEqual(@as(u32, 3), def.fields[0].item_count);
+    try testing.expectEqual(@as(u32, 2), def.fields[0].item_count);
 
-    const hit = (try findTag(xml, 0, "", "items")).?;
-    const close = try closeOf(xml, hit, "", "items");
-    try testing.expectEqualStrings("</items></pivotField>", xml[close .. close + "</items></pivotField>".len]);
+    const root = try scanRoot(xml, "pivotTableDefinition");
+    var kids = Children.init(xml, root.hit, root.body_end, "");
+    const loc = (try kids.next()).?;
+    try testing.expectEqualStrings("location", loc.local);
+    const pf = (try kids.next()).?;
+    try testing.expectEqualStrings("pivotFields", pf.local);
+    try testing.expectEqualStrings("</pivotFields>", xml[pf.end .. pf.end + "</pivotFields>".len]);
+    try testing.expect((try kids.next()) == null);
 }
 
-test "nsAttr: bound prefix wins, xmlns declarations never match, bare name never matches" {
+test "nsAttr: bound prefix wins, xmlns declarations never match, bare name never matches, a rebound prefix is foreign" {
     const attrs =
         \\ xmlns:r="urn:r" id="bare" xmlns:id="urn:id" rel:id="rId7"
     ;
     try testing.expectEqualStrings("rId7", nsAttr(attrs, null, "id").?);
     try testing.expect(nsAttr(attrs, "r", "id") == null);
     try testing.expect(nsAttr(" id=\"bare\" xmlns:id=\"u\"", null, "id") == null);
-    // An element that rebinds the root's `r` to a vendor URI: its `r:id`
-    // is the vendor's, not the relationship's.
     try testing.expect(nsAttr(" xmlns:r=\"urn:vendor\" r:id=\"bad\"", "r", "id") == null);
+}
+
+fn parseCacheForFailures(allocator: Allocator, xml: []const u8) !void {
+    var def = try parseCacheDefinition(allocator, xml);
+    def.deinit(allocator);
+}
+
+fn parseTableForFailures(allocator: Allocator, xml: []const u8) !void {
+    var def = try parseTableDefinition(allocator, xml);
+    def.deinit(allocator);
+}
+
+test "allocation failure at every point leaves nothing behind" {
+    const cons =
+        \\<pivotCacheDefinition><cacheSource type="consolidation"><consolidation><rangeSets><rangeSet sheet="Q1" ref="A1:B9"/><rangeSet name="Q2"/></rangeSets></consolidation></cacheSource><cacheFields count="2"><cacheField name="A"><sharedItems/></cacheField><cacheField name="B"/></cacheFields></pivotCacheDefinition>
+    ;
+    try testing.checkAllAllocationFailures(testing.allocator, parseCacheForFailures, .{cache_def_worksheet});
+    try testing.checkAllAllocationFailures(testing.allocator, parseCacheForFailures, .{cons});
+    try testing.checkAllAllocationFailures(testing.allocator, parseTableForFailures, .{table_def_xml});
 }

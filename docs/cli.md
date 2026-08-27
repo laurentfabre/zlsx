@@ -77,7 +77,7 @@ suppresses them. Nothing is modified; this is the read half of
 |---|---|
 | `sheet`, `sheet_idx` | The **host** sheet — where the pivot renders; `location.ref` is in its grid. Dropped under `--output compact-ndjson` in favour of the sheet prologue. |
 | `name`, `part` | `pivotTableDefinition@name` (decoded) and the part's archive name. |
-| `location` | `ref` plus `first_header_row` / `first_data_row` / `first_data_col`; an absent attribute is `null`. |
+| `location` | `ref` (entity-decoded) plus `first_header_row` / `first_data_row` / `first_data_col`; an absent attribute is `null`. |
 | `rows`, `cols`, `pages` | The axes, in order. Each entry is `{"field":NAME,"idx":N}` — `NAME` is the cache field at pivot-field ordinal `N` (`null` when the cache has no such field) — or `{"values":true}` for the values axis (`x="-2"`). |
 | `values` | The data fields: caption (`name`), source field (`field` / `idx`), `subtotal` as the ST_DataConsolidateFunction token (`sum`, `count`, `average`, `max`, `min`, `product`, `countNums`, `stdDev`, `stdDevp`, `var`, `varp`; an unknown token passes through verbatim), `show_data_as` (raw; `null` means normal), `num_fmt_id`. |
 | `data_caption`, `grand_totals`, `style` | The values-axis caption, `rowGrandTotals` / `colGrandTotals` (schema default `true`), `pivotTableStyleInfo@name`. |
@@ -94,12 +94,14 @@ Sheet selection follows the read family — `--sheet` / `--name` narrow to one
 host sheet, `--all-sheets` / `--sheet-glob` widen, the default streams every
 sheet — and `--skip` / `--take` page the record stream. A workbook without
 pivots is an empty, successful stream. The graph is read whole or not at all
-(`MalformedPivotXml`, exit 2): a part a pivot or cache relationship names but
-that is missing or unreadable, a `<pivotCache>` entry without its `cacheId` or
-`r:id`, a cache whose identity disagrees between `xl/workbook.xml` and the pivot
-that reads it, two caches under one id, or a records part that is named but
-absent all fail the command rather than listing the pivots that did parse — a
-partial inventory is the shape of a guard hole. Formats, conditional formats,
+(`MalformedPivotXml`, exit 2): a part a pivot, cache or sheet relationship
+names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
+without its `cacheId` or `r:id`, a cache whose identity disagrees between
+`xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
+with two cache edges, a records part that is named but absent, a `<tablePart>`
+that attaches nothing, or a defined-name inventory the engine refuses (when a
+source is spelled by name) all fail the command rather than listing the pivots
+that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
 chart formats, hierarchies and every OLAP-only element are not exposed; the
 parts stay byte-preserved for callers that need them raw
 (`zlsx_pkg.PartStore`).
