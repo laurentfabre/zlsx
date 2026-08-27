@@ -808,7 +808,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  eval              evaluate one formula against a workbook (NDJSON)
         \\  recalc            recalculate every formula cell into --out
         \\
-        \\  --sheet N         0-indexed sheet to read (default: 0)
+        \\  --sheet N         0-indexed sheet to read (default: 0; on
+        \\                    pivots, every host sheet)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
@@ -845,7 +846,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    sheet's own rows, unlike --skip which is
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
-        \\                    / meta / list-sheets / styles / sst.
+        \\                    / pivots / meta / list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -4119,7 +4120,7 @@ fn writePivotRecord(
     try out.writeAll("],\"data_caption\":");
     try writeJsonOptString(out, pt.data_caption);
     try out.print(",\"grand_totals\":{{\"rows\":{},\"cols\":{}}},\"style\":", .{ def.row_grand_totals, def.col_grand_totals });
-    try writeJsonOptString(out, if (def.style) |s| s.name else null);
+    try writeJsonOptString(out, pt.style_name);
     try out.writeAll(",\"cache\":");
     if (pivots.cacheOf(pt)) |c| try writePivotCacheObject(out, c.*) else try out.writeAll("null");
     try out.writeAll("}\n");

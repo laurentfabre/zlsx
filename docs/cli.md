@@ -99,8 +99,8 @@ names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
 without its `cacheId` or `r:id`, a cache whose identity disagrees between
 `xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
 with two cache edges, a records part that is named but absent, a `<tablePart>`
-that attaches nothing, or a defined-name inventory the engine refuses (when a
-source is spelled by name) all fail the command rather than listing the pivots
+that attaches nothing or a defined-name inventory the engine refuses (both
+checked when a source is spelled by name) all fail the command rather than listing the pivots
 that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
 chart formats, hierarchies and every OLAP-only element are not exposed; the
 parts stay byte-preserved for callers that need them raw

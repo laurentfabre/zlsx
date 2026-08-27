@@ -262,16 +262,24 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
         src.type = if (wbxml.decodeScalarAttr(&buf, t)) |d| std.meta.stringToEnum(SourceType, d) orelse .unknown else .unknown;
         if (src.type == .unknown) src.type_raw = t;
     }
+    errdefer allocator.free(src.range_sets);
+    var have_consolidation = false;
     var kids = Children.init(xml, el.hit, el.end, root.prefix);
     while (try kids.next()) |k| {
         if (std.mem.eql(u8, k.local, "worksheetSource")) {
             if (src.worksheet != null) return error.MalformedXml;
             src.worksheet = parseWorksheetSource(xml, k, root.rel_prefix);
         } else if (std.mem.eql(u8, k.local, "consolidation")) {
-            if (src.range_sets.len != 0) return error.MalformedXml;
+            // One consolidation, one range-set list: a second of either
+            // is refused, never read over the first.
+            if (have_consolidation) return error.MalformedXml;
+            have_consolidation = true;
+            var have_range_sets = false;
             var cons = Children.init(xml, k.hit, k.end, root.prefix);
             while (try cons.next()) |c| {
                 if (!std.mem.eql(u8, c.local, "rangeSets")) continue;
+                if (have_range_sets) return error.MalformedXml;
+                have_range_sets = true;
                 var sets: std.ArrayListUnmanaged(WorksheetSource) = .empty;
                 errdefer sets.deinit(allocator);
                 var rs = Children.init(xml, c.hit, c.end, root.prefix);
@@ -279,7 +287,6 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
                     if (!std.mem.eql(u8, set.local, "rangeSet")) continue;
                     try sets.append(allocator, parseWorksheetSource(xml, set, root.rel_prefix));
                 }
-                allocator.free(src.range_sets);
                 src.range_sets = try sets.toOwnedSlice(allocator);
             }
         }
@@ -810,9 +817,13 @@ fn preflight(xml: []const u8) Error!void {
     var stack: [max_depth][]const u8 = undefined;
     var depth: usize = 0;
     var root_closed = false;
-    var i: usize = 0;
+    var i: usize = if (std.mem.startsWith(u8, xml, "\xEF\xBB\xBF")) 3 else 0;
     while (i < xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
+        // Outside the root there is no element to hold text: anything
+        // but whitespace before, between or after top-level constructs
+        // is not a document.
+        if (depth == 0 and !isBlank(xml[i..lt])) return error.MalformedXml;
         const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
         if (skip_to != lt) {
             i = skip_to;
@@ -847,6 +858,12 @@ fn preflight(xml: []const u8) Error!void {
         i = tag_end.after_gt;
     }
     if (depth != 0) return error.MalformedXml;
+    if (!isBlank(xml[i..])) return error.MalformedXml;
+}
+
+fn isBlank(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isWhitespace(c)) return false;
+    return true;
 }
 
 const TagEnd = struct { after_gt: usize, self_closing: bool };
@@ -960,13 +977,6 @@ fn localUnder(qname: []const u8, prefix: []const u8) ?[]const u8 {
     return if (prefix.len == 0) qname else null;
 }
 
-/// One past the element opened at `hit`: the byte after its `/>`, or
-/// the `<` of its matching close tag — which must exist.
-pub fn endOf(xml: []const u8, hit: wbxml.TagHit, prefix: []const u8, local: []const u8) Error!usize {
-    var buf: [max_prefix_len + 1 + max_local_len]u8 = undefined;
-    return endOfQ(xml, hit, qualify(&buf, prefix, local));
-}
-
 fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
     if (hit.self_closing) return hit.after_tag_close;
     return closeOfQ(xml, hit, qname);
@@ -979,28 +989,44 @@ fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
 /// does, and read the outer element's children as the inner one's.
 fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
     assert(!hit.self_closing);
-    if (qname.len > max_prefix_len + 1 + max_local_len) return error.MalformedXml;
-    var close_buf: [2 + max_prefix_len + 1 + max_local_len + 1]u8 = undefined;
-    close_buf[0] = '<';
-    close_buf[1] = '/';
-    @memcpy(close_buf[2 .. 2 + qname.len], qname);
-    close_buf[2 + qname.len] = '>';
-    const close_tag = close_buf[0 .. 2 + qname.len + 1];
-
     var depth: usize = 1;
     var cursor = hit.after_tag_close;
     while (true) {
-        const close = (wbxml.findClosingTag(xml, cursor, close_tag) catch |e| return narrow(e)) orelse
-            return error.MalformedXml;
+        const close = (try findCloseTag(xml, cursor, qname)) orelse return error.MalformedXml;
         var scan = cursor;
-        while (wbxml.findTagOpen(xml[0..close], scan, qname) catch |e| return narrow(e)) |inner| {
+        while (wbxml.findTagOpen(xml[0..close.lt], scan, qname) catch |e| return narrow(e)) |inner| {
             if (!inner.self_closing) depth += 1;
             scan = inner.after_tag_close;
         }
         depth -= 1;
-        if (depth == 0) return close;
-        cursor = close + close_tag.len;
+        if (depth == 0) return close.lt;
+        cursor = close.after_gt;
     }
+}
+
+const CloseHit = struct { lt: usize, after_gt: usize };
+
+/// The next `</qname>` at or after `from`, decoy-aware, allowing the
+/// whitespace XML permits before the `>` (`</location >`).
+fn findCloseTag(xml: []const u8, from: usize, qname: []const u8) Error!?CloseHit {
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (lt + 2 + qname.len <= xml.len and xml[lt + 1] == '/' and
+            std.mem.eql(u8, xml[lt + 2 .. lt + 2 + qname.len], qname))
+        {
+            var j = lt + 2 + qname.len;
+            while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
+            if (j < xml.len and xml[j] == '>') return .{ .lt = lt, .after_gt = j + 1 };
+        }
+        i = lt + 1;
+    }
+    return null;
 }
 
 /// The shared scanner declares `workbook_xml.zig`'s whole error set;
@@ -1243,6 +1269,18 @@ test "parseCacheDefinition: table-name source carries no sheet, no ref" {
     try testing.expectEqual(@as(usize, 0), def.fields.len);
 }
 
+test "parseCacheDefinition: a second consolidation or range-set list is refused, leaking nothing" {
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="consolidation"><consolidation><rangeSets><rangeSet sheet="A" ref="A1"/></rangeSets><rangeSets><rangeSet sheet="B" ref="A1"/></rangeSets></consolidation></cacheSource></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="consolidation"><consolidation><rangeSets><rangeSet sheet="A" ref="A1"/></rangeSets></consolidation><consolidation/></cacheSource></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="consolidation"><consolidation/><consolidation><rangeSets><rangeSet sheet="A" ref="A1"/></rangeSets></consolidation></cacheSource></pivotCacheDefinition>
+    ));
+}
+
 test "parseCacheDefinition: external and consolidation sources" {
     const ext =
         \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="external" connectionId="3"/><cacheFields/></pivotCacheDefinition>
@@ -1439,9 +1477,24 @@ test "preflight: crossed and out-of-root closures, a raw `<` in a tag, bad UTF-8
     ));
     // Not UTF-8.
     try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator, "<pivotCacheDefinition refreshedBy=\"z\xff\"><cacheSource type=\"worksheet\"/></pivotCacheDefinition>"));
+    // Text outside the root.
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\garbage<pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition>
+    ));
+    try testing.expectError(error.MalformedXml, parseCacheDefinition(testing.allocator,
+        \\<pivotCacheDefinition><cacheSource type="worksheet"/></pivotCacheDefinition>garbage
+    ));
+    // Whitespace before a close tag's `>` is legal and pairs correctly.
+    var ws = try parseTableDefinition(testing.allocator,
+        \\<pivotTableDefinition name="P" cacheId="0"><location ref="B2:C3"></location ><dataFields count="1"><dataField fld="0"></dataField
+        \\></dataFields></pivotTableDefinition >
+    );
+    defer ws.deinit(testing.allocator);
+    try testing.expectEqualStrings("B2:C3", ws.location.ref);
+    try testing.expectEqual(@as(usize, 1), ws.data_fields.len);
     // A comment after the root, `>` in text, an attribute spanning
-    // lines, whitespace around `=`, and a PI are all fine.
-    var ok = try parseCacheDefinition(testing.allocator,
+    // lines, whitespace around `=`, a BOM, and a PI are all fine.
+    var ok = try parseCacheDefinition(testing.allocator, "\xEF\xBB\xBF" ++
         \\<?xml version="1.0"?><pivotCacheDefinition refreshedBy = "two
         \\lines"><cacheSource type="worksheet"><worksheetSource sheet="S" ref="A1"/></cacheSource>a > b</pivotCacheDefinition><!-- trailing -->
     );

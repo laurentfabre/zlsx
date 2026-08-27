@@ -157,6 +157,8 @@ pub const PivotTable = struct {
     /// Decoded captions.
     data_caption: ?[]const u8,
     grand_total_caption: ?[]const u8,
+    /// Decoded `pivotTableStyleInfo@name`.
+    style_name: ?[]const u8,
     /// Decoded `dataField@name`, parallel to `definition.data_fields`.
     data_field_names: []const ?[]const u8,
     /// Index into `Pivots.caches`, or null when neither the part's
@@ -329,6 +331,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
                 .definition = def,
                 .data_caption = if (def.data_caption) |c| try decode(a, .pivot_table_name, c) else null,
                 .grand_total_caption = if (def.grand_total_caption) |c| try decode(a, .pivot_table_name, c) else null,
+                .style_name = if (def.style) |st| (if (st.name) |n| try decode(a, .pivot_table_name, n) else null) else null,
                 .data_field_names = data_field_names,
                 .cache = cache_idx,
                 .raw_xml = pt_part.bytes,
@@ -463,7 +466,7 @@ fn collectWorkbookCaches(
 }
 
 /// The relationship types a `<sheet r:id>` may carry.
-const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet" };
+const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
 
 /// The one way a raw `r:id` becomes a relationship: entity-decoded
 /// (the store decodes ids the same way), found by id, of one of the
@@ -498,8 +501,9 @@ fn requiredTarget(store: *PartStore, owner: []const u8, target: []const u8) Erro
     return (try store.resolve(owner, target)) orelse error.MalformedPivotXml;
 }
 
-/// A part that must exist. Materialises it.
+/// A part that must exist, under a name a reader can show. Materialises it.
 fn requiredPart(store: *PartStore, name: []const u8) Error!store_mod.Part {
+    if (!std.unicode.utf8ValidateSlice(name)) return error.MalformedPivotXml;
     return (try store.part(name)) orelse error.MalformedPivotXml;
 }
 
@@ -624,6 +628,9 @@ const Resolver = struct {
             const rel = relById(cache_rels, rid) orelse return .unresolved;
             if (rel.target_mode != .external) return .unresolved;
             if (!relLeafIs(rel.type, "externalLinkPath")) return .unresolved;
+            // The target is handed to readers as text; bytes that are
+            // not text are refused at this boundary, not emitted.
+            if (!std.unicode.utf8ValidateSlice(rel.target)) return error.MalformedPivotXml;
             return .{ .external = rel.target };
         }
         if (ws.sheet) |raw_sheet| {
@@ -695,7 +702,13 @@ const Resolver = struct {
     /// `<tablePart>` names is not a table of the sheet; a `<tablePart>`
     /// whose relationship is missing, mistyped, external or whose part
     /// is absent is a broken attachment and refuses the read (Codex
-    /// #199 r3 REL-018).
+    /// #199 r3 REL-018). The block is read by the scanner the table
+    /// editor reads it with — `<tableParts>` in the default main
+    /// namespace, `r:id` — so a producer that binds a prefix to the
+    /// main namespace attaches nothing here, exactly as it attaches
+    /// nothing to `renameTableColumn`; the source then resolves to
+    /// nothing rather than the wrong sheet (Codex r4 REL-024, declined:
+    /// one scanner for one block).
     fn ensureTables(self: *Resolver) Error![]const TableEntry {
         if (self.tables) |t| return t;
         var entries: std.ArrayListUnmanaged(TableEntry) = .empty;
@@ -1631,6 +1644,38 @@ test "collect: relationships are typed, decoded, and singular; sheet roots must 
     try testing.expectEqual(@as(usize, 1), od.pivots.caches.len);
 }
 
+test "collect: macro sheets are sheet roots; style names decode; a non-text external target refuses" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    // An Excel 4.0 macro sheet listed under `<sheets>` is a legitimate
+    // root, pivots or not.
+    const macro = try tt.path(testing.allocator, io, "macro_sheet.xlsx");
+    defer testing.allocator.free(macro);
+    try fixture.write(testing.allocator, io, macro, .sheet_ref);
+    try patchPart(io, macro, "xl/_rels/workbook.xml.rels", "relationships/worksheet\" Target=\"worksheets/sheet1.xml\"", "relationships/xlMacrosheet\" Target=\"worksheets/sheet1.xml\"");
+    var om = try Opened.open(testing.allocator, io, macro);
+    defer om.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), om.pivots.tables.len);
+
+    const styled = try tt.path(testing.allocator, io, "style_name.xlsx");
+    defer testing.allocator.free(styled);
+    try fixture.write(testing.allocator, io, styled, .sheet_ref);
+    try patchPart(io, styled, "xl/pivotTables/pivotTable1.xml", "name=\"PivotStyleLight16\"", "name=\"Finance &amp; Ops_x0021_\"");
+    var os = try Opened.open(testing.allocator, io, styled);
+    defer os.deinit(testing.allocator);
+    try testing.expectEqualStrings("Finance & Ops!", os.pivots.tables[0].style_name.?);
+
+    const bad = try tt.path(testing.allocator, io, "bad_target.xlsx");
+    defer testing.allocator.free(bad);
+    try fixture.write(testing.allocator, io, bad, .external);
+    try patchPart(io, bad, "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", "file:///C:/data/other.xlsx", "file:///C:/data/\xff.xlsx");
+    try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, bad));
+}
+
 test "collect: a table-spelled source under a refused name inventory is refused too" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1655,20 +1700,25 @@ test "collect: allocation failure at every point leaves nothing behind" {
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    // The defined-name kind exercises every inventory: sheet folds, the
-    // symbol table, the parser, and the table index.
-    const path = try tt.path(testing.allocator, io, "alloc_fail.xlsx");
-    defer testing.allocator.free(path);
-    try fixture.write(testing.allocator, io, path, .defined_name);
-    var store = try PartStore.open(testing.allocator, io, path);
-    defer store.deinit();
-    const wb_part = (try store.part("xl/workbook.xml")).?;
-    var wb = try wbxml.parse(testing.allocator, wb_part.bytes);
-    defer wb.deinit(testing.allocator);
-    // Materialise every part first: the store allocates through its own
-    // allocator on first access, and that is not what is under test.
-    for (try store.partNames()) |n| _ = try store.part(n);
-    try testing.checkAllAllocationFailures(testing.allocator, collectForFailures, .{ &store, &wb });
+    // The defined-name kind exercises the sheet folds, the symbol table
+    // and the body parser; the table-name kind adds the table index.
+    const kinds = [_]fixture.SourceKind{ .defined_name, .table_name };
+    for (kinds, 0..) |kind, k| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "alloc_fail_{d}.xlsx", .{k});
+        const path = try tt.path(testing.allocator, io, name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, kind);
+        var store = try PartStore.open(testing.allocator, io, path);
+        defer store.deinit();
+        const wb_part = (try store.part("xl/workbook.xml")).?;
+        var wb = try wbxml.parse(testing.allocator, wb_part.bytes);
+        defer wb.deinit(testing.allocator);
+        // Materialise every part first: the store allocates through its
+        // own allocator on first access, and that is not what is under test.
+        for (try store.partNames()) |n| _ = try store.part(n);
+        try testing.checkAllAllocationFailures(testing.allocator, collectForFailures, .{ &store, &wb });
+    }
 }
 
 test "collect: one pivot part linked from two sheets is two pivots reading one cache" {
