@@ -83,7 +83,7 @@ below is the S6 owner-gate contract.
 | `cache` | The cache the pivot reads, or `null` when neither the part's relationship nor its `cacheId` reaches one. |
 | `cache.id` | `<pivotCache cacheId>` from `xl/workbook.xml`; `null` for a cache only a pivot's own relationship reaches. |
 | `cache.records_part`, `cache.record_count` | The `pivotCacheRecords` part and its declared `recordCount`. Records are never parsed. |
-| `cache.refreshed_by`, `refreshed_date`, `refresh_on_load`, `save_data` | Refresh facts as written (`refreshed_date` is the raw serial or ISO string). |
+| `cache.refreshed_by`, `refreshed_date`, `refresh_on_load`, `save_data` | Refresh facts as written. `refreshed_date` is the `refreshedDate` serial, or the `refreshedDateIso` string when a producer wrote only that; `null` with neither. |
 | `cache.source` | `{"type":"worksheet",…}`, `{"type":"consolidation","range_sets":[…]}`, `{"type":"external","connection_id":N}`, `{"type":"scenario"}` or `{"type":"unknown","raw":"…"}`. |
 | `cache.source.sheet`, `.ref`, `.name` | The `worksheetSource` spellings, decoded. A worksheet source is spelled either as `sheet` + `ref`, or as `name` — a table or a defined name. |
 | `cache.source.resolved` | **What the spelling led to** — the surface-matrix footnote-¹⁰ answer: `{"sheet":…,"sheet_idx":N,"via":"sheet_attr"|"table"|"defined_name"}` for a sheet of this workbook; `{"external":TARGET}` when the source lives in another workbook (the `r:id` relationship target); `null` when the spelling names nothing the workbook has (a dangling sheet name, a defined name with a dynamic or 3D body). Each consolidation `range_sets[]` entry carries the same four keys. |
@@ -92,12 +92,16 @@ below is the S6 owner-gate contract.
 Sheet selection follows the read family — `--sheet` / `--name` narrow to one
 host sheet, `--all-sheets` / `--sheet-glob` widen, the default streams every
 sheet — and `--skip` / `--take` page the record stream. A workbook without
-pivots is an empty, successful stream. A pivot part the graph reaches but
-cannot read (`MalformedPivotXml`) fails the command with exit 2 rather than
-listing the pivots that did parse: a partial inventory is the shape of a guard
-hole. Formats, conditional formats, chart formats, hierarchies and every
-OLAP-only element are not exposed; the parts stay byte-preserved for callers
-that need them raw (`zlsx_pkg.PartStore`).
+pivots is an empty, successful stream. The graph is read whole or not at all
+(`MalformedPivotXml`, exit 2): a part a pivot or cache relationship names but
+that is missing or unreadable, a `<pivotCache>` entry without its `cacheId` or
+`r:id`, a cache whose identity disagrees between `xl/workbook.xml` and the pivot
+that reads it, two caches under one id, or a records part that is named but
+absent all fail the command rather than listing the pivots that did parse — a
+partial inventory is the shape of a guard hole. Formats, conditional formats,
+chart formats, hierarchies and every OLAP-only element are not exposed; the
+parts stay byte-preserved for callers that need them raw
+(`zlsx_pkg.PartStore`).
 
 ### Edit (load-modify-save)
 
@@ -464,7 +468,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot part the relationship graph reaches but cannot read |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

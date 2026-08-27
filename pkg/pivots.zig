@@ -51,12 +51,16 @@ const table_edit = @import("table_edit.zig");
 const recalc_run = @import("recalc_run.zig");
 
 pub const Error = store_mod.Error || error{
-    /// A pivot part reached through the relationship graph is not
-    /// readable: wrong root, a required element or attribute missing,
-    /// unbalanced markup, or a name that fails its carrier's decode.
-    /// The whole read refuses rather than reporting the pivots it
-    /// could parse — a partial inventory is the shape of every guard
-    /// hole this row exists to close.
+    /// The pivot graph cannot be read whole: a part a recognised
+    /// relationship names is missing or unreadable (wrong root, a
+    /// required element or attribute missing or unreadable, unbalanced
+    /// markup, a name that fails its carrier's decode), a `<pivotCache>`
+    /// entry lacks its `cacheId` or `r:id`, a cache's identity disagrees
+    /// between `xl/workbook.xml` and the pivot that reads it, two caches
+    /// claim one id, or a records part is named but absent. The whole
+    /// read refuses rather than reporting the pivots it could parse — a
+    /// partial inventory is the shape of every guard hole this row
+    /// exists to close.
     MalformedPivotXml,
 };
 
@@ -113,6 +117,7 @@ pub const PivotCache = struct {
     /// The `pivotCacheRecordsN.xml` part the definition's `r:id` names,
     /// when it exists.
     records_part_name: ?[]const u8,
+    /// Spines live in the `Pivots` arena — never `deinit` this.
     definition: pivot_xml.CacheDefinition,
     /// Decoded (plain-text) field names, parallel to `definition.fields`.
     field_names: []const []const u8,
@@ -143,6 +148,7 @@ pub const PivotTable = struct {
     /// Decoded host sheet name.
     sheet_name: []const u8,
     sheet_part_name: []const u8,
+    /// Spines live in the `Pivots` arena — never `deinit` this.
     definition: pivot_xml.TableDefinition,
     /// Decoded captions.
     data_caption: ?[]const u8,
@@ -250,22 +256,34 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
         for (store.rels(sheet_part)) |rel| {
             if (rel.target_mode == .external) continue;
             if (!relLeafIs(rel.type, "pivotTable")) continue;
-            const pt_name = (try store.resolve(sheet_part, rel.target)) orelse continue;
-            const pt_part = (try store.part(pt_name)) orelse continue;
+            // Once the relationship type says "pivot table", the edge is
+            // part of the graph: a target that does not resolve or a
+            // part that is not there is a broken workbook, not a pivot
+            // to leave out of the inventory.
+            const pt_name = try requiredTarget(store, sheet_part, rel.target);
+            const pt_part = try requiredPart(store, pt_name);
             const def = pivot_xml.parseTableDefinition(a, pt_part.bytes) catch |e| return mapParse(e);
 
             // The cache: the part's own relationship first (that is the
             // edge Excel follows), then `cacheId` against the workbook
-            // list when the relationship is missing.
+            // list when the relationship is missing. Both must agree
+            // when both are present — a pivot whose relationship names
+            // one cache and whose `cacheId` names another is not one
+            // Excel could refresh.
             var cache_idx: ?usize = null;
             for (store.rels(pt_name)) |prel| {
                 if (prel.target_mode == .external) continue;
                 if (!relLeafIs(prel.type, "pivotCacheDefinition")) continue;
-                const cd_name = (try store.resolve(pt_name, prel.target)) orelse continue;
+                const cd_name = try requiredTarget(store, pt_name, prel.target);
+                _ = try requiredPart(store, cd_name);
                 cache_idx = try findOrAddCache(a, &caches, cd_name, null);
                 break;
             }
-            if (cache_idx == null) {
+            if (cache_idx) |ci| {
+                if (caches.items[ci].cache_id) |id| {
+                    if (id != def.cache_id) return error.MalformedPivotXml;
+                }
+            } else {
                 for (caches.items, 0..) |c, ci| {
                     if (c.cache_id != null and c.cache_id.? == def.cache_id) {
                         cache_idx = ci;
@@ -310,22 +328,28 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
 
     const finished = try a.alloc(PivotCache, caches.items.len);
     for (caches.items, 0..) |slot, ci| {
-        const part = (try store.part(slot.part_name)) orelse return error.MalformedPivotXml;
+        const part = try requiredPart(store, slot.part_name);
         const def = pivot_xml.parseCacheDefinition(a, part.bytes) catch |e| return mapParse(e);
 
+        // The records part: the definition's `r:id` names it; a
+        // definition without one (`saveData="0"`) has none, and a
+        // relationship of the records type is taken in its place. Named
+        // and absent is a refusal — the count says there are records,
+        // and there is nothing to hold them.
         const cache_rels = store.rels(slot.part_name);
         var records: ?[]const u8 = null;
         if (def.r_id) |rid| {
-            if (try relTarget(store, slot.part_name, cache_rels, rid)) |t| records = t;
-        }
-        if (records == null) {
+            records = (try relTarget(store, slot.part_name, cache_rels, rid)) orelse
+                return error.MalformedPivotXml;
+        } else {
             for (cache_rels) |rel| {
                 if (rel.target_mode == .external) continue;
                 if (!relLeafIs(rel.type, "pivotCacheRecords")) continue;
-                records = try store.resolve(slot.part_name, rel.target);
+                records = try requiredTarget(store, slot.part_name, rel.target);
                 break;
             }
         }
+        if (records) |r| _ = try requiredPart(store, r);
 
         const field_names = try a.alloc([]const u8, def.fields.len);
         const field_formulas = try a.alloc(?[]const u8, def.fields.len);
@@ -342,7 +366,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
             .worksheet => {
                 if (def.source.worksheet) |ws| {
                     source_spelling = try spell(a, ws);
-                    resolution = try resolver.resolve(ws, slot.part_name, cache_rels);
+                    resolution = try resolver.resolve(ws, cache_rels);
                 } else {
                     resolution = .unresolved;
                 }
@@ -352,7 +376,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
                 set_resolutions = try a.alloc(SourceResolution, def.source.range_sets.len);
                 for (def.source.range_sets, 0..) |rs, k| {
                     set_spellings[k] = try spell(a, rs);
-                    set_resolutions[k] = try resolver.resolve(rs, slot.part_name, cache_rels);
+                    set_resolutions[k] = try resolver.resolve(rs, cache_rels);
                 }
             },
             .external, .scenario, .unknown => {},
@@ -385,8 +409,13 @@ const CacheSlot = struct {
     consumer_count: u32 = 0,
 };
 
-/// `<pivotCaches><pivotCache cacheId="N" r:id="…"/>` in `xl/workbook.xml`,
-/// under whatever prefix the main namespace is bound to.
+/// `<pivotCaches><pivotCache cacheId="N" r:id="…"/>` in `xl/workbook.xml`.
+/// Read with the part parsers' own scanner — the workbook root's
+/// prefix, its relationships binding, the container's close — so only
+/// the children of the main-namespace `<pivotCaches>` count; a
+/// `<vendor:pivotCache>` inside `<extLst>` is not a cache. Both
+/// attributes are required by the schema and here: an entry that
+/// cannot say which cache it is, or where, breaks the list.
 fn collectWorkbookCaches(
     a: Allocator,
     store: *PartStore,
@@ -394,20 +423,38 @@ fn collectWorkbookCaches(
     wb_rels: []const store_mod.Relationship,
     caches: *std.ArrayListUnmanaged(CacheSlot),
 ) Error!void {
-    var cursor: usize = 0;
-    while (try nextLocalTag(wb_xml, cursor, "pivotCache")) |hit| {
-        cursor = hit.after_tag_close;
+    const root = pivot_xml.scanRoot(wb_xml, "workbook") catch |e| return mapParse(e);
+    const container = (pivot_xml.findTag(wb_xml[0..root.body_end], root.hit.after_tag_close, root.prefix, "pivotCaches") catch |e| return mapParse(e)) orelse
+        return;
+    const end = pivot_xml.endOf(wb_xml, container, root.prefix, "pivotCaches") catch |e| return mapParse(e);
+    if (container.self_closing) return;
+    var cursor = container.after_tag_close;
+    while (pivot_xml.findTag(wb_xml[0..end], cursor, root.prefix, "pivotCache") catch |e| return mapParse(e)) |hit| {
+        cursor = pivot_xml.endOf(wb_xml, hit, root.prefix, "pivotCache") catch |e| return mapParse(e);
         const attrs = wb_xml[hit.attrs_start..hit.attrs_end];
-        const rid = pivot_xml.nsAttr(attrs, "id") orelse continue;
-        const cache_id: ?u32 = if (wbxml.getAttr(attrs, "cacheId")) |v|
-            std.fmt.parseInt(u32, v, 10) catch null
-        else
-            null;
-        const part_name = (try relTarget(store, "xl/workbook.xml", wb_rels, rid)) orelse continue;
+        const rid = pivot_xml.nsAttr(attrs, root.rel_prefix, "id") orelse return error.MalformedPivotXml;
+        const cache_id = (pivot_xml.u32Attr(attrs, "cacheId") catch |e| return mapParse(e)) orelse
+            return error.MalformedPivotXml;
+        const part_name = (try relTarget(store, "xl/workbook.xml", wb_rels, rid)) orelse
+            return error.MalformedPivotXml;
+        _ = try requiredPart(store, part_name);
         _ = try findOrAddCache(a, caches, part_name, cache_id);
     }
 }
 
+/// A relationship target that must resolve to a part name.
+fn requiredTarget(store: *PartStore, owner: []const u8, target: []const u8) Error![]const u8 {
+    return (try store.resolve(owner, target)) orelse error.MalformedPivotXml;
+}
+
+/// A part that must exist. Materialises it.
+fn requiredPart(store: *PartStore, name: []const u8) Error!store_mod.Part {
+    return (try store.part(name)) orelse error.MalformedPivotXml;
+}
+
+/// One slot per cache part, one id per slot: a part listed under two
+/// ids, or an id given to two parts, is an identity Excel cannot
+/// resolve and is refused.
 fn findOrAddCache(
     a: Allocator,
     caches: *std.ArrayListUnmanaged(CacheSlot),
@@ -416,8 +463,17 @@ fn findOrAddCache(
 ) Error!usize {
     for (caches.items, 0..) |c, i| {
         if (std.mem.eql(u8, c.part_name, part_name)) {
-            if (c.cache_id == null and cache_id != null) caches.items[i].cache_id = cache_id;
+            if (cache_id) |id| {
+                if (c.cache_id) |have| {
+                    if (have != id) return error.MalformedPivotXml;
+                } else {
+                    caches.items[i].cache_id = id;
+                }
+            }
             return i;
+        }
+        if (cache_id != null and c.cache_id != null and c.cache_id.? == cache_id.?) {
+            return error.MalformedPivotXml;
         }
     }
     try caches.append(a, .{ .cache_id = cache_id, .part_name = part_name });
@@ -447,36 +503,6 @@ fn relTarget(
 pub fn relLeafIs(rel_type: []const u8, leaf: []const u8) bool {
     const l = if (std.mem.lastIndexOfScalar(u8, rel_type, '/')) |i| rel_type[i + 1 ..] else rel_type;
     return std.ascii.eqlIgnoreCase(l, leaf);
-}
-
-/// The next element whose *local* name is `local`, under any prefix,
-/// decoy-aware. `<pivotCaches>` does not match `pivotCache`: the
-/// boundary after the name is checked.
-fn nextLocalTag(xml: []const u8, from: usize, local: []const u8) Error!?wbxml.TagHit {
-    var i = from;
-    while (i < xml.len) {
-        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
-        const skip_to = wbxml.skipNonElement(xml, lt) catch return error.MalformedPivotXml;
-        if (skip_to != lt) {
-            i = skip_to;
-            continue;
-        }
-        var j = lt + 1;
-        while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
-        const qname = xml[lt + 1 .. j];
-        const name = if (std.mem.indexOfScalar(u8, qname, ':')) |c| qname[c + 1 ..] else qname;
-        if (qname.len > 0 and qname[0] != '/' and std.mem.eql(u8, name, local)) {
-            const hit = wbxml.findTagOpen(xml, lt, qname) catch return error.MalformedPivotXml;
-            if (hit) |h| return h;
-            return null;
-        }
-        i = lt + 1;
-    }
-    return null;
-}
-
-fn isNameBoundary(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>';
 }
 
 fn spell(a: Allocator, ws: pivot_xml.WorksheetSource) Error!SourceSpelling {
@@ -536,18 +562,20 @@ const Resolver = struct {
     fn resolve(
         self: *Resolver,
         ws: pivot_xml.WorksheetSource,
-        cache_part: []const u8,
         cache_rels: []const store_mod.Relationship,
     ) Error!SourceResolution {
         // Another workbook: the relationship says so, whatever the
-        // sheet and range spell.
+        // sheet and range spell — and only an External-mode
+        // relationship says so. An internal target under `r:id` is not
+        // a workbook this reader can name.
         if (ws.r_id) |rid| {
             for (cache_rels) |rel| {
-                if (std.mem.eql(u8, rel.id, rid)) return .{ .external = rel.target };
+                if (!std.mem.eql(u8, rel.id, rid)) continue;
+                if (rel.target_mode != .external) return .unresolved;
+                return .{ .external = rel.target };
             }
             return .unresolved;
         }
-        _ = cache_part;
         try self.ensureBuilt();
         const symbols = &(self.symbols orelse return .unresolved);
 
@@ -837,6 +865,42 @@ pub const fixture = struct {
             \\<Relationship Id="rIdPC1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/>
         );
 
+        try store.save(io, path);
+    }
+
+    /// `write`, plus a second cache (`cacheId` 8) no pivot table reads —
+    /// the shape `zlsx pivots` reports as a `pivot_cache` record.
+    pub fn writeWithOrphanCache(allocator: Allocator, io: std.Io, path: []const u8, kind: SourceKind) !void {
+        try write(allocator, io, path, kind);
+        var store = try PartStore.open(allocator, io, path);
+        defer store.deinit();
+        try store.addPart(
+            "xl/pivotCache/pivotCacheDefinition2.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" recordCount="0" saveData="0"><cacheSource type="worksheet"><worksheetSource sheet="Report" ref="A1:A1"/></cacheSource><cacheFields count="1"><cacheField name="Note" numFmtId="0"><sharedItems/></cacheField></cacheFields></pivotCacheDefinition>
+            ,
+        );
+        try store.addPart(
+            "xl/pivotCache/pivotCacheRecords2.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0"/>
+            ,
+        );
+        try store.addPart(
+            "xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords2.xml"/></Relationships>
+            ,
+        );
+        try spliceBefore(allocator, &store, "xl/workbook.xml", "</pivotCaches>",
+            \\<pivotCache cacheId="8" r:id="rIdPC2"/>
+        );
+        try spliceBefore(allocator, &store, "xl/_rels/workbook.xml.rels", "</Relationships>",
+            \\<Relationship Id="rIdPC2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition2.xml"/>
+        );
         try store.save(io, path);
     }
 
@@ -1143,11 +1207,135 @@ test "unquoteSheetSpec: quoted, doubled apostrophe, bare" {
     try testing.expect(unquoteSheetSpec(&buf, .{ .first = "'broken", .quoted = true }) == null);
 }
 
-test "nextLocalTag: any prefix, decoys skipped, no suffix match" {
-    const xml =
-        \\<x:workbook><!-- <pivotCache cacheId="9"/> --><x:pivotCaches><x:pivotCache cacheId="4" r:id="rId1"/></x:pivotCaches></x:workbook>
-    ;
-    const hit = (try nextLocalTag(xml, 0, "pivotCache")).?;
-    try testing.expectEqualStrings("cacheId=\"4\"", std.mem.trim(u8, xml[hit.attrs_start..hit.attrs_end], " ")[0..11]);
-    try testing.expect((try nextLocalTag(xml, hit.after_tag_close, "pivotCache")) == null);
+/// Patch one part of a saved fixture (byte replace, first occurrence)
+/// and save it back.
+fn patchPart(io: std.Io, path: []const u8, part: []const u8, old: []const u8, new: []const u8) !void {
+    var store = try PartStore.open(testing.allocator, io, path);
+    defer store.deinit();
+    const p = (try store.part(part)) orelse return error.PartNotFound;
+    const at = std.mem.indexOf(u8, p.bytes, old) orelse return error.TestUnexpectedResult;
+    const patched = try std.mem.concat(testing.allocator, u8, &.{ p.bytes[0..at], new, p.bytes[at + old.len ..] });
+    defer testing.allocator.free(patched);
+    try store.replacePart(part, patched);
+    try store.save(io, path);
+}
+
+test "collect: an orphan cache is listed with no consumer; a vendor pivotCache in extLst is not a cache" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_orphan.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.writeWithOrphanCache(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, "xl/workbook.xml", "</workbook>",
+        \\<extLst><ext uri="{decoy}" xmlns:v="urn:vendor"><v:pivotCaches><v:pivotCache cacheId="99" r:id="rIdNope"/></v:pivotCaches></ext></extLst></workbook>
+    );
+
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), o.pivots.tables.len);
+    try testing.expectEqual(@as(?usize, 0), o.pivots.tables[0].cache);
+    try testing.expectEqual(@as(usize, 2), o.pivots.caches.len);
+    try testing.expectEqual(@as(u32, 1), o.pivots.caches[0].consumer_count);
+    const orphan = o.pivots.caches[1];
+    try testing.expectEqual(@as(?u32, 8), orphan.cache_id);
+    try testing.expectEqual(@as(u32, 0), orphan.consumer_count);
+    try testing.expectEqualStrings("xl/pivotCache/pivotCacheRecords2.xml", orphan.records_part_name.?);
+    try testing.expectEqual(@as(u32, 1), orphan.resolution.sheet.sheet_idx);
+    // The orphan reads `Report`, so both sheets are now sources.
+    try testing.expect(o.pivots.readsFromSheet(1));
+}
+
+test "collect: a recognised edge that leads nowhere refuses the read" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        // The host sheet's relationship names a pivot part that is not there.
+        .{ .name = "missing_pivot.xlsx", .part = "xl/worksheets/_rels/sheet2.xml.rels", .old = "pivotTables/pivotTable1.xml", .new = "pivotTables/pivotTable9.xml" },
+        // The pivot's relationship names a cache part that is not there.
+        .{ .name = "missing_cache.xlsx", .part = "xl/pivotTables/_rels/pivotTable1.xml.rels", .old = "pivotCacheDefinition1.xml", .new = "pivotCacheDefinition9.xml" },
+        // The definition's r:id names a records part that is not there.
+        .{ .name = "missing_records.xlsx", .part = "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", .old = "pivotCacheRecords1.xml", .new = "pivotCacheRecords9.xml" },
+        // The pivot's cacheId disagrees with the cache its relationship names.
+        .{ .name = "cache_mismatch.xlsx", .part = "xl/pivotTables/pivotTable1.xml", .old = "cacheId=\"7\"", .new = "cacheId=\"9\"" },
+        // The workbook's cache entry cannot say which cache it is.
+        .{ .name = "cacheid_bad.xlsx", .part = "xl/workbook.xml", .old = "cacheId=\"7\"", .new = "cacheId=\"abc\"" },
+        // The workbook's cache entry has no relationship.
+        .{ .name = "cache_rid_missing.xlsx", .part = "xl/workbook.xml", .old = "r:id=\"rIdPC1\"", .new = "r:id=\"rIdGone\"" },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .sheet_ref);
+        try patchPart(io, path, case.part, case.old, case.new);
+        try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, path));
+    }
+
+    // Two caches under one id.
+    const dup = try tt.path(testing.allocator, io, "cache_dup.xlsx");
+    defer testing.allocator.free(dup);
+    try fixture.writeWithOrphanCache(testing.allocator, io, dup, .sheet_ref);
+    try patchPart(io, dup, "xl/workbook.xml", "cacheId=\"8\"", "cacheId=\"7\"");
+    try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, dup));
+}
+
+test "collect: a definition without r:id has no records part; an internal r:id source is unresolved" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const none = try tt.path(testing.allocator, io, "no_records.xlsx");
+    defer testing.allocator.free(none);
+    try fixture.write(testing.allocator, io, none, .sheet_ref);
+    try patchPart(io, none, "xl/pivotCache/pivotCacheDefinition1.xml", " r:id=\"rId1\"", " saveData=\"0\"");
+    try patchPart(io, none, "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", "pivotCacheRecords\" ", "notRecords\" ");
+    var on = try Opened.open(testing.allocator, io, none);
+    defer on.deinit(testing.allocator);
+    try testing.expect(on.pivots.caches[0].records_part_name == null);
+    try testing.expect(!on.pivots.caches[0].definition.save_data);
+
+    const internal = try tt.path(testing.allocator, io, "internal_rid.xlsx");
+    defer testing.allocator.free(internal);
+    try fixture.write(testing.allocator, io, internal, .external);
+    try patchPart(io, internal, "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", " TargetMode=\"External\"", "");
+    var oi = try Opened.open(testing.allocator, io, internal);
+    defer oi.deinit(testing.allocator);
+    try testing.expect(oi.pivots.caches[0].resolution == .unresolved);
+}
+
+test "collect: one pivot part linked from two sheets is two pivots reading one cache" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_two_hosts.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        var store = try PartStore.open(testing.allocator, io, path);
+        defer store.deinit();
+        try store.addPart("xl/worksheets/_rels/sheet1.xml.rels", "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdPT1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>
+        );
+        try store.save(io, path);
+    }
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), o.pivots.tables.len);
+    try testing.expectEqual(@as(u32, 0), o.pivots.tables[0].sheet_idx);
+    try testing.expectEqual(@as(u32, 1), o.pivots.tables[1].sheet_idx);
+    try testing.expectEqual(@as(usize, 1), o.pivots.caches.len);
+    try testing.expectEqual(@as(u32, 2), o.pivots.caches[0].consumer_count);
+    try testing.expect(o.pivots.hostsPivot(0) and o.pivots.hostsPivot(1));
 }

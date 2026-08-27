@@ -4092,13 +4092,13 @@ fn writePivotRecord(
     try out.writeAll(",\"pages\":[");
     for (def.page_fields, 0..) |pf, i| {
         if (i > 0) try out.writeByte(',');
-        if (pf.fld < 0) {
-            try out.writeAll("{\"values\":true}");
-        } else {
-            const ordinal: u32 = @intCast(pf.fld);
-            try out.writeAll("{\"field\":");
-            try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
-            try out.print(",\"idx\":{d}}}", .{ordinal});
+        switch (pf.fld) {
+            .values => try out.writeAll("{\"values\":true}"),
+            .field => |ordinal| {
+                try out.writeAll("{\"field\":");
+                try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
+                try out.print(",\"idx\":{d}}}", .{ordinal});
+            },
         }
     }
     try out.writeAll("],\"values\":[");
@@ -4161,8 +4161,10 @@ fn writePivotCacheObject(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
     try writeJsonOptU32(out, def.record_count);
     try out.writeAll(",\"refreshed_by\":");
     try writeJsonOptString(out, def.refreshed_by);
+    // `refreshedDate` is the serial Excel writes; a producer that wrote
+    // only the ISO form (`refreshedDateIso`) still gets a date here.
     try out.writeAll(",\"refreshed_date\":");
-    try writeJsonOptString(out, def.refreshed_date);
+    try writeJsonOptString(out, def.refreshed_date orelse def.refreshed_date_iso);
     try out.print(",\"refresh_on_load\":{},\"save_data\":{},\"source\":", .{ def.refresh_on_load, def.save_data });
     try writePivotSource(out, c);
     try out.writeAll(",\"fields\":[");
@@ -4213,7 +4215,7 @@ fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
     const src = &c.definition.source;
     switch (src.type) {
         .worksheet => {
-            try out.writeAll("{\"type\":\"worksheet\"");
+            try out.writeAll("{\"type\":\"worksheet\",");
             try writePivotSourceSpelling(out, c.source, c.resolution);
             try out.writeByte('}');
         },
@@ -4221,7 +4223,7 @@ fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
             try out.writeAll("{\"type\":\"consolidation\",\"range_sets\":[");
             for (c.range_set_sources, 0..) |sp, i| {
                 if (i > 0) try out.writeByte(',');
-                try out.writeAll("{\"_\":0");
+                try out.writeByte('{');
                 try writePivotSourceSpelling(out, sp, c.range_set_resolutions[i]);
                 try out.writeByte('}');
             }
@@ -4241,8 +4243,8 @@ fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
     }
 }
 
-/// `,"sheet":…,"ref":…,"name":…,"resolved":…` — the spellings as
-/// written and what they led to: a local sheet
+/// `"sheet":…,"ref":…,"name":…,"resolved":…` (no braces, no leading
+/// comma) — the spellings as written and what they led to: a local sheet
 /// (`{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}`), another
 /// workbook (`{"external":"…"}`), or `null` when the spelling names
 /// nothing this workbook has.
@@ -4251,7 +4253,7 @@ fn writePivotSourceSpelling(
     sp: zlsx_pkg.pivots.SourceSpelling,
     res: zlsx_pkg.PivotSourceResolution,
 ) !void {
-    try out.writeAll(",\"sheet\":");
+    try out.writeAll("\"sheet\":");
     try writeJsonOptString(out, sp.sheet);
     try out.writeAll(",\"ref\":");
     try writeJsonOptString(out, sp.ref);
@@ -8576,7 +8578,7 @@ test "runCellsCommand emits t:formula with formula_ref for array-formula slaves"
 
 // ─── S6: `pivots` ────────────────────────────────────────────────────
 
-test "runPivotsCommand: one record per pivot, the frozen field order, orphan caches after" {
+test "runPivotsCommand: one record per pivot in the frozen field order" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -8702,6 +8704,72 @@ test "runPivotsCommand: --sheet / --name select the host sheet; compact-ndjson d
         const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = plain, .subcommand = .pivots }, &w, &err_w);
         try std.testing.expectEqual(@as(u8, 0), rc);
         try std.testing.expectEqualStrings("", w.buffered());
+    }
+}
+
+test "runPivotsCommand: orphan caches follow the pivots, only when no sheet is selected, and page through" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_orphan.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.writeWithOrphanCache(std.testing.allocator, io, path, .sheet_ref);
+
+    const orphan_line =
+        "{\"kind\":\"pivot_cache\",\"cache\":{\"id\":8,\"part\":\"xl/pivotCache/pivotCacheDefinition2.xml\"," ++
+        "\"records_part\":\"xl/pivotCache/pivotCacheRecords2.xml\",\"record_count\":0,\"refreshed_by\":null," ++
+        "\"refreshed_date\":null,\"refresh_on_load\":false,\"save_data\":false," ++
+        "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Report\",\"ref\":\"A1:A1\",\"name\":null," ++
+        "\"resolved\":{\"sheet\":\"Report\",\"sheet_idx\":1,\"via\":\"sheet_attr\"}}," ++
+        "\"fields\":[{\"name\":\"Note\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"string\"],\"min\":null,\"max\":null}]}}\n";
+
+    // No selection: the pivot, then the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"pivot\","));
+        const second = std.mem.indexOf(u8, got, "\n").? + 1;
+        try std.testing.expectEqualStrings(orphan_line, got[second..]);
+    }
+    // A sheet selected: the orphan belongs to no sheet and is not emitted.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_index = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "pivot_cache") == null);
+    }
+    // --all-sheets is not a selection; --skip 1 pages past the pivot to the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .all_sheets = true, .skip = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(orphan_line, w.buffered());
+    }
+    // --take 1 stops before the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "pivot_cache") == null);
     }
 }
 
