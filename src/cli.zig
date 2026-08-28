@@ -4272,12 +4272,8 @@ fn writePivotSourceSpelling(
             try out.writeAll("{\"sheet\":");
             try writeJsonString(out, s.sheet_name);
             try out.print(",\"sheet_idx\":{d},\"via\":\"{s}\",\"bounds\":", .{ s.sheet_idx, @tagName(s.via) });
-            if (s.bounds) |b| {
-                var buf: [zlsx_pkg.pivots.Bounds.format_buf_len]u8 = undefined;
-                try writeJsonString(out, b.formatA1(&buf));
-            } else {
-                try out.writeAll("null");
-            }
+            var buf: [zlsx_pkg.pivots.Bounds.format_buf_len]u8 = undefined;
+            try writeJsonOptString(out, if (s.bounds) |b| b.formatA1(&buf) else null);
             try out.writeByte('}');
         },
         .external => |target| {

@@ -92,26 +92,36 @@ pub const Bounds = union(enum) {
     whole_rows: struct { first_row: u32, last_row: u32 },
 
     /// The A1 spelling — `A1:C4`, `A:C`, `1:4`. `buf` holds any of them
-    /// at `format_buf_len`. Every column here is in-grid (the parsers
-    /// below refuse anything past `XFD`), so the letter writer cannot
-    /// fail.
-    pub fn formatA1(self: Bounds, buf: *[format_buf_len]u8) []const u8 {
+    /// at `format_buf_len`. Null for a value outside the grid (a
+    /// column or row of 0, or past `XFD` / 1048576): the parsers here
+    /// never produce one, but the type is public (Codex #202 r4 F4).
+    pub fn formatA1(self: Bounds, buf: *[format_buf_len]u8) ?[]const u8 {
+        if (!self.inGrid()) return null;
         return switch (self) {
             .rect => |r| blk: {
                 var tl: [coords.max_col_letters]u8 = undefined;
                 var br: [coords.max_col_letters]u8 = undefined;
-                const tl_len = coords.writeColNumberLetters(&tl, r.tl_col) catch unreachable;
-                const br_len = coords.writeColNumberLetters(&br, r.br_col) catch unreachable;
-                break :blk std.fmt.bufPrint(buf, "{s}{d}:{s}{d}", .{ tl[0..tl_len], r.tl_row, br[0..br_len], r.br_row }) catch unreachable;
+                const tl_len = coords.writeColNumberLetters(&tl, r.tl_col) catch return null;
+                const br_len = coords.writeColNumberLetters(&br, r.br_col) catch return null;
+                break :blk std.fmt.bufPrint(buf, "{s}{d}:{s}{d}", .{ tl[0..tl_len], r.tl_row, br[0..br_len], r.br_row }) catch return null;
             },
             .whole_columns => |c| blk: {
                 var f: [coords.max_col_letters]u8 = undefined;
                 var l: [coords.max_col_letters]u8 = undefined;
-                const f_len = coords.writeColNumberLetters(&f, c.first_col) catch unreachable;
-                const l_len = coords.writeColNumberLetters(&l, c.last_col) catch unreachable;
-                break :blk std.fmt.bufPrint(buf, "{s}:{s}", .{ f[0..f_len], l[0..l_len] }) catch unreachable;
+                const f_len = coords.writeColNumberLetters(&f, c.first_col) catch return null;
+                const l_len = coords.writeColNumberLetters(&l, c.last_col) catch return null;
+                break :blk std.fmt.bufPrint(buf, "{s}:{s}", .{ f[0..f_len], l[0..l_len] }) catch return null;
             },
-            .whole_rows => |r| std.fmt.bufPrint(buf, "{d}:{d}", .{ r.first_row, r.last_row }) catch unreachable,
+            .whole_rows => |r| std.fmt.bufPrint(buf, "{d}:{d}", .{ r.first_row, r.last_row }) catch return null,
+        };
+    }
+
+    /// 1-based and inside the grid, corners ordered.
+    pub fn inGrid(self: Bounds) bool {
+        return switch (self) {
+            .rect => |r| r.tl_col >= 1 and r.tl_row >= 1 and r.br_col <= zlsx.max_col_1based and r.br_row <= zlsx.max_row and r.tl_col <= r.br_col and r.tl_row <= r.br_row,
+            .whole_columns => |c| c.first_col >= 1 and c.last_col <= zlsx.max_col_1based and c.first_col <= c.last_col,
+            .whole_rows => |r| r.first_row >= 1 and r.last_row <= zlsx.max_row and r.first_row <= r.last_row,
         };
     }
 
@@ -993,8 +1003,16 @@ const Resolver = struct {
         // operator whose LEFT operand carries the qualifier. The right
         // operand must be a static reference too, on the same sheet if
         // it is qualified at all — compared by resolved index, so
-        // `Data!A1:data!C4` is one sheet.
-        switch (ast.node(ast.root)) {
+        // `Data!A1:data!C4` is one sheet. Parentheses around the whole
+        // body keep it a reference (Codex #202 r4 F2).
+        var root = ast.root;
+        while (true) {
+            switch (ast.node(root)) {
+                .paren => |pn| root = pn.child,
+                else => break,
+            }
+        }
+        switch (ast.node(root)) {
             .qualified => |q| {
                 const bounds = staticBounds(ast.node(q.target)) orelse return null;
                 const idx = (try self.sheetOfSpec(q.sheet)) orelse return null;
@@ -1089,9 +1107,43 @@ const Resolver = struct {
         defer parsed.deinit(self.gpa);
         const ast = switch (parsed) {
             .ok => |t| t,
-            .refused => return,
+            // A body the parser refuses — an external workbook reference
+            // beside a local one, say — still names what it names: the
+            // sheets are read off the text (Codex #202 r4 F1).
+            .refused => return self.scanBodyText(body, sheets),
         };
         try self.walkNode(ast, ast.root, scope, sheets, walk);
+    }
+
+    /// The refusal-tolerant fallback: every sheet of this workbook whose
+    /// name, bare or quoted (`'` doubled inside), is followed by `!` in
+    /// the body text. Evidence only, so a match inside a string literal
+    /// over-marks rather than under-marks; names referenced by a refused
+    /// body are not followed.
+    fn scanBodyText(self: *Resolver, body: []const u8, sheets: *std.ArrayListUnmanaged(u32)) Error!void {
+        for (self.sheet_names, 0..) |name, idx| {
+            if (name.len == 0) continue;
+            if (try self.textNamesSheet(body, name)) try addSheet(self.gpa, sheets, @intCast(idx));
+        }
+    }
+
+    fn textNamesSheet(self: *Resolver, body: []const u8, name: []const u8) Error!bool {
+        // Bare: `Name!`, matched case-insensitively by the sheet fold.
+        const folded_body = (try fold(self.arena, body)) orelse return false;
+        const folded_name = (try fold(self.arena, name)) orelse return false;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, folded_body, from, folded_name)) |at| : (from = at + 1) {
+            const end = at + folded_name.len;
+            if (end < folded_body.len and folded_body[end] == '!') return true;
+            if (end + 1 < folded_body.len and folded_body[end] == '\'' and folded_body[end + 1] == '!' and at > 0 and folded_body[at - 1] == '\'') return true;
+        }
+        // Quoted with an apostrophe inside: `'It''s'!`.
+        if (std.mem.indexOfScalar(u8, name, '\'') != null) {
+            const doubled = try std.mem.replaceOwned(u8, self.arena, folded_name, "'", "''");
+            const needle = try std.mem.concat(self.arena, u8, &.{ "'", doubled, "'!" });
+            return std.mem.indexOf(u8, folded_body, needle) != null;
+        }
+        return false;
     }
 
     fn walkNode(
@@ -1174,8 +1226,7 @@ const Resolver = struct {
     /// is `#REF!` and names nothing — Codex #202 r1 F3). Returns the
     /// members, for a name looked up through the qualifier.
     fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?Members {
-        var buf: [256]u8 = undefined;
-        const unquoted = unquoteSheetSpec(&buf, spec) orelse return null;
+        const unquoted = try self.unquoteSpec(spec);
         if (!engine.names.isSpan(spec)) {
             const idx = (try self.sheetIndexOf(unquoted)) orelse return null;
             try addSheet(self.gpa, sheets, idx);
@@ -1214,9 +1265,17 @@ const Resolver = struct {
 
     fn sheetOfSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error!?u32 {
         if (spec.last != null) return null;
-        var buf: [256]u8 = undefined;
-        const name = unquoteSheetSpec(&buf, spec) orelse return null;
+        const name = try self.unquoteSpec(spec);
         return self.sheetIndexOf(name);
+    }
+
+    /// `unquoteSheetSpec` sized by the token, not a fixed buffer: a
+    /// sheet name the inventories accepted is one the walk must be able
+    /// to look up, whatever its length (Codex #202 r4 F3).
+    fn unquoteSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error![]const u8 {
+        if (!spec.quoted) return spec.first;
+        const buf = try self.arena.alloc(u8, spec.first.len);
+        return unquoteSheetSpec(buf, spec) orelse spec.first;
     }
 };
 
@@ -2670,7 +2729,7 @@ fn expectRect(b: ?Bounds, tl_col: u32, tl_row: u32, br_col: u32, br_row: u32) !v
 
 fn expectA1(b: ?Bounds, want: []const u8) !void {
     var buf: [Bounds.format_buf_len]u8 = undefined;
-    try testing.expectEqualStrings(want, (b orelse return error.TestExpectedBounds).formatA1(&buf));
+    try testing.expectEqualStrings(want, (b orelse return error.TestExpectedBounds).formatA1(&buf) orelse return error.TestExpectedBounds);
 }
 
 test "bounds: every spelling that proves an area carries it, and one that does not carries none" {
@@ -2713,6 +2772,9 @@ test "bounds: every spelling that proves an area carries it, and one that does n
         // one the engine refuses to reference (`relative_reference_name`),
         // and S6 made that refuse the read.
         .{ .body = "'Data'!$B$2:data!$C$3", .a1 = "B2:C3" },
+        // Parentheses keep a reference a reference (Codex r4 F2).
+        .{ .body = "(Data!$A$1:$C$4)", .a1 = "A1:C4" },
+        .{ .body = "((Data!$A$1))", .a1 = "A1:A1" },
     };
     for (cases) |case| {
         try fixture.write(testing.allocator, io, path, .defined_name);
@@ -2810,6 +2872,19 @@ test "bounds: every spelling that proves an area carries it, and one that does n
     try fixture.write(testing.allocator, io, path, .table_name);
     try patchPart(io, path, "xl/tables/table1.xml", "ref=\"A1:C4\" totalsRowShown", "ref=\"A1:C\" totalsRowShown");
     try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, path));
+}
+
+test "formatA1: a value outside the grid formats as nothing, not a panic (Codex r4 F4)" {
+    var buf: [Bounds.format_buf_len]u8 = undefined;
+    const bad = [_]Bounds{
+        .{ .whole_columns = .{ .first_col = 0, .last_col = 1 } },
+        .{ .whole_rows = .{ .first_row = 0, .last_row = 1 } },
+        .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 0, .br_row = 1 } },
+        .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 16385, .br_row = 1 } },
+        .{ .whole_rows = .{ .first_row = 5, .last_row = 4 } },
+    };
+    for (bad) |b| try testing.expect(b.formatA1(&buf) == null);
+    try testing.expectEqualStrings("A1:A1", (Bounds{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 1, .br_row = 1 } }).formatA1(&buf).?);
 }
 
 test "parseBounds: rectangles, whole columns, whole rows, and nothing else" {
@@ -2975,6 +3050,30 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         var o = try Opened.open(testing.allocator, io, path);
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A body the parser refuses (an external workbook reference beside
+    // a local one) still proves the local sheets it names (Codex r4 F1).
+    for ([_][]const u8{
+        "OFFSET(Data!$A$1,0,0,MAX(1,'[Book.xlsx]Sheet1'!$A$1),1)",
+        "OFFSET('Data'!$A$1,0,0,[Book.xlsx]Sheet1!$A$1,1)",
+        "OFFSET(data!$A$1,0,0,[Book.xlsx]Sheet1!$A$1,1)",
+    }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // A sheet name longer than any fixed buffer is still looked up
+    // (Codex r4 F3): the workbook accepts it, so must the walk.
+    {
+        const long = "L" ** 300;
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<sheet name=\"Data\"", "<sheet name=\"" ++ long ++ "\"");
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET('" ++ long ++ "'!$A$1,0,0,1,1)");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
     }
     // A value-position name resolves as written: `_xlfn.Anchor` is not
     // `Anchor` (Codex r1 F5).
