@@ -48,6 +48,8 @@ const PartStore = store_mod.PartStore;
 const wbxml = @import("typed_parts/workbook_xml.zig");
 const pivot_xml = @import("typed_parts/pivot_xml.zig");
 const table_edit = @import("table_edit.zig");
+const sheet_edit = @import("sheet_edit.zig");
+const coords = @import("zlsx_refs");
 const workbook_mod = @import("workbook.zig");
 const recalc_run = @import("recalc_run.zig");
 
@@ -215,10 +217,35 @@ pub const Pivots = struct {
         return false;
     }
 
+    /// The S7a guard's question, which is wider than `readsFromSheet`:
+    /// could any cache read this sheet? True when a source resolves to
+    /// it, and — conservatively — when a source is `unresolved` (a
+    /// defined name with a dynamic body such as `OFFSET(Report!$D$1,…)`
+    /// is a source Excel accepts and this reader cannot place; a
+    /// dangling spelling is one it cannot rule out either) or when a
+    /// cache's source type is one the reader does not know. "Not
+    /// proven local" is not "proven elsewhere" (Codex #200 r1 REL-033).
+    pub fn mayReadFromSheet(self: *const Pivots, sheet_idx: u32) bool {
+        for (self.caches) |c| {
+            if (c.definition.source.type == .unknown) return true;
+            if (mayResolveTo(c.resolution, sheet_idx)) return true;
+            for (c.range_set_resolutions) |r| if (mayResolveTo(r, sheet_idx)) return true;
+        }
+        return false;
+    }
+
     fn resolvesTo(r: SourceResolution, sheet_idx: u32) bool {
         return switch (r) {
             .sheet => |s| s.sheet_idx == sheet_idx,
             else => false,
+        };
+    }
+
+    fn mayResolveTo(r: SourceResolution, sheet_idx: u32) bool {
+        return switch (r) {
+            .sheet => |s| s.sheet_idx == sheet_idx,
+            .unresolved => true,
+            .external, .none => false,
         };
     }
 };
@@ -860,6 +887,236 @@ fn unquoteSheetSpec(buf: []u8, spec: engine.parser.SheetSpec) ?[]const u8 {
     }
     return buf[0..n];
 }
+
+// ─── S7a: the output-location lift ───────────────────────────────────
+
+/// S7a (`goal_sigmoid.md`): shift `pivotTableDefinition/location@ref`
+/// in step with a row / col edit on the pivot's HOST sheet.
+///
+/// The output rectangle is the one absolute coordinate a pivot-table
+/// definition carries: `firstHeaderRow` / `firstDataRow` /
+/// `firstDataCol` are offsets inside it, formats and selections are
+/// field-addressed (`pivotArea`), and the cache's `worksheetSource`
+/// addresses the SOURCE sheet (S7b). So a whole-row / whole-column edit
+/// that leaves the rectangle intact — an insert at or above its top, a
+/// delete above it — moves the rectangle and nothing else; an edit that
+/// lands inside it would change the pivot's own layout, which Excel
+/// itself refuses ("We can't make this change for the selected cells
+/// because it will affect a PivotTable"), so it refuses here too.
+///
+/// **The footprint is wider than `ref` when the pivot has report
+/// filters.** Excel renders page fields ABOVE the rectangle —
+/// `rowPageCount` rows of label + value pairs, a blank separator row,
+/// then the body at `ref`'s top — and, for the over-then-down layout,
+/// across `colPageCount` pairs with a blank column between. Those cells
+/// are the pivot's too, but no attribute names them, so the lift treats
+/// a conservative superset as inside: `rowPageCount + 1` rows above the
+/// top, `3 · colPageCount` columns from the left edge (against Excel's
+/// `3 · colPageCount − 1`). The oracle question the row parks — how
+/// Excel re-lays a pivot whose rectangle moved — is what would let a
+/// later row narrow it; until then over-refusing costs an edit,
+/// under-refusing costs a workbook.
+///
+/// The splice lands exactly where `parseTableDefinition` read the
+/// attribute (`Location.ref_span`): the parser is decoy-aware and reads
+/// one tree, so there is no second scanner to disagree with it. Every
+/// other byte of the part is preserved; a no-op edit (the rectangle is
+/// below / right of the edit) returns the input unchanged, entities and
+/// all, so the caller's byte compare skips the part.
+pub const edit = struct {
+    pub const Axis = enum { row, col };
+    pub const Kind = enum { insert, delete };
+
+    pub const EditError = error{
+        /// The edit lands inside the pivot's footprint — its output
+        /// rectangle, or the report-filter band above it.
+        PivotLocationEditUnsafe,
+        /// The shift would push the rectangle past `XFD` / `1048576`.
+        PivotCoordinateOverflow,
+        /// The part is not one readable `pivotTableDefinition`, or its
+        /// `location@ref` is not an A1 rectangle.
+        MalformedPivotXml,
+        OutOfMemory,
+    };
+
+    /// 1-based, inclusive, top-left ≤ bottom-right.
+    pub const Rect = struct {
+        tl_col: u32,
+        tl_row: u32,
+        br_col: u32,
+        br_row: u32,
+
+        pub fn eql(a: Rect, b: Rect) bool {
+            return a.tl_col == b.tl_col and a.tl_row == b.tl_row and
+                a.br_col == b.br_col and a.br_row == b.br_row;
+        }
+    };
+
+    /// The rows and columns the pivot occupies on its host: the output
+    /// rectangle plus the report-filter band (see the namespace note).
+    /// `first_row ≤ rect.tl_row`, `last_col ≥ rect.br_col`; the left
+    /// edge and the bottom are the rectangle's own.
+    pub const Footprint = struct {
+        rect: Rect,
+        first_row: u32,
+        last_col: u32,
+    };
+
+    /// Rewrite one `pivotTableN.xml` part for a row / col edit on its
+    /// host sheet. `idx_1based` is the inserted row / column position or
+    /// the deleted one, in the sheet's pre-edit coordinates. Returns a
+    /// fresh buffer the caller owns — byte-equal to `src` when the edit
+    /// does not move the rectangle.
+    pub fn applyToTableDefinition(
+        allocator: Allocator,
+        src: []const u8,
+        axis: Axis,
+        idx_1based: u32,
+        kind: Kind,
+    ) EditError![]u8 {
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        var def = pivot_xml.parseTableDefinition(allocator, src) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedXml => return error.MalformedPivotXml,
+        };
+        defer def.deinit(allocator);
+
+        const fp = try footprintOf(allocator, def);
+        const shifted = try shiftRect(fp, axis, idx_1based, kind);
+        if (shifted.eql(fp.rect)) return allocator.dupe(u8, src);
+
+        var ref_buf: [48]u8 = undefined;
+        const new_ref = formatRect(&ref_buf, shifted) catch return error.PivotCoordinateOverflow;
+        const span = def.location.ref_span;
+        assert(span.start <= span.end and span.end <= src.len);
+        return std.mem.concat(allocator, u8, &.{ src[0..span.start], new_ref, src[span.end..] });
+    }
+
+    /// The footprint of a parsed definition. Refuses (as malformed) a
+    /// `ref` that is not an A1 rectangle — ST_Ref has no `$`, no sheet
+    /// qualifier, no whitespace.
+    pub fn footprintOf(allocator: Allocator, def: pivot_xml.TableDefinition) EditError!Footprint {
+        const decoded = engine.decode.decodeCarrier(allocator, .lexical, def.location.ref) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        defer allocator.free(decoded);
+        const rect = parseRect(decoded) orelse return error.MalformedPivotXml;
+
+        // Report filters: `rowPageCount` / `colPageCount` when Excel
+        // wrote them, the page-field count as a superset for BOTH when
+        // a producer left them out — an over-then-down layout puts every
+        // field on one row, so the count bounds the columns as much as
+        // the rows (Codex #200 r3 REL-041). `max(1, …)` because a band
+        // with rows has at least one pair per row.
+        const pages: u32 = @intCast(@min(def.page_fields.len, std.math.maxInt(u32)));
+        const page_rows: u32 = @max(def.location.row_page_count orelse 0, pages);
+        var first_row = rect.tl_row;
+        var last_col = rect.br_col;
+        if (page_rows > 0) {
+            // Subtraction only: `rowPageCount` is any u32 the part
+            // declares, and `page_rows + 1` would wrap at the maximum
+            // (Codex #200 r1 REL-037). `rect.tl_row ≥ 1`.
+            first_row = if (page_rows >= rect.tl_row - 1) 1 else rect.tl_row - page_rows - 1;
+            const page_cols: u32 = @max(@max(def.location.col_page_count orelse 0, pages), 1);
+            const band_width = std.math.mul(u32, page_cols, 3) catch return error.PivotCoordinateOverflow;
+            const band_right = std.math.add(u32, rect.tl_col, band_width - 1) catch return error.PivotCoordinateOverflow;
+            last_col = @max(last_col, band_right);
+        }
+        return .{ .rect = rect, .first_row = first_row, .last_col = last_col };
+    }
+
+    /// Interval semantics on the footprint. An insert AT the footprint's
+    /// first row / column pushes the whole pivot (Excel's "insert above"),
+    /// so the shift zone is `idx ≤ first` for inserts and `idx < first`
+    /// for deletes; `first < idx ≤ last` (delete: `first ≤ idx ≤ last`)
+    /// is inside and refuses; beyond `last` nothing moves.
+    pub fn shiftRect(fp: Footprint, axis: Axis, idx_1based: u32, kind: Kind) EditError!Rect {
+        // Public: a caller reaching this without `applyToTableDefinition`
+        // gets the same answer for a position that does not exist,
+        // never a rectangle at row or column 0 (Codex #200 r4 REL-044).
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        var r = fp.rect;
+        switch (axis) {
+            .row => switch (kind) {
+                .insert => {
+                    if (idx_1based <= fp.first_row) {
+                        if (r.br_row >= zlsx.max_row) return error.PivotCoordinateOverflow;
+                        r.tl_row += 1;
+                        r.br_row += 1;
+                    } else if (idx_1based <= r.br_row) {
+                        return error.PivotLocationEditUnsafe;
+                    }
+                },
+                .delete => {
+                    if (idx_1based < fp.first_row) {
+                        r.tl_row -= 1;
+                        r.br_row -= 1;
+                    } else if (idx_1based <= r.br_row) {
+                        return error.PivotLocationEditUnsafe;
+                    }
+                },
+            },
+            .col => switch (kind) {
+                .insert => {
+                    if (idx_1based <= r.tl_col) {
+                        if (r.br_col >= zlsx.max_col_1based) return error.PivotCoordinateOverflow;
+                        r.tl_col += 1;
+                        r.br_col += 1;
+                    } else if (idx_1based <= fp.last_col) {
+                        return error.PivotLocationEditUnsafe;
+                    }
+                },
+                .delete => {
+                    if (idx_1based < r.tl_col) {
+                        r.tl_col -= 1;
+                        r.br_col -= 1;
+                    } else if (idx_1based <= fp.last_col) {
+                        return error.PivotLocationEditUnsafe;
+                    }
+                },
+            },
+        }
+        return r;
+    }
+
+    /// `A1` or `A1:C4`, plain A1 only. Null on anything else.
+    pub fn parseRect(ref: []const u8) ?Rect {
+        const colon = std.mem.indexOfScalar(u8, ref, ':');
+        const tl = parseCell(if (colon) |c| ref[0..c] else ref) orelse return null;
+        const br = if (colon) |c| (parseCell(ref[c + 1 ..]) orelse return null) else tl;
+        if (br.col < tl.col or br.row < tl.row) return null;
+        return .{ .tl_col = tl.col, .tl_row = tl.row, .br_col = br.col, .br_row = br.row };
+    }
+
+    const Cell = struct { col: u32, row: u32 };
+
+    fn parseCell(s: []const u8) ?Cell {
+        var letters: usize = 0;
+        while (letters < s.len and s[letters] >= 'A' and s[letters] <= 'Z') letters += 1;
+        if (letters == 0 or letters > 3 or letters == s.len) return null;
+        const digits = s[letters..];
+        // `A01` is not a cell Excel writes; a leading zero would round-
+        // trip to a different spelling, so it is refused with the rest.
+        if (digits[0] == '0') return null;
+        for (digits) |d| if (d < '0' or d > '9') return null;
+        const col = sheet_edit.parseColLetters(s[0..letters]) orelse return null;
+        const row = std.fmt.parseInt(u32, digits, 10) catch return null;
+        if (col == 0 or col > zlsx.max_col_1based or row == 0 or row > zlsx.max_row) return null;
+        return .{ .col = col, .row = row };
+    }
+
+    fn formatRect(buf: *[48]u8, r: Rect) ![]const u8 {
+        var tl_buf: [8]u8 = undefined;
+        var br_buf: [8]u8 = undefined;
+        const tl_len = try coords.writeColNumberLetters(&tl_buf, r.tl_col);
+        const br_len = try coords.writeColNumberLetters(&br_buf, r.br_col);
+        if (r.tl_col == r.br_col and r.tl_row == r.br_row) {
+            return std.fmt.bufPrint(buf, "{s}{d}", .{ tl_buf[0..tl_len], r.tl_row });
+        }
+        return std.fmt.bufPrint(buf, "{s}{d}:{s}{d}", .{ tl_buf[0..tl_len], r.tl_row, br_buf[0..br_len], r.br_row });
+    }
+};
 
 // ─── Test fixture ────────────────────────────────────────────────────
 
@@ -1759,4 +2016,193 @@ test "collect: one pivot part linked from two sheets is two pivots reading one c
     try testing.expectEqual(@as(usize, 1), o.pivots.caches.len);
     try testing.expectEqual(@as(u32, 2), o.pivots.caches[0].consumer_count);
     try testing.expect(o.pivots.hostsPivot(0) and o.pivots.hostsPivot(1));
+}
+
+// ─── S7a: the output-location lift ───────────────────────────────────
+
+const pt_head =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="7">
+;
+const pt_tail =
+    \\<pivotFields count="1"><pivotField axis="axisRow"/></pivotFields><rowFields count="1"><field x="0"/></rowFields></pivotTableDefinition>
+;
+
+fn ptWith(middle: []const u8) ![]u8 {
+    return std.mem.concat(testing.allocator, u8, &.{ pt_head, middle, pt_tail });
+}
+
+fn expectMove(middle: []const u8, axis: edit.Axis, idx: u32, kind: edit.Kind, want_middle: []const u8) !void {
+    const src = try ptWith(middle);
+    defer testing.allocator.free(src);
+    const out = try edit.applyToTableDefinition(testing.allocator, src, axis, idx, kind);
+    defer testing.allocator.free(out);
+    const want = try ptWith(want_middle);
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, out);
+}
+
+fn expectRefusal(middle: []const u8, axis: edit.Axis, idx: u32, kind: edit.Kind, err: anyerror) !void {
+    const src = try ptWith(middle);
+    defer testing.allocator.free(src);
+    try testing.expectError(err, edit.applyToTableDefinition(testing.allocator, src, axis, idx, kind));
+}
+
+test "edit: an insert at or above the rectangle moves it; below, the bytes are untouched" {
+    const loc = "<location ref=\"C3:D6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>";
+    // Rows: the offsets inside the rectangle do not move with it.
+    try expectMove(loc, .row, 1, .insert, "<location ref=\"C4:D7\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .row, 3, .insert, "<location ref=\"C4:D7\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .row, 7, .insert, loc);
+    try expectMove(loc, .row, 2, .delete, "<location ref=\"C2:D5\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .row, 7, .delete, loc);
+    // Columns.
+    try expectMove(loc, .col, 1, .insert, "<location ref=\"D3:E6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .col, 3, .insert, "<location ref=\"D3:E6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .col, 5, .insert, loc);
+    try expectMove(loc, .col, 2, .delete, "<location ref=\"B3:C6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+    try expectMove(loc, .col, 5, .delete, loc);
+}
+
+test "edit: an edit inside the rectangle refuses — Excel refuses it too" {
+    const loc = "<location ref=\"C3:D6\"/>";
+    try expectRefusal(loc, .row, 4, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .row, 6, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .row, 3, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .row, 6, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .col, 4, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .col, 3, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .col, 4, .delete, error.PivotLocationEditUnsafe);
+}
+
+test "edit: report filters widen the footprint above the rectangle and to its right" {
+    // One filter: label + value at A1:B1, blank row 2, body at A3.
+    // The band is `rowPageCount + 1` rows above and `3 · colPageCount`
+    // columns wide (A..C) — a superset of the cells Excel draws.
+    const loc = "<location ref=\"A3:B6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\" rowPageCount=\"1\" colPageCount=\"1\"/>";
+    try expectMove(loc, .row, 1, .insert, "<location ref=\"A4:B7\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\" rowPageCount=\"1\" colPageCount=\"1\"/>");
+    try expectRefusal(loc, .row, 2, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .row, 1, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .row, 2, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .col, 3, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(loc, .col, 3, .delete, error.PivotLocationEditUnsafe);
+    try expectMove(loc, .col, 4, .insert, loc);
+    try expectMove(loc, .col, 1, .insert, "<location ref=\"B3:C6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\" rowPageCount=\"1\" colPageCount=\"1\"/>");
+
+    // A producer that wrote `<pageFields>` but no counts: the field
+    // count stands in for both.
+    const bare = "<location ref=\"A3:B6\"/><pageFields count=\"1\"><pageField fld=\"0\" hier=\"-1\"/></pageFields>";
+    try expectRefusal(bare, .row, 2, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(bare, .col, 3, .insert, error.PivotLocationEditUnsafe);
+    try expectMove(bare, .row, 1, .insert, "<location ref=\"A4:B7\"/><pageFields count=\"1\"><pageField fld=\"0\" hier=\"-1\"/></pageFields>");
+    // Two fields, no counts: over-then-down would put the second pair
+    // at D:E, so the count bounds the columns too — A..F is inside, G
+    // is not (Codex #200 r3 REL-041).
+    const two = "<location ref=\"A4:B6\"/><pageFields count=\"2\"><pageField fld=\"0\" hier=\"-1\"/><pageField fld=\"2\" hier=\"-1\"/></pageFields>";
+    try expectRefusal(two, .col, 4, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(two, .col, 4, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(two, .col, 6, .insert, error.PivotLocationEditUnsafe);
+    try expectMove(two, .col, 7, .insert, two);
+    try expectRefusal(two, .row, 3, .insert, error.PivotLocationEditUnsafe);
+    try expectMove(two, .row, 1, .insert, "<location ref=\"A5:B7\"/><pageFields count=\"2\"><pageField fld=\"0\" hier=\"-1\"/><pageField fld=\"2\" hier=\"-1\"/></pageFields>");
+
+    // A rectangle too close to the top for its band: the band is
+    // clamped to row 1, never wraps — including at the largest count a
+    // part can declare (Codex #200 r1 REL-037).
+    try expectMove("<location ref=\"A2:B4\" rowPageCount=\"3\"/>", .row, 1, .insert, "<location ref=\"A3:B5\" rowPageCount=\"3\"/>");
+    try expectMove("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 1, .insert, "<location ref=\"A4:B7\" rowPageCount=\"4294967295\"/>");
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 1, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 2, .insert, error.PivotLocationEditUnsafe);
+    // The band's width is checked arithmetic too.
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"1\" colPageCount=\"4294967295\"/>", .col, 9, .insert, error.PivotCoordinateOverflow);
+}
+
+test "mayReadFromSheet: an unresolved source may be any sheet; external and non-worksheet sources are not" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_may_read.xlsx");
+    defer testing.allocator.free(path);
+
+    // A dynamic defined name: Excel accepts `OFFSET(...)` as a pivot
+    // source; the reader cannot place it, so every sheet may be read.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET(Report!$D$1,0,0,4,3)");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .unresolved);
+        try testing.expect(!o.pivots.readsFromSheet(1));
+        try testing.expect(o.pivots.mayReadFromSheet(0) and o.pivots.mayReadFromSheet(1));
+    }
+    // An external workbook is proven elsewhere.
+    try fixture.write(testing.allocator, io, path, .external);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .external);
+        try testing.expect(!o.pivots.mayReadFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A resolved local source: the one sheet, and no other.
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.mayReadFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A source type the reader does not know may be anything.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "type=\"worksheet\"", "type=\"lakehouse\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].definition.source.type == .unknown);
+        try testing.expect(o.pivots.mayReadFromSheet(1));
+    }
+}
+
+test "edit: the splice lands on the parser's span — past a decoy, through an entity" {
+    const decoy = "<!-- <location ref=\"Z9\"/> --><location ref=\"A3&#58;B6\"/>";
+    try expectMove(decoy, .row, 1, .insert, "<!-- <location ref=\"Z9\"/> --><location ref=\"A4:B7\"/>");
+    // A no-op keeps the entity spelling: the part is byte-preserved.
+    try expectMove(decoy, .row, 9, .insert, decoy);
+}
+
+test "edit: a single-cell rectangle and the grid edges" {
+    try expectMove("<location ref=\"A3\"/>", .row, 1, .insert, "<location ref=\"A4\"/>");
+    try expectMove("<location ref=\"A3\"/>", .col, 1, .insert, "<location ref=\"B3\"/>");
+    try expectMove("<location ref=\"A1048576\"/>", .row, 1, .delete, "<location ref=\"A1048575\"/>");
+    try expectRefusal("<location ref=\"A1048576\"/>", .row, 1, .insert, error.PivotCoordinateOverflow);
+    try expectRefusal("<location ref=\"A1:XFD1\"/>", .col, 1, .insert, error.PivotCoordinateOverflow);
+    try expectMove("<location ref=\"XFD1\"/>", .col, 1, .delete, "<location ref=\"XFC1\"/>");
+}
+
+test "edit: a ref that is not an A1 rectangle refuses as malformed" {
+    for ([_][]const u8{ "$A$3:B6", "A3:", ":B6", "B6:A3", "Sheet!A3:B6", "A03", "a3", "A3:B6:C7", "A0", "XFE1", " A3" }) |bad| {
+        const middle = try std.fmt.allocPrint(testing.allocator, "<location ref=\"{s}\"/>", .{bad});
+        defer testing.allocator.free(middle);
+        try expectRefusal(middle, .row, 1, .insert, error.MalformedPivotXml);
+    }
+    // No `<location>` at all — the parser's refusal, surfaced whole.
+    try expectRefusal("", .row, 1, .insert, error.MalformedPivotXml);
+    // Row / column 0 is not a position — on the splice and on the
+    // public rectangle helper alike (Codex #200 r4 REL-044).
+    try expectRefusal("<location ref=\"A3\"/>", .row, 0, .insert, error.MalformedPivotXml);
+    const fp: edit.Footprint = .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 1, .br_row = 1 }, .first_row = 1, .last_col = 1 };
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .row, 0, .delete));
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .col, 0, .delete));
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .row, 0, .insert));
+    try testing.expectEqual(@as(u32, 2), (try edit.shiftRect(fp, .row, 1, .insert)).tl_row);
+}
+
+fn editForFailures(allocator: Allocator, src: []const u8) !void {
+    const out = try edit.applyToTableDefinition(allocator, src, .row, 1, .insert);
+    allocator.free(out);
+}
+
+test "edit: allocation failure at every point leaves nothing behind" {
+    const src = try ptWith("<location ref=\"A3:B6\" rowPageCount=\"1\"/><pageFields count=\"1\"><pageField fld=\"0\"/></pageFields>");
+    defer testing.allocator.free(src);
+    try testing.checkAllAllocationFailures(testing.allocator, editForFailures, .{src});
 }

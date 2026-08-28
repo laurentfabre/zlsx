@@ -5691,6 +5691,16 @@ pub const Workbook = struct {
 
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec) Error!void {
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        // The direct `Workbook` path validates the position itself (the
+        // Editor does too): every sweep below spells 1-based, and a 0
+        // reaching the walkers is arithmetic on an index that does not
+        // exist (Codex #200 r2 REL-038).
+        if (spec.row) |r| {
+            if (r == 0 or r > zlsx.max_row) return error.RowIndexOutOfRange;
+        }
+        if (spec.col) |c| {
+            if (c == 0 or c > zlsx.max_col_1based) return error.ColumnIndexOutOfRange;
+        }
         const ws = try self.sheet(sheet_idx);
         if (ws.deltas.count() > 0) return error.SheetHasUnsavedMutations;
         if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
@@ -5720,6 +5730,16 @@ pub const Workbook = struct {
                 try sheet_edit.applyColEditToWorksheet(self.allocator, pre.bytes, spec.col.?, spec.kind);
             self.allocator.free(probe);
         }
+
+        // S7a: the pivot sweep goes FIRST among the mutations. It is
+        // all-or-nothing on its own parts (`xl/pivotTables/*`, which no
+        // other sweep touches) and it is the one sweep that can still
+        // refuse — an edit inside a hosted pivot's footprint, a host
+        // that is also a source — so a direct `Workbook` caller gets
+        // that refusal before any part has changed. The Editor
+        // pre-flights the same check and folds it into
+        // `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
+        try self.applyPivotEditsForSheet(part_name, spec);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
         // #192 F1): formula text spells PRE-edit positions, and
@@ -5938,35 +5958,148 @@ pub const Workbook = struct {
         }
     }
 
-    /// Refuse a row/col edit on a sheet that a pivot table reads from.
+    /// S7a: admit or refuse a row/col edit on a sheet that a pivot
+    /// table renders on, before the first mutation.
     ///
-    /// A pivot's `<location ref>` and its cache field ranges live in
-    /// `xl/pivotTables/pivotN.xml` and `xl/pivotCache/*`, keyed by a
-    /// cross-part reference graph zlsx has no rewriter for. Until it
-    /// does, the honest outcome is a typed refusal.
+    /// Before #139 there was no guard at all: neither `pkg/sheet_edit.zig`
+    /// nor `pkg/editor.zig` contained the string "pivot", and a row insert
+    /// left every pivot coordinate pointing at the pre-shift grid —
+    /// `docs/plans/refusal-audit.md` had recorded pivots as "refused at
+    /// consumer level". #139 refused every sheet whose relationships name
+    /// a pivot part. S7a lifts the one case the definition part can
+    /// answer on its own: a sheet that only HOSTS a pivot. Its
+    /// `location@ref` is the single absolute coordinate the definition
+    /// carries, and `pivots.edit.applyToTableDefinition` moves it —
+    /// dry-run here, applied by `applyPivotEditsForSheet` in the sweep.
     ///
-    /// This closes a **silent-corruption** path, not a feature gap.
-    /// `docs/plans/refusal-audit.md` recorded pivots as "refused at
-    /// consumer level" — they were not refused anywhere: neither
-    /// `pkg/sheet_edit.zig` nor `pkg/editor.zig` contained the string
-    /// "pivot". A row insert simply left every pivot coordinate
-    /// pointing at the pre-shift grid. Same class as the four
-    /// unrewritten elements #125 found, and invisible to the same
-    /// audit method for the same reason: you cannot enumerate a guard
-    /// that was never written.
+    /// Still refused, all as `PivotEditUnsafe`:
+    ///   - the edit lands inside a hosted pivot's footprint (the output
+    ///     rectangle, or the report-filter band above it) — Excel
+    ///     refuses that edit too, and admitting it would change the
+    ///     pivot's own layout;
+    ///   - some cache MAY read this sheet (`Pivots.mayReadFromSheet`):
+    ///     a source resolved to it — `worksheetSource@ref` and the
+    ///     cache records are S7b's / S7c's, and the corpus' own
+    ///     `IrisSample` is this shape (hosts `PivotTable1`, read through
+    ///     `Table2`) — or one the reader cannot place (a defined name
+    ///     with a dynamic body, a dangling spelling) or of a type it
+    ///     does not know; "not proven local" is not "proven elsewhere";
+    ///   - a shift past `XFD` / `1048576`;
+    ///   - the pivot part is also a host relationship of ANOTHER sheet
+    ///     — one rectangle cannot follow two grids;
+    ///   - the sheet's relationships name a cache part directly — not a
+    ///     topology the graph has a reading for.
+    /// The host sheet's own `<pivotSelection>` coordinates move with the
+    /// grid in `pkg/sheet_edit.zig`, like `<selection>`.
+    /// A graph that cannot be read whole is `MalformedPivotXml`, the
+    /// typed read's own refusal; the Editor folds both into
+    /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
     ///
-    /// Detection is by relationship type rather than by scanning the
-    /// sheet body: a pivot leaves no required marker in the worksheet
-    /// XML (`<pivotSelection>` rides in `<sheetView>` but is
-    /// optional), while the r:id edge to the pivot part is what makes
-    /// the pivot depend on this sheet's coordinates at all.
+    /// The sheet a pivot only *reads from* is still admitted (S6 audit,
+    /// surface-matrix footnote ¹⁰): its relationships name no pivot
+    /// part, so nothing here runs — the graph is parsed only for a
+    /// sheet that hosts one. S7b owns that refusal and the rewrite.
     pub fn preflightPivotEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
     ) Error!void {
-        for (self.store.rels(sheet_part_name)) |rel| {
-            if (isPivotRelType(rel.type)) return error.PivotEditUnsafe;
+        var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
+        defer p.deinit();
+        for (p.tables, 0..) |t, i| {
+            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
+            const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
+            self.allocator.free(out);
         }
+    }
+
+    /// The typed graph when the sheet's relationships name a pivot
+    /// table part; null when they name none — the common case, and the
+    /// one that must not pay for a parse (or inherit a refusal from a
+    /// pivot elsewhere in the workbook).
+    fn hostedPivotsForEdit(self: *Workbook, sheet_part_name: []const u8) Error!?pivots_mod.Pivots {
+        var hosts = false;
+        for (self.store.rels(sheet_part_name)) |rel| {
+            if (pivots_mod.relLeafIs(rel.type, "pivotTable")) {
+                hosts = true;
+            } else if (isPivotRelType(rel.type)) {
+                return error.PivotEditUnsafe;
+            }
+        }
+        if (!hosts) return null;
+        return try self.pivotTables();
+    }
+
+    /// Is `p.tables[i]` a pivot this edit moves? False for a pivot on
+    /// another sheet and for a repeat of a part already seen on this one
+    /// (two relationships to one part move it once). The admission
+    /// that does not depend on the edit's position runs here too: no
+    /// cache may read the host, and the part may not also be hosted by
+    /// a different sheet — one rectangle cannot follow two grids (Codex
+    /// #200 r1 REL-033 / REL-035).
+    fn hostedHere(p: *const pivots_mod.Pivots, i: usize, sheet_part_name: []const u8) Error!bool {
+        const t = p.tables[i];
+        if (!std.mem.eql(u8, t.sheet_part_name, sheet_part_name)) return false;
+        if (p.mayReadFromSheet(t.sheet_idx)) return error.PivotEditUnsafe;
+        for (p.tables, 0..) |u, k| {
+            if (!std.mem.eql(u8, u.part_name, t.part_name)) continue;
+            if (!std.mem.eql(u8, u.sheet_part_name, sheet_part_name)) return error.PivotEditUnsafe;
+            if (k < i) return false;
+        }
+        return true;
+    }
+
+    fn applyPivotLocationEdit(
+        allocator: Allocator,
+        src: []const u8,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+    ) Error![]u8 {
+        return pivots_mod.edit.applyToTableDefinition(allocator, src, axis, idx_1based, kind) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.MalformedPivotXml => error.MalformedPivotXml,
+            error.PivotLocationEditUnsafe, error.PivotCoordinateOverflow => error.PivotEditUnsafe,
+        };
+    }
+
+    /// S7a sweep: move `location@ref` of every pivot the sheet hosts.
+    /// All-or-nothing — every definition is rewritten in memory before
+    /// the first part is replaced, so a refusal on the second pivot
+    /// leaves the first untouched, and the install itself is the
+    /// store's transactional `replaceParts`, so an allocation failure
+    /// midway leaves every part as it was. Byte-identical rewrites (the
+    /// pivot sits below / right of the edit) are not installed, so the
+    /// SHA-256 passthrough holds for them.
+    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
+        const idx_1based = spec.row orelse spec.col.?;
+        std.debug.assert(idx_1based >= 1);
+        const axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
+        const kind: pivots_mod.edit.Kind = switch (spec.kind) {
+            .insert => .insert,
+            .delete => .delete,
+        };
+        var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
+        defer p.deinit();
+
+        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
+        defer {
+            for (patches.items) |it| self.allocator.free(it.bytes);
+            patches.deinit(self.allocator);
+        }
+        for (p.tables, 0..) |t, i| {
+            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
+            const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
+            if (std.mem.eql(u8, out, t.raw_xml)) {
+                self.allocator.free(out);
+                continue;
+            }
+            errdefer self.allocator.free(out);
+            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = out });
+        }
+        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
     }
 
     /// tbl: walk the sheet's `<tableParts>` block, resolve each

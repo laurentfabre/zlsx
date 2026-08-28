@@ -973,6 +973,68 @@ pub const PartStore = struct {
         return self.replacePartControlled(name, bytes, .none);
     }
 
+    pub const Replacement = struct {
+        name: []const u8,
+        bytes: []const u8,
+    };
+
+    /// `replacePart` for several parts at once, atomic with respect to
+    /// allocation failure: every index is resolved, every payload
+    /// duplicated and every rels re-parse done before the first part is
+    /// installed, so an `OutOfMemory` midway leaves the store exactly as
+    /// it was — a sweep that stages N rewrites cannot land N−1 of them
+    /// (Codex #200 r1 REL-036). Arena space the duplicates took before
+    /// the failure is not reclaimed; it is an arena. Same deferred-
+    /// compression contract as `replacePart`; no poll seam.
+    pub fn replaceParts(self: *PartStore, entries: []const Replacement) !void {
+        const ar_alloc = self.arena.allocator();
+        const Staged = struct {
+            idx: usize,
+            bytes: []u8,
+            owner: ?[]const u8,
+            rels: []Relationship,
+        };
+        const staged = try self.allocator.alloc(Staged, entries.len);
+        defer self.allocator.free(staged);
+
+        // Resolve and size-check everything before the first duplicate.
+        for (entries, 0..) |e, k| {
+            const idx = self.findIndex(e.name) orelse return error.PartNotFound;
+            if (e.bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
+            staged[k] = .{ .idx = idx, .bytes = &.{}, .owner = null, .rels = &.{} };
+        }
+
+        // Large payloads live outside the arena as exact blocks that
+        // `dupePayload` registers as it goes; a failure after the first
+        // of them must give those blocks back, or a recoverable error
+        // leaves resident bytes no part refers to (Codex #200 r2
+        // REL-040). Arena space is not reclaimed; it is an arena.
+        const big_before = self.big_parts.items.len;
+        errdefer {
+            for (self.big_parts.items[big_before..]) |block| self.allocator.free(block);
+            self.big_parts.shrinkRetainingCapacity(big_before);
+        }
+
+        var n_rels: u32 = 0;
+        for (entries, 0..) |e, k| {
+            const dupe_bytes = try self.dupePayload(ar_alloc, e.bytes);
+            staged[k].bytes = dupe_bytes;
+            if (try relsOwner(ar_alloc, e.name)) |o| {
+                staged[k].owner = o;
+                staged[k].rels = try parseRelationships(ar_alloc, dupe_bytes);
+                n_rels += 1;
+            }
+        }
+        try self.rels_by_owner.ensureUnusedCapacity(ar_alloc, n_rels);
+
+        // Nothing below can fail.
+        for (staged) |st| {
+            self.overrides[st.idx] = .pending;
+            self.parts[st.idx].bytes = st.bytes;
+            if (st.owner) |o| self.rels_by_owner.putAssumeCapacity(o, st.rels);
+        }
+    }
+
     /// Payloads at or above this get an exact block instead of the
     /// arena. The threshold is about the arena's chunk arithmetic, not
     /// about the part: below it a payload generally fits the chunk the
