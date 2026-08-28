@@ -1004,9 +1004,11 @@ pub const edit = struct {
         const rect = parseRect(decoded) orelse return error.MalformedPivotXml;
 
         // Report filters: `rowPageCount` / `colPageCount` when Excel
-        // wrote them, the page-field count as a superset when a producer
-        // left them out. `max(1, colPageCount)` because a band with
-        // rows has at least one pair per row.
+        // wrote them, the page-field count as a superset for BOTH when
+        // a producer left them out — an over-then-down layout puts every
+        // field on one row, so the count bounds the columns as much as
+        // the rows (Codex #200 r3 REL-041). `max(1, …)` because a band
+        // with rows has at least one pair per row.
         const pages: u32 = @intCast(@min(def.page_fields.len, std.math.maxInt(u32)));
         const page_rows: u32 = @max(def.location.row_page_count orelse 0, pages);
         var first_row = rect.tl_row;
@@ -1016,7 +1018,7 @@ pub const edit = struct {
             // declares, and `page_rows + 1` would wrap at the maximum
             // (Codex #200 r1 REL-037). `rect.tl_row ≥ 1`.
             first_row = if (page_rows >= rect.tl_row - 1) 1 else rect.tl_row - page_rows - 1;
-            const page_cols: u32 = @max(def.location.col_page_count orelse 0, 1);
+            const page_cols: u32 = @max(@max(def.location.col_page_count orelse 0, pages), 1);
             const band_width = std.math.mul(u32, page_cols, 3) catch return error.PivotCoordinateOverflow;
             const band_right = std.math.add(u32, rect.tl_col, band_width - 1) catch return error.PivotCoordinateOverflow;
             last_col = @max(last_col, band_right);
@@ -2089,6 +2091,16 @@ test "edit: report filters widen the footprint above the rectangle and to its ri
     try expectRefusal(bare, .row, 2, .insert, error.PivotLocationEditUnsafe);
     try expectRefusal(bare, .col, 3, .insert, error.PivotLocationEditUnsafe);
     try expectMove(bare, .row, 1, .insert, "<location ref=\"A4:B7\"/><pageFields count=\"1\"><pageField fld=\"0\" hier=\"-1\"/></pageFields>");
+    // Two fields, no counts: over-then-down would put the second pair
+    // at D:E, so the count bounds the columns too — A..F is inside, G
+    // is not (Codex #200 r3 REL-041).
+    const two = "<location ref=\"A4:B6\"/><pageFields count=\"2\"><pageField fld=\"0\" hier=\"-1\"/><pageField fld=\"2\" hier=\"-1\"/></pageFields>";
+    try expectRefusal(two, .col, 4, .insert, error.PivotLocationEditUnsafe);
+    try expectRefusal(two, .col, 4, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal(two, .col, 6, .insert, error.PivotLocationEditUnsafe);
+    try expectMove(two, .col, 7, .insert, two);
+    try expectRefusal(two, .row, 3, .insert, error.PivotLocationEditUnsafe);
+    try expectMove(two, .row, 1, .insert, "<location ref=\"A5:B7\"/><pageFields count=\"2\"><pageField fld=\"0\" hier=\"-1\"/><pageField fld=\"2\" hier=\"-1\"/></pageFields>");
 
     // A rectangle too close to the top for its band: the band is
     // clamped to row 1, never wraps — including at the largest count a

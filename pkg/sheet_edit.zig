@@ -1816,9 +1816,14 @@ fn processPivotSelectionTag(
     var n_subs: usize = 0;
     for (names, 0..) |name, k| {
         const raw = getAttr(attrs, name) orelse continue;
-        // A value that is not a number is left as written: the walker
-        // never invents view state.
-        const v = std.fmt.parseInt(u32, raw, 10) catch continue;
+        // Character references are the value too (`&#51;` is `3`, Codex
+        // #200 r3 REL-042); a value that is still not a number is left
+        // as written — the walker never invents view state. A shifted
+        // value is re-emitted plain: the entity spelling is not
+        // preserved, the number is.
+        var dec_buf: [16]u8 = undefined;
+        const decoded = workbook_xml.decodeScalarAttr(&dec_buf, raw) orelse continue;
+        const v = std.fmt.parseInt(u32, decoded, 10) catch continue;
         const shifted = shiftIndex0(v, idx_1based, kind) orelse continue;
         if (shifted == v) continue;
         subs[n_subs] = .{ .name = name, .new_value = try std.fmt.bufPrint(&bufs[k], "{d}", .{shifted}) };
@@ -2366,6 +2371,22 @@ test "pivotSelection: whitespace around `=`, single quotes and an open tag are r
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<pivotSelection activeRow = \"12\" previousRow =\t'12' activeCol= \"1\" r:id=\"rIdPT\">") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<selection activeCell = \"C13\" sqref = \"C13\"/>") != null);
+}
+
+test "pivotSelection: character references spell the coordinate too" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sheetView><pivotSelection activeRow=\"&#51;\" activeCol=\"&#x31;\" previousRow=\"3\" previousCol=\"1\" r:id=\"rIdPT\"/></sheetView>");
+    defer a.free(src);
+    {
+        const out = try applyRowEditToWorksheet(a, src, 2, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"4\" activeCol=\"&#x31;\" previousRow=\"4\" previousCol=\"1\"") != null);
+    }
+    {
+        const out = try applyColEditToWorksheet(a, src, 1, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"&#51;\" activeCol=\"2\" previousRow=\"3\" previousCol=\"2\"") != null);
+    }
 }
 
 test "pivotSelection: a coordinate that is not a number is left as written" {
