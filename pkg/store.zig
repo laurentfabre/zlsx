@@ -997,19 +997,33 @@ pub const PartStore = struct {
         const staged = try self.allocator.alloc(Staged, entries.len);
         defer self.allocator.free(staged);
 
-        var n_rels: u32 = 0;
+        // Resolve and size-check everything before the first duplicate.
         for (entries, 0..) |e, k| {
             const idx = self.findIndex(e.name) orelse return error.PartNotFound;
             if (e.bytes.len >= std.math.maxInt(u32)) return Error.Zip64NotSupported;
+            staged[k] = .{ .idx = idx, .bytes = &.{}, .owner = null, .rels = &.{} };
+        }
+
+        // Large payloads live outside the arena as exact blocks that
+        // `dupePayload` registers as it goes; a failure after the first
+        // of them must give those blocks back, or a recoverable error
+        // leaves resident bytes no part refers to (Codex #200 r2
+        // REL-040). Arena space is not reclaimed; it is an arena.
+        const big_before = self.big_parts.items.len;
+        errdefer {
+            for (self.big_parts.items[big_before..]) |block| self.allocator.free(block);
+            self.big_parts.shrinkRetainingCapacity(big_before);
+        }
+
+        var n_rels: u32 = 0;
+        for (entries, 0..) |e, k| {
             const dupe_bytes = try self.dupePayload(ar_alloc, e.bytes);
-            var owner: ?[]const u8 = null;
-            var parsed_rels: []Relationship = &.{};
+            staged[k].bytes = dupe_bytes;
             if (try relsOwner(ar_alloc, e.name)) |o| {
-                owner = o;
-                parsed_rels = try parseRelationships(ar_alloc, dupe_bytes);
+                staged[k].owner = o;
+                staged[k].rels = try parseRelationships(ar_alloc, dupe_bytes);
                 n_rels += 1;
             }
-            staged[k] = .{ .idx = idx, .bytes = dupe_bytes, .owner = owner, .rels = parsed_rels };
         }
         try self.rels_by_owner.ensureUnusedCapacity(ar_alloc, n_rels);
 

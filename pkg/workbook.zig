@@ -5691,6 +5691,16 @@ pub const Workbook = struct {
 
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec) Error!void {
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
+        // The direct `Workbook` path validates the position itself (the
+        // Editor does too): every sweep below spells 1-based, and a 0
+        // reaching the walkers is arithmetic on an index that does not
+        // exist (Codex #200 r2 REL-038).
+        if (spec.row) |r| {
+            if (r == 0 or r > zlsx.max_row) return error.RowIndexOutOfRange;
+        }
+        if (spec.col) |c| {
+            if (c == 0 or c > zlsx.max_col_1based) return error.ColumnIndexOutOfRange;
+        }
         const ws = try self.sheet(sheet_idx);
         if (ws.deltas.count() > 0) return error.SheetHasUnsavedMutations;
         if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
@@ -6065,7 +6075,7 @@ pub const Workbook = struct {
     /// SHA-256 passthrough holds for them.
     fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
-        if (idx_1based == 0) return;
+        std.debug.assert(idx_1based >= 1);
         const axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
         const kind: pivots_mod.edit.Kind = switch (spec.kind) {
             .insert => .insert,

@@ -5865,13 +5865,16 @@ fn replacePartsForFailures(allocator: std.mem.Allocator, io: std.Io, path: []con
     defer allocator.free(a_old);
     const b_old = try allocator.dupe(u8, (try store.part("xl/pivotTables/pivotTable2.xml")).?.bytes);
     defer allocator.free(b_old);
+    const big_before = store.big_parts.items.len;
     store.replaceParts(&.{
         .{ .name = "xl/pivotTables/pivotTable1.xml", .bytes = a_new },
         .{ .name = "xl/pivotTables/pivotTable2.xml", .bytes = b_new },
     }) catch |e| {
-        // Neither installed: the failure left the store as it was.
+        // Neither installed, and no out-of-arena block retained: the
+        // failure left the store as it was (Codex r2 REL-040).
         try std.testing.expectEqualStrings(a_old, (try store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
         try std.testing.expectEqualStrings(b_old, (try store.part("xl/pivotTables/pivotTable2.xml")).?.bytes);
+        try std.testing.expectEqual(big_before, store.big_parts.items.len);
         return e;
     };
     try std.testing.expectEqualStrings(a_new, (try store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
@@ -5897,6 +5900,55 @@ test "S7a: the sweep's install is transactional under allocation failure (Codex 
     const a_new = "<pivotTableDefinition a/>";
     const b_new = "<pivotTableDefinition b/>";
     try std.testing.checkAllAllocationFailures(std.testing.allocator, replacePartsForFailures, .{ io, src, a_new, b_new });
+
+    // Payloads at the exact-block threshold take the out-of-arena path,
+    // where a block registered for the first part must be given back
+    // when the second fails.
+    const big = store_mod.PartStore.big_payload_bytes + 16;
+    const a_big = try std.testing.allocator.alloc(u8, big);
+    defer std.testing.allocator.free(a_big);
+    @memset(a_big, 'a');
+    const b_big = try std.testing.allocator.alloc(u8, big);
+    defer std.testing.allocator.free(b_big);
+    @memset(b_big, 'b');
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replacePartsForFailures, .{ io, src, a_big, b_big });
+}
+
+test "S7a: the direct Workbook path refuses position 0 and beyond the grid before any sweep (Codex r2 REL-038)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7a_zero_src.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    // A pivot selection on the host, as Excel saves one: absolute
+    // 0-based coordinates inside `A3:B6`.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "/></sheetViews>", "><pivotSelection pane=\"topLeft\" activeRow=\"3\" activeCol=\"1\" previousRow=\"3\" previousCol=\"1\" r:id=\"rIdPT1\"/></sheetView></sheetViews>");
+
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    const before_sheet = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+    defer std.testing.allocator.free(before_sheet);
+    const before_pt = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
+    defer std.testing.allocator.free(before_pt);
+
+    try std.testing.expectError(error.RowIndexOutOfRange, wb.insertRow(1, 0));
+    try std.testing.expectError(error.RowIndexOutOfRange, wb.deleteRow(1, 0));
+    try std.testing.expectError(error.RowIndexOutOfRange, wb.insertRow(1, xlsx.max_row + 1));
+    try std.testing.expectError(error.ColumnIndexOutOfRange, wb.insertColumn(1, 0));
+    try std.testing.expectError(error.ColumnIndexOutOfRange, wb.deleteColumn(1, 0));
+    try std.testing.expectError(error.ColumnIndexOutOfRange, wb.deleteColumn(1, xlsx.max_col_1based + 1));
+    try std.testing.expectEqualStrings(before_sheet, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+    try std.testing.expectEqualStrings(before_pt, (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
+
+    // And the selection moves with the rectangle on a real edit.
+    try wb.insertRow(1, 1);
+    const sheet = (try wb.store.part("xl/worksheets/sheet2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, "activeRow=\"4\" activeCol=\"1\" previousRow=\"4\" previousCol=\"1\"") != null);
+    const pt = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "ref=\"A4:B7\"") != null);
 }
 
 test "S7a: the corpus fixture — a row above `mtCars Pivot` moves PivotTable3; `IrisSample` still refuses" {
