@@ -4055,7 +4055,7 @@ fn runPivotsCommand(
                 .emit => {},
             }
             try out.writeAll("{\"kind\":\"pivot_cache\",\"cache\":");
-            try writePivotCacheObject(out, c);
+            try writePivotCacheObject(out, &pivots, c);
             try out.writeAll("}\n");
         }
     }
@@ -4124,7 +4124,7 @@ fn writePivotRecord(
     try out.print(",\"grand_totals\":{{\"rows\":{},\"cols\":{}}},\"style\":", .{ def.row_grand_totals, def.col_grand_totals });
     try writeJsonOptString(out, pt.style_name);
     try out.writeAll(",\"cache\":");
-    if (pivots.cacheOf(pt)) |c| try writePivotCacheObject(out, c.*) else try out.writeAll("null");
+    if (pivots.cacheOf(pt)) |c| try writePivotCacheObject(out, pivots, c.*) else try out.writeAll("null");
     try out.writeAll("}\n");
 }
 
@@ -4152,7 +4152,7 @@ fn writePivotAxis(
     try out.writeByte(']');
 }
 
-fn writePivotCacheObject(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
+fn writePivotCacheObject(out: *std.Io.Writer, pivots: *const zlsx_pkg.Pivots, c: zlsx_pkg.PivotCache) !void {
     const def = &c.definition;
     try out.writeAll("{\"id\":");
     try writeJsonOptU32(out, c.cache_id);
@@ -4169,7 +4169,7 @@ fn writePivotCacheObject(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
     try out.writeAll(",\"refreshed_date\":");
     try writeJsonOptString(out, def.refreshed_date orelse def.refreshed_date_iso);
     try out.print(",\"refresh_on_load\":{},\"save_data\":{},\"source\":", .{ def.refresh_on_load, def.save_data });
-    try writePivotSource(out, c);
+    try writePivotSource(out, pivots, c);
     try out.writeAll(",\"fields\":[");
     for (def.fields, 0..) |f, i| {
         if (i > 0) try out.writeByte(',');
@@ -4214,12 +4214,12 @@ fn writeSharedItemTypes(out: *std.Io.Writer, si: zlsx_pkg.typed_parts.pivot_xml.
     try out.writeByte(']');
 }
 
-fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
+fn writePivotSource(out: *std.Io.Writer, pivots: *const zlsx_pkg.Pivots, c: zlsx_pkg.PivotCache) !void {
     const src = &c.definition.source;
     switch (src.type) {
         .worksheet => {
             try out.writeAll("{\"type\":\"worksheet\",");
-            try writePivotSourceSpelling(out, c.source, c.resolution);
+            try writePivotSourceSpelling(out, pivots, c.source, c.resolution);
             try out.writeByte('}');
         },
         .consolidation => {
@@ -4227,7 +4227,7 @@ fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
             for (c.range_set_sources, 0..) |sp, i| {
                 if (i > 0) try out.writeByte(',');
                 try out.writeByte('{');
-                try writePivotSourceSpelling(out, sp, c.range_set_resolutions[i]);
+                try writePivotSourceSpelling(out, pivots, sp, c.range_set_resolutions[i]);
                 try out.writeByte('}');
             }
             try out.writeAll("]}");
@@ -4246,13 +4246,16 @@ fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
     }
 }
 
-/// `"sheet":…,"ref":…,"name":…,"resolved":…` (no braces, no leading
-/// comma) — the spellings as written and what they led to: a local sheet
-/// (`{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}`), another
-/// workbook (`{"external":"…"}`), or `null` when the spelling names
-/// nothing this workbook has.
+/// `"sheet":…,"ref":…,"name":…,"resolved":…,"unresolved":…` (no braces,
+/// no leading comma) — the spellings as written and what they led to: a
+/// local sheet (`{"sheet":"Data","sheet_idx":0,"via":"sheet_attr",
+/// "bounds":"A1:C4"}` — `bounds` the A1 area the spelling proves, or
+/// `null`), another workbook (`{"external":"…"}`), or `null` when the
+/// spelling names nothing this workbook has — in which case
+/// `unresolved` says why and which sheets it still proves (S7b-1).
 fn writePivotSourceSpelling(
     out: *std.Io.Writer,
+    pivots: *const zlsx_pkg.Pivots,
     sp: zlsx_pkg.pivots.SourceSpelling,
     res: zlsx_pkg.PivotSourceResolution,
 ) !void {
@@ -4267,7 +4270,14 @@ fn writePivotSourceSpelling(
         .sheet => |s| {
             try out.writeAll("{\"sheet\":");
             try writeJsonString(out, s.sheet_name);
-            try out.print(",\"sheet_idx\":{d},\"via\":\"{s}\"}}", .{ s.sheet_idx, @tagName(s.via) });
+            try out.print(",\"sheet_idx\":{d},\"via\":\"{s}\",\"bounds\":", .{ s.sheet_idx, @tagName(s.via) });
+            if (s.bounds) |b| {
+                var buf: [zlsx_pkg.pivots.Bounds.format_buf_len]u8 = undefined;
+                try writeJsonString(out, b.formatA1(&buf));
+            } else {
+                try out.writeAll("null");
+            }
+            try out.writeByte('}');
         },
         .external => |target| {
             try out.writeAll("{\"external\":");
@@ -4275,6 +4285,20 @@ fn writePivotSourceSpelling(
             try out.writeByte('}');
         },
         .unresolved, .none => try out.writeAll("null"),
+    }
+    try out.writeAll(",\"unresolved\":");
+    switch (res) {
+        .unresolved => |u| {
+            try out.print("{{\"why\":\"{s}\",\"sheets\":[", .{@tagName(u.why)});
+            for (u.sheets, 0..) |idx, k| {
+                if (k > 0) try out.writeByte(',');
+                try out.writeAll("{\"sheet\":");
+                try writeJsonOptString(out, if (idx < pivots.sheet_names.len) pivots.sheet_names[idx] else null);
+                try out.print(",\"sheet_idx\":{d}}}", .{idx});
+            }
+            try out.writeAll("]}");
+        },
+        .sheet, .external, .none => try out.writeAll("null"),
     }
 }
 
@@ -8608,7 +8632,7 @@ test "runPivotsCommand: one record per pivot in the frozen field order" {
         "\"records_part\":\"xl/pivotCache/pivotCacheRecords1.xml\",\"record_count\":3," ++
         "\"refreshed_by\":\"zlsx\",\"refreshed_date\":\"45000.5\",\"refresh_on_load\":false,\"save_data\":true," ++
         "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Data\",\"ref\":\"A1:C4\",\"name\":null," ++
-        "\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"sheet_attr\"}}," ++
+        "\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"sheet_attr\",\"bounds\":\"A1:C4\"},\"unresolved\":null}," ++
         "\"fields\":[" ++
         "{\"name\":\"Region\",\"num_fmt_id\":0,\"formula\":null,\"items\":2,\"types\":[\"string\"],\"min\":null,\"max\":null}," ++
         "{\"name\":\"Qty\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"number\",\"integer\"],\"min\":\"3\",\"max\":\"5\"}," ++
@@ -8625,10 +8649,11 @@ test "runPivotsCommand: table-name, defined-name, external and dangling sources 
     defer tt.deinit();
 
     const cases = [_]struct { kind: zlsx_pkg.pivots.fixture.SourceKind, want: []const u8 }{
-        .{ .kind = .table_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"SalesTbl\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"table\"}}" },
-        .{ .kind = .defined_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"PivotSrc\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"defined_name\"}}" },
-        .{ .kind = .external, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Sheet1\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":{\"external\":\"file:///C:/data/other.xlsx\"}}" },
-        .{ .kind = .dangling, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Nope\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":null}" },
+        .{ .kind = .table_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"SalesTbl\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"table\",\"bounds\":\"A1:C4\"},\"unresolved\":null}" },
+        .{ .kind = .defined_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"PivotSrc\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"defined_name\",\"bounds\":\"A1:C4\"},\"unresolved\":null}" },
+        .{ .kind = .external, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Sheet1\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":{\"external\":\"file:///C:/data/other.xlsx\"},\"unresolved\":null}" },
+        .{ .kind = .dangling, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Nope\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":null,\"unresolved\":{\"why\":\"dangling_sheet\",\"sheets\":[]}}" },
+        .{ .kind = .consolidation, .want = "\"source\":{\"type\":\"consolidation\",\"range_sets\":[{\"sheet\":\"Data\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"sheet_attr\",\"bounds\":\"A1:C4\"},\"unresolved\":null},{\"sheet\":null,\"ref\":null,\"name\":\"PivotSrc\",\"resolved\":{\"sheet\":\"Report\",\"sheet_idx\":1,\"via\":\"defined_name\",\"bounds\":\"A1:B2\"},\"unresolved\":null}]}" },
     };
     for (cases, 0..) |case, i| {
         var name_buf: [32]u8 = undefined;
@@ -8646,6 +8671,32 @@ test "runPivotsCommand: table-name, defined-name, external and dangling sources 
         const line = w.buffered();
         try std.testing.expect(std.mem.indexOf(u8, line, case.want) != null);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    }
+}
+
+test "runPivotsCommand: an unbounded name reports its provenance; whole columns report as bounds (S7b-1)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_provenance.xlsx");
+    defer std.testing.allocator.free(path);
+
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "OFFSET(Report!$D$1,0,0,4,3)", .want = "\"resolved\":null,\"unresolved\":{\"why\":\"unbounded_body\",\"sheets\":[{\"sheet\":\"Report\",\"sheet_idx\":1}]}}" },
+        .{ .body = "Data!$A:$C", .want = "\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"defined_name\",\"bounds\":\"A:C\"},\"unresolved\":null}" },
+    };
+    for (cases) |case| {
+        try zlsx_pkg.pivots.fixture.write(std.testing.allocator, io, path, .defined_name);
+        try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/workbook.xml", "Data!$A$1:$C$4", case.body);
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), case.want) != null);
     }
 }
 
@@ -8725,7 +8776,7 @@ test "runPivotsCommand: orphan caches follow the pivots, only when no sheet is s
         "\"records_part\":\"xl/pivotCache/pivotCacheRecords2.xml\",\"record_count\":0,\"refreshed_by\":null," ++
         "\"refreshed_date\":null,\"refresh_on_load\":false,\"save_data\":false," ++
         "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Report\",\"ref\":\"A1:A1\",\"name\":null," ++
-        "\"resolved\":{\"sheet\":\"Report\",\"sheet_idx\":1,\"via\":\"sheet_attr\"}}," ++
+        "\"resolved\":{\"sheet\":\"Report\",\"sheet_idx\":1,\"via\":\"sheet_attr\",\"bounds\":\"A1:A1\"},\"unresolved\":null}," ++
         "\"fields\":[{\"name\":\"Note\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"string\"],\"min\":null,\"max\":null}]}}\n";
 
     // No selection: the pivot, then the orphan.
