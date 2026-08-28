@@ -1032,6 +1032,10 @@ pub const edit = struct {
     /// for deletes; `first < idx ≤ last` (delete: `first ≤ idx ≤ last`)
     /// is inside and refuses; beyond `last` nothing moves.
     pub fn shiftRect(fp: Footprint, axis: Axis, idx_1based: u32, kind: Kind) EditError!Rect {
+        // Public: a caller reaching this without `applyToTableDefinition`
+        // gets the same answer for a position that does not exist,
+        // never a rectangle at row or column 0 (Codex #200 r4 REL-044).
+        if (idx_1based == 0) return error.MalformedPivotXml;
         var r = fp.rect;
         switch (axis) {
             .row => switch (kind) {
@@ -2182,8 +2186,14 @@ test "edit: a ref that is not an A1 rectangle refuses as malformed" {
     }
     // No `<location>` at all — the parser's refusal, surfaced whole.
     try expectRefusal("", .row, 1, .insert, error.MalformedPivotXml);
-    // Row / column 0 is not a position.
+    // Row / column 0 is not a position — on the splice and on the
+    // public rectangle helper alike (Codex #200 r4 REL-044).
     try expectRefusal("<location ref=\"A3\"/>", .row, 0, .insert, error.MalformedPivotXml);
+    const fp: edit.Footprint = .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 1, .br_row = 1 }, .first_row = 1, .last_col = 1 };
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .row, 0, .delete));
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .col, 0, .delete));
+    try testing.expectError(error.MalformedPivotXml, edit.shiftRect(fp, .row, 0, .insert));
+    try testing.expectEqual(@as(u32, 2), (try edit.shiftRect(fp, .row, 1, .insert)).tl_row);
 }
 
 fn editForFailures(allocator: Allocator, src: []const u8) !void {

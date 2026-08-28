@@ -5924,13 +5924,16 @@ test "S7a: the direct Workbook path refuses position 0 and beyond the grid befor
     defer std.testing.allocator.free(src);
     try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
     // A pivot selection on the host, as Excel saves one: absolute
-    // 0-based coordinates inside `A3:B6`.
-    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "/></sheetViews>", "><pivotSelection pane=\"topLeft\" activeRow=\"3\" activeCol=\"1\" previousRow=\"3\" previousCol=\"1\" r:id=\"rIdPT1\"/></sheetView></sheetViews>");
+    // 0-based coordinates inside `A3:B6`. The writer emits
+    // `<sheetViews>` only for frozen panes, so the whole block goes in
+    // ahead of `<sheetData>`.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "<sheetData", "<sheetViews><sheetView workbookViewId=\"0\"><pivotSelection pane=\"topLeft\" activeRow=\"3\" activeCol=\"1\" previousRow=\"3\" previousCol=\"1\" r:id=\"rIdPT1\"/></sheetView></sheetViews><sheetData");
 
     var wb = try Workbook.open(std.testing.allocator, io, src);
     defer wb.deinit();
     const before_sheet = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
     defer std.testing.allocator.free(before_sheet);
+    try std.testing.expect(std.mem.indexOf(u8, before_sheet, "<pivotSelection ") != null);
     const before_pt = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
     defer std.testing.allocator.free(before_pt);
 
