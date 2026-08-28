@@ -14,7 +14,7 @@
 > Questions are asked when they are *necessary* — at semantic decision points —
 > exactly as directed.
 
-_Created: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0 · Status: **S0 done (gate answered 2026-08-26) · S1 done (gate open: the three numbers) · S2 done (no gate fired) · S6 partial (Zig + CLI + audit shipped 2026-08-27; gate open: the NDJSON shape; C + Py legs follow the answer) · S3a or S7a next**_
+_Created: 2026-08-26 · `main` at `d99a386` · v0.8.0, Zig 0.16.0 · Status: **S0 done (gate answered 2026-08-26) · S1 done (gate open: the three numbers) · S2 done (no gate fired) · S6 partial (Zig + CLI + audit merged 2026-08-28; gate answered — shape frozen, C + Py legs = S6's second PR, hole to S7b) · S3a or S7a next**_
 
 ---
 
@@ -121,7 +121,7 @@ roadmap rows.
 | S5 | Confirm Writer API shape (mirror `addImage`/`addImageRange`/`addImageAnchored` or a reduced set); the public module name (`zlsx_writer`). |
 | S5b | Approve the typed object API (extract / replace / remove; what "repaired" means for a removed image's drawing) and the `zlsx images` sub-command shape. |
 | S11 | Approve the workbook-spec JSON schema before it freezes (it is a public contract like the NDJSON envelope). |
-| S6 | **Asked 2026-08-27.** (1) The `zlsx pivots` record shape (`docs/cli.md` "pivots") — approve or amend before it freezes. The choices made: axes as `{"field":NAME,"idx":N}` objects with `{"values":true}` for the values axis; `cache` nested inside the pivot record; orphan caches as separate `pivot_cache` records; `source.resolved` as a sheet / external / `null` union; `types` as a list of present kinds; no `v` version key (the read family carries none). (2) Where the C ABI + Python legs land: S6's second PR (recommended — they mirror the frozen shape) or S3b's typed-read parity batch. (3) Whether the source-only-sheet hole stays open until S7b (recommended: S7b owns the refusal and the `worksheetSource@ref` rewrite together, so no interim refusal lands only to be lifted) or gets an interim refusal for `sheet`+`ref` sources now that `Pivots.readsFromSheet` can see them. |
+| S6 | **Answered 2026-08-28** (asked 2026-08-27, PR #199). (1) The `zlsx pivots` record shape (`docs/cli.md` "pivots") **approved as built** and frozen at merge: axes as `{"field":NAME,"idx":N}` objects with `{"values":true}` for the values axis; `cache` nested inside the pivot record; orphan caches as separate `pivot_cache` records; `source.resolved` as a sheet / external / `null` union; `types` as a list of present kinds; no `v` version key (the read family carries none). (2) The C ABI + Python legs ship as **S6's second PR**, mirroring the frozen shape; the row stays `partial` until they land. (3) The source-only-sheet hole **stays open until S7b**, which owns the refusal and the `worksheetSource@ref` rewrite together; the three `S6 audit` tests keep it pinned meanwhile. |
 | S7b | **The cache policy**: on source-row edits, adjust `worksheetSource@ref` and mark refresh-on-load, vs also rewriting cache records. This is the row's semantic core. |
 | S7c | Per-case lift/refuse ruling once the oracle matrix is in hand. |
 | S8 | Which pivot type ships first; the refresh policy; the oracle bar (Excel alone vs Excel+LibreOffice both green). |
