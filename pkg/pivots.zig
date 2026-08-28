@@ -771,7 +771,16 @@ const Resolver = struct {
         if (ws.sheet) |raw_sheet| {
             const name = try decode(self.arena, .pivot_source_sheet_name, raw_sheet);
             const idx = (try self.sheetIndexOf(name)) orelse return unresolved(.dangling_sheet, &.{});
-            return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref));
+            // `sheet` names the sheet; a `ref` bounds it, else a `name`
+            // beside it may (a table or a static name on that same
+            // sheet — Codex #202 r1 F4). The sheet wins on identity.
+            const bounds = if (ws.ref != null)
+                try self.boundsOfRef(ws.ref)
+            else if (ws.name) |raw_name|
+                try self.carrierBounds(idx, raw_name)
+            else
+                null;
+            return try self.local(idx, .sheet_attr, bounds);
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -784,7 +793,7 @@ const Resolver = struct {
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
                     if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds);
-                    return unresolved(.unbounded_body, try self.closureSheets(n.body, n.folded));
+                    return unresolved(.unbounded_body, try self.closureSheets(n));
                 },
                 .refused => return error.MalformedPivotXml,
                 .table, .not_found => {},
@@ -811,6 +820,35 @@ const Resolver = struct {
             .via = via,
             .bounds = bounds,
         } };
+    }
+
+    /// The bounds a `name` beside a `sheet` lends the source, when the
+    /// carrier is on that sheet: a static defined-name body, else a
+    /// table. Nothing refuses here — the sheet is already placed, and
+    /// the name is evidence for the area only.
+    fn carrierBounds(self: *Resolver, sheet_idx: u32, raw_name: []const u8) Error!?Bounds {
+        const name = try decode(self.arena, .pivot_source_name, raw_name);
+        const symbols = self.ensureSymbols() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        switch (try symbols.resolveName(self.gpa, null, name)) {
+            .name => |n| {
+                const area = (try self.areaOfBody(n.body)) orelse return null;
+                return if (area.sheet_idx == sheet_idx) area.bounds else null;
+            },
+            .refused => return null,
+            .table, .not_found => {},
+        }
+        const folded = (try fold(self.arena, name)) orelse return null;
+        const tables = self.ensureTables() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        for (tables) |t| {
+            if (std.mem.eql(u8, t.folded, folded)) return if (t.sheet_idx == sheet_idx) t.bounds else null;
+        }
+        return null;
     }
 
     /// The one sheet a `sheet` attribute names, as evidence: `[idx]`,
@@ -937,14 +975,16 @@ const Resolver = struct {
         return &self.symbols.?;
     }
 
-    const Area = struct { sheet_idx: u32, bounds: Bounds };
+    const Area = struct { sheet_idx: u32, bounds: ?Bounds };
 
     /// The area a defined name's body denotes, when the body is exactly
     /// one static sheet-qualified area (`Data!$A$1:$C$4`, `Data!$A$1`,
     /// `'My Data'!A1:B2`, `Data!$A:$C`). A 3D span, a dynamic body
-    /// (`OFFSET(…)`, `Data!A1:INDEX(…)`), a union, a bare range, or a
-    /// range whose ends are not the same kind of reference resolves to
-    /// null: none names one area a pivot could read.
+    /// (`OFFSET(…)`, `Data!A1:INDEX(…)`), a union or a bare range
+    /// resolves to null: none names one area a pivot could read. A
+    /// range whose ends are static references of different kinds
+    /// (`Data!$A$1:$C:$C`) names the sheet — as it did before S7b-1 —
+    /// with no bounds (Codex #202 r1 F1).
     fn areaOfBody(self: *Resolver, body: []const u8) Error!?Area {
         var parsed = try engine.parser.parse(self.gpa, body, .{});
         defer parsed.deinit(self.gpa);
@@ -979,8 +1019,9 @@ const Resolver = struct {
                     },
                     else => rhs_node,
                 };
-                const bounds = rangeBounds(ast.node(lhs.target), rhs_target) orelse return null;
-                return .{ .sheet_idx = idx, .bounds = bounds };
+                const lhs_target = ast.node(lhs.target);
+                if (staticBounds(lhs_target) == null or staticBounds(rhs_target) == null) return null;
+                return .{ .sheet_idx = idx, .bounds = rangeBounds(lhs_target, rhs_target) };
             },
             else => return null,
         }
@@ -988,28 +1029,40 @@ const Resolver = struct {
 
     /// Every sheet a name body depends on, through the names it
     /// references: sheet qualifiers (a 3D span contributes each sheet
-    /// between its ends, in tab order), tables (their host sheet), and
-    /// the bodies of referenced names, recursively. A name is walked
-    /// once, so a cycle terminates; a body the parser refuses, a name
-    /// the inventory refuses or lacks, and a nest deeper than
+    /// between its ends, in tab order, by the engine's own expansion —
+    /// a reversed or dangling span is `#REF!` and contributes nothing),
+    /// tables (their host sheet), and the bodies of referenced names,
+    /// recursively — each name resolved in the scope the reference sits
+    /// in (a qualifier's sheet, else the enclosing name's own scope), so
+    /// a sheet-scoped name that shadows a workbook one is its own
+    /// dependency (Codex #202 r1 F2). A name is walked once, by
+    /// identity, so a cycle terminates; a body the parser refuses, a
+    /// name the inventory refuses or lacks, and a nest deeper than
     /// `max_closure_depth` contribute nothing — evidence, not refusal.
     /// Ascending, deduplicated, arena-owned.
-    fn closureSheets(self: *Resolver, body: []const u8, folded_self: []const u8) Error![]const u32 {
+    fn closureSheets(self: *Resolver, root: *const engine.Name) Error![]const u32 {
         var sheets: std.ArrayListUnmanaged(u32) = .empty;
         defer sheets.deinit(self.gpa);
-        var visited: std.ArrayListUnmanaged([]const u8) = .empty;
+        var visited: std.ArrayListUnmanaged(*const engine.Name) = .empty;
         defer visited.deinit(self.gpa);
-        try visited.append(self.gpa, folded_self);
-        try self.walkBody(body, &sheets, &visited, 0);
+        try visited.append(self.gpa, root);
+        try self.walkBody(root.body, scopeOf(root), &sheets, &visited, 0);
         std.mem.sort(u32, sheets.items, {}, std.sort.asc(u32));
         return try self.arena.dupe(u32, sheets.items);
     }
 
+    fn scopeOf(n: *const engine.Name) ?u32 {
+        return if (n.scope) |sc| sc.toInt() else null;
+    }
+
+    const Visited = std.ArrayListUnmanaged(*const engine.Name);
+
     fn walkBody(
         self: *Resolver,
         body: []const u8,
+        scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *std.ArrayListUnmanaged([]const u8),
+        visited: *Visited,
         depth: u32,
     ) Error!void {
         if (depth > max_closure_depth) return;
@@ -1019,33 +1072,42 @@ const Resolver = struct {
             .ok => |t| t,
             .refused => return,
         };
-        try self.walkNode(ast, ast.root, sheets, visited, depth);
+        try self.walkNode(ast, ast.root, scope, sheets, visited, depth);
     }
 
     fn walkNode(
         self: *Resolver,
         ast: engine.parser.Ast,
         i: engine.parser.Index,
+        scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *std.ArrayListUnmanaged([]const u8),
+        visited: *Visited,
         depth: u32,
     ) Error!void {
         switch (ast.node(i)) {
             .qualified => |q| {
-                try self.addSpecSheets(q.sheet, sheets);
-                try self.walkNode(ast, q.target, sheets, visited, depth);
+                const first = try self.addSpecSheets(q.sheet, sheets);
+                // `Report!N` is the name `N` looked up from `Report`: the
+                // qualifier is the scope of the lookup, and it counts as
+                // a dependency like any other qualifier.
+                switch (ast.node(q.target)) {
+                    .name => |n| try self.walkName(n.raw, first orelse scope, sheets, visited, depth),
+                    else => try self.walkNode(ast, q.target, scope, sheets, visited, depth),
+                }
             },
-            .name => |n| try self.walkName(n.bare, sheets, visited, depth),
+            // The raw spelling: a value-position name resolves as written,
+            // so `_xlfn.Anchor` is not `Anchor` (Codex #202 r1 F5).
+            .name => |n| try self.walkName(n.raw, scope, sheets, visited, depth),
             .structured => |st| if (st.table) |t| try self.addTableSheet(t, sheets),
             // The callee is a function, not a name.
-            .call => |c| for (ast.children(c.args)) |k| try self.walkNode(ast, k, sheets, visited, depth),
-            .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, sheets, visited, depth),
-            .paren => |pn| try self.walkNode(ast, pn.child, sheets, visited, depth),
-            .unary => |u| try self.walkNode(ast, u.child, sheets, visited, depth),
-            .postfix => |pf| try self.walkNode(ast, pf.child, sheets, visited, depth),
+            .call => |c| for (ast.children(c.args)) |k| try self.walkNode(ast, k, scope, sheets, visited, depth),
+            .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, scope, sheets, visited, depth),
+            .paren => |pn| try self.walkNode(ast, pn.child, scope, sheets, visited, depth),
+            .unary => |u| try self.walkNode(ast, u.child, scope, sheets, visited, depth),
+            .postfix => |pf| try self.walkNode(ast, pf.child, scope, sheets, visited, depth),
             .binary => |b| {
-                try self.walkNode(ast, b.lhs, sheets, visited, depth);
-                try self.walkNode(ast, b.rhs, sheets, visited, depth);
+                try self.walkNode(ast, b.lhs, scope, sheets, visited, depth);
+                try self.walkNode(ast, b.rhs, scope, sheets, visited, depth);
             },
             .number, .string, .boolean, .error_lit, .missing_arg, .ref_cell, .ref_full_col, .ref_full_row => {},
         }
@@ -1053,40 +1115,57 @@ const Resolver = struct {
 
     fn walkName(
         self: *Resolver,
-        bare: []const u8,
+        raw: []const u8,
+        scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *std.ArrayListUnmanaged([]const u8),
+        visited: *Visited,
         depth: u32,
     ) Error!void {
-        const folded = (try fold(self.arena, bare)) orelse return;
-        for (visited.items) |v| if (std.mem.eql(u8, v, folded)) return;
-        try visited.append(self.gpa, folded);
         const symbols = self.ensureSymbols() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
         };
-        switch (try symbols.resolveName(self.gpa, null, bare)) {
-            .name => |n| try self.walkBody(n.body, sheets, visited, depth + 1),
+        const from: ?engine.SheetIndex = if (scope) |sc| engine.SheetIndex.fromInt(sc) else null;
+        switch (try symbols.resolveName(self.gpa, from, raw)) {
+            .name => |n| {
+                for (visited.items) |v| if (v == n) return;
+                try visited.append(self.gpa, n);
+                try self.walkBody(n.body, scopeOf(n), sheets, visited, depth + 1);
+            },
             .table, .not_found, .refused => {
                 // A table spelled bare, or nothing: the table index has
                 // the host if there is one.
-                try self.addTableSheet(bare, sheets);
+                try self.addTableSheet(raw, sheets);
             },
         }
     }
 
-    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!void {
+    /// The sheets a qualifier names — one, or every member of a 3D span
+    /// (quoted `'Data:Report'!` and unquoted `Data:Report!` alike, by
+    /// the engine's own split and expansion; a reversed or dangling span
+    /// is `#REF!` and names nothing — Codex #202 r1 F3). Returns the
+    /// first sheet, for a name looked up through the qualifier.
+    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?u32 {
         var buf: [256]u8 = undefined;
-        const first_name = unquoteSheetSpec(&buf, spec) orelse return;
-        const first = (try self.sheetIndexOf(first_name)) orelse return;
-        var last = first;
-        if (spec.last) |raw_last| {
-            var last_buf: [256]u8 = undefined;
-            const last_name = unquoteSheetSpec(&last_buf, .{ .first = raw_last, .quoted = spec.quoted }) orelse return;
-            last = (try self.sheetIndexOf(last_name)) orelse return;
+        const unquoted = unquoteSheetSpec(&buf, spec) orelse return null;
+        if (!engine.names.isSpan(spec)) {
+            const idx = (try self.sheetIndexOf(unquoted)) orelse return null;
+            try addSheet(self.gpa, sheets, idx);
+            return idx;
         }
-        var k = @min(first, last);
-        while (k <= @max(first, last)) : (k += 1) try addSheet(self.gpa, sheets, k);
+        const ends = engine.names.splitSpan(spec, unquoted) orelse return null;
+        const symbols = self.ensureSymbols() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        switch (try symbols.resolveSheetSpan(self.gpa, ends.first, ends.last)) {
+            .members => |m| {
+                var k = m.first;
+                while (k <= m.last) : (k += 1) try addSheet(self.gpa, sheets, k);
+                return m.first;
+            },
+            .ref_error => return null,
+        }
     }
 
     fn addTableSheet(self: *Resolver, raw_table: []const u8, sheets: *std.ArrayListUnmanaged(u32)) Error!void {
@@ -1161,16 +1240,30 @@ fn rangeBounds(lhs: engine.parser.Node, rhs: engine.parser.Node) ?Bounds {
     };
 }
 
-/// A decoded `ref` as bounds: `A1:C4` / `A1` (the S7a rectangle parser),
-/// `A:C` (letters on both sides), `1:4` (digits on both sides). Null on
-/// anything else — bounds are evidence, and an unparseable spelling is
-/// none.
+/// A decoded `ref` as bounds: `A1:C4` / `A1` (corners in either order —
+/// the bounds are the normalised rectangle; the S7a splice parser stays
+/// strict), `A:C` (letters on both sides), `1:4` (digits on both sides).
+/// Plain `ST_Ref` spellings only: uppercase, no `$`, no leading zero.
+/// Null on anything else — bounds are evidence, and an unparseable
+/// spelling is none.
 pub fn parseBounds(ref: []const u8) ?Bounds {
-    if (edit.parseRect(ref)) |r| return .{ .rect = r };
-    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse return null;
+    const cell_opts: coords.CellParseOptions = .{ .case = .upper_only };
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        const c = coords.parseCell(ref, cell_opts) catch return null;
+        return .{ .rect = .{ .tl_col = c.col.oneBased(), .tl_row = c.row.oneBased(), .br_col = c.col.oneBased(), .br_row = c.row.oneBased() } };
+    };
     const lhs = ref[0..colon];
     const rhs = ref[colon + 1 ..];
     if (lhs.len == 0 or rhs.len == 0) return null;
+    if (coords.parseCell(lhs, cell_opts)) |a| {
+        const b = coords.parseCell(rhs, cell_opts) catch return null;
+        return .{ .rect = .{
+            .tl_col = @min(a.col.oneBased(), b.col.oneBased()),
+            .tl_row = @min(a.row.oneBased(), b.row.oneBased()),
+            .br_col = @max(a.col.oneBased(), b.col.oneBased()),
+            .br_row = @max(a.row.oneBased(), b.row.oneBased()),
+        } };
+    } else |_| {}
     if (allLetters(lhs) and allLetters(rhs)) {
         // Uppercase only and inside the grid — the spelling `ST_Ref` and
         // the S7a rectangle parser accept.
@@ -2580,6 +2673,51 @@ test "bounds: every spelling that proves an area carries it, and one that does n
         try testing.expectEqual(ResolvedVia.defined_name, r.via);
         try expectA1(r.bounds, case.a1);
     }
+    // A range whose ends are static references of different kinds
+    // names the sheet, as before S7b-1, with no bounds (Codex r1 F1).
+    for ([_][]const u8{ "Data!$A$1:$C:$C", "Data!$A:$A:$B$2", "Data!$1:$1:$C$4" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 0), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.defined_name, r.via);
+        try testing.expect(r.bounds == null);
+        try testing.expect(o.pivots.readsFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A reversed direct `ref` is the same rectangle (Codex r1 F6).
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "ref=\"A1:C4\"", "ref=\"C4:A1\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "A1:C4");
+        try testing.expectEqualStrings("C4:A1", o.pivots.caches[0].source.ref.?);
+    }
+    // `sheet` + `name`, no `ref`: the sheet is the identity, the carrier
+    // lends its bounds when it is on that sheet (Codex r1 F4).
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"SalesTbl\"/>", "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try expectA1(r.bounds, "A1:C4");
+    }
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource sheet=\"Report\" name=\"PivotSrc\"/>");
+    {
+        // The name's area is on `Data`; the source says `Report` — the
+        // sheet wins, the bounds are not lent across sheets.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 1), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try testing.expect(r.bounds == null);
+    }
     // `Data!$A:$C` is whole columns, not a rectangle; `Data!$1:$4` whole rows.
     {
         try fixture.write(testing.allocator, io, path, .defined_name);
@@ -2612,14 +2750,17 @@ test "bounds: every spelling that proves an area carries it, and one that does n
 
 test "parseBounds: rectangles, whole columns, whole rows, and nothing else" {
     try expectA1(parseBounds("A1:C4"), "A1:C4");
+    try expectA1(parseBounds("C4:A1"), "A1:C4");
+    try expectA1(parseBounds("A4:C1"), "A1:C4");
     try expectA1(parseBounds("B7"), "B7:B7");
+    try expectA1(parseBounds("XFD1048576:A1"), "A1:XFD1048576");
     try expectA1(parseBounds("A:C"), "A:C");
     try expectA1(parseBounds("C:A"), "A:C");
     try expectA1(parseBounds("XFD:XFD"), "XFD:XFD");
     try expectA1(parseBounds("3:9"), "3:9");
     try expectA1(parseBounds("9:3"), "3:9");
     try expectA1(parseBounds("1:1048576"), "1:1048576");
-    for ([_][]const u8{ "", ":", "A:", ":C", "A1:C", "a:c", "XFE:XFE", "0:4", "1:1048577", "A:C:D", "$A:$C", "A1:C4 " }) |bad| {
+    for ([_][]const u8{ "", ":", "A:", ":C", "A1:C", "A:C4", "a:c", "a1:c4", "XFE:XFE", "XFE1:XFE1", "A0:C4", "A01:C4", "0:4", "1:1048577", "A:C:D", "$A:$C", "$A$1:$C$4", "A1:C4 " }) |bad| {
         try testing.expect(parseBounds(bad) == null);
     }
 }
@@ -2668,13 +2809,50 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
     }
-    // A 3D span proves every sheet between its ends; a union both sides.
+    // A 3D span proves every sheet between its ends — quoted or not —
+    // and a reversed or dangling one is `#REF!`, proving nothing
+    // (Codex r1 F3); a union proves both sides.
+    for ([_][]const u8{ "SUM(Data:Report!$A$1)", "SUM('Data:Report'!$A$1)", "SUM(data:REPORT!$A$1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    for ([_][]const u8{ "SUM(Report:Data!$A$1)", "SUM(Data:Nope!$A$1)", "SUM('Nope:Report'!$A$1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A sheet-scoped name shadowing a workbook one is its own
+    // dependency: `N` from the workbook reads `Report`, `Report!N` is
+    // the Report-scoped `N` reading `Data` (Codex r1 F2). Visited by
+    // identity, not spelling, both are walked.
     try fixture.write(testing.allocator, io, path, .defined_name);
-    try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "SUM(Data:Report!$A$1)");
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Report!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Data!$C$3</definedName><definedName name=\"PivotSrc\">OFFSET(N,0,0,1,1)+OFFSET(Report!N,0,0,1,1)</definedName>");
     {
         var o = try Opened.open(testing.allocator, io, path);
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Report!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Data!$C$3</definedName><definedName name=\"PivotSrc\">OFFSET(N,0,0,1,1)</definedName>");
+    {
+        // Unqualified from the workbook scope: the workbook `N` only.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    // A value-position name resolves as written: `_xlfn.Anchor` is not
+    // `Anchor` (Codex r1 F5).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1</definedName><definedName name=\"PivotSrc\">OFFSET(_xlfn.Anchor,0,0,1,1)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
     }
     try fixture.write(testing.allocator, io, path, .defined_name);
     try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "(Report!$A$1:$B$2,Data!$A$1:$C$4)");
