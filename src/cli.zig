@@ -969,7 +969,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                      "cache":{"id":7,"part":"…","records_part":"…",
         \\                      "record_count":3,…,"source":{"type":"worksheet",
         \\                      "sheet":"Data","ref":"A1:C4","name":null,
-        \\                      "resolved":{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}},
+        \\                      "resolved":{"sheet":"Data","sheet_idx":0,"via":"sheet_attr",
+        \\                      "bounds":"A1:C4"},"unresolved":null},
         \\                      "fields":[{"name":"Region","types":["string"],…}]}}
         \\  styles             one NDJSON record per cell-XF style entry
         \\                     (workbook-wide, iter58):

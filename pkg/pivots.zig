@@ -832,7 +832,9 @@ const Resolver = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
         };
-        switch (try symbols.resolveName(self.gpa, null, name)) {
+        // Looked up FROM the stated sheet: its own scoped name shadows a
+        // workbook one of the same spelling there (Codex #202 r2 F3).
+        switch (try symbols.resolveName(self.gpa, engine.SheetIndex.fromInt(sheet_idx), name)) {
             .name => |n| {
                 const area = (try self.areaOfBody(n.body)) orelse return null;
                 return if (area.sheet_idx == sheet_idx) area.bounds else null;
@@ -1043,10 +1045,11 @@ const Resolver = struct {
     fn closureSheets(self: *Resolver, root: *const engine.Name) Error![]const u32 {
         var sheets: std.ArrayListUnmanaged(u32) = .empty;
         defer sheets.deinit(self.gpa);
-        var visited: std.ArrayListUnmanaged(*const engine.Name) = .empty;
+        var visited: Visited = .empty;
         defer visited.deinit(self.gpa);
-        try visited.append(self.gpa, root);
-        try self.walkBody(root.body, scopeOf(root), &sheets, &visited, 0);
+        const scope = scopeOf(root);
+        try visited.append(self.gpa, .{ .name = root, .scope = scope });
+        try self.walkBody(root.body, scope, &sheets, &visited, 0);
         std.mem.sort(u32, sheets.items, {}, std.sort.asc(u32));
         return try self.arena.dupe(u32, sheets.items);
     }
@@ -1055,7 +1058,13 @@ const Resolver = struct {
         return if (n.scope) |sc| sc.toInt() else null;
     }
 
-    const Visited = std.ArrayListUnmanaged(*const engine.Name);
+    /// A name is walked once per scope it is invoked from: a
+    /// sheet-scoped name has one scope, its own; a workbook-scoped body
+    /// resolves its unqualified names from the sheet that invoked it,
+    /// so the same body under two invoking sheets is two walks (Codex
+    /// #202 r2 F1).
+    const Visit = struct { name: *const engine.Name, scope: ?u32 };
+    const Visited = std.ArrayListUnmanaged(Visit);
 
     fn walkBody(
         self: *Resolver,
@@ -1086,12 +1095,19 @@ const Resolver = struct {
     ) Error!void {
         switch (ast.node(i)) {
             .qualified => |q| {
-                const first = try self.addSpecSheets(q.sheet, sheets);
+                const members = try self.addSpecSheets(q.sheet, sheets);
                 // `Report!N` is the name `N` looked up from `Report`: the
                 // qualifier is the scope of the lookup, and it counts as
-                // a dependency like any other qualifier.
+                // a dependency like any other qualifier. A span qualifier
+                // (`'Data:Report'!N`) looks `N` up from every member
+                // (Codex #202 r2 F2).
                 switch (ast.node(q.target)) {
-                    .name => |n| try self.walkName(n.raw, first orelse scope, sheets, visited, depth),
+                    .name => |n| if (members) |m| {
+                        var k = m.first;
+                        while (k <= m.last) : (k += 1) try self.walkName(n.raw, k, sheets, visited, depth);
+                    } else {
+                        try self.walkName(n.raw, scope, sheets, visited, depth);
+                    },
                     else => try self.walkNode(ast, q.target, scope, sheets, visited, depth),
                 }
             },
@@ -1128,30 +1144,37 @@ const Resolver = struct {
         const from: ?engine.SheetIndex = if (scope) |sc| engine.SheetIndex.fromInt(sc) else null;
         switch (try symbols.resolveName(self.gpa, from, raw)) {
             .name => |n| {
-                for (visited.items) |v| if (v == n) return;
-                try visited.append(self.gpa, n);
-                try self.walkBody(n.body, scopeOf(n), sheets, visited, depth + 1);
+                const effective = scopeOf(n) orelse scope;
+                for (visited.items) |v| if (v.name == n and v.scope == effective) return;
+                try visited.append(self.gpa, .{ .name = n, .scope = effective });
+                try self.walkBody(n.body, effective, sheets, visited, depth + 1);
             },
-            .table, .not_found, .refused => {
+            .table, .not_found => {
                 // A table spelled bare, or nothing: the table index has
                 // the host if there is one.
                 try self.addTableSheet(raw, sheets);
             },
+            // A name the engine refuses to reference evaluates to nothing
+            // — it does not fall through to a table of the same spelling
+            // (Codex #202 r2 F5).
+            .refused => {},
         }
     }
+
+    const Members = struct { first: u32, last: u32 };
 
     /// The sheets a qualifier names — one, or every member of a 3D span
     /// (quoted `'Data:Report'!` and unquoted `Data:Report!` alike, by
     /// the engine's own split and expansion; a reversed or dangling span
     /// is `#REF!` and names nothing — Codex #202 r1 F3). Returns the
-    /// first sheet, for a name looked up through the qualifier.
-    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?u32 {
+    /// members, for a name looked up through the qualifier.
+    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?Members {
         var buf: [256]u8 = undefined;
         const unquoted = unquoteSheetSpec(&buf, spec) orelse return null;
         if (!engine.names.isSpan(spec)) {
             const idx = (try self.sheetIndexOf(unquoted)) orelse return null;
             try addSheet(self.gpa, sheets, idx);
-            return idx;
+            return .{ .first = idx, .last = idx };
         }
         const ends = engine.names.splitSpan(spec, unquoted) orelse return null;
         const symbols = self.ensureSymbols() catch |e| switch (e) {
@@ -1162,7 +1185,7 @@ const Resolver = struct {
             .members => |m| {
                 var k = m.first;
                 while (k <= m.last) : (k += 1) try addSheet(self.gpa, sheets, k);
-                return m.first;
+                return .{ .first = m.first, .last = m.last };
             },
             .ref_error => return null,
         }
@@ -1272,6 +1295,7 @@ pub fn parseBounds(ref: []const u8) ?Bounds {
         return .{ .whole_columns = .{ .first_col = @min(a, b), .last_col = @max(a, b) } };
     }
     if (allDigits(lhs) and allDigits(rhs)) {
+        if (lhs[0] == '0' or rhs[0] == '0') return null;
         const a = std.fmt.parseInt(u32, lhs, 10) catch return null;
         const b = std.fmt.parseInt(u32, rhs, 10) catch return null;
         if (a == 0 or b == 0 or a > zlsx.max_row or b > zlsx.max_row) return null;
@@ -1696,6 +1720,28 @@ pub const fixture = struct {
             \\<Relationship Id="rIdPC1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/>
         );
 
+        try store.save(io, path);
+    }
+
+    /// Add an empty third sheet, `Third` (index 2), to a written fixture
+    /// — for the cases where two sheets cannot tell a right answer from
+    /// a wrong one (a name scoped to one sheet reading a third).
+    pub fn addThirdSheet(allocator: Allocator, io: std.Io, path: []const u8) !void {
+        var store = try PartStore.open(allocator, io, path);
+        defer store.deinit();
+        try store.addPart(
+            "xl/worksheets/sheet3.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/></worksheet>
+            ,
+        );
+        try spliceBefore(allocator, &store, "xl/workbook.xml", "</sheets>",
+            \\<sheet name="Third" sheetId="3" r:id="rIdS3"/>
+        );
+        try spliceBefore(allocator, &store, "xl/_rels/workbook.xml.rels", "</Relationships>",
+            \\<Relationship Id="rIdS3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
+        );
         try store.save(io, path);
     }
 
@@ -2706,6 +2752,19 @@ test "bounds: every spelling that proves an area carries it, and one that does n
         try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
         try expectA1(r.bounds, "A1:C4");
     }
+    // The carrier is looked up from the stated sheet: its scoped name
+    // shadows the workbook one there (Codex r2 F3).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Rate\">Report!$A$1:$A$2</definedName><definedName name=\"Rate\" localSheetId=\"1\">Report!$C$3:$D$4</definedName>");
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource sheet=\"Report\" name=\"Rate\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 1), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try expectA1(r.bounds, "C3:D4");
+    }
     try fixture.write(testing.allocator, io, path, .defined_name);
     try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource sheet=\"Report\" name=\"PivotSrc\"/>");
     {
@@ -2760,7 +2819,7 @@ test "parseBounds: rectangles, whole columns, whole rows, and nothing else" {
     try expectA1(parseBounds("3:9"), "3:9");
     try expectA1(parseBounds("9:3"), "3:9");
     try expectA1(parseBounds("1:1048576"), "1:1048576");
-    for ([_][]const u8{ "", ":", "A:", ":C", "A1:C", "A:C4", "a:c", "a1:c4", "XFE:XFE", "XFE1:XFE1", "A0:C4", "A01:C4", "0:4", "1:1048577", "A:C:D", "$A:$C", "$A$1:$C$4", "A1:C4 " }) |bad| {
+    for ([_][]const u8{ "", ":", "A:", ":C", "A1:C", "A:C4", "a:c", "a1:c4", "XFE:XFE", "XFE1:XFE1", "A0:C4", "A01:C4", "0:4", "01:4", "1:04", "1:1048577", "A:C:D", "$A:$C", "$A$1:$C$4", "A1:C4 " }) |bad| {
         try testing.expect(parseBounds(bad) == null);
     }
 }
@@ -2844,6 +2903,39 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         var o = try Opened.open(testing.allocator, io, path);
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    // A workbook-scoped body resolves its unqualified names from the
+    // sheet that invoked it: `Report!W`, `W = N`, and the Report-scoped
+    // `N` reads `Third` (Codex r2 F1).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.addThirdSheet(testing.allocator, io, path);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\" localSheetId=\"1\">Third!$A$1</definedName><definedName name=\"PivotSrc\">OFFSET(Report!W,0,0,1,1)</definedName><definedName name=\"W\">N</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 3), o.pivots.sheet_names.len);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 1, 2 });
+    }
+    // A span qualifier looks the name up from every member: the
+    // workbook `N` reads `Data`, the Report-scoped `N` reads `Third`
+    // (Codex r2 F2).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.addThirdSheet(testing.allocator, io, path);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Data!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Third!$D$1</definedName><definedName name=\"PivotSrc\">SUM('Data:Report'!N)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1, 2 });
+    }
+    // A name the engine refuses to reference contributes nothing — it
+    // does not fall through to a table of the same spelling (Codex r2 F5).
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">OFFSET(SalesTbl,0,0,1,1)</definedName><definedName name=\"SalesTbl\" function=\"1\">SalesTbl</definedName></definedNames><pivotCaches>");
+    try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
     }
     // A value-position name resolves as written: `_xlfn.Anchor` is not
     // `Anchor` (Codex r1 F5).
