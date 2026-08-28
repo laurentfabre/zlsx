@@ -736,11 +736,6 @@ const Resolver = struct {
         bounds: ?Bounds,
     };
 
-    /// Names walked per closure before the walk stops — deeper nests are
-    /// not workbooks Excel wrote, and a bound keeps a hostile chain
-    /// finite even without the visited set.
-    const max_closure_depth: u32 = 64;
-
     fn deinit(self: *Resolver) void {
         if (self.symbols) |*s| s.deinit();
     }
@@ -1033,23 +1028,24 @@ const Resolver = struct {
     /// references: sheet qualifiers (a 3D span contributes each sheet
     /// between its ends, in tab order, by the engine's own expansion —
     /// a reversed or dangling span is `#REF!` and contributes nothing),
-    /// tables (their host sheet), and the bodies of referenced names,
-    /// recursively — each name resolved in the scope the reference sits
-    /// in (a qualifier's sheet, else the enclosing name's own scope), so
-    /// a sheet-scoped name that shadows a workbook one is its own
-    /// dependency (Codex #202 r1 F2). A name is walked once, by
-    /// identity, so a cycle terminates; a body the parser refuses, a
-    /// name the inventory refuses or lacks, and a nest deeper than
-    /// `max_closure_depth` contribute nothing — evidence, not refusal.
-    /// Ascending, deduplicated, arena-owned.
+    /// tables (their host sheet), and the bodies of referenced names —
+    /// each name resolved in the scope the reference sits in (a
+    /// qualifier's sheet, else the enclosing scope), so a sheet-scoped
+    /// name that shadows a workbook one is its own dependency (Codex
+    /// #202 r1 F2). The bodies are walked from a worklist, not by
+    /// recursion: every (name, scope) pair is walked exactly once, so a
+    /// cycle terminates, a chain of any length costs one visit per name,
+    /// and no depth cap can cut a body short (Codex #202 r3 F1). A body
+    /// the parser refuses and a name the inventory refuses or lacks
+    /// contribute nothing — evidence, not refusal. Ascending,
+    /// deduplicated, arena-owned.
     fn closureSheets(self: *Resolver, root: *const engine.Name) Error![]const u32 {
         var sheets: std.ArrayListUnmanaged(u32) = .empty;
         defer sheets.deinit(self.gpa);
-        var visited: Visited = .empty;
-        defer visited.deinit(self.gpa);
-        const scope = scopeOf(root);
-        try visited.append(self.gpa, .{ .name = root, .scope = scope });
-        try self.walkBody(root.body, scope, &sheets, &visited, 0);
+        var walk: Walk = .{};
+        defer walk.deinit(self.gpa);
+        try walk.enqueue(self.gpa, .{ .name = root, .scope = scopeOf(root) });
+        while (walk.pending.pop()) |v| try self.walkBody(v.name.body, v.scope, &sheets, &walk);
         std.mem.sort(u32, sheets.items, {}, std.sort.asc(u32));
         return try self.arena.dupe(u32, sheets.items);
     }
@@ -1064,24 +1060,38 @@ const Resolver = struct {
     /// so the same body under two invoking sheets is two walks (Codex
     /// #202 r2 F1).
     const Visit = struct { name: *const engine.Name, scope: ?u32 };
-    const Visited = std.ArrayListUnmanaged(Visit);
+
+    const Walk = struct {
+        visited: std.ArrayListUnmanaged(Visit) = .empty,
+        pending: std.ArrayListUnmanaged(Visit) = .empty,
+
+        fn deinit(self: *Walk, gpa: Allocator) void {
+            self.visited.deinit(gpa);
+            self.pending.deinit(gpa);
+        }
+
+        /// Queue a visit not yet made.
+        fn enqueue(self: *Walk, gpa: Allocator, v: Visit) Error!void {
+            for (self.visited.items) |seen| if (seen.name == v.name and seen.scope == v.scope) return;
+            try self.visited.append(gpa, v);
+            try self.pending.append(gpa, v);
+        }
+    };
 
     fn walkBody(
         self: *Resolver,
         body: []const u8,
         scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *Visited,
-        depth: u32,
+        walk: *Walk,
     ) Error!void {
-        if (depth > max_closure_depth) return;
         var parsed = try engine.parser.parse(self.gpa, body, .{});
         defer parsed.deinit(self.gpa);
         const ast = switch (parsed) {
             .ok => |t| t,
             .refused => return,
         };
-        try self.walkNode(ast, ast.root, scope, sheets, visited, depth);
+        try self.walkNode(ast, ast.root, scope, sheets, walk);
     }
 
     fn walkNode(
@@ -1090,8 +1100,7 @@ const Resolver = struct {
         i: engine.parser.Index,
         scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *Visited,
-        depth: u32,
+        walk: *Walk,
     ) Error!void {
         switch (ast.node(i)) {
             .qualified => |q| {
@@ -1100,42 +1109,43 @@ const Resolver = struct {
                 // qualifier is the scope of the lookup, and it counts as
                 // a dependency like any other qualifier. A span qualifier
                 // (`'Data:Report'!N`) looks `N` up from every member
-                // (Codex #202 r2 F2).
+                // (Codex #202 r2 F2); a qualifier that names nothing is
+                // `#REF!`, and the name behind it is not looked up from
+                // anywhere else (Codex #202 r3 F2).
                 switch (ast.node(q.target)) {
                     .name => |n| if (members) |m| {
                         var k = m.first;
-                        while (k <= m.last) : (k += 1) try self.walkName(n.raw, k, sheets, visited, depth);
-                    } else {
-                        try self.walkName(n.raw, scope, sheets, visited, depth);
+                        while (k <= m.last) : (k += 1) try self.enqueueName(n.raw, k, sheets, walk);
                     },
-                    else => try self.walkNode(ast, q.target, scope, sheets, visited, depth),
+                    else => try self.walkNode(ast, q.target, scope, sheets, walk),
                 }
             },
             // The raw spelling: a value-position name resolves as written,
             // so `_xlfn.Anchor` is not `Anchor` (Codex #202 r1 F5).
-            .name => |n| try self.walkName(n.raw, scope, sheets, visited, depth),
+            .name => |n| try self.enqueueName(n.raw, scope, sheets, walk),
             .structured => |st| if (st.table) |t| try self.addTableSheet(t, sheets),
             // The callee is a function, not a name.
-            .call => |c| for (ast.children(c.args)) |k| try self.walkNode(ast, k, scope, sheets, visited, depth),
-            .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, scope, sheets, visited, depth),
-            .paren => |pn| try self.walkNode(ast, pn.child, scope, sheets, visited, depth),
-            .unary => |u| try self.walkNode(ast, u.child, scope, sheets, visited, depth),
-            .postfix => |pf| try self.walkNode(ast, pf.child, scope, sheets, visited, depth),
+            .call => |c| for (ast.children(c.args)) |k| try self.walkNode(ast, k, scope, sheets, walk),
+            .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, scope, sheets, walk),
+            .paren => |pn| try self.walkNode(ast, pn.child, scope, sheets, walk),
+            .unary => |u| try self.walkNode(ast, u.child, scope, sheets, walk),
+            .postfix => |pf| try self.walkNode(ast, pf.child, scope, sheets, walk),
             .binary => |b| {
-                try self.walkNode(ast, b.lhs, scope, sheets, visited, depth);
-                try self.walkNode(ast, b.rhs, scope, sheets, visited, depth);
+                try self.walkNode(ast, b.lhs, scope, sheets, walk);
+                try self.walkNode(ast, b.rhs, scope, sheets, walk);
             },
             .number, .string, .boolean, .error_lit, .missing_arg, .ref_cell, .ref_full_col, .ref_full_row => {},
         }
     }
 
-    fn walkName(
+    /// Resolve a name from `scope` and queue its body — or, for a table
+    /// spelled bare, take the host sheet now.
+    fn enqueueName(
         self: *Resolver,
         raw: []const u8,
         scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
-        visited: *Visited,
-        depth: u32,
+        walk: *Walk,
     ) Error!void {
         const symbols = self.ensureSymbols() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1143,12 +1153,7 @@ const Resolver = struct {
         };
         const from: ?engine.SheetIndex = if (scope) |sc| engine.SheetIndex.fromInt(sc) else null;
         switch (try symbols.resolveName(self.gpa, from, raw)) {
-            .name => |n| {
-                const effective = scopeOf(n) orelse scope;
-                for (visited.items) |v| if (v.name == n and v.scope == effective) return;
-                try visited.append(self.gpa, .{ .name = n, .scope = effective });
-                try self.walkBody(n.body, effective, sheets, visited, depth + 1);
-            },
+            .name => |n| try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope }),
             .table, .not_found => {
                 // A table spelled bare, or nothing: the table index has
                 // the host if there is one.
@@ -2933,6 +2938,40 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
     try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">OFFSET(SalesTbl,0,0,1,1)</definedName><definedName name=\"SalesTbl\" function=\"1\">SalesTbl</definedName></definedNames><pivotCaches>");
     try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
     {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A chain of any length reaches its end: `PivotSrc = _D0 + _W`,
+    // `_D0 = _D1`, …, `_D99 = _W`, `_W = _Target`, `_Target = Report!$A$1`
+    // — a depth cap once cut `_Target` off on the deep path and the
+    // shallow `_W` was then skipped as visited (Codex r3 F1).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    {
+        var names: std.ArrayListUnmanaged(u8) = .empty;
+        defer names.deinit(testing.allocator);
+        try names.appendSlice(testing.allocator, "<definedName name=\"PivotSrc\">_D0+_W</definedName>");
+        var k: u32 = 0;
+        while (k < 100) : (k += 1) {
+            const line = if (k == 99)
+                try std.fmt.allocPrint(testing.allocator, "<definedName name=\"_D{d}\">_W</definedName>", .{k})
+            else
+                try std.fmt.allocPrint(testing.allocator, "<definedName name=\"_D{d}\">_D{d}</definedName>", .{ k, k + 1 });
+            defer testing.allocator.free(line);
+            try names.appendSlice(testing.allocator, line);
+        }
+        try names.appendSlice(testing.allocator, "<definedName name=\"_Target\">Report!$A$1</definedName><definedName name=\"_W\">_Target</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", names.items);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    // A qualifier that names nothing is `#REF!`: the name behind it is
+    // not looked up from the enclosing scope instead (Codex r3 F2).
+    for ([_][]const u8{ "OFFSET(Nope!_N,0,0,1,1)", "OFFSET(Report:Data!_N,0,0,1,1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"_N\">Report!$A$1</definedName><definedName name=\"PivotSrc\">PLACEHOLDER</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "PLACEHOLDER", body);
         var o = try Opened.open(testing.allocator, io, path);
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
