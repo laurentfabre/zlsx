@@ -118,10 +118,14 @@ Pivot tables on the edited sheet (S7a, `goal_sigmoid.md`): a row/col edit on
 a sheet that only *hosts* a pivot moves the pivot's output rectangle
 (`pivotTableDefinition/location@ref`) in step — an insert at or above the
 rectangle, a delete above it, an edit below or to its right (which leaves the
-part byte-identical). The edit exits 3 instead when it lands *inside* the
-pivot's footprint (the rectangle, or the report-filter band Excel draws above
-it — Excel refuses that edit too), when the host sheet is also one a pivot
-*reads from* (row S7b), or when the pivot graph cannot be read whole. One
+part byte-identical); the host's own `<pivotSelection>` coordinates move with
+the grid. The edit exits 3 instead when it lands *inside* the pivot's
+footprint (the rectangle, or the report-filter band Excel draws above it —
+Excel refuses that edit too), when some cache *may read* the host sheet — a
+source resolved to it (row S7b), or one `zlsx pivots` reports as
+`"resolved":null` (a dynamic defined name, a dangling spelling) or of a type
+it does not know — when one pivot part is hosted by two sheets, or when the
+pivot graph cannot be read whole. One
 known hole in the promise, pinned by the S6 audit: a sheet a pivot only *reads
 from* is admitted today, and for a source spelled as `sheet` + `ref` the
 cache's range goes stale (a table-named source follows the table rewriter and

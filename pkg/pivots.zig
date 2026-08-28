@@ -217,10 +217,35 @@ pub const Pivots = struct {
         return false;
     }
 
+    /// The S7a guard's question, which is wider than `readsFromSheet`:
+    /// could any cache read this sheet? True when a source resolves to
+    /// it, and — conservatively — when a source is `unresolved` (a
+    /// defined name with a dynamic body such as `OFFSET(Report!$D$1,…)`
+    /// is a source Excel accepts and this reader cannot place; a
+    /// dangling spelling is one it cannot rule out either) or when a
+    /// cache's source type is one the reader does not know. "Not
+    /// proven local" is not "proven elsewhere" (Codex #200 r1 REL-033).
+    pub fn mayReadFromSheet(self: *const Pivots, sheet_idx: u32) bool {
+        for (self.caches) |c| {
+            if (c.definition.source.type == .unknown) return true;
+            if (mayResolveTo(c.resolution, sheet_idx)) return true;
+            for (c.range_set_resolutions) |r| if (mayResolveTo(r, sheet_idx)) return true;
+        }
+        return false;
+    }
+
     fn resolvesTo(r: SourceResolution, sheet_idx: u32) bool {
         return switch (r) {
             .sheet => |s| s.sheet_idx == sheet_idx,
             else => false,
+        };
+    }
+
+    fn mayResolveTo(r: SourceResolution, sheet_idx: u32) bool {
+        return switch (r) {
+            .sheet => |s| s.sheet_idx == sheet_idx,
+            .unresolved => true,
+            .external, .none => false,
         };
     }
 };
@@ -987,7 +1012,10 @@ pub const edit = struct {
         var first_row = rect.tl_row;
         var last_col = rect.br_col;
         if (page_rows > 0) {
-            first_row = if (rect.tl_row > page_rows + 1) rect.tl_row - (page_rows + 1) else 1;
+            // Subtraction only: `rowPageCount` is any u32 the part
+            // declares, and `page_rows + 1` would wrap at the maximum
+            // (Codex #200 r1 REL-037). `rect.tl_row ≥ 1`.
+            first_row = if (page_rows >= rect.tl_row - 1) 1 else rect.tl_row - page_rows - 1;
             const page_cols: u32 = @max(def.location.col_page_count orelse 0, 1);
             const band_width = std.math.mul(u32, page_cols, 3) catch return error.PivotCoordinateOverflow;
             const band_right = std.math.add(u32, rect.tl_col, band_width - 1) catch return error.PivotCoordinateOverflow;
@@ -2063,8 +2091,59 @@ test "edit: report filters widen the footprint above the rectangle and to its ri
     try expectMove(bare, .row, 1, .insert, "<location ref=\"A4:B7\"/><pageFields count=\"1\"><pageField fld=\"0\" hier=\"-1\"/></pageFields>");
 
     // A rectangle too close to the top for its band: the band is
-    // clamped to row 1, never wraps.
+    // clamped to row 1, never wraps — including at the largest count a
+    // part can declare (Codex #200 r1 REL-037).
     try expectMove("<location ref=\"A2:B4\" rowPageCount=\"3\"/>", .row, 1, .insert, "<location ref=\"A3:B5\" rowPageCount=\"3\"/>");
+    try expectMove("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 1, .insert, "<location ref=\"A4:B7\" rowPageCount=\"4294967295\"/>");
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 1, .delete, error.PivotLocationEditUnsafe);
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"4294967295\"/>", .row, 2, .insert, error.PivotLocationEditUnsafe);
+    // The band's width is checked arithmetic too.
+    try expectRefusal("<location ref=\"A3:B6\" rowPageCount=\"1\" colPageCount=\"4294967295\"/>", .col, 9, .insert, error.PivotCoordinateOverflow);
+}
+
+test "mayReadFromSheet: an unresolved source may be any sheet; external and non-worksheet sources are not" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_may_read.xlsx");
+    defer testing.allocator.free(path);
+
+    // A dynamic defined name: Excel accepts `OFFSET(...)` as a pivot
+    // source; the reader cannot place it, so every sheet may be read.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET(Report!$D$1,0,0,4,3)");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .unresolved);
+        try testing.expect(!o.pivots.readsFromSheet(1));
+        try testing.expect(o.pivots.mayReadFromSheet(0) and o.pivots.mayReadFromSheet(1));
+    }
+    // An external workbook is proven elsewhere.
+    try fixture.write(testing.allocator, io, path, .external);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .external);
+        try testing.expect(!o.pivots.mayReadFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A resolved local source: the one sheet, and no other.
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.mayReadFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A source type the reader does not know may be anything.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "type=\"worksheet\"", "type=\"lakehouse\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].definition.source.type == .unknown);
+        try testing.expect(o.pivots.mayReadFromSheet(1));
+    }
 }
 
 test "edit: the splice lands on the parser's span — past a decoy, through an entity" {

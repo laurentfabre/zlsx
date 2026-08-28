@@ -5967,17 +5967,20 @@ pub const Workbook = struct {
     ///     rectangle, or the report-filter band above it) — Excel
     ///     refuses that edit too, and admitting it would change the
     ///     pivot's own layout;
-    ///   - the sheet is also a SOURCE of some cache
-    ///     (`Pivots.readsFromSheet`) — `worksheetSource@ref` and the
+    ///   - some cache MAY read this sheet (`Pivots.mayReadFromSheet`):
+    ///     a source resolved to it — `worksheetSource@ref` and the
     ///     cache records are S7b's / S7c's, and the corpus' own
     ///     `IrisSample` is this shape (hosts `PivotTable1`, read through
-    ///     `Table2`);
-    ///   - a hosted pivot's cache has a source type the reader does not
-    ///     know (`unknown`) — it might address this sheet in a way the
-    ///     typed read cannot see;
+    ///     `Table2`) — or one the reader cannot place (a defined name
+    ///     with a dynamic body, a dangling spelling) or of a type it
+    ///     does not know; "not proven local" is not "proven elsewhere";
     ///   - a shift past `XFD` / `1048576`;
+    ///   - the pivot part is also a host relationship of ANOTHER sheet
+    ///     — one rectangle cannot follow two grids;
     ///   - the sheet's relationships name a cache part directly — not a
     ///     topology the graph has a reading for.
+    /// The host sheet's own `<pivotSelection>` coordinates move with the
+    /// grid in `pkg/sheet_edit.zig`, like `<selection>`.
     /// A graph that cannot be read whole is `MalformedPivotXml`, the
     /// typed read's own refusal; the Editor folds both into
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
@@ -5995,9 +5998,8 @@ pub const Workbook = struct {
     ) Error!void {
         var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
         defer p.deinit();
-        for (p.tables) |t| {
-            if (!std.mem.eql(u8, t.sheet_part_name, sheet_part_name)) continue;
-            try admitHostedPivotEdit(&p, t);
+        for (p.tables, 0..) |t, i| {
+            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
             const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
             self.allocator.free(out);
         }
@@ -6020,14 +6022,23 @@ pub const Workbook = struct {
         return try self.pivotTables();
     }
 
-    /// The per-pivot admission that does not depend on the edit's
-    /// position: the host must not also be a source, and the cache must
-    /// be one the reader understands.
-    fn admitHostedPivotEdit(p: *const pivots_mod.Pivots, t: pivots_mod.PivotTable) Error!void {
-        if (p.readsFromSheet(t.sheet_idx)) return error.PivotEditUnsafe;
-        if (p.cacheOf(t)) |c| {
-            if (c.definition.source.type == .unknown) return error.PivotEditUnsafe;
+    /// Is `p.tables[i]` a pivot this edit moves? False for a pivot on
+    /// another sheet and for a repeat of a part already seen on this one
+    /// (two relationships to one part move it once). The admission
+    /// that does not depend on the edit's position runs here too: no
+    /// cache may read the host, and the part may not also be hosted by
+    /// a different sheet — one rectangle cannot follow two grids (Codex
+    /// #200 r1 REL-033 / REL-035).
+    fn hostedHere(p: *const pivots_mod.Pivots, i: usize, sheet_part_name: []const u8) Error!bool {
+        const t = p.tables[i];
+        if (!std.mem.eql(u8, t.sheet_part_name, sheet_part_name)) return false;
+        if (p.mayReadFromSheet(t.sheet_idx)) return error.PivotEditUnsafe;
+        for (p.tables, 0..) |u, k| {
+            if (!std.mem.eql(u8, u.part_name, t.part_name)) continue;
+            if (!std.mem.eql(u8, u.sheet_part_name, sheet_part_name)) return error.PivotEditUnsafe;
+            if (k < i) return false;
         }
+        return true;
     }
 
     fn applyPivotLocationEdit(
@@ -6047,8 +6058,10 @@ pub const Workbook = struct {
     /// S7a sweep: move `location@ref` of every pivot the sheet hosts.
     /// All-or-nothing — every definition is rewritten in memory before
     /// the first part is replaced, so a refusal on the second pivot
-    /// leaves the first untouched. Byte-identical rewrites (the pivot
-    /// sits below / right of the edit) skip `replacePart`, so the
+    /// leaves the first untouched, and the install itself is the
+    /// store's transactional `replaceParts`, so an allocation failure
+    /// midway leaves every part as it was. Byte-identical rewrites (the
+    /// pivot sits below / right of the edit) are not installed, so the
     /// SHA-256 passthrough holds for them.
     fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
@@ -6061,24 +6074,22 @@ pub const Workbook = struct {
         var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
         defer p.deinit();
 
-        const Patch = struct { part_name: []const u8, bytes: []u8 };
-        var patches: std.ArrayListUnmanaged(Patch) = .empty;
+        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer {
             for (patches.items) |it| self.allocator.free(it.bytes);
             patches.deinit(self.allocator);
         }
-        for (p.tables) |t| {
-            if (!std.mem.eql(u8, t.sheet_part_name, sheet_part_name)) continue;
-            try admitHostedPivotEdit(&p, t);
+        for (p.tables, 0..) |t, i| {
+            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
             const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
             if (std.mem.eql(u8, out, t.raw_xml)) {
                 self.allocator.free(out);
                 continue;
             }
             errdefer self.allocator.free(out);
-            try patches.append(self.allocator, .{ .part_name = t.part_name, .bytes = out });
+            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = out });
         }
-        for (patches.items) |it| try self.store.replacePart(it.part_name, it.bytes);
+        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
     }
 
     /// tbl: walk the sheet's `<tableParts>` block, resolve each

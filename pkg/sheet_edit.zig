@@ -83,6 +83,9 @@ pub fn applyColEditToWorksheet(
         } else if (matchTagAt(src, i, "selection")) |t| {
             try processSelectionTagCol(allocator, &out, src, t, col_1based, kind);
             i = t.after_open;
+        } else if (matchTagAt(src, i, "pivotSelection")) |t| {
+            try processPivotSelectionTag(allocator, &out, src, t, .col, col_1based, kind);
+            i = t.after_open;
         } else if (matchTagAt(src, i, "sortState")) |t| {
             try processSortStateTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else if (matchTagAt(src, i, "sortCondition")) |t| {
@@ -809,6 +812,9 @@ pub fn applyRowEditToWorksheet(
             i = t.after_open;
         } else if (matchTagAt(src, i, "selection")) |t| {
             try processSelectionTagRow(allocator, &out, src, t, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "pivotSelection")) |t| {
+            try processPivotSelectionTag(allocator, &out, src, t, .row, row, kind);
             i = t.after_open;
         } else if (matchTagAt(src, i, "sortState")) |t| {
             try processSortStateTagRow(allocator, &out, src, t, row, kind, &i);
@@ -1781,6 +1787,62 @@ pub fn processSelectionTagRow(
     return processSelectionTag(allocator, out, src, t, .row, row, kind);
 }
 
+/// Rewrite `<pivotSelection activeRow="11" activeCol="1" previousRow="11"
+/// previousCol="1" …>` (ECMA-376 §18.3.1.62): the selection state of a
+/// pivot on the host sheet. The four are ABSOLUTE 0-based grid
+/// coordinates and move with the grid like `activeCell` — the
+/// hold-the-index rule on a delete-match, since selection is view
+/// state and any in-grid value is schema-valid. `start` / `min` /
+/// `max` are pivot-area item indices and `<pivotArea offset>` is
+/// relative to the pivot; neither is a grid coordinate. S7a (Codex
+/// #200 r1 REL-034): the pivot's own rectangle moves with the same
+/// edit, so a selection left behind would point outside it.
+fn processPivotSelectionTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + "<pivotSelection".len .. t.after_open - 1];
+    const names: [2][]const u8 = switch (axis) {
+        .row => .{ "activeRow", "previousRow" },
+        .col => .{ "activeCol", "previousCol" },
+    };
+    var bufs: [2][12]u8 = undefined;
+    var subs: [2]AttrSub = undefined;
+    var n_subs: usize = 0;
+    for (names, 0..) |name, k| {
+        const raw = getAttr(attrs, name) orelse continue;
+        // A value that is not a number is left as written: the walker
+        // never invents view state.
+        const v = std.fmt.parseInt(u32, raw, 10) catch continue;
+        const shifted = shiftIndex0(v, idx_1based, kind) orelse continue;
+        if (shifted == v) continue;
+        subs[n_subs] = .{ .name = name, .new_value = try std.fmt.bufPrint(&bufs[k], "{d}", .{shifted}) };
+        n_subs += 1;
+    }
+    if (n_subs == 0) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttrs(allocator, out, src, t, "<pivotSelection".len, subs[0..n_subs]);
+}
+
+/// Hold-the-index shift of a 0-based coordinate under a 1-based edit:
+/// an insert at or before it pushes it by one, a delete before it pulls
+/// it by one, a delete AT it leaves it (it now names the cell that
+/// moved up). Null when the push would leave `u32`.
+fn shiftIndex0(v: u32, idx_1based: u32, kind: RowEditKind) ?u32 {
+    const edit0 = idx_1based - 1;
+    return switch (kind) {
+        .insert => if (v >= edit0) (std.math.add(u32, v, 1) catch return null) else v,
+        .delete => if (v > edit0) v - 1 else v,
+    };
+}
+
 /// Rewrite `<sortState ref="…">` and drop it whole when its range
 /// collapses (the body's `<sortCondition>` children go with it).
 ///
@@ -2245,6 +2307,55 @@ test "sheetViews container is not mistaken for sheetView" {
     try testing.expect(std.mem.indexOf(u8, out, "<sheetViews>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "</sheetViews>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "topLeftCell=\"A10\"") != null);
+}
+
+test "pivotSelection: the four absolute coordinates move with the grid, the item indices do not" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sheetView workbookViewId=\"0\"><selection activeCell=\"C12\" sqref=\"C12\"/><pivotSelection pane=\"bottomRight\" showHeader=\"1\" axis=\"axisRow\" dimension=\"0\" start=\"2\" min=\"2\" max=\"3\" activeRow=\"11\" activeCol=\"1\" previousRow=\"11\" previousCol=\"1\" click=\"1\" r:id=\"rIdPT\"><pivotArea dataOnly=\"0\" labelOnly=\"1\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\"><x v=\"1\"/></reference></references></pivotArea></pivotSelection></sheetView>");
+    defer a.free(src);
+    // Insert row 1: rows 11 → 12; columns untouched.
+    {
+        const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"12\" activeCol=\"1\" previousRow=\"12\" previousCol=\"1\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "start=\"2\" min=\"2\" max=\"3\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "activeCell=\"C13\"") != null);
+    }
+    // Delete row 12 (the selected one): hold the index.
+    {
+        const out = try applyRowEditToWorksheet(a, src, 12, .delete);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"11\" activeCol=\"1\" previousRow=\"11\" previousCol=\"1\"") != null);
+    }
+    // Delete row 3 (above): 11 → 10.
+    {
+        const out = try applyRowEditToWorksheet(a, src, 3, .delete);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"10\" activeCol=\"1\" previousRow=\"10\" previousCol=\"1\"") != null);
+    }
+    // Insert column B (2): cols 1 → 2; rows untouched.
+    {
+        const out = try applyColEditToWorksheet(a, src, 2, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"11\" activeCol=\"2\" previousRow=\"11\" previousCol=\"2\"") != null);
+    }
+    // Insert row 20 (below): byte-identical.
+    {
+        const out = try applyRowEditToWorksheet(a, src, 20, .insert);
+        defer a.free(out);
+        try testing.expectEqualStrings(src, out);
+    }
+}
+
+test "pivotSelection: a coordinate that is not a number is left as written" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<sheetView><pivotSelection activeRow=\"x\" activeCol=\"1\" previousRow=\"30\" r:id=\"rIdPT\"/></sheetView>");
+    defer a.free(src);
+    // Row 20 is below the fixture's data, so only the selection moves:
+    // the numeric coordinate shifts, the unreadable one stays.
+    const out = try applyRowEditToWorksheet(a, src, 20, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "activeRow=\"x\" activeCol=\"1\" previousRow=\"31\"") != null);
 }
 
 test "selection activeCell and sqref both shift" {

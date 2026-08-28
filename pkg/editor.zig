@@ -5766,6 +5766,139 @@ test "S7a: Workbook.insertRow refuses whole — a second hosted pivot's refusal 
     try std.testing.expectEqualStrings("A9:B11", p.tables[1].location_ref);
 }
 
+test "S7a: a source the reader cannot place may be the host — refused (Codex r1 REL-033)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7a_offset_src.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .defined_name);
+    // A dynamic name Excel accepts as a source, and which reads the
+    // HOST: `Report!D1:F4`. The reader resolves it to nothing; the
+    // guard must not read "nothing" as "elsewhere".
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET(Report!$D$1,0,0,4,3)");
+
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    {
+        var p = try wb.pivotTables();
+        defer p.deinit();
+        try std.testing.expect(p.caches[0].resolution == .unresolved);
+        try std.testing.expect(!p.readsFromSheet(1) and p.mayReadFromSheet(1));
+    }
+    // Above the rectangle (`A3:B6`) and inside the name's range.
+    try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(1, 2));
+    try std.testing.expectError(error.PivotEditUnsafe, wb.deleteColumn(1, 4));
+    const pt = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "ref=\"A3:B6\"") != null);
+    const sheet = (try wb.store.part("xl/worksheets/sheet2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, "r=\"A1\"") != null);
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 2));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(1, 4));
+    // The dangling spelling is the same class: not placed, not ruled out.
+    const dangling = try tt.path(std.testing.allocator, io, "s7a_dangling_src.xlsx");
+    defer std.testing.allocator.free(dangling);
+    try pivots_mod.fixture.write(std.testing.allocator, io, dangling, .dangling);
+    var ed2 = try Editor.open(std.testing.allocator, io, dangling);
+    defer ed2.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed2.insertRow(1, 1));
+}
+
+test "S7a: a pivot part two sheets host refuses on either host (Codex r1 REL-035)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7a_shared_src.xlsx");
+    defer std.testing.allocator.free(src);
+    // An external source so neither sheet is a source; `Data` (sheet 1)
+    // gets a relationship to `Report`'s pivot part.
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .external);
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+        defer store.deinit();
+        try store.addPart(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdPT1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>
+            ,
+        );
+        try store.save(io, src);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    {
+        var p = try wb.pivotTables();
+        defer p.deinit();
+        try std.testing.expectEqual(@as(usize, 2), p.tables.len);
+        try std.testing.expect(p.hostsPivot(0) and p.hostsPivot(1));
+    }
+    try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 1));
+    try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(1, 1));
+    const pt = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "ref=\"A3:B6\"") != null);
+
+    // Two relationships from ONE sheet to one part move it once.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/_rels/sheet1.xml.rels", "<Relationship Id=\"rIdPT1\"", "<Relationship Id=\"rIdPT0\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable1.xml\"/><Relationship Id=\"rIdPT1\"");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/_rels/sheet2.xml.rels", "<Relationship Id=\"rIdPT1\"", "<Relationship Id=\"rIdNone\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"http://example.invalid\" TargetMode=\"External\"/>");
+    var wb2 = try Workbook.open(std.testing.allocator, io, src);
+    defer wb2.deinit();
+    try wb2.insertRow(0, 1);
+    var p = try wb2.pivotTables();
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p.tables.len);
+    try std.testing.expectEqualStrings("A4:B7", p.tables[0].location_ref);
+    try std.testing.expectEqualStrings("A4:B7", p.tables[1].location_ref);
+}
+
+fn replacePartsForFailures(allocator: std.mem.Allocator, io: std.Io, path: []const u8, a_new: []const u8, b_new: []const u8) !void {
+    var store = try store_mod.PartStore.open(allocator, io, path);
+    defer store.deinit();
+    const a_old = try allocator.dupe(u8, (try store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
+    defer allocator.free(a_old);
+    const b_old = try allocator.dupe(u8, (try store.part("xl/pivotTables/pivotTable2.xml")).?.bytes);
+    defer allocator.free(b_old);
+    store.replaceParts(&.{
+        .{ .name = "xl/pivotTables/pivotTable1.xml", .bytes = a_new },
+        .{ .name = "xl/pivotTables/pivotTable2.xml", .bytes = b_new },
+    }) catch |e| {
+        // Neither installed: the failure left the store as it was.
+        try std.testing.expectEqualStrings(a_old, (try store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
+        try std.testing.expectEqualStrings(b_old, (try store.part("xl/pivotTables/pivotTable2.xml")).?.bytes);
+        return e;
+    };
+    try std.testing.expectEqualStrings(a_new, (try store.part("xl/pivotTables/pivotTable1.xml")).?.bytes);
+    try std.testing.expectEqualStrings(b_new, (try store.part("xl/pivotTables/pivotTable2.xml")).?.bytes);
+}
+
+test "S7a: the sweep's install is transactional under allocation failure (Codex r1 REL-036)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7a_txn_src.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+        defer store.deinit();
+        const first = (try store.part("xl/pivotTables/pivotTable1.xml")).?;
+        try store.addPart("xl/pivotTables/pivotTable2.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml", first.bytes);
+        try store.save(io, src);
+    }
+    const a_new = "<pivotTableDefinition a/>";
+    const b_new = "<pivotTableDefinition b/>";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replacePartsForFailures, .{ io, src, a_new, b_new });
+}
+
 test "S7a: the corpus fixture — a row above `mtCars Pivot` moves PivotTable3; `IrisSample` still refuses" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
