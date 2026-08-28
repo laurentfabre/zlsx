@@ -112,14 +112,21 @@ Every edit sub-command reads `<file>`, applies the change, and atomic-renames
 the result to `--out PATH` — the input is never modified in place. A refused
 edit (a construct the rewriter cannot shift safely yet — see
 [`plans/refusal-audit.md`](plans/refusal-audit.md)) exits with a diagnostic
-instead of writing a corrupt workbook; a successful save is byte-safe. One
-known hole in that promise, pinned by the S6 audit (`goal_sigmoid.md`): the
-pivot guard detects sheets that *host* a pivot, not sheets a pivot only *reads
-from* — a row/col edit on a source-only sheet is admitted today, and for a
-source spelled as `sheet` + `ref` the cache's range goes stale (a table-named
-source follows the table rewriter and stays valid). `zlsx pivots` names the
-sheet every pivot reads from (`cache.source.resolved`); row S7b closes the
-hole.
+instead of writing a corrupt workbook; a successful save is byte-safe.
+
+Pivot tables on the edited sheet (S7a, `goal_sigmoid.md`): a row/col edit on
+a sheet that only *hosts* a pivot moves the pivot's output rectangle
+(`pivotTableDefinition/location@ref`) in step — an insert at or above the
+rectangle, a delete above it, an edit below or to its right (which leaves the
+part byte-identical). The edit exits 3 instead when it lands *inside* the
+pivot's footprint (the rectangle, or the report-filter band Excel draws above
+it — Excel refuses that edit too), when the host sheet is also one a pivot
+*reads from* (row S7b), or when the pivot graph cannot be read whole. One
+known hole in the promise, pinned by the S6 audit: a sheet a pivot only *reads
+from* is admitted today, and for a source spelled as `sheet` + `ref` the
+cache's range goes stale (a table-named source follows the table rewriter and
+stays valid). `zlsx pivots` names the sheet every pivot reads from
+(`cache.source.resolved`); row S7b closes the hole.
 
 | Command | Required flags | What it does |
 |---|---|---|
