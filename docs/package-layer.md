@@ -163,8 +163,12 @@ function pointer to keep the graph a DAG.
 - **External-workbook chart series refs** (`[Book.xlsx]Sheet1!A1`
   patterns inside `<c:f>`) — surfaced verbatim in `series_refs`;
   no path-resolution or external-part fetching.
-- **Pivot tables** — detected, opaque-byte preserved, never
-  materialised as a typed object.
+- **Pivot tables** — read as a typed graph (`Workbook.pivotTables`;
+  `zlsx_pkg.pivots.collect` over a `PartStore` plus its parsed
+  `typed_parts.workbook_xml` view): tables with host
+  sheet and output rectangle, caches with their source resolved to the
+  sheet it reads from, field schema, records part. Never emitted or
+  rewritten; the parts stay byte-preserved through every edit.
 - **Per-part inferred metadata refresh** — `replacePart` /
   `addPart` install fresh bytes for the touched part(s), but
   metadata derived from `[Content_Types].xml` or `_rels/*.rels`

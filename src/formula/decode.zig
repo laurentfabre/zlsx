@@ -353,6 +353,17 @@ pub const Site = enum {
     table_name,
     /// `CT_TableColumn@name`.
     table_column_name,
+    /// `CT_pivotTableDefinition@name` and its captions (`dataCaption`,
+    /// `grandTotalCaption`). S6.
+    pivot_table_name,
+    /// `CT_CacheField@name`, `CT_PivotField@name`, `CT_DataField@name`,
+    /// `CT_PageField@name` — every field caption in the pivot parts.
+    pivot_field_name,
+    /// `CT_WorksheetSource@sheet` — a sheet name, resolved like a
+    /// sheet qualifier.
+    pivot_source_sheet_name,
+    /// `CT_WorksheetSource@name` — a table or defined-name spelling.
+    pivot_source_name,
     /// A numeric `<v>`.
     number_value,
     /// A `t="b"` `<v>`.
@@ -377,6 +388,10 @@ pub const Site = enum {
             .defined_name_identifier,
             .table_name,
             .table_column_name,
+            .pivot_table_name,
+            .pivot_field_name,
+            .pivot_source_sheet_name,
+            .pivot_source_name,
             => .string,
 
             .number_value,

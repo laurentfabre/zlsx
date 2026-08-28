@@ -1734,6 +1734,36 @@ pub fn build(b: *std.Build) void {
     const package_workbook_tests = b.addTest(.{ .root_module = package_workbook_tests_mod });
     test_step.dependOn(&b.addRunArtifact(package_workbook_tests).step);
 
+    // pkg/pivots.zig — S6's pivot graph walk + the typed-parts pivot
+    // parsers it composes. Its own root: `workbook.zig` reaches it only
+    // through one accessor body, and a file no test root analyses is a
+    // file whose tests never run (the `pkg/control.zig` lesson, S1).
+    // Same import list as the workbook target — it resolves sources
+    // through the engine's symbol table.
+    const package_pivots_tests_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/pivots.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_pivots_tests_mod.addImport("zlsx_control", control_mod);
+    package_pivots_tests_mod.addImport("zlsx", zlsx_mod);
+    package_pivots_tests_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    package_pivots_tests_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    package_pivots_tests_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    package_pivots_tests_mod.addImport("zlsx_zip", zip_mod);
+    package_pivots_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    package_pivots_tests_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    package_pivots_tests_mod.addImport("zlsx_nfc", nfc_mod);
+    package_pivots_tests_mod.addImport("zlsx_refs", refs_mod);
+    package_pivots_tests_mod.addImport("zlsx_formula", formula_pkg_mod);
+    const package_pivots_tests = b.addTest(.{ .root_module = package_pivots_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(package_pivots_tests).step);
+    // Alone as well: the S7 lifts iterate on this graph, and the full
+    // suite is minutes per turn.
+    const pivots_step = b.step("test-pivots", "Run the S6 pivot graph + parser tests alone");
+    pivots_step.dependOn(&b.addRunArtifact(package_pivots_tests).step);
+    pivots_step.dependOn(&b.addRunArtifact(package_typed_parts_tests).step);
+
     // pkg/recalc_txn.zig — M5b2's prepare/swap transaction. Its own test
     // binary rather than a section of the workbook target: nothing that is
     // already a test root reaches it (`workbook.zig` imports it, but only

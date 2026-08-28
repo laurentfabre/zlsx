@@ -72,7 +72,7 @@ The four surfaces:
 | Image / chart anchors | ✓ `zlsx_pkg.imageAnchors`, `zlsx_pkg.chartAnchors` | — S3b | — S3b | — S3b | S3b |
 | Document properties | ✓ `Workbook.docProps` | ✓ `zlsx_editor_docprop_at`, `zlsx_editor_has_custom_properties` | ✓ `Editor.doc_props` | — S3b | S3b |
 | Embedding vectors (state / model / dim / dtype / coverage / vectors / hashes / digest / carrier / tombstones) | ✓ `Workbook.embeddings` | ✓ `zlsx_emb_open`, `zlsx_emb_state`, `zlsx_emb_model`, `zlsx_emb_dim`, `zlsx_emb_dtype`, `zlsx_emb_coverage_count`, `zlsx_emb_coverage_id`, `zlsx_emb_coverage_sheet`, `zlsx_emb_coverage_range`, `zlsx_emb_coverage_rows`, `zlsx_emb_vectors`, `zlsx_emb_hashes`, `zlsx_emb_digest`, `zlsx_emb_carrier`, `zlsx_emb_tombstone` | ✓ `zlsx.embeddings` | — S3c ⁵ | S3c |
-| Pivot tables, typed | — S6 ⁶ | — S6 | — S6 | — S6 | S6 |
+| Pivot tables, typed — tables (host sheet, `location`, axes, data fields), caches (source resolved to its sheet, field schema, records part) | ✓ `Workbook.pivotTables` ⁶ | — S6 | — S6 | ✓ `pivots` ⁶ | S6 |
 
 ⁰ Every read sub-command opens the file; `rows` is the default and the lint anchor. `dbx genie` is the one sub-command that takes no workbook.
 ¹ `rows` / `cells` tag date cells `t:"date"` unconditionally, with the ISO value and the raw `serial` — `docs/cli.md`, "The NDJSON row envelope".
@@ -80,7 +80,7 @@ The four surfaces:
 ³ The C cell tags are `ZLSX_CELL_{STRING,INTEGER,NUMBER,BOOLEAN,EMPTY}` (`include/zlsx.h`); an error literal (`#DIV/0!`, `#N/A`, …) arrives as an ordinary string cell and Python converts it as one. Zig readers get the tag from `Rows.errorStrings` alongside `Rows.next` (`src/xlsx.zig`: "the Cell union slot stays `.string`").
 ⁴ Theme colours resolve through the workbook palette on every surface; the legacy indexed table and `tint` math do not, anywhere.
 ⁵ `embed --extract` lists the rows that need embedding; no mode dumps the stored vectors or the recovery state.
-⁶ Pivots are byte-preserved through every edit on every surface; no surface parses them into a typed object. See §3 for how far the refusal guard reaches.
+⁶ Read-only typed graph (`pkg/pivots.zig`; parsers in `pkg/typed_parts/pivot_xml.zig`, Strict + Transitional by namespace prefix): every pivot table with its host sheet and `location`, every cache with its `worksheetSource` resolved to a sheet of the workbook (the `sheet` attribute, a table's host, or a defined name's body — through the engine's symbol table), to another workbook, or to nothing. Formats, hierarchies and OLAP elements stay raw; the parts are byte-preserved through every edit on every surface. The NDJSON contract is `docs/cli.md` "pivots"; the C and Python legs follow the S6 gate. See §3 footnote ¹⁰ for how far the refusal guard reaches.
 
 ## 2 · Write — fresh workbooks (`Writer`)
 
@@ -143,7 +143,7 @@ The four surfaces:
 
 ⁸ Every edit sub-command opens the file for editing; `append-rows` is the lint anchor.
 ⁹ The rewriters run under every structural edit on every surface that has the edit — the CLI cell names one sub-command as the lint anchor. `pkg/sheet_edit.zig`, `pkg/table_edit.zig`, `pkg/drawing_edit.zig` are the per-part transforms behind them.
-¹⁰ `Workbook.preflightPivotEditsForSheet` walks the relationships **of the edited sheet** and refuses when one points at a pivot part — it catches sheets that *host* a pivot. A sheet a pivot only *reads from* (named by `worksheetSource` inside the cache definition) carries no such relationship and is **not detected today**; auditing that is S6's first job. `Editor` remaps `PivotEditUnsafe` (and the S2 residual `MalformedExtensionXml`, footnote ¹⁵) to `RowEditUnsafeForSheet` (row edits) / `ColEditUnsafeForSheet` (column edits); the CLI reports those with exit 3.
+¹⁰ `Workbook.preflightPivotEditsForSheet` walks the relationships **of the edited sheet** and refuses when one points at a pivot part — it catches sheets that *host* a pivot. A sheet a pivot only *reads from* (named by `worksheetSource` inside the cache definition) carries no such relationship and is **not detected** — S6's audit (2026-08-27) pinned it: the `S6 audit` tests in `pkg/editor.zig` show the host refusing and the source-only sheet admitted, with `worksheetSource@ref` left stale for a `sheet` + `ref` source (a table-named source follows the table rewriter and stays valid). `Workbook.pivotTables` resolves every source sheet (`Pivots.readsFromSheet`), which is what S7b guards on. `Editor` remaps `PivotEditUnsafe` (and the S2 residual `MalformedExtensionXml`, footnote ¹⁵) to `RowEditUnsafeForSheet` (row edits) / `ColEditUnsafeForSheet` (column edits); the CLI reports those with exit 3.
 ¹¹ Zig composes over *raw* parts: `PartStore.imageParts` lists image parts, `replacePart` / `removePart` swap or drop bytes by part name. There is no typed removal that also repairs the drawing, its relationships and content types, and no typed chart replacement (`ChartAnchor` is read-only). The sibling binary `zlsx-extract-images` extracts images by part name — no replace / remove, no chart parts, and not reachable as `zlsx <sub-command>`. S5b therefore includes Zig.
 ¹² `recalc --on-unsupported keep-stale-and-mark` sets the flag only as the fallback arm of a recalc; there is no standalone mark sub-command.
 ¹³ The fingerprint string is assembled privately in `src/c_abi.zig` from the `fingerprint_config` build option; no `zlsx` / `zlsx_pkg` / `zlsx_recalc` accessor exists.
@@ -212,7 +212,7 @@ gate (2026-08-26).
 | S4 | §1 indexed palette + tint, all four. |
 | S5 | §2 Writer images; §3 `Workbook.addImage*` → C + Py + CLI; §2 first row — export `src/writer.zig` as a public module (footnote ⁷), since S5 is the row that reshapes the Writer API anyway. The CLI leg presupposes a fresh-workbook path — see S11. |
 | S5b | §3 typed object extract / replace / remove (images, charts) on **all four** surfaces — Zig has raw-part composition only (footnote ¹¹) — retiring the `zlsx-extract-images` sibling into `zlsx`. C2a's product promise, distinct from the raw OPC substrate. |
-| S6 | §1 typed pivot read; the pivot-guard audit in footnote ¹⁰. |
+| S6 | §1 typed pivot read — Zig + CLI shipped; the C and Python legs follow the S6 gate. Footnote ¹⁰'s audit answered (2026-08-27). |
 | S7a · S7b · S7c | §3 `PivotEditUnsafe` lifts, staged. |
 | S8 | §2 pivot authoring, fresh workbooks. CLI leg presupposes S11. |
 | S9 | §2 charts, fresh workbooks. CLI leg presupposes S11. |

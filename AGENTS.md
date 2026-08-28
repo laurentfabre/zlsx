@@ -38,7 +38,9 @@ zlsx/
 ├── pkg/                            # "package layer" — usable without the full reader/writer
 │   ├── root.zig                    # @import("zlsx_pkg") root
 │   ├── store.zig                   # PartStore + decodeXmlEntities + looksExternal (fuzzed)
-│   └── drawings.zig                # image / chart anchor parsing
+│   ├── drawings.zig                # image / chart anchor parsing
+│   ├── pivots.zig                  # S6: pivot graph walk — tables, caches, source sheets
+│   └── typed_parts/pivot_xml.zig   # pivot cache-definition + table-definition parsers
 ├── include/zlsx.h                  # PUBLIC C header — must track src/c_abi.zig
 ├── bindings/python/                # py-zlsx
 │   ├── pyproject.toml              # version mirrors build.zig.zon

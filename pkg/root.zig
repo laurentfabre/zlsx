@@ -115,6 +115,14 @@ pub const shared_probe = struct {
     }
 };
 pub const Worksheet = workbook_mod.Worksheet;
+/// S6: the read-only pivot graph behind `Workbook.pivotTables`. The
+/// module is exported for its fixture builder and `collect`, which
+/// walks a bare `PartStore` for callers that hold no `Workbook`.
+pub const pivots = @import("pivots.zig");
+pub const Pivots = pivots.Pivots;
+pub const PivotTable = pivots.PivotTable;
+pub const PivotCache = pivots.PivotCache;
+pub const PivotSourceResolution = pivots.SourceResolution;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
 /// M6 (§12.2): what `Workbook.evaluate` returns — the CLI is the first

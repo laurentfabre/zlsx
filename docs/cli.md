@@ -39,10 +39,72 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx comments <file>` | `"comment"` | `sheet, sheet_idx, ref, row, col, author, text, runs?` |
 | `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
 | `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
+| `zlsx pivots <file>` | `"pivot"`, then `"pivot_cache"` | `sheet, sheet_idx, name, part, location{}, rows[], cols[], pages[], values[], data_caption, grand_totals{}, style, cache{}` — [contract](#pivots--the-typed-pivot-read) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
 | `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx, state` — lighter-weight than `meta` |
+
+#### `pivots` — the typed pivot read
+
+`zlsx pivots <file>` walks the pivot graph (`xl/workbook.xml` `<pivotCaches>` →
+cache definitions → records parts; every sheet's relationships → pivot-table
+definitions) and emits one record per **pivot table**, in host-sheet order,
+followed by one `pivot_cache` record per cache **no pivot table reads**. Orphan
+caches belong to no sheet, so they ride along by default and under
+`--all-sheets`, and a concrete selector — `--sheet`, `--name`, `--sheet-glob` —
+suppresses them. Nothing is modified; this is the read half of
+`goal_sigmoid.md` row S6, and the shape below is the S6 owner-gate contract.
+
+```jsonl
+{"kind":"pivot","sheet":"Report","sheet_idx":1,"name":"PivotTable1","part":"xl/pivotTables/pivotTable1.xml",
+ "location":{"ref":"A3:B6","first_header_row":1,"first_data_row":1,"first_data_col":1},
+ "rows":[{"field":"Region","idx":0}],"cols":[],"pages":[],
+ "values":[{"name":"Sum of Qty","field":"Qty","idx":1,"subtotal":"sum","show_data_as":null,"num_fmt_id":null}],
+ "data_caption":"Values","grand_totals":{"rows":true,"cols":true},"style":"PivotStyleLight16",
+ "cache":{"id":7,"part":"xl/pivotCache/pivotCacheDefinition1.xml","records_part":"xl/pivotCache/pivotCacheRecords1.xml",
+  "record_count":3,"refreshed_by":"zlsx","refreshed_date":"45000.5","refresh_on_load":false,"save_data":true,
+  "source":{"type":"worksheet","sheet":"Data","ref":"A1:C4","name":null,
+            "resolved":{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}},
+  "fields":[{"name":"Region","num_fmt_id":0,"formula":null,"items":2,"types":["string"],"min":null,"max":null},
+            {"name":"Qty","num_fmt_id":0,"formula":null,"items":null,"types":["number","integer"],"min":"3","max":"5"}]}}
+{"kind":"pivot_cache","cache":{…}}
+```
+
+(One line per record on the wire; wrapped here for reading.)
+
+| Field | Meaning |
+|---|---|
+| `sheet`, `sheet_idx` | The **host** sheet — where the pivot renders; `location.ref` is in its grid. Dropped under `--output compact-ndjson` in favour of the sheet prologue. |
+| `name`, `part` | `pivotTableDefinition@name` (decoded) and the part's archive name. |
+| `location` | `ref` (entity-decoded) plus `first_header_row` / `first_data_row` / `first_data_col`; an absent attribute is `null`. |
+| `rows`, `cols`, `pages` | The axes, in order. Each entry is `{"field":NAME,"idx":N}` — `NAME` is the cache field at pivot-field ordinal `N` (`null` when the cache has no such field) — or `{"values":true}` for the values axis (`x="-2"`). |
+| `values` | The data fields: caption (`name`), source field (`field` / `idx`), `subtotal` as the ST_DataConsolidateFunction token (`sum`, `count`, `average`, `max`, `min`, `product`, `countNums`, `stdDev`, `stdDevp`, `var`, `varp`; an unknown token passes through verbatim), `show_data_as` (raw; `null` means normal), `num_fmt_id`. |
+| `data_caption`, `grand_totals`, `style` | The values-axis caption, `rowGrandTotals` / `colGrandTotals` (schema default `true`), `pivotTableStyleInfo@name`. |
+| `cache` | The cache the pivot reads, or `null` when neither the part's relationship nor its `cacheId` reaches one. |
+| `cache.id` | `<pivotCache cacheId>` from `xl/workbook.xml`; `null` for a cache only a pivot's own relationship reaches. |
+| `cache.records_part`, `cache.record_count` | The `pivotCacheRecords` part and its declared `recordCount`. Records are never parsed. |
+| `cache.refreshed_by`, `refreshed_date`, `refresh_on_load`, `save_data` | Refresh facts as written. `refreshed_date` is the `refreshedDate` serial, or the `refreshedDateIso` string when a producer wrote only that; `null` with neither. |
+| `cache.source` | `{"type":"worksheet",…}`, `{"type":"consolidation","range_sets":[…]}`, `{"type":"external","connection_id":N}`, `{"type":"scenario"}` or `{"type":"unknown","raw":"…"}`. |
+| `cache.source.sheet`, `.ref`, `.name` | The `worksheetSource` spellings, decoded (`sheet` and `name` by their string carrier, `ref` entity-decoded). A worksheet source is spelled either as `sheet` + `ref`, or as `name` — a table or a defined name. |
+| `cache.source.resolved` | **What the spelling led to** — the surface-matrix footnote-¹⁰ answer: `{"sheet":…,"sheet_idx":N,"via":"sheet_attr"|"table"|"defined_name"}` for a sheet of this workbook; `{"external":TARGET}` when the source lives in another workbook (the `r:id` relationship target); `null` when the spelling names nothing the workbook has (a dangling sheet name, a defined name with a dynamic or 3D body). Each consolidation `range_sets[]` entry carries the same four keys. |
+| `cache.fields` | The cache-field schema in ordinal order: decoded `name`, `num_fmt_id`, `formula` (calculated fields; `null` otherwise), `items` (`sharedItems@count`; `null` when absent), `types` (the `contains*` inventory as a list drawn from `string`, `number`, `integer`, `blank`, `date`, `mixed`; `null` without `<sharedItems>`), `min` / `max` (`minValue` / `maxValue`, else `minDate` / `maxDate`, raw). |
+
+Sheet selection follows the read family — `--sheet` / `--name` narrow to one
+host sheet, `--all-sheets` / `--sheet-glob` widen, the default streams every
+sheet — and `--skip` / `--take` page the record stream. A workbook without
+pivots is an empty, successful stream. The graph is read whole or not at all
+(`MalformedPivotXml`, exit 2): a part a pivot, cache or sheet relationship
+names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
+without its `cacheId` or `r:id`, a cache whose identity disagrees between
+`xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
+with two cache edges, a records part that is named but absent, a defined-name
+inventory the engine refuses or a `<tablePart>` that attaches nothing (checked,
+in that order, when a source is spelled by name and no defined name has it) all fail the command rather than listing the pivots
+that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
+chart formats, hierarchies and every OLAP-only element are not exposed; the
+parts stay byte-preserved for callers that need them raw
+(`zlsx_pkg.PartStore`).
 
 ### Edit (load-modify-save)
 
@@ -51,9 +113,13 @@ the result to `--out PATH` — the input is never modified in place. A refused
 edit (a construct the rewriter cannot shift safely yet — see
 [`plans/refusal-audit.md`](plans/refusal-audit.md)) exits with a diagnostic
 instead of writing a corrupt workbook; a successful save is byte-safe. One
-known hole in that promise: the pivot guard detects sheets that *host* a
-pivot, not sheets a pivot only *reads from* — a row/col edit on a source-only
-sheet is not refused today (the S6 audit in `goal_sigmoid.md` closes it).
+known hole in that promise, pinned by the S6 audit (`goal_sigmoid.md`): the
+pivot guard detects sheets that *host* a pivot, not sheets a pivot only *reads
+from* — a row/col edit on a source-only sheet is admitted today, and for a
+source spelled as `sheet` + `ref` the cache's range goes stale (a table-named
+source follows the table rewriter and stays valid). `zlsx pivots` names the
+sheet every pivot reads from (`cache.source.resolved`); row S7b closes the
+hole.
 
 | Command | Required flags | What it does |
 |---|---|---|
@@ -271,8 +337,8 @@ is set.
 ## Flags
 
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
-unless told otherwise; `comments` / `validations` / `hyperlinks` stream every
-sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
+unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots`
+stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
 
 **Sheet selection** — mutually exclusive:
 
@@ -314,8 +380,8 @@ sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
 --output ndjson               # default: invariant-envelope stream
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
-                              # validations / hyperlinks — a no-op on workbook-scoped
-                              # sub-commands
+                              # validations / hyperlinks / pivots — a no-op on
+                              # workbook-scoped sub-commands
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -405,7 +471,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

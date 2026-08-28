@@ -44,6 +44,7 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
     var any_seen: bool = false;
     var sheets_total: u32 = 0;
     var rows_total: u64 = 0;
+    var pivots_total: usize = 0;
 
     for (fixtures) |name| {
         var path_buf: [256]u8 = undefined;
@@ -90,6 +91,16 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
         _ = try wb.styles();
         _ = wb.definedNames();
         _ = wb.calcProperties();
+
+        // S6: the pivot graph walks relationships every fixture has and
+        // must never error on a workbook without pivots. The one fixture
+        // with pivots is pinned in `pkg/pivots.zig`'s own corpus test.
+        var pivots = wb.pivotTables() catch |err| {
+            std.debug.print("\n  [{s} pivotTables] -> {s}\n", .{ name, @errorName(err) });
+            return err;
+        };
+        defer pivots.deinit();
+        pivots_total += pivots.tables.len;
     }
 
     if (!any_seen) {
@@ -99,4 +110,16 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
 
     try std.testing.expect(sheets_total > 0);
     try std.testing.expect(rows_total > 0);
+    // `openxlsx_loadExample.xlsx` carries two; the count is a floor so a
+    // fixture added later with pivots of its own does not fail this.
+    var has_pivot_fixture = false;
+    for (fixtures) |name| {
+        if (std.mem.eql(u8, name, "openxlsx_loadExample.xlsx")) {
+            var path_buf: [256]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
+            std.Io.Dir.cwd().access(io, path, .{}) catch continue;
+            has_pivot_fixture = true;
+        }
+    }
+    if (has_pivot_fixture) try std.testing.expect(pivots_total >= 2);
 }

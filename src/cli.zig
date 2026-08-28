@@ -44,6 +44,10 @@ const Subcommand = enum {
     comments,
     validations,
     hyperlinks,
+    /// S6: typed pivot read — one record per pivot table (host-sheet
+    /// order), then one per cache no table reads. Package-layer
+    /// route (`Workbook.pivotTables`), dispatched before the Book open.
+    pivots,
     styles,
     sst,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
@@ -293,6 +297,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "comments")) return .comments;
         if (std.mem.eql(u8, a, "validations")) return .validations;
         if (std.mem.eql(u8, a, "hyperlinks")) return .hyperlinks;
+        if (std.mem.eql(u8, a, "pivots")) return .pivots;
         if (std.mem.eql(u8, a, "styles")) return .styles;
         if (std.mem.eql(u8, a, "sst")) return .sst;
         return .rows; // first positional is the file path
@@ -405,7 +410,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -630,6 +635,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "comments") or
                     std.mem.eql(u8, a, "validations") or
                     std.mem.eql(u8, a, "hyperlinks") or
+                    std.mem.eql(u8, a, "pivots") or
                     std.mem.eql(u8, a, "styles") or
                     std.mem.eql(u8, a, "sst") or
                     std.mem.eql(u8, a, "append-rows") or
@@ -659,7 +665,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -671,7 +677,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -703,7 +709,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -712,7 +718,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -802,7 +808,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  eval              evaluate one formula against a workbook (NDJSON)
         \\  recalc            recalculate every formula cell into --out
         \\
-        \\  --sheet N         0-indexed sheet to read (default: 0)
+        \\  --sheet N         0-indexed sheet to read (default: 0; on
+        \\                    pivots, every host sheet)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
@@ -830,7 +837,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  --skip N          drop the first N emitted records (iter59a).
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
-        \\                    hyperlinks / styles / sst. Ignored by meta
+        \\                    hyperlinks / pivots / styles / sst. Ignored by meta
         \\                    and list-sheets.
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
@@ -839,7 +846,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    sheet's own rows, unlike --skip which is
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
-        \\                    / meta / list-sheets / styles / sst.
+        \\                    / pivots / meta / list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -893,7 +900,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     sheet; subsequent records OMIT
         \\                                     `sheet`/`sheet_idx`. Applies to
         \\                                     cells / rows / comments /
-        \\                                     validations / hyperlinks.
+        \\                                     validations / hyperlinks / pivots.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
@@ -948,6 +955,22 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     sheet (iter58):
         \\                     {"kind":"hyperlink","sheet":"S","sheet_idx":0,
         \\                      "range":"A1","url":"https://…","location":null}
+        \\  pivots             one NDJSON record per pivot table across every
+        \\                     sheet (S6), then one per pivot cache no table
+        \\                     reads. Host sheet in `sheet`; the cache's
+        \\                     `source.resolved` names the sheet the pivot
+        \\                     READS from (or another workbook, or null):
+        \\                     {"kind":"pivot","sheet":"S","sheet_idx":0,
+        \\                      "name":"PivotTable1","part":"xl/pivotTables/…",
+        \\                      "location":{"ref":"A3:B6",…},"rows":[{"field":"Region","idx":0}],
+        \\                      "cols":[],"pages":[],"values":[{"name":"Sum of Qty",
+        \\                      "field":"Qty","idx":1,"subtotal":"sum",…}],
+        \\                      "data_caption":"Values","grand_totals":{…},"style":"…",
+        \\                      "cache":{"id":7,"part":"…","records_part":"…",
+        \\                      "record_count":3,…,"source":{"type":"worksheet",
+        \\                      "sheet":"Data","ref":"A1:C4","name":null,
+        \\                      "resolved":{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}},
+        \\                      "fields":[{"name":"Region","types":["string"],…}]}}
         \\  styles             one NDJSON record per cell-XF style entry
         \\                     (workbook-wide, iter58):
         \\                     {"kind":"style","idx":0,"font":{…}|null,
@@ -1931,6 +1954,9 @@ fn runMain(init: std.process.Init) !u8 {
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
         .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
         .embed => return try runEmbedCommand(alloc, proc_io, args, out, err),
+        // The legacy --list-sheets flag overrides every read
+        // sub-command, this one included: it takes the Book path below.
+        .pivots => if (!args.list_sheets) return try runPivotsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2035,6 +2061,7 @@ fn runMain(init: std.process.Init) !u8 {
         .delete_sheet,
         .scrub_metadata,
         .embed,
+        .pivots,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2089,6 +2116,7 @@ fn runMain(init: std.process.Init) !u8 {
         .delete_sheet,
         .scrub_metadata,
         .embed,
+        .pivots,
         => unreachable,
     }
     return 0;
@@ -3938,6 +3966,326 @@ fn runHyperlinksCommand(
     try out.flush();
 }
 
+/// S6: `zlsx pivots` — one `{"kind":"pivot",…}` record per pivot table in
+/// host-sheet order, then one `{"kind":"pivot_cache",…}` record per cache
+/// no pivot table reads. Routes through the package layer: `Workbook` is
+/// the surface that walks relationships, and a pivot is nothing but
+/// relationships (`pkg/pivots.zig`) — the reader-only `Book` has no view
+/// of the parts. Sheet selection follows the read family (`--sheet` /
+/// `--name` narrow to one host sheet, `--all-sheets` / `--sheet-glob`
+/// widen, the default visits every sheet); orphan caches are workbook-
+/// scoped and only ride along when no sheet was selected. Contract in
+/// docs/cli.md, "pivots".
+fn runPivotsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    var pivots = wb.pivotTables() catch |e| {
+        try err.print("zlsx: cannot read pivots in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer pivots.deinit();
+
+    const filter: ?usize = blk: {
+        if (args.all_sheets or args.sheet_glob != null) break :blk null;
+        if (args.sheet_index) |idx| {
+            if (idx >= pivots.sheet_names.len) {
+                try err.writeAll("zlsx: sheet not found\n");
+                try err.flush();
+                return 3;
+            }
+            break :blk idx;
+        }
+        if (args.sheet_name) |name| {
+            for (pivots.sheet_names, 0..) |s, i| {
+                if (std.mem.eql(u8, s, name)) break :blk i;
+            }
+            try err.writeAll("zlsx: sheet not found\n");
+            try err.flush();
+            return 3;
+        }
+        break :blk null;
+    };
+
+    var pg = Pagination.init(args.skip, args.take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
+    for (pivots.tables) |pt| {
+        if (signals.shouldStop()) return 0;
+        if (filter) |f| {
+            if (pt.sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, pt.sheet_name, pt.sheet_idx)) continue;
+        }
+        switch (pg.consume()) {
+            .drop => continue,
+            .stop => {
+                try out.flush();
+                return 0;
+            },
+            .emit => {},
+        }
+        if (compact and (last_prologue == null or last_prologue.? != pt.sheet_idx)) {
+            try writeCompactSheetPrologue(out, pt.sheet_name, pt.sheet_idx);
+            last_prologue = pt.sheet_idx;
+        }
+        try writePivotRecord(out, &pivots, pt, compact);
+    }
+
+    if (filter == null and args.sheet_glob == null) {
+        for (pivots.caches) |c| {
+            if (c.consumer_count != 0) continue;
+            if (signals.shouldStop()) return 0;
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => {
+                    try out.flush();
+                    return 0;
+                },
+                .emit => {},
+            }
+            try out.writeAll("{\"kind\":\"pivot_cache\",\"cache\":");
+            try writePivotCacheObject(out, c);
+            try out.writeAll("}\n");
+        }
+    }
+    try out.flush();
+    return 0;
+}
+
+fn writePivotRecord(
+    out: *std.Io.Writer,
+    pivots: *const zlsx_pkg.Pivots,
+    pt: zlsx_pkg.PivotTable,
+    compact: bool,
+) !void {
+    const def = &pt.definition;
+    try out.writeAll("{\"kind\":\"pivot\"");
+    if (!compact) {
+        try out.writeAll(",\"sheet\":");
+        try writeJsonString(out, pt.sheet_name);
+        try out.print(",\"sheet_idx\":{d}", .{pt.sheet_idx});
+    }
+    try out.writeAll(",\"name\":");
+    try writeJsonString(out, pt.name);
+    try out.writeAll(",\"part\":");
+    try writeJsonString(out, pt.part_name);
+    try out.writeAll(",\"location\":{\"ref\":");
+    try writeJsonString(out, pt.location_ref);
+    try out.writeAll(",\"first_header_row\":");
+    try writeJsonOptU32(out, def.location.first_header_row);
+    try out.writeAll(",\"first_data_row\":");
+    try writeJsonOptU32(out, def.location.first_data_row);
+    try out.writeAll(",\"first_data_col\":");
+    try writeJsonOptU32(out, def.location.first_data_col);
+    try out.writeAll("},\"rows\":");
+    try writePivotAxis(out, pivots, pt, def.row_fields);
+    try out.writeAll(",\"cols\":");
+    try writePivotAxis(out, pivots, pt, def.col_fields);
+    try out.writeAll(",\"pages\":[");
+    for (def.page_fields, 0..) |pf, i| {
+        if (i > 0) try out.writeByte(',');
+        switch (pf.fld) {
+            .values => try out.writeAll("{\"values\":true}"),
+            .field => |ordinal| {
+                try out.writeAll("{\"field\":");
+                try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
+                try out.print(",\"idx\":{d}}}", .{ordinal});
+            },
+        }
+    }
+    try out.writeAll("],\"values\":[");
+    for (def.data_fields, 0..) |df, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("{\"name\":");
+        try writeJsonOptString(out, pt.data_field_names[i]);
+        try out.writeAll(",\"field\":");
+        try writeJsonOptString(out, pivots.fieldName(pt, df.fld));
+        try out.print(",\"idx\":{d},\"subtotal\":", .{df.fld});
+        try writeJsonString(out, if (df.subtotal == .unknown) (df.subtotal_raw orelse "unknown") else df.subtotal.xmlName());
+        try out.writeAll(",\"show_data_as\":");
+        try writeJsonOptString(out, df.show_data_as);
+        try out.writeAll(",\"num_fmt_id\":");
+        try writeJsonOptU32(out, df.num_fmt_id);
+        try out.writeByte('}');
+    }
+    try out.writeAll("],\"data_caption\":");
+    try writeJsonOptString(out, pt.data_caption);
+    try out.print(",\"grand_totals\":{{\"rows\":{},\"cols\":{}}},\"style\":", .{ def.row_grand_totals, def.col_grand_totals });
+    try writeJsonOptString(out, pt.style_name);
+    try out.writeAll(",\"cache\":");
+    if (pivots.cacheOf(pt)) |c| try writePivotCacheObject(out, c.*) else try out.writeAll("null");
+    try out.writeAll("}\n");
+}
+
+/// `[{"field":"Region","idx":0},{"values":true}]` — a row or column
+/// axis: pivot-field ordinals resolved to their cache-field names, the
+/// values axis (`x="-2"`) as its own marker.
+fn writePivotAxis(
+    out: *std.Io.Writer,
+    pivots: *const zlsx_pkg.Pivots,
+    pt: zlsx_pkg.PivotTable,
+    axis: []const zlsx_pkg.typed_parts.pivot_xml.AxisField,
+) !void {
+    try out.writeByte('[');
+    for (axis, 0..) |af, i| {
+        if (i > 0) try out.writeByte(',');
+        switch (af) {
+            .values => try out.writeAll("{\"values\":true}"),
+            .field => |ordinal| {
+                try out.writeAll("{\"field\":");
+                try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
+                try out.print(",\"idx\":{d}}}", .{ordinal});
+            },
+        }
+    }
+    try out.writeByte(']');
+}
+
+fn writePivotCacheObject(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
+    const def = &c.definition;
+    try out.writeAll("{\"id\":");
+    try writeJsonOptU32(out, c.cache_id);
+    try out.writeAll(",\"part\":");
+    try writeJsonString(out, c.part_name);
+    try out.writeAll(",\"records_part\":");
+    try writeJsonOptString(out, c.records_part_name);
+    try out.writeAll(",\"record_count\":");
+    try writeJsonOptU32(out, def.record_count);
+    try out.writeAll(",\"refreshed_by\":");
+    try writeJsonOptString(out, def.refreshed_by);
+    // `refreshedDate` is the serial Excel writes; a producer that wrote
+    // only the ISO form (`refreshedDateIso`) still gets a date here.
+    try out.writeAll(",\"refreshed_date\":");
+    try writeJsonOptString(out, def.refreshed_date orelse def.refreshed_date_iso);
+    try out.print(",\"refresh_on_load\":{},\"save_data\":{},\"source\":", .{ def.refresh_on_load, def.save_data });
+    try writePivotSource(out, c);
+    try out.writeAll(",\"fields\":[");
+    for (def.fields, 0..) |f, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("{\"name\":");
+        try writeJsonString(out, c.field_names[i]);
+        try out.writeAll(",\"num_fmt_id\":");
+        try writeJsonOptU32(out, f.num_fmt_id);
+        try out.writeAll(",\"formula\":");
+        try writeJsonOptString(out, c.field_formulas[i]);
+        try out.writeAll(",\"items\":");
+        try writeJsonOptU32(out, if (f.shared_items) |si| si.count else null);
+        try out.writeAll(",\"types\":");
+        if (f.shared_items) |si| try writeSharedItemTypes(out, si) else try out.writeAll("null");
+        try out.writeAll(",\"min\":");
+        try writeJsonOptString(out, if (f.shared_items) |si| (si.min_value orelse si.min_date) else null);
+        try out.writeAll(",\"max\":");
+        try writeJsonOptString(out, if (f.shared_items) |si| (si.max_value orelse si.max_date) else null);
+        try out.writeByte('}');
+    }
+    try out.writeAll("]}");
+}
+
+/// The `containsX` inventory as a list of the kinds present, in a fixed
+/// order: `string`, `number`, `integer`, `blank`, `date`, `mixed`.
+fn writeSharedItemTypes(out: *std.Io.Writer, si: zlsx_pkg.typed_parts.pivot_xml.SharedItems) !void {
+    try out.writeByte('[');
+    var first = true;
+    const kinds = [_]struct { on: bool, name: []const u8 }{
+        .{ .on = si.contains_string, .name = "string" },
+        .{ .on = si.contains_number, .name = "number" },
+        .{ .on = si.contains_integer, .name = "integer" },
+        .{ .on = si.contains_blank, .name = "blank" },
+        .{ .on = si.contains_date, .name = "date" },
+        .{ .on = si.contains_mixed_types, .name = "mixed" },
+    };
+    for (kinds) |k| {
+        if (!k.on) continue;
+        if (!first) try out.writeByte(',');
+        first = false;
+        try out.print("\"{s}\"", .{k.name});
+    }
+    try out.writeByte(']');
+}
+
+fn writePivotSource(out: *std.Io.Writer, c: zlsx_pkg.PivotCache) !void {
+    const src = &c.definition.source;
+    switch (src.type) {
+        .worksheet => {
+            try out.writeAll("{\"type\":\"worksheet\",");
+            try writePivotSourceSpelling(out, c.source, c.resolution);
+            try out.writeByte('}');
+        },
+        .consolidation => {
+            try out.writeAll("{\"type\":\"consolidation\",\"range_sets\":[");
+            for (c.range_set_sources, 0..) |sp, i| {
+                if (i > 0) try out.writeByte(',');
+                try out.writeByte('{');
+                try writePivotSourceSpelling(out, sp, c.range_set_resolutions[i]);
+                try out.writeByte('}');
+            }
+            try out.writeAll("]}");
+        },
+        .external => {
+            try out.writeAll("{\"type\":\"external\",\"connection_id\":");
+            try writeJsonOptU32(out, src.connection_id);
+            try out.writeByte('}');
+        },
+        .scenario => try out.writeAll("{\"type\":\"scenario\"}"),
+        .unknown => {
+            try out.writeAll("{\"type\":\"unknown\",\"raw\":");
+            try writeJsonOptString(out, src.type_raw);
+            try out.writeByte('}');
+        },
+    }
+}
+
+/// `"sheet":…,"ref":…,"name":…,"resolved":…` (no braces, no leading
+/// comma) — the spellings as written and what they led to: a local sheet
+/// (`{"sheet":"Data","sheet_idx":0,"via":"sheet_attr"}`), another
+/// workbook (`{"external":"…"}`), or `null` when the spelling names
+/// nothing this workbook has.
+fn writePivotSourceSpelling(
+    out: *std.Io.Writer,
+    sp: zlsx_pkg.pivots.SourceSpelling,
+    res: zlsx_pkg.PivotSourceResolution,
+) !void {
+    try out.writeAll("\"sheet\":");
+    try writeJsonOptString(out, sp.sheet);
+    try out.writeAll(",\"ref\":");
+    try writeJsonOptString(out, sp.ref);
+    try out.writeAll(",\"name\":");
+    try writeJsonOptString(out, sp.name);
+    try out.writeAll(",\"resolved\":");
+    switch (res) {
+        .sheet => |s| {
+            try out.writeAll("{\"sheet\":");
+            try writeJsonString(out, s.sheet_name);
+            try out.print(",\"sheet_idx\":{d},\"via\":\"{s}\"}}", .{ s.sheet_idx, @tagName(s.via) });
+        },
+        .external => |target| {
+            try out.writeAll("{\"external\":");
+            try writeJsonString(out, target);
+            try out.writeByte('}');
+        },
+        .unresolved, .none => try out.writeAll("null"),
+    }
+}
+
+fn writeJsonOptString(w: *std.Io.Writer, s: ?[]const u8) !void {
+    if (s) |v| try writeJsonString(w, v) else try w.writeAll("null");
+}
+
+fn writeJsonOptU32(w: *std.Io.Writer, v: ?u32) !void {
+    if (v) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+}
+
 /// Emit `{…}` for a BorderSide or `null` when the side has no style.
 fn writeBorderSideOrNull(w: *std.Io.Writer, side: xlsx.BorderSide) !void {
     if (side.style.len == 0) {
@@ -5520,7 +5868,7 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
         try std.testing.expectEqual(@as(?u32, 7), a.end_row);
     }
     // Sub-commands without a row key reject --start-row / --end-row.
-    inline for (.{ "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+    inline for (.{ "validations", "hyperlinks", "pivots", "meta", "list-sheets", "styles", "sst" }) |cmd| {
         {
             const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2" };
             try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
@@ -8229,4 +8577,270 @@ test "runCellsCommand emits t:formula with formula_ref for array-formula slaves"
     try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C3\",\"row\":3,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":20") != null);
     // Slave C4: formula_ref to C2 + cached.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"ref\":\"C4\",\"row\":4,\"col\":3,\"t\":\"formula\",\"formula_ref\":\"C2\",\"cached\":30") != null);
+}
+
+// ─── S6: `pivots` ────────────────────────────────────────────────────
+
+test "runPivotsCommand: one record per pivot in the frozen field order" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.write(std.testing.allocator, io, path, .sheet_ref);
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    const expected =
+        "{\"kind\":\"pivot\",\"sheet\":\"Report\",\"sheet_idx\":1,\"name\":\"PivotTable1\"," ++
+        "\"part\":\"xl/pivotTables/pivotTable1.xml\"," ++
+        "\"location\":{\"ref\":\"A3:B6\",\"first_header_row\":1,\"first_data_row\":1,\"first_data_col\":1}," ++
+        "\"rows\":[{\"field\":\"Region\",\"idx\":0}],\"cols\":[],\"pages\":[]," ++
+        "\"values\":[{\"name\":\"Sum of Qty\",\"field\":\"Qty\",\"idx\":1,\"subtotal\":\"sum\",\"show_data_as\":null,\"num_fmt_id\":null}]," ++
+        "\"data_caption\":\"Values\",\"grand_totals\":{\"rows\":true,\"cols\":true},\"style\":\"PivotStyleLight16\"," ++
+        "\"cache\":{\"id\":7,\"part\":\"xl/pivotCache/pivotCacheDefinition1.xml\"," ++
+        "\"records_part\":\"xl/pivotCache/pivotCacheRecords1.xml\",\"record_count\":3," ++
+        "\"refreshed_by\":\"zlsx\",\"refreshed_date\":\"45000.5\",\"refresh_on_load\":false,\"save_data\":true," ++
+        "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Data\",\"ref\":\"A1:C4\",\"name\":null," ++
+        "\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"sheet_attr\"}}," ++
+        "\"fields\":[" ++
+        "{\"name\":\"Region\",\"num_fmt_id\":0,\"formula\":null,\"items\":2,\"types\":[\"string\"],\"min\":null,\"max\":null}," ++
+        "{\"name\":\"Qty\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"number\",\"integer\"],\"min\":\"3\",\"max\":\"5\"}," ++
+        "{\"name\":\"Price\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"number\"],\"min\":\"1.5\",\"max\":\"3.5\"}" ++
+        "]}}\n";
+    try std.testing.expectEqualStrings(expected, w.buffered());
+}
+
+test "runPivotsCommand: table-name, defined-name, external and dangling sources in the resolved slot" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const cases = [_]struct { kind: zlsx_pkg.pivots.fixture.SourceKind, want: []const u8 }{
+        .{ .kind = .table_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"SalesTbl\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"table\"}}" },
+        .{ .kind = .defined_name, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":null,\"ref\":null,\"name\":\"PivotSrc\",\"resolved\":{\"sheet\":\"Data\",\"sheet_idx\":0,\"via\":\"defined_name\"}}" },
+        .{ .kind = .external, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Sheet1\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":{\"external\":\"file:///C:/data/other.xlsx\"}}" },
+        .{ .kind = .dangling, .want = "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Nope\",\"ref\":\"A1:C4\",\"name\":null,\"resolved\":null}" },
+    };
+    for (cases, 0..) |case, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "cli_pivots_{d}.xlsx", .{i});
+        const path = try tt.path(std.testing.allocator, io, name);
+        defer std.testing.allocator.free(path);
+        try zlsx_pkg.pivots.fixture.write(std.testing.allocator, io, path, case.kind);
+
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const line = w.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, line, case.want) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    }
+}
+
+test "runPivotsCommand: --sheet / --name select the host sheet; compact-ndjson drops the envelope" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_filter.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.write(std.testing.allocator, io, path, .sheet_ref);
+
+    // The source sheet hosts nothing: an empty, successful stream.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_index = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // By name, compact: prologue + envelope-less record.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_name = "Report", .output = .compact_ndjson }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n{\"kind\":\"pivot\",\"name\":\"PivotTable1\","));
+    }
+    // Unknown sheet: exit 3, like every read sub-command.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_name = "Nope" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc);
+    }
+    // A workbook without pivots is an empty, successful stream.
+    {
+        const plain = try tt.path(std.testing.allocator, io, "cli_pivots_none.xlsx");
+        defer std.testing.allocator.free(plain);
+        {
+            var wr = xlsx.writer_types.Writer.init(std.testing.allocator);
+            defer wr.deinit();
+            var s = try wr.addSheet("S");
+            try s.writeRow(&.{.{ .integer = 1 }});
+            try wr.save(io, plain);
+        }
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = plain, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+}
+
+test "runPivotsCommand: orphan caches follow the pivots, only when no sheet is selected, and page through" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_orphan.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.writeWithOrphanCache(std.testing.allocator, io, path, .sheet_ref);
+
+    const orphan_line =
+        "{\"kind\":\"pivot_cache\",\"cache\":{\"id\":8,\"part\":\"xl/pivotCache/pivotCacheDefinition2.xml\"," ++
+        "\"records_part\":\"xl/pivotCache/pivotCacheRecords2.xml\",\"record_count\":0,\"refreshed_by\":null," ++
+        "\"refreshed_date\":null,\"refresh_on_load\":false,\"save_data\":false," ++
+        "\"source\":{\"type\":\"worksheet\",\"sheet\":\"Report\",\"ref\":\"A1:A1\",\"name\":null," ++
+        "\"resolved\":{\"sheet\":\"Report\",\"sheet_idx\":1,\"via\":\"sheet_attr\"}}," ++
+        "\"fields\":[{\"name\":\"Note\",\"num_fmt_id\":0,\"formula\":null,\"items\":null,\"types\":[\"string\"],\"min\":null,\"max\":null}]}}\n";
+
+    // No selection: the pivot, then the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"pivot\","));
+        const second = std.mem.indexOf(u8, got, "\n").? + 1;
+        try std.testing.expectEqualStrings(orphan_line, got[second..]);
+    }
+    // A sheet selected: the orphan belongs to no sheet and is not emitted.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_index = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "pivot_cache") == null);
+    }
+    // --all-sheets is not a selection; --skip 1 pages past the pivot to the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .all_sheets = true, .skip = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(orphan_line, w.buffered());
+    }
+    // --take 1 stops before the orphan.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "pivot_cache") == null);
+    }
+}
+
+test "runPivotsCommand: --sheet-glob suppresses orphans, an ISO-only refresh date shows, an unreadable part is exit 2 with no stdout" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_pivots_glob.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.pivots.fixture.writeWithOrphanCache(std.testing.allocator, io, path, .sheet_ref);
+    try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "refreshedDate=\"45000.5\"", "refreshedDateIso=\"2023-03-15T12:00:00Z\"");
+
+    // A glob is a selection: the host matches, the orphan is not emitted.
+    {
+        var scratch: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_glob = "Rep*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "pivot_cache") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"refreshed_date\":\"2023-03-15T12:00:00Z\"") != null);
+    }
+    // A glob matching no host: an empty, successful stream.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots, .sheet_glob = "Nope*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // A pivot part that cannot be read: exit 2, a diagnostic, nothing on stdout.
+    try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/pivotTables/pivotTable1.xml", "<location ref=\"A3:B6\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>", "");
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runPivotsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .pivots }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 2), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedPivotXml") != null);
+    }
+}
+
+test "parseArgs routes 'pivots' and rejects row-keyed flags on it" {
+    {
+        const argv = [_][]const u8{ "pivots", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.pivots, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    {
+        // The legacy override parses alongside the sub-command; the
+        // dispatch honours it before the pivot path.
+        const argv = [_][]const u8{ "pivots", "f.xlsx", "--list-sheets" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.pivots, a.subcommand);
+        try std.testing.expect(a.list_sheets);
+    }
+    {
+        const argv = [_][]const u8{ "pivots", "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
 }
