@@ -105,7 +105,7 @@ test proves.
 | 2 | `<worksheetSource name="SalesTbl"/>` — a table | corpus (both caches); fixture `.table_name` | `.table` | **Nothing in the cache.** The range is spelled through the table part, and `table_edit.applyEditToTable` already moves `table@ref` + `autoFilter@ref` on every row edit, grows on an insert inside, shrinks on a delete inside, and refuses a header-row delete (`TableHeaderRowDeleteUnsafe`) and a collapse (`TableCollapseUnsafe`). | **Valid.** `S6 audit: a table-named source stays valid because the table rewriter moves the table` (`table1.xml` → `A1:C5`); corpus `mtcars` insert → `table2.xml` `A1:K31`. Only the snapshot is stale (§3). |
 | 3 | `<worksheetSource name="PivotSrc"/>` — a defined name, body `Data!$A$1:$C$4` | fixture `.defined_name`; parser tests | `.defined_name` | **Nothing in the cache.** The body is a formula carrier; `Workbook.rewriteAllDefinedNames` is the second of the five sweeps every row / col edit runs (`applySheetEditTransform`), so the body moves with the grid. **But the rewriter's endpoint policy differs from Excel's:** deleting *either* endpoint row spells `#REF!` at that endpoint (`A4:A5` minus row 5 → `A4:#REF!`, pinned in `src/formula/rewriter.zig`; the convention S2 carried), after which the source is `.unresolved` and Excel's *Refresh* fails — where Excel itself would have shrunk the name to `$A$1:$C$3`. So for this carrier S7b's refusal is on the **rewrite**, not only the rectangle: dry-run the name sweep for every body a cache reads through, and refuse the edit when the new body spells `#REF!` (§2.2) — that covers both endpoint rows of a static body and the deleted anchor of a dynamic one (`OFFSET(Report!$D$1,…)` minus row 1); interior deletes and every insert are already right. | **Valid under inserts and interior deletes**, pinned by `S7b analysis: a defined-name source follows the defined-name rewriter` (added with this document); **wrong under an endpoint delete** (the source goes `.unresolved`) — today admitted, S7b refuses it. |
 | 4 | `<worksheetSource r:id="rIdExt" sheet="Sheet1" ref="A1:C4"/>` — another workbook | fixture `.external`; parser tests | `.external` | **Nothing.** `r:id` wins in the resolver: the `sheet` and `ref` describe a sheet of *another* file, so a local sheet named `Sheet1` is not a source and its edits do not touch this cache. | Correct by construction — `readsFromSheet` is false for every local sheet. |
-| 5 | `<worksheetSource sheet="Nope" ref="A1:C4"/>` — a sheet the workbook lacks | fixture `.dangling` | `.unresolved` | **Nothing** — there is no sheet to edit. `.unresolved` also covers a **dynamic defined name** (`OFFSET(Report!$D$1,0,0,4,3)` — the `mayReadFromSheet` test in `pkg/pivots.zig`), which *does* read a local sheet the resolver cannot bound: its body moves with the grid through the name sweep, but there is no rectangle to detect a content change by, and a deleted anchor row turns the body into `#REF!` — the same dry-run rule as row 3 refuses that. | Nothing to do for a dangling name. S7a's *host* guard refuses when any source is unresolved (`mayReadFromSheet`); S7b's *source* guard cannot mirror that without refusing every row edit on every sheet of the workbook — the split is §7 Q4. |
+| 5 | `<worksheetSource sheet="Nope" ref="A1:C4"/>` — a sheet the workbook lacks | fixture `.dangling` | `.unresolved` | **Nothing** — there is no sheet to edit. `.unresolved` is one arm for several provenances: a name whose body the resolver cannot bound — dynamic (`OFFSET(Report!$D$1,0,0,4,3)`, the `mayReadFromSheet` test in `pkg/pivots.zig`), 3D, a union, a bare range, or one that reaches its sheet only *through another name* (`PivotSrc = OFFSET(Anchor,…)`, `Anchor = Report!$D$1`) — and an `r:id` the resolver could not place (missing, internal, mistyped). A name-spelled one *does* read a local sheet: its body moves with the grid through the name sweep, but there is no rectangle to detect a content change by, and a deleted anchor row turns a body into `#REF!` — the rule for all of them is §7 Q4. | Nothing to do for a dangling name. S7a's *host* guard refuses when any source is unresolved (`mayReadFromSheet`); S7b's *source* guard cannot mirror that without refusing every row edit on every sheet of the workbook — the split is §7 Q4. |
 | 6 | `<cacheSource type="consolidation"><consolidation><rangeSets><rangeSet sheet="Q1" ref="A1:B9"/><rangeSet name="Q2Data"/>…` | parser tests only — no corpus, **no fixture kind** | one `SourceResolution` per set (`range_set_resolutions`) | **Per set, as rows 1–3**: a `sheet`+`ref` set splices at its own `ref_span`; a named set follows its carrier. One definition may need several splices — apply them in descending span order so earlier spans stay valid. | Untested end-to-end: `fixture.SourceKind` has no consolidation kind. S7b adds one. |
 | 7 | `<x:worksheetSource …/>` — Strict (`purl.oclc.org`) prefix | parser tests | as 1–5 | As 1–5: the splice is at `ref_span`, which the parser fills whatever the prefix. | As 1–5. |
 
@@ -115,10 +115,11 @@ not need a fixture per shape:
 | Shape | Treatment |
 |---|---|
 | `sheet` + `name`, no `ref` | The resolver takes `sheet`; no `ref` to splice; the name's own carrier (table part or defined-name body) moves. |
-| `ref="A:C"` — whole columns | **No coordinate rewrite, but not a no-op.** The spelling cannot move, yet every row edit changes the range's content (a mark under A1 / A2), and row 1 is the header: an insert at row 1 blanks it and a delete at row 1 promotes data to field names — both refuse. `edit.parseRect` rejects this spelling today; the bounds model (§6) gets a whole-columns case beside the finite rectangle. Excel writes whole-column sources for "expanding" ranges, so the shape is Excel-reachable even though the corpus lacks it. |
+| whole columns | A *direct* `ref` is `ST_Ref` — one or two complete cell references (MS-OI29500's note on the type), so Excel spells a whole-column source as the full-height rectangle `A1:C1048576`: a finite rectangle, and an insert inside it overflows → refuse (S7a's rule). Whole columns *do* arrive through a defined name (`Data!$A:$C`), which is why the bounds model (§6) has a whole-columns case: **no coordinate rewrite, but not a no-op** — every row edit changes the range's content (a mark), and row 1 is the header, so an insert at row 1 (blanks it) and a delete at row 1 (promotes data to field names) refuse. A literal `ref="A:C"`, if a producer ever writes one, takes the same path; `edit.parseRect` rejects it today. |
 | bottom edge at row 1 048 576 | An insert inside cannot grow: `PivotCoordinateOverflow`, refused — S7a's rule for the same overflow. |
 | `ref="&#65;1:C4"` — character references in `ref` | `workbook_xml.decodeScalarAttr` before parsing (Codex #200 r3 REL-042); the splice writes a plain spelling. |
-| `type="external"` / `"scenario"` / unknown | No `worksheetSource`; nothing to rewrite. An unknown type refuses host edits today (S7a) — source edits: §7 Q4. |
+| `type="external"` / `"scenario"` | No `worksheetSource`; nothing to rewrite. |
+| an unknown `type` | The parser keeps a `worksheetSource` / `rangeSet` child under *any* type (`parseCacheSource`); `Pivots` drops it today only because its `.unknown` arm is empty. Whether such a locator is authoritative is §7 Q5. An unknown type refuses host edits today (S7a). |
 
 ### 2.2 The range semantics for row 1 (and each `rangeSet`)
 
@@ -267,11 +268,13 @@ Three facts about B:
    (`rowItems` / `colItems`) plus the aggregation, which is S8's engine
    — or it is A with a heavier, riskier snapshot that still needs the
    refresh A needs.
-3. **Its Excel-visible upside is conditional.** If every inventory is
-   consistent, the pivot opens showing the new numbers with no
-   refresh. If any is not, Excel's *"We found a problem with some
-   content"* repair drops the pivot — the corruption class the ladder
-   exists to avoid.
+3. **It has no Excel-visible upside without the engine.** Cache-only
+   B — the B of Q1 and the table below — displays the old totals until
+   *Refresh* exactly as A does, because the totals are host cells (§3);
+   what it adds is a rewritten snapshot that may be wrong (B.1). And
+   if any inventory it wrote is inconsistent, Excel's *"We found a
+   problem with some content"* repair drops the pivot — the corruption
+   class the ladder exists to avoid.
 
 Cost: an S8-sized cache builder with an oracle per shape, for a result
 Excel itself does not produce on this edit.
@@ -280,10 +283,10 @@ Excel itself does not produce on this edit.
 
 | | A0 | A1 | B |
 |---|---|---|---|
-| Parts rewritten | cache definition (`ref`) | cache definition (`ref`, `refreshOnLoad`) | + records, + every table on the cache |
+| Parts rewritten | cache definition (`ref`) | cache definition (`ref`, `refreshOnLoad`) | + records, + every table on the cache (+ every host sheet's output cells, if it is to show anything — the engine) |
 | Bytes preserved | all but `ref` | all but `ref` and one root attribute | no |
 | Assumes the snapshot is current | no | no | **yes, unverifiably** |
-| Excel shows the change | after *Refresh* | on open | on open, if consistent |
+| Excel shows the change | after *Refresh* | on open | after *Refresh* — the host cells are untouched; on open only with the aggregation engine |
 | New repair-prompt risk | none | none | real |
 | Matches what Excel writes after the same edit | exactly | plus one option Excel exposes in its UI | no |
 | Size | one PR | one PR | S8-sized, several PRs |
@@ -310,9 +313,13 @@ produces no prompt, and is visible where the user can turn it off
 (§4). It is **best-effort**, not a guarantee: inert under
 `enableRefresh="0"` (which S7b does not override) and under a
 programmatic open, and it refreshes every consumer of a shared cache.
-Marking only on *content change* keeps a pure shift byte-faithful and
-answers the S7a gate's parked second question the same way: a moved
-host rectangle changes no data, so it does not mark.
+The marker has **one predicate** wherever it appears: the edit *may
+have changed the source's content* — a bounded source had a row
+inserted or deleted inside its rectangle, or an unbounded name-spelled
+source (Q4) had a body in its dependency closure rewritten. A pure
+shift of a bounded source does not mark, which keeps it byte-faithful
+and answers the S7a gate's parked second question the same way: a
+moved host rectangle changes no data, so it does not mark.
 
 Why A1 over A2 *today*: A2 is the cleaner signal — a state flag, no
 persistent option flipped — but its effect at open is unknown here,
@@ -338,10 +345,10 @@ For the estimate to be honest, the shape of the row:
 | Piece | Where | What |
 |---|---|---|
 | The reverse edge | `Workbook.preflightPivotEditsForSheet` / `applyPivotEditsForSheet` | Today the graph is read only when the edited sheet's rels name a pivot part. S7b reads it whenever the workbook carries a cache at all (`<pivotCaches>` in `workbook.xml` or a `pivotCacheDefinition` relationship — a cheap string gate before the full walk) and asks `Pivots` which caches resolve to the edited sheet, `worksheetSource` and `rangeSet` alike. |
-| Typed bounds | `pkg/pivots.zig::SourceResolution.LocalSheet` | `bounds: Rect \| whole_columns \| unbounded` — parsed from a direct `ref` (finite or `A:C`), from `table@ref` for a table-named source, from a static name's body (`Sheet!$A$1:$C$4`); `unbounded` for a dynamic body. Today the resolver reads those for the sheet and discards them, so every rectangle rule below stands on this piece. |
+| Typed bounds | `pkg/pivots.zig::SourceResolution.LocalSheet` | `bounds: Rect \| whole_columns \| unbounded` — parsed from a direct `ref`, from `table@ref` for a table-named source, from a static name's body (`Sheet!$A$1:$C$4`, or `Sheet!$A:$C` → whole columns); `unbounded` for a body the resolver cannot bound (Q4). Today the resolver reads those for the sheet and discards them, so every rectangle rule below stands on this piece. |
 | Refusal by rectangle, and by rewrite | `pkg/pivots.zig::edit` + a name-sweep dry-run | Header-row delete, collapse, overflow on the *resolved* rectangle, whatever spelled it; whole-column sources refuse row-1 edits. For a name-spelled (non-table) carrier, dry-run `rewriteAllDefinedNames`' body computation for the names caches read through and refuse when a new body spells `#REF!` (§2.2). Folded to `Row`/`ColEditUnsafeForSheet` by `Editor` like S7a's. |
-| Rewrite by carrier | `pkg/pivots.zig::edit.applyToCacheDefinition` (new) | `sheet`+`ref` → splice at `ref_span` (descending span order over rangeSets); named → no-op (the carrier's own sweep moves it); external / dangling → no-op; an unknown `type` → per Q5. All-or-nothing across the sheet's caches via `PartStore.replaceParts`, as S7a. |
-| The marker | same | `refreshOnLoad="1"` (A1) or `invalid="1"` (A2) on the root when the rectangle's content changed. This is an **upsert**, not a replace: both corpus definitions omit the attribute, and the shared attribute writer (`writeWithReplacedAttrs`) substitutes values it encounters and has no insertion path — S7b adds a root-attribute upsert that replaces a present value or inserts `name="1"` before the root's `>` / `/>`, tested for both the present and the absent case. |
+| Rewrite by carrier | `pkg/pivots.zig::edit.applyToCacheDefinition` (new) | `sheet`+`ref` → splice at `ref_span` (descending span order over rangeSets); named → no-op (the carrier's own sweep moves it); external / dangling → no-op; a locator under an unknown `type` → by its spelling (Q5). All-or-nothing across the sheet's caches via `PartStore.replaceParts`, as S7a. |
+| The marker | same | `refreshOnLoad="1"` (A1) or `invalid="1"` (A2) on the root under the one predicate of §5 (rectangle content changed, or a closure body rewritten). This is an **upsert**, not a replace: both corpus definitions omit the attribute, and the shared attribute writer (`writeWithReplacedAttrs`) substitutes values it encounters and has no insertion path — S7b adds a root-attribute upsert that replaces a present value or inserts `name="1"` before the root's `>` / `/>`, tested for both the present and the absent case. |
 | Host **and** source | composition | `IrisSample` in the corpus: S7a moves `location@ref`, S7b moves the table (already) and marks the cache. The refusal narrows from "any row" to "inside the pivot's footprint" — the `S7a: a host that is also a source still refuses (S7b's case)` test flips. |
 | Fixture | `pivots.fixture.SourceKind` | a `.consolidation` kind (two `rangeSet`s, one `sheet`+`ref`, one named). |
 | Tests that flip | `pkg/editor.zig` | `S6 audit: a sheet+ref source sheet is admitted, and worksheetSource@ref goes stale` (assert the moved `ref`), `S7b (failing-first)` (drop its skip guard), the S7a host-and-source test, the corpus test (`IrisSample` rows outside the footprint admitted). |
@@ -356,11 +363,11 @@ Asked of the owner at analyse-end, in order:
 
 | # | Question | Recommended |
 |---|---|---|
-| Q1 | **Cache policy:** A (move the reference, leave the snapshot) or B (also rewrite the records and inventories)? | **A** |
-| Q2 | **Refresh marker:** A0 (never — byte-faithful to Excel's own save), A1 (`refreshOnLoad="1"` when the edit changed the rectangle's content; a pure shift does not mark; best-effort under `enableRefresh="0"` and programmatic opens; refreshes every consumer of a shared cache), or A2 (`invalid="1"` on the same condition — oracle-gated)? | **A1, or A2 if oracle (3) shows Excel refreshes on `invalid` and clears it** |
+| Q1 | **Cache policy:** A (move the reference, leave the snapshot) or B (also rewrite the records, inventories and indices — which still shows the old totals until *Refresh*, since the numbers are host cells, unless it also rebuilds every consumer's output: S8's engine)? | **A** |
+| Q2 | **Refresh marker:** A0 (never — byte-faithful to Excel's own save), A1 (`refreshOnLoad="1"` when the edit *may have changed the source's content* — one predicate: a bounded source's rectangle had a row inserted or deleted inside it, or an unbounded name-spelled source had a body in its dependency closure rewritten by the edit; a pure shift of a bounded source does not mark; best-effort under `enableRefresh="0"` and programmatic opens; refreshes every consumer of a shared cache), or A2 (`invalid="1"` on the same predicate — oracle-gated)? | **A1, or A2 if oracle (3) shows Excel refreshes on `invalid` and clears it** |
 | Q3 | **One rule:** extend the marker to `setCell` writes inside a resolved source rectangle, as a save-time pass in S7b's second PR? | **yes** |
-| Q4 | **Unresolved sources** on a row edit of a sheet that hosts nothing — `.unresolved` is two cases: a **dangling** spelling (a sheet or name the workbook lacks: nothing local is affected) and a **dynamic name** (`OFFSET(Report!$D$1,…)`: it reads a local sheet the resolver cannot bound; the name sweep moves its body, but no rectangle exists to refuse on or to detect a content change by). Admit both untouched; admit both and *mark* the dynamic case on any row edit of a sheet its body names; or refuse workbook-wide (S7a's "not proven local is not proven elsewhere", applied to every sheet)? | **split**: dangling → admit; dynamic → admit and mark (under A1/A2) whenever the edited sheet appears in the body, **unless the dry-run body spells `#REF!`** (a deleted anchor row), which refuses like any name-spelled source — workbook-wide refusal would refuse every row edit on every sheet for one `OFFSET` name |
-| Q5 | **Unknown cache source `type`** (not `worksheet` / `external` / `consolidation` / `scenario`) on a row edit of a sheet that hosts nothing: the definition names no sheet, so admit — or refuse workbook-wide, as S7a does for a *host* (`mayReadFromSheet` is true for every sheet when any cache's type is unknown)? | **admit** — S7a's refusal protects a drawn rectangle on the edited sheet; here nothing on the edited sheet is named by the cache, and a spelling it does carry (`worksheetSource` / `rangeSet` under an unknown type) is treated by its spelling |
+| Q4 | **Unresolved sources** on a row edit of a sheet that hosts nothing. `.unresolved` has several provenances (§2.1 row 5): a dangling sheet or name; a name-spelled source whose body the resolver cannot bound (dynamic, 3D, union, bare range, or reaching its sheet through another name); an `r:id` it could not place, with a `sheet` + `ref` beside it. One rule, or refuse workbook-wide (S7a's "not proven local is not proven elsewhere", applied to every sheet — every row edit on every sheet refused for one `OFFSET` name)? | **one rule, by what the spelling proves**: (i) a spelling whose `sheet` attribute *is* the edited sheet but which the resolver could not place (an unplaceable `r:id`) → **refuse** — it may be this sheet, and the `ref` cannot be moved; (ii) a name-spelled source → **admit**; dry-run the name sweep over the source's **dependency closure** (the names its body references, transitively — the engine's symbol table has it): any body rewritten → *mark* (under A1 / A2), any body spelling `#REF!` → **refuse**; (iii) a dangling spelling → admit untouched. The resolver keeps the provenance so the rule can tell (i) from (iii). |
+| Q5 | **Unknown cache source `type`** (not `worksheet` / `external` / `consolidation` / `scenario`). First: is a `worksheetSource` / `rangeSet` the definition carries under an unknown type *authoritative*? The parser keeps it; `Pivots` discards it (`.unknown => {}`). Then, for an unknown type with no usable local locator, on a row edit of a sheet that hosts nothing: admit, or refuse workbook-wide as S7a does for a *host* (`mayReadFromSheet` is true for every sheet when any cache's type is unknown)? | **authoritative** — resolve a carried locator and apply the normal carrier rules (S7b fills the `.unknown` arm); **admit** when there is none — S7a's refusal protects a drawn rectangle on the edited sheet, and a definition that names no sheet names not this one |
 
 The answers are recorded in `goal_sigmoid.md` §5 (row S7b) and this
 file is amended with them; the row's `What it does` cell then names
