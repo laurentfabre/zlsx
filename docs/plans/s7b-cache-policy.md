@@ -14,7 +14,8 @@
 
 _Written 2026-08-28 against `main` at `74641af` (S7a merged). Row S7c
 (source **columns**) is out of scope: a column edit changes the cache's
-field schema, not its range._
+field schema, not its range. **Gate answered 2026-08-28 — see §8**: the
+owner chose **full B with the engine**, not the recommended A._
 
 ---
 
@@ -27,6 +28,7 @@ field schema, not its range._
 5. [Recommendation](#5-recommendation)
 6. [What S7b builds under the recommendation](#6-what-s7b-builds-under-the-recommendation)
 7. [The gate](#7-the-gate)
+8. [The answers](#8-the-answers)
 
 ---
 
@@ -389,3 +391,22 @@ The answers are recorded in `goal_sigmoid.md` §5 (row S7b) and this
 file is amended with them; the row's `What it does` cell then names
 the chosen policy, and the refusal audit and surface matrix update when
 the lift lands.
+
+---
+
+## 8. The answers
+
+Asked and answered 2026-08-28 (PR #201), after five Codex framing
+rounds (8 → 6 → 5 → 4 → 2 findings).
+
+| # | Answer | What it means for the build |
+|---|---|---|
+| Q1 | **B — full B with the engine.** Not the recommended A, and not "B when provable": the owner chose the reading in which zlsx *performs the refresh* — rebuild the cache from the source cells (records, every `sharedItems` inventory, `recordCount`, `refreshedDate`), rebuild every consumer's items and layout (`pivotFields/items`, `rowItems` / `colItems`), and recompute every consumer's output cells on its host sheet (aggregation). | B.1's precondition disappears: nothing is mapped by ordinal, the cache is *rebuilt*, not patched. B.2 is satisfied by construction: the engine is the row. The estimate is no longer 2–3 weeks — S7b absorbs the cache builder and the aggregation engine S8 was to bring, and **S8 reuses S7b's engine** (the spine inverts: S7b → S8, not the other way). The refusal posture holds at the engine's edge: a pivot shape the engine does not evaluate (the S7c/S8 list — calculated fields, grouping, OLAP, consolidation, external sources, …) **refuses** the source edit rather than write a partial rebuild; that list is the row's oracle matrix, per the phase discipline. |
+| Q2 | **A1, or A2 if the oracle proves it.** | With B the marker is a safety net, not the mechanism: Excel refreshes again at open and must land on what zlsx wrote. Set under the §5 predicate; the `invalid` oracle (§6, oracle 3) still runs before the build PR. |
+| Q3 | **Yes — one rule, S7b's second PR.** | Cell writes inside a source rectangle (or on a referenced sheet of an unbounded source) mark at save time; under B they are also candidates for the same rebuild — the second PR decides whether a `setCell` triggers the engine or only the marker. |
+| Q4 + Q5 | **The doc's one rule.** | Refuse narrowly (an unplaceable `r:id` or a sheet-only spelling naming the edited sheet; a dry-run body spelling `#REF!`); admit and mark otherwise; a locator carried under an unknown `type` is authoritative. Under B an unbounded source cannot be rebuilt (no rectangle to read) — it takes the marker path only. |
+
+What the recommendation got wrong, for the record: it weighed B as
+"patch the snapshot" and found the patch unsound; the owner's B is
+"rebuild the snapshot", which is sound and simply expensive — the
+engine the ladder had scheduled two rows later.
