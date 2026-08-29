@@ -6532,6 +6532,12 @@ test "S7b-4: a prepared collection is this edit's or nothing — another index, 
     try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 2, .kind = .delete }, &prepared));
     try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .col = 2, .kind = .insert }, &prepared));
     try std.testing.expectError(error.PivotEditUnsafe, other.applySheetEdit(0, .{ .row = 2, .kind = .insert }, &prepared));
+    // Neither axis, or both: not an edit (Codex #205 r12 REL-1201) —
+    // refused before anything is read, the store untouched.
+    const mutations = wb.store.mutations;
+    try std.testing.expectError(error.InvalidSheetEditSpec, wb.applySheetEdit(0, .{ .kind = .insert }, &prepared));
+    try std.testing.expectError(error.InvalidSheetEditSpec, wb.applySheetEdit(0, .{ .row = 2, .col = 2, .kind = .insert }, &prepared));
+    try std.testing.expectEqual(mutations, wb.store.mutations);
     try std.testing.expectEqualStrings(before_def, (try wb.store.part(def_part)).?.bytes);
     try std.testing.expectEqualStrings(before_rec, (try wb.store.part(rec_part)).?.bytes);
     try std.testing.expectEqualStrings(before_def, (try other.store.part(def_part)).?.bytes);

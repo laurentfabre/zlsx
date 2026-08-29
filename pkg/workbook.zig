@@ -273,6 +273,9 @@ pub const Error = error{
     /// (`xlsx.max_row`). Caller should split the append into
     /// multiple sheets — there is no in-place recovery.
     RowIndexOutOfRange,
+    /// `Workbook.applySheetEdit` was handed a `SheetEditSpec` naming
+    /// neither axis or both — not an edit (Codex #205 r12 REL-1201).
+    InvalidSheetEditSpec,
     /// `Workbook.insertRow` refused because shifting an existing
     /// row would push it past Excel's 1,048,576-row cap. Surfaced
     /// from `pkg/sheet_edit.zig`.
@@ -5786,6 +5789,10 @@ pub const Workbook = struct {
     }
 
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
+        // One axis, exactly: a spec naming neither would unwrap
+        // nothing below, one naming both is not one edit (Codex #205
+        // r12 REL-1201).
+        if ((spec.row == null) == (spec.col == null)) return error.InvalidSheetEditSpec;
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         // The direct `Workbook` path validates the position itself (the
         // Editor does too): every sweep below spells 1-based, and a 0
