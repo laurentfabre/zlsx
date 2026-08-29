@@ -943,6 +943,11 @@ pub const Root = struct {
     /// child walk runs under. For a self-closing root, the end of the
     /// root tag itself.
     body_end: usize,
+    /// One past the root's close tag (or its `/>`): where the
+    /// document's trailing miscellany — a comment, a processing
+    /// instruction, whitespace — begins, for a writer that regenerates
+    /// the root to keep (Codex #205 r9 REL-903).
+    after: usize,
 };
 
 /// Check the part is one well-formed tree, locate the root element,
@@ -988,8 +993,8 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         if (countBindings(attrs, &main_ns_uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
         const env = try (NsEnv{}).forChild(attrs);
         for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
-        const body_end = try endOfQ(xml, hit, qname);
-        return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = body_end };
+        const extent = try extentOfQ(xml, hit, qname);
+        return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = extent.close_lt, .after = extent.after };
     }
     return error.MalformedXml;
 }

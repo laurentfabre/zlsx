@@ -6527,7 +6527,7 @@ pub const Workbook = struct {
             ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
         else
             null;
-        return eng.rebuild(arena, c, after, records_xml, try self.nowSerial()) catch |e| return mapEngineError(e);
+        return eng.rebuild(arena, c, after, records_xml, try self.nowInstant(arena)) catch |e| return mapEngineError(e);
     }
 
     fn mapEngineError(e: pivots_mod.engine.RebuildError) Error {
@@ -6720,17 +6720,33 @@ pub const Workbook = struct {
     /// `io` the workbook was opened with. Null when there is none (a
     /// workbook built from a bare store) or the epoch cannot be read;
     /// the rebuild then drops the attribute.
-    fn nowSerial(self: *Workbook) Error!?f64 {
+    fn nowInstant(self: *Workbook, arena: Allocator) Error!?pivots_mod.engine.Refreshed {
         const io = self.clock orelse return null;
         const wb_part = (try self.store.part("xl/workbook.xml")) orelse return null;
         const date_system = (try epochOf(wb_part.bytes)) orelse return null;
         const ts = std.Io.Clock.now(.real, io);
         const secs = @as(f64, @floatFromInt(ts.nanoseconds)) / 1e9;
         // Unix epoch = serial 25569 under 1900, 24107 under 1904.
-        return secs / 86400.0 + switch (date_system) {
+        const serial = secs / 86400.0 + switch (date_system) {
             .d1900 => @as(f64, 25569.0),
             .d1904 => @as(f64, 24107.0),
         };
+        // The same instant as ISO 8601, for a part that spells
+        // `refreshedDateIso` too (Codex #205 r9 REL-902).
+        const whole: u64 = @intCast(@max(@divFloor(ts.nanoseconds, std.time.ns_per_s), 0));
+        const es: std.time.epoch.EpochSeconds = .{ .secs = whole };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
+        const iso = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+            yd.year,
+            md.month.numeric(),
+            @as(u32, md.day_index) + 1,
+            ds.getHoursIntoDay(),
+            ds.getMinutesIntoHour(),
+            ds.getSecondsIntoMinute(),
+        });
+        return .{ .serial = serial, .iso = iso };
     }
 
     /// `workbookPr@date1904` read on its own — not through the
@@ -6747,17 +6763,31 @@ pub const Workbook = struct {
             else => return null,
         };
         var kids = px.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+        var found: ?engine.run_inputs.DateSystem = null;
+        var seen = false;
         while (kids.next() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
         }) |k| {
             if (!std.mem.eql(u8, k.local, "workbookPr")) continue;
-            const raw = wbxml_typed.getAttr(k.attrs(xml), "date1904") orelse return .d1900;
-            if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return .d1904;
-            if (std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return .d1900;
-            return null;
+            // Two `workbookPr` are not one epoch to read (Codex #205 r9
+            // REL-905); the attribute's text is XML, decoded before it
+            // is read as a boolean (r9 REL-904).
+            if (seen) return null;
+            seen = true;
+            const raw = wbxml_typed.getAttr(k.attrs(xml), "date1904") orelse {
+                found = .d1900;
+                continue;
+            };
+            var buf: [32]u8 = undefined;
+            const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return null;
+            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
+                found = .d1904;
+            } else if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) {
+                found = .d1900;
+            } else return null;
         }
-        return .d1900;
+        return found orelse .d1900;
     }
 
     /// S7b-3, the save-time half of the refresh marker (§7 Q3 — one

@@ -6164,6 +6164,11 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         // A coordinate twice (Codex #205 r4 REL-404).
         .{ .name = "duprow", .part = sheet_part, .old = "<row r=\"3\">", .new = "<row r=\"2\"><c r=\"C2\"><v>9</v></c></row><row r=\"3\">", .err = error.MalformedSheetXml, .shift_ok = true },
         .{ .name = "dupcell", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>3</v></c><c r=\"B2\"><v>4</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
+        // Zig's float grammar is wider than xsd:double (Codex #205 r9
+        // REL-901).
+        .{ .name = "hexfloat", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>0x1p0</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
+        .{ .name = "underscore", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>1_0</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
+        .{ .name = "hexitem", .part = def_part, .old = "minValue=\"3\" maxValue=\"5\"/>", .new = "minValue=\"3\" maxValue=\"5\" count=\"1\"><n v=\"0x1p0\"/></sharedItems>", .err = error.MalformedPivotXml, .shift_ok = true },
         // A `t` this view does not know is not a number (Codex #205 r8
         // REL-801).
         .{ .name = "bogus_t", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\" t=\"bogus\"><v>3</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
@@ -6571,6 +6576,49 @@ test "S7b-4: refreshedDate survives a calc policy the recalculator refuses, unde
         } else {
             try std.testing.expect(serial > 46000 and serial < 47000);
         }
+    }
+    // The attribute's text is XML (r9 REL-904); two `workbookPr` are
+    // not one epoch, and the rebuild goes undated (r9 REL-905); an
+    // ISO spelling beside the serial is redated to the same instant
+    // (r9 REL-902).
+    const Case = struct { name: []const u8, pr: []const u8, dated: bool, d1904: bool };
+    const cases = [_]Case{
+        .{ .name = "ref49", .pr = "<workbookPr date1904=\"&#49;\"/>", .dated = true, .d1904 = true },
+        .{ .name = "ref48", .pr = "<workbookPr date1904=\"&#48;\"/>", .dated = true, .d1904 = false },
+        .{ .name = "twice", .pr = "<workbookPr/><workbookPr date1904=\"1\"/>", .dated = false, .d1904 = false },
+        .{ .name = "twice_equal", .pr = "<workbookPr date1904=\"1\"/><workbookPr date1904=\"1\"/>", .dated = false, .d1904 = false },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r9_epoch_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        const pr = try std.mem.concat(std.testing.allocator, u8, &.{ case.pr, "<sheets>" });
+        defer std.testing.allocator.free(pr);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "<sheets>", pr);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "refreshedDate=\"45000.5\"", "refreshedDate=\"45000.5\" refreshedDateIso=\"2023-03-15T12:00:00\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try wb.insertRow(0, 2);
+        const cd = (try wb.store.part(def_part)).?;
+        if (!case.dated) {
+            try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "refreshedDate") == null);
+            continue;
+        }
+        const at = std.mem.indexOf(u8, cd.bytes, "refreshedDate=\"") orelse return error.TestExpectedRefreshedDate;
+        const from = at + "refreshedDate=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, cd.bytes, from, '"') orelse return error.TestExpectedRefreshedDate;
+        const serial = try std.fmt.parseFloat(f64, cd.bytes[from..end]);
+        if (case.d1904) {
+            try std.testing.expect(serial > 44000 and serial < 45500);
+        } else {
+            try std.testing.expect(serial > 46000 and serial < 47000);
+        }
+        const iso_at = std.mem.indexOf(u8, cd.bytes, "refreshedDateIso=\"") orelse return error.TestExpectedRefreshedDate;
+        const iso = cd.bytes[iso_at + "refreshedDateIso=\"".len ..][0..19];
+        try std.testing.expect(std.mem.startsWith(u8, iso, "20") and iso[4] == '-' and iso[10] == 'T');
+        try std.testing.expect(!std.mem.eql(u8, iso, "2023-03-15T12:00:00"));
     }
 }
 

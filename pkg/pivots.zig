@@ -2517,6 +2517,15 @@ pub const engine = struct {
         }
     }
 
+    /// The refresh instant: an Excel serial under the workbook's date
+    /// system for `refreshedDate`, and the same instant as ISO 8601
+    /// for a part that also spells `refreshedDateIso` (Codex #205 r9
+    /// REL-902).
+    pub const Refreshed = struct {
+        serial: f64,
+        iso: []const u8,
+    };
+
     /// The rebuilt parts.
     pub const Rebuild = struct {
         /// Splices on the definition: every field's inventory element
@@ -2533,11 +2542,11 @@ pub const engine = struct {
     /// Rebuild `cache` from `rows`, the data rows of its source
     /// rectangle after the edit (`rowsAfterEdit`), each one value per
     /// field. `records_xml` is the cache's records part as stored,
-    /// when it has one. `refreshed_serial` is the refresh instant as
-    /// an Excel serial under the workbook's date system, or null when
-    /// the caller has no clock — `refreshedDate` is then removed
-    /// rather than left describing a refresh that did not happen.
-    pub fn rebuild(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed_serial: ?f64) RebuildError!Rebuild {
+    /// when it has one. `refreshed` is the refresh instant, or null
+    /// when the caller has no clock — `refreshedDate` (and a
+    /// `refreshedDateIso` beside it) is then removed rather than left
+    /// describing a refresh that did not happen.
+    pub fn rebuild(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed: ?Refreshed) RebuildError!Rebuild {
         const def = &cache.definition;
         try checkShape(def);
         if (rows.len == 0 or rows.len > std.math.maxInt(u32)) return error.PivotShapeUnsupported;
@@ -2567,8 +2576,8 @@ pub const engine = struct {
             try insert.appendSlice(arena, count_text);
             try insert.append(arena, '"');
         }
-        if (refreshed_serial) |serial| {
-            const date_text = try std.fmt.allocPrint(arena, "{d}", .{serial});
+        if (refreshed) |now| {
+            const date_text = try std.fmt.allocPrint(arena, "{d}", .{now.serial});
             if (def.rootAttrValueSpan(cache.raw_xml, "refreshedDate")) |span| {
                 try splices.append(arena, .{ .span = span, .text = date_text });
             } else {
@@ -2576,8 +2585,15 @@ pub const engine = struct {
                 try insert.appendSlice(arena, date_text);
                 try insert.append(arena, '"');
             }
-        } else if (rootAttrSpan(cache.raw_xml, def, "refreshedDate")) |span| {
-            try splices.append(arena, .{ .span = span, .text = "" });
+            // The ISO spelling, where the part carries it, is the same
+            // instant — never a stale one beside a fresh serial (Codex
+            // #205 r9 REL-902); a part without it does not gain one.
+            if (def.rootAttrValueSpan(cache.raw_xml, "refreshedDateIso")) |span| {
+                try splices.append(arena, .{ .span = span, .text = now.iso });
+            }
+        } else {
+            if (rootAttrSpan(cache.raw_xml, def, "refreshedDate")) |span| try splices.append(arena, .{ .span = span, .text = "" });
+            if (rootAttrSpan(cache.raw_xml, def, "refreshedDateIso")) |span| try splices.append(arena, .{ .span = span, .text = "" });
         }
         if (insert.items.len > 0) {
             try splices.append(arena, .{ .span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end }, .text = insert.items });
@@ -2965,15 +2981,43 @@ pub const engine = struct {
         try out.appendSlice(arena, "</");
         try out.appendSlice(arena, p);
         try out.appendSlice(arena, "pivotCacheRecords>");
+        // What followed the root — a comment, a processing instruction,
+        // whitespace — as written (Codex #205 r9 REL-903).
+        try out.appendSlice(arena, xml[root.after..]);
         return out.items;
     }
 
-    /// An xsd:double lexical as a finite value; null otherwise.
+    /// An xsd:double lexical — `[+-]? (D+ ('.' D*)? | '.' D+)
+    /// ([eE] [+-]? D+)?` — as a finite value; null otherwise. Zig's
+    /// parser reads more (`0x1p0`, `1_0`, `inf`), none of which a cache
+    /// may spell, so the grammar is checked first (Codex #205 r9
+    /// REL-901).
     pub fn parseNumber(lex: []const u8) ?f64 {
-        if (lex.len == 0) return null;
+        if (!isXsdDoubleLexical(lex)) return null;
         const x = std.fmt.parseFloat(f64, lex) catch return null;
         if (!std.math.isFinite(x)) return null;
         return x;
+    }
+
+    fn isXsdDoubleLexical(s: []const u8) bool {
+        var i: usize = 0;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        var int_digits: usize = 0;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) int_digits += 1;
+        var frac_digits: usize = 0;
+        if (i < s.len and s[i] == '.') {
+            i += 1;
+            while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) frac_digits += 1;
+        }
+        if (int_digits == 0 and frac_digits == 0) return false;
+        if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+            i += 1;
+            if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+            var exp_digits: usize = 0;
+            while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) exp_digits += 1;
+            if (exp_digits == 0) return false;
+        }
+        return i == s.len;
     }
 
     /// `containsInteger`'s reading: integral and within a 32-bit int —
@@ -5323,13 +5367,13 @@ const Rebuilt = struct { definition: []u8, records: []u8 };
 /// The workbook's composition, on the fixture: plan the edit on sheet
 /// 0, rebuild from `rows` (the data rows AFTER the edit), render both
 /// parts.
-fn rebuildFixture(alloc: Allocator, arena: Allocator, o: *const Opened, axis: edit.Axis, idx: u32, kind: edit.Kind, rows: []const engine.Row, serial: ?f64) !Rebuilt {
+fn rebuildFixture(alloc: Allocator, arena: Allocator, o: *const Opened, axis: edit.Axis, idx: u32, kind: edit.Kind, rows: []const engine.Row, refreshed: ?engine.Refreshed) !Rebuilt {
     const cache = &o.pivots.caches[0];
     var plan = try edit.planCacheEdit(arena, cache, 0, axis, idx, kind);
     try testing.expect(plan.changed);
     try testing.expect(plan.rebuild != null);
     const records_xml = (try o.store.part(cache.records_part_name.?)).?.bytes;
-    const rb = try engine.rebuild(arena, cache, rows, records_xml, serial);
+    const rb = try engine.rebuild(arena, cache, rows, records_xml, refreshed);
     try plan.splices.appendSlice(arena, rb.splices);
     const definition = (try edit.applyPlan(alloc, cache, &plan)).?;
     errdefer alloc.free(definition);
@@ -5369,7 +5413,7 @@ test "engine: an insert inside adds one blank record — every inventory keeps i
     try testing.expect(rows[0][0] == .blank and rows[0][2] == .blank);
     try testing.expectEqualStrings("East", rows[1][0].string);
 
-    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 2, .insert, rows, 46000.5);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 2, .insert, rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
     defer testing.allocator.free(rb.definition);
     defer testing.allocator.free(rb.records);
 
@@ -5403,7 +5447,7 @@ test "engine: a delete inside drops one record and keeps the item it alone refer
     const rows = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 3, .delete);
     try testing.expectEqual(@as(usize, 2), rows.len);
     try testing.expectEqualStrings("5", rows[1][1].number);
-    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, rows, 46000.5);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
     defer testing.allocator.free(rb.definition);
     defer testing.allocator.free(rb.records);
 
@@ -5440,7 +5484,7 @@ test "engine: a stale snapshot meets the cells — a value the inventory lacks a
         &.{ .{ .number = "7" }, .{ .number = "3" }, .{ .number = "1E+15" } },
         &.{ .{ .string = long }, .blank, .{ .number = "-0" } },
     };
-    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, 46000.5);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
     defer testing.allocator.free(rb.definition);
     defer testing.allocator.free(rb.records);
 
@@ -5492,7 +5536,7 @@ test "engine: an all-blank column, no clock, and a root without the counted attr
     try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", " recordCount=\"3\"", "");
     var o = try Opened.open(testing.allocator, io, path);
     defer o.deinit(testing.allocator);
-    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, 46001);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, .{ .serial = 46001, .iso = "2025-12-14T00:00:00" });
     defer testing.allocator.free(rb.definition);
     defer testing.allocator.free(rb.records);
     try testing.expect(std.mem.indexOf(u8, rb.definition, "minRefreshableVersion=\"3\" refreshOnLoad=\"1\" recordCount=\"1\" refreshedDate=\"46001\">") != null);
@@ -5640,7 +5684,7 @@ test "engine: a Strict-prefixed part is rebuilt under its prefix — items, reco
         &.{ .{ .string = "a" }, .{ .number = "1" } },
         &.{ .{ .string = "b" }, .blank },
     };
-    const rb = try engine.rebuild(arena, &cache, &rows, rec_xml, 46002.25);
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_xml, .{ .serial = 46002.25, .iso = "2025-12-15T06:00:00" });
     const out = try edit.spliceAll(arena, def_xml, rb.splices);
     try testing.expect(std.mem.indexOf(u8, out, "<x:sharedItems count=\"2\"><x:s v=\"a\"/><x:s v=\"b\"/></x:sharedItems>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<x:sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\"/>") != null);
@@ -6177,5 +6221,68 @@ test "engine: a retained number spelt with a character reference matches by valu
     for (sneaky) |s| {
         const def = try pivot_xml.parseCacheDefinition(arena, s);
         try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+}
+
+test "engine: parseNumber reads the xsd:double grammar and nothing wider; a rebuild redates or removes refreshedDateIso with its sibling; the records root's suffix is kept (Codex #205 r9 REL-901, REL-902, REL-903)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "1_0", "0x1p0", "1e", "1e+", " 1", "1 ", "1..", ".", "+", "", "inf", "nan", "1.5f", "0x10" }) |bad| try testing.expect(engine.parseNumber(bad) == null);
+    for ([_][]const u8{ "+1", ".5", "1.", "1E-3", "-0", "4.4000000000000004", "1e10", "-.5E+2" }) |good| try testing.expect(engine.parseNumber(good) != null);
+
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const Case = struct { attrs: []const u8, with_clock: []const u8, without: []const u8 };
+    const cases = [_]Case{
+        .{ .attrs = "refreshedDate=\"45000.5\" refreshedDateIso=\"2023-03-15T12:00:00\" recordCount=\"1\"", .with_clock = "refreshedDate=\"46000.5\" refreshedDateIso=\"2025-12-13T12:00:00\" recordCount=\"1\"", .without = " recordCount=\"1\"" },
+        .{ .attrs = "refreshedDateIso=\"2023-03-15T12:00:00\" recordCount=\"1\"", .with_clock = "refreshedDateIso=\"2025-12-13T12:00:00\" recordCount=\"1\" refreshedDate=\"46000.5\"", .without = " recordCount=\"1\"" },
+    };
+    for (cases) |c| {
+        const xml = try std.mem.concat(arena, u8, &.{ "<pivotCacheDefinition xmlns=\"", main_ns, "\" ", c.attrs, "><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>" });
+        const cache: PivotCache = .{
+            .cache_id = null,
+            .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+            .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+            .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+            .field_names = &.{"K"},
+            .field_formulas = &.{null},
+            .source = .{},
+            .resolution = .none,
+            .range_set_sources = &.{},
+            .range_set_resolutions = &.{},
+            .consumer_count = 0,
+            .raw_xml = xml,
+        };
+        const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+        const rec = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords><!-- keep -->\n<?zlsx trailing?>\n";
+        const dated = try engine.rebuild(arena, &cache, &rows, rec, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
+        const dated_out = try edit.spliceAll(arena, xml, dated.splices);
+        try testing.expect(std.mem.indexOf(u8, dated_out, c.with_clock) != null);
+        try testing.expectEqualStrings(rec, dated.records.?);
+        const undated = try engine.rebuild(arena, &cache, &rows, rec, null);
+        const undated_out = try edit.spliceAll(arena, xml, undated.splices);
+        try testing.expect(std.mem.indexOf(u8, undated_out, "refreshedDate") == null);
+        try testing.expect(std.mem.indexOf(u8, undated_out, c.without) != null);
+    }
+    // A self-closing records root followed by a comment.
+    {
+        const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"0\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>";
+        const cache: PivotCache = .{
+            .cache_id = null,
+            .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+            .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+            .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+            .field_names = &.{"K"},
+            .field_formulas = &.{null},
+            .source = .{},
+            .resolution = .none,
+            .range_set_sources = &.{},
+            .range_set_resolutions = &.{},
+            .consumer_count = 0,
+            .raw_xml = xml,
+        };
+        const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+        const rb = try engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"0\"/><!-- keep -->", null);
+        try testing.expectEqualStrings("<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords><!-- keep -->", rb.records.?);
     }
 }
