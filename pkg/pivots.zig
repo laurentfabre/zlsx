@@ -1109,22 +1109,50 @@ const Resolver = struct {
             .ok => |t| t,
             // A body the parser refuses — an external workbook reference
             // beside a local one, say — still names what it names: the
-            // sheets are read off the text (Codex #202 r4 F1).
-            .refused => return self.scanBodyText(body, sheets),
+            // sheets, names and tables are read off the text (Codex #202
+            // r4 F1, r5 F1).
+            .refused => return self.scanBodyText(body, scope, sheets, walk),
         };
         try self.walkNode(ast, ast.root, scope, sheets, walk);
     }
 
     /// The refusal-tolerant fallback: every sheet of this workbook whose
     /// name, bare or quoted (`'` doubled inside), is followed by `!` in
-    /// the body text. Evidence only, so a match inside a string literal
-    /// over-marks rather than under-marks; names referenced by a refused
-    /// body are not followed.
-    fn scanBodyText(self: *Resolver, body: []const u8, sheets: *std.ArrayListUnmanaged(u32)) Error!void {
+    /// the body text; every defined name and every table whose
+    /// identifier appears in it as a whole word — the names queued for
+    /// their own walk, the tables for their host. Evidence only, so a
+    /// match inside a string literal over-marks rather than under-marks.
+    fn scanBodyText(self: *Resolver, body: []const u8, scope: ?u32, sheets: *std.ArrayListUnmanaged(u32), walk: *Walk) Error!void {
         for (self.sheet_names, 0..) |name, idx| {
             if (name.len == 0) continue;
             if (try self.textNamesSheet(body, name)) try addSheet(self.gpa, sheets, @intCast(idx));
         }
+        const folded_body = (try fold(self.arena, body)) orelse return;
+        if (self.ensureSymbols()) |symbols| {
+            for (symbols.names) |*n| {
+                if (textHasWord(folded_body, n.folded)) try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope });
+            }
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+        if (self.ensureTables()) |tables| {
+            for (tables) |t| if (textHasWord(folded_body, t.folded)) try addSheet(self.gpa, sheets, t.sheet_idx);
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+    }
+
+    /// `word` in `text` with no identifier byte on either side.
+    fn textHasWord(text: []const u8, word: []const u8) bool {
+        if (word.len == 0) return false;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, word)) |at| : (from = at + 1) {
+            const end = at + word.len;
+            const before_ok = at == 0 or !isIdentByte(text[at - 1]);
+            const after_ok = end == text.len or !isIdentByte(text[end]);
+            if (before_ok and after_ok) return true;
+        }
+        return false;
+    }
+
+    fn isIdentByte(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.' or c >= 0x80;
     }
 
     fn textNamesSheet(self: *Resolver, body: []const u8, name: []const u8) Error!bool {
@@ -1176,8 +1204,23 @@ const Resolver = struct {
             // so `_xlfn.Anchor` is not `Anchor` (Codex #202 r1 F5).
             .name => |n| try self.enqueueName(n.raw, scope, sheets, walk),
             .structured => |st| if (st.table) |t| try self.addTableSheet(t, sheets),
-            // The callee is a function, not a name.
-            .call => |c| for (ast.children(c.args)) |k| try self.walkNode(ast, k, scope, sheets, walk),
+            // The callee is a function, not a name — except that
+            // `INDIRECT("Report!$A$1")` reads what its literal spells: the
+            // evaluator resolves the text, so the walk does too, by
+            // walking the literal as a body (Codex #202 r5 F2).
+            .call => |c| {
+                const args = ast.children(c.args);
+                if (args.len > 0 and isIndirect(ast, c.callee)) {
+                    switch (ast.node(args[0])) {
+                        .string => |lit| {
+                            const text = try unquoteStringLiteral(self.arena, lit.text);
+                            try self.walkBody(text, scope, sheets, walk);
+                        },
+                        else => {},
+                    }
+                }
+                for (args) |k| try self.walkNode(ast, k, scope, sheets, walk);
+            },
             .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, scope, sheets, walk),
             .paren => |pn| try self.walkNode(ast, pn.child, scope, sheets, walk),
             .unary => |u| try self.walkNode(ast, u.child, scope, sheets, walk),
@@ -1188,6 +1231,21 @@ const Resolver = struct {
             },
             .number, .string, .boolean, .error_lit, .missing_arg, .ref_cell, .ref_full_col, .ref_full_row => {},
         }
+    }
+
+    fn isIndirect(ast: engine.parser.Ast, callee: engine.parser.Index) bool {
+        return switch (ast.node(callee)) {
+            .name => |n| std.ascii.eqlIgnoreCase(n.bare, "INDIRECT"),
+            else => false,
+        };
+    }
+
+    /// `"Report!$A$1"` → `Report!$A$1`, a doubled `""` → `"`.
+    fn unquoteStringLiteral(arena: Allocator, lit: []const u8) Error![]const u8 {
+        if (lit.len < 2 or lit[0] != '"' or lit[lit.len - 1] != '"') return lit;
+        const inner = lit[1 .. lit.len - 1];
+        if (std.mem.indexOf(u8, inner, "\"\"") == null) return inner;
+        return std.mem.replaceOwned(u8, arena, inner, "\"\"", "\"");
     }
 
     /// Resolve a name from `scope` and queue its body — or, for a table
@@ -3063,6 +3121,41 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         var o = try Opened.open(testing.allocator, io, path);
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // A refused body still queues the names and tables it spells
+    // (Codex r5 F1): `Anchor` reads `Report`; `SalesTbl` is on `Data`.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$A$1</definedName><definedName name=\"PivotSrc\">OFFSET(Anchor,0,0,MAX(1,'[Book.xlsx]Sheet1'!$A$1),1)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">OFFSET(SalesTbl[Qty],0,0,[Book.xlsx]Sheet1!$A$1,1)</definedName></definedNames><pivotCaches>");
+    try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // `INDIRECT` with a literal reads what the literal spells: a sheet
+    // reference, or a name; an unqualified cell proves nothing
+    // (Codex r5 F2).
+    const Indirect = struct { body: []const u8, sheets: []const u32 };
+    for ([_]Indirect{
+        .{ .body = "OFFSET(INDIRECT(\"Report!$A$1\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT(\"'Report'!A1\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(indirect(\"Anchor\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT(\"A1\"),0,0,2,2)", .sheets = &.{} },
+        .{ .body = "OFFSET(INDIRECT(\"Nope!A1\"),0,0,2,2)", .sheets = &.{} },
+    }) |case| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$B$2</definedName><definedName name=\"PivotSrc\">PLACEHOLDER</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "PLACEHOLDER", case.body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, case.sheets);
     }
     // A sheet name longer than any fixed buffer is still looked up
     // (Codex r4 F3): the workbook accepts it, so must the walk.
