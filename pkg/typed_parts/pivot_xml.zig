@@ -174,11 +174,12 @@ pub const SharedItems = struct {
         /// `v`, raw as written; null for `<m/>` and for an item
         /// without one.
         v: ?[]const u8,
-        /// The item's bytes, `<` through `/>`, for a rebuild that
-        /// keeps it as written; the open tag alone when the item has
-        /// children.
+        /// The item's bytes whole — `<` through its `/>` or its close
+        /// tag — for a rebuild that keeps it as written.
         raw: []const u8,
-        /// Self-closing — an item with children (`<s><tpls>…`, OLAP
+        /// Childless: self-closing, or an explicit close around nothing
+        /// but whitespace (`<s v="a"></s>` is `<s v="a"/>` — Codex #205
+        /// r2 REL-201). An item with children (`<s><tpls>…`, OLAP
         /// members) is not, and no rebuild here can keep it.
         simple: bool,
 
@@ -434,8 +435,8 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
         try items.append(allocator, .{
             .kind = kind,
             .v = wbxml.getAttr(k.attrs(xml), "v"),
-            .raw = xml[k.hit.open_lt..k.hit.after_tag_close],
-            .simple = k.hit.self_closing,
+            .raw = xml[k.hit.open_lt..k.after],
+            .simple = isBlank(xml[k.hit.after_tag_close..k.end]),
         });
     }
     si.has_other_children = kids.skipped > 0;

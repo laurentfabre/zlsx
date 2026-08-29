@@ -6210,6 +6210,59 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
     try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"2\"><r><x v=\"2\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r></pivotCacheRecords>") != null);
 }
 
+test "S7b-4: a numeric cell under a style the workbook cannot spell — a locale built-in, a missing custom entry, a format the grammar refuses, an index past cellXfs — refuses the rebuild; General and a plain number format admit (Codex #205 r2 REL-202)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const Case = struct { name: []const u8, num_fmts: []const u8, xf1: []const u8, style: []const u8, admits: bool };
+    const cases = [_]Case{
+        // 27 is a locale date built-in the table does not spell.
+        .{ .name = "builtin27", .num_fmts = "", .xf1 = "numFmtId=\"27\"", .style = "1", .admits = false },
+        .{ .name = "nocustom", .num_fmts = "", .xf1 = "numFmtId=\"164\"", .style = "1", .admits = false },
+        .{ .name = "grammar", .num_fmts = "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"[DBNum1]0\"/></numFmts>", .xf1 = "numFmtId=\"164\"", .style = "1", .admits = false },
+        .{ .name = "pastxfs", .num_fmts = "", .xf1 = "numFmtId=\"0\"", .style = "7", .admits = false },
+        .{ .name = "general", .num_fmts = "", .xf1 = "", .style = "1", .admits = true },
+        .{ .name = "zero", .num_fmts = "", .xf1 = "numFmtId=\"0\"", .style = "1", .admits = true },
+        .{ .name = "number", .num_fmts = "", .xf1 = "numFmtId=\"2\" applyNumberFormat=\"1\"", .style = "1", .admits = true },
+        .{ .name = "custom", .num_fmts = "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.000\"/></numFmts>", .xf1 = "numFmtId=\"164\" applyNumberFormat=\"1\"", .style = "1", .admits = true },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r2_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        const styles = try std.fmt.allocPrint(std.testing.allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">{s}<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf {s} fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>", .{ case.num_fmts, case.xf1 });
+        defer std.testing.allocator.free(styles);
+        {
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", styles);
+            try store.save(io, src);
+        }
+        const cell = try std.fmt.allocPrint(std.testing.allocator, "<c r=\"C2\" s=\"{s}\"><v>1.5</v></c>", .{case.style});
+        defer std.testing.allocator.free(cell);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet1.xml", "<c r=\"C2\"><v>1.5</v></c>", cell);
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        defer std.testing.allocator.free(before);
+        if (case.admits) {
+            try wb.deleteRow(0, 4);
+            const rec = (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+            try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"2\"><r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r>") != null);
+        } else {
+            try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 4));
+            try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+            var ed = try Editor.open(std.testing.allocator, io, src);
+            defer ed.deinit();
+            try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 4));
+        }
+    }
+}
+
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───
 //
 // A row edit inside a source rectangle marks the cache in the sweep; a

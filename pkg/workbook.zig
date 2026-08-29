@@ -6598,10 +6598,23 @@ pub const Workbook = struct {
     /// Does cell style `style_idx` render a number as a date or
     /// duration — the grammar's answer, memoised per style for one
     /// read. A format code the grammar refuses refuses the read: it
-    /// cannot be told from a date.
+    /// cannot be told from a date. So does a style whose code the
+    /// workbook cannot spell at all (an unlisted locale built-in, a
+    /// custom id without its `<numFmt>`, an index past `cellXfs`);
+    /// only a style with no `numFmtId` — General by the schema's
+    /// default — reads as not a date without a code.
     fn styleDescribesDate(self: *Workbook, arena: Allocator, style_idx: u32, memo: *std.AutoHashMapUnmanaged(u32, bool)) Error!bool {
         if (memo.get(style_idx)) |v| return v;
         const info = (try self.numberFormatFor(style_idx)) orelse {
+            // No code to read the style by. A style without a
+            // `numFmtId` is General and admits; anything else cannot be
+            // told from a date and refuses — a locale built-in the
+            // table does not spell (27–36, 50–58, 81, dates among them;
+            // Codex #205 r2 REL-202), a custom id without its
+            // `<numFmt>`, a style past `cellXfs`, no styles part.
+            const styles_view = (try self.styles()) orelse return error.PivotEditUnsafe;
+            if (style_idx >= styles_view.cell_xfs.len) return error.PivotEditUnsafe;
+            if (styles_view.cell_xfs[style_idx].num_fmt_id != null) return error.PivotEditUnsafe;
             try memo.put(arena, style_idx, false);
             return false;
         };

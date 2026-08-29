@@ -5694,3 +5694,49 @@ test "engine: containsInteger's 32-bit interval is the signed one, both ends in 
     try testing.expect(!engine.isInteger(2147483648));
     try testing.expect(!engine.isInteger(1.5));
 }
+
+test "engine: an explicitly closed empty item is the self-closing one — kept as written on either prefix; a child still refuses (Codex #205 r2 REL-201)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const xml = head ++ "<sharedItems containsMixedTypes=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" containsBlank=\"1\" count=\"3\"><s v=\"a\"></s><n v=\"1\"></n><m>\n</m></sharedItems>" ++ tail;
+    const def = try pivot_xml.parseCacheDefinition(arena, xml);
+    const items = def.fields[0].shared_items.?.items;
+    try testing.expectEqual(@as(usize, 3), items.len);
+    for (items) |it| try testing.expect(it.simple);
+    try testing.expectEqualStrings("<s v=\"a\"></s>", items[0].raw);
+    try engine.checkShape(&def);
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = def,
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "b" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "count=\"4\"><s v=\"a\"></s><n v=\"1\"></n><m>\n</m><s v=\"b\"/></sharedItems>") != null);
+    _ = try pivot_xml.parseCacheDefinition(arena, out);
+
+    // Strict, explicit close.
+    const strict = "<x:pivotCacheDefinition xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\"><x:sharedItems count=\"1\"><x:s v=\"a\"></x:s></x:sharedItems></x:cacheField></x:cacheFields></x:pivotCacheDefinition>";
+    const sdef = try pivot_xml.parseCacheDefinition(arena, strict);
+    try testing.expect(sdef.fields[0].shared_items.?.items[0].simple);
+    try engine.checkShape(&sdef);
+
+    // A child is a child.
+    const nested = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s v=\"a\"><tpls c=\"1\"><tpl fld=\"0\" item=\"0\"/></tpls></s></sharedItems>" ++ tail);
+    try testing.expect(!nested.fields[0].shared_items.?.items[0].simple);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&nested));
+}
