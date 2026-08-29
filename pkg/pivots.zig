@@ -1958,8 +1958,10 @@ pub const edit = struct {
     //     sheet its closure references, because no shift can be
     //     proven for it;
     //   · a cell write (`setCell`, an appended row) marks under the
-    //     same predicate at save time (§7 Q3): inside the rectangle,
-    //     or anywhere on a referenced sheet of an unbounded source —
+    //     same predicate at save time (§7 Q3): inside a rectangle, in
+    //     a whole-column source's columns or a whole-row source's
+    //     rows, anywhere on the sheet a `sheet`-only spelling claims,
+    //     anywhere on a referenced sheet of an unbounded source —
     //     `cellWriteChangesSource`, applied by `Workbook`'s save.
     //
     // A2 — `invalid="1"`, the spec's "needs refreshing" state flag —

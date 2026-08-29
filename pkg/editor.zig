@@ -516,9 +516,10 @@ pub const Editor = struct {
     /// per worksheet, then `PartStore.save` rebuilds the ZIP from
     /// the override map. Source LFH bytes for untouched parts copy
     /// through byte-for-byte; the EOCD comment is preserved. Before
-    /// the sheet emit, a staged write that lands inside a pivot
-    /// source — a `setCell` in its rectangle, an appended row the
-    /// emitter places there, any write on a sheet an unbounded source
+    /// the sheet emit, a staged write that lands where a pivot source
+    /// reads — a `setCell` or an appended row inside its rectangle, in
+    /// a whole-column or whole-row source's span, anywhere on a sheet
+    /// a `sheet`-only spelling claims or an unbounded source
     /// references — marks that cache `refreshOnLoad="1"` (S7b-3, the
     /// one rule a row edit inside the same rectangle follows); writes
     /// outside every source leave every cache definition byte-identical.

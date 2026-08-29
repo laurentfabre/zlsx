@@ -6368,10 +6368,13 @@ pub const Workbook = struct {
 
     /// S7b-3, the save-time half of the refresh marker (§7 Q3 — one
     /// rule): a staged cell write — `setCell`, an appended row — that
-    /// lands inside a source's resolved rectangle, or on a sheet an
-    /// unbounded source's closure references, marks that cache to
-    /// refresh at open (`pivots.edit.cellWriteChangesSource`), as a
-    /// row edit inside the rectangle does in the sweep. A write outside
+    /// lands where a source reads — inside its rectangle, in a
+    /// whole-column source's columns or a whole-row source's rows,
+    /// anywhere on the sheet a `sheet`-only spelling claims, anywhere
+    /// on a sheet an unbounded source's closure references — marks
+    /// that cache to refresh at open
+    /// (`pivots.edit.cellWriteChangesSource`), as a row edit inside
+    /// the rectangle does in the sweep. A write outside
     /// every source leaves every definition byte-identical. The graph
     /// is read once per save, only when a sheet has staged writes and
     /// the workbook carries a cache (the sweep's string gate); the
