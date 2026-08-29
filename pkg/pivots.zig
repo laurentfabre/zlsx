@@ -1950,11 +1950,13 @@ pub const edit = struct {
     //     one); an edit above it is a proven shift, below it a no-op,
     //     and neither marks — the part stays byte-faithful to what
     //     Excel writes after the same edit;
-    //   · a source with no finite rectangle — whole columns, an
-    //     unbounded name body — marks on any row or column edit of a
+    //   · a whole-column source marks on every admitted row edit (row 1
+    //     refuses) and on no column edit — inside refuses (S7c),
+    //     outside is a shift; `Data!$A:$C` is byte-identical under
+    //     every row edit, its content is not;
+    //   · an unbounded name body marks on any row or column edit of a
     //     sheet its closure references, because no shift can be
-    //     proven for it (`Data!$A:$C` is byte-identical under every
-    //     row edit; its content is not);
+    //     proven for it;
     //   · a cell write (`setCell`, an appended row) marks under the
     //     same predicate at save time (§7 Q3): inside the rectangle,
     //     or anywhere on a referenced sheet of an unbounded source —
