@@ -5761,6 +5761,21 @@ pub const Workbook = struct {
         // as they are before it runs. The Editor pre-flights the same
         // check and folds it into `RowEditUnsafeForSheet` /
         // `ColEditUnsafeForSheet`.
+        // The table rewriter's refusals (a header-row or collapsing
+        // delete) come from a sweep that runs AFTER the transform; a
+        // direct `Workbook` caller reaching them there would find the
+        // pivot parts and the sheet already replaced (Codex #203 r2
+        // REL-202 — the corpus' `IrisSample`, whose table starts on
+        // row 1, is that shape). Dry-run them here, as the Editor does.
+        try self.preflightTableEditsForSheet(
+            part_name,
+            if (spec.row != null) .row else .col,
+            spec.row orelse spec.col.?,
+            switch (spec.kind) {
+                .insert => .insert,
+                .delete => .delete,
+            },
+        );
         try self.applyPivotEditsForSheet(part_name, spec);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
@@ -6232,13 +6247,52 @@ pub const Workbook = struct {
                 judged[dn_idx] = true;
                 const rewritten = (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target)) orelse break;
                 defer a.free(rewritten);
-                if (std.mem.indexOf(u8, rewritten, "#REF!") == null) break;
+                const after_count = countRefErrorsOutsideQuotes(rewritten);
+                if (after_count == 0) break;
                 const before = try store_mod.decodeXmlEntities(a, dn.formula);
                 defer a.free(before);
-                if (std.mem.indexOf(u8, before, "#REF!") == null) return error.PivotEditUnsafe;
+                if (after_count > countRefErrorsOutsideQuotes(before)) return error.PivotEditUnsafe;
                 break;
             }
         }
+    }
+
+    /// `#REF!` tokens in a decoded formula body — outside string
+    /// literals (`"…"`, `""` doubled inside) and quoted sheet names
+    /// (`'…'`, `''` doubled), which the rewriter never touches and
+    /// which may spell the same five bytes: `INDIRECT("#REF!")` is a
+    /// live name Excel accepts, and it must not mask a real `#REF!` the
+    /// sweep introduces beside it (Codex #203 r2 REL-203). A count
+    /// rather than a flag, so a body that already carried one error
+    /// still refuses when the edit adds another.
+    fn countRefErrorsOutsideQuotes(body: []const u8) usize {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < body.len) {
+            const c = body[i];
+            if (c == '"' or c == '\'') {
+                // Skip to the closing quote; a doubled quote is an
+                // escaped one and stays inside.
+                i += 1;
+                while (i < body.len) : (i += 1) {
+                    if (body[i] != c) continue;
+                    if (i + 1 < body.len and body[i + 1] == c) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, body[i..], "#REF!")) {
+                n += 1;
+                i += "#REF!".len;
+                continue;
+            }
+            i += 1;
+        }
+        return n;
     }
 
     /// S7a + S7b sweep: move `location@ref` of every pivot the sheet

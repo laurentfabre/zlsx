@@ -116,6 +116,14 @@ pub const Bounds = union(enum) {
         };
     }
 
+    pub fn eql(a: Bounds, b: Bounds) bool {
+        return switch (a) {
+            .rect => |r| b == .rect and r.eql(b.rect),
+            .whole_columns => |c| b == .whole_columns and c.first_col == b.whole_columns.first_col and c.last_col == b.whole_columns.last_col,
+            .whole_rows => |r| b == .whole_rows and r.first_row == b.whole_rows.first_row and r.last_row == b.whole_rows.last_row,
+        };
+    }
+
     /// 1-based and inside the grid, corners ordered.
     pub fn inGrid(self: Bounds) bool {
         return switch (self) {
@@ -1731,7 +1739,7 @@ pub const edit = struct {
         const shifted = try shiftRect(fp, axis, idx_1based, kind);
         if (shifted.eql(fp.rect)) return allocator.dupe(u8, src);
 
-        var ref_buf: [48]u8 = undefined;
+        var ref_buf: [Bounds.format_buf_len]u8 = undefined;
         const new_ref = formatRect(&ref_buf, shifted) catch return error.PivotCoordinateOverflow;
         const span = def.location.ref_span;
         assert(span.start <= span.end and span.end <= src.len);
@@ -1889,38 +1897,33 @@ pub const edit = struct {
         return out;
     }
 
-    /// The same semantics on any bounds. A rectangle comes back moved
-    /// (or as it was); whole columns and whole rows come back null —
-    /// nothing in their spelling is a row or column coordinate that
-    /// moves — after the same refusals: row 1 is a whole-column
-    /// source's header (an insert there blanks it, a delete promotes
-    /// data to field names), and every column of a whole-row source
-    /// is inside it.
-    pub fn shiftSourceBounds(b: Bounds, axis: Axis, idx_1based: u32, kind: Kind) EditError!?Rect {
+    /// The same semantics on any bounds: the moved bounds, or null when
+    /// the spelling is unchanged. A whole-column source moves on the
+    /// column axis as a rectangle's columns do (shift left of it, a
+    /// column inside is the schema) and never on the row axis — but
+    /// row 1 is its header (an insert there blanks it, a delete
+    /// promotes data to field names) and refuses. A whole-row source
+    /// moves on the row axis as a rectangle's rows do, and every
+    /// column is inside it (Codex #203 r2 REL-201).
+    pub fn shiftSourceBounds(b: Bounds, axis: Axis, idx_1based: u32, kind: Kind) EditError!?Bounds {
         if (idx_1based == 0) return error.MalformedPivotXml;
-        switch (b) {
-            .rect => |r| return try shiftSourceRect(r, axis, idx_1based, kind),
-            .whole_columns => |c| {
-                switch (axis) {
-                    .row => if (idx_1based == 1) return error.PivotSourceEditUnsafe,
-                    .col => {
-                        const inside = switch (kind) {
-                            .insert => idx_1based > c.first_col and idx_1based <= c.last_col,
-                            .delete => idx_1based >= c.first_col and idx_1based <= c.last_col,
-                        };
-                        if (inside) return error.PivotSourceEditUnsafe;
-                    },
+        const moved: Bounds = switch (b) {
+            .rect => |r| .{ .rect = try shiftSourceRect(r, axis, idx_1based, kind) },
+            .whole_columns => |c| blk: {
+                if (axis == .row) {
+                    if (idx_1based == 1) return error.PivotSourceEditUnsafe;
+                    return null;
                 }
-                return null;
+                const r = try shiftSourceRect(.{ .tl_col = c.first_col, .tl_row = 1, .br_col = c.last_col, .br_row = 1 }, axis, idx_1based, kind);
+                break :blk .{ .whole_columns = .{ .first_col = r.tl_col, .last_col = r.br_col } };
             },
-            .whole_rows => |r| {
-                switch (axis) {
-                    .row => _ = try shiftSourceRect(.{ .tl_col = 1, .tl_row = r.first_row, .br_col = 1, .br_row = r.last_row }, axis, idx_1based, kind),
-                    .col => return error.PivotSourceEditUnsafe,
-                }
-                return null;
+            .whole_rows => |r| blk: {
+                if (axis == .col) return error.PivotSourceEditUnsafe;
+                const m = try shiftSourceRect(.{ .tl_col = 1, .tl_row = r.first_row, .br_col = 1, .br_row = r.last_row }, axis, idx_1based, kind);
+                break :blk .{ .whole_rows = .{ .first_row = m.tl_row, .last_row = m.br_row } };
             },
-        }
+        };
+        return if (moved.eql(b)) null else moved;
     }
 
     /// Rewrite one `pivotCacheDefinitionN.xml` part for a row / col
@@ -1980,7 +1983,7 @@ pub const edit = struct {
 
     const Splice = struct {
         span: pivot_xml.Span,
-        buf: [48]u8,
+        buf: [Bounds.format_buf_len]u8,
         len: usize,
 
         fn text(self: *const Splice) []const u8 {
@@ -2041,16 +2044,18 @@ pub const edit = struct {
                     },
                     .ref, .defined_name => {},
                 }
-                const moved = try shiftSourceBounds(bounds, axis, idx_1based, kind);
+                const moved = (try shiftSourceBounds(bounds, axis, idx_1based, kind)) orelse return;
                 // Only a spelling with its own `ref` is respelled; a
-                // name-spelled area moves with the name's body, and a
-                // whole-column spelling has no coordinate to move.
+                // name-spelled area moves with the name's body.
                 if (s.carrier != .ref) return;
                 const span = ws.ref_span orelse return error.MalformedPivotXml;
-                const r = moved orelse return;
-                if (r.eql(bounds.rect)) return;
                 var sp: Splice = .{ .span = span, .buf = undefined, .len = 0 };
-                const text = formatRect(&sp.buf, r) catch return error.PivotCoordinateOverflow;
+                // A rectangle keeps the single-cell spelling `A1`;
+                // whole columns / rows spell `A:C` / `1:4` as read.
+                const text = switch (moved) {
+                    .rect => |r| formatRect(&sp.buf, r) catch return error.PivotCoordinateOverflow,
+                    else => moved.formatA1(&sp.buf) orelse return error.PivotCoordinateOverflow,
+                };
                 sp.len = text.len;
                 try splices.append(allocator, sp);
             },
@@ -2083,7 +2088,7 @@ pub const edit = struct {
         return .{ .col = col, .row = row };
     }
 
-    fn formatRect(buf: *[48]u8, r: Rect) ![]const u8 {
+    fn formatRect(buf: *[Bounds.format_buf_len]u8, r: Rect) ![]const u8 {
         var tl_buf: [8]u8 = undefined;
         var br_buf: [8]u8 = undefined;
         const tl_len = try coords.writeColNumberLetters(&tl_buf, r.tl_col);
@@ -3812,24 +3817,79 @@ test "edit: whole columns and whole rows have no coordinate to move, and refuse 
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .row, 1, .delete));
     try testing.expect((try edit.shiftSourceBounds(cols, .row, 2, .insert)) == null);
     try testing.expect((try edit.shiftSourceBounds(cols, .row, 9, .delete)) == null);
-    try testing.expect((try edit.shiftSourceBounds(cols, .col, 1, .insert)) == null);
+    // On the column axis the columns move as a rectangle's would.
+    try expectBoundsA1(try edit.shiftSourceBounds(cols, .col, 1, .insert), "B:D");
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 2, .insert));
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 1, .delete));
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 3, .delete));
     try testing.expect((try edit.shiftSourceBounds(cols, .col, 4, .insert)) == null);
     try testing.expect((try edit.shiftSourceBounds(cols, .col, 4, .delete)) == null);
+    const right: Bounds = .{ .whole_columns = .{ .first_col = 2, .last_col = zlsx.max_col_1based } };
+    try testing.expectError(error.PivotCoordinateOverflow, edit.shiftSourceBounds(right, .col, 1, .insert));
+    try expectBoundsA1(try edit.shiftSourceBounds(right, .col, 1, .delete), "A:XFC");
 
-    const rows: Bounds = .{ .whole_rows = .{ .first_row = 1, .last_row = 4 } };
-    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .row, 1, .delete));
-    try testing.expect((try edit.shiftSourceBounds(rows, .row, 1, .insert)) == null);
-    try testing.expect((try edit.shiftSourceBounds(rows, .row, 3, .delete)) == null);
+    const rows: Bounds = .{ .whole_rows = .{ .first_row = 2, .last_row = 4 } };
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .row, 2, .delete));
+    try expectBoundsA1(try edit.shiftSourceBounds(rows, .row, 1, .insert), "3:5");
+    try expectBoundsA1(try edit.shiftSourceBounds(rows, .row, 2, .insert), "3:5");
+    try expectBoundsA1(try edit.shiftSourceBounds(rows, .row, 3, .insert), "2:5");
+    try expectBoundsA1(try edit.shiftSourceBounds(rows, .row, 1, .delete), "1:3");
+    try expectBoundsA1(try edit.shiftSourceBounds(rows, .row, 3, .delete), "2:3");
     try testing.expect((try edit.shiftSourceBounds(rows, .row, 5, .insert)) == null);
     // Every column is inside a whole-row source.
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .col, 1, .insert));
     try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .col, 500, .delete));
 
     const r: Bounds = .{ .rect = testRect(1, 1, 3, 4) };
-    try testing.expect((try edit.shiftSourceBounds(r, .row, 2, .insert)).?.eql(testRect(1, 1, 3, 5)));
+    try expectBoundsA1(try edit.shiftSourceBounds(r, .row, 2, .insert), "A1:C5");
+    try testing.expect((try edit.shiftSourceBounds(r, .row, 5, .insert)) == null);
+}
+
+fn expectBoundsA1(b: ?Bounds, want: []const u8) !void {
+    var buf: [Bounds.format_buf_len]u8 = undefined;
+    const got = (b orelse return error.TestExpectedBounds).formatA1(&buf) orelse return error.TestExpectedBounds;
+    try testing.expectEqualStrings(want, got);
+}
+
+test "edit: a direct whole-row or whole-column ref is respelled like its rectangle counterpart (Codex r2 REL-201)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rows = try tt.path(testing.allocator, io, "s7b_edit_whole_rows.xlsx");
+    defer testing.allocator.free(rows);
+    try fixture.write(testing.allocator, io, rows, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, rows, def_part, "ref=\"A1:C4\"", "ref=\"1:4\"");
+    {
+        var o = try Opened.open(testing.allocator, io, rows);
+        defer o.deinit(testing.allocator);
+        try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "1:4");
+        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"2:5\"/>");
+        try expectCacheSource(testing.allocator, &o, 0, .row, 3, .insert, "<worksheetSource sheet=\"Data\" ref=\"1:5\"/>");
+        try expectCacheSource(testing.allocator, &o, 0, .row, 4, .delete, "<worksheetSource sheet=\"Data\" ref=\"1:3\"/>");
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 1, .insert));
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 5, .insert)) == null);
+    }
+    const cols = try tt.path(testing.allocator, io, "s7b_edit_whole_cols.xlsx");
+    defer testing.allocator.free(cols);
+    try fixture.write(testing.allocator, io, cols, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, cols, def_part, "ref=\"A1:C4\"", "ref=\"B:D\"");
+    var o = try Opened.open(testing.allocator, io, cols);
+    defer o.deinit(testing.allocator);
+    try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "B:D");
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .col, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .delete, "<worksheetSource sheet=\"Data\" ref=\"A:C\"/>");
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 3, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 4, .delete));
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 5, .insert)) == null);
+    // Row 1 is the header; other rows change nothing in the spelling.
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .delete)) == null);
 }
 
 /// The fixture's cache definition under one edit on one sheet: the

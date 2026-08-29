@@ -5711,14 +5711,18 @@ test "S7b: a defined-name source refuses the endpoint delete the name sweep woul
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource name=\"PivotSrc\"/>") != null);
 
     // A name already spelling `#REF!` is not this edit's doing: the
-    // dangling class, admitted untouched (§7 Q4 iii).
+    // dangling class, admitted while the edit leaves its body alone
+    // (§7 Q4 iii) — and refused when the edit adds a `#REF!` of its
+    // own (the count, not a flag: Codex r2 REL-203), here the delete
+    // of the one anchor the body still had.
     const broken = try tt.path(std.testing.allocator, io, "s7b_name_broken_src.xlsx");
     defer std.testing.allocator.free(broken);
     try pivots_mod.fixture.write(std.testing.allocator, io, broken, .defined_name);
     try pivots_mod.fixture.patchPart(std.testing.allocator, io, broken, "xl/workbook.xml", "Data!$A$1:$C$4", "Data!$A$1:#REF!");
     var ed2 = try Editor.open(std.testing.allocator, io, broken);
     defer ed2.deinit();
-    try ed2.deleteRow(0, 1);
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed2.deleteRow(0, 1));
+    try ed2.deleteRow(0, 3);
     try ed2.insertRow(1, 1);
 }
 
@@ -5964,6 +5968,60 @@ test "S7b: a sheet+name source on a headerless table admits the top-row delete t
     try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C3\"") != null);
     const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>") != null);
+}
+
+test "S7b: the direct Workbook path refuses a table source's header-row delete before any part changes (Codex r2 REL-202)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, src, .{}) catch return error.SkipZigTest;
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    // `IrisSample` hosts `G2:K6` and sources it through `Table2` at
+    // `A1:E51`: row 1 is above the pivot (it would shift) and the
+    // table's header (it refuses). Nothing may move.
+    const parts = [_][]const u8{ "xl/pivotTables/pivotTable1.xml", "xl/worksheets/sheet1.xml", "xl/tables/table1.xml", "xl/pivotCache/pivotCacheDefinition1.xml" };
+    var before: [parts.len][]u8 = undefined;
+    var filled: usize = 0;
+    defer for (before[0..filled]) |b| std.testing.allocator.free(b);
+    for (parts, 0..) |name, i| {
+        before[i] = try std.testing.allocator.dupe(u8, (try wb.store.part(name)).?.bytes);
+        filled += 1;
+    }
+    try std.testing.expectError(error.TableHeaderRowDeleteUnsafe, wb.deleteRow(0, 1));
+    for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+    // The same edit through the Editor folds the refusal.
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
+}
+
+test "S7b: a #REF! inside a string literal neither masks a new one nor counts as one (Codex r2 REL-203)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b_ref_literal_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b_ref_literal_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .defined_name);
+    // A live name whose unused branch spells the error as text.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "Data!$A$1:$C$4", "IF(TRUE,Data!$A$1:$C$4,INDIRECT(\"#REF!\"))");
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    // The endpoint delete introduces a real `#REF!` beside the literal.
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 4));
+    // An interior delete leaves the literal as the body's only one.
+    try ed.deleteRow(0, 3);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const wb_xml = (try store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$3,INDIRECT(&quot;#REF!&quot;))") != null or
+        std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$3,INDIRECT(\"#REF!\"))") != null);
 }
 
 // ─── S7a: the output-location lift ───────────────────────────────────
