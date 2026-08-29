@@ -128,6 +128,16 @@ pub const Bounds = union(enum) {
     pub const format_buf_len = 32;
 };
 
+/// A defined name a source reads through, as `<definedName>` spells
+/// it: the decoded identifier and the `localSheetId` scope. What the
+/// S7b guard dry-runs the name sweep on — the sweep moves such a body
+/// with the grid, and where it would spell `#REF!` (a deleted endpoint
+/// or anchor) the edit refuses instead of leaving the source unresolved.
+pub const NameKey = struct {
+    identifier: []const u8,
+    scope: ?u32,
+};
+
 /// Why a worksheet-type source could not be placed, and what it does
 /// prove — the S7b guard's evidence for a source it cannot bound.
 pub const Unresolved = struct {
@@ -139,6 +149,10 @@ pub const Unresolved = struct {
     /// from a name body through the names it references. Empty when
     /// nothing local is proven.
     sheets: []const u32,
+    /// The defined names the spelling reads through — the source name
+    /// and every name its body references, transitively (the same walk
+    /// as `sheets`). Empty unless `why` is `unbounded_body`.
+    names: []const NameKey = &.{},
 
     pub const Why = enum {
         /// `sheet` names no sheet of this workbook.
@@ -181,8 +195,23 @@ pub const SourceResolution = union(enum) {
         via: ResolvedVia,
         /// The area read, when the spelling proves one (S7b's rectangle).
         bounds: ?Bounds,
+        /// The defined names the spelling reads through (`NameKey`):
+        /// the source name and its closure for a defined-name source,
+        /// or a name beside a `sheet` attribute; empty for a direct
+        /// `ref` and for a table.
+        names: []const NameKey = &.{},
     };
 };
+
+/// The defined names a resolution reads through, whichever arm holds
+/// them — empty for the arms that read through none.
+pub fn namesOf(r: SourceResolution) []const NameKey {
+    return switch (r) {
+        .sheet => |s| s.names,
+        .unresolved => |u| u.names,
+        .external, .none => &.{},
+    };
+}
 
 /// The decoded spellings of one `worksheetSource` / `rangeSet` — what
 /// a reader shows next to the resolution the spellings led to.
@@ -264,6 +293,10 @@ pub const Pivots = struct {
     /// Every sheet's decoded name, in workbook order — what `sheet_idx`
     /// indexes, so a consumer can name sheets without a second decode.
     sheet_names: []const []const u8,
+    /// Every sheet's part name, parallel to `sheet_names` — resolved
+    /// and checked by the walk, so an editor can go from the part it
+    /// is about to rewrite to the index every resolution carries.
+    sheet_parts: []const []const u8,
 
     pub fn deinit(self: *Pivots) void {
         self.arena.deinit();
@@ -288,6 +321,15 @@ pub const Pivots = struct {
     pub fn hostsPivot(self: *const Pivots, sheet_idx: u32) bool {
         for (self.tables) |t| if (t.sheet_idx == sheet_idx) return true;
         return false;
+    }
+
+    /// The index of the sheet a part name belongs to, or null when no
+    /// sheet of the workbook is that part.
+    pub fn sheetIndexOfPart(self: *const Pivots, part_name: []const u8) ?u32 {
+        for (self.sheet_parts, 0..) |p, i| {
+            if (std.mem.eql(u8, p, part_name)) return @intCast(i);
+        }
+        return null;
     }
 
     /// Does any cache read its data from this sheet? The footnote-¹⁰
@@ -370,6 +412,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
         .tables = &.{},
         .caches = &.{},
         .sheet_names = &.{},
+        .sheet_parts = &.{},
     };
     errdefer out.arena.deinit();
     const a = out.arena.allocator();
@@ -391,6 +434,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
         sheet_parts[i] = try requiredTarget(store, "xl/workbook.xml", rel.target);
         _ = try requiredPart(store, sheet_parts[i]);
     }
+    out.sheet_parts = sheet_parts;
 
     var caches: std.ArrayListUnmanaged(CacheSlot) = .empty;
     var tables: std.ArrayListUnmanaged(PivotTable) = .empty;
@@ -533,7 +577,26 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
                     set_resolutions[k] = try resolver.resolve(rs, cache_rels);
                 }
             },
-            .external, .scenario, .unknown => {},
+            // A locator carried under a `type` this reader does not know
+            // is authoritative (S7b gate, Q5): whatever the type means,
+            // a `<worksheetSource>` or `<rangeSet>` names what it names,
+            // and an edit of that sheet must move or refuse it. Without
+            // one the cache names no sheet — `.none`, as before.
+            .unknown => {
+                if (def.source.worksheet) |ws| {
+                    source_spelling = try spell(a, ws);
+                    resolution = try resolver.resolve(ws, cache_rels);
+                }
+                if (def.source.range_sets.len > 0) {
+                    set_spellings = try a.alloc(SourceSpelling, def.source.range_sets.len);
+                    set_resolutions = try a.alloc(SourceResolution, def.source.range_sets.len);
+                    for (def.source.range_sets, 0..) |rs, k| {
+                        set_spellings[k] = try spell(a, rs);
+                        set_resolutions[k] = try resolver.resolve(rs, cache_rels);
+                    }
+                }
+            },
+            .external, .scenario => {},
         }
 
         finished[ci] = .{
@@ -771,21 +834,20 @@ const Resolver = struct {
                     return .{ .external = rel.target };
                 }
             }
-            return unresolved(.unplaceable_rid, try self.sheetsOfAttr(ws.sheet));
+            return unresolved(.unplaceable_rid, try self.sheetsOfAttr(ws.sheet), &.{});
         }
         if (ws.sheet) |raw_sheet| {
             const name = try decode(self.arena, .pivot_source_sheet_name, raw_sheet);
-            const idx = (try self.sheetIndexOf(name)) orelse return unresolved(.dangling_sheet, &.{});
+            const idx = (try self.sheetIndexOf(name)) orelse return unresolved(.dangling_sheet, &.{}, &.{});
             // `sheet` names the sheet; a `ref` bounds it, else a `name`
             // beside it may (a table or a static name on that same
             // sheet — Codex #202 r1 F4). The sheet wins on identity.
-            const bounds = if (ws.ref != null)
-                try self.boundsOfRef(ws.ref)
-            else if (ws.name) |raw_name|
-                try self.carrierBounds(idx, raw_name)
-            else
-                null;
-            return try self.local(idx, .sheet_attr, bounds);
+            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), &.{});
+            if (ws.name) |raw_name| {
+                const carrier = try self.carrierBounds(idx, raw_name);
+                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.names);
+            }
+            return try self.local(idx, .sheet_attr, null, &.{});
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -797,65 +859,73 @@ const Resolver = struct {
             const symbols = try self.ensureSymbols();
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
-                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds);
-                    return unresolved(.unbounded_body, try self.closureSheets(n));
+                    const cl = try self.closure(n);
+                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, cl.names);
+                    return unresolved(.unbounded_body, cl.sheets, cl.names);
                 },
                 .refused => return error.MalformedPivotXml,
                 .table, .not_found => {},
             }
-            const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{});
+            const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{}, &.{});
             for (try self.ensureTables()) |t| {
-                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds);
+                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, &.{});
             }
-            return unresolved(.dangling_name, &.{});
+            return unresolved(.dangling_name, &.{}, &.{});
         }
-        return unresolved(if (ws.ref != null) .sheetless_ref else .no_locator, &.{});
+        return unresolved(if (ws.ref != null) .sheetless_ref else .no_locator, &.{}, &.{});
     }
 
-    fn unresolved(why: Unresolved.Why, sheets: []const u32) SourceResolution {
-        return .{ .unresolved = .{ .why = why, .sheets = sheets } };
+    fn unresolved(why: Unresolved.Why, sheets: []const u32, names: []const NameKey) SourceResolution {
+        return .{ .unresolved = .{ .why = why, .sheets = sheets, .names = names } };
     }
 
-    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds) Error!SourceResolution {
-        if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{});
+    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, names: []const NameKey) Error!SourceResolution {
+        if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{}, &.{});
         return .{ .sheet = .{
             .sheet_idx = sheet_idx,
             .sheet_name = self.sheet_names[sheet_idx],
             .part_name = self.sheet_parts[sheet_idx],
             .via = via,
             .bounds = bounds,
+            .names = names,
         } };
     }
+
+    const Carrier = struct { bounds: ?Bounds, names: []const NameKey };
 
     /// The bounds a `name` beside a `sheet` lends the source, when the
     /// carrier is on that sheet: a static defined-name body, else a
     /// table. Nothing refuses here — the sheet is already placed, and
-    /// the name is evidence for the area only.
-    fn carrierBounds(self: *Resolver, sheet_idx: u32, raw_name: []const u8) Error!?Bounds {
+    /// the name is evidence for the area only. A defined-name carrier
+    /// also hands back its closure, bounded or not: its body moves with
+    /// the grid, and the S7b guard dry-runs that move.
+    fn carrierBounds(self: *Resolver, sheet_idx: u32, raw_name: []const u8) Error!Carrier {
+        const none: Carrier = .{ .bounds = null, .names = &.{} };
         const name = try decode(self.arena, .pivot_source_name, raw_name);
         const symbols = self.ensureSymbols() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
+            else => return none,
         };
         // Looked up FROM the stated sheet: its own scoped name shadows a
         // workbook one of the same spelling there (Codex #202 r2 F3).
         switch (try symbols.resolveName(self.gpa, engine.SheetIndex.fromInt(sheet_idx), name)) {
             .name => |n| {
-                const area = (try self.areaOfBody(n.body)) orelse return null;
-                return if (area.sheet_idx == sheet_idx) area.bounds else null;
+                const cl = try self.closure(n);
+                const area = (try self.areaOfBody(n.body)) orelse return .{ .bounds = null, .names = cl.names };
+                return .{ .bounds = if (area.sheet_idx == sheet_idx) area.bounds else null, .names = cl.names };
             },
-            .refused => return null,
+            .refused => return none,
             .table, .not_found => {},
         }
-        const folded = (try fold(self.arena, name)) orelse return null;
+        const folded = (try fold(self.arena, name)) orelse return none;
         const tables = self.ensureTables() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
+            else => return none,
         };
         for (tables) |t| {
-            if (std.mem.eql(u8, t.folded, folded)) return if (t.sheet_idx == sheet_idx) t.bounds else null;
+            if (std.mem.eql(u8, t.folded, folded)) return .{ .bounds = if (t.sheet_idx == sheet_idx) t.bounds else null, .names = &.{} };
         }
-        return null;
+        return none;
     }
 
     /// The one sheet a `sheet` attribute names, as evidence: `[idx]`,
@@ -1057,7 +1127,14 @@ const Resolver = struct {
     /// the parser refuses and a name the inventory refuses or lacks
     /// contribute nothing — evidence, not refusal. Ascending,
     /// deduplicated, arena-owned.
-    fn closureSheets(self: *Resolver, root: *const engine.Name) Error![]const u32 {
+    const Closure = struct { sheets: []const u32, names: []const NameKey };
+
+    /// The sheets as documented above, plus every name the walk visited
+    /// — the root and each name reachable from it, once each whatever
+    /// the scopes it was invoked from, keyed as `<definedName>` spells
+    /// it (the name's own `localSheetId`, not the invoking scope).
+    /// Arena-owned.
+    fn closure(self: *Resolver, root: *const engine.Name) Error!Closure {
         var sheets: std.ArrayListUnmanaged(u32) = .empty;
         defer sheets.deinit(self.gpa);
         var walk: Walk = .{};
@@ -1065,7 +1142,22 @@ const Resolver = struct {
         try walk.enqueue(self.gpa, .{ .name = root, .scope = scopeOf(root) });
         while (walk.pending.pop()) |v| try self.walkBody(v.name.body, v.scope, &sheets, &walk);
         std.mem.sort(u32, sheets.items, {}, std.sort.asc(u32));
-        return try self.arena.dupe(u32, sheets.items);
+
+        var names: std.ArrayListUnmanaged(NameKey) = .empty;
+        defer names.deinit(self.gpa);
+        for (walk.visited.items, 0..) |v, i| {
+            var dup = false;
+            for (walk.visited.items[0..i]) |earlier| dup = dup or earlier.name == v.name;
+            if (dup) continue;
+            try names.append(self.gpa, .{
+                .identifier = try self.arena.dupe(u8, v.name.identifier),
+                .scope = scopeOf(v.name),
+            });
+        }
+        return .{
+            .sheets = try self.arena.dupe(u32, sheets.items),
+            .names = try self.arena.dupe(NameKey, names.items),
+        };
     }
 
     fn scopeOf(n: *const engine.Name) ?u32 {
@@ -1536,6 +1628,13 @@ pub const edit = struct {
         /// The edit lands inside the pivot's footprint — its output
         /// rectangle, or the report-filter band above it.
         PivotLocationEditUnsafe,
+        /// S7b: the edit lands on a source in a way no range semantics
+        /// admit — a delete of its header row (the field names) or of
+        /// its only row, a column edit inside it (the cache's field
+        /// schema, S7c's), an unplaceable `r:id` or a `sheet`-only
+        /// spelling naming the edited sheet, a `ref` no rectangle
+        /// parser accepts (`docs/plans/s7b-cache-policy.md` §2.2, §7 Q4).
+        PivotSourceEditUnsafe,
         /// The shift would push the rectangle past `XFD` / `1048576`.
         PivotCoordinateOverflow,
         /// The part is not one readable `pivotTableDefinition`, or its
@@ -1683,6 +1782,231 @@ pub const edit = struct {
             },
         }
         return r;
+    }
+
+    // ─── S7b: the source range ─────────────────────────────────────
+    //
+    // A pivot's source is a range reference, and a row edit on its
+    // sheet treats it as one (`docs/plans/s7b-cache-policy.md` §2.2):
+    // an edit above shifts it, an insert inside grows it, a delete
+    // inside shrinks it — where the host rectangle above refuses. What
+    // refuses is what Excel's own refresh would fail on: deleting the
+    // header row (the field names come from it) or the only row. A
+    // column edit inside the range is the cache's field schema, which
+    // is S7c's row — refused here; outside, the range shifts.
+
+    /// The range semantics on one rectangle. `idx_1based` in the
+    /// sheet's pre-edit coordinates.
+    pub fn shiftSourceRect(r: Rect, axis: Axis, idx_1based: u32, kind: Kind) EditError!Rect {
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        var out = r;
+        switch (axis) {
+            .row => switch (kind) {
+                .insert => {
+                    // At or above the top row: a pure shift. Inside:
+                    // the bottom edge alone moves (one blank record).
+                    if (idx_1based <= r.br_row) {
+                        if (r.br_row >= zlsx.max_row) return error.PivotCoordinateOverflow;
+                        out.br_row += 1;
+                        if (idx_1based <= r.tl_row) out.tl_row += 1;
+                    }
+                },
+                .delete => {
+                    // The top row is the header; a range of one row
+                    // collapses. Both refuse (the table rewriter's
+                    // `TableHeaderRowDeleteUnsafe` / `TableCollapseUnsafe`).
+                    if (idx_1based == r.tl_row) return error.PivotSourceEditUnsafe;
+                    if (idx_1based < r.tl_row) {
+                        out.tl_row -= 1;
+                        out.br_row -= 1;
+                    } else if (idx_1based <= r.br_row) {
+                        out.br_row -= 1;
+                    }
+                },
+            },
+            .col => switch (kind) {
+                .insert => {
+                    if (idx_1based <= r.tl_col) {
+                        if (r.br_col >= zlsx.max_col_1based) return error.PivotCoordinateOverflow;
+                        out.tl_col += 1;
+                        out.br_col += 1;
+                    } else if (idx_1based <= r.br_col) {
+                        return error.PivotSourceEditUnsafe;
+                    }
+                },
+                .delete => {
+                    if (idx_1based < r.tl_col) {
+                        out.tl_col -= 1;
+                        out.br_col -= 1;
+                    } else if (idx_1based <= r.br_col) {
+                        return error.PivotSourceEditUnsafe;
+                    }
+                },
+            },
+        }
+        return out;
+    }
+
+    /// The same semantics on any bounds. A rectangle comes back moved
+    /// (or as it was); whole columns and whole rows come back null —
+    /// nothing in their spelling is a row or column coordinate that
+    /// moves — after the same refusals: row 1 is a whole-column
+    /// source's header (an insert there blanks it, a delete promotes
+    /// data to field names), and every column of a whole-row source
+    /// is inside it.
+    pub fn shiftSourceBounds(b: Bounds, axis: Axis, idx_1based: u32, kind: Kind) EditError!?Rect {
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        switch (b) {
+            .rect => |r| return try shiftSourceRect(r, axis, idx_1based, kind),
+            .whole_columns => |c| {
+                switch (axis) {
+                    .row => if (idx_1based == 1) return error.PivotSourceEditUnsafe,
+                    .col => {
+                        const inside = switch (kind) {
+                            .insert => idx_1based > c.first_col and idx_1based <= c.last_col,
+                            .delete => idx_1based >= c.first_col and idx_1based <= c.last_col,
+                        };
+                        if (inside) return error.PivotSourceEditUnsafe;
+                    },
+                }
+                return null;
+            },
+            .whole_rows => |r| {
+                switch (axis) {
+                    .row => _ = try shiftSourceRect(.{ .tl_col = 1, .tl_row = r.first_row, .br_col = 1, .br_row = r.last_row }, axis, idx_1based, kind),
+                    .col => return error.PivotSourceEditUnsafe,
+                }
+                return null;
+            },
+        }
+    }
+
+    /// Rewrite one `pivotCacheDefinitionN.xml` part for a row / col
+    /// edit on sheet `sheet_idx` — the S7b splice. Every source the
+    /// cache reads on that sheet, `worksheetSource` and each `rangeSet`
+    /// alike, passes the range semantics above; the ones that carry
+    /// their own coordinate (`sheet` + `ref`) are respelled at the
+    /// parser's `ref_span` (each set at its own), the rest move with their carrier — a table
+    /// part under `table_edit`, a defined name's body under the name
+    /// sweep — and a source on another sheet, in another workbook, or
+    /// placed nowhere is left alone. Refuses per §7 Q4: an unplaceable
+    /// `r:id` whose `sheet` is this sheet, a spelling that claims the
+    /// sheet and bounds nothing. Returns a fresh buffer the caller
+    /// owns, or null when no spelling changes (the part is then
+    /// byte-preserved).
+    pub fn applyToCacheDefinition(
+        allocator: Allocator,
+        cache: *const PivotCache,
+        sheet_idx: u32,
+        axis: Axis,
+        idx_1based: u32,
+        kind: Kind,
+    ) EditError!?[]u8 {
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        var splices: std.ArrayListUnmanaged(Splice) = .empty;
+        defer splices.deinit(allocator);
+
+        const def = &cache.definition;
+        if (def.source.worksheet) |ws| {
+            try sourceSplice(allocator, &splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind);
+        }
+        // The walk resolved every set it parsed; a definition that
+        // disagrees with its own resolutions is not one this row read.
+        if (def.source.range_sets.len != cache.range_set_resolutions.len) return error.MalformedPivotXml;
+        for (def.source.range_sets, cache.range_set_resolutions) |rs, res| {
+            try sourceSplice(allocator, &splices, rs, res, sheet_idx, axis, idx_1based, kind);
+        }
+        if (splices.items.len == 0) return null;
+
+        // In span order: the part is rebuilt from its own bytes with
+        // each value swapped in place, so no span moves under another.
+        std.mem.sort(Splice, splices.items, {}, Splice.before);
+        const src = cache.raw_xml;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var pos: usize = 0;
+        for (splices.items) |sp| {
+            assert(pos <= sp.span.start and sp.span.start <= sp.span.end and sp.span.end <= src.len);
+            try out.appendSlice(allocator, src[pos..sp.span.start]);
+            try out.appendSlice(allocator, sp.text());
+            pos = sp.span.end;
+        }
+        try out.appendSlice(allocator, src[pos..]);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    const Splice = struct {
+        span: pivot_xml.Span,
+        buf: [48]u8,
+        len: usize,
+
+        fn text(self: *const Splice) []const u8 {
+            return self.buf[0..self.len];
+        }
+
+        fn before(_: void, a: Splice, b: Splice) bool {
+            return a.span.start < b.span.start;
+        }
+    };
+
+    fn sourceSplice(
+        allocator: Allocator,
+        splices: *std.ArrayListUnmanaged(Splice),
+        ws: pivot_xml.WorksheetSource,
+        res: SourceResolution,
+        sheet_idx: u32,
+        axis: Axis,
+        idx_1based: u32,
+        kind: Kind,
+    ) EditError!void {
+        switch (res) {
+            .external, .none => return,
+            .unresolved => |u| {
+                if (std.mem.indexOfScalar(u32, u.sheets, sheet_idx) == null) return;
+                switch (u.why) {
+                    // The `sheet` beside an `r:id` the reader could not
+                    // place: it may be this sheet, and its `ref` cannot
+                    // be moved without knowing (Q4 i).
+                    .unplaceable_rid => return error.PivotSourceEditUnsafe,
+                    // A name body reaching this sheet without bounding
+                    // it: the body moves under the name sweep, whose
+                    // dry-run is the workbook's (Q4 ii). Nothing here.
+                    .unbounded_body => return,
+                    // These prove no sheet; `sheets` is empty for them.
+                    .dangling_sheet, .dangling_name, .sheetless_ref, .no_locator => return,
+                }
+            },
+            .sheet => |s| {
+                if (s.sheet_idx != sheet_idx) return;
+                // Claims the sheet, bounds nothing: `sheet` alone, or a
+                // `ref` the bounds parser rejects (Q4 iv).
+                const bounds = s.bounds orelse return error.PivotSourceEditUnsafe;
+                switch (s.via) {
+                    // A table carries its own row rules — `table_edit`
+                    // refuses a header-row or collapsing delete and
+                    // admits the top row of a `headerRowCount="0"` table
+                    // — and moves its own `ref`; only the column axis,
+                    // the field schema, is judged here.
+                    .table => {
+                        if (axis == .col) _ = try shiftSourceBounds(bounds, axis, idx_1based, kind);
+                        return;
+                    },
+                    .sheet_attr, .defined_name => {},
+                }
+                const moved = try shiftSourceBounds(bounds, axis, idx_1based, kind);
+                // Only a spelling with its own `ref` is respelled; a
+                // name-spelled area moves with the name's body, and a
+                // whole-column spelling has no coordinate to move.
+                const span = ws.ref_span orelse return;
+                if (s.via != .sheet_attr) return;
+                const r = moved orelse return;
+                if (r.eql(bounds.rect)) return;
+                var sp: Splice = .{ .span = span, .buf = undefined, .len = 0 };
+                const text = formatRect(&sp.buf, r) catch return error.PivotCoordinateOverflow;
+                sp.len = text.len;
+                try splices.append(allocator, sp);
+            },
+        }
     }
 
     /// `A1` or `A1:C4`, plain A1 only. Null on anything else.
@@ -3367,4 +3691,370 @@ test "edit: allocation failure at every point leaves nothing behind" {
     const src = try ptWith("<location ref=\"A3:B6\" rowPageCount=\"1\"/><pageFields count=\"1\"><pageField fld=\"0\"/></pageFields>");
     defer testing.allocator.free(src);
     try testing.checkAllAllocationFailures(testing.allocator, editForFailures, .{src});
+}
+
+// ─── S7b: the source range ───────────────────────────────────────────
+
+fn testRect(tl_col: u32, tl_row: u32, br_col: u32, br_row: u32) edit.Rect {
+    return .{ .tl_col = tl_col, .tl_row = tl_row, .br_col = br_col, .br_row = br_row };
+}
+
+fn expectSourceMove(r: edit.Rect, axis: edit.Axis, idx: u32, kind: edit.Kind, want: edit.Rect) !void {
+    const got = try edit.shiftSourceRect(r, axis, idx, kind);
+    if (!got.eql(want)) {
+        std.debug.print("want {any}, got {any}\n", .{ want, got });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "edit: a source rectangle follows range semantics on the row axis" {
+    const src = testRect(1, 1, 3, 4); // A1:C4 — a header row and three records.
+    // Above or at the top row: a pure shift.
+    try expectSourceMove(src, .row, 1, .insert, testRect(1, 2, 3, 5));
+    // Inside: the bottom edge alone (one blank record, a content change).
+    try expectSourceMove(src, .row, 2, .insert, testRect(1, 1, 3, 5));
+    try expectSourceMove(src, .row, 4, .insert, testRect(1, 1, 3, 5));
+    // Below: nothing.
+    try expectSourceMove(src, .row, 5, .insert, src);
+    // The header row feeds the field names — refused, as the table
+    // rewriter refuses it for a headered table.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(src, .row, 1, .delete));
+    try expectSourceMove(src, .row, 2, .delete, testRect(1, 1, 3, 3));
+    try expectSourceMove(src, .row, 4, .delete, testRect(1, 1, 3, 3));
+    try expectSourceMove(src, .row, 5, .delete, src);
+    // A range that starts lower shifts whole under an edit above it.
+    const low = testRect(2, 3, 4, 6); // B3:D6
+    try expectSourceMove(low, .row, 1, .delete, testRect(2, 2, 4, 5));
+    try expectSourceMove(low, .row, 3, .insert, testRect(2, 4, 4, 7));
+    try expectSourceMove(low, .row, 2, .delete, testRect(2, 2, 4, 5));
+    // A one-row source collapses under its only delete — the same
+    // row is also its header, and both refuse.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(testRect(1, 1, 3, 1), .row, 1, .delete));
+    // Overflow: an insert inside or above cannot grow past the grid.
+    const bottom = testRect(1, 1, 3, zlsx.max_row);
+    try testing.expectError(error.PivotCoordinateOverflow, edit.shiftSourceRect(bottom, .row, 1, .insert));
+    try testing.expectError(error.PivotCoordinateOverflow, edit.shiftSourceRect(bottom, .row, 5, .insert));
+    try expectSourceMove(bottom, .row, 2, .delete, testRect(1, 1, 3, zlsx.max_row - 1));
+    // Position 0 is not a position.
+    try testing.expectError(error.MalformedPivotXml, edit.shiftSourceRect(src, .row, 0, .insert));
+    try testing.expectError(error.MalformedPivotXml, edit.shiftSourceBounds(.{ .rect = src }, .col, 0, .delete));
+}
+
+test "edit: a column edit inside a source is the field schema (S7c) — refused; outside, the range shifts" {
+    const src = testRect(2, 1, 4, 4); // B1:D4
+    try expectSourceMove(src, .col, 1, .insert, testRect(3, 1, 5, 4));
+    try expectSourceMove(src, .col, 2, .insert, testRect(3, 1, 5, 4));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(src, .col, 3, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(src, .col, 4, .insert));
+    try expectSourceMove(src, .col, 5, .insert, src);
+    try expectSourceMove(src, .col, 1, .delete, testRect(1, 1, 3, 4));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(src, .col, 2, .delete));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceRect(src, .col, 4, .delete));
+    try expectSourceMove(src, .col, 5, .delete, src);
+    const right = testRect(zlsx.max_col_1based - 1, 1, zlsx.max_col_1based, 4);
+    try testing.expectError(error.PivotCoordinateOverflow, edit.shiftSourceRect(right, .col, 1, .insert));
+    try expectSourceMove(right, .col, 1, .delete, testRect(zlsx.max_col_1based - 2, 1, zlsx.max_col_1based - 1, 4));
+}
+
+test "edit: whole columns and whole rows have no coordinate to move, and refuse what a rectangle would" {
+    const cols: Bounds = .{ .whole_columns = .{ .first_col = 1, .last_col = 3 } };
+    // Row 1 is the header of a whole-column source: an insert blanks
+    // it, a delete promotes a record to the field names.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .row, 1, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .row, 1, .delete));
+    try testing.expect((try edit.shiftSourceBounds(cols, .row, 2, .insert)) == null);
+    try testing.expect((try edit.shiftSourceBounds(cols, .row, 9, .delete)) == null);
+    try testing.expect((try edit.shiftSourceBounds(cols, .col, 1, .insert)) == null);
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 2, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 1, .delete));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(cols, .col, 3, .delete));
+    try testing.expect((try edit.shiftSourceBounds(cols, .col, 4, .insert)) == null);
+    try testing.expect((try edit.shiftSourceBounds(cols, .col, 4, .delete)) == null);
+
+    const rows: Bounds = .{ .whole_rows = .{ .first_row = 1, .last_row = 4 } };
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .row, 1, .delete));
+    try testing.expect((try edit.shiftSourceBounds(rows, .row, 1, .insert)) == null);
+    try testing.expect((try edit.shiftSourceBounds(rows, .row, 3, .delete)) == null);
+    try testing.expect((try edit.shiftSourceBounds(rows, .row, 5, .insert)) == null);
+    // Every column is inside a whole-row source.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .col, 1, .insert));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.shiftSourceBounds(rows, .col, 500, .delete));
+
+    const r: Bounds = .{ .rect = testRect(1, 1, 3, 4) };
+    try testing.expect((try edit.shiftSourceBounds(r, .row, 2, .insert)).?.eql(testRect(1, 1, 3, 5)));
+}
+
+/// The fixture's cache definition under one edit on one sheet: the
+/// rewritten part, or null when nothing in it moves.
+fn cacheEdit(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis, idx: u32, kind: edit.Kind) !?[]u8 {
+    return edit.applyToCacheDefinition(alloc, &o.pivots.caches[0], sheet_idx, axis, idx, kind);
+}
+
+fn expectCacheSource(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis, idx: u32, kind: edit.Kind, want_source: []const u8) !void {
+    const out = (try cacheEdit(alloc, o, sheet_idx, axis, idx, kind)) orelse return error.TestExpectedMove;
+    defer alloc.free(out);
+    // The source element is the one thing that changed.
+    const src = o.pivots.caches[0].raw_xml;
+    const at = std.mem.indexOf(u8, out, want_source) orelse {
+        std.debug.print("want {s}\nin   {s}\n", .{ want_source, out });
+        return error.TestExpectedMove;
+    };
+    const old_open = std.mem.indexOf(u8, src, "<cacheSource").?;
+    try testing.expectEqualStrings(src[0..old_open], out[0..old_open]);
+    const tail_from = std.mem.indexOf(u8, src, "<cacheFields").?;
+    try testing.expectEqualStrings(src[tail_from..], out[at + want_source.len ..][std.mem.indexOf(u8, out[at + want_source.len ..], "<cacheFields").?..]);
+}
+
+test "edit: a sheet+ref source is respelled at the parser's span; another sheet's edit leaves the part alone" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b_edit_sheet_ref.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.expectEqualStrings("xl/worksheets/sheet1.xml", o.pivots.sheet_parts[0]);
+    try testing.expectEqual(@as(?u32, 0), o.pivots.sheetIndexOfPart("xl/worksheets/sheet1.xml"));
+    try testing.expectEqual(@as(?u32, null), o.pivots.sheetIndexOfPart("xl/worksheets/sheet9.xml"));
+
+    // `Data` (0) feeds `A1:C4`.
+    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"A2:C5\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<worksheetSource sheet=\"Data\" ref=\"A1:C3\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"B1:D4\"/>");
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 5, .insert)) == null);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 4, .delete)) == null);
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
+    try testing.expectError(error.MalformedPivotXml, cacheEdit(testing.allocator, &o, 0, .row, 0, .insert));
+    // `Report` (1) hosts and does not feed: nothing to move.
+    try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .delete)) == null);
+}
+
+test "edit: a consolidation definition splices each set at its own span" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b_edit_consolidation.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .consolidation);
+    {
+        // The fixture's second set is name-spelled; two direct sets on
+        // one sheet are what the ordering is for.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        // Set 1 reads `Report!A1:B2` through `PivotSrc`: a `Report` row
+        // edit judges its rectangle (the header row refuses) and
+        // moves nothing here — the name's body is the name sweep's.
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 1, .row, 1, .delete));
+        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 2, .delete)) == null);
+        // Set 0 is `Data!A1:C4` by `sheet` + `ref`.
+        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/>");
+    }
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<rangeSet i1=\"1\" name=\"PivotSrc\"/>", "<rangeSet i1=\"1\" sheet=\"Data\" ref=\"A6:C9\"/>");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 5, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C4\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C3\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A5:C8\"/>");
+    // One set's refusal is the definition's.
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 6, .delete));
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 10, .insert)) == null);
+    try testing.expect(!o.pivots.dependsOnSheet(1));
+}
+
+test "edit: a table-named source moves with its table; a defined-name source with its body — both judged on their rectangle" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const table = try tt.path(testing.allocator, io, "s7b_edit_table.xlsx");
+    defer testing.allocator.free(table);
+    try fixture.write(testing.allocator, io, table, .table_name);
+    {
+        var o = try Opened.open(testing.allocator, io, table);
+        defer o.deinit(testing.allocator);
+        // The row axis is `table_edit`'s: header and collapse refuse
+        // there, with the table's own `headerRowCount` knowledge.
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) == null);
+        // The column axis inside the table is the field schema.
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 1, .insert)) == null);
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 3, .delete));
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 4, .delete)) == null);
+        try testing.expectEqual(@as(usize, 0), namesOf(o.pivots.caches[0].resolution).len);
+    }
+    const name = try tt.path(testing.allocator, io, "s7b_edit_name.xlsx");
+    defer testing.allocator.free(name);
+    try fixture.write(testing.allocator, io, name, .defined_name);
+    var o = try Opened.open(testing.allocator, io, name);
+    defer o.deinit(testing.allocator);
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) == null);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 4, .delete)) == null);
+    // The names the sweep's dry-run judges: the source name itself.
+    const keys = namesOf(o.pivots.caches[0].resolution);
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqualStrings("PivotSrc", keys[0].identifier);
+    try testing.expectEqual(@as(?u32, null), keys[0].scope);
+}
+
+test "collect: a name-spelled source carries its closure's names — the root and every name it reaches, once each" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b_closure_names.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    // `PivotSrc` reaches `Report` through `Anchor`, which cites
+    // `PivotSrc` back — a cycle. (A sheet-scoped `Anchor` would be
+    // invisible from the workbook-scoped root — Codex #202 r2 F1 — and
+    // the closure rightly empty; the scope rules have their own tests.)
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1+ROWS(PivotSrc)</definedName><definedName name=\"PivotSrc\">OFFSET(Anchor,0,0,4,3)</definedName>");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    const u = o.pivots.caches[0].resolution.unresolved;
+    try testing.expectEqual(Unresolved.Why.unbounded_body, u.why);
+    try testing.expectEqualSlices(u32, &.{1}, u.sheets);
+    try testing.expectEqual(@as(usize, 2), u.names.len);
+    try testing.expectEqualStrings("PivotSrc", u.names[0].identifier);
+    try testing.expectEqual(@as(?u32, null), u.names[0].scope);
+    try testing.expectEqualStrings("Anchor", u.names[1].identifier);
+    try testing.expectEqual(@as(?u32, null), u.names[1].scope);
+    // Unbounded on `Report`: nothing to move, nothing refused here —
+    // the body is the name sweep's, whose dry-run is the workbook's.
+    try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .delete)) == null);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+}
+
+test "collect: a locator under a source type the reader does not know is authoritative (S7b gate, Q5)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b_unknown_type.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<cacheSource type=\"worksheet\">", "<cacheSource type=\"zlsxFuture\">");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    const c = o.pivots.caches[0];
+    try testing.expect(c.definition.source.type == .unknown);
+    try testing.expectEqualStrings("Data", c.source.sheet.?);
+    try testing.expectEqual(@as(u32, 0), c.resolution.sheet.sheet_idx);
+    try expectA1(c.resolution.sheet.bounds, "A1:C4");
+    try testing.expect(o.pivots.dependsOnSheet(0) and !o.pivots.dependsOnSheet(1));
+    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>");
+    // Without a locator the type names no sheet, as before.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "");
+    var o2 = try Opened.open(testing.allocator, io, path);
+    defer o2.deinit(testing.allocator);
+    try testing.expect(o2.pivots.caches[0].resolution == .none);
+    try testing.expect(!o2.pivots.dependsOnSheet(0) and !o2.pivots.dependsOnSheet(1));
+}
+
+test "edit: spellings that claim the edited sheet without a range refuse; the ones that claim nothing are left alone" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+
+    // `sheet` alone (Q4 iv): it claims `Data` and gives no rectangle.
+    const only = try tt.path(testing.allocator, io, "s7b_sheet_only.xlsx");
+    defer testing.allocator.free(only);
+    try fixture.write(testing.allocator, io, only, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, only, def_part, "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "<worksheetSource sheet=\"Data\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, only);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution.sheet.bounds == null);
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 9, .insert));
+        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
+    }
+    // A `ref` the bounds parser rejects is the same shape.
+    const bad = try tt.path(testing.allocator, io, "s7b_bad_ref.xlsx");
+    defer testing.allocator.free(bad);
+    try fixture.write(testing.allocator, io, bad, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, bad, def_part, "ref=\"A1:C4\"", "ref=\"A1:C4:E6\"");
+    {
+        var o = try Opened.open(testing.allocator, io, bad);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution.sheet.bounds == null);
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 9, .insert));
+    }
+    // `ref` alone claims no sheet; a dangling sheet claims none either.
+    const sheetless = try tt.path(testing.allocator, io, "s7b_sheetless.xlsx");
+    defer testing.allocator.free(sheetless);
+    try fixture.write(testing.allocator, io, sheetless, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, sheetless, def_part, "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "<worksheetSource ref=\"A1:C4\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, sheetless);
+        defer o.deinit(testing.allocator);
+        try testing.expectEqual(Unresolved.Why.sheetless_ref, o.pivots.caches[0].resolution.unresolved.why);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .delete)) == null);
+    }
+    const dangling = try tt.path(testing.allocator, io, "s7b_dangling.xlsx");
+    defer testing.allocator.free(dangling);
+    try fixture.write(testing.allocator, io, dangling, .dangling);
+    {
+        var o = try Opened.open(testing.allocator, io, dangling);
+        defer o.deinit(testing.allocator);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .delete)) == null);
+    }
+    // An `r:id` the reader could not place beside a local `sheet`
+    // (Q4 i): it may be this sheet, and the `ref` cannot be moved.
+    // Another workbook's sheet of the same name is not local at all.
+    const rid = try tt.path(testing.allocator, io, "s7b_unplaceable.xlsx");
+    defer testing.allocator.free(rid);
+    try fixture.write(testing.allocator, io, rid, .external);
+    {
+        var o = try Opened.open(testing.allocator, io, rid);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .external);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+    }
+    try fixture.patchPart(testing.allocator, io, rid, def_part, "sheet=\"Sheet1\"", "sheet=\"Data\"");
+    try fixture.patchPart(testing.allocator, io, rid, "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", "Id=\"rIdExt\"", "Id=\"rIdGone\"");
+    var o = try Opened.open(testing.allocator, io, rid);
+    defer o.deinit(testing.allocator);
+    try testing.expectEqual(Unresolved.Why.unplaceable_rid, o.pivots.caches[0].resolution.unresolved.why);
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 9, .insert));
+    try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
+}
+
+fn cacheEditForFailures(allocator: Allocator, o: *const Opened) !void {
+    const out = (try cacheEdit(allocator, o, 0, .row, 1, .insert)) orelse return error.TestExpectedMove;
+    allocator.free(out);
+}
+
+test "edit: allocation failure in the cache splice leaves nothing behind" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b_edit_failures.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .consolidation);
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<rangeSet i1=\"1\" name=\"PivotSrc\"/>", "<rangeSet i1=\"1\" sheet=\"Data\" ref=\"A6:C9\"/>");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, cacheEditForFailures, .{&o});
 }

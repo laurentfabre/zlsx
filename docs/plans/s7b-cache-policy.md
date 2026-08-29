@@ -410,3 +410,16 @@ What the recommendation got wrong, for the record: it weighed B as
 "patch the snapshot" and found the patch unsound; the owner's B is
 "rebuild the snapshot", which is sound and simply expensive — the
 engine the ladder had scheduled two rows later.
+
+---
+
+## 9. What has landed
+
+The row ships in pieces, each behind the previous one's tests:
+
+| Piece | PR | What |
+|---|---|---|
+| S7b-1 — typed bounds + provenance | #202 | `SourceResolution.LocalSheet.bounds`, `Unresolved{why, sheets}`, `Pivots.dependsOnSheet`, the consolidation fixture kind. |
+| S7b-2 — the reference move | this PR | The reverse edge (§6 row 1): the graph is read whenever the workbook's relationships name a cache definition, and every cache that depends on the edited sheet is selected. `pivots.edit.applyToCacheDefinition` (§6 row 4): each `sheet` + `ref` spelling — `worksheetSource@ref`, every consolidation `rangeSet@ref` — is respelled by the §2.2 semantics at its `ref_span`, later spans first; a table-named source moves with its table, a defined-name source with its body. The refusals of §6 row 3 by rectangle (header-row delete, collapse, overflow, a column edit inside the range — S7c's schema) and by rewrite (`rewrittenDefinedNameBody`, the one computation behind `rewriteAllDefinedNames`, dry-run over every name a cache reads through — `SourceResolution.names` carries the closure — refusing a body that would newly spell `#REF!`); the Q4 refusals (an unplaceable `r:id` or a `sheet`-only spelling naming the edited sheet); the Q5 arm (a locator under an unknown `type` is resolved). The S7a "host some cache *may read*" refusal is lifted — a host that is also a source moves both coordinates. A graph that cannot be read now refuses every sheet's structural edit, since the source edge cannot be read either. |
+| S7b-3 — the marker | next | The §5 predicate as a root-attribute upsert (A1 / A2 by the oracle), and the `setCell` rule (Q3). |
+| S7b-4 — the engine | after | The cache rebuild, the consumers' layout, the output cells (Q1, B). |

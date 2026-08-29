@@ -339,11 +339,16 @@ pub const Error = error{
     /// `ColEditUnsafeForSheet`, so this variant only surfaces when a
     /// caller bypasses Editor. Surfaces from `pkg/table_edit.zig`.
     TableCollapseUnsafe,
-    /// A row/col edit targets a sheet a pivot table reads from. The
-    /// pivot's `<location ref>` and cache field ranges live in a
-    /// cross-part graph zlsx has no rewriter for, so the edit refuses
-    /// rather than leaving those coordinates pointing at the pre-shift
-    /// grid. The Editor pre-flight remaps this to
+    /// A row/col edit on a sheet a pivot renders on or reads from
+    /// that no rewriter admits: inside a hosted pivot's footprint
+    /// (S7a), a delete of a source's header row or only row, a column
+    /// edit inside a source range (the cache's field schema — S7c), a
+    /// source spelling that claims the sheet and cannot be moved (an
+    /// unplaceable `r:id`, a `sheet` alone), a defined-name source
+    /// whose body the name sweep would turn into `#REF!` (S7b), a
+    /// pivot part two sheets host, a shift past the grid. The edit
+    /// refuses rather than leave a coordinate pointing at the
+    /// pre-shift grid. The Editor pre-flight remaps this to
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`. Surfaces
     /// from `Workbook.preflightPivotEditsForSheet`.
     PivotEditUnsafe,
@@ -4102,6 +4107,67 @@ pub const Workbook = struct {
     /// loop reading freed memory on the sheet-scope branch. This impl
     /// collects ALL rewrites FIRST, then performs the splice +
     /// `replacePart` + re-parse in a single transactional step.
+    /// One defined name's body under `edit`, decoded: the new body
+    /// when the rewrite changes it, null when it does not or when the
+    /// body is one the sweep never touches. The one computation behind
+    /// `rewriteAllDefinedNames` and the S7b pivot guard's dry-run of
+    /// it, so the guard judges exactly the body the sweep would write.
+    fn rewrittenDefinedNameBody(
+        self: *Workbook,
+        dn_idx: usize,
+        sheet_order: []const []const u8,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!?[]u8 {
+        const a = self.allocator;
+        const dn = self.workbook.defined_names[dn_idx];
+        // Resolve `on_sheet`: null for workbook-scope, sheet name
+        // for sheet-scope (via local_sheet_id index lookup). The
+        // decoded order snapshot doubles as the decoded-name
+        // source — same indices, same lifetime.
+        const on_sheet: ?[]const u8 = blk: {
+            if (dn.local_sheet_id) |sid| {
+                if (sid < sheet_order.len) {
+                    break :blk sheet_order[sid];
+                }
+                // Out-of-range localSheetId in source XML — treat
+                // as workbook-scope rather than crashing. Tolerant
+                // of malformed input, not a happy path.
+                break :blk null;
+            }
+            break :blk null;
+        };
+        const ctx = zlsx.formula_rewriter.RewriteContext{
+            .on_sheet = on_sheet,
+            .target_sheet = target_sheet,
+            .sheet_order = sheet_order,
+            .edit = edit,
+        };
+
+        // A raw `<` cannot appear in a well-formed formula body
+        // (content escapes it as `&lt;`) — its presence means
+        // embedded markup: a comment or CDATA block, which also
+        // defeats the parser's raw close-tag search, so the
+        // recorded span may stop at a decoy `</definedName>`
+        // inside a comment. Splicing such a span would expose
+        // the decoy as live markup. Conservative: never rewrite
+        // a markup-bearing body (Codex #188 r8).
+        if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) return null;
+
+        // Decode-in: `dn.formula` is raw XML inner text (still
+        // entity-escaped); the rewriter operates on decoded text
+        // and `spliceFormulas` re-escapes the patched bodies on
+        // emit.
+        const decoded = try store_mod.decodeXmlEntities(a, dn.formula);
+        defer a.free(decoded);
+        const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx);
+        if (std.mem.eql(u8, rewritten, decoded)) {
+            a.free(rewritten);
+            return null;
+        }
+        return rewritten;
+    }
+
     pub fn rewriteAllDefinedNames(
         self: *Workbook,
         edit: zlsx.formula_rewriter.RewriteEdit,
@@ -4128,55 +4194,8 @@ pub const Workbook = struct {
             new_bodies.deinit(a);
         }
 
-        for (self.workbook.defined_names, 0..) |dn, dn_idx| {
-            // Resolve `on_sheet`: null for workbook-scope, sheet name
-            // for sheet-scope (via local_sheet_id index lookup). The
-            // decoded order snapshot doubles as the decoded-name
-            // source — same indices, same lifetime.
-            const on_sheet: ?[]const u8 = blk: {
-                if (dn.local_sheet_id) |sid| {
-                    if (sid < sheet_order.len) {
-                        break :blk sheet_order[sid];
-                    }
-                    // Out-of-range localSheetId in source XML — treat
-                    // as workbook-scope rather than crashing. Tolerant
-                    // of malformed input, not a happy path.
-                    break :blk null;
-                }
-                break :blk null;
-            };
-            const ctx = zlsx.formula_rewriter.RewriteContext{
-                .on_sheet = on_sheet,
-                .target_sheet = target_sheet,
-                .sheet_order = sheet_order,
-                .edit = edit,
-            };
-
-            // A raw `<` cannot appear in a well-formed formula body
-            // (content escapes it as `&lt;`) — its presence means
-            // embedded markup: a comment or CDATA block, which also
-            // defeats the parser's raw close-tag search, so the
-            // recorded span may stop at a decoy `</definedName>`
-            // inside a comment. Splicing such a span would expose
-            // the decoy as live markup. Conservative: never rewrite
-            // a markup-bearing body (Codex #188 r8).
-            if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) continue;
-
-            // Decode-in: `dn.formula` is raw XML inner text (still
-            // entity-escaped); the rewriter operates on decoded text
-            // and `spliceFormulas` re-escapes the patched bodies on
-            // emit.
-            const decoded = try store_mod.decodeXmlEntities(a, dn.formula);
-            const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
-                a.free(decoded);
-                return err;
-            };
-            const unchanged = std.mem.eql(u8, rewritten, decoded);
-            a.free(decoded);
-            if (unchanged) {
-                a.free(rewritten);
-                continue;
-            }
+        for (self.workbook.defined_names, 0..) |_, dn_idx| {
+            const rewritten = (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target_sheet)) orelse continue;
             errdefer a.free(rewritten);
             try new_bodies.put(a, dn_idx, rewritten);
         }
@@ -5731,14 +5750,17 @@ pub const Workbook = struct {
             self.allocator.free(probe);
         }
 
-        // S7a: the pivot sweep goes FIRST among the mutations. It is
-        // all-or-nothing on its own parts (`xl/pivotTables/*`, which no
-        // other sweep touches) and it is the one sweep that can still
-        // refuse — an edit inside a hosted pivot's footprint, a host
-        // that is also a source — so a direct `Workbook` caller gets
-        // that refusal before any part has changed. The Editor
-        // pre-flights the same check and folds it into
-        // `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
+        // S7a + S7b: the pivot sweep goes FIRST among the mutations. It
+        // is all-or-nothing on its own parts (`xl/pivotTables/*` and
+        // `xl/pivotCache/*`, which no other sweep touches) and it is the
+        // one sweep that can still refuse — an edit inside a hosted
+        // pivot's footprint, a source's header row deleted, a name
+        // source the name sweep below would break — so a direct
+        // `Workbook` caller gets that refusal before any part has
+        // changed, and the dry-run of the name sweep judges the names
+        // as they are before it runs. The Editor pre-flights the same
+        // check and folds it into `RowEditUnsafeForSheet` /
+        // `ColEditUnsafeForSheet`.
         try self.applyPivotEditsForSheet(part_name, spec);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
@@ -5958,33 +5980,45 @@ pub const Workbook = struct {
         }
     }
 
-    /// S7a: admit or refuse a row/col edit on a sheet that a pivot
-    /// table renders on, before the first mutation.
+    /// S7a + S7b: admit or refuse a row/col edit on a sheet a pivot
+    /// renders on or reads from, before the first mutation.
     ///
     /// Before #139 there was no guard at all: neither `pkg/sheet_edit.zig`
     /// nor `pkg/editor.zig` contained the string "pivot", and a row insert
     /// left every pivot coordinate pointing at the pre-shift grid —
     /// `docs/plans/refusal-audit.md` had recorded pivots as "refused at
     /// consumer level". #139 refused every sheet whose relationships name
-    /// a pivot part. S7a lifts the one case the definition part can
-    /// answer on its own: a sheet that only HOSTS a pivot. Its
-    /// `location@ref` is the single absolute coordinate the definition
-    /// carries, and `pivots.edit.applyToTableDefinition` moves it —
-    /// dry-run here, applied by `applyPivotEditsForSheet` in the sweep.
+    /// a pivot part. S7a lifted the host: `location@ref` — the single
+    /// absolute coordinate the definition carries — moves under
+    /// `pivots.edit.applyToTableDefinition`. S7b lifts the source: the
+    /// sheet a cache *reads from* has no relationship to any pivot part
+    /// (the edge runs from `worksheetSource` to the sheet, by name), so
+    /// the graph is read whenever the workbook carries a cache at all,
+    /// every cache that depends on the edited sheet (`Pivots.
+    /// dependsOnSheet`: a source resolved to it, or an unresolved one
+    /// whose provenance names it) is selected, and `pivots.edit.
+    /// applyToCacheDefinition` moves each `sheet` + `ref` spelling by
+    /// range semantics (a table-named or defined-name source moves with
+    /// its own carrier's sweep). Both are dry-run here and applied by
+    /// `applyPivotEditsForSheet` first in the sweep.
     ///
     /// Still refused, all as `PivotEditUnsafe`:
     ///   - the edit lands inside a hosted pivot's footprint (the output
     ///     rectangle, or the report-filter band above it) — Excel
     ///     refuses that edit too, and admitting it would change the
     ///     pivot's own layout;
-    ///   - some cache MAY read this sheet (`Pivots.mayReadFromSheet`):
-    ///     a source resolved to it — `worksheetSource@ref` and the
-    ///     cache records are S7b's / S7c's, and the corpus' own
-    ///     `IrisSample` is this shape (hosts `PivotTable1`, read through
-    ///     `Table2`) — or one the reader cannot place (a defined name
-    ///     with a dynamic body, a dangling spelling) or of a type it
-    ///     does not know; "not proven local" is not "proven elsewhere";
-    ///   - a shift past `XFD` / `1048576`;
+    ///   - on a source range: a delete of its header row (the field
+    ///     names) or its only row; a column edit inside it (the cache's
+    ///     field schema — S7c); a shift past `XFD` / `1048576`;
+    ///   - a source spelling that claims this sheet and cannot be
+    ///     moved: an `r:id` the reader could not place beside a local
+    ///     `sheet`, a `sheet` with neither `ref` nor `name`, a `ref` no
+    ///     rectangle parser accepts (`docs/plans/s7b-cache-policy.md`
+    ///     §7 Q4);
+    ///   - a defined-name source whose body the name sweep would turn
+    ///     into `#REF!` — the rewriter spells `#REF!` at a deleted
+    ///     endpoint or anchor where Excel would shrink the range, which
+    ///     would leave the source unresolved (§2.2);
     ///   - the pivot part is also a host relationship of ANOTHER sheet
     ///     — one rectangle cannot follow two grids;
     ///   - the sheet's relationships name a cache part directly — not a
@@ -5992,13 +6026,18 @@ pub const Workbook = struct {
     /// The host sheet's own `<pivotSelection>` coordinates move with the
     /// grid in `pkg/sheet_edit.zig`, like `<selection>`.
     /// A graph that cannot be read whole is `MalformedPivotXml`, the
-    /// typed read's own refusal; the Editor folds both into
+    /// typed read's own refusal — and, since S7b reads the graph for
+    /// every sheet of a workbook that carries a cache, it refuses every
+    /// sheet's edit: a source cannot be told from a non-source through
+    /// a graph that does not read. The Editor folds both into
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
     ///
-    /// The sheet a pivot only *reads from* is still admitted (S6 audit,
-    /// surface-matrix footnote ¹⁰): its relationships name no pivot
-    /// part, so nothing here runs — the graph is parsed only for a
-    /// sheet that hosts one. S7b owns that refusal and the rewrite.
+    /// Admitted without a coordinate change: a name-spelled source the
+    /// reader could not bound (its body moves under the name sweep), a
+    /// dangling spelling, an external one, a whole-column body, a cache
+    /// under a source `type` the reader does not know whose locator
+    /// names another sheet or no sheet (§7 Q5). The refresh marker on a
+    /// content change is S7b's next piece.
     pub fn preflightPivotEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
@@ -6006,20 +6045,22 @@ pub const Workbook = struct {
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
     ) Error!void {
-        var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
-        defer p.deinit();
-        for (p.tables, 0..) |t, i| {
-            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
-            const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
-            self.allocator.free(out);
+        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
+        defer {
+            for (patches.items) |it| self.allocator.free(it.bytes);
+            patches.deinit(self.allocator);
         }
+        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
     }
 
-    /// The typed graph when the sheet's relationships name a pivot
-    /// table part; null when they name none — the common case, and the
-    /// one that must not pay for a parse (or inherit a refusal from a
-    /// pivot elsewhere in the workbook).
-    fn hostedPivotsForEdit(self: *Workbook, sheet_part_name: []const u8) Error!?pivots_mod.Pivots {
+    /// The typed graph when it must be read for this edit: the sheet's
+    /// relationships name a pivot table part (it hosts one), or the
+    /// workbook's relationships name a cache definition (some sheet
+    /// may be a source). Null otherwise — the common case, which must
+    /// not pay for a parse. A cache no `<pivotCaches>` relationship
+    /// reaches is one Excel does not load; its host's own rels still
+    /// gate the host edit.
+    fn pivotsForEdit(self: *Workbook, sheet_part_name: []const u8) Error!?pivots_mod.Pivots {
         var hosts = false;
         for (self.store.rels(sheet_part_name)) |rel| {
             if (pivots_mod.relLeafIs(rel.type, "pivotTable")) {
@@ -6028,21 +6069,28 @@ pub const Workbook = struct {
                 return error.PivotEditUnsafe;
             }
         }
-        if (!hosts) return null;
+        if (!hosts and !self.carriesPivotCache()) return null;
         return try self.pivotTables();
+    }
+
+    fn carriesPivotCache(self: *Workbook) bool {
+        for (self.store.rels("xl/workbook.xml")) |rel| {
+            if (pivots_mod.relLeafIs(rel.type, "pivotCacheDefinition")) return true;
+        }
+        return false;
     }
 
     /// Is `p.tables[i]` a pivot this edit moves? False for a pivot on
     /// another sheet and for a repeat of a part already seen on this one
     /// (two relationships to one part move it once). The admission
-    /// that does not depend on the edit's position runs here too: no
-    /// cache may read the host, and the part may not also be hosted by
-    /// a different sheet — one rectangle cannot follow two grids (Codex
-    /// #200 r1 REL-033 / REL-035).
+    /// that does not depend on the edit's position runs here too: the
+    /// part may not also be hosted by a different sheet — one rectangle
+    /// cannot follow two grids (Codex #200 r1 REL-035). A host that is
+    /// also a source is no longer refused here: the source guard below
+    /// judges the source spelling on its own terms (S7b).
     fn hostedHere(p: *const pivots_mod.Pivots, i: usize, sheet_part_name: []const u8) Error!bool {
         const t = p.tables[i];
         if (!std.mem.eql(u8, t.sheet_part_name, sheet_part_name)) return false;
-        if (p.mayReadFromSheet(t.sheet_idx)) return error.PivotEditUnsafe;
         for (p.tables, 0..) |u, k| {
             if (!std.mem.eql(u8, u.part_name, t.part_name)) continue;
             if (!std.mem.eql(u8, u.sheet_part_name, sheet_part_name)) return error.PivotEditUnsafe;
@@ -6051,28 +6099,153 @@ pub const Workbook = struct {
         return true;
     }
 
-    fn applyPivotLocationEdit(
-        allocator: Allocator,
-        src: []const u8,
-        axis: pivots_mod.edit.Axis,
-        idx_1based: u32,
-        kind: pivots_mod.edit.Kind,
-    ) Error![]u8 {
-        return pivots_mod.edit.applyToTableDefinition(allocator, src, axis, idx_1based, kind) catch |e| switch (e) {
+    fn mapPivotEditError(e: pivots_mod.edit.EditError) Error {
+        return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.MalformedPivotXml => error.MalformedPivotXml,
-            error.PivotLocationEditUnsafe, error.PivotCoordinateOverflow => error.PivotEditUnsafe,
+            error.PivotLocationEditUnsafe, error.PivotSourceEditUnsafe, error.PivotCoordinateOverflow => error.PivotEditUnsafe,
         };
     }
 
-    /// S7a sweep: move `location@ref` of every pivot the sheet hosts.
-    /// All-or-nothing — every definition is rewritten in memory before
-    /// the first part is replaced, so a refusal on the second pivot
+    /// Every pivot part this edit rewrites — hosted definitions
+    /// (`location@ref`, S7a) and depended-on cache definitions
+    /// (`worksheetSource@ref` / `rangeSet@ref`, S7b) — appended to
+    /// `patches` as fresh buffers the caller owns, byte-identical
+    /// rewrites left out; and every refusal, raised before the caller
+    /// installs anything. The preflight discards the patches, the
+    /// sweep installs them.
+    fn collectPivotEditsForSheet(
+        self: *Workbook,
+        sheet_part_name: []const u8,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+        patches: *std.ArrayListUnmanaged(store_mod.PartStore.Replacement),
+    ) Error!void {
+        var p = (try self.pivotsForEdit(sheet_part_name)) orelse return;
+        defer p.deinit();
+
+        // Hosts (S7a).
+        for (p.tables, 0..) |t, i| {
+            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
+            const out = pivots_mod.edit.applyToTableDefinition(self.allocator, t.raw_xml, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
+            if (std.mem.eql(u8, out, t.raw_xml)) {
+                self.allocator.free(out);
+                continue;
+            }
+            errdefer self.allocator.free(out);
+            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = out });
+        }
+
+        // Sources (S7b). The edited sheet is one the walk placed — it
+        // resolved every `<sheet>` of the workbook, and the part came
+        // from that same list.
+        const sheet_idx = p.sheetIndexOfPart(sheet_part_name) orelse return error.MalformedPivotXml;
+        for (p.caches) |*c| {
+            const out = (pivots_mod.edit.applyToCacheDefinition(self.allocator, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e)) orelse continue;
+            errdefer self.allocator.free(out);
+            try patches.append(self.allocator, .{ .name = c.part_name, .bytes = out });
+        }
+        try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
+    }
+
+    /// S7b: dry-run the defined-name sweep this edit will run
+    /// (`rewriteAllDefinedNames`, the same body computation) over
+    /// every name a cache reads through — the source name and its
+    /// closure — and refuse when a body that did not spell `#REF!`
+    /// would. The formula rewriter spells `#REF!` at a deleted
+    /// endpoint (`Data!$A$1:$C$4` minus row 4) and at a deleted anchor
+    /// (`OFFSET(Report!$D$1,…)` minus row 1) where Excel shrinks the
+    /// range; either would leave the source unresolved and Excel's own
+    /// refresh failing (`docs/plans/s7b-cache-policy.md` §2.2). A name
+    /// already spelling `#REF!` is not this edit's doing and does not
+    /// refuse (Q4 iii: a dangling spelling is admitted).
+    fn refuseNameSourcesTheSweepBreaks(
+        self: *Workbook,
+        p: *const pivots_mod.Pivots,
+        sheet_idx: u32,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+    ) Error!void {
+        if (self.workbook.defined_names.len == 0) return;
+        var any = false;
+        for (p.caches) |c| {
+            any = any or pivots_mod.namesOf(c.resolution).len > 0;
+            for (c.range_set_resolutions) |r| any = any or pivots_mod.namesOf(r).len > 0;
+        }
+        if (!any) return;
+
+        const a = self.allocator;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer self.freeSheetOrder(sheet_order);
+        if (sheet_idx >= sheet_order.len) return error.MalformedPivotXml;
+        const target = sheet_order[sheet_idx];
+        const edit: zlsx.formula_rewriter.RewriteEdit = switch (axis) {
+            .row => switch (kind) {
+                .insert => .{ .insert_rows = .{ .at = idx_1based, .count = 1 } },
+                .delete => .{ .delete_rows = .{ .at = idx_1based, .count = 1 } },
+            },
+            .col => switch (kind) {
+                .insert => .{ .insert_cols = .{ .at = idx_1based, .count = 1 } },
+                .delete => .{ .delete_cols = .{ .at = idx_1based, .count = 1 } },
+            },
+        };
+
+        // Each name once: the same body under the same edit gives the
+        // same answer whichever cache reads it.
+        const judged = try a.alloc(bool, self.workbook.defined_names.len);
+        defer a.free(judged);
+        @memset(judged, false);
+        for (p.caches) |c| {
+            try self.judgeNameKeys(pivots_mod.namesOf(c.resolution), judged, sheet_order, edit, target);
+            for (c.range_set_resolutions) |r| try self.judgeNameKeys(pivots_mod.namesOf(r), judged, sheet_order, edit, target);
+        }
+    }
+
+    fn judgeNameKeys(
+        self: *Workbook,
+        keys: []const pivots_mod.NameKey,
+        judged: []bool,
+        sheet_order: []const []const u8,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target: []const u8,
+    ) Error!void {
+        const a = self.allocator;
+        for (keys) |key| {
+            for (self.workbook.defined_names, 0..) |dn, dn_idx| {
+                if (judged[dn_idx]) continue;
+                if (dn.local_sheet_id != key.scope) continue;
+                // The key's identifier is the engine's decode of this
+                // same attribute; an attribute the codec refuses named
+                // no key.
+                const ident = engine.decode.decodeAt(a, .defined_name_identifier, dn.name) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    continue;
+                };
+                defer a.free(ident);
+                if (!std.mem.eql(u8, ident, key.identifier)) continue;
+                judged[dn_idx] = true;
+                const rewritten = (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target)) orelse break;
+                defer a.free(rewritten);
+                if (std.mem.indexOf(u8, rewritten, "#REF!") == null) break;
+                const before = try store_mod.decodeXmlEntities(a, dn.formula);
+                defer a.free(before);
+                if (std.mem.indexOf(u8, before, "#REF!") == null) return error.PivotEditUnsafe;
+                break;
+            }
+        }
+    }
+
+    /// S7a + S7b sweep: move `location@ref` of every pivot the sheet
+    /// hosts and `worksheetSource@ref` / `rangeSet@ref` of every cache
+    /// that reads it. All-or-nothing — every part is rewritten in
+    /// memory before the first is replaced, so a refusal on the last
     /// leaves the first untouched, and the install itself is the
     /// store's transactional `replaceParts`, so an allocation failure
     /// midway leaves every part as it was. Byte-identical rewrites (the
-    /// pivot sits below / right of the edit) are not installed, so the
-    /// SHA-256 passthrough holds for them.
+    /// pivot sits below / right of the edit, the source is elsewhere)
+    /// are not installed, so the SHA-256 passthrough holds for them.
     fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
         std.debug.assert(idx_1based >= 1);
@@ -6081,24 +6254,12 @@ pub const Workbook = struct {
             .insert => .insert,
             .delete => .delete,
         };
-        var p = (try self.hostedPivotsForEdit(sheet_part_name)) orelse return;
-        defer p.deinit();
-
         var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer {
             for (patches.items) |it| self.allocator.free(it.bytes);
             patches.deinit(self.allocator);
         }
-        for (p.tables, 0..) |t, i| {
-            if (!(try hostedHere(&p, i, sheet_part_name))) continue;
-            const out = try applyPivotLocationEdit(self.allocator, t.raw_xml, axis, idx_1based, kind);
-            if (std.mem.eql(u8, out, t.raw_xml)) {
-                self.allocator.free(out);
-                continue;
-            }
-            errdefer self.allocator.free(out);
-            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = out });
-        }
+        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
         if (patches.items.len > 0) try self.store.replaceParts(patches.items);
     }
 
