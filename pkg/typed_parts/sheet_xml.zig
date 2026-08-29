@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const wbxml = @import("workbook_xml.zig");
 
 // ─── Public types ────────────────────────────────────────────────────
 
@@ -38,7 +39,16 @@ pub const Cell = struct {
     ref: []const u8,
     /// `<c s="…">` style index into the workbook's cellXfs table.
     style_idx: ?u32,
+    /// `s` was written but is not a number (`s="bogus"`, `s=""`):
+    /// `style_idx` is null, and the cell is not unstyled. A reader
+    /// that keys on the style (the S7b-4 rebuild's date check) refuses
+    /// rather than read it as General (Codex #205 r5 REL-504).
+    style_invalid: bool = false,
     cell_type: CellType,
+    /// `t` was written but names no type this view knows: `cell_type`
+    /// is `.number` by the schema's default, and the cell is not one
+    /// the S7b-4 rebuild reads (Codex #205 r8 REL-801).
+    cell_type_invalid: bool = false,
     /// Raw inner text of `<v>` (or `<is><t>` for inline strings).
     /// Borrows. No XML-entity decoding — caller decodes if needed.
     raw_value: ?[]const u8,
@@ -52,6 +62,10 @@ pub const Row = struct {
     height: ?f64,
     custom_height: bool,
     hidden: bool,
+    /// `<c>` elements of this row without an `r` — not in `cells`,
+    /// since the view has no coordinate for them. A reader that needs
+    /// the row whole (the S7b-4 rebuild) refuses when this is not 0.
+    unaddressed_cells: u32 = 0,
 };
 
 pub const MergeRange = struct {
@@ -100,6 +114,11 @@ pub const SheetXml = struct {
     validations: []DataValidation,
     conditional_formats: []ConditionalFormat,
     freeze: ?FreezePane,
+    /// `<row>` elements without a usable `r` — not in `rows`, since the
+    /// view has no coordinate for them (the Editor's own scanner numbers
+    /// them implicitly). A reader that needs the grid whole refuses
+    /// when this is not 0.
+    unaddressed_rows: u32 = 0,
     /// Owns the spine slices. `null` only when no allocations were
     /// performed — `parse` always sets it. Kept optional so a
     /// caller-constructed empty `SheetXml` (e.g. in tests) can free
@@ -166,7 +185,8 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
     const dim = parseDimension(sanitized);
     const freeze = parseFreezePane(sanitized);
 
-    const rows = try parseRows(a, sanitized);
+    var unaddressed_rows: u32 = 0;
+    const rows = try parseRows(a, sanitized, &unaddressed_rows);
     const merges = try parseMerges(a, sanitized);
     const hyperlinks = try parseHyperlinks(a, sanitized);
     const validations = try parseValidations(a, sanitized);
@@ -180,6 +200,7 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
         .validations = validations,
         .conditional_formats = cfs,
         .freeze = freeze,
+        .unaddressed_rows = unaddressed_rows,
         .arena = arena,
     };
 }
@@ -402,6 +423,19 @@ fn parseFreezePane(xml: []const u8) ?FreezePane {
     return null;
 }
 
+/// An attribute's text with its character references resolved, when
+/// it has any: the value the schema types, not its spelling
+/// (`r="B&#50;"` is `B2` — Codex #205 r10 REL-1002). A reference that
+/// does not resolve to a short ASCII scalar leaves the text as written,
+/// for its parser to refuse. Arena-owned when decoded.
+fn scalarAttr(a: std.mem.Allocator, attrs: []const u8, key: []const u8) ParseError!?[]const u8 {
+    const raw = attrAt(attrs, key) orelse return null;
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+    var buf: [64]u8 = undefined;
+    const decoded = wbxml.decodeScalarAttr(&buf, raw) orelse return raw;
+    return try a.dupe(u8, decoded);
+}
+
 fn parseU32Attr(attrs: []const u8, key: []const u8) ?u32 {
     const raw = attrAt(attrs, key) orelse return null;
     if (raw.len == 0) return null;
@@ -425,7 +459,7 @@ fn parseBoolAttr(attrs: []const u8, key: []const u8) bool {
 
 // ─── <sheetData><row><c>… ────────────────────────────────────────────
 
-fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
+fn parseRows(a: std.mem.Allocator, xml: []const u8, unaddressed: *u32) ParseError![]Row {
     assert(xml.len > 0);
 
     const sd_start = indexOfTag(xml, 0, "<sheetData") orelse return &.{};
@@ -451,15 +485,18 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
         const row_open_end = findTagEnd(body, row_open) orelse return error.MalformedXml;
         const row_attrs = body[row_open + "<row".len .. row_open_end];
 
-        const row_idx_raw = attrAt(row_attrs, "r") orelse {
+        const row_idx_raw = (try scalarAttr(a, row_attrs, "r")) orelse {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         };
         const row_idx = std.fmt.parseInt(u32, row_idx_raw, 10) catch {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         };
         if (row_idx == 0) {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         }
@@ -471,11 +508,12 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
         // Self-closing `<row r="N"/>` — empty row.
         const self_closing = row_open_end > row_open and body[row_open_end - 1] == '/';
         var cells: []Cell = &.{};
+        var unaddressed_cells: u32 = 0;
         if (!self_closing) {
             const row_close = std.mem.indexOfPos(u8, body, row_open_end, "</row>") orelse
                 return error.MalformedXml;
             const row_body = body[row_open_end + 1 .. row_close];
-            cells = try parseCells(a, row_body);
+            cells = try parseCells(a, row_body, &unaddressed_cells);
             probe = row_close + "</row>".len;
         } else {
             probe = row_open_end + 1;
@@ -487,13 +525,14 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
             .height = height,
             .custom_height = custom_height,
             .hidden = hidden,
+            .unaddressed_cells = unaddressed_cells,
         });
     }
 
     return try rows.toOwnedSlice(a);
 }
 
-fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
+fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) ParseError![]Cell {
     assert(row_body.len < (1 << 31));
 
     var cells: std.ArrayListUnmanaged(Cell) = .empty;
@@ -511,12 +550,18 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
         const c_open_end = findTagEnd(row_body, c_open) orelse return error.MalformedXml;
         const c_attrs = row_body[c_open + "<c".len .. c_open_end];
 
-        const ref = attrAt(c_attrs, "r") orelse {
+        const ref = (try scalarAttr(a, c_attrs, "r")) orelse {
+            unaddressed.* +|= 1;
             probe = c_open_end + 1;
             continue;
         };
-        const style_idx: ?u32 = parseU32Attr(c_attrs, "s");
-        const cell_type = parseCellType(attrAt(c_attrs, "t"));
+        const style_raw = try scalarAttr(a, c_attrs, "s");
+        const style_idx: ?u32 = if (style_raw) |v| (if (v.len == 0) null else std.fmt.parseInt(u32, v, 10) catch null) else null;
+        const style_invalid = style_raw != null and style_idx == null;
+        const type_raw = try scalarAttr(a, c_attrs, "t");
+        const cell_type_known = parseCellType(type_raw);
+        const cell_type = cell_type_known orelse .number;
+        const cell_type_invalid = type_raw != null and cell_type_known == null;
 
         const self_closing = c_open_end > c_open and row_body[c_open_end - 1] == '/';
         var raw_value: ?[]const u8 = null;
@@ -535,7 +580,9 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
         try cells.append(a, .{
             .ref = ref,
             .style_idx = style_idx,
+            .style_invalid = style_invalid,
             .cell_type = cell_type,
+            .cell_type_invalid = cell_type_invalid,
             .raw_value = raw_value,
             .formula = formula,
         });
@@ -544,7 +591,9 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
     return try cells.toOwnedSlice(a);
 }
 
-fn parseCellType(raw: ?[]const u8) CellType {
+/// The schema's default (`.number`) for an absent `t`; null for a `t`
+/// this view does not know — the caller keeps that provenance.
+fn parseCellType(raw: ?[]const u8) ?CellType {
     const t = raw orelse return .number;
     if (std.mem.eql(u8, t, "n")) return .number;
     if (std.mem.eql(u8, t, "s")) return .shared_string;
@@ -553,7 +602,7 @@ fn parseCellType(raw: ?[]const u8) CellType {
     if (std.mem.eql(u8, t, "inlineStr")) return .inline_string;
     if (std.mem.eql(u8, t, "e")) return .error_value;
     if (std.mem.eql(u8, t, "d")) return .date;
-    return .number;
+    return null;
 }
 
 fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {

@@ -27,6 +27,7 @@
 //! resolution and can land in a follow-up.
 
 const std = @import("std");
+const wbxml = @import("workbook_xml.zig");
 const assert = std.debug.assert;
 
 // ─── Public types ─────────────────────────────────────────────────────
@@ -104,6 +105,10 @@ pub const NumberFormat = struct {
 
 pub const CellXf = struct {
     num_fmt_id: ?u32,
+    /// `numFmtId` was written but is not a number: `num_fmt_id` is
+    /// null, and the style is not General by default (Codex #205 r5
+    /// REL-504).
+    num_fmt_id_invalid: bool = false,
     font_id: ?u32,
     fill_id: ?u32,
     border_id: ?u32,
@@ -325,6 +330,13 @@ fn attrValue(attrs: []const u8, name: []const u8) ?[]const u8 {
 
 fn attrU32(attrs: []const u8, name: []const u8) ?u32 {
     const raw = attrValue(attrs, name) orelse return null;
+    // The value the schema types, not its spelling: `numFmtId="&#49;"`
+    // is 1 (Codex #205 r10 REL-1002).
+    if (std.mem.indexOfScalar(u8, raw, '&') != null) {
+        var buf: [32]u8 = undefined;
+        const decoded = wbxml.decodeScalarAttr(&buf, raw) orelse return null;
+        return std.fmt.parseInt(u32, decoded, 10) catch null;
+    }
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
 
@@ -610,6 +622,7 @@ fn parseCellXfs(a: std.mem.Allocator, xml: []const u8, wrapper: []const u8) Erro
         cursor = el.end;
         var xf: CellXf = .{
             .num_fmt_id = attrU32(el.attrs, "numFmtId"),
+            .num_fmt_id_invalid = attrValue(el.attrs, "numFmtId") != null and attrU32(el.attrs, "numFmtId") == null,
             .font_id = attrU32(el.attrs, "fontId"),
             .fill_id = attrU32(el.attrs, "fillId"),
             .border_id = attrU32(el.attrs, "borderId"),

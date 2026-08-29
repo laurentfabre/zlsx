@@ -42,7 +42,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const zlsx = @import("zlsx");
-const engine = @import("zlsx_formula");
+const formula = @import("zlsx_formula");
 const store_mod = @import("store.zig");
 const PartStore = store_mod.PartStore;
 const wbxml = @import("typed_parts/workbook_xml.zig");
@@ -211,6 +211,21 @@ pub const SourceResolution = union(enum) {
         /// or a name beside a `sheet` attribute; empty for a direct
         /// `ref` and for a table.
         names: []const NameKey = &.{},
+        /// Rows at the top of `bounds` that are field names rather
+        /// than data: 1 for a direct `ref` and a name body (Excel
+        /// reads a range source's first row as its headers), the
+        /// table's `headerRowCount` for a table — 0 for a headerless
+        /// one, whose field names come from `<tableColumns>`. What
+        /// the S7b-4 rebuild splits the rectangle by.
+        header_rows: u32 = 1,
+        /// Rows at the bottom of `bounds` that are a table's totals
+        /// (`totalsRowCount`), not data; 0 for every other carrier
+        /// (Codex #205 r4 REL-401).
+        totals_rows: u32 = 0,
+        /// A table's `<tableColumn>` names, decoded, in order — a
+        /// headerless table's field names (Codex #205 r4 REL-402);
+        /// empty for every other carrier.
+        columns: []const []const u8 = &.{},
     };
 };
 
@@ -582,6 +597,15 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
             const rel = try requiredRel(cache_rels, rid, &.{"pivotCacheRecords"});
             const r = try requiredTarget(store, slot.part_name, rel.target);
             _ = try requiredPart(store, r);
+            // One records part per definition: two naming the same one
+            // would each rebuild it in their own image, and the one
+            // installed last would hold the other's records under its
+            // own inventories (Codex #205 r3 REL-301).
+            for (finished[0..ci]) |prev| {
+                if (prev.records_part_name) |taken| {
+                    if (std.mem.eql(u8, taken, r)) return error.MalformedPivotXml;
+                }
+            }
             records = r;
         }
 
@@ -804,7 +828,7 @@ fn spell(a: Allocator, ws: pivot_xml.WorksheetSource) Error!SourceSpelling {
 /// Entity decode for a lexical token (ST_Ref): `A1&#58;C4` is `A1:C4`.
 /// The raw slice and its `ref_span` stay as written, for the splice.
 fn decodeLexical(a: Allocator, raw: []const u8) Error![]const u8 {
-    return engine.decode.decodeCarrier(a, .lexical, raw) catch |e| switch (e) {
+    return formula.decode.decodeCarrier(a, .lexical, raw) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.MalformedPivotXml,
     };
@@ -819,8 +843,8 @@ fn mapParse(e: pivot_xml.Error) Error {
 
 /// STRING-carrier decode (entities + ST_Xstring) at a named site — the
 /// codec every name attribute in these parts is written with.
-fn decode(a: Allocator, site: engine.decode.Site, raw: []const u8) Error![]const u8 {
-    return engine.decode.decodeAt(a, site, raw) catch |e| switch (e) {
+fn decode(a: Allocator, site: formula.decode.Site, raw: []const u8) Error![]const u8 {
+    return formula.decode.decodeAt(a, site, raw) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.MalformedPivotXml,
     };
@@ -852,7 +876,7 @@ const Resolver = struct {
 
     sheet_folds: ?[]const []const u8 = null,
     tables: ?[]const TableEntry = null,
-    symbols: ?engine.SymbolTable = null,
+    symbols: ?formula.SymbolTable = null,
     symbols_refused: bool = false,
 
     const TableEntry = struct {
@@ -860,6 +884,16 @@ const Resolver = struct {
         sheet_idx: u32,
         /// The table part's `ref`, when it parses as a rectangle.
         bounds: ?Bounds,
+        /// The table's `headerRowCount` (default 1).
+        header_rows: u32,
+        /// The table's `totalsRowCount` (default 0).
+        totals_rows: u32,
+        /// The table's `<tableColumn>` names, decoded, in order.
+        columns: []const []const u8,
+
+        fn shape(self: TableEntry) TableShape {
+            return .{ .header_rows = self.header_rows, .totals_rows = self.totals_rows, .columns = self.columns };
+        }
     };
 
     fn deinit(self: *Resolver) void {
@@ -895,12 +929,12 @@ const Resolver = struct {
             // `sheet` names the sheet; a `ref` bounds it, else a `name`
             // beside it may (a table or a static name on that same
             // sheet — Codex #202 r1 F4). The sheet wins on identity.
-            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), .ref, &.{});
+            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), .ref, &.{}, .{});
             if (ws.name) |raw_name| {
                 const carrier = try self.carrierBounds(idx, raw_name);
-                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.kind, carrier.names);
+                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.kind, carrier.names, carrier.shape);
             }
-            return try self.local(idx, .sheet_attr, null, .none, &.{});
+            return try self.local(idx, .sheet_attr, null, .none, &.{}, .{});
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -913,7 +947,7 @@ const Resolver = struct {
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
                     const cl = try self.closure(n);
-                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, .defined_name, cl.names);
+                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, .defined_name, cl.names, .{});
                     return unresolved(.unbounded_body, cl.sheets, cl.names);
                 },
                 .refused => return error.MalformedPivotXml,
@@ -921,7 +955,7 @@ const Resolver = struct {
             }
             const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{}, &.{});
             for (try self.ensureTables()) |t| {
-                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, .table, &.{});
+                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, .table, &.{}, t.shape());
             }
             return unresolved(.dangling_name, &.{}, &.{});
         }
@@ -932,7 +966,15 @@ const Resolver = struct {
         return .{ .unresolved = .{ .why = why, .sheets = sheets, .names = names } };
     }
 
-    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey) Error!SourceResolution {
+    /// A table's shape beyond its bounds: what the rectangle's rows
+    /// are, and what its columns are called.
+    const TableShape = struct {
+        header_rows: u32 = 1,
+        totals_rows: u32 = 0,
+        columns: []const []const u8 = &.{},
+    };
+
+    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey, shape: TableShape) Error!SourceResolution {
         if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{}, &.{});
         return .{ .sheet = .{
             .sheet_idx = sheet_idx,
@@ -942,10 +984,13 @@ const Resolver = struct {
             .bounds = bounds,
             .carrier = if (bounds == null) .none else carrier,
             .names = names,
+            .header_rows = shape.header_rows,
+            .totals_rows = shape.totals_rows,
+            .columns = shape.columns,
         } };
     }
 
-    const Carrier = struct { bounds: ?Bounds, kind: SourceCarrier, names: []const NameKey };
+    const Carrier = struct { bounds: ?Bounds, kind: SourceCarrier, names: []const NameKey, shape: TableShape = .{} };
 
     /// The bounds a `name` beside a `sheet` lends the source, when the
     /// carrier is on that sheet: a static defined-name body, else a
@@ -962,7 +1007,7 @@ const Resolver = struct {
         };
         // Looked up FROM the stated sheet: its own scoped name shadows a
         // workbook one of the same spelling there (Codex #202 r2 F3).
-        switch (try symbols.resolveName(self.gpa, engine.SheetIndex.fromInt(sheet_idx), name)) {
+        switch (try symbols.resolveName(self.gpa, formula.SheetIndex.fromInt(sheet_idx), name)) {
             .name => |n| {
                 const cl = try self.closure(n);
                 const area = (try self.areaOfBody(n.body)) orelse return .{ .bounds = null, .kind = .none, .names = cl.names };
@@ -980,7 +1025,7 @@ const Resolver = struct {
         for (tables) |t| {
             if (!std.mem.eql(u8, t.folded, folded)) continue;
             const on_sheet = t.sheet_idx == sheet_idx;
-            return .{ .bounds = if (on_sheet) t.bounds else null, .kind = if (on_sheet) .table else .none, .names = &.{} };
+            return .{ .bounds = if (on_sheet) t.bounds else null, .kind = if (on_sheet) .table else .none, .names = &.{}, .shape = t.shape() };
         }
         return none;
     }
@@ -1062,33 +1107,63 @@ const Resolver = struct {
                 if (tableRefRaw(table_part.bytes)) |ref_raw| {
                     bounds = parseBounds(try decodeLexical(self.arena, ref_raw));
                 }
-                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds });
+                const header_rows = table_edit.tableHeaderRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
+                const totals_rows = table_edit.tableTotalsRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
+                // Only a headerless table's names are its schema; a
+                // headered one's are read off its header row.
+                const columns: []const []const u8 = if (header_rows == 0) try self.tableColumnNames(table_part.bytes) else &.{};
+                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows, .totals_rows = totals_rows, .columns = columns });
             }
         }
         self.tables = try entries.toOwnedSlice(self.arena);
         return self.tables.?;
     }
 
+    /// A table's `<tableColumn>` names in order, decoded — read through
+    /// the pivot scanner (one preflighted tree, direct children only,
+    /// decoy-aware, the close where the scanner finds it) rather than
+    /// a lexical search a comment could feed (Codex #205 r5 REL-503).
+    /// Arena-owned.
+    fn tableColumnNames(self: *Resolver, src: []const u8) Error![]const []const u8 {
+        const root = pivot_xml.scanRoot(src, "table") catch |e| return mapParse(e);
+        var kids = pivot_xml.Children.init(src, root.hit, root.body_end, root.prefix, root.env);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen = false;
+        while (kids.next() catch |e| return mapParse(e)) |k| {
+            if (!std.mem.eql(u8, k.local, "tableColumns")) continue;
+            if (seen) return error.MalformedPivotXml;
+            seen = true;
+            var cols = pivot_xml.Children.init(src, k.hit, k.end, root.prefix, k.env);
+            while (cols.next() catch |e| return mapParse(e)) |c| {
+                if (!std.mem.eql(u8, c.local, "tableColumn")) continue;
+                const raw = wbxml.getAttr(c.attrs(src), "name") orelse return error.MalformedPivotXml;
+                try names.append(self.arena, try decode(self.arena, .table_column_name, raw));
+            }
+        }
+        if (!seen) return error.MalformedPivotXml;
+        return names.toOwnedSlice(self.arena);
+    }
+
     /// The engine's symbol table, or `MalformedPivotXml` when it
     /// refuses: with the name inventory unreadable, no name-based
     /// source can be resolved either way.
-    fn ensureSymbols(self: *Resolver) Error!*const engine.SymbolTable {
+    fn ensureSymbols(self: *Resolver) Error!*const formula.SymbolTable {
         if (self.symbols) |*t| return t;
         if (self.symbols_refused) return error.MalformedPivotXml;
 
-        var builder = engine.Builder.init(self.gpa, recalc_run.collation_v1);
+        var builder = formula.Builder.init(self.gpa, recalc_run.collation_v1);
         defer builder.deinit();
         for (self.wb.sheets) |s| try builder.addSheet(s.name);
         // The names come from the part, as the evaluator's do: the
         // typed view drops the attribute region that says whether a
         // name is a macro entry point rather than a range.
-        switch (try engine.names.scanDefinedNames(self.gpa, self.wb_xml)) {
+        switch (try formula.names.scanDefinedNames(self.gpa, self.wb_xml)) {
             .ok => |d| {
                 var defined = d;
                 defer defined.deinit();
                 for (defined.rows) |dn| {
                     try builder.addName(dn.raw_identifier, dn.raw_body, .{
-                        .scope = if (dn.local_sheet_id) |id| engine.env.SheetIndex.fromInt(id) else null,
+                        .scope = if (dn.local_sheet_id) |id| formula.env.SheetIndex.fromInt(id) else null,
                         .hidden = dn.hidden,
                         .attr_refusal = dn.refusal_when_referenced,
                     });
@@ -1120,7 +1195,7 @@ const Resolver = struct {
     /// (`Data!$A$1:$C:$C`) names the sheet — as it did before S7b-1 —
     /// with no bounds (Codex #202 r1 F1).
     fn areaOfBody(self: *Resolver, body: []const u8) Error!?Area {
-        var parsed = try engine.parser.parse(self.gpa, body, .{});
+        var parsed = try formula.parser.parse(self.gpa, body, .{});
         defer parsed.deinit(self.gpa);
         const ast = switch (parsed) {
             .ok => |t| t,
@@ -1153,7 +1228,7 @@ const Resolver = struct {
                 };
                 const idx = (try self.sheetOfSpec(lhs.sheet)) orelse return null;
                 const rhs_node = ast.node(b.rhs);
-                const rhs_target: engine.parser.Node = switch (rhs_node) {
+                const rhs_target: formula.parser.Node = switch (rhs_node) {
                     .qualified => |q| blk: {
                         const r = (try self.sheetOfSpec(q.sheet)) orelse return null;
                         if (r != idx) return null;
@@ -1191,7 +1266,7 @@ const Resolver = struct {
     /// the scopes it was invoked from, keyed as `<definedName>` spells
     /// it (the name's own `localSheetId`, not the invoking scope).
     /// Arena-owned.
-    fn closure(self: *Resolver, root: *const engine.Name) Error!Closure {
+    fn closure(self: *Resolver, root: *const formula.Name) Error!Closure {
         var sheets: std.ArrayListUnmanaged(u32) = .empty;
         defer sheets.deinit(self.gpa);
         var walk: Walk = .{};
@@ -1217,7 +1292,7 @@ const Resolver = struct {
         };
     }
 
-    fn scopeOf(n: *const engine.Name) ?u32 {
+    fn scopeOf(n: *const formula.Name) ?u32 {
         return if (n.scope) |sc| sc.toInt() else null;
     }
 
@@ -1226,7 +1301,7 @@ const Resolver = struct {
     /// resolves its unqualified names from the sheet that invoked it,
     /// so the same body under two invoking sheets is two walks (Codex
     /// #202 r2 F1).
-    const Visit = struct { name: *const engine.Name, scope: ?u32 };
+    const Visit = struct { name: *const formula.Name, scope: ?u32 };
 
     const Walk = struct {
         visited: std.ArrayListUnmanaged(Visit) = .empty,
@@ -1252,7 +1327,7 @@ const Resolver = struct {
         sheets: *std.ArrayListUnmanaged(u32),
         walk: *Walk,
     ) Error!void {
-        var parsed = try engine.parser.parse(self.gpa, body, .{});
+        var parsed = try formula.parser.parse(self.gpa, body, .{});
         defer parsed.deinit(self.gpa);
         const ast = switch (parsed) {
             .ok => |t| t,
@@ -1338,8 +1413,8 @@ const Resolver = struct {
 
     fn walkNode(
         self: *Resolver,
-        ast: engine.parser.Ast,
-        i: engine.parser.Index,
+        ast: formula.parser.Ast,
+        i: formula.parser.Index,
         scope: ?u32,
         sheets: *std.ArrayListUnmanaged(u32),
         walk: *Walk,
@@ -1404,7 +1479,7 @@ const Resolver = struct {
         }
     }
 
-    fn isIndirect(ast: engine.parser.Ast, callee: engine.parser.Index) bool {
+    fn isIndirect(ast: formula.parser.Ast, callee: formula.parser.Index) bool {
         return switch (ast.node(callee)) {
             .name => |n| std.ascii.eqlIgnoreCase(n.bare, "INDIRECT"),
             else => false,
@@ -1432,7 +1507,7 @@ const Resolver = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
         };
-        const from: ?engine.SheetIndex = if (scope) |sc| engine.SheetIndex.fromInt(sc) else null;
+        const from: ?formula.SheetIndex = if (scope) |sc| formula.SheetIndex.fromInt(sc) else null;
         switch (try symbols.resolveName(self.gpa, from, raw)) {
             .name => |n| try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope }),
             .table, .not_found => {
@@ -1454,14 +1529,14 @@ const Resolver = struct {
     /// the engine's own split and expansion; a reversed or dangling span
     /// is `#REF!` and names nothing — Codex #202 r1 F3). Returns the
     /// members, for a name looked up through the qualifier.
-    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?Members {
+    fn addSpecSheets(self: *Resolver, spec: formula.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?Members {
         const unquoted = try self.unquoteSpec(spec);
-        if (!engine.names.isSpan(spec)) {
+        if (!formula.names.isSpan(spec)) {
             const idx = (try self.sheetIndexOf(unquoted)) orelse return null;
             try addSheet(self.gpa, sheets, idx);
             return .{ .first = idx, .last = idx };
         }
-        const ends = engine.names.splitSpan(spec, unquoted) orelse return null;
+        const ends = formula.names.splitSpan(spec, unquoted) orelse return null;
         const symbols = self.ensureSymbols() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
@@ -1492,7 +1567,7 @@ const Resolver = struct {
         try sheets.append(gpa, idx);
     }
 
-    fn sheetOfSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error!?u32 {
+    fn sheetOfSpec(self: *Resolver, spec: formula.parser.SheetSpec) Error!?u32 {
         if (spec.last != null) return null;
         const name = try self.unquoteSpec(spec);
         return self.sheetIndexOf(name);
@@ -1501,7 +1576,7 @@ const Resolver = struct {
     /// `unquoteSheetSpec` sized by the token, not a fixed buffer: a
     /// sheet name the inventories accepted is one the walk must be able
     /// to look up, whatever its length (Codex #202 r4 F3).
-    fn unquoteSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error![]const u8 {
+    fn unquoteSpec(self: *Resolver, spec: formula.parser.SheetSpec) Error![]const u8 {
         if (!spec.quoted) return spec.first;
         const buf = try self.arena.alloc(u8, spec.first.len);
         return unquoteSheetSpec(buf, spec) orelse spec.first;
@@ -1510,7 +1585,7 @@ const Resolver = struct {
 
 /// A cell, a whole-column span or a whole-row span — the reference
 /// nodes that denote a fixed area — as bounds.
-fn staticBounds(n: engine.parser.Node) ?Bounds {
+fn staticBounds(n: formula.parser.Node) ?Bounds {
     return switch (n) {
         .ref_cell => |c| .{ .rect = .{
             .tl_col = c.cell.col.oneBased(),
@@ -1534,7 +1609,7 @@ fn staticBounds(n: engine.parser.Node) ?Bounds {
 /// rectangle (corners normalised), two column spans or two row spans
 /// merge. Mixed kinds denote an area Excel accepts but this reader
 /// does not bound.
-fn rangeBounds(lhs: engine.parser.Node, rhs: engine.parser.Node) ?Bounds {
+fn rangeBounds(lhs: formula.parser.Node, rhs: formula.parser.Node) ?Bounds {
     const a = staticBounds(lhs) orelse return null;
     const b = staticBounds(rhs) orelse return null;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return null;
@@ -1626,7 +1701,7 @@ fn fold(a: Allocator, s: []const u8) Error!?[]const u8 {
 /// `'It''s'` → `It's`; an unquoted spelling is itself. Null when the
 /// unescaped name does not fit `buf` — Excel caps sheet names at 31
 /// characters, so it always does for a name Excel wrote.
-fn unquoteSheetSpec(buf: []u8, spec: engine.parser.SheetSpec) ?[]const u8 {
+fn unquoteSheetSpec(buf: []u8, spec: formula.parser.SheetSpec) ?[]const u8 {
     if (!spec.quoted) return spec.first;
     const raw = spec.first;
     if (raw.len < 2 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return null;
@@ -1694,6 +1769,10 @@ pub const edit = struct {
         PivotSourceEditUnsafe,
         /// The shift would push the rectangle past `XFD` / `1048576`.
         PivotCoordinateOverflow,
+        /// S7b-4: the edit changed a source's content and the cache
+        /// cannot be rebuilt from it — a shape the engine's first
+        /// slice does not evaluate (`engine.RebuildError` names them).
+        PivotShapeUnsupported,
         /// The part is not one readable `pivotTableDefinition`, or its
         /// `location@ref` is not an A1 rectangle.
         MalformedPivotXml,
@@ -1757,7 +1836,7 @@ pub const edit = struct {
     /// `ref` that is not an A1 rectangle — ST_Ref has no `$`, no sheet
     /// qualifier, no whitespace.
     pub fn footprintOf(allocator: Allocator, def: pivot_xml.TableDefinition) EditError!Footprint {
-        const decoded = engine.decode.decodeCarrier(allocator, .lexical, def.location.ref) catch |e| switch (e) {
+        const decoded = formula.decode.decodeCarrier(allocator, .lexical, def.location.ref) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedPivotXml,
         };
@@ -2062,22 +2141,48 @@ pub const edit = struct {
     /// attribute. Null when the definition already carries it.
     fn markerSplice(src: []const u8, def: *const pivot_xml.CacheDefinition) ?Splice {
         if (markerSet(def)) return null;
-        var sp: Splice = .{ .span = undefined, .buf = undefined, .len = 0 };
-        if (def.rootAttrValueSpan(src, marker_attr)) |span| {
-            sp.span = span;
-            sp.buf[0] = '1';
-            sp.len = 1;
-        } else {
-            comptime assert(marker_insert.len <= Bounds.format_buf_len);
-            sp.span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end };
-            @memcpy(sp.buf[0..marker_insert.len], marker_insert);
-            sp.len = marker_insert.len;
-        }
-        return sp;
+        if (def.rootAttrValueSpan(src, marker_attr)) |span| return .{ .span = span, .text = "1" };
+        return .{ .span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end }, .text = marker_insert };
     }
 
-    /// Rewrite one `pivotCacheDefinitionN.xml` part for a row / col
-    /// edit on sheet `sheet_idx` — the S7b splice. Every source the
+    /// What one row / col edit does to one `pivotCacheDefinitionN.xml`
+    /// part: the splices that move its coordinates and set its marker,
+    /// and what the S7b-4 rebuild needs to know — whether the edit
+    /// changed some source's content, and the rectangle to rebuild
+    /// from when it did. `planCacheEdit` computes it; `applyPlan`
+    /// renders it. The splice texts live in the arena the plan was
+    /// built in.
+    pub const Plan = struct {
+        splices: std.ArrayListUnmanaged(Splice) = .empty,
+        /// The S7b-3 predicate over every source on the edited sheet:
+        /// the edit changed what some source HOLDS (an insert inside a
+        /// rectangle, a delete inside it, any edit of a sheet an
+        /// unbounded body references) — the marker is set, and the
+        /// snapshot is no longer the source.
+        changed: bool = false,
+        /// The rectangle the cache can be rebuilt from when `changed`:
+        /// a `worksheet`-type source with a finite rectangle on the
+        /// edited sheet, in pre-edit coordinates. Null when `changed`
+        /// and no such rectangle exists — whole columns or rows, an
+        /// unbounded name body, a consolidation set, a locator under
+        /// an unknown `type` — which the rebuild refuses
+        /// (`docs/plans/s7b-cache-policy.md` §9, S7b-4).
+        rebuild: ?RebuildSource = null,
+    };
+
+    /// Where a rebuild reads: the source rectangle as the sheet is
+    /// before the edit, and how many of its top rows are field names.
+    pub const RebuildSource = struct {
+        rect: Rect,
+        header_rows: u32,
+        /// A table's totals rows at the bottom of `rect` — not data.
+        totals_rows: u32 = 0,
+        /// A table's column names — a headerless table's field names.
+        columns: []const []const u8 = &.{},
+    };
+
+    /// Plan one `pivotCacheDefinitionN.xml` part's rewrite for a row /
+    /// col edit on sheet `sheet_idx` — the S7b splice. Every source the
     /// cache reads on that sheet, `worksheetSource` and each `rangeSet`
     /// alike, passes the range semantics above; the ones that carry
     /// their own coordinate (`sheet` + `ref`) are respelled at the
@@ -2089,9 +2194,59 @@ pub const edit = struct {
     /// `r:id` whose `sheet` is this sheet, a spelling that claims the
     /// sheet and bounds nothing. When any source's content changed
     /// under the edit (the S7b-3 predicate above), the root gains the
-    /// refresh marker in the same rebuild. Returns a fresh buffer the
-    /// caller owns, or null when nothing in the part changes (it is
-    /// then byte-preserved).
+    /// refresh marker in the same rebuild and the plan says so, with
+    /// the rectangle the S7b-4 engine rebuilds the snapshot from.
+    pub fn planCacheEdit(
+        arena: Allocator,
+        cache: *const PivotCache,
+        sheet_idx: u32,
+        axis: Axis,
+        idx_1based: u32,
+        kind: Kind,
+    ) EditError!Plan {
+        if (idx_1based == 0) return error.MalformedPivotXml;
+        var plan: Plan = .{};
+        const def = &cache.definition;
+        if (def.source.worksheet) |ws| {
+            const r = try sourceSplice(arena, &plan.splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind);
+            if (r.changed) {
+                plan.changed = true;
+                // Only a worksheet-type source is a rectangle the
+                // engine reads as records; a carried locator under an
+                // unknown `type` moves (Q5) but is not rebuilt.
+                if (def.source.type == .worksheet) {
+                    if (r.local) |local| {
+                        if (local.bounds) |b| {
+                            if (b == .rect) plan.rebuild = .{ .rect = b.rect, .header_rows = local.header_rows, .totals_rows = local.totals_rows, .columns = local.columns };
+                        }
+                    }
+                }
+            }
+        }
+        // The walk resolved every set it parsed; a definition that
+        // disagrees with its own resolutions is not one this row read.
+        if (def.source.range_sets.len != cache.range_set_resolutions.len) return error.MalformedPivotXml;
+        for (def.source.range_sets, cache.range_set_resolutions) |rs, res| {
+            const r = try sourceSplice(arena, &plan.splices, rs, res, sheet_idx, axis, idx_1based, kind);
+            plan.changed = plan.changed or r.changed;
+        }
+        if (plan.changed) {
+            if (markerSplice(cache.raw_xml, def)) |sp| try plan.splices.append(arena, sp);
+        }
+        return plan;
+    }
+
+    /// `planCacheEdit` rendered: the part with every planned splice
+    /// applied, as a fresh buffer the caller owns; null when the plan
+    /// holds none (the part is then byte-preserved).
+    pub fn applyPlan(allocator: Allocator, cache: *const PivotCache, plan: *const Plan) EditError!?[]u8 {
+        if (plan.splices.items.len == 0) return null;
+        return try spliceAll(allocator, cache.raw_xml, plan.splices.items);
+    }
+
+    /// The coordinate move and the marker alone — `planCacheEdit` +
+    /// `applyPlan`, without the S7b-4 rebuild. Returns a fresh buffer
+    /// the caller owns, or null when nothing in the part changes.
     pub fn applyToCacheDefinition(
         allocator: Allocator,
         cache: *const PivotCache,
@@ -2100,65 +2255,59 @@ pub const edit = struct {
         idx_1based: u32,
         kind: Kind,
     ) EditError!?[]u8 {
-        if (idx_1based == 0) return error.MalformedPivotXml;
-        var splices: std.ArrayListUnmanaged(Splice) = .empty;
-        defer splices.deinit(allocator);
-
-        const def = &cache.definition;
-        var changed = false;
-        if (def.source.worksheet) |ws| {
-            changed = (try sourceSplice(allocator, &splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind)) or changed;
-        }
-        // The walk resolved every set it parsed; a definition that
-        // disagrees with its own resolutions is not one this row read.
-        if (def.source.range_sets.len != cache.range_set_resolutions.len) return error.MalformedPivotXml;
-        for (def.source.range_sets, cache.range_set_resolutions) |rs, res| {
-            changed = (try sourceSplice(allocator, &splices, rs, res, sheet_idx, axis, idx_1based, kind)) or changed;
-        }
-        if (changed) {
-            if (markerSplice(cache.raw_xml, def)) |sp| try splices.append(allocator, sp);
-        }
-        if (splices.items.len == 0) return null;
-        return try spliceAll(allocator, cache.raw_xml, splices.items);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const plan = try planCacheEdit(arena_state.allocator(), cache, sheet_idx, axis, idx_1based, kind);
+        return try applyPlan(allocator, cache, &plan);
     }
 
     /// `src` rebuilt from its own bytes with each splice swapped in
     /// place, in span order, so no span moves under another. An
-    /// insertion is a splice with an empty span.
-    fn spliceAll(allocator: Allocator, src: []const u8, splices: []Splice) EditError![]u8 {
+    /// insertion is a splice with an empty span; two insertions at one
+    /// position keep their order (the sort is stable). A span that is
+    /// reversed, overlaps an earlier one or reaches past `src` is
+    /// `MalformedPivotXml` — a public seam answers, it does not assert
+    /// (Codex #205 r7 REL-701).
+    pub fn spliceAll(allocator: Allocator, src: []const u8, splices: []Splice) EditError![]u8 {
         std.mem.sort(Splice, splices, {}, Splice.before);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
         var pos: usize = 0;
         for (splices) |sp| {
-            assert(pos <= sp.span.start and sp.span.start <= sp.span.end and sp.span.end <= src.len);
+            if (pos > sp.span.start or sp.span.start > sp.span.end or sp.span.end > src.len) return error.MalformedPivotXml;
             try out.appendSlice(allocator, src[pos..sp.span.start]);
-            try out.appendSlice(allocator, sp.text());
+            try out.appendSlice(allocator, sp.text);
             pos = sp.span.end;
         }
         try out.appendSlice(allocator, src[pos..]);
         return try out.toOwnedSlice(allocator);
     }
 
-    const Splice = struct {
+    /// One replacement on a part: `text` in place of `span` (empty
+    /// span = insertion). `text` is borrowed — a literal, or bytes in
+    /// the arena the plan was built in.
+    pub const Splice = struct {
         span: pivot_xml.Span,
-        buf: [Bounds.format_buf_len]u8,
-        len: usize,
-
-        fn text(self: *const Splice) []const u8 {
-            return self.buf[0..self.len];
-        }
+        text: []const u8,
 
         fn before(_: void, a: Splice, b: Splice) bool {
             return a.span.start < b.span.start;
         }
     };
 
+    const SourceOutcome = struct {
+        /// The edit changed what this source holds — the marker's input.
+        changed: bool,
+        /// The local resolution the outcome was judged on, when it was
+        /// one on the edited sheet.
+        local: ?SourceResolution.LocalSheet = null,
+    };
+
     /// One source under the edit: its `ref` splice appended when it has
     /// one, its refusal raised, and whether the edit changed what it
     /// holds — the marker's input.
     fn sourceSplice(
-        allocator: Allocator,
+        arena: Allocator,
         splices: *std.ArrayListUnmanaged(Splice),
         ws: pivot_xml.WorksheetSource,
         res: SourceResolution,
@@ -2166,11 +2315,11 @@ pub const edit = struct {
         axis: Axis,
         idx_1based: u32,
         kind: Kind,
-    ) EditError!bool {
+    ) EditError!SourceOutcome {
         switch (res) {
-            .external, .none => return false,
+            .external, .none => return .{ .changed = false },
             .unresolved => |u| {
-                if (std.mem.indexOfScalar(u32, u.sheets, sheet_idx) == null) return false;
+                if (std.mem.indexOfScalar(u32, u.sheets, sheet_idx) == null) return .{ .changed = false };
                 switch (u.why) {
                     // The `sheet` beside an `r:id` the reader could not
                     // place: it may be this sheet, and its `ref` cannot
@@ -2181,13 +2330,13 @@ pub const edit = struct {
                     // dry-run is the workbook's (Q4 ii). Nothing to
                     // move here — and no shift to prove, so the
                     // content may have changed.
-                    .unbounded_body => return true,
+                    .unbounded_body => return .{ .changed = true },
                     // These prove no sheet; `sheets` is empty for them.
-                    .dangling_sheet, .dangling_name, .sheetless_ref, .no_locator => return false,
+                    .dangling_sheet, .dangling_name, .sheetless_ref, .no_locator => return .{ .changed = false },
                 }
             },
             .sheet => |s| {
-                if (s.sheet_idx != sheet_idx) return false;
+                if (s.sheet_idx != sheet_idx) return .{ .changed = false };
                 // Claims the sheet, bounds nothing: `sheet` alone, a
                 // `ref` the bounds parser rejects, a name the reader
                 // could not place on that sheet (Q4 iv).
@@ -2204,7 +2353,7 @@ pub const edit = struct {
                     // (Codex #203 r1 REL-102).
                     .table => {
                         if (axis == .col) _ = try shiftSourceBounds(bounds, axis, idx_1based, kind);
-                        return editChangesContent(bounds, axis, idx_1based, kind);
+                        return .{ .changed = editChangesContent(bounds, axis, idx_1based, kind), .local = s };
                     },
                     .ref, .defined_name => {},
                 }
@@ -2212,21 +2361,21 @@ pub const edit = struct {
                 // admitted edit.
                 const shifted = try shiftSourceBounds(bounds, axis, idx_1based, kind);
                 const changed = editChangesContent(bounds, axis, idx_1based, kind);
-                const moved = shifted orelse return changed;
+                const outcome: SourceOutcome = .{ .changed = changed, .local = s };
+                const moved = shifted orelse return outcome;
                 // Only a spelling with its own `ref` is respelled; a
                 // name-spelled area moves with the name's body.
-                if (s.carrier != .ref) return changed;
+                if (s.carrier != .ref) return outcome;
                 const span = ws.ref_span orelse return error.MalformedPivotXml;
-                var sp: Splice = .{ .span = span, .buf = undefined, .len = 0 };
                 // A rectangle keeps the single-cell spelling `A1`;
                 // whole columns / rows spell `A:C` / `1:4` as read.
+                var buf: [Bounds.format_buf_len]u8 = undefined;
                 const text = switch (moved) {
-                    .rect => |r| formatRect(&sp.buf, r) catch return error.PivotCoordinateOverflow,
-                    else => moved.formatA1(&sp.buf) orelse return error.PivotCoordinateOverflow,
+                    .rect => |r| formatRect(&buf, r) catch return error.PivotCoordinateOverflow,
+                    else => moved.formatA1(&buf) orelse return error.PivotCoordinateOverflow,
                 };
-                sp.len = text.len;
-                try splices.append(allocator, sp);
-                return changed;
+                try splices.append(arena, .{ .span = span, .text = try arena.dupe(u8, text) });
+                return outcome;
             },
         }
     }
@@ -2266,6 +2415,670 @@ pub const edit = struct {
             return std.fmt.bufPrint(buf, "{s}{d}", .{ tl_buf[0..tl_len], r.tl_row });
         }
         return std.fmt.bufPrint(buf, "{s}{d}:{s}{d}", .{ tl_buf[0..tl_len], r.tl_row, br_buf[0..br_len], r.br_row });
+    }
+};
+
+// ─── S7b-4: the cache rebuild — the engine's first slice ─────────────
+//
+// The owner's cache policy is B (`docs/plans/s7b-cache-policy.md`
+// §8): zlsx PERFORMS the refresh. This slice rebuilds the CACHE from
+// the source cells — the records, every field's inventory,
+// `recordCount`, `refreshedDate` — for the shapes it can read and
+// write exactly; the consumers' items, layout and output cells are
+// the next slice, and until they land the refresh marker (S7b-3)
+// stays on a rebuilt cache, so Excel's own refresh at open lays the
+// consumers out over a snapshot that is already the source.
+//
+// Two invariants make a rebuilt cache one its consumers still index:
+// an inventory keeps every item it had, in its order — a
+// `pivotField/items/item@x`, a `rowItems` position, a chart's
+// selection keep naming the same value; Excel itself retains items no
+// record references, up to `missingItemsLimit` — and a value the
+// inventory lacks is appended after them, in first-appearance order.
+// A field whose records were inline (`<n>` in the records part — a
+// data-only numeric field) stays inline unless it now holds a string;
+// a field whose inventory was enumerated stays enumerated. Items match
+// as Excel groups them: numbers by value, strings case-insensitively
+// under the workbook's collation, spelled by their first occurrence.
+//
+// Everything the slice does not evaluate REFUSES the edit rather than
+// write a partial rebuild (§8 Q1): calculated and group fields, OLAP
+// and consolidation shapes, a source without a finite rectangle, a
+// records part carrying anything but records, and cells the oracle
+// matrix has not covered — dates (a `t="d"` cell, a number under a
+// date format, an inventory that held dates), booleans, errors, an
+// uncomputed formula, an inline string. A pure shift never reaches
+// the engine: the S7b-3 predicate gates it, so a part Excel would
+// leave byte-identical still is.
+
+pub const engine = struct {
+    pub const RebuildError = error{
+        /// A shape this slice does not rebuild — see the namespace
+        /// note. The edit refuses; nothing is written.
+        PivotShapeUnsupported,
+        /// The definition or records part disagrees with itself (an
+        /// item without its value, a `count` that is not the number
+        /// of items, a row that is not one value per field).
+        MalformedPivotXml,
+        OutOfMemory,
+    };
+
+    /// One source cell as the rebuild reads it — what the workbook
+    /// resolves from the sheet's typed view, the shared strings and
+    /// the styles before the engine sees it.
+    pub const Value = union(enum) {
+        blank,
+        /// The cell's `<v>` as written: an xsd:double lexical the
+        /// producer wrote and Excel read, kept verbatim so a value
+        /// round-trips to the byte (`4.4000000000000004` stays so).
+        /// Finite — the reader checks, the engine re-checks.
+        number: []const u8,
+        /// The cell's text, decoded (entities and ST_Xstring resolved).
+        string: []const u8,
+    };
+
+    /// One data row of the source rectangle, one value per field.
+    pub const Row = []const Value;
+
+    /// The most cells — rectangle width × height — one rebuild reads:
+    /// 16 Mi, a million-row source of sixteen fields. A finite
+    /// rectangle past it refuses before any read (a hand-written
+    /// `A1:XFD1048576` is not a rectangle this slice reads — Codex #205
+    /// r3 PERF-301); a streaming read is a later slice's.
+    pub const max_rebuild_cells: usize = 1 << 24;
+
+    /// The data rows after a row edit inside the rectangle, in source
+    /// order: an insert at `idx_1based` puts a blank row there, a
+    /// delete drops the row there. `first_data_row` is the sheet row
+    /// of `rows[0]` — the rectangle's top plus its header rows. The
+    /// edit is one `edit.editChangesContent` admitted, so it lands on
+    /// a data row.
+    pub fn rowsAfterEdit(arena: Allocator, rows: []const Row, width: usize, first_data_row: u32, idx_1based: u32, kind: edit.Kind) RebuildError![]const Row {
+        if (idx_1based < first_data_row) return error.MalformedPivotXml;
+        const k: usize = idx_1based - first_data_row;
+        switch (kind) {
+            .insert => {
+                if (k > rows.len) return error.MalformedPivotXml;
+                const out = try arena.alloc(Row, rows.len + 1);
+                @memcpy(out[0..k], rows[0..k]);
+                const blank = try arena.alloc(Value, width);
+                @memset(blank, .blank);
+                out[k] = blank;
+                @memcpy(out[k + 1 ..], rows[k..]);
+                return out;
+            },
+            .delete => {
+                if (k >= rows.len) return error.MalformedPivotXml;
+                const out = try arena.alloc(Row, rows.len - 1);
+                @memcpy(out[0..k], rows[0..k]);
+                @memcpy(out[k..], rows[k + 1 ..]);
+                return out;
+            },
+        }
+    }
+
+    /// The refresh instant: an Excel serial under the workbook's date
+    /// system for `refreshedDate`, and the same instant as ISO 8601
+    /// for a part that also spells `refreshedDateIso` (Codex #205 r9
+    /// REL-902).
+    pub const Refreshed = struct {
+        serial: f64,
+        iso: []const u8,
+    };
+
+    /// The rebuilt parts.
+    pub const Rebuild = struct {
+        /// Splices on the definition: every field's inventory element
+        /// replaced whole, `recordCount` and `refreshedDate` on the
+        /// root. Texts live in the arena the rebuild ran in.
+        splices: []edit.Splice,
+        /// The records part rebuilt whole — its root tag as written
+        /// with `count` set, one `<r>` per data row — or null when the
+        /// cache names no records part.
+        records: ?[]u8,
+        record_count: u32,
+    };
+
+    /// Rebuild `cache` from `rows`, the data rows of its source
+    /// rectangle after the edit (`rowsAfterEdit`), each one value per
+    /// field. `records_xml` is the cache's records part as stored,
+    /// when it has one. `refreshed` is the refresh instant, or null
+    /// when the caller has no clock — `refreshedDate` (and a
+    /// `refreshedDateIso` beside it) is then removed rather than left
+    /// describing a refresh that did not happen.
+    pub fn rebuild(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed: ?Refreshed) RebuildError!Rebuild {
+        const def = &cache.definition;
+        try checkShape(def);
+        if (rows.len == 0 or rows.len > std.math.maxInt(u32)) return error.PivotShapeUnsupported;
+        // The rectangle's width is the field schema: a disagreement
+        // is S7c's column edit, not a rebuild.
+        if (rows[0].len != def.fields.len) return error.PivotShapeUnsupported;
+        for (rows) |r| if (r.len != def.fields.len) return error.MalformedPivotXml;
+
+        const p = try qualified(arena, def.prefix);
+        // The records as written say how each field spelt its values —
+        // `<x>` into the inventory, or inline — which is what "stays
+        // inline" is measured against (Codex #205 r10 REL-1001).
+        const spelt = if (records_xml) |xml| try inspectRecords(arena, xml, def.fields.len) else try arena.alloc(?bool, def.fields.len);
+        if (records_xml == null) @memset(spelt, null);
+        const fields = try arena.alloc(Field, def.fields.len);
+        for (def.fields, 0..) |f, k| fields[k] = try Field.build(arena, f.shared_items.?, rows, k, p, spelt[k]);
+
+        var splices: std.ArrayListUnmanaged(edit.Splice) = .empty;
+        for (def.fields, fields) |f, built| {
+            try splices.append(arena, .{ .span = f.shared_items.?.span, .text = built.xml });
+        }
+
+        // Root attributes: replaced where present, inserted before the
+        // root's `>` where absent — one insertion for both, so their
+        // order is this writer's, not a sort's.
+        const count_text = try std.fmt.allocPrint(arena, "{d}", .{rows.len});
+        var insert: std.ArrayListUnmanaged(u8) = .empty;
+        if (def.rootAttrValueSpan(cache.raw_xml, "recordCount")) |span| {
+            try splices.append(arena, .{ .span = span, .text = count_text });
+        } else {
+            try insert.appendSlice(arena, " recordCount=\"");
+            try insert.appendSlice(arena, count_text);
+            try insert.append(arena, '"');
+        }
+        if (refreshed) |now| {
+            const date_text = try std.fmt.allocPrint(arena, "{d}", .{now.serial});
+            if (def.rootAttrValueSpan(cache.raw_xml, "refreshedDate")) |span| {
+                try splices.append(arena, .{ .span = span, .text = date_text });
+            } else {
+                try insert.appendSlice(arena, " refreshedDate=\"");
+                try insert.appendSlice(arena, date_text);
+                try insert.append(arena, '"');
+            }
+            // The ISO spelling, where the part carries it, is the same
+            // instant — never a stale one beside a fresh serial (Codex
+            // #205 r9 REL-902); a part without it does not gain one.
+            if (def.rootAttrValueSpan(cache.raw_xml, "refreshedDateIso")) |span| {
+                try splices.append(arena, .{ .span = span, .text = now.iso });
+            }
+        } else {
+            if (rootAttrSpan(cache.raw_xml, def, "refreshedDate")) |span| try splices.append(arena, .{ .span = span, .text = "" });
+            if (rootAttrSpan(cache.raw_xml, def, "refreshedDateIso")) |span| try splices.append(arena, .{ .span = span, .text = "" });
+        }
+        if (insert.items.len > 0) {
+            try splices.append(arena, .{ .span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end }, .text = insert.items });
+        }
+
+        const records = if (records_xml) |xml| try renderRecords(arena, xml, fields, rows) else null;
+        return .{ .splices = try splices.toOwnedSlice(arena), .records = records, .record_count = @intCast(rows.len) };
+    }
+
+    /// The definition shapes this slice rebuilds — everything else
+    /// refuses. A worksheet source with plain database fields, each
+    /// with an inventory of simple string / number / blank items and
+    /// no date; no calculated or group field, no OLAP element.
+    pub fn checkShape(def: *const pivot_xml.CacheDefinition) RebuildError!void {
+        if (def.source.type != .worksheet or def.source.has_consolidation or def.source.range_sets.len != 0) return error.PivotShapeUnsupported;
+        if (def.has_other_children) return error.PivotShapeUnsupported;
+        if (def.fields_count_attr) |n| {
+            if (n != def.fields.len) return error.MalformedPivotXml;
+        }
+        for (def.fields) |f| {
+            if (f.formula != null or !f.database_field or f.has_other_children) return error.PivotShapeUnsupported;
+            const si = f.shared_items orelse return error.PivotShapeUnsupported;
+            if (si.has_other_children) return error.PivotShapeUnsupported;
+            if (si.contains_date or si.min_date != null or si.max_date != null) return error.PivotShapeUnsupported;
+            if (si.count) |n| {
+                if (n != si.items.len) return error.MalformedPivotXml;
+            }
+            for (si.items) |it| {
+                if (!it.simple) return error.PivotShapeUnsupported;
+                switch (it.kind) {
+                    .s, .n, .m => {},
+                    .b, .d, .e, .other => return error.PivotShapeUnsupported,
+                }
+            }
+        }
+    }
+
+    /// The whole ` name="value"` of a root attribute, leading
+    /// whitespace included — what removing it takes out. Null when the
+    /// root does not carry it, or when the bytes around the value are
+    /// not the `name = "value"` the parser read it from.
+    fn rootAttrSpan(src: []const u8, def: *const pivot_xml.CacheDefinition, name: []const u8) ?pivot_xml.Span {
+        const value = def.rootAttrValueSpan(src, name) orelse return null;
+        const lo = def.root_attrs.start;
+        if (value.start <= lo + 1 or value.end >= src.len) return null;
+        var i = value.start - 1;
+        if (src[i] != '"' and src[i] != '\'') return null;
+        i -= 1;
+        while (i > lo and isXmlSpace(src[i])) i -= 1;
+        if (src[i] != '=') return null;
+        i -= 1;
+        while (i > lo and isXmlSpace(src[i])) i -= 1;
+        if (i + 1 < lo + name.len) return null;
+        const name_start = i + 1 - name.len;
+        if (!std.mem.eql(u8, src[name_start .. i + 1], name)) return null;
+        var start = name_start;
+        while (start > lo and isXmlSpace(src[start - 1])) start -= 1;
+        return .{ .start = start, .end = value.end + 1 };
+    }
+
+    fn isXmlSpace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+    }
+
+    /// `prefix:` for a prefixed root, empty otherwise.
+    fn qualified(arena: Allocator, prefix: []const u8) RebuildError![]const u8 {
+        if (prefix.len == 0) return "";
+        return std.mem.concat(arena, u8, &.{ prefix, ":" });
+    }
+
+    /// One field's rebuilt inventory and how its records spell it.
+    const Field = struct {
+        /// The rebuilt `<sharedItems …>` element.
+        xml: []const u8,
+        /// Records spell this field as `<x v>` into the inventory;
+        /// otherwise inline (`<n>` / `<m>`).
+        indexed: bool,
+        /// Per data row, the item index — meaningful when `indexed`.
+        index_of_row: []const u32,
+
+        const Item = struct {
+            /// As written, for an item the inventory already had.
+            raw: ?[]const u8,
+            /// The value: a number's `f64` and lexical (`<n>`), a
+            /// string decoded (`<s>`) — retained and appended alike, so
+            /// the element can describe the items it holds.
+            num: f64 = 0,
+            lex: []const u8 = "",
+            text: []const u8 = "",
+            kind: pivot_xml.SharedItems.Item.Kind,
+        };
+
+        /// What a `sharedItems` says of its contents: the `contains*`
+        /// flags, the integer and long-text hints, the extrema. Fed
+        /// the items the element will hold for an enumerated field —
+        /// retained and appended, since a flag that ignored a retained
+        /// `<s>` would deny the child it sits beside (Codex #205 r3
+        /// REL-303) — and the rows for an inline one.
+        const Description = struct {
+            has_string: bool = false,
+            has_number: bool = false,
+            has_blank: bool = false,
+            all_int: bool = true,
+            long_text: bool = false,
+            min: f64 = 0,
+            max: f64 = 0,
+            min_lex: []const u8 = "",
+            max_lex: []const u8 = "",
+
+            fn blank(self: *Description) void {
+                self.has_blank = true;
+            }
+
+            fn number(self: *Description, x: f64, lex: []const u8) void {
+                if (!self.has_number or x < self.min) {
+                    self.min = x;
+                    self.min_lex = lex;
+                }
+                if (!self.has_number or x > self.max) {
+                    self.max = x;
+                    self.max_lex = lex;
+                }
+                self.has_number = true;
+                if (!isInteger(x)) self.all_int = false;
+            }
+
+            fn string(self: *Description, s: []const u8) RebuildError!void {
+                self.has_string = true;
+                const cps = std.unicode.utf8CountCodepoints(s) catch return error.PivotShapeUnsupported;
+                if (cps > 255) self.long_text = true;
+            }
+        };
+
+        /// `spelt_indexed` is how the records as written spelt this
+        /// field — `<x>` into the inventory, or a value inline — when
+        /// there was a record to read it from; without one, an
+        /// inventory with items is the enumerated one. An explicit
+        /// `count` alone says nothing (Codex #205 r10 REL-1001).
+        fn build(arena: Allocator, si: pivot_xml.SharedItems, rows: []const Row, k: usize, p: []const u8, spelt_indexed: ?bool) RebuildError!Field {
+            var items: std.ArrayListUnmanaged(Item) = .empty;
+            var by_string: std.StringHashMapUnmanaged(u32) = .empty;
+            var by_number: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+            var blank_at: ?u32 = null;
+
+            // The inventory as written, in its order.
+            for (si.items) |it| {
+                const idx: u32 = @intCast(items.items.len);
+                var item: Item = .{ .raw = it.raw, .kind = it.kind };
+                switch (it.kind) {
+                    .m => {
+                        if (blank_at == null) blank_at = idx;
+                    },
+                    .n => {
+                        // The value as written may spell itself with
+                        // references (`&#49;`); it is matched by what
+                        // it is (Codex #205 r8 REL-802).
+                        const lex = decodeLexical(arena, it.v orelse return error.MalformedPivotXml) catch |e| switch (e) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.MalformedPivotXml,
+                        };
+                        const x = parseNumber(lex) orelse return error.MalformedPivotXml;
+                        const gop = try by_number.getOrPut(arena, numberKey(x));
+                        if (!gop.found_existing) gop.value_ptr.* = idx;
+                        item.num = x;
+                        item.lex = lex;
+                    },
+                    .s => {
+                        const text = try decodeItem(arena, it.v orelse return error.MalformedPivotXml);
+                        const gop = try by_string.getOrPut(arena, try foldOrRefuse(arena, text));
+                        if (!gop.found_existing) gop.value_ptr.* = idx;
+                        item.text = text;
+                    },
+                    else => unreachable, // checkShape
+                }
+                try items.append(arena, item);
+            }
+            // Records spelt inline beside an inventory that holds items
+            // are not one shape: an inline rebuild would emit the
+            // attribute-only element and drop every item a consumer
+            // indexes (Codex #205 r11 REL-1101).
+            if (spelt_indexed == false and si.items.len > 0) return error.PivotShapeUnsupported;
+            const was_indexed = spelt_indexed orelse (si.items.len > 0);
+
+            // Pass one: what the column holds — whether the records can
+            // stay inline.
+            var rows_string = false;
+            var rows_number = false;
+            for (rows) |r| switch (r[k]) {
+                .blank => {},
+                .number => |lex| {
+                    if (parseNumber(lex) == null) return error.PivotShapeUnsupported;
+                    rows_number = true;
+                },
+                .string => rows_string = true,
+            };
+            const indexed = was_indexed or rows_string or !rows_number;
+
+            // Pass two: index every row, appending what the inventory
+            // lacks in first-appearance order.
+            const index_of_row = try arena.alloc(u32, rows.len);
+            @memset(index_of_row, 0);
+            if (indexed) {
+                for (rows, 0..) |r, i| {
+                    const next: u32 = @intCast(items.items.len);
+                    switch (r[k]) {
+                        .blank => {
+                            if (blank_at) |at| {
+                                index_of_row[i] = at;
+                            } else {
+                                blank_at = next;
+                                index_of_row[i] = next;
+                                try items.append(arena, .{ .raw = null, .text = "", .kind = .m });
+                            }
+                        },
+                        .number => |lex| {
+                            const x = parseNumber(lex).?;
+                            const gop = try by_number.getOrPut(arena, numberKey(x));
+                            if (!gop.found_existing) {
+                                gop.value_ptr.* = next;
+                                try items.append(arena, .{ .raw = null, .num = x, .lex = lex, .kind = .n });
+                            }
+                            index_of_row[i] = gop.value_ptr.*;
+                        },
+                        .string => |s| {
+                            const gop = try by_string.getOrPut(arena, try foldOrRefuse(arena, s));
+                            if (!gop.found_existing) {
+                                gop.value_ptr.* = next;
+                                try items.append(arena, .{ .raw = null, .text = s, .kind = .s });
+                            }
+                            index_of_row[i] = gop.value_ptr.*;
+                        },
+                    }
+                }
+            }
+            if (items.items.len > std.math.maxInt(u32)) return error.PivotShapeUnsupported;
+
+            // What the element says of itself — from its items when it
+            // enumerates them, from the rows when the records are inline.
+            var d: Description = .{};
+            if (indexed) {
+                for (items.items) |it| switch (it.kind) {
+                    .m => d.blank(),
+                    .n => d.number(it.num, it.lex),
+                    .s => try d.string(it.text),
+                    else => unreachable,
+                };
+            } else {
+                for (rows) |r| switch (r[k]) {
+                    .blank => d.blank(),
+                    .number => |lex| d.number(parseNumber(lex).?, lex),
+                    .string => unreachable, // a string enumerates the field
+                };
+            }
+
+            // The element, attributes in the schema's order, defaults
+            // omitted — the spelling Excel writes.
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "sharedItems");
+            if (d.has_number and !d.has_string and !d.has_blank) try out.appendSlice(arena, " containsSemiMixedTypes=\"0\"");
+            if (!d.has_number and !d.has_string) try out.appendSlice(arena, " containsNonDate=\"0\"");
+            if (!d.has_string) try out.appendSlice(arena, " containsString=\"0\"");
+            if (d.has_blank) try out.appendSlice(arena, " containsBlank=\"1\"");
+            if (d.has_string and d.has_number) try out.appendSlice(arena, " containsMixedTypes=\"1\"");
+            if (d.has_number) {
+                try out.appendSlice(arena, " containsNumber=\"1\"");
+                if (d.all_int) try out.appendSlice(arena, " containsInteger=\"1\"");
+                try out.appendSlice(arena, " minValue=\"");
+                try out.appendSlice(arena, d.min_lex);
+                try out.appendSlice(arena, "\" maxValue=\"");
+                try out.appendSlice(arena, d.max_lex);
+                try out.append(arena, '"');
+            }
+            if (indexed) {
+                try out.appendSlice(arena, " count=\"");
+                try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{items.items.len}));
+                try out.append(arena, '"');
+            }
+            if (d.long_text) try out.appendSlice(arena, " longText=\"1\"");
+            if (indexed and items.items.len > 0) {
+                try out.append(arena, '>');
+                for (items.items) |it| {
+                    if (it.raw) |raw| {
+                        try out.appendSlice(arena, raw);
+                        continue;
+                    }
+                    try out.append(arena, '<');
+                    try out.appendSlice(arena, p);
+                    switch (it.kind) {
+                        .m => try out.appendSlice(arena, "m/>"),
+                        .n => {
+                            try out.appendSlice(arena, "n v=\"");
+                            try out.appendSlice(arena, it.lex);
+                            try out.appendSlice(arena, "\"/>");
+                        },
+                        .s => {
+                            try out.appendSlice(arena, "s v=\"");
+                            try out.appendSlice(arena, try formula.decode.encodeAuthoredString(arena, it.text));
+                            try out.appendSlice(arena, "\"/>");
+                        },
+                        else => unreachable,
+                    }
+                }
+                try out.appendSlice(arena, "</");
+                try out.appendSlice(arena, p);
+                try out.appendSlice(arena, "sharedItems>");
+            } else {
+                try out.appendSlice(arena, "/>");
+            }
+            return .{ .xml = out.items, .indexed = indexed, .index_of_row = index_of_row };
+        }
+    };
+
+    /// The records part as written, checked to be a shape the rebuild
+    /// carries — one `<r>` per record, each holding exactly one value
+    /// element per field, childless, under the part's prefix, with no
+    /// qualified attribute, nothing else anywhere (Codex #205 r3
+    /// REL-304, r4 REL-403, r6 REL-602) — and read for how each field
+    /// spelt its values: `<x>` into the inventory (true), inline
+    /// (false), or unknown where no record spoke (null). A field spelt
+    /// both ways is not one shape (r10 REL-1001).
+    fn inspectRecords(arena: Allocator, xml: []const u8, field_count: usize) RebuildError![]?bool {
+        const spelt = try arena.alloc(?bool, field_count);
+        @memset(spelt, null);
+        const root = pivot_xml.scanRoot(xml, "pivotCacheRecords") catch |e| return mapRecordsParse(e);
+        var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+        while (kids.next() catch |e| return mapRecordsParse(e)) |k| {
+            if (!std.mem.eql(u8, k.local, "r")) return error.PivotShapeUnsupported;
+            if (pivot_xml.hasAnyAttr(k.attrs(xml))) return error.PivotShapeUnsupported;
+            var vals = pivot_xml.Children.init(xml, k.hit, k.end, root.prefix, k.env);
+            var j: usize = 0;
+            while (vals.next() catch |e| return mapRecordsParse(e)) |v| {
+                if (v.local.len != 1) return error.PivotShapeUnsupported;
+                switch (v.local[0]) {
+                    'x', 'n', 's', 'm', 'b', 'd', 'e' => {},
+                    else => return error.PivotShapeUnsupported,
+                }
+                if (pivot_xml.hasQualifiedAttr(v.attrs(xml))) return error.PivotShapeUnsupported;
+                if (!pivot_xml.isBlank(xml[v.hit.after_tag_close..v.end])) return error.PivotShapeUnsupported;
+                if (j >= field_count) return error.PivotShapeUnsupported;
+                const is_x = v.local[0] == 'x';
+                if (spelt[j]) |was| {
+                    if (was != is_x) return error.PivotShapeUnsupported;
+                } else spelt[j] = is_x;
+                j += 1;
+            }
+            if (j != field_count) return error.PivotShapeUnsupported;
+            if (vals.skipped > 0 or vals.other) return error.PivotShapeUnsupported;
+        }
+        if (kids.skipped > 0 or kids.other) return error.PivotShapeUnsupported;
+        return spelt;
+    }
+
+    /// The records part: the root tag as written with `count` set,
+    /// one `<r>` per row — `<x v>` for an indexed field, `<n v>` /
+    /// `<m/>` inline for the rest — the close, and whatever followed
+    /// the root. Runs after `inspectRecords` read the part.
+    fn renderRecords(arena: Allocator, xml: []const u8, fields: []const Field, rows: []const Row) RebuildError![]u8 {
+        const root = pivot_xml.scanRoot(xml, "pivotCacheRecords") catch |e| return mapRecordsParse(e);
+        const p = try qualified(arena, root.prefix);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(arena, xml[0..root.hit.attrs_start]);
+        const attrs = xml[root.hit.attrs_start..root.hit.attrs_end];
+        const count_text = try std.fmt.allocPrint(arena, "{d}", .{rows.len});
+        if (wbxml.getAttr(attrs, "count")) |v| {
+            const off = @intFromPtr(v.ptr) - @intFromPtr(attrs.ptr);
+            try out.appendSlice(arena, attrs[0..off]);
+            try out.appendSlice(arena, count_text);
+            try out.appendSlice(arena, attrs[off + v.len ..]);
+        } else {
+            try out.appendSlice(arena, attrs);
+            try out.appendSlice(arena, " count=\"");
+            try out.appendSlice(arena, count_text);
+            try out.append(arena, '"');
+        }
+        try out.append(arena, '>');
+        for (rows, 0..) |r, i| {
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "r>");
+            for (fields, 0..) |f, k| {
+                try out.append(arena, '<');
+                try out.appendSlice(arena, p);
+                if (f.indexed) {
+                    try out.appendSlice(arena, "x v=\"");
+                    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{f.index_of_row[i]}));
+                    try out.appendSlice(arena, "\"/>");
+                    continue;
+                }
+                switch (r[k]) {
+                    .blank => try out.appendSlice(arena, "m/>"),
+                    .number => |lex| {
+                        try out.appendSlice(arena, "n v=\"");
+                        try out.appendSlice(arena, lex);
+                        try out.appendSlice(arena, "\"/>");
+                    },
+                    // A string forces the field indexed.
+                    .string => unreachable,
+                }
+            }
+            try out.appendSlice(arena, "</");
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "r>");
+        }
+        try out.appendSlice(arena, "</");
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "pivotCacheRecords>");
+        // What followed the root — a comment, a processing instruction,
+        // whitespace — as written (Codex #205 r9 REL-903).
+        try out.appendSlice(arena, xml[root.after..]);
+        return out.items;
+    }
+
+    /// An xsd:double lexical — `[+-]? (D+ ('.' D*)? | '.' D+)
+    /// ([eE] [+-]? D+)?` — as a finite value; null otherwise. Zig's
+    /// parser reads more (`0x1p0`, `1_0`, `inf`), none of which a cache
+    /// may spell, so the grammar is checked first (Codex #205 r9
+    /// REL-901).
+    pub fn parseNumber(lex: []const u8) ?f64 {
+        if (!isXsdDoubleLexical(lex)) return null;
+        const x = std.fmt.parseFloat(f64, lex) catch return null;
+        if (!std.math.isFinite(x)) return null;
+        return x;
+    }
+
+    fn isXsdDoubleLexical(s: []const u8) bool {
+        var i: usize = 0;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        var int_digits: usize = 0;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) int_digits += 1;
+        var frac_digits: usize = 0;
+        if (i < s.len and s[i] == '.') {
+            i += 1;
+            while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) frac_digits += 1;
+        }
+        if (int_digits == 0 and frac_digits == 0) return false;
+        if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+            i += 1;
+            if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+            var exp_digits: usize = 0;
+            while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) exp_digits += 1;
+            if (exp_digits == 0) return false;
+        }
+        return i == s.len;
+    }
+
+    /// `containsInteger`'s reading: integral and within a 32-bit int —
+    /// a hint Excel sets for such fields, safe to leave unset.
+    fn isInteger(x: f64) bool {
+        return @trunc(x) == x and x >= -2147483648.0 and x <= 2147483647.0;
+    }
+
+    /// One key per numeric value: `-0` and `0` are one item.
+    fn numberKey(x: f64) u64 {
+        return @bitCast(if (x == 0) @as(f64, 0) else x);
+    }
+
+    fn foldOrRefuse(arena: Allocator, s: []const u8) RebuildError![]const u8 {
+        const folded = fold(arena, s) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        return folded orelse error.PivotShapeUnsupported;
+    }
+
+    /// An inventory string as written (`<s v>` is an ST_Xstring
+    /// attribute, like a field name).
+    fn decodeItem(arena: Allocator, raw: []const u8) RebuildError![]const u8 {
+        return formula.decode.decodeAt(arena, .pivot_field_name, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+    }
+
+    fn mapRecordsParse(e: pivot_xml.Error) RebuildError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.MalformedXml => error.MalformedPivotXml,
+        };
     }
 };
 
@@ -4558,4 +5371,1043 @@ test "edit: allocation failure in the cache splice leaves nothing behind" {
     var o = try Opened.open(testing.allocator, io, path);
     defer o.deinit(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, cacheEditForFailures, .{&o});
+}
+
+// ─── S7b-4: the engine ───────────────────────────────────────────────
+
+const fixture_records_head =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" count="
+;
+
+/// The fixture's three data rows (`Data!A2:C4`) as the reader hands
+/// them to the engine.
+const fixture_rows = [_]engine.Row{
+    &.{ .{ .string = "East" }, .{ .number = "3" }, .{ .number = "1.5" } },
+    &.{ .{ .string = "West" }, .{ .number = "4" }, .{ .number = "2.5" } },
+    &.{ .{ .string = "East" }, .{ .number = "5" }, .{ .number = "3.5" } },
+};
+
+const Rebuilt = struct { definition: []u8, records: []u8 };
+
+/// The workbook's composition, on the fixture: plan the edit on sheet
+/// 0, rebuild from `rows` (the data rows AFTER the edit), render both
+/// parts.
+fn rebuildFixture(alloc: Allocator, arena: Allocator, o: *const Opened, axis: edit.Axis, idx: u32, kind: edit.Kind, rows: []const engine.Row, refreshed: ?engine.Refreshed) !Rebuilt {
+    const cache = &o.pivots.caches[0];
+    var plan = try edit.planCacheEdit(arena, cache, 0, axis, idx, kind);
+    try testing.expect(plan.changed);
+    try testing.expect(plan.rebuild != null);
+    const records_xml = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rb = try engine.rebuild(arena, cache, rows, records_xml, refreshed);
+    try plan.splices.appendSlice(arena, rb.splices);
+    const definition = (try edit.applyPlan(alloc, cache, &plan)).?;
+    errdefer alloc.free(definition);
+    return .{ .definition = definition, .records = try alloc.dupe(u8, rb.records.?) };
+}
+
+/// `src` with exactly one `old` replaced by `new`.
+fn replacedOnce(alloc: Allocator, src: []const u8, old: []const u8, new: []const u8) ![]u8 {
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, old));
+    return std.mem.replaceOwned(u8, alloc, src, old, new);
+}
+
+fn expectRecords(alloc: Allocator, got: []const u8, count: []const u8, body: []const u8) !void {
+    const want = try std.mem.concat(alloc, u8, &.{ fixture_records_head, count, "\">", body, "</pivotCacheRecords>" });
+    defer alloc.free(want);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "engine: an insert inside adds one blank record — every inventory keeps its order, the blank appends, counts and extremes follow, the root is redated" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_insert.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Row 2 is the first data row: the blank lands first.
+    const rows = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 2, .insert);
+    try testing.expectEqual(@as(usize, 4), rows.len);
+    try testing.expect(rows[0][0] == .blank and rows[0][2] == .blank);
+    try testing.expectEqualStrings("East", rows[1][0].string);
+
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 2, .insert, rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
+    defer testing.allocator.free(rb.definition);
+    defer testing.allocator.free(rb.records);
+
+    const src = o.pivots.caches[0].raw_xml;
+    var want = try replacedOnce(arena, src, "refreshedDate=\"45000.5\"", "refreshedDate=\"46000.5\"");
+    want = try replacedOnce(arena, want, "recordCount=\"3\">", "recordCount=\"4\" refreshOnLoad=\"1\">");
+    want = try replacedOnce(arena, want, "ref=\"A1:C4\"", "ref=\"A1:C5\"");
+    want = try replacedOnce(arena, want, "<sharedItems count=\"2\"><s v=\"East\"/><s v=\"West\"/></sharedItems>", "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>");
+    want = try replacedOnce(arena, want, "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"3\" maxValue=\"5\"/>", "<sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"3\" maxValue=\"5\"/>");
+    want = try replacedOnce(arena, want, "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" minValue=\"1.5\" maxValue=\"3.5\"/>", "<sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" minValue=\"1.5\" maxValue=\"3.5\"/>");
+    try testing.expectEqualStrings(want, rb.definition);
+    try expectRecords(testing.allocator, rb.records, "4", "<r><x v=\"2\"/><m/><m/></r><r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r><r><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r>");
+}
+
+test "engine: a delete inside drops one record and keeps the item it alone referenced — a consumer's index still names it" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_delete.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Row 3 is `West`: gone from the records, kept in the inventory.
+    const rows = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 3, .delete);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("5", rows[1][1].number);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
+    defer testing.allocator.free(rb.definition);
+    defer testing.allocator.free(rb.records);
+
+    const src = o.pivots.caches[0].raw_xml;
+    var want = try replacedOnce(arena, src, "refreshedDate=\"45000.5\"", "refreshedDate=\"46000.5\"");
+    want = try replacedOnce(arena, want, "recordCount=\"3\">", "recordCount=\"2\" refreshOnLoad=\"1\">");
+    want = try replacedOnce(arena, want, "ref=\"A1:C4\"", "ref=\"A1:C3\"");
+    // The inventories are byte-identical: nothing new, nothing dropped,
+    // the extremes unchanged (3..5 and 1.5..3.5 survive).
+    try testing.expectEqualStrings(want, rb.definition);
+    try expectRecords(testing.allocator, rb.records, "2", "<r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r>");
+}
+
+test "engine: a stale snapshot meets the cells — a value the inventory lacks appends, a string matches case-insensitively, a string in a numeric field enumerates it, mixed types and blanks are flagged, markup is escaped" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_stale.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const long = try arena.alloc(u8, 256);
+    @memset(long, 'x');
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "east" }, .{ .number = "2.25" }, .{ .number = "10" } },
+        &.{ .{ .string = "A&B<\"c\">" }, .{ .string = "n/a" }, .blank },
+        &.{ .{ .number = "7" }, .{ .number = "3" }, .{ .number = "1E+15" } },
+        &.{ .{ .string = long }, .blank, .{ .number = "-0" } },
+    };
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
+    defer testing.allocator.free(rb.definition);
+    defer testing.allocator.free(rb.records);
+
+    // Region: `east` is item 0; the markup string, the number and the
+    // 256-character string append after the inventory, in order.
+    const want_region = try std.fmt.allocPrint(arena, "<sharedItems containsMixedTypes=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"7\" maxValue=\"7\" count=\"5\" longText=\"1\"><s v=\"East\"/><s v=\"West\"/><s v=\"A&amp;B&lt;&quot;c&quot;&gt;\"/><n v=\"7\"/><s v=\"{s}\"/></sharedItems>", .{long});
+    try testing.expect(std.mem.indexOf(u8, rb.definition, want_region) != null);
+    // Qty was inline (numbers only); a string enumerates it, in
+    // first-appearance order, and the blank follows.
+    try testing.expect(std.mem.indexOf(u8, rb.definition, "<sharedItems containsBlank=\"1\" containsMixedTypes=\"1\" containsNumber=\"1\" minValue=\"2.25\" maxValue=\"3\" count=\"4\"><n v=\"2.25\"/><s v=\"n/a\"/><n v=\"3\"/><m/></sharedItems>") != null);
+    // Price stays inline: numbers and a blank; `1E+15` is integral but
+    // past the 32-bit hint, `-0` is a number like any other.
+    try testing.expect(std.mem.indexOf(u8, rb.definition, "<sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" minValue=\"-0\" maxValue=\"1E+15\"/>") != null);
+    try expectRecords(testing.allocator, rb.records, "4", "<r><x v=\"0\"/><x v=\"0\"/><n v=\"10\"/></r><r><x v=\"2\"/><x v=\"1\"/><m/></r><r><x v=\"3\"/><x v=\"2\"/><n v=\"1E+15\"/></r><r><x v=\"4\"/><x v=\"3\"/><n v=\"-0\"/></r>");
+}
+
+test "engine: an all-blank column, no clock, and a root without the counted attributes" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_blank.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "East" }, .blank, .{ .number = "1.5" } },
+    };
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, null);
+        defer testing.allocator.free(rb.definition);
+        defer testing.allocator.free(rb.records);
+        // No clock: `refreshedDate` is removed, whitespace and all.
+        try testing.expect(std.mem.indexOf(u8, rb.definition, "refreshedDate") == null);
+        try testing.expect(std.mem.indexOf(u8, rb.definition, "refreshedBy=\"zlsx\" createdVersion=\"6\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rb.definition, "recordCount=\"1\" refreshOnLoad=\"1\">") != null);
+        // An all-blank field is enumerated with its one blank item.
+        try testing.expect(std.mem.indexOf(u8, rb.definition, "<cacheField name=\"Qty\" numFmtId=\"0\"><sharedItems containsNonDate=\"0\" containsString=\"0\" containsBlank=\"1\" count=\"1\"><m/></sharedItems></cacheField>") != null);
+        try expectRecords(testing.allocator, rb.records, "1", "<r><x v=\"0\"/><x v=\"0\"/><n v=\"1.5\"/></r>");
+    }
+    // A root that carries neither `recordCount` nor `refreshedDate`
+    // gains both in one insertion, before the marker's.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", " refreshedDate=\"45000.5\"", "");
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", " recordCount=\"3\"", "");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    const rb = try rebuildFixture(testing.allocator, arena, &o, .row, 3, .delete, &rows, .{ .serial = 46001, .iso = "2025-12-14T00:00:00" });
+    defer testing.allocator.free(rb.definition);
+    defer testing.allocator.free(rb.records);
+    try testing.expect(std.mem.indexOf(u8, rb.definition, "minRefreshableVersion=\"3\" refreshOnLoad=\"1\" recordCount=\"1\" refreshedDate=\"46001\">") != null);
+}
+
+test "engine: rowsAfterEdit lands on the data row the edit named, header rows or none" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Header at row 1, data at 2..4: an insert at 4 lands before the
+    // last row; a delete at 4 drops it.
+    const ins = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 4, .insert);
+    try testing.expectEqual(@as(usize, 4), ins.len);
+    try testing.expect(ins[2][0] == .blank);
+    try testing.expectEqualStrings("East", ins[3][0].string);
+    const del = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 4, .delete);
+    try testing.expectEqual(@as(usize, 2), del.len);
+    try testing.expectEqualStrings("West", del[1][0].string);
+    // Headerless: row 1 is data index 0.
+    const del0 = try engine.rowsAfterEdit(arena, &fixture_rows, 3, 1, 1, .delete);
+    try testing.expectEqualStrings("West", del0[0][0].string);
+    // Off the data: not an edit the predicate admitted.
+    try testing.expectError(error.MalformedPivotXml, engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 1, .delete));
+    try testing.expectError(error.MalformedPivotXml, engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 5, .delete));
+    try testing.expectError(error.MalformedPivotXml, engine.rowsAfterEdit(arena, &fixture_rows, 3, 2, 6, .insert));
+}
+
+fn expectShape(alloc: Allocator, src: []const u8, old: []const u8, new: []const u8, want: anyerror) !void {
+    const xml = try replacedOnce(alloc, src, old, new);
+    defer alloc.free(xml);
+    var def = try pivot_xml.parseCacheDefinition(alloc, xml);
+    defer def.deinit(alloc);
+    try testing.expectError(want, engine.checkShape(&def));
+}
+
+test "engine: the shapes the slice refuses — calculated, group and OLAP elements, date inventories, items with children, a missing inventory; and the shapes it reads" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_shapes.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    const alloc = testing.allocator;
+    const src = o.pivots.caches[0].raw_xml;
+    try engine.checkShape(&o.pivots.caches[0].definition);
+
+    const price_field = "<cacheField name=\"Price\" numFmtId=\"0\">";
+    try expectShape(alloc, src, price_field, "<cacheField name=\"Price\" numFmtId=\"0\" formula=\"Qty*2\" databaseField=\"0\">", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, price_field, "<cacheField name=\"Price\" numFmtId=\"0\" databaseField=\"0\">", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, price_field, price_field ++ "<fieldGroup base=\"1\"/>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "</cacheFields>", "</cacheFields><cacheHierarchies count=\"0\"/>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "</cacheFields>", "</cacheFields><kpis count=\"0\"/>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<sharedItems count=\"2\"><s v=\"East\"/><s v=\"West\"/></sharedItems>", "<sharedItems containsSemiMixedTypes=\"0\" containsNonDate=\"0\" containsDate=\"1\" containsString=\"0\" minDate=\"2024-01-01T00:00:00\" maxDate=\"2024-01-02T00:00:00\" count=\"1\"><d v=\"2024-01-01T00:00:00\"/></sharedItems>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<s v=\"West\"/>", "<b v=\"1\"/>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<s v=\"West\"/>", "<e v=\"#N/A\"/>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<s v=\"West\"/>", "<s v=\"West\"><tpls c=\"1\"><tpl fld=\"0\" item=\"1\"/></tpls></s>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" minValue=\"1.5\" maxValue=\"3.5\"/>", "", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "<sharedItems count=\"2\">", "<sharedItems count=\"3\">", error.MalformedPivotXml);
+    try expectShape(alloc, src, "<cacheFields count=\"3\">", "<cacheFields count=\"4\">", error.MalformedPivotXml);
+    // A consolidation source, an external one: not a rectangle.
+    try expectShape(alloc, src, "<cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:C4\"/></cacheSource>", "<cacheSource type=\"consolidation\"><consolidation><rangeSets count=\"1\"><rangeSet sheet=\"Data\" ref=\"A1:C4\"/></rangeSets></consolidation></cacheSource>", error.PivotShapeUnsupported);
+    try expectShape(alloc, src, "type=\"worksheet\"", "type=\"external\" connectionId=\"1\"", error.PivotShapeUnsupported);
+    // The corpus' own shapes read: an `extLst` on the root and an
+    // inventory attribute Excel writes (`containsInteger`) are fine.
+    {
+        const xml = try replacedOnce(alloc, src, "</cacheFields>", "</cacheFields><extLst><ext uri=\"{725AE2AE-9491-48be-B2B4-4EB974FC3084}\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"><x14:pivotCacheDefinition pivotCacheId=\"2\"/></ext></extLst>");
+        defer alloc.free(xml);
+        var def = try pivot_xml.parseCacheDefinition(alloc, xml);
+        defer def.deinit(alloc);
+        try engine.checkShape(&def);
+    }
+}
+
+test "engine: the rectangle must be the schema — a wider or narrower one, no rows, or a records part carrying more than records refuse" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_width.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const records_xml = (try o.store.part(cache.records_part_name.?)).?.bytes;
+
+    const narrow = [_]engine.Row{&.{ .{ .string = "East" }, .{ .number = "3" } }};
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, cache, &narrow, records_xml, null));
+    const wide = [_]engine.Row{&.{ .{ .string = "East" }, .{ .number = "3" }, .{ .number = "1" }, .blank }};
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, cache, &wide, records_xml, null));
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, cache, &.{}, records_xml, null));
+    const ragged = [_]engine.Row{ fixture_rows[0], &.{ .{ .string = "East" }, .{ .number = "3" } } };
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, cache, &ragged, records_xml, null));
+    // A number lexical the reader would never pass.
+    const nan = [_]engine.Row{&.{ .{ .string = "East" }, .{ .number = "nan" }, .{ .number = "1" } }};
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, cache, &nan, records_xml, null));
+    // Records with an extension list: not carried over.
+    const ext = try replacedOnce(arena, records_xml, "</pivotCacheRecords>", "<extLst/></pivotCacheRecords>");
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, cache, &fixture_rows, ext, null));
+    // No records part at all: the definition alone.
+    const rb = try engine.rebuild(arena, cache, &fixture_rows, null, null);
+    try testing.expect(rb.records == null);
+    try testing.expectEqual(@as(u32, 3), rb.record_count);
+}
+
+test "engine: a Strict-prefixed part is rebuilt under its prefix — items, records and the root's close" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const def_xml =
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<x:pivotCacheDefinition xmlns:x="http://purl.oclc.org/ooxml/spreadsheetml/main" xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships" r:id="rId1" recordCount="1"><x:cacheSource type="worksheet"><x:worksheetSource sheet="Data" ref="A1:B2"/></x:cacheSource><x:cacheFields count="2"><x:cacheField name="K" numFmtId="0"><x:sharedItems count="1"><x:s v="a"/></x:sharedItems></x:cacheField><x:cacheField name="V" numFmtId="0"><x:sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" containsInteger="1" minValue="1" maxValue="1"/></x:cacheField></x:cacheFields></x:pivotCacheDefinition>
+    ;
+    const rec_xml =
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<x:pivotCacheRecords xmlns:x="http://purl.oclc.org/ooxml/spreadsheetml/main" count="1"><x:r><x:x v="0"/><x:n v="1"/></x:r></x:pivotCacheRecords>
+    ;
+    const def = try pivot_xml.parseCacheDefinition(arena, def_xml);
+    try testing.expectEqualStrings("x", def.prefix);
+    try testing.expectEqual(@as(usize, 1), def.fields[0].shared_items.?.items.len);
+    try testing.expectEqualStrings("<x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems>", def_xml[def.fields[0].shared_items.?.span.start..def.fields[0].shared_items.?.span.end]);
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = def,
+        .field_names = &.{ "K", "V" },
+        .field_formulas = &.{ null, null },
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "a" }, .{ .number = "1" } },
+        &.{ .{ .string = "b" }, .blank },
+    };
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_xml, .{ .serial = 46002.25, .iso = "2025-12-15T06:00:00" });
+    const out = try edit.spliceAll(arena, def_xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "<x:sharedItems count=\"2\"><x:s v=\"a\"/><x:s v=\"b\"/></x:sharedItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<x:sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "r:id=\"rId1\" recordCount=\"2\" refreshedDate=\"46002.25\">") != null);
+    try testing.expectEqualStrings(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<x:pivotCacheRecords xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\" count=\"2\"><x:r><x:x v=\"0\"/><x:n v=\"1\"/></x:r><x:r><x:x v=\"1\"/><x:m/></x:r></x:pivotCacheRecords>",
+        rb.records.?,
+    );
+}
+
+test "engine: the plan names the rectangle for the carriers the slice reads and none for the rest" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const kinds = [_]fixture.SourceKind{ .sheet_ref, .table_name, .defined_name };
+    for (kinds, 0..) |kind, i| {
+        const name = try std.fmt.allocPrint(arena, "s7b4_plan_{d}.xlsx", .{i});
+        const path = try tt.path(testing.allocator, io, name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, kind);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const inside = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 3, .insert);
+        try testing.expect(inside.changed);
+        try testing.expect(inside.rebuild.?.rect.eql(.{ .tl_col = 1, .tl_row = 1, .br_col = 3, .br_row = 4 }));
+        try testing.expectEqual(@as(u32, 1), inside.rebuild.?.header_rows);
+        // A pure shift plans no rebuild and no marker.
+        const above = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 1, .insert);
+        try testing.expect(!above.changed and above.rebuild == null);
+        // Another sheet: nothing.
+        const other = try edit.planCacheEdit(arena, &o.pivots.caches[0], 1, .row, 2, .insert);
+        try testing.expect(!other.changed and other.splices.items.len == 0);
+    }
+    // A headerless table: the rectangle's first row is data.
+    {
+        const path = try tt.path(testing.allocator, io, "s7b4_plan_headerless.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .table_name);
+        try fixture.patchPart(testing.allocator, io, path, "xl/tables/table1.xml", "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, 0), o.pivots.caches[0].resolution.sheet.header_rows);
+        const top = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 1, .delete);
+        try testing.expect(top.changed);
+        try testing.expectEqual(@as(u32, 0), top.rebuild.?.header_rows);
+    }
+    // Whole columns, an unbounded body, a consolidation set: changed,
+    // and nothing to rebuild from.
+    {
+        const path = try tt.path(testing.allocator, io, "s7b4_plan_cols.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "Data!$A:$C");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const plan = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 2, .insert);
+        try testing.expect(plan.changed and plan.rebuild == null);
+    }
+    {
+        const path = try tt.path(testing.allocator, io, "s7b4_plan_offset.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET(Data!$A$1,0,0,4,3)");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const plan = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 9, .insert);
+        try testing.expect(plan.changed and plan.rebuild == null);
+    }
+    {
+        const path = try tt.path(testing.allocator, io, "s7b4_plan_consolidation.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .consolidation);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const plan = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 2, .insert);
+        try testing.expect(plan.changed and plan.rebuild == null);
+    }
+}
+
+// ─── Codex #205 round 1 ──────────────────────────────────────────────
+
+test "engine: a close tag padded with whitespace bounds the inventory span — the splice takes the whole element, on either prefix (Codex #205 r1 REL-101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const plain = "<?xml version=\"1.0\"?><pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems \t></cacheField></cacheFields></pivotCacheDefinition>";
+    const strict = "<x:pivotCacheDefinition xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\"><x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems\n></x:cacheField></x:cacheFields></x:pivotCacheDefinition>";
+    const cases = [_]struct { xml: []const u8, want: []const u8 }{
+        .{ .xml = plain, .want = "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems \t>" },
+        .{ .xml = strict, .want = "<x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems\n>" },
+    };
+    for (cases) |c| {
+        const def = try pivot_xml.parseCacheDefinition(arena, c.xml);
+        const span = def.fields[0].shared_items.?.span;
+        try testing.expectEqualStrings(c.want, c.xml[span.start..span.end]);
+    }
+    // Rebuilt: the padded close is gone with the element, the part
+    // still one readable tree.
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = try pivot_xml.parseCacheDefinition(arena, plain),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = plain,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "b" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, plain, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "<sharedItems count=\"2\"><s v=\"a\"/><s v=\"b\"/></sharedItems></cacheField>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\t>") == null);
+    _ = try pivot_xml.parseCacheDefinition(arena, out);
+}
+
+test "engine: a namespace alias or rebinding below the root refuses the part; a foreign direct child reads but refuses the rebuild (Codex #205 r1 REL-102)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const strict_ns = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const inventory = "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>";
+
+    // Refused whole: the main namespace under another prefix on a
+    // descendant (either spelling of the URI), the default namespace
+    // rebound, the root's prefix rebound, and a root whose one main
+    // binding is not its own prefix.
+    const refused = [_][]const u8{
+        head ++ "<sharedItems count=\"1\" xmlns:y=\"" ++ main_ns ++ "\"><y:s v=\"a\"/></sharedItems>" ++ tail,
+        head ++ inventory ++ "<y:fieldGroup xmlns:y=\"" ++ strict_ns ++ "\" base=\"0\"/>" ++ tail,
+        head ++ inventory ++ "<fieldGroup xmlns=\"urn:vendor\" base=\"0\"/>" ++ tail,
+        "<x:pivotCacheDefinition xmlns:x=\"" ++ main_ns ++ "\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\" xmlns:x=\"urn:vendor\"><x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems></x:cacheField></x:cacheFields></x:pivotCacheDefinition>",
+        "<pivotCacheDefinition xmlns:y=\"" ++ main_ns ++ "\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource></pivotCacheDefinition>",
+    };
+    for (refused) |xml| try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml));
+
+    // A redundant redeclaration of the root's own binding changes
+    // nothing; a vendor prefix bound to a vendor URI is nobody's.
+    {
+        const def = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\" xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\"><s v=\"a\"/></sharedItems>" ++ tail);
+        try engine.checkShape(&def);
+    }
+
+    // A foreign direct child where the schema names only its own:
+    // read and flagged; the rebuild, which would regenerate around it,
+    // refuses.
+    const foreign = [_][]const u8{
+        head ++ "<sharedItems count=\"1\"><s v=\"a\"/><z:s xmlns:z=\"urn:vendor\" v=\"b\"/></sharedItems>" ++ tail,
+        head ++ inventory ++ "<z:fieldGroup xmlns:z=\"urn:vendor\" base=\"0\"/>" ++ tail,
+        head ++ inventory ++ "</cacheField></cacheFields><z:kpis xmlns:z=\"urn:vendor\"/></pivotCacheDefinition>",
+    };
+    for (foreign) |xml| {
+        const def = try pivot_xml.parseCacheDefinition(arena, xml);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+
+    // The records part: an aliased record refuses the read, a foreign
+    // direct child refuses the rebuild — neither is dropped.
+    const def_xml = head ++ inventory ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const aliased = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><y:r xmlns:y=\"" ++ main_ns ++ "\"><y:x v=\"0\"/></y:r></pivotCacheRecords>";
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, aliased, null));
+    const vendor = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r><z:r xmlns:z=\"urn:vendor\"/></pivotCacheRecords>";
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, vendor, null));
+    const clean = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords>";
+    const rb = try engine.rebuild(arena, &cache, &rows, clean, null);
+    try testing.expectEqualStrings(clean, rb.records.?);
+}
+
+test "engine: containsInteger's 32-bit interval is the signed one, both ends in (Codex #205 r1 REL-105)" {
+    try testing.expect(engine.isInteger(-2147483648));
+    try testing.expect(engine.isInteger(2147483647));
+    try testing.expect(engine.isInteger(0));
+    try testing.expect(!engine.isInteger(-2147483649));
+    try testing.expect(!engine.isInteger(2147483648));
+    try testing.expect(!engine.isInteger(1.5));
+}
+
+test "engine: an explicitly closed empty item is the self-closing one — kept as written on either prefix; a child still refuses (Codex #205 r2 REL-201)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const xml = head ++ "<sharedItems containsMixedTypes=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" containsBlank=\"1\" count=\"3\"><s v=\"a\"></s><n v=\"1\"></n><m>\n</m></sharedItems>" ++ tail;
+    const def = try pivot_xml.parseCacheDefinition(arena, xml);
+    const items = def.fields[0].shared_items.?.items;
+    try testing.expectEqual(@as(usize, 3), items.len);
+    for (items) |it| try testing.expect(it.simple);
+    try testing.expectEqualStrings("<s v=\"a\"></s>", items[0].raw);
+    try engine.checkShape(&def);
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = def,
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "b" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "count=\"4\"><s v=\"a\"></s><n v=\"1\"></n><m>\n</m><s v=\"b\"/></sharedItems>") != null);
+    _ = try pivot_xml.parseCacheDefinition(arena, out);
+
+    // Strict, explicit close.
+    const strict = "<x:pivotCacheDefinition xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\"><x:sharedItems count=\"1\"><x:s v=\"a\"></x:s></x:sharedItems></x:cacheField></x:cacheFields></x:pivotCacheDefinition>";
+    const sdef = try pivot_xml.parseCacheDefinition(arena, strict);
+    try testing.expect(sdef.fields[0].shared_items.?.items[0].simple);
+    try engine.checkShape(&sdef);
+
+    // A child is a child.
+    const nested = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s v=\"a\"><tpls c=\"1\"><tpl fld=\"0\" item=\"0\"/></tpls></s></sharedItems>" ++ tail);
+    try testing.expect(!nested.fields[0].shared_items.?.items[0].simple);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&nested));
+}
+
+test "engine: a rebuilt inventory describes the items it holds — a retained string, number, blank or long text sets the flags the rows alone would not (Codex #205 r3 REL-303)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const long = try arena.alloc(u8, 256);
+    @memset(long, 'y');
+    const Case = struct { inventory: []const u8, row: engine.Value, want: []const u8 };
+    const cases = [_]Case{
+        // Retained string + number, rows all integral numbers: mixed, not
+        // integer (1.5 is retained), extrema over the items.
+        .{ .inventory = "<sharedItems count=\"2\"><s v=\"East\"/><n v=\"1.5\"/></sharedItems>", .row = .{ .number = "7" }, .want = "<sharedItems containsMixedTypes=\"1\" containsNumber=\"1\" minValue=\"1.5\" maxValue=\"7\" count=\"3\"><s v=\"East\"/><n v=\"1.5\"/><n v=\"7\"/></sharedItems>" },
+        // Retained blank, rows a string.
+        .{ .inventory = "<sharedItems containsBlank=\"1\" count=\"1\"><m/></sharedItems>", .row = .{ .string = "a" }, .want = "<sharedItems containsBlank=\"1\" count=\"2\"><m/><s v=\"a\"/></sharedItems>" },
+        // Retained long text, rows a short one.
+        .{ .inventory = try std.fmt.allocPrint(arena, "<sharedItems count=\"1\" longText=\"1\"><s v=\"{s}\"/></sharedItems>", .{long}), .row = .{ .string = "a" }, .want = try std.fmt.allocPrint(arena, "<sharedItems count=\"2\" longText=\"1\"><s v=\"{s}\"/><s v=\"a\"/></sharedItems>", .{long}) },
+        // Retained numbers only, rows a number: still semi-mixed 0 /
+        // string 0, the integer hint from every item.
+        .{ .inventory = "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"2\" maxValue=\"2\" count=\"1\"><n v=\"2\"/></sharedItems>", .row = .{ .number = "9" }, .want = "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"2\" maxValue=\"9\" count=\"2\"><n v=\"2\"/><n v=\"9\"/></sharedItems>" },
+    };
+    for (cases) |c| {
+        const xml = try std.mem.concat(arena, u8, &.{ head, c.inventory, tail });
+        const cache: PivotCache = .{
+            .cache_id = null,
+            .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+            .records_part_name = null,
+            .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+            .field_names = &.{"K"},
+            .field_formulas = &.{null},
+            .source = .{},
+            .resolution = .none,
+            .range_set_sources = &.{},
+            .range_set_resolutions = &.{},
+            .consumer_count = 0,
+            .raw_xml = xml,
+        };
+        const rows = [_]engine.Row{&.{c.row}};
+        const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+        const out = try edit.spliceAll(arena, xml, rb.splices);
+        try testing.expect(std.mem.indexOf(u8, out, c.want) != null);
+    }
+}
+
+test "engine: a main-namespace binding first introduced below the root refuses; a record holding anything but childless value elements refuses (Codex #205 r3 REL-302, REL-304)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    // The root never bound the main namespace: a descendant cannot be
+    // the one to, on either spelling of the root.
+    const late = [_][]const u8{
+        "<pivotCacheDefinition recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\" xmlns=\"" ++ main_ns ++ "\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>",
+        "<x:pivotCacheDefinition recordCount=\"1\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\"><x:sharedItems count=\"1\" xmlns:x=\"" ++ main_ns ++ "\"><x:s v=\"a\"/></x:sharedItems></x:cacheField></x:cacheFields></x:pivotCacheDefinition>",
+    };
+    for (late) |xml| try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml));
+
+    const def_xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>";
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    const unsupported = [_][]const u8{
+        rec_head ++ "<r><x v=\"0\"/><extLst/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/><z:q xmlns:z=\"urn:vendor\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"><t/></x></r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/><y v=\"1\"/></r></pivotCacheRecords>",
+    };
+    for (unsupported) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
+    // A binding introduced on a record refuses the read.
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords count=\"1\"><r xmlns=\"" ++ main_ns ++ "\"><x v=\"0\"/></r></pivotCacheRecords>", null));
+    // Every value kind, explicitly closed around nothing, reads — one
+    // per record, a record being one value per field: `<x>` against
+    // the stocked inventory, the inline kinds against an item-less one
+    // (inline records beside items are not one shape — r11 REL-1101).
+    {
+        const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"></x></r></pivotCacheRecords>", null);
+        try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    }
+    const inline_xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\"/></cacheField></cacheFields></pivotCacheDefinition>";
+    const inline_cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, inline_xml),
+        .field_names = &.{"V"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = inline_xml,
+    };
+    const number_rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    for ([_][]const u8{ "<n v=\"1\"></n>", "<s v=\"q\"></s>", "<m></m>", "<b v=\"1\"></b>", "<d v=\"2024-01-01T00:00:00\"></d>", "<e v=\"#N/A\"></e>" }) |one| {
+        const part = try std.mem.concat(arena, u8, &.{ rec_head, "<r>", one, "</r></pivotCacheRecords>" });
+        const rb = try engine.rebuild(arena, &inline_cache, &number_rows, part, null);
+        try testing.expectEqualStrings(rec_head ++ "<r><n v=\"1\"/></r></pivotCacheRecords>", rb.records.?);
+    }
+}
+
+test "engine: a records part shared by two definitions is a graph that refuses (Codex #205 r3 REL-301)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b4_r3_shared_records.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.writeWithOrphanCache(testing.allocator, io, path, .sheet_ref);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        o.deinit(testing.allocator);
+    }
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels", "Target=\"pivotCacheRecords2.xml\"", "Target=\"pivotCacheRecords1.xml\"");
+    try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, path));
+}
+
+test "engine: character data or a comment between the children of a records part, a record or an inventory refuses; a name twice on one tag refuses the part (Codex #205 r4 REL-403, REL-405)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const def_xml = head ++ "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    const lossy = [_][]const u8{
+        rec_head ++ "opaque<r><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r>head<x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/>tail</r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/></r>trailer</pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/></r><!-- lost --></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/><![CDATA[lost]]></r></pivotCacheRecords>",
+    };
+    for (lossy) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
+    // Whitespace between and around is nothing.
+    const spaced = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">\n  <r>\n    <x v=\"0\"/>\n  </r>\n</pivotCacheRecords>";
+    const rb = try engine.rebuild(arena, &cache, &rows, spaced, null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    // An inventory with text between its items.
+    const chatty = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s v=\"a\"/>junk</sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&chatty));
+    // A duplicated attribute, on either root.
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\" count=\"2\"><r><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\" recordCount=\"2\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>"));
+    try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail));
+}
+
+test "engine: an item with a prefixed attribute refuses — the declaration it may hang on lives on the element the rebuild replaces (Codex #205 r5 REL-501)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    // Declared on the inventory element, and declared on the root: the
+    // slice keeps neither item.
+    const on_element = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems xmlns:y=\"urn:other\" count=\"1\"><s y:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_element));
+    const on_root = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s z:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_root));
+    // A declaration nothing uses is nothing.
+    const unused = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems xmlns:y=\"urn:other\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail);
+    try engine.checkShape(&unused);
+}
+
+test "engine: a qualified attribute on the inventory element, a record or a value element refuses; an unqualified one on a value element reads; empty consolidation markup refuses; a tag past the attribute ceiling refuses the part (Codex #205 r6 REL-602, REL-604, PERF-601)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const on_element = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems z:meta=\"x\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_element));
+
+    const def_xml = head ++ "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" count=\"1\">";
+    const lossy = [_][]const u8{
+        rec_head ++ "<r z:meta=\"x\"><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r u=\"1\"><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x z:meta=\"x\" v=\"0\"/></r></pivotCacheRecords>",
+        "<x:pivotCacheRecords xmlns:x=\"" ++ main_ns ++ "\" count=\"1\"><x:r><x:x x:meta=\"1\" v=\"0\"/></x:r></x:pivotCacheRecords>",
+    };
+    for (lossy) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\" u=\"1\"/></r></pivotCacheRecords>", null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+
+    // Consolidation markup beside a worksheet locator, sets or none.
+    const cons = [_][]const u8{
+        "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/><consolidation/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>",
+        "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/><consolidation><rangeSets count=\"0\"/></consolidation></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>",
+    };
+    for (cons) |xml| {
+        const def = try pivot_xml.parseCacheDefinition(arena, xml);
+        try testing.expect(def.source.has_consolidation);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+
+    // The attribute ceiling: 256 unknown attributes read, 257 refuse.
+    for ([_]usize{ 254, 255 }) |extra| {
+        var xml: std.ArrayListUnmanaged(u8) = .empty;
+        try xml.appendSlice(arena, "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"");
+        for (0..extra) |i| try xml.appendSlice(arena, try std.fmt.allocPrint(arena, " a{d}=\"\"", .{i}));
+        try xml.appendSlice(arena, "><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource></pivotCacheDefinition>");
+        // xmlns + recordCount + extra: 256 passes, 257 does not.
+        if (extra == 254) {
+            _ = try pivot_xml.parseCacheDefinition(arena, xml.items);
+        } else {
+            try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml.items));
+        }
+    }
+}
+
+test "edit: spliceAll answers a reversed, overlapping or out-of-range span with MalformedPivotXml, never an assertion (Codex #205 r7 REL-701)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = "abcdef";
+    var reversed = [_]edit.Splice{.{ .span = .{ .start = 3, .end = 2 }, .text = "" }};
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &reversed));
+    var past = [_]edit.Splice{.{ .span = .{ .start = 0, .end = src.len + 1 }, .text = "" }};
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &past));
+    var overlapping = [_]edit.Splice{ .{ .span = .{ .start = 0, .end = 2 }, .text = "X" }, .{ .span = .{ .start = 1, .end = 3 }, .text = "Y" } };
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &overlapping));
+    var fine = [_]edit.Splice{ .{ .span = .{ .start = 4, .end = 6 }, .text = "Z" }, .{ .span = .{ .start = 1, .end = 1 }, .text = "-" }, .{ .span = .{ .start = 1, .end = 3 }, .text = "" } };
+    try testing.expectEqualStrings("a-dZ", try edit.spliceAll(arena, src, &fine));
+}
+
+test "engine: a retained number spelt with a character reference matches by value; an `xmlnsfoo:` prefix is a prefix (Codex #205 r8 REL-802, REL-804)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const xml = head ++ "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" count=\"1\"><n v=\"&#49;\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    // Matched, not appended: one item, kept as written, the extrema
+    // spelt by the item's decoded lexical.
+    try testing.expect(std.mem.indexOf(u8, out, "minValue=\"1\" maxValue=\"1\" count=\"1\"><n v=\"&#49;\"/></sharedItems>") != null);
+
+    const sneaky = [_][]const u8{
+        head ++ "<sharedItems xmlns:xmlnsfoo=\"urn:vendor\" xmlnsfoo:meta=\"x\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail,
+        head ++ "<sharedItems xmlns:xmlnsfoo=\"urn:vendor\" count=\"1\"><s xmlnsfoo:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail,
+    };
+    for (sneaky) |s| {
+        const def = try pivot_xml.parseCacheDefinition(arena, s);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+}
+
+test "engine: parseNumber reads the xsd:double grammar and nothing wider; a rebuild redates or removes refreshedDateIso with its sibling; the records root's suffix is kept (Codex #205 r9 REL-901, REL-902, REL-903)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "1_0", "0x1p0", "1e", "1e+", " 1", "1 ", "1..", ".", "+", "", "inf", "nan", "1.5f", "0x10" }) |bad| try testing.expect(engine.parseNumber(bad) == null);
+    for ([_][]const u8{ "+1", ".5", "1.", "1E-3", "-0", "4.4000000000000004", "1e10", "-.5E+2" }) |good| try testing.expect(engine.parseNumber(good) != null);
+
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const Case = struct { attrs: []const u8, with_clock: []const u8, without: []const u8 };
+    const cases = [_]Case{
+        .{ .attrs = "refreshedDate=\"45000.5\" refreshedDateIso=\"2023-03-15T12:00:00\" recordCount=\"1\"", .with_clock = "refreshedDate=\"46000.5\" refreshedDateIso=\"2025-12-13T12:00:00\" recordCount=\"1\"", .without = " recordCount=\"1\"" },
+        .{ .attrs = "refreshedDateIso=\"2023-03-15T12:00:00\" recordCount=\"1\"", .with_clock = "refreshedDateIso=\"2025-12-13T12:00:00\" recordCount=\"1\" refreshedDate=\"46000.5\"", .without = " recordCount=\"1\"" },
+    };
+    for (cases) |c| {
+        const xml = try std.mem.concat(arena, u8, &.{ "<pivotCacheDefinition xmlns=\"", main_ns, "\" ", c.attrs, "><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>" });
+        const cache: PivotCache = .{
+            .cache_id = null,
+            .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+            .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+            .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+            .field_names = &.{"K"},
+            .field_formulas = &.{null},
+            .source = .{},
+            .resolution = .none,
+            .range_set_sources = &.{},
+            .range_set_resolutions = &.{},
+            .consumer_count = 0,
+            .raw_xml = xml,
+        };
+        const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+        const rec = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords><!-- keep -->\n<?zlsx trailing?>\n";
+        const dated = try engine.rebuild(arena, &cache, &rows, rec, .{ .serial = 46000.5, .iso = "2025-12-13T12:00:00" });
+        const dated_out = try edit.spliceAll(arena, xml, dated.splices);
+        try testing.expect(std.mem.indexOf(u8, dated_out, c.with_clock) != null);
+        try testing.expectEqualStrings(rec, dated.records.?);
+        const undated = try engine.rebuild(arena, &cache, &rows, rec, null);
+        const undated_out = try edit.spliceAll(arena, xml, undated.splices);
+        try testing.expect(std.mem.indexOf(u8, undated_out, "refreshedDate") == null);
+        try testing.expect(std.mem.indexOf(u8, undated_out, c.without) != null);
+    }
+    // A self-closing records root followed by a comment.
+    {
+        const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"0\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>";
+        const cache: PivotCache = .{
+            .cache_id = null,
+            .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+            .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+            .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+            .field_names = &.{"K"},
+            .field_formulas = &.{null},
+            .source = .{},
+            .resolution = .none,
+            .range_set_sources = &.{},
+            .range_set_resolutions = &.{},
+            .consumer_count = 0,
+            .raw_xml = xml,
+        };
+        const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+        const rb = try engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"0\"/><!-- keep -->", null);
+        try testing.expectEqualStrings("<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords><!-- keep -->", rb.records.?);
+    }
+}
+
+test "engine: the records say what was indexed — an explicit count=\"0\" keeps an inline field inline; a field spelt both ways, or a record of the wrong arity, refuses (Codex #205 r10 REL-1001)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:B2\"/></cacheSource><cacheFields count=\"2\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" count=\"0\"/></cacheField></cacheFields></pivotCacheDefinition>";
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{ "K", "V" },
+        .field_formulas = &.{ null, null },
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{ &.{ .{ .string = "a" }, .{ .number = "1" } }, &.{ .{ .string = "b" }, .{ .number = "2" } } };
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    // Inline as written: stays inline, the `count="0"` gone with the
+    // attribute-only form.
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/></r></pivotCacheRecords>", null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "<cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"2\"/></cacheField>") != null);
+    try testing.expectEqualStrings("<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"2\"><r><x v=\"0\"/><n v=\"1\"/></r><r><x v=\"1\"/><n v=\"2\"/></r></pivotCacheRecords>", rb.records.?);
+    // Indexed as written (an inventory the definition does not show
+    // is not this slice's to invent): refused by the inventory, which
+    // has no item for index 0 — the records are read first.
+    const indexed = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><x v=\"0\"/></r></pivotCacheRecords>", null);
+    const indexed_out = try edit.spliceAll(arena, xml, indexed.splices);
+    try testing.expect(std.mem.indexOf(u8, indexed_out, "<cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"2\" count=\"2\"><n v=\"1\"/><n v=\"2\"/></sharedItems></cacheField>") != null);
+    // Spelt both ways, or the wrong arity: not one shape.
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/></r><r><x v=\"0\"/><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/><n v=\"1\"/></r></pivotCacheRecords>", null));
+    // No records part: an inventory with items is the enumerated one.
+    const none = try engine.rebuild(arena, &cache, &rows, null, null);
+    const none_out = try edit.spliceAll(arena, xml, none.splices);
+    try testing.expect(std.mem.indexOf(u8, none_out, "minValue=\"1\" maxValue=\"2\"/></cacheField>") != null);
+}
+
+test "engine: inline records beside an inventory that holds items refuse — an inline rebuild would drop what a consumer indexes; the same inventory with `<x>` records keeps it (Codex #205 r11 REL-1101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"99\" maxValue=\"99\" count=\"1\"><n v=\"99\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>";
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{"V"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><n v=\"1\"/></r></pivotCacheRecords>", null));
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "minValue=\"1\" maxValue=\"99\" count=\"2\"><n v=\"99\"/><n v=\"1\"/></sharedItems>") != null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"1\"/></r></pivotCacheRecords>", rb.records.?);
 }

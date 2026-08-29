@@ -109,6 +109,15 @@ const TableHeader = struct {
     /// top-row deletes in the header-less case (REL-A501).
     header_row_count: u32,
     header_row_count_explicit_zero: bool,
+    /// `totalsRowCount`, 0 by default (ECMA-376 §18.5.1.2): rows at
+    /// the bottom of `ref` that are totals, not data.
+    totals_row_count: u32,
+    /// A count was written but is not a number: the editor's own
+    /// transform keeps the default (its refusals fold into
+    /// `RowEditUnsafeForSheet` anyway); a pivot source over the table
+    /// refuses the graph instead (Codex #205 r8 REL-803).
+    header_row_count_invalid: bool = false,
+    totals_row_count_invalid: bool = false,
 };
 
 /// Apply one row OR column edit to a `xl/tables/tableN.xml` body.
@@ -198,7 +207,10 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
     // malformed non-element constructs read as "no table here".
     const hit = (wbxml.findTagOpen(src, 0, "table") catch return null) orelse return null;
     const attrs = src[hit.attrs_start..hit.attrs_end];
-    const ref = getAttr(attrs, "ref") orelse return null;
+    // The values the schema types, not their spellings: `ref="A1&#58;C4"`
+    // is `A1:C4` (Codex #205 r10 REL-1002).
+    var ref_buf: [64]u8 = undefined;
+    const ref = scalar(&ref_buf, getAttr(attrs, "ref") orelse return null) orelse return null;
     const range = parseRange(ref) orelse return null;
     // REL-A501 + REL-A509: distinguish "explicit 0" from
     // "default 1". Malformed (un-parseable) values fall
@@ -208,11 +220,21 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
     // to RowEditUnsafeForSheet anyway.
     var hrc: u32 = 1;
     var hrc_explicit_zero = false;
-    if (getAttr(attrs, "headerRowCount")) |v| {
-        if (std.fmt.parseInt(u32, v, 10) catch null) |n| {
+    var hrc_invalid = false;
+    var hrc_buf: [32]u8 = undefined;
+    if (getAttr(attrs, "headerRowCount")) |raw| {
+        if (parseCount(&hrc_buf, raw)) |n| {
             hrc = n;
             if (n == 0) hrc_explicit_zero = true;
+        } else {
+            hrc_invalid = true;
         }
+    }
+    var trc: u32 = 0;
+    var trc_invalid = false;
+    var trc_buf: [32]u8 = undefined;
+    if (getAttr(attrs, "totalsRowCount")) |raw| {
+        if (parseCount(&trc_buf, raw)) |n| trc = n else trc_invalid = true;
     }
     return .{
         .tag = .{ .start = hit.open_lt, .after_open = hit.after_tag_close },
@@ -222,6 +244,9 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
         .br_row = range.br_row,
         .header_row_count = hrc,
         .header_row_count_explicit_zero = hrc_explicit_zero,
+        .totals_row_count = trc,
+        .header_row_count_invalid = hrc_invalid,
+        .totals_row_count_invalid = trc_invalid,
     };
 }
 
@@ -231,6 +256,19 @@ const Range = struct {
     tl_row: u32,
     br_row: u32,
 };
+
+/// An attribute's text with its character references resolved into
+/// `buf`, when it has any; the text itself otherwise. Null when the
+/// references do not resolve to a short ASCII scalar.
+fn scalar(buf: []u8, raw: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+    return wbxml.decodeScalarAttr(buf, raw);
+}
+
+fn parseCount(buf: []u8, raw: []const u8) ?u32 {
+    const text = scalar(buf, raw) orelse return null;
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
 
 fn parseRange(ref: []const u8) ?Range {
     const colon = std.mem.indexOfScalar(u8, ref, ':');
@@ -840,6 +878,28 @@ pub fn renameTableColumn(
 /// references resolve against, still XML-encoded. Null when the
 /// part has no parseable `<table>` tag or neither attribute.
 /// Public for the Workbook's locate-table-by-name scan.
+/// The table's `headerRowCount` — 1 by default (ECMA-376 §18.5.1.2),
+/// 0 for a headerless table whose field names live in
+/// `<tableColumns>`. Null when the part is not one this module reads
+/// (no `<table ref>` rectangle) — or when the count is written but is
+/// not a number: a pivot source's geometry is not guessed (Codex #205
+/// r8 REL-803).
+pub fn tableHeaderRowCount(src: []const u8) ?u32 {
+    const hdr = parseTableHeader(src) orelse return null;
+    if (hdr.header_row_count_invalid) return null;
+    return hdr.header_row_count;
+}
+
+/// The table's `totalsRowCount` — 0 by default: the rows at the bottom
+/// of `ref` that hold totals rather than data, which a pivot source
+/// over the table does not read as records (S7b-4, Codex #205 r4
+/// REL-401). Null when the part is not one this module reads.
+pub fn tableTotalsRowCount(src: []const u8) ?u32 {
+    const hdr = parseTableHeader(src) orelse return null;
+    if (hdr.totals_row_count_invalid) return null;
+    return hdr.totals_row_count;
+}
+
 pub fn tableDisplayNameRaw(src: []const u8) ?[]const u8 {
     const hdr = parseTableHeader(src) orelse return null;
     const attrs = src[hdr.tag.start + "<table".len .. hdr.tag.after_open - 1];

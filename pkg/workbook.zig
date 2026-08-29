@@ -42,6 +42,7 @@ const recalc_txn = @import("recalc_txn.zig");
 /// their own to run under.
 const recalc_run = @import("recalc_run.zig");
 const typed_parts = @import("typed_parts/root.zig");
+const wbxml_typed = @import("typed_parts/workbook_xml.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const embedding_part = @import("embedding_part.zig");
@@ -272,6 +273,9 @@ pub const Error = error{
     /// (`xlsx.max_row`). Caller should split the append into
     /// multiple sheets — there is no in-place recovery.
     RowIndexOutOfRange,
+    /// `Workbook.applySheetEdit` was handed a `SheetEditSpec` naming
+    /// neither axis or both — not an edit (Codex #205 r12 REL-1201).
+    InvalidSheetEditSpec,
     /// `Workbook.insertRow` refused because shifting an existing
     /// row would push it past Excel's 1,048,576-row cap. Surfaced
     /// from `pkg/sheet_edit.zig`.
@@ -965,6 +969,16 @@ pub const RetainedGeneration = struct {
 pub const Workbook = struct {
     allocator: Allocator,
     store: PartStore,
+    /// The wall clock a pivot-cache rebuild dates `refreshedDate` by
+    /// (S7b-4): the `io` the workbook was opened with. Null for a
+    /// workbook built from a bare store, whose rebuilt caches drop the
+    /// attribute rather than keep a stale one.
+    clock: ?std.Io = null,
+    /// S7b-4: how many cache rebuilds this workbook has run — one per
+    /// cache per content-changing row edit, on either path; the
+    /// Editor's pre-flight is the one run its sweep installs (Codex
+    /// #205 r1 PERF-101 pins it).
+    pivot_rebuilds: u32 = 0,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -1053,7 +1067,9 @@ pub const Workbook = struct {
         var owned = true;
         errdefer if (owned) store.deinit();
         owned = false;
-        return try fromStore(allocator, store);
+        var wb = try fromStore(allocator, store);
+        wb.clock = io;
+        return wb;
     }
 
     /// Lazy-open variant. Same shape as `open` for v1 — sheets are
@@ -1120,7 +1136,9 @@ pub const Workbook = struct {
         var owned = true;
         errdefer if (owned) store.deinit();
         owned = false;
-        return try fromStoreControlled(allocator, store, poller);
+        var wb = try fromStoreControlled(allocator, store, poller);
+        wb.clock = io;
+        return wb;
     }
 
     /// Construct a `Workbook` from an already-opened `PartStore`.
@@ -1236,7 +1254,9 @@ pub const Workbook = struct {
 
         // Ownership moves on failure too — see `open`.
         owned = false;
-        return try fromStore(allocator, store);
+        var wb = try fromStore(allocator, store);
+        wb.clock = io;
+        return wb;
     }
 
     pub fn deinit(self: *Workbook) void {
@@ -5699,7 +5719,7 @@ pub const Workbook = struct {
     /// rewriter-call wiring) are tracked in
     /// `docs/plans/refusal-audit.md`.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert });
+        try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }
 
     /// Delete row `row` (1-based) in sheet `sheet_idx`. Every row
@@ -5707,7 +5727,7 @@ pub const Workbook = struct {
     /// dropped. Same refusal contract + cross-sheet-rewrite
     /// limitations as `insertRow`.
     pub fn deleteRow(self: *Workbook, sheet_idx: u32, row: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete });
+        try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete }, null);
     }
 
     /// Insert a blank column at position `before_col` (1-based, A=1)
@@ -5716,22 +5736,63 @@ pub const Workbook = struct {
     /// `insertRow`; cross-sheet rewrite is the same iter-er-5
     /// follow-up.
     pub fn insertColumn(self: *Workbook, sheet_idx: u32, before_col_1based: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert });
+        try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert }, null);
     }
 
     /// Delete column `col_1based` in sheet `sheet_idx`. Every
     /// column > `col_1based` shifts left by 1.
     pub fn deleteColumn(self: *Workbook, sheet_idx: u32, col_1based: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .col = col_1based, .kind = .delete });
+        try self.applySheetEditTransform(sheet_idx, .{ .col = col_1based, .kind = .delete }, null);
     }
 
-    const SheetEditSpec = struct {
+    pub const SheetEditSpec = struct {
         row: ?u32 = null,
         col: ?u32 = null,
         kind: sheet_edit.RowEditKind,
     };
 
-    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec) Error!void {
+    /// S7a / S7b: the pivot parts one row / col edit replaces — the
+    /// definitions, records and consumers the sweep installs —
+    /// collected before any mutation. The Editor pre-flights the edit
+    /// through `preflightPivotEditsForSheet` and hands the result to
+    /// `applySheetEdit`, so the S7b-4 rebuild — a read of the whole
+    /// source rectangle — runs once per edit rather than once for the
+    /// pre-flight and again for the sweep (Codex #205 r1 PERF-101).
+    /// Good for that one edit, on that one workbook, over the store as
+    /// it was collected on — and checked to be, at run time, before it
+    /// is installed: another edit's token, another workbook's, or one
+    /// a store mutation has aged refuses (Codex #205 r6 REL-605).
+    pub const PreparedPivotEdits = struct {
+        owner: *const Workbook,
+        /// `PartStore.mutations` at collection.
+        mutations: u64,
+        sheet_part_name: []const u8,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+        patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty,
+
+        pub fn deinit(self: *PreparedPivotEdits, allocator: Allocator) void {
+            for (self.patches.items) |it| allocator.free(it.bytes);
+            self.patches.deinit(allocator);
+            allocator.free(self.sheet_part_name);
+            self.* = undefined;
+        }
+    };
+
+    /// A row / col edit with the pivot parts the Editor already
+    /// collected: the four wrappers above with `prepared` threaded
+    /// through to the pivot sweep, which installs that collection
+    /// instead of computing it a second time.
+    pub fn applySheetEdit(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: *PreparedPivotEdits) Error!void {
+        try self.applySheetEditTransform(sheet_idx, spec, prepared);
+    }
+
+    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
+        // One axis, exactly: a spec naming neither would unwrap
+        // nothing below, one naming both is not one edit (Codex #205
+        // r12 REL-1201).
+        if ((spec.row == null) == (spec.col == null)) return error.InvalidSheetEditSpec;
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         // The direct `Workbook` path validates the position itself (the
         // Editor does too): every sweep below spells 1-based, and a 0
@@ -5799,7 +5860,7 @@ pub const Workbook = struct {
                 .delete => .delete,
             },
         );
-        try self.applyPivotEditsForSheet(part_name, spec);
+        try self.applyPivotEditsForSheet(part_name, spec, prepared);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
         // #192 F1): formula text spells PRE-edit positions, and
@@ -6080,19 +6141,27 @@ pub const Workbook = struct {
     /// definition marked `refreshOnLoad="1"` in the same rewrite
     /// (S7b-3, `pivots.edit`'s marker section); a proven shift does
     /// not mark, and the part stays byte-identical but for `ref`.
+    ///
+    /// Returns the collection itself, for `applySheetEdit` to install
+    /// — the caller owns it (`PreparedPivotEdits.deinit`).
     pub fn preflightPivotEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
-    ) Error!void {
-        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
-        defer {
-            for (patches.items) |it| self.allocator.free(it.bytes);
-            patches.deinit(self.allocator);
-        }
-        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
+    ) Error!PreparedPivotEdits {
+        var prepared: PreparedPivotEdits = .{
+            .owner = self,
+            .mutations = self.store.mutations,
+            .sheet_part_name = try self.allocator.dupe(u8, sheet_part_name),
+            .axis = axis,
+            .idx_1based = idx_1based,
+            .kind = kind,
+        };
+        errdefer prepared.deinit(self.allocator);
+        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &prepared.patches);
+        return prepared;
     }
 
     /// The typed graph when it must be read for this edit: the sheet's
@@ -6149,7 +6218,7 @@ pub const Workbook = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.MalformedPivotXml => error.MalformedPivotXml,
-            error.PivotLocationEditUnsafe, error.PivotSourceEditUnsafe, error.PivotCoordinateOverflow => error.PivotEditUnsafe,
+            error.PivotLocationEditUnsafe, error.PivotSourceEditUnsafe, error.PivotCoordinateOverflow, error.PivotShapeUnsupported => error.PivotEditUnsafe,
         };
     }
 
@@ -6187,8 +6256,24 @@ pub const Workbook = struct {
         // resolved every `<sheet>` of the workbook, and the part came
         // from that same list.
         const sheet_idx = p.sheetIndexOfPart(sheet_part_name) orelse return error.MalformedPivotXml;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         for (p.caches) |*c| {
-            const out = (pivots_mod.edit.applyToCacheDefinition(self.allocator, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e)) orelse continue;
+            var plan = pivots_mod.edit.planCacheEdit(arena, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
+            if (plan.changed) {
+                // S7b-4: the snapshot is no longer the source. Rebuild
+                // it from the cells — records, inventories, counts,
+                // date — in the same install, or refuse the edit.
+                const rb = try self.rebuildPivotCache(arena, c, plan.rebuild, sheet_idx, axis, idx_1based, kind);
+                try plan.splices.appendSlice(arena, rb.splices);
+                if (rb.records) |bytes| {
+                    const dup = try self.allocator.dupe(u8, bytes);
+                    errdefer self.allocator.free(dup);
+                    try patches.append(self.allocator, .{ .name = c.records_part_name.?, .bytes = dup });
+                }
+            }
+            const out = (pivots_mod.edit.applyPlan(self.allocator, c, &plan) catch |e| return mapPivotEditError(e)) orelse continue;
             errdefer self.allocator.free(out);
             try patches.append(self.allocator, .{ .name = c.part_name, .bytes = out });
         }
@@ -6349,7 +6434,7 @@ pub const Workbook = struct {
     /// midway leaves every part as it was. Byte-identical rewrites (the
     /// pivot sits below / right of the edit, the source is elsewhere)
     /// are not installed, so the SHA-256 passthrough holds for them.
-    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
+    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
         std.debug.assert(idx_1based >= 1);
         const axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
@@ -6357,6 +6442,17 @@ pub const Workbook = struct {
             .insert => .insert,
             .delete => .delete,
         };
+        if (prepared) |p| {
+            // The pre-flight's own collection, for this very edit, on
+            // this workbook, over this store as it was: anything else
+            // is a token for another edit (Codex #205 r6 REL-605).
+            const same = p.owner == self and p.mutations == self.store.mutations and
+                std.mem.eql(u8, p.sheet_part_name, sheet_part_name) and
+                p.axis == axis and p.idx_1based == idx_1based and p.kind == kind;
+            if (!same) return error.PivotEditUnsafe;
+            if (p.patches.items.len > 0) try self.store.replaceParts(p.patches.items);
+            return;
+        }
         var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer {
             for (patches.items) |it| self.allocator.free(it.bytes);
@@ -6364,6 +6460,341 @@ pub const Workbook = struct {
         }
         try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
         if (patches.items.len > 0) try self.store.replaceParts(patches.items);
+    }
+
+    /// S7b-4: rebuild one cache whose source content a row edit
+    /// changed — the S7b-3 predicate said so (`Plan.changed`) — from
+    /// its source rectangle as the sheet is before the edit, with the
+    /// edit applied to the rows (`engine.rowsAfterEdit`), so the
+    /// rebuilt records are the post-edit source and the sweep still
+    /// runs before the first mutation. The header row must spell the
+    /// cache's field names (a header that does not is a renamed schema
+    /// — S7c's column work, refused); a headerless table
+    /// (`headerRowCount="0"`) has none to check. Refuses
+    /// (`PivotEditUnsafe`) whatever the engine's first slice does not
+    /// evaluate: a source without a finite rectangle (whole columns or
+    /// rows, an unbounded name body, a consolidation set, a locator
+    /// under an unknown `type`), a definition shape `engine.checkShape`
+    /// names, a cell `readPivotSourceRows` does not carry.
+    fn rebuildPivotCache(
+        self: *Workbook,
+        arena: Allocator,
+        c: *const pivots_mod.PivotCache,
+        rebuild: ?pivots_mod.edit.RebuildSource,
+        sheet_idx: u32,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+    ) Error!pivots_mod.engine.Rebuild {
+        const src = rebuild orelse return error.PivotEditUnsafe;
+        // A column edit inside a rectangle refuses before this; only a
+        // row edit changes a rectangle's content.
+        if (axis != .row or src.header_rows > 1) return error.PivotEditUnsafe;
+        // The header row is the field names: its delete is the table
+        // rewriter's refusal, reached first here on the Editor's path.
+        if (kind == .delete and idx_1based < src.rect.tl_row + src.header_rows) return error.PivotEditUnsafe;
+        const eng = pivots_mod.engine;
+        // Before any read: the rectangle's width is the field schema
+        // (a disagreement is S7c's column edit), and its area is
+        // bounded — `engine.max_rebuild_cells` (Codex #205 r3
+        // PERF-301).
+        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
+        if (c.field_names.len != width) return error.PivotEditUnsafe;
+        // A table's totals rows span the bottom of its `ref` and are
+        // not records (Codex #205 r4 REL-401): a delete on one is not
+        // a data edit, an insert at one appends a data row above it,
+        // and they are not read at all (r5 REL-502) — a label or an
+        // uncached SUBTOTAL there is nobody's source cell. The counts
+        // are the part's own, added with a check (r5 SEC-501).
+        const skip = std.math.add(u32, src.header_rows, src.totals_rows) catch return error.PivotEditUnsafe;
+        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
+        if (skip >= height) return error.PivotEditUnsafe;
+        const read_rect: pivots_mod.edit.Rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows };
+        if (kind == .delete and idx_1based > read_rect.br_row) return error.PivotEditUnsafe;
+        const area = std.math.mul(usize, width, height - src.totals_rows) catch return error.PivotEditUnsafe;
+        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
+        // A headerless table's field names are its `<tableColumn>`
+        // names (Codex #205 r4 REL-402); a headered one's are checked
+        // on the header row once read.
+        if (src.header_rows == 0) {
+            if (src.columns.len != c.field_names.len) return error.PivotEditUnsafe;
+            for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
+        }
+        self.pivot_rebuilds +|= 1;
+        const all = try self.readPivotSourceRows(arena, sheet_idx, read_rect);
+        if (src.header_rows == 1) {
+            for (all[0], c.field_names) |v, name| switch (v) {
+                .string => |s| if (!std.mem.eql(u8, s, name)) return error.PivotEditUnsafe,
+                .number, .blank => return error.PivotEditUnsafe,
+            };
+        }
+        const data = all[src.header_rows..];
+        const after = eng.rowsAfterEdit(arena, data, width, src.rect.tl_row + src.header_rows, idx_1based, kind) catch |e| return mapEngineError(e);
+        const records_xml: ?[]const u8 = if (c.records_part_name) |n|
+            ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
+        else
+            null;
+        return eng.rebuild(arena, c, after, records_xml, try self.nowInstant(arena)) catch |e| return mapEngineError(e);
+    }
+
+    fn mapEngineError(e: pivots_mod.engine.RebuildError) Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.MalformedPivotXml => error.MalformedPivotXml,
+            error.PivotShapeUnsupported => error.PivotEditUnsafe,
+        };
+    }
+
+    /// The source rectangle as engine values, header rows included:
+    /// one row per sheet row of `rect` (a row or cell the sheet lacks
+    /// is blank), each cell resolved through the typed sheet view, the
+    /// shared strings and the styles. Arena-owned; number lexicals
+    /// borrow the sheet part. Refuses (`PivotEditUnsafe`) a cell the
+    /// rebuild does not carry: a date — `t="d"`, or a number under a
+    /// date format (the grammar's `describesDate`; a format the
+    /// grammar refuses cannot be told from one) — a boolean, an error,
+    /// a formula without a cached value, an inline string (the typed
+    /// view keeps its first `<t>` only, which is not a rich one whole).
+    fn readPivotSourceRows(self: *Workbook, arena: Allocator, sheet_idx: u32, rect: pivots_mod.edit.Rect) Error![]const pivots_mod.engine.Row {
+        const eng = pivots_mod.engine;
+        const ws = try self.sheet(sheet_idx);
+        const view = try ws.ensureParsed();
+        const width: usize = rect.br_col - rect.tl_col + 1;
+        const height: usize = rect.br_row - rect.tl_row + 1;
+        // Rows the sheet has no cell in share one blank row: the read
+        // costs the sheet's cells inside the rectangle, not its area
+        // (Codex #205 r3 PERF-301).
+        const blank_row = try arena.alloc(eng.Value, width);
+        @memset(blank_row, .blank);
+        const grid = try arena.alloc([]eng.Value, height);
+        @memset(grid, blank_row);
+        // A coordinate twice — two `<row>` of one `r`, two `<c>` of one
+        // `r` — is a grid with two values for one cell, which no
+        // record can hold (Codex #205 r4 REL-404).
+        const seen_row = try arena.alloc(bool, height);
+        @memset(seen_row, false);
+        const seen_cell = try arena.alloc(?[]bool, height);
+        @memset(seen_cell, null);
+        var date_styles: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+        // A row or cell without its `r` is one the typed view could not
+        // place, and the rectangle cannot be read around it (Codex #205
+        // r1 REL-103).
+        if (view.unaddressed_rows > 0) return error.PivotEditUnsafe;
+        for (view.rows) |row| {
+            if (row.row_idx < rect.tl_row or row.row_idx > rect.br_row) continue;
+            if (row.unaddressed_cells > 0) return error.PivotEditUnsafe;
+            const gi = row.row_idx - rect.tl_row;
+            if (seen_row[gi]) return error.MalformedSheetXml;
+            seen_row[gi] = true;
+            for (row.cells) |cell| {
+                // The whole reference, and its row must be the row that
+                // holds it: an `A999` inside `<row r="2">` is not A2.
+                // The strict grid parser: uppercase letters inside
+                // `XFD`, a row inside 1048576 with no leading zero, no
+                // `$`, nothing after (Codex #205 r6 REL-603).
+                const parsed = coords.parseCell(cell.ref, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
+                const col = parsed.col.oneBased();
+                if (parsed.row.oneBased() != row.row_idx) return error.MalformedSheetXml;
+                if (col < rect.tl_col or col > rect.br_col) continue;
+                if (grid[gi].ptr == blank_row.ptr) {
+                    const own = try arena.alloc(eng.Value, width);
+                    @memset(own, .blank);
+                    grid[gi] = own;
+                    const own_seen = try arena.alloc(bool, width);
+                    @memset(own_seen, false);
+                    seen_cell[gi] = own_seen;
+                }
+                const ci = col - rect.tl_col;
+                if (seen_cell[gi].?[ci]) return error.MalformedSheetXml;
+                seen_cell[gi].?[ci] = true;
+                grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
+            }
+        }
+        const rows = try arena.alloc(eng.Row, height);
+        for (rows, grid) |*r, g| r.* = g;
+        return rows;
+    }
+
+    fn pivotSourceValue(
+        self: *Workbook,
+        arena: Allocator,
+        cell: sheet_xml_mod.Cell,
+        date_styles: *std.AutoHashMapUnmanaged(u32, bool),
+    ) Error!pivots_mod.engine.Value {
+        // A `t` this view does not know is not a number by default
+        // (Codex #205 r8 REL-801).
+        if (cell.cell_type_invalid) return error.PivotEditUnsafe;
+        switch (cell.cell_type) {
+            .number => {
+                // An empty `<c/>` is a blank; a formula without a
+                // cached value is one Excel would compute first. The
+                // text is XML: `1&#x2E;5` is `1.5` (r8 REL-802).
+                const trimmed = std.mem.trim(u8, cell.raw_value orelse "", " \t\r\n");
+                if (trimmed.len == 0) return if (cell.formula != null) error.PivotEditUnsafe else .blank;
+                const raw = try pivotSourceLexical(arena, trimmed);
+                if (pivots_mod.engine.parseNumber(raw) == null) return error.PivotEditUnsafe;
+                // A style the cell names but the view could not read
+                // is not "unstyled" (Codex #205 r5 REL-504).
+                if (cell.style_invalid) return error.PivotEditUnsafe;
+                // A cell without `s` wears style 0 (ECMA-376
+                // §18.3.1.4), which a workbook may make a date (Codex
+                // #205 r6 REL-601); only a workbook with no styles part
+                // has no style 0 to wear.
+                const style: ?u32 = cell.style_idx orelse if ((try self.styles()) != null) @as(?u32, 0) else null;
+                if (style) |s| {
+                    if (try self.styleDescribesDate(arena, s, date_styles)) return error.PivotEditUnsafe;
+                }
+                return .{ .number = raw };
+            },
+            .shared_string => {
+                const trimmed = std.mem.trim(u8, cell.raw_value orelse return error.PivotEditUnsafe, " \t\r\n");
+                const raw = try pivotSourceLexical(arena, trimmed);
+                const idx = std.fmt.parseInt(u32, raw, 10) catch return error.PivotEditUnsafe;
+                const sst_view = (try self.sst()) orelse return error.PivotEditUnsafe;
+                if (idx >= sst_view.entries.len) return error.PivotEditUnsafe;
+                switch (sst_view.entries[idx]) {
+                    .plain => |t| return .{ .string = try pivotSourceText(arena, .shared_string, t) },
+                    .rich => |runs| {
+                        var out: std.ArrayListUnmanaged(u8) = .empty;
+                        for (runs) |run| try out.appendSlice(arena, try pivotSourceText(arena, .shared_string, run.text));
+                        return .{ .string = out.items };
+                    },
+                }
+            },
+            // `t="str"` without a `<v>` is a formula Excel has not
+            // computed, like the numeric case above — not the empty
+            // string an empty `<v/>` spells (Codex #205 r1 REL-104).
+            .formula_string => return .{ .string = try pivotSourceText(arena, .formula_string_value, cell.raw_value orelse return error.PivotEditUnsafe) },
+            .inline_string, .boolean, .error_value, .date => return error.PivotEditUnsafe,
+        }
+    }
+
+    /// A scalar's text with its character references resolved — what
+    /// the number or index IS, as opposed to how the part spelt it
+    /// (Codex #205 r8 REL-802).
+    fn pivotSourceLexical(arena: Allocator, raw: []const u8) Error![]const u8 {
+        return engine.decode.decodeCarrier(arena, .lexical, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PivotEditUnsafe,
+        };
+    }
+
+    fn pivotSourceText(arena: Allocator, site: engine.decode.Site, raw: []const u8) Error![]const u8 {
+        return engine.decode.decodeAt(arena, site, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PivotEditUnsafe,
+        };
+    }
+
+    /// Does cell style `style_idx` render a number as a date or
+    /// duration — the grammar's answer, memoised per style for one
+    /// read. A format code the grammar refuses refuses the read: it
+    /// cannot be told from a date. So does a style whose code the
+    /// workbook cannot spell at all (an unlisted locale built-in, a
+    /// custom id without its `<numFmt>`, an index past `cellXfs`);
+    /// only a style with no `numFmtId` — General by the schema's
+    /// default — reads as not a date without a code.
+    fn styleDescribesDate(self: *Workbook, arena: Allocator, style_idx: u32, memo: *std.AutoHashMapUnmanaged(u32, bool)) Error!bool {
+        if (memo.get(style_idx)) |v| return v;
+        const info = (try self.numberFormatFor(style_idx)) orelse {
+            // No code to read the style by. A style without a
+            // `numFmtId` is General and admits; anything else cannot be
+            // told from a date and refuses — a locale built-in the
+            // table does not spell (27–36, 50–58, 81, dates among them;
+            // Codex #205 r2 REL-202), a custom id without its
+            // `<numFmt>`, a style past `cellXfs`, no styles part.
+            const styles_view = (try self.styles()) orelse return error.PivotEditUnsafe;
+            if (style_idx >= styles_view.cell_xfs.len) return error.PivotEditUnsafe;
+            const xf = styles_view.cell_xfs[style_idx];
+            if (xf.num_fmt_id != null or xf.num_fmt_id_invalid) return error.PivotEditUnsafe;
+            try memo.put(arena, style_idx, false);
+            return false;
+        };
+        const is_date = switch (try engine.numfmt.parse(self.allocator, info.code)) {
+            .refused => return error.PivotEditUnsafe,
+            .ok => |fmt| blk: {
+                var f = fmt;
+                defer f.deinit(self.allocator);
+                break :blk f.describesDate();
+            },
+        };
+        try memo.put(arena, style_idx, is_date);
+        return is_date;
+    }
+
+    /// The instant a rebuild dates `refreshedDate` by, as an Excel
+    /// serial under the workbook's date system — the wall clock of the
+    /// `io` the workbook was opened with. Null when there is none (a
+    /// workbook built from a bare store) or the epoch cannot be read;
+    /// the rebuild then drops the attribute.
+    fn nowInstant(self: *Workbook, arena: Allocator) Error!?pivots_mod.engine.Refreshed {
+        const io = self.clock orelse return null;
+        const wb_part = (try self.store.part("xl/workbook.xml")) orelse return null;
+        const date_system = (try epochOf(wb_part.bytes)) orelse return null;
+        const ts = std.Io.Clock.now(.real, io);
+        const secs = @as(f64, @floatFromInt(ts.nanoseconds)) / 1e9;
+        // Unix epoch = serial 25569 under 1900, 24107 under 1904.
+        const serial = secs / 86400.0 + switch (date_system) {
+            .d1900 => @as(f64, 25569.0),
+            .d1904 => @as(f64, 24107.0),
+        };
+        // The same instant as ISO 8601, for a part that spells
+        // `refreshedDateIso` too (Codex #205 r9 REL-902).
+        const whole: u64 = @intCast(@max(@divFloor(ts.nanoseconds, std.time.ns_per_s), 0));
+        const es: std.time.epoch.EpochSeconds = .{ .secs = whole };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
+        const iso = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+            yd.year,
+            md.month.numeric(),
+            @as(u32, md.day_index) + 1,
+            ds.getHoursIntoDay(),
+            ds.getMinutesIntoHour(),
+            ds.getSecondsIntoMinute(),
+        });
+        return .{ .serial = serial, .iso = iso };
+    }
+
+    /// `workbookPr@date1904` read on its own — not through the
+    /// calc-state parser, whose refusals (`fullPrecision="0"`, a policy
+    /// the recalculator does not evaluate) are no reason to lose a
+    /// refresh date (Codex #205 r7 REL-702). Absent is 1900, the
+    /// schema's default. Null when the part does not read as one tree
+    /// under the pivot scanner, or the attribute is not a boolean: a
+    /// refresh under an epoch that does not read is not dated.
+    fn epochOf(xml: []const u8) Error!?engine.run_inputs.DateSystem {
+        const px = typed_parts.pivot_xml;
+        const root = px.scanRoot(xml, "workbook") catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        var kids = px.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+        var found: ?engine.run_inputs.DateSystem = null;
+        var seen = false;
+        while (kids.next() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        }) |k| {
+            if (!std.mem.eql(u8, k.local, "workbookPr")) continue;
+            // Two `workbookPr` are not one epoch to read (Codex #205 r9
+            // REL-905); the attribute's text is XML, decoded before it
+            // is read as a boolean (r9 REL-904).
+            if (seen) return null;
+            seen = true;
+            const raw = wbxml_typed.getAttr(k.attrs(xml), "date1904") orelse {
+                found = .d1900;
+                continue;
+            };
+            var buf: [32]u8 = undefined;
+            const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return null;
+            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
+                found = .d1904;
+            } else if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) {
+                found = .d1900;
+            } else return null;
+        }
+        return found orelse .d1900;
     }
 
     /// S7b-3, the save-time half of the refresh marker (§7 Q3 — one
@@ -23138,4 +23569,14 @@ test "M5c: openBuffer leaves nothing allocated under any failure" {
             _ = try ws.ensureParsed();
         }
     }.run, .{ io, raw });
+}
+
+test "Workbook.countRefErrorsOutsideQuotes: a #REF! inside a string literal or a quoted sheet name is not one; a doubled quote stays inside (Codex #203 r2 REL-203)" {
+    const count = Workbook.countRefErrorsOutsideQuotes;
+    try std.testing.expectEqual(@as(usize, 0), count("IF(TRUE,Data!$A$1:$C$4,INDIRECT(\"#REF!\"))"));
+    try std.testing.expectEqual(@as(usize, 1), count("IF(TRUE,Data!$A$1:#REF!,INDIRECT(\"#REF!\"))"));
+    try std.testing.expectEqual(@as(usize, 0), count("'#REF!'!$A$1"));
+    try std.testing.expectEqual(@as(usize, 1), count("'It''s #REF!'!#REF!"));
+    try std.testing.expectEqual(@as(usize, 2), count("#REF!:#REF!"));
+    try std.testing.expectEqual(@as(usize, 0), count("\"a\"\"#REF!\"\"b\""));
 }

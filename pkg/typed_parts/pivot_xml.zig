@@ -134,6 +134,10 @@ pub const CacheSource = struct {
     /// `<consolidation><rangeSets><rangeSet …/>` — one per set, in
     /// document order; empty for every other type.
     range_sets: []WorksheetSource = &.{},
+    /// A `<consolidation>` element was there, with sets or without —
+    /// a shape of its own whatever `range_sets` holds (Codex #205 r6
+    /// REL-604).
+    has_consolidation: bool = false,
 };
 
 /// `CT_SharedItems` — the field's value inventory. Defaults are the
@@ -155,6 +159,40 @@ pub const SharedItems = struct {
     max_value: ?[]const u8 = null,
     min_date: ?[]const u8 = null,
     max_date: ?[]const u8 = null,
+    /// The element's own bytes in the part — `<sharedItems …/>`, or
+    /// `<sharedItems …>` through `</sharedItems>`. S7b-4's splice
+    /// target: the rebuild replaces the inventory whole.
+    span: Span = .{ .start = 0, .end = 0 },
+    /// The inventory's children in document order; empty for the
+    /// attribute-only form a data-only numeric field takes.
+    items: []Item = &.{},
+    /// A direct child not under the part's prefix — a foreign element
+    /// where the schema names only items — character data between the
+    /// items, or an item carrying a prefixed attribute (`z:meta`),
+    /// which may hang on a declaration this element carries and a
+    /// rebuilt one would not: none of it is content `items` holds or a
+    /// rebuild can keep (Codex #205 r1 REL-102, r4 REL-403, r5
+    /// REL-501).
+    has_other_children: bool = false,
+
+    /// One inventory item. Kinds beyond the six the schema names
+    /// (`<s>`, `<n>`, `<m>`, `<b>`, `<d>`, `<e>`) read as `.other`.
+    pub const Item = struct {
+        kind: Kind,
+        /// `v`, raw as written; null for `<m/>` and for an item
+        /// without one.
+        v: ?[]const u8,
+        /// The item's bytes whole — `<` through its `/>` or its close
+        /// tag — for a rebuild that keeps it as written.
+        raw: []const u8,
+        /// Childless: self-closing, or an explicit close around nothing
+        /// but whitespace (`<s v="a"></s>` is `<s v="a"/>` — Codex #205
+        /// r2 REL-201). An item with children (`<s><tpls>…`, OLAP
+        /// members) is not, and no rebuild here can keep it.
+        simple: bool,
+
+        pub const Kind = enum { s, n, m, b, d, e, other };
+    };
 };
 
 pub const CacheField = struct {
@@ -167,6 +205,10 @@ pub const CacheField = struct {
     /// `databaseField` — false for a calculated or group field.
     database_field: bool = true,
     shared_items: ?SharedItems = null,
+    /// A main-namespace child other than `sharedItems` and `extLst`
+    /// — `fieldGroup` (grouping), `mpMap` — a shape the S7b-4 rebuild
+    /// refuses rather than rewrite around.
+    has_other_children: bool = false,
 };
 
 pub const CacheDefinition = struct {
@@ -199,10 +241,24 @@ pub const CacheDefinition = struct {
     /// name to the `>` (or the `/` of a self-close). S7b-3's upsert
     /// target: a root attribute the part lacks is inserted at `end`.
     root_attrs: Span,
+    /// The root's namespace prefix without the colon (empty when the
+    /// main namespace is the default) — what a child this reader
+    /// writes back (S7b-4) must carry to be one of the root's.
+    prefix: []const u8,
+    /// A main-namespace root child other than `cacheSource`,
+    /// `cacheFields` and `extLst` — `cacheHierarchies`, `kpis`,
+    /// `tupleCache`, `calculatedItems`, `calculatedMembers`,
+    /// `dimensions`, `measureGroups`, `maps`: OLAP and calculated
+    /// shapes the S7b-4 rebuild refuses. Or a direct child under
+    /// another prefix, which the schema does not place there.
+    has_other_children: bool,
 
     /// Release the spines. Pass the allocator `parseCacheDefinition`
     /// was given; a caller that parsed into an arena never calls this.
     pub fn deinit(self: *CacheDefinition, allocator: Allocator) void {
+        for (self.fields) |f| {
+            if (f.shared_items) |si| allocator.free(si.items);
+        }
         allocator.free(self.fields);
         allocator.free(self.source.range_sets);
         self.* = undefined;
@@ -246,6 +302,8 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
         .fields = &.{},
         .fields_count_attr = null,
         .root_attrs = .{ .start = root.hit.attrs_start, .end = root.hit.attrs_end },
+        .prefix = root.prefix,
+        .has_other_children = false,
     };
     errdefer def.deinit(allocator);
 
@@ -264,8 +322,13 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
             have_fields = true;
             def.fields_count_attr = try u32Attr(k.attrs(xml), "count");
             def.fields = try parseCacheFields(allocator, xml, k, root.prefix);
+        } else if (!std.mem.eql(u8, k.local, "extLst")) {
+            def.has_other_children = true;
         }
     }
+    // A direct child under another prefix is a foreign element where
+    // the schema names only its own (Codex #205 r1 REL-102).
+    if (kids.skipped > 0) def.has_other_children = true;
     if (!have_source) return error.MalformedXml;
     return def;
 }
@@ -292,6 +355,7 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
             // is refused, never read over the first.
             if (have_consolidation) return error.MalformedXml;
             have_consolidation = true;
+            src.has_consolidation = true;
             var have_range_sets = false;
             var cons = Children.init(xml, k.hit, k.end, root.prefix, k.env);
             while (try cons.next()) |c| {
@@ -328,7 +392,12 @@ fn parseWorksheetSource(xml: []const u8, el: Child) WorksheetSource {
 
 fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]CacheField {
     var out: std.ArrayListUnmanaged(CacheField) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        for (out.items) |f| {
+            if (f.shared_items) |si| allocator.free(si.items);
+        }
+        out.deinit(allocator);
+    }
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "cacheField")) continue;
@@ -340,18 +409,56 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .formula = wbxml.getAttr(attrs, "formula"),
             .database_field = try boolAttr(attrs, "databaseField", true),
         };
+        errdefer if (field.shared_items) |si| allocator.free(si.items);
         var inner = Children.init(xml, k.hit, k.end, p, k.env);
         while (try inner.next()) |c| {
-            if (!std.mem.eql(u8, c.local, "sharedItems")) continue;
-            if (field.shared_items != null) return error.MalformedXml;
-            field.shared_items = try parseSharedItems(c.attrs(xml));
+            if (std.mem.eql(u8, c.local, "sharedItems")) {
+                if (field.shared_items != null) return error.MalformedXml;
+                field.shared_items = try parseSharedItems(allocator, xml, c, p);
+            } else if (!std.mem.eql(u8, c.local, "extLst")) {
+                field.has_other_children = true;
+            }
         }
+        if (inner.skipped > 0) field.has_other_children = true;
         try out.append(allocator, field);
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn parseSharedItems(attrs: []const u8) Error!SharedItems {
+fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error!SharedItems {
+    var si = try sharedItemsAttrs(el.attrs(xml));
+    si.span = .{ .start = el.hit.open_lt, .end = el.after };
+    var items: std.ArrayListUnmanaged(SharedItems.Item) = .empty;
+    errdefer items.deinit(allocator);
+    // A qualified attribute on the element or on an item may hang on
+    // a declaration the rebuilt element would not carry (Codex #205 r5
+    // REL-501, r6 REL-602).
+    var prefixed_attr = hasQualifiedAttr(el.attrs(xml));
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try kids.next()) |k| {
+        if (hasQualifiedAttr(k.attrs(xml))) prefixed_attr = true;
+        const kind: SharedItems.Item.Kind = if (k.local.len == 1) switch (k.local[0]) {
+            's' => .s,
+            'n' => .n,
+            'm' => .m,
+            'b' => .b,
+            'd' => .d,
+            'e' => .e,
+            else => .other,
+        } else .other;
+        try items.append(allocator, .{
+            .kind = kind,
+            .v = wbxml.getAttr(k.attrs(xml), "v"),
+            .raw = xml[k.hit.open_lt..k.after],
+            .simple = isBlank(xml[k.hit.after_tag_close..k.end]),
+        });
+    }
+    si.has_other_children = kids.skipped > 0 or kids.other or prefixed_attr;
+    si.items = try items.toOwnedSlice(allocator);
+    return si;
+}
+
+fn sharedItemsAttrs(attrs: []const u8) Error!SharedItems {
     return .{
         .count = try u32Attr(attrs, "count"),
         .contains_semi_mixed_types = try boolAttr(attrs, "containsSemiMixedTypes", true),
@@ -760,6 +867,11 @@ pub const max_prefix_len = 32;
 /// about eight deep; a part past this is refused rather than tracked
 /// on the heap.
 const max_depth = 64;
+/// Attributes one start tag may carry. Excel's widest — a
+/// `pivotTableDefinition` root — carries some sixty; the ceiling bounds
+/// the duplicate-name scan, which reads every earlier pair once per
+/// attribute (Codex #205 r6 PERF-601).
+const max_attrs_per_tag = 256;
 
 /// Most prefixes one document may bind to the relationships namespace
 /// at once. Office binds one (`r`); a conforming producer may alias it,
@@ -831,6 +943,11 @@ pub const Root = struct {
     /// child walk runs under. For a self-closing root, the end of the
     /// root tag itself.
     body_end: usize,
+    /// One past the root's close tag (or its `/>`): where the
+    /// document's trailing miscellany — a comment, a processing
+    /// instruction, whitespace — begins, for a writer that regenerates
+    /// the root to keep (Codex #205 r9 REL-903).
+    after: usize,
 };
 
 /// Check the part is one well-formed tree, locate the root element,
@@ -869,10 +986,15 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         if (declaredBinding(attrs, prefix)) |uri| {
             if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
         }
+        // And the one main binding there is must be the root's own: a
+        // `<pivotCacheDefinition xmlns:y="…/main">` puts every `y:`
+        // child under a prefix this parser does not match (Codex #205
+        // r1 REL-102).
+        if (countBindings(attrs, &main_ns_uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
         const env = try (NsEnv{}).forChild(attrs);
         for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
-        const body_end = try endOfQ(xml, hit, qname);
-        return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = body_end };
+        const extent = try extentOfQ(xml, hit, qname);
+        return .{ .hit = hit, .prefix = prefix, .env = env, .body_end = extent.close_lt, .after = extent.after };
     }
     return error.MalformedXml;
 }
@@ -886,11 +1008,15 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
 /// innermost open one (so `<a><b></a></b>` and a child closing after
 /// its root are refused); a second element once the root — explicit
 /// or self-closing — has closed; an element still open at the end.
+/// And the namespace hygiene the one-prefix walk rests on, below the
+/// root (`checkDescendantBindings`).
 fn preflight(xml: []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedXml;
     var stack: [max_depth][]const u8 = undefined;
     var depth: usize = 0;
     var root_closed = false;
+    var root_prefix: []const u8 = "";
+    var root_bound = false;
     var i: usize = if (std.mem.startsWith(u8, xml, "\xEF\xBB\xBF")) 3 else 0;
     while (i < xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
@@ -922,6 +1048,13 @@ fn preflight(xml: []const u8) Error!void {
         while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
         const qname = xml[lt + 1 .. j];
         const tag_end = try attributesEnd(xml, j);
+        const attrs_end = tag_end.after_gt - @as(usize, if (tag_end.self_closing) 2 else 1);
+        if (depth == 0) {
+            root_prefix = if (std.mem.indexOfScalar(u8, qname, ':')) |c| qname[0..c] else "";
+            root_bound = declaredBinding(xml[j..attrs_end], root_prefix) != null;
+        } else {
+            try checkDescendantBindings(xml[j..attrs_end], root_prefix, root_bound);
+        }
         if (!tag_end.self_closing) {
             if (depth >= max_depth) return error.MalformedXml;
             stack[depth] = qname;
@@ -935,9 +1068,59 @@ fn preflight(xml: []const u8) Error!void {
     if (!isBlank(xml[i..])) return error.MalformedXml;
 }
 
-fn isBlank(s: []const u8) bool {
+/// Whether an attributes region carries a qualified attribute — a
+/// name under a prefix (`z:meta`) that is not a namespace declaration.
+/// An element a rebuild regenerates from its typed reading would drop
+/// it, and the declaration it hangs on may live on that very element
+/// (Codex #205 r5 REL-501, r6 REL-602).
+pub fn hasQualifiedAttr(attrs: []const u8) bool {
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        // The declarations themselves, exactly: `xmlnsfoo:meta` is a
+        // qualified attribute like any other (Codex #205 r8 REL-804).
+        if (std.mem.eql(u8, a.name, "xmlns") or std.mem.startsWith(u8, a.name, "xmlns:")) continue;
+        if (std.mem.indexOfScalar(u8, a.name, ':') != null) return true;
+    }
+    return false;
+}
+
+/// Whether an attributes region carries any attribute at all.
+pub fn hasAnyAttr(attrs: []const u8) bool {
+    var it: AttrIter = .{ .attrs = attrs };
+    return it.next() != null;
+}
+
+pub fn isBlank(s: []const u8) bool {
     for (s) |c| if (!std.ascii.isWhitespace(c)) return false;
     return true;
+}
+
+/// The namespace hygiene the one-prefix walk rests on, checked on
+/// every element below the root: a descendant that binds another
+/// prefix (or the default) to the main namespace would hide a
+/// main-namespace child under a spelling the walk steps over, and one
+/// that rebinds the root's prefix to a foreign URI would pass a foreign
+/// child off as one of the root's. Excel writes neither; a part that
+/// does is refused whole (Codex #205 r1 REL-102). A redundant
+/// redeclaration of the root's own binding changes nothing and passes
+/// — redundant, that is, only when the root made it: a binding first
+/// introduced below the root lives on an element a rebuild may
+/// regenerate without it (Codex #205 r3 REL-302).
+fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_bound: bool) Error!void {
+    if (std.mem.indexOf(u8, attrs, "xmlns") == null) return;
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        const declared: []const u8 = if (std.mem.eql(u8, a.name, "xmlns"))
+            ""
+        else if (std.mem.startsWith(u8, a.name, "xmlns:"))
+            a.name["xmlns:".len..]
+        else
+            continue;
+        const binds_main = isOneOf(a.value, &main_ns_uris);
+        const is_root_prefix = std.mem.eql(u8, declared, root_prefix);
+        if (binds_main != is_root_prefix) return error.MalformedXml;
+        if (binds_main and !root_bound) return error.MalformedXml;
+    }
 }
 
 const TagEnd = struct { after_gt: usize, self_closing: bool };
@@ -948,6 +1131,7 @@ const TagEnd = struct { after_gt: usize, self_closing: bool };
 /// anywhere is refused. Returns where the tag ends.
 fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
     var j = from;
+    var count: usize = 0;
     while (true) {
         while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
         if (j >= xml.len) return error.MalformedXml;
@@ -957,7 +1141,15 @@ fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
             return error.MalformedXml;
         }
         if (!isNameStart(xml[j])) return error.MalformedXml;
+        const name_start = j;
         while (j < xml.len and xml[j] != '=' and !std.ascii.isWhitespace(xml[j]) and xml[j] != '<' and xml[j] != '>' and xml[j] != '/') j += 1;
+        count += 1;
+        if (count > max_attrs_per_tag) return error.MalformedXml;
+        // A name twice on one tag is not XML, and a writer that
+        // replaced the first value would leave the second standing
+        // (Codex #205 r4 REL-405). The pairs before it are whole.
+        var seen: AttrIter = .{ .attrs = xml[from..name_start] };
+        while (seen.next()) |a| if (std.mem.eql(u8, a.name, xml[name_start..j])) return error.MalformedXml;
         while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
         if (j >= xml.len or xml[j] != '=') return error.MalformedXml;
         j += 1;
@@ -989,6 +1181,11 @@ pub const Child = struct {
     /// One past the child: the byte after its `/>`, or the `<` of its
     /// close tag.
     end: usize,
+    /// One past the child's last byte: after its `/>`, or after the
+    /// `>` of its close tag — which the markup may pad (`</s >`), so
+    /// no arithmetic on `end` and the name reaches it (Codex #205 r1
+    /// REL-101). Where the next sibling can start.
+    after: usize,
     /// The relationships-namespace environment inside this child.
     env: NsEnv,
 
@@ -1008,6 +1205,16 @@ pub const Children = struct {
     env: NsEnv,
     cursor: usize,
     end: usize,
+    /// Direct children stepped over for not being under the parent's
+    /// prefix. A reader that regenerates the parent's body (S7b-4)
+    /// cannot carry what it did not classify, and asks (Codex #205 r1
+    /// REL-102).
+    skipped: usize = 0,
+    /// Something between the children that is not a child and not
+    /// whitespace — character data, a comment, CDATA, a processing
+    /// instruction — which a regenerated body would lose (Codex #205
+    /// r4 REL-403). Complete once `next` has returned null.
+    other: bool = false,
 
     pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8, env: NsEnv) Children {
         return .{
@@ -1022,10 +1229,18 @@ pub const Children = struct {
     pub fn next(self: *Children) Error!?Child {
         const xml = self.xml;
         while (self.cursor < self.end) {
-            const lt = std.mem.indexOfScalarPos(u8, xml, self.cursor, '<') orelse return null;
-            if (lt >= self.end) return null;
+            const lt = std.mem.indexOfScalarPos(u8, xml, self.cursor, '<') orelse {
+                self.noteGap(self.end);
+                return null;
+            };
+            if (lt >= self.end) {
+                self.noteGap(self.end);
+                return null;
+            }
+            self.noteGap(lt);
             const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
             if (skip_to != lt) {
+                self.other = true;
                 self.cursor = skip_to;
                 continue;
             }
@@ -1036,18 +1251,24 @@ pub const Children = struct {
             const qname = xml[lt + 1 .. j];
             const hit = (wbxml.findTagOpen(xml, lt, qname) catch |e| return narrow(e)) orelse
                 return error.MalformedXml;
-            const child_end = try endOfQ(xml, hit, qname);
-            self.cursor = if (hit.self_closing) child_end else child_end + "</".len + qname.len + ">".len;
+            const extent = try extentOfQ(xml, hit, qname);
+            self.cursor = extent.after;
             if (localUnder(qname, self.prefix)) |local| {
                 return .{
                     .local = local,
                     .hit = hit,
-                    .end = child_end,
+                    .end = extent.close_lt,
+                    .after = extent.after,
                     .env = try self.env.forChild(xml[hit.attrs_start..hit.attrs_end]),
                 };
             }
+            self.skipped += 1;
         }
         return null;
+    }
+
+    fn noteGap(self: *Children, to: usize) void {
+        if (to > self.cursor and !isBlank(self.xml[self.cursor..to])) self.other = true;
     }
 };
 
@@ -1061,9 +1282,18 @@ fn localUnder(qname: []const u8, prefix: []const u8) ?[]const u8 {
     return if (prefix.len == 0) qname else null;
 }
 
-fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
-    if (hit.self_closing) return hit.after_tag_close;
+/// Where an element ends: `close_lt` is the `<` of its close tag —
+/// the bound its children walk under — and `after` is one past that
+/// tag's `>`. Both are the byte after `/>` for a self-closing element.
+const Extent = struct { close_lt: usize, after: usize };
+
+fn extentOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!Extent {
+    if (hit.self_closing) return .{ .close_lt = hit.after_tag_close, .after = hit.after_tag_close };
     return closeOfQ(xml, hit, qname);
+}
+
+fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
+    return (try extentOfQ(xml, hit, qname)).close_lt;
 }
 
 /// The `<` of the close tag matching the open tag at `hit`, by depth:
@@ -1071,7 +1301,7 @@ fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
 /// is. None of these schemas nest an element in itself, but a scanner
 /// that took the first `</…>` would pair the wrong tags on a part that
 /// does, and read the outer element's children as the inner one's.
-fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
+fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!Extent {
     assert(!hit.self_closing);
     var depth: usize = 1;
     var cursor = hit.after_tag_close;
@@ -1083,7 +1313,7 @@ fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
             scan = inner.after_tag_close;
         }
         depth -= 1;
-        if (depth == 0) return close.lt;
+        if (depth == 0) return .{ .close_lt = close.lt, .after = close.after_gt };
         cursor = close.after_gt;
     }
 }
