@@ -38,6 +38,11 @@ pub const Cell = struct {
     ref: []const u8,
     /// `<c s="…">` style index into the workbook's cellXfs table.
     style_idx: ?u32,
+    /// `s` was written but is not a number (`s="bogus"`, `s=""`):
+    /// `style_idx` is null, and the cell is not unstyled. A reader
+    /// that keys on the style (the S7b-4 rebuild's date check) refuses
+    /// rather than read it as General (Codex #205 r5 REL-504).
+    style_invalid: bool = false,
     cell_type: CellType,
     /// Raw inner text of `<v>` (or `<is><t>` for inline strings).
     /// Borrows. No XML-entity decoding — caller decodes if needed.
@@ -533,6 +538,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
             continue;
         };
         const style_idx: ?u32 = parseU32Attr(c_attrs, "s");
+        const style_invalid = attrAt(c_attrs, "s") != null and style_idx == null;
         const cell_type = parseCellType(attrAt(c_attrs, "t"));
 
         const self_closing = c_open_end > c_open and row_body[c_open_end - 1] == '/';
@@ -552,6 +558,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
         try cells.append(a, .{
             .ref = ref,
             .style_idx = style_idx,
+            .style_invalid = style_invalid,
             .cell_type = cell_type,
             .raw_value = raw_value,
             .formula = formula,

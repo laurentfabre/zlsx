@@ -104,6 +104,10 @@ pub const NumberFormat = struct {
 
 pub const CellXf = struct {
     num_fmt_id: ?u32,
+    /// `numFmtId` was written but is not a number: `num_fmt_id` is
+    /// null, and the style is not General by default (Codex #205 r5
+    /// REL-504).
+    num_fmt_id_invalid: bool = false,
     font_id: ?u32,
     fill_id: ?u32,
     border_id: ?u32,
@@ -610,6 +614,7 @@ fn parseCellXfs(a: std.mem.Allocator, xml: []const u8, wrapper: []const u8) Erro
         cursor = el.end;
         var xf: CellXf = .{
             .num_fmt_id = attrU32(el.attrs, "numFmtId"),
+            .num_fmt_id_invalid = attrValue(el.attrs, "numFmtId") != null and attrU32(el.attrs, "numFmtId") == null,
             .font_id = attrU32(el.attrs, "fontId"),
             .fill_id = attrU32(el.attrs, "fillId"),
             .border_id = attrU32(el.attrs, "borderId"),

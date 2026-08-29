@@ -6230,6 +6230,9 @@ test "S7b-4: a numeric cell under a style the workbook cannot spell — a locale
         .{ .name = "zero", .num_fmts = "", .xf1 = "numFmtId=\"0\"", .style = "1", .admits = true },
         .{ .name = "number", .num_fmts = "", .xf1 = "numFmtId=\"2\" applyNumberFormat=\"1\"", .style = "1", .admits = true },
         .{ .name = "custom", .num_fmts = "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.000\"/></numFmts>", .xf1 = "numFmtId=\"164\" applyNumberFormat=\"1\"", .style = "1", .admits = true },
+        // Written but not a number: not absent (Codex #205 r5 REL-504).
+        .{ .name = "bogus_xf", .num_fmts = "", .xf1 = "numFmtId=\"bogus\"", .style = "1", .admits = false },
+        .{ .name = "bogus_s", .num_fmts = "", .xf1 = "numFmtId=\"0\"", .style = "bogus", .admits = false },
     };
     for (cases) |case| {
         const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r2_{s}.xlsx", .{case.name});
@@ -6364,7 +6367,9 @@ test "S7b-4: a table's totals row is not a record — its delete refuses, an ins
         defer std.testing.allocator.free(dst);
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C5\" totalsRowCount=\"1\" totalsRowShown=\"1\"");
-        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "</sheetData>", "<row r=\"5\"><c r=\"B5\"><f>SUBTOTAL(109,SalesTbl[Qty])</f><v>12</v></c></row></sheetData>");
+        // The totals row: an inline label and an uncached SUBTOTAL —
+        // cells the rebuild would refuse, were they read (r5 REL-502).
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "</sheetData>", "<row r=\"5\"><c r=\"A5\" t=\"inlineStr\"><is><t>Total</t></is></c><c r=\"B5\"><f>SUBTOTAL(109,SalesTbl[Qty])</f></c></row></sheetData>");
         {
             var wb = try Workbook.open(std.testing.allocator, io, src);
             defer wb.deinit();
@@ -6381,14 +6386,33 @@ test "S7b-4: a table's totals row is not a record — its delete refuses, an ins
         try ed.save(io, dst);
         var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
         defer store.deinit();
-        // Three data rows and the inserted blank: the totals row's 12
-        // is nowhere in the records.
+        // Three data rows and the inserted blank: the totals row is
+        // neither read nor a record.
         try expectRebuilt(&store, def_part, rec_part, 4);
         const rec = (try store.part(rec_part)).?;
-        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "12") == null);
+        const cd = (try store.part(def_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "Total") == null);
         try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"2\"/><m/><m/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r><r><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r>") != null);
         const tbl = (try store.part(table_part)).?;
         try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C6\"") != null);
+    }
+    {
+        // A totals count no rectangle holds: refused, not added
+        // (Codex #205 r5 SEC-501).
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r5_totals_overflow_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" totalsRowCount=\"4294967295\" totalsRowShown=\"0\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqual(@as(u32, 0), wb.pivot_rebuilds);
+        try std.testing.expectEqualStrings(before, (try wb.store.part(rec_part)).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
     }
     {
         // Headerless: the column names are the schema.
@@ -6406,13 +6430,16 @@ test "S7b-4: a table's totals row is not a record — its delete refuses, an ins
         try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
     }
     {
-        // Headerless and named as the fields: the first row is data.
+        // Headerless and named as the fields: the first row is data. A
+        // column-shaped comment and a padded close are nothing to the
+        // scanner the names are read through (r5 REL-503).
         const src = try tt.path(std.testing.allocator, io, "s7b4_r4_headerless_ok_src.xlsx");
         defer std.testing.allocator.free(src);
         const dst = try tt.path(std.testing.allocator, io, "s7b4_r4_headerless_ok_dst.xlsx");
         defer std.testing.allocator.free(dst);
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "</tableColumns>", "<!-- <tableColumn id=\"9\" name=\"Fake\"/> --></tableColumns >");
         var ed = try Editor.open(std.testing.allocator, io, src);
         defer ed.deinit();
         try ed.insertRow(0, 2);

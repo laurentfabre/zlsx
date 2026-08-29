@@ -163,9 +163,12 @@ pub const SharedItems = struct {
     /// attribute-only form a data-only numeric field takes.
     items: []Item = &.{},
     /// A direct child not under the part's prefix — a foreign element
-    /// where the schema names only items — or character data between
-    /// the items, which `items` cannot hold and no rebuild can keep
-    /// (Codex #205 r1 REL-102, r4 REL-403).
+    /// where the schema names only items — character data between the
+    /// items, or an item carrying a prefixed attribute (`z:meta`),
+    /// which may hang on a declaration this element carries and a
+    /// rebuilt one would not: none of it is content `items` holds or a
+    /// rebuild can keep (Codex #205 r1 REL-102, r4 REL-403, r5
+    /// REL-501).
     has_other_children: bool = false,
 
     /// One inventory item. Kinds beyond the six the schema names
@@ -422,8 +425,13 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
     si.span = .{ .start = el.hit.open_lt, .end = el.after };
     var items: std.ArrayListUnmanaged(SharedItems.Item) = .empty;
     errdefer items.deinit(allocator);
+    var prefixed_attr = false;
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
+        var attrs_it: AttrIter = .{ .attrs = k.attrs(xml) };
+        while (attrs_it.next()) |a| {
+            if (std.mem.indexOfScalar(u8, a.name, ':') != null) prefixed_attr = true;
+        }
         const kind: SharedItems.Item.Kind = if (k.local.len == 1) switch (k.local[0]) {
             's' => .s,
             'n' => .n,
@@ -440,7 +448,7 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .simple = isBlank(xml[k.hit.after_tag_close..k.end]),
         });
     }
-    si.has_other_children = kids.skipped > 0 or kids.other;
+    si.has_other_children = kids.skipped > 0 or kids.other or prefixed_attr;
     si.items = try items.toOwnedSlice(allocator);
     return si;
 }

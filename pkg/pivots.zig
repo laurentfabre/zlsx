@@ -1109,17 +1109,39 @@ const Resolver = struct {
                 }
                 const header_rows = table_edit.tableHeaderRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
                 const totals_rows = table_edit.tableTotalsRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
-                const raw_columns = (table_edit.tableColumnNamesRaw(self.arena, table_part.bytes) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.MalformedPivotXml,
-                }) orelse return error.MalformedPivotXml;
-                const columns = try self.arena.alloc([]const u8, raw_columns.len);
-                for (raw_columns, 0..) |raw_col, k| columns[k] = try decode(self.arena, .table_column_name, raw_col);
+                // Only a headerless table's names are its schema; a
+                // headered one's are read off its header row.
+                const columns: []const []const u8 = if (header_rows == 0) try self.tableColumnNames(table_part.bytes) else &.{};
                 try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows, .totals_rows = totals_rows, .columns = columns });
             }
         }
         self.tables = try entries.toOwnedSlice(self.arena);
         return self.tables.?;
+    }
+
+    /// A table's `<tableColumn>` names in order, decoded — read through
+    /// the pivot scanner (one preflighted tree, direct children only,
+    /// decoy-aware, the close where the scanner finds it) rather than
+    /// a lexical search a comment could feed (Codex #205 r5 REL-503).
+    /// Arena-owned.
+    fn tableColumnNames(self: *Resolver, src: []const u8) Error![]const []const u8 {
+        const root = pivot_xml.scanRoot(src, "table") catch |e| return mapParse(e);
+        var kids = pivot_xml.Children.init(src, root.hit, root.body_end, root.prefix, root.env);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen = false;
+        while (kids.next() catch |e| return mapParse(e)) |k| {
+            if (!std.mem.eql(u8, k.local, "tableColumns")) continue;
+            if (seen) return error.MalformedPivotXml;
+            seen = true;
+            var cols = pivot_xml.Children.init(src, k.hit, k.end, root.prefix, k.env);
+            while (cols.next() catch |e| return mapParse(e)) |c| {
+                if (!std.mem.eql(u8, c.local, "tableColumn")) continue;
+                const raw = wbxml.getAttr(c.attrs(src), "name") orelse return error.MalformedPivotXml;
+                try names.append(self.arena, try decode(self.arena, .table_column_name, raw));
+            }
+        }
+        if (!seen) return error.MalformedPivotXml;
+        return names.toOwnedSlice(self.arena);
     }
 
     /// The engine's symbol table, or `MalformedPivotXml` when it
@@ -6007,4 +6029,22 @@ test "engine: character data or a comment between the children of a records part
     try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\" count=\"2\"><r><x v=\"0\"/></r></pivotCacheRecords>", null));
     try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\" recordCount=\"2\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>"));
     try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail));
+}
+
+test "engine: an item with a prefixed attribute refuses — the declaration it may hang on lives on the element the rebuild replaces (Codex #205 r5 REL-501)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    // Declared on the inventory element, and declared on the root: the
+    // slice keeps neither item.
+    const on_element = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems xmlns:y=\"urn:other\" count=\"1\"><s y:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_element));
+    const on_root = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s z:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_root));
+    // A declaration nothing uses is nothing.
+    const unused = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems xmlns:y=\"urn:other\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail);
+    try engine.checkShape(&unused);
 }

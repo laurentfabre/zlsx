@@ -867,31 +867,6 @@ pub fn tableTotalsRowCount(src: []const u8) ?u32 {
     return hdr.totals_row_count;
 }
 
-/// The `<tableColumn>` names in document order, raw as written (an
-/// ST_Xstring attribute the caller decodes) — the field names of a
-/// headerless table (S7b-4, Codex #205 r4 REL-402). Null when the
-/// part is not one this module reads; `MalformedTableXml` for a column
-/// without a name. The slice is `allocator`'s, its strings borrow
-/// `src`.
-pub fn tableColumnNamesRaw(allocator: Allocator, src: []const u8) !?[]const []const u8 {
-    const hdr = parseTableHeader(src) orelse return null;
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer names.deinit(allocator);
-    var j: usize = hdr.tag.after_open;
-    while (std.mem.indexOfScalarPos(u8, src, j, '<')) |lt| {
-        if (std.mem.startsWith(u8, src[lt..], "</tableColumns>")) break;
-        if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
-            const attrs = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
-            const name = getAttr(attrs, "name") orelse return error.MalformedTableXml;
-            try names.append(allocator, name);
-            j = ct.after_open;
-            continue;
-        }
-        j = lt + 1;
-    }
-    return try names.toOwnedSlice(allocator);
-}
-
 pub fn tableDisplayNameRaw(src: []const u8) ?[]const u8 {
     const hdr = parseTableHeader(src) orelse return null;
     const attrs = src[hdr.tag.start + "<table".len .. hdr.tag.after_open - 1];

@@ -6480,15 +6480,20 @@ pub const Workbook = struct {
         // bounded — `engine.max_rebuild_cells` (Codex #205 r3
         // PERF-301).
         const width: usize = src.rect.br_col - src.rect.tl_col + 1;
-        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
         if (c.field_names.len != width) return error.PivotEditUnsafe;
-        const area = std.math.mul(usize, width, height) catch return error.PivotEditUnsafe;
-        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
         // A table's totals rows span the bottom of its `ref` and are
         // not records (Codex #205 r4 REL-401): a delete on one is not
-        // a data edit; an insert at one appends a data row above it.
-        if (src.header_rows + src.totals_rows >= height) return error.PivotEditUnsafe;
-        if (kind == .delete and idx_1based > src.rect.br_row - src.totals_rows) return error.PivotEditUnsafe;
+        // a data edit, an insert at one appends a data row above it,
+        // and they are not read at all (r5 REL-502) — a label or an
+        // uncached SUBTOTAL there is nobody's source cell. The counts
+        // are the part's own, added with a check (r5 SEC-501).
+        const skip = std.math.add(u32, src.header_rows, src.totals_rows) catch return error.PivotEditUnsafe;
+        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
+        if (skip >= height) return error.PivotEditUnsafe;
+        const read_rect: pivots_mod.edit.Rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows };
+        if (kind == .delete and idx_1based > read_rect.br_row) return error.PivotEditUnsafe;
+        const area = std.math.mul(usize, width, height - src.totals_rows) catch return error.PivotEditUnsafe;
+        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
         // A headerless table's field names are its `<tableColumn>`
         // names (Codex #205 r4 REL-402); a headered one's are checked
         // on the header row once read.
@@ -6497,14 +6502,14 @@ pub const Workbook = struct {
             for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
         }
         self.pivot_rebuilds +|= 1;
-        const all = try self.readPivotSourceRows(arena, sheet_idx, src.rect);
+        const all = try self.readPivotSourceRows(arena, sheet_idx, read_rect);
         if (src.header_rows == 1) {
             for (all[0], c.field_names) |v, name| switch (v) {
                 .string => |s| if (!std.mem.eql(u8, s, name)) return error.PivotEditUnsafe,
                 .number, .blank => return error.PivotEditUnsafe,
             };
         }
-        const data = all[src.header_rows .. all.len - src.totals_rows];
+        const data = all[src.header_rows..];
         const after = eng.rowsAfterEdit(arena, data, width, src.rect.tl_row + src.header_rows, idx_1based, kind) catch |e| return mapEngineError(e);
         const records_xml: ?[]const u8 = if (c.records_part_name) |n|
             ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
@@ -6601,6 +6606,9 @@ pub const Workbook = struct {
                 const raw = std.mem.trim(u8, cell.raw_value orelse "", " \t\r\n");
                 if (raw.len == 0) return if (cell.formula != null) error.PivotEditUnsafe else .blank;
                 if (pivots_mod.engine.parseNumber(raw) == null) return error.PivotEditUnsafe;
+                // A style the cell names but the view could not read
+                // is not "unstyled" (Codex #205 r5 REL-504).
+                if (cell.style_invalid) return error.PivotEditUnsafe;
                 if (cell.style_idx) |s| {
                     if (try self.styleDescribesDate(arena, s, date_styles)) return error.PivotEditUnsafe;
                 }
@@ -6654,7 +6662,8 @@ pub const Workbook = struct {
             // `<numFmt>`, a style past `cellXfs`, no styles part.
             const styles_view = (try self.styles()) orelse return error.PivotEditUnsafe;
             if (style_idx >= styles_view.cell_xfs.len) return error.PivotEditUnsafe;
-            if (styles_view.cell_xfs[style_idx].num_fmt_id != null) return error.PivotEditUnsafe;
+            const xf = styles_view.cell_xfs[style_idx];
+            if (xf.num_fmt_id != null or xf.num_fmt_id_invalid) return error.PivotEditUnsafe;
             try memo.put(arena, style_idx, false);
             return false;
         };
