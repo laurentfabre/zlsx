@@ -319,6 +319,12 @@ pub const SourceBacking = struct {
 
 pub const PartStore = struct {
     allocator: std.mem.Allocator,
+    /// How many times a part was added, removed or replaced through
+    /// this store — attempted, not only done; a count that moved is
+    /// a store that may have. What a collection made over the store
+    /// (`Workbook.PreparedPivotEdits`) checks before it is installed
+    /// (Codex #205 r6 REL-605).
+    mutations: u64 = 0,
     /// The `Io` this store was opened with. `save()` needs one for the
     /// atomic-file output long after `open()` returned, so the store
     /// carries its own. Source *reads* go through `backing.io`, which
@@ -703,6 +709,7 @@ pub const PartStore = struct {
         bytes: []const u8,
         poller: Poller,
     ) !void {
+        self.mutations += 1;
         if (self.findIndex(name) != null) return error.PartAlreadyExists;
         // Strict `>=`: 0xFFFFFFFF is the Zip64 sentinel — emitting that
         // in compressed_size or uncompressed_size produces an archive
@@ -902,6 +909,7 @@ pub const PartStore = struct {
     /// worksheet would produce an archive that no reader accepts; this
     /// exists for genuinely optional parts such as `docProps/custom.xml`.
     pub fn removePart(self: *PartStore, name: []const u8) !void {
+        self.mutations += 1;
         const idx = self.findIndex(name) orelse return;
         const ar_alloc = self.arena.allocator();
 
@@ -987,6 +995,7 @@ pub const PartStore = struct {
     /// the failure is not reclaimed; it is an arena. Same deferred-
     /// compression contract as `replacePart`; no poll seam.
     pub fn replaceParts(self: *PartStore, entries: []const Replacement) !void {
+        self.mutations += 1;
         const ar_alloc = self.arena.allocator();
         const Staged = struct {
             idx: usize,
@@ -1093,6 +1102,7 @@ pub const PartStore = struct {
         bytes: []const u8,
         poller: Poller,
     ) !void {
+        self.mutations += 1;
         const idx = self.findIndex(name) orelse return error.PartNotFound;
         const ar_alloc = self.arena.allocator();
 

@@ -6164,6 +6164,9 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         // A coordinate twice (Codex #205 r4 REL-404).
         .{ .name = "duprow", .part = sheet_part, .old = "<row r=\"3\">", .new = "<row r=\"2\"><c r=\"C2\"><v>9</v></c></row><row r=\"3\">", .err = error.MalformedSheetXml, .shift_ok = true },
         .{ .name = "dupcell", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>3</v></c><c r=\"B2\"><v>4</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
+        // Not the strict grid spelling (Codex #205 r6 REL-603).
+        .{ .name = "leadingzero", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B02\"><v>3</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
+        .{ .name = "pastxfd", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"XFE2\"><v>3</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
     };
     for (cases) |case| {
         const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r1_{s}.xlsx", .{case.name});
@@ -6191,6 +6194,25 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         defer ed.deinit();
         const want: anyerror = if (case.err == error.MalformedSheetXml) error.MalformedSheetXml else error.RowEditUnsafeForSheet;
         try std.testing.expectError(want, ed.insertRow(0, 2));
+    }
+    {
+        // A row past the grid: an insert is the sheet transform's own
+        // refusal (`RowEditExceedsMaxRow`, before any mutation); a
+        // delete passes that probe and meets the strict parser.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r1_pastlastrow.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"B2\"><v>3</v></c>", "<c r=\"B1048577\"><v>3</v></c>");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.RowEditExceedsMaxRow, wb.insertRow(0, 2));
+        try std.testing.expectError(error.MalformedSheetXml, wb.deleteRow(0, 3));
+        try std.testing.expectEqualStrings(before, (try wb.store.part(rec_part)).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, ed.deleteRow(0, 3));
     }
 
     // A string formula whose cached value is the empty string is the
@@ -6234,6 +6256,28 @@ test "S7b-4: a numeric cell under a style the workbook cannot spell — a locale
         .{ .name = "bogus_xf", .num_fmts = "", .xf1 = "numFmtId=\"bogus\"", .style = "1", .admits = false },
         .{ .name = "bogus_s", .num_fmts = "", .xf1 = "numFmtId=\"0\"", .style = "bogus", .admits = false },
     };
+    // A cell without `s` wears style 0: a date there refuses (Codex
+    // #205 r6 REL-601). The fixture's cells carry no `s`.
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r6_style0_date.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        {
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"1\"><xf numFmtId=\"14\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>");
+            try store.save(io, src);
+        }
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 4));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 4));
+    }
     for (cases) |case| {
         const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r2_{s}.xlsx", .{case.name});
         defer std.testing.allocator.free(file);
@@ -6448,6 +6492,48 @@ test "S7b-4: a table's totals row is not a record — its delete refuses, an ins
         defer store.deinit();
         try expectRebuilt(&store, def_part, rec_part, 5);
     }
+}
+
+test "S7b-4: a prepared collection is this edit's or nothing — another index, another axis, an aged store, another workbook refuse and change no part (Codex #205 r6 REL-605)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b4_r6_token.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rec_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    var other = try Workbook.open(std.testing.allocator, io, src);
+    defer other.deinit();
+    const before_def = try std.testing.allocator.dupe(u8, (try wb.store.part(def_part)).?.bytes);
+    defer std.testing.allocator.free(before_def);
+    const before_rec = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+    defer std.testing.allocator.free(before_rec);
+
+    var prepared = try wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 2, .insert);
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expect(prepared.patches.items.len == 2);
+    try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 3, .kind = .insert }, &prepared));
+    try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 2, .kind = .delete }, &prepared));
+    try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .col = 2, .kind = .insert }, &prepared));
+    try std.testing.expectError(error.PivotEditUnsafe, other.applySheetEdit(0, .{ .row = 2, .kind = .insert }, &prepared));
+    try std.testing.expectEqualStrings(before_def, (try wb.store.part(def_part)).?.bytes);
+    try std.testing.expectEqualStrings(before_rec, (try wb.store.part(rec_part)).?.bytes);
+    try std.testing.expectEqualStrings(before_def, (try other.store.part(def_part)).?.bytes);
+    // The store moved under the token (a pure shift replaced the
+    // definition): aged, it refuses too.
+    try wb.insertRow(0, 1);
+    try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 2, .kind = .insert }, &prepared));
+    // The token for the edit as it now is installs.
+    var fresh = try wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 3, .insert);
+    defer fresh.deinit(std.testing.allocator);
+    try wb.applySheetEdit(0, .{ .row = 3, .kind = .insert }, &fresh);
+    const cd = (try wb.store.part(def_part)).?;
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "recordCount=\"4\"") != null);
 }
 
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───

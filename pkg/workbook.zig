@@ -5754,9 +5754,14 @@ pub const Workbook = struct {
     /// `applySheetEdit`, so the S7b-4 rebuild — a read of the whole
     /// source rectangle — runs once per edit rather than once for the
     /// pre-flight and again for the sweep (Codex #205 r1 PERF-101).
-    /// Good for that one edit over the store as it was collected on;
-    /// the caller mutates nothing in between.
+    /// Good for that one edit, on that one workbook, over the store as
+    /// it was collected on — and checked to be, at run time, before it
+    /// is installed: another edit's token, another workbook's, or one
+    /// a store mutation has aged refuses (Codex #205 r6 REL-605).
     pub const PreparedPivotEdits = struct {
+        owner: *const Workbook,
+        /// `PartStore.mutations` at collection.
+        mutations: u64,
         sheet_part_name: []const u8,
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
@@ -6139,6 +6144,8 @@ pub const Workbook = struct {
         kind: pivots_mod.edit.Kind,
     ) Error!PreparedPivotEdits {
         var prepared: PreparedPivotEdits = .{
+            .owner = self,
+            .mutations = self.store.mutations,
             .sheet_part_name = try self.allocator.dupe(u8, sheet_part_name),
             .axis = axis,
             .idx_1based = idx_1based,
@@ -6428,9 +6435,13 @@ pub const Workbook = struct {
             .delete => .delete,
         };
         if (prepared) |p| {
-            // The pre-flight's own collection, for this very edit.
-            std.debug.assert(std.mem.eql(u8, p.sheet_part_name, sheet_part_name));
-            std.debug.assert(p.axis == axis and p.idx_1based == idx_1based and p.kind == kind);
+            // The pre-flight's own collection, for this very edit, on
+            // this workbook, over this store as it was: anything else
+            // is a token for another edit (Codex #205 r6 REL-605).
+            const same = p.owner == self and p.mutations == self.store.mutations and
+                std.mem.eql(u8, p.sheet_part_name, sheet_part_name) and
+                p.axis == axis and p.idx_1based == idx_1based and p.kind == kind;
+            if (!same) return error.PivotEditUnsafe;
             if (p.patches.items.len > 0) try self.store.replaceParts(p.patches.items);
             return;
         }
@@ -6570,9 +6581,12 @@ pub const Workbook = struct {
             for (row.cells) |cell| {
                 // The whole reference, and its row must be the row that
                 // holds it: an `A999` inside `<row r="2">` is not A2.
-                const col = sheet_edit.parseColFromA1(cell.ref) orelse return error.MalformedSheetXml;
-                const cell_row = sheet_edit.parseRowFromA1(cell.ref) orelse return error.MalformedSheetXml;
-                if (cell_row != row.row_idx) return error.MalformedSheetXml;
+                // The strict grid parser: uppercase letters inside
+                // `XFD`, a row inside 1048576 with no leading zero, no
+                // `$`, nothing after (Codex #205 r6 REL-603).
+                const parsed = coords.parseCell(cell.ref, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
+                const col = parsed.col.oneBased();
+                if (parsed.row.oneBased() != row.row_idx) return error.MalformedSheetXml;
                 if (col < rect.tl_col or col > rect.br_col) continue;
                 if (grid[gi].ptr == blank_row.ptr) {
                     const own = try arena.alloc(eng.Value, width);
@@ -6609,7 +6623,12 @@ pub const Workbook = struct {
                 // A style the cell names but the view could not read
                 // is not "unstyled" (Codex #205 r5 REL-504).
                 if (cell.style_invalid) return error.PivotEditUnsafe;
-                if (cell.style_idx) |s| {
+                // A cell without `s` wears style 0 (ECMA-376
+                // §18.3.1.4), which a workbook may make a date (Codex
+                // #205 r6 REL-601); only a workbook with no styles part
+                // has no style 0 to wear.
+                const style: ?u32 = cell.style_idx orelse if ((try self.styles()) != null) @as(?u32, 0) else null;
+                if (style) |s| {
                     if (try self.styleDescribesDate(arena, s, date_styles)) return error.PivotEditUnsafe;
                 }
                 return .{ .number = raw };

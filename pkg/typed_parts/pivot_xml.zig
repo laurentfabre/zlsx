@@ -134,6 +134,10 @@ pub const CacheSource = struct {
     /// `<consolidation><rangeSets><rangeSet …/>` — one per set, in
     /// document order; empty for every other type.
     range_sets: []WorksheetSource = &.{},
+    /// A `<consolidation>` element was there, with sets or without —
+    /// a shape of its own whatever `range_sets` holds (Codex #205 r6
+    /// REL-604).
+    has_consolidation: bool = false,
 };
 
 /// `CT_SharedItems` — the field's value inventory. Defaults are the
@@ -351,6 +355,7 @@ fn parseCacheSource(allocator: Allocator, xml: []const u8, el: Child, root: Root
             // is refused, never read over the first.
             if (have_consolidation) return error.MalformedXml;
             have_consolidation = true;
+            src.has_consolidation = true;
             var have_range_sets = false;
             var cons = Children.init(xml, k.hit, k.end, root.prefix, k.env);
             while (try cons.next()) |c| {
@@ -425,13 +430,13 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
     si.span = .{ .start = el.hit.open_lt, .end = el.after };
     var items: std.ArrayListUnmanaged(SharedItems.Item) = .empty;
     errdefer items.deinit(allocator);
-    var prefixed_attr = false;
+    // A qualified attribute on the element or on an item may hang on
+    // a declaration the rebuilt element would not carry (Codex #205 r5
+    // REL-501, r6 REL-602).
+    var prefixed_attr = hasQualifiedAttr(el.attrs(xml));
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
-        var attrs_it: AttrIter = .{ .attrs = k.attrs(xml) };
-        while (attrs_it.next()) |a| {
-            if (std.mem.indexOfScalar(u8, a.name, ':') != null) prefixed_attr = true;
-        }
+        if (hasQualifiedAttr(k.attrs(xml))) prefixed_attr = true;
         const kind: SharedItems.Item.Kind = if (k.local.len == 1) switch (k.local[0]) {
             's' => .s,
             'n' => .n,
@@ -862,6 +867,11 @@ pub const max_prefix_len = 32;
 /// about eight deep; a part past this is refused rather than tracked
 /// on the heap.
 const max_depth = 64;
+/// Attributes one start tag may carry. Excel's widest — a
+/// `pivotTableDefinition` root — carries some sixty; the ceiling bounds
+/// the duplicate-name scan, which reads every earlier pair once per
+/// attribute (Codex #205 r6 PERF-601).
+const max_attrs_per_tag = 256;
 
 /// Most prefixes one document may bind to the relationships namespace
 /// at once. Office binds one (`r`); a conforming producer may alias it,
@@ -1053,6 +1063,26 @@ fn preflight(xml: []const u8) Error!void {
     if (!isBlank(xml[i..])) return error.MalformedXml;
 }
 
+/// Whether an attributes region carries a qualified attribute — a
+/// name under a prefix (`z:meta`) that is not a namespace declaration.
+/// An element a rebuild regenerates from its typed reading would drop
+/// it, and the declaration it hangs on may live on that very element
+/// (Codex #205 r5 REL-501, r6 REL-602).
+pub fn hasQualifiedAttr(attrs: []const u8) bool {
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        if (std.mem.startsWith(u8, a.name, "xmlns")) continue;
+        if (std.mem.indexOfScalar(u8, a.name, ':') != null) return true;
+    }
+    return false;
+}
+
+/// Whether an attributes region carries any attribute at all.
+pub fn hasAnyAttr(attrs: []const u8) bool {
+    var it: AttrIter = .{ .attrs = attrs };
+    return it.next() != null;
+}
+
 pub fn isBlank(s: []const u8) bool {
     for (s) |c| if (!std.ascii.isWhitespace(c)) return false;
     return true;
@@ -1094,6 +1124,7 @@ const TagEnd = struct { after_gt: usize, self_closing: bool };
 /// anywhere is refused. Returns where the tag ends.
 fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
     var j = from;
+    var count: usize = 0;
     while (true) {
         while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
         if (j >= xml.len) return error.MalformedXml;
@@ -1105,6 +1136,8 @@ fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
         if (!isNameStart(xml[j])) return error.MalformedXml;
         const name_start = j;
         while (j < xml.len and xml[j] != '=' and !std.ascii.isWhitespace(xml[j]) and xml[j] != '<' and xml[j] != '>' and xml[j] != '/') j += 1;
+        count += 1;
+        if (count > max_attrs_per_tag) return error.MalformedXml;
         // A name twice on one tag is not XML, and a writer that
         // replaced the first value would leave the second standing
         // (Codex #205 r4 REL-405). The pairs before it are whole.

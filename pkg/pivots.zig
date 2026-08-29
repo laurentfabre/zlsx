@@ -2589,7 +2589,7 @@ pub const engine = struct {
     /// with an inventory of simple string / number / blank items and
     /// no date; no calculated or group field, no OLAP element.
     pub fn checkShape(def: *const pivot_xml.CacheDefinition) RebuildError!void {
-        if (def.source.type != .worksheet or def.source.range_sets.len != 0) return error.PivotShapeUnsupported;
+        if (def.source.type != .worksheet or def.source.has_consolidation or def.source.range_sets.len != 0) return error.PivotShapeUnsupported;
         if (def.has_other_children) return error.PivotShapeUnsupported;
         if (def.fields_count_attr) |n| {
             if (n != def.fields.len) return error.MalformedPivotXml;
@@ -2883,10 +2883,14 @@ pub const engine = struct {
         var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
         while (kids.next() catch |e| return mapRecordsParse(e)) |k| {
             if (!std.mem.eql(u8, k.local, "r")) return error.PivotShapeUnsupported;
+            // A record carries no attribute (CT_Record); one that does
+            // is content the regenerated part would lose (Codex #205
+            // r6 REL-602).
+            if (pivot_xml.hasAnyAttr(k.attrs(xml))) return error.PivotShapeUnsupported;
             // Inside a record, only the value elements, childless,
-            // under the part's prefix: anything else is a shape the
-            // regenerated part would silently lose (Codex #205 r3
-            // REL-304).
+            // under the part's prefix, with no qualified attribute:
+            // anything else is a shape the regenerated part would
+            // silently lose (Codex #205 r3 REL-304, r6 REL-602).
             var vals = pivot_xml.Children.init(xml, k.hit, k.end, root.prefix, k.env);
             while (vals.next() catch |e| return mapRecordsParse(e)) |v| {
                 if (v.local.len != 1) return error.PivotShapeUnsupported;
@@ -2894,6 +2898,7 @@ pub const engine = struct {
                     'x', 'n', 's', 'm', 'b', 'd', 'e' => {},
                     else => return error.PivotShapeUnsupported,
                 }
+                if (pivot_xml.hasQualifiedAttr(v.attrs(xml))) return error.PivotShapeUnsupported;
                 if (!pivot_xml.isBlank(xml[v.hit.after_tag_close..v.end])) return error.PivotShapeUnsupported;
             }
             if (vals.skipped > 0 or vals.other) return error.PivotShapeUnsupported;
@@ -6047,4 +6052,67 @@ test "engine: an item with a prefixed attribute refuses — the declaration it m
     // A declaration nothing uses is nothing.
     const unused = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems xmlns:y=\"urn:other\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail);
     try engine.checkShape(&unused);
+}
+
+test "engine: a qualified attribute on the inventory element, a record or a value element refuses; an unqualified one on a value element reads; empty consolidation markup refuses; a tag past the attribute ceiling refuses the part (Codex #205 r6 REL-602, REL-604, PERF-601)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const on_element = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems z:meta=\"x\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&on_element));
+
+    const def_xml = head ++ "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\" count=\"1\">";
+    const lossy = [_][]const u8{
+        rec_head ++ "<r z:meta=\"x\"><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r u=\"1\"><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x z:meta=\"x\" v=\"0\"/></r></pivotCacheRecords>",
+        "<x:pivotCacheRecords xmlns:x=\"" ++ main_ns ++ "\" count=\"1\"><x:r><x:x x:meta=\"1\" v=\"0\"/></x:r></x:pivotCacheRecords>",
+    };
+    for (lossy) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\" u=\"1\"/></r></pivotCacheRecords>", null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+
+    // Consolidation markup beside a worksheet locator, sets or none.
+    const cons = [_][]const u8{
+        "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/><consolidation/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>",
+        "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/><consolidation><rangeSets count=\"0\"/></consolidation></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>",
+    };
+    for (cons) |xml| {
+        const def = try pivot_xml.parseCacheDefinition(arena, xml);
+        try testing.expect(def.source.has_consolidation);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+
+    // The attribute ceiling: 256 unknown attributes read, 257 refuse.
+    for ([_]usize{ 254, 255 }) |extra| {
+        var xml: std.ArrayListUnmanaged(u8) = .empty;
+        try xml.appendSlice(arena, "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"");
+        for (0..extra) |i| try xml.appendSlice(arena, try std.fmt.allocPrint(arena, " a{d}=\"\"", .{i}));
+        try xml.appendSlice(arena, "><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource></pivotCacheDefinition>");
+        // xmlns + recordCount + extra: 256 passes, 257 does not.
+        if (extra == 254) {
+            _ = try pivot_xml.parseCacheDefinition(arena, xml.items);
+        } else {
+            try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml.items));
+        }
+    }
 }
