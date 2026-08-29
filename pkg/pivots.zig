@@ -78,6 +78,87 @@ pub const ResolvedVia = enum {
     defined_name,
 };
 
+/// The area a local source reads — what a static spelling proves.
+/// `null` on `LocalSheet.bounds` for a spelling that names a sheet and
+/// nothing on it (a `sheet` attribute alone, a `ref` no rectangle
+/// parser accepts).
+pub const Bounds = union(enum) {
+    /// A finite rectangle: a direct `ref`, a table's `ref`, a name body
+    /// such as `Data!$A$1:$C$4` or `Data!$A$1`.
+    rect: edit.Rect,
+    /// Whole columns, 1-based and inclusive: `Data!$A:$C`.
+    whole_columns: struct { first_col: u32, last_col: u32 },
+    /// Whole rows, 1-based and inclusive: `Data!$1:$4`.
+    whole_rows: struct { first_row: u32, last_row: u32 },
+
+    /// The A1 spelling — `A1:C4`, `A:C`, `1:4`. `buf` holds any of them
+    /// at `format_buf_len`. Null for a value outside the grid (a
+    /// column or row of 0, or past `XFD` / 1048576): the parsers here
+    /// never produce one, but the type is public (Codex #202 r4 F4).
+    pub fn formatA1(self: Bounds, buf: *[format_buf_len]u8) ?[]const u8 {
+        if (!self.inGrid()) return null;
+        return switch (self) {
+            .rect => |r| blk: {
+                var tl: [coords.max_col_letters]u8 = undefined;
+                var br: [coords.max_col_letters]u8 = undefined;
+                const tl_len = coords.writeColNumberLetters(&tl, r.tl_col) catch return null;
+                const br_len = coords.writeColNumberLetters(&br, r.br_col) catch return null;
+                break :blk std.fmt.bufPrint(buf, "{s}{d}:{s}{d}", .{ tl[0..tl_len], r.tl_row, br[0..br_len], r.br_row }) catch return null;
+            },
+            .whole_columns => |c| blk: {
+                var f: [coords.max_col_letters]u8 = undefined;
+                var l: [coords.max_col_letters]u8 = undefined;
+                const f_len = coords.writeColNumberLetters(&f, c.first_col) catch return null;
+                const l_len = coords.writeColNumberLetters(&l, c.last_col) catch return null;
+                break :blk std.fmt.bufPrint(buf, "{s}:{s}", .{ f[0..f_len], l[0..l_len] }) catch return null;
+            },
+            .whole_rows => |r| std.fmt.bufPrint(buf, "{d}:{d}", .{ r.first_row, r.last_row }) catch return null,
+        };
+    }
+
+    /// 1-based and inside the grid, corners ordered.
+    pub fn inGrid(self: Bounds) bool {
+        return switch (self) {
+            .rect => |r| r.tl_col >= 1 and r.tl_row >= 1 and r.br_col <= zlsx.max_col_1based and r.br_row <= zlsx.max_row and r.tl_col <= r.br_col and r.tl_row <= r.br_row,
+            .whole_columns => |c| c.first_col >= 1 and c.last_col <= zlsx.max_col_1based and c.first_col <= c.last_col,
+            .whole_rows => |r| r.first_row >= 1 and r.last_row <= zlsx.max_row and r.first_row <= r.last_row,
+        };
+    }
+
+    pub const format_buf_len = 32;
+};
+
+/// Why a worksheet-type source could not be placed, and what it does
+/// prove — the S7b guard's evidence for a source it cannot bound.
+pub const Unresolved = struct {
+    why: Why,
+    /// Sheets of this workbook the spelling or its name closure names —
+    /// ascending, without duplicates: the local `sheet` beside an
+    /// unplaceable `r:id`; every sheet qualifier (a 3D span: each sheet
+    /// between its ends, in tab order) and every table's host reachable
+    /// from a name body through the names it references. Empty when
+    /// nothing local is proven.
+    sheets: []const u32,
+
+    pub const Why = enum {
+        /// `sheet` names no sheet of this workbook.
+        dangling_sheet,
+        /// `name` is neither a defined name nor a table.
+        dangling_name,
+        /// `name` is a defined name whose body is not one static
+        /// sheet-qualified area — dynamic, 3D, a union, a bare range,
+        /// or reaching its sheet only through another name.
+        unbounded_body,
+        /// `r:id` names no External-mode external-link relationship.
+        unplaceable_rid,
+        /// `ref` without `sheet` or `name`: a range on no sheet.
+        sheetless_ref,
+        /// Neither `sheet`, `name` nor `ref`, or a `worksheet`-type
+        /// source without its `<worksheetSource>` child.
+        no_locator,
+    };
+};
+
 pub const SourceResolution = union(enum) {
     /// A sheet of this workbook.
     sheet: LocalSheet,
@@ -86,7 +167,8 @@ pub const SourceResolution = union(enum) {
     /// A worksheet-type source whose spelling names nothing this
     /// workbook has — a dangling sheet name, a name with a dynamic or
     /// 3D body, a missing relationship. Excel would fail the refresh.
-    unresolved,
+    /// The payload says why, and which sheets the spelling still proves.
+    unresolved: Unresolved,
     /// Not a worksheet-type source (external connection, scenario,
     /// unknown), so there is no sheet to resolve.
     none,
@@ -97,6 +179,8 @@ pub const SourceResolution = union(enum) {
         sheet_name: []const u8,
         part_name: []const u8,
         via: ResolvedVia,
+        /// The area read, when the spelling proves one (S7b's rectangle).
+        bounds: ?Bounds,
     };
 };
 
@@ -217,6 +301,20 @@ pub const Pivots = struct {
         return false;
     }
 
+    /// The S7b guard's selection: does any cache *provably* depend on
+    /// this sheet — a source resolved to it, or an unresolved one whose
+    /// evidence names it (the local `sheet` beside an unplaceable
+    /// `r:id`; a name body reaching the sheet through the names it
+    /// references)? Between `readsFromSheet` (resolved only) and
+    /// `mayReadFromSheet` (every sheet, once a source proves nothing).
+    pub fn dependsOnSheet(self: *const Pivots, sheet_idx: u32) bool {
+        for (self.caches) |c| {
+            if (dependsOn(c.resolution, sheet_idx)) return true;
+            for (c.range_set_resolutions) |r| if (dependsOn(r, sheet_idx)) return true;
+        }
+        return false;
+    }
+
     /// The S7a guard's question, which is wider than `readsFromSheet`:
     /// could any cache read this sheet? True when a source resolves to
     /// it, and — conservatively — when a source is `unresolved` (a
@@ -238,6 +336,14 @@ pub const Pivots = struct {
         return switch (r) {
             .sheet => |s| s.sheet_idx == sheet_idx,
             else => false,
+        };
+    }
+
+    fn dependsOn(r: SourceResolution, sheet_idx: u32) bool {
+        return switch (r) {
+            .sheet => |s| s.sheet_idx == sheet_idx,
+            .unresolved => |u| std.mem.indexOfScalar(u32, u.sheets, sheet_idx) != null,
+            .external, .none => false,
         };
     }
 
@@ -416,7 +522,7 @@ pub fn collect(allocator: Allocator, store: *PartStore, wb: *const wbxml.Workboo
                     source_spelling = try spell(a, ws);
                     resolution = try resolver.resolve(ws, cache_rels);
                 } else {
-                    resolution = .unresolved;
+                    resolution = .{ .unresolved = .{ .why = .no_locator, .sheets = &.{} } };
                 }
             },
             .consolidation => {
@@ -636,6 +742,8 @@ const Resolver = struct {
     const TableEntry = struct {
         folded: []const u8,
         sheet_idx: u32,
+        /// The table part's `ref`, when it parses as a rectangle.
+        bounds: ?Bounds,
     };
 
     fn deinit(self: *Resolver) void {
@@ -651,20 +759,33 @@ const Resolver = struct {
         // sheet and range spell — and only an External-mode
         // relationship of the external-link type says so. An internal
         // or differently typed target under `r:id` is not a workbook
-        // this reader can name.
+        // this reader can name; what such a spelling still proves is
+        // the local `sheet` beside it, if any.
         if (ws.r_id) |rid| {
-            const rel = relById(cache_rels, rid) orelse return .unresolved;
-            if (rel.target_mode != .external) return .unresolved;
-            if (!relLeafIs(rel.type, "externalLinkPath")) return .unresolved;
-            // The target is handed to readers as text; bytes that are
-            // not text are refused at this boundary, not emitted.
-            if (!std.unicode.utf8ValidateSlice(rel.target)) return error.MalformedPivotXml;
-            return .{ .external = rel.target };
+            if (relById(cache_rels, rid)) |rel| {
+                if (rel.target_mode == .external and relLeafIs(rel.type, "externalLinkPath")) {
+                    // The target is handed to readers as text; bytes that
+                    // are not text are refused at this boundary, not
+                    // emitted.
+                    if (!std.unicode.utf8ValidateSlice(rel.target)) return error.MalformedPivotXml;
+                    return .{ .external = rel.target };
+                }
+            }
+            return unresolved(.unplaceable_rid, try self.sheetsOfAttr(ws.sheet));
         }
         if (ws.sheet) |raw_sheet| {
             const name = try decode(self.arena, .pivot_source_sheet_name, raw_sheet);
-            const idx = (try self.sheetIndexOf(name)) orelse return .unresolved;
-            return try self.local(idx, .sheet_attr);
+            const idx = (try self.sheetIndexOf(name)) orelse return unresolved(.dangling_sheet, &.{});
+            // `sheet` names the sheet; a `ref` bounds it, else a `name`
+            // beside it may (a table or a static name on that same
+            // sheet — Codex #202 r1 F4). The sheet wins on identity.
+            const bounds = if (ws.ref != null)
+                try self.boundsOfRef(ws.ref)
+            else if (ws.name) |raw_name|
+                try self.carrierBounds(idx, raw_name)
+            else
+                null;
+            return try self.local(idx, .sheet_attr, bounds);
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -676,29 +797,84 @@ const Resolver = struct {
             const symbols = try self.ensureSymbols();
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
-                    const idx = (try self.sheetOfBody(n.body)) orelse return .unresolved;
-                    return try self.local(idx, .defined_name);
+                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds);
+                    return unresolved(.unbounded_body, try self.closureSheets(n));
                 },
                 .refused => return error.MalformedPivotXml,
                 .table, .not_found => {},
             }
-            const folded = (try fold(self.arena, name)) orelse return .unresolved;
+            const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{});
             for (try self.ensureTables()) |t| {
-                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table);
+                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds);
             }
-            return .unresolved;
+            return unresolved(.dangling_name, &.{});
         }
-        return .unresolved;
+        return unresolved(if (ws.ref != null) .sheetless_ref else .no_locator, &.{});
     }
 
-    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia) Error!SourceResolution {
-        if (sheet_idx >= self.sheet_parts.len) return .unresolved;
+    fn unresolved(why: Unresolved.Why, sheets: []const u32) SourceResolution {
+        return .{ .unresolved = .{ .why = why, .sheets = sheets } };
+    }
+
+    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds) Error!SourceResolution {
+        if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{});
         return .{ .sheet = .{
             .sheet_idx = sheet_idx,
             .sheet_name = self.sheet_names[sheet_idx],
             .part_name = self.sheet_parts[sheet_idx],
             .via = via,
+            .bounds = bounds,
         } };
+    }
+
+    /// The bounds a `name` beside a `sheet` lends the source, when the
+    /// carrier is on that sheet: a static defined-name body, else a
+    /// table. Nothing refuses here — the sheet is already placed, and
+    /// the name is evidence for the area only.
+    fn carrierBounds(self: *Resolver, sheet_idx: u32, raw_name: []const u8) Error!?Bounds {
+        const name = try decode(self.arena, .pivot_source_name, raw_name);
+        const symbols = self.ensureSymbols() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        // Looked up FROM the stated sheet: its own scoped name shadows a
+        // workbook one of the same spelling there (Codex #202 r2 F3).
+        switch (try symbols.resolveName(self.gpa, engine.SheetIndex.fromInt(sheet_idx), name)) {
+            .name => |n| {
+                const area = (try self.areaOfBody(n.body)) orelse return null;
+                return if (area.sheet_idx == sheet_idx) area.bounds else null;
+            },
+            .refused => return null,
+            .table, .not_found => {},
+        }
+        const folded = (try fold(self.arena, name)) orelse return null;
+        const tables = self.ensureTables() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        for (tables) |t| {
+            if (std.mem.eql(u8, t.folded, folded)) return if (t.sheet_idx == sheet_idx) t.bounds else null;
+        }
+        return null;
+    }
+
+    /// The one sheet a `sheet` attribute names, as evidence: `[idx]`,
+    /// or nothing when it names no sheet here.
+    fn sheetsOfAttr(self: *Resolver, raw_sheet: ?[]const u8) Error![]const u32 {
+        const raw = raw_sheet orelse return &.{};
+        const name = try decode(self.arena, .pivot_source_sheet_name, raw);
+        const idx = (try self.sheetIndexOf(name)) orelse return &.{};
+        const one = try self.arena.alloc(u32, 1);
+        one[0] = idx;
+        return one;
+    }
+
+    /// A direct `ref`, entity-decoded, as bounds — or null when there is
+    /// none or it is not a rectangle, whole columns or whole rows.
+    fn boundsOfRef(self: *Resolver, raw_ref: ?[]const u8) Error!?Bounds {
+        const raw = raw_ref orelse return null;
+        const decoded = try decodeLexical(self.arena, raw);
+        return parseBounds(decoded);
     }
 
     /// Sheet lookup by decoded name, case-folded the way every sheet
@@ -751,7 +927,15 @@ const Resolver = struct {
                 const raw = table_edit.tableDisplayNameRaw(table_part.bytes) orelse return error.MalformedPivotXml;
                 const name = try decode(self.arena, .table_name, raw);
                 const folded = (try fold(self.arena, name)) orelse continue;
-                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i) });
+                // The table's `ref` is the source's rectangle — the same
+                // scanner and attribute the table editor reads; a `ref`
+                // that is not a rectangle leaves the bounds unproven,
+                // it does not refuse the read.
+                var bounds: ?Bounds = null;
+                if (tableRefRaw(table_part.bytes)) |ref_raw| {
+                    bounds = parseBounds(try decodeLexical(self.arena, ref_raw));
+                }
+                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds });
             }
         }
         self.tables = try entries.toOwnedSlice(self.arena);
@@ -798,12 +982,17 @@ const Resolver = struct {
         return &self.symbols.?;
     }
 
-    /// The sheet a defined name's body denotes, when the body is exactly
-    /// one static sheet-qualified reference (`Data!$A$1:$C$4`,
-    /// `'My Data'!A1:B2`). A 3D span, a dynamic body (`OFFSET(…)`,
-    /// `Data!A1:INDEX(…)`), a union, or a bare range resolves to null:
-    /// none names one sheet a pivot could read.
-    fn sheetOfBody(self: *Resolver, body: []const u8) Error!?u32 {
+    const Area = struct { sheet_idx: u32, bounds: ?Bounds };
+
+    /// The area a defined name's body denotes, when the body is exactly
+    /// one static sheet-qualified area (`Data!$A$1:$C$4`, `Data!$A$1`,
+    /// `'My Data'!A1:B2`, `Data!$A:$C`). A 3D span, a dynamic body
+    /// (`OFFSET(…)`, `Data!A1:INDEX(…)`), a union or a bare range
+    /// resolves to null: none names one area a pivot could read. A
+    /// range whose ends are static references of different kinds
+    /// (`Data!$A$1:$C:$C`) names the sheet — as it did before S7b-1 —
+    /// with no bounds (Codex #202 r1 F1).
+    fn areaOfBody(self: *Resolver, body: []const u8) Error!?Area {
         var parsed = try engine.parser.parse(self.gpa, body, .{});
         defer parsed.deinit(self.gpa);
         const ast = switch (parsed) {
@@ -814,11 +1003,20 @@ const Resolver = struct {
         // operator whose LEFT operand carries the qualifier. The right
         // operand must be a static reference too, on the same sheet if
         // it is qualified at all — compared by resolved index, so
-        // `Data!A1:data!C4` is one sheet.
-        switch (ast.node(ast.root)) {
+        // `Data!A1:data!C4` is one sheet. Parentheses around the whole
+        // body keep it a reference (Codex #202 r4 F2).
+        var root = ast.root;
+        while (true) {
+            switch (ast.node(root)) {
+                .paren => |pn| root = pn.child,
+                else => break,
+            }
+        }
+        switch (ast.node(root)) {
             .qualified => |q| {
-                if (!isStaticRef(ast.node(q.target))) return null;
-                return try self.sheetOfSpec(q.sheet);
+                const bounds = staticBounds(ast.node(q.target)) orelse return null;
+                const idx = (try self.sheetOfSpec(q.sheet)) orelse return null;
+                return .{ .sheet_idx = idx, .bounds = bounds };
             },
             .binary => |b| {
                 if (b.op != .range) return null;
@@ -826,38 +1024,445 @@ const Resolver = struct {
                     .qualified => |q| q,
                     else => return null,
                 };
-                if (!isStaticRef(ast.node(lhs.target))) return null;
                 const idx = (try self.sheetOfSpec(lhs.sheet)) orelse return null;
-                const rhs = ast.node(b.rhs);
-                switch (rhs) {
-                    .qualified => |q| {
-                        if (!isStaticRef(ast.node(q.target))) return null;
+                const rhs_node = ast.node(b.rhs);
+                const rhs_target: engine.parser.Node = switch (rhs_node) {
+                    .qualified => |q| blk: {
                         const r = (try self.sheetOfSpec(q.sheet)) orelse return null;
                         if (r != idx) return null;
+                        break :blk ast.node(q.target);
                     },
-                    else => if (!isStaticRef(rhs)) return null,
-                }
-                return idx;
+                    else => rhs_node,
+                };
+                const lhs_target = ast.node(lhs.target);
+                if (staticBounds(lhs_target) == null or staticBounds(rhs_target) == null) return null;
+                return .{ .sheet_idx = idx, .bounds = rangeBounds(lhs_target, rhs_target) };
             },
             else => return null,
         }
     }
 
+    /// Every sheet a name body depends on, through the names it
+    /// references: sheet qualifiers (a 3D span contributes each sheet
+    /// between its ends, in tab order, by the engine's own expansion —
+    /// a reversed or dangling span is `#REF!` and contributes nothing),
+    /// tables (their host sheet), and the bodies of referenced names —
+    /// each name resolved in the scope the reference sits in (a
+    /// qualifier's sheet, else the enclosing scope), so a sheet-scoped
+    /// name that shadows a workbook one is its own dependency (Codex
+    /// #202 r1 F2). The bodies are walked from a worklist, not by
+    /// recursion: every (name, scope) pair is walked exactly once, so a
+    /// cycle terminates, a chain of any length costs one visit per name,
+    /// and no depth cap can cut a body short (Codex #202 r3 F1). A body
+    /// the parser refuses and a name the inventory refuses or lacks
+    /// contribute nothing — evidence, not refusal. Ascending,
+    /// deduplicated, arena-owned.
+    fn closureSheets(self: *Resolver, root: *const engine.Name) Error![]const u32 {
+        var sheets: std.ArrayListUnmanaged(u32) = .empty;
+        defer sheets.deinit(self.gpa);
+        var walk: Walk = .{};
+        defer walk.deinit(self.gpa);
+        try walk.enqueue(self.gpa, .{ .name = root, .scope = scopeOf(root) });
+        while (walk.pending.pop()) |v| try self.walkBody(v.name.body, v.scope, &sheets, &walk);
+        std.mem.sort(u32, sheets.items, {}, std.sort.asc(u32));
+        return try self.arena.dupe(u32, sheets.items);
+    }
+
+    fn scopeOf(n: *const engine.Name) ?u32 {
+        return if (n.scope) |sc| sc.toInt() else null;
+    }
+
+    /// A name is walked once per scope it is invoked from: a
+    /// sheet-scoped name has one scope, its own; a workbook-scoped body
+    /// resolves its unqualified names from the sheet that invoked it,
+    /// so the same body under two invoking sheets is two walks (Codex
+    /// #202 r2 F1).
+    const Visit = struct { name: *const engine.Name, scope: ?u32 };
+
+    const Walk = struct {
+        visited: std.ArrayListUnmanaged(Visit) = .empty,
+        pending: std.ArrayListUnmanaged(Visit) = .empty,
+
+        fn deinit(self: *Walk, gpa: Allocator) void {
+            self.visited.deinit(gpa);
+            self.pending.deinit(gpa);
+        }
+
+        /// Queue a visit not yet made.
+        fn enqueue(self: *Walk, gpa: Allocator, v: Visit) Error!void {
+            for (self.visited.items) |seen| if (seen.name == v.name and seen.scope == v.scope) return;
+            try self.visited.append(gpa, v);
+            try self.pending.append(gpa, v);
+        }
+    };
+
+    fn walkBody(
+        self: *Resolver,
+        body: []const u8,
+        scope: ?u32,
+        sheets: *std.ArrayListUnmanaged(u32),
+        walk: *Walk,
+    ) Error!void {
+        var parsed = try engine.parser.parse(self.gpa, body, .{});
+        defer parsed.deinit(self.gpa);
+        const ast = switch (parsed) {
+            .ok => |t| t,
+            // A body the parser refuses — an external workbook reference
+            // beside a local one, say — still names what it names: the
+            // sheets, names and tables are read off the text (Codex #202
+            // r4 F1, r5 F1).
+            .refused => return self.scanBodyText(body, scope, sheets, walk),
+        };
+        try self.walkNode(ast, ast.root, scope, sheets, walk);
+    }
+
+    /// The refusal-tolerant fallback: every sheet of this workbook whose
+    /// name, bare or quoted (`'` doubled inside), is followed by `!` in
+    /// the body text; every defined name and every table whose
+    /// identifier appears in it as a whole word — the names queued for
+    /// their own walk, the tables for their host. Evidence only, so a
+    /// match inside a string literal over-marks rather than under-marks.
+    fn scanBodyText(self: *Resolver, body: []const u8, scope: ?u32, sheets: *std.ArrayListUnmanaged(u32), walk: *Walk) Error!void {
+        for (self.sheet_names, 0..) |name, idx| {
+            if (name.len == 0) continue;
+            if (try self.textNamesSheet(body, name)) try addSheet(self.gpa, sheets, @intCast(idx));
+        }
+        const folded_body = (try fold(self.arena, body)) orelse return;
+        // 3D spans, `First:Last!` bare or `'First:Last'!` quoted, in tab
+        // order — every member between the ends (Codex #202 r6 F1).
+        const folds = try self.ensureSheetFolds();
+        for (folds, 0..) |first, i| {
+            for (folds[i..], i..) |last, j| {
+                const bare = try std.mem.concat(self.arena, u8, &.{ first, ":", last, "!" });
+                const quoted = try std.mem.concat(self.arena, u8, &.{ "'", first, ":", last, "'!" });
+                if (std.mem.indexOf(u8, folded_body, bare) != null or std.mem.indexOf(u8, folded_body, quoted) != null) {
+                    var k: u32 = @intCast(i);
+                    while (k <= j) : (k += 1) try addSheet(self.gpa, sheets, k);
+                }
+            }
+        }
+        if (self.ensureSymbols()) |symbols| {
+            for (symbols.names) |*n| {
+                if (textHasWord(folded_body, n.folded)) try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope });
+            }
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+        if (self.ensureTables()) |tables| {
+            for (tables) |t| if (textHasWord(folded_body, t.folded)) try addSheet(self.gpa, sheets, t.sheet_idx);
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+    }
+
+    /// `word` in `text` with no identifier byte on either side.
+    fn textHasWord(text: []const u8, word: []const u8) bool {
+        if (word.len == 0) return false;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, word)) |at| : (from = at + 1) {
+            const end = at + word.len;
+            const before_ok = at == 0 or !isIdentByte(text[at - 1]);
+            const after_ok = end == text.len or !isIdentByte(text[end]);
+            if (before_ok and after_ok) return true;
+        }
+        return false;
+    }
+
+    fn isIdentByte(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.' or c >= 0x80;
+    }
+
+    fn textNamesSheet(self: *Resolver, body: []const u8, name: []const u8) Error!bool {
+        // Bare: `Name!`, matched case-insensitively by the sheet fold.
+        const folded_body = (try fold(self.arena, body)) orelse return false;
+        const folded_name = (try fold(self.arena, name)) orelse return false;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, folded_body, from, folded_name)) |at| : (from = at + 1) {
+            const end = at + folded_name.len;
+            if (end < folded_body.len and folded_body[end] == '!') return true;
+            if (end + 1 < folded_body.len and folded_body[end] == '\'' and folded_body[end + 1] == '!' and at > 0 and folded_body[at - 1] == '\'') return true;
+        }
+        // Quoted with an apostrophe inside: `'It''s'!`.
+        if (std.mem.indexOfScalar(u8, name, '\'') != null) {
+            const doubled = try std.mem.replaceOwned(u8, self.arena, folded_name, "'", "''");
+            const needle = try std.mem.concat(self.arena, u8, &.{ "'", doubled, "'!" });
+            return std.mem.indexOf(u8, folded_body, needle) != null;
+        }
+        return false;
+    }
+
+    fn walkNode(
+        self: *Resolver,
+        ast: engine.parser.Ast,
+        i: engine.parser.Index,
+        scope: ?u32,
+        sheets: *std.ArrayListUnmanaged(u32),
+        walk: *Walk,
+    ) Error!void {
+        switch (ast.node(i)) {
+            .qualified => |q| {
+                const members = try self.addSpecSheets(q.sheet, sheets);
+                // `Report!N` is the name `N` looked up from `Report`: the
+                // qualifier is the scope of the lookup, and it counts as
+                // a dependency like any other qualifier. A span qualifier
+                // (`'Data:Report'!N`) looks `N` up from every member
+                // (Codex #202 r2 F2); a qualifier that names nothing is
+                // `#REF!`, and the name behind it is not looked up from
+                // anywhere else (Codex #202 r3 F2).
+                switch (ast.node(q.target)) {
+                    .name => |n| if (members) |m| {
+                        var k = m.first;
+                        while (k <= m.last) : (k += 1) try self.enqueueName(n.raw, k, sheets, walk);
+                    },
+                    else => try self.walkNode(ast, q.target, scope, sheets, walk),
+                }
+            },
+            // The raw spelling: a value-position name resolves as written,
+            // so `_xlfn.Anchor` is not `Anchor` (Codex #202 r1 F5).
+            .name => |n| try self.enqueueName(n.raw, scope, sheets, walk),
+            .structured => |st| if (st.table) |t| try self.addTableSheet(t, sheets),
+            // The callee is a function, not a name — except that
+            // `INDIRECT("Report!$A$1")` reads what its literal spells: the
+            // evaluator resolves the text, so the walk does too, by
+            // walking the literal as a body (Codex #202 r5 F2).
+            .call => |c| {
+                const args = ast.children(c.args);
+                if (args.len > 0 and isIndirect(ast, c.callee)) {
+                    // Through any parentheses around the literal (Codex
+                    // #202 r6 F2).
+                    var arg = args[0];
+                    while (true) {
+                        switch (ast.node(arg)) {
+                            .paren => |pn| arg = pn.child,
+                            else => break,
+                        }
+                    }
+                    switch (ast.node(arg)) {
+                        .string => |lit| {
+                            const text = try unquoteStringLiteral(self.arena, lit.text);
+                            try self.walkBody(text, scope, sheets, walk);
+                        },
+                        else => {},
+                    }
+                }
+                for (args) |k| try self.walkNode(ast, k, scope, sheets, walk);
+            },
+            .array => |a| for (ast.children(a.elems)) |k| try self.walkNode(ast, k, scope, sheets, walk),
+            .paren => |pn| try self.walkNode(ast, pn.child, scope, sheets, walk),
+            .unary => |u| try self.walkNode(ast, u.child, scope, sheets, walk),
+            .postfix => |pf| try self.walkNode(ast, pf.child, scope, sheets, walk),
+            .binary => |b| {
+                try self.walkNode(ast, b.lhs, scope, sheets, walk);
+                try self.walkNode(ast, b.rhs, scope, sheets, walk);
+            },
+            .number, .string, .boolean, .error_lit, .missing_arg, .ref_cell, .ref_full_col, .ref_full_row => {},
+        }
+    }
+
+    fn isIndirect(ast: engine.parser.Ast, callee: engine.parser.Index) bool {
+        return switch (ast.node(callee)) {
+            .name => |n| std.ascii.eqlIgnoreCase(n.bare, "INDIRECT"),
+            else => false,
+        };
+    }
+
+    /// `"Report!$A$1"` → `Report!$A$1`, a doubled `""` → `"`.
+    fn unquoteStringLiteral(arena: Allocator, lit: []const u8) Error![]const u8 {
+        if (lit.len < 2 or lit[0] != '"' or lit[lit.len - 1] != '"') return lit;
+        const inner = lit[1 .. lit.len - 1];
+        if (std.mem.indexOf(u8, inner, "\"\"") == null) return inner;
+        return std.mem.replaceOwned(u8, arena, inner, "\"\"", "\"");
+    }
+
+    /// Resolve a name from `scope` and queue its body — or, for a table
+    /// spelled bare, take the host sheet now.
+    fn enqueueName(
+        self: *Resolver,
+        raw: []const u8,
+        scope: ?u32,
+        sheets: *std.ArrayListUnmanaged(u32),
+        walk: *Walk,
+    ) Error!void {
+        const symbols = self.ensureSymbols() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        const from: ?engine.SheetIndex = if (scope) |sc| engine.SheetIndex.fromInt(sc) else null;
+        switch (try symbols.resolveName(self.gpa, from, raw)) {
+            .name => |n| try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope }),
+            .table, .not_found => {
+                // A table spelled bare, or nothing: the table index has
+                // the host if there is one.
+                try self.addTableSheet(raw, sheets);
+            },
+            // A name the engine refuses to reference evaluates to nothing
+            // — it does not fall through to a table of the same spelling
+            // (Codex #202 r2 F5).
+            .refused => {},
+        }
+    }
+
+    const Members = struct { first: u32, last: u32 };
+
+    /// The sheets a qualifier names — one, or every member of a 3D span
+    /// (quoted `'Data:Report'!` and unquoted `Data:Report!` alike, by
+    /// the engine's own split and expansion; a reversed or dangling span
+    /// is `#REF!` and names nothing — Codex #202 r1 F3). Returns the
+    /// members, for a name looked up through the qualifier.
+    fn addSpecSheets(self: *Resolver, spec: engine.parser.SheetSpec, sheets: *std.ArrayListUnmanaged(u32)) Error!?Members {
+        const unquoted = try self.unquoteSpec(spec);
+        if (!engine.names.isSpan(spec)) {
+            const idx = (try self.sheetIndexOf(unquoted)) orelse return null;
+            try addSheet(self.gpa, sheets, idx);
+            return .{ .first = idx, .last = idx };
+        }
+        const ends = engine.names.splitSpan(spec, unquoted) orelse return null;
+        const symbols = self.ensureSymbols() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        switch (try symbols.resolveSheetSpan(self.gpa, ends.first, ends.last)) {
+            .members => |m| {
+                var k = m.first;
+                while (k <= m.last) : (k += 1) try addSheet(self.gpa, sheets, k);
+                return .{ .first = m.first, .last = m.last };
+            },
+            .ref_error => return null,
+        }
+    }
+
+    fn addTableSheet(self: *Resolver, raw_table: []const u8, sheets: *std.ArrayListUnmanaged(u32)) Error!void {
+        const folded = (try fold(self.arena, raw_table)) orelse return;
+        const tables = self.ensureTables() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        for (tables) |t| {
+            if (std.mem.eql(u8, t.folded, folded)) return addSheet(self.gpa, sheets, t.sheet_idx);
+        }
+    }
+
+    fn addSheet(gpa: Allocator, sheets: *std.ArrayListUnmanaged(u32), idx: u32) Error!void {
+        if (std.mem.indexOfScalar(u32, sheets.items, idx) != null) return;
+        try sheets.append(gpa, idx);
+    }
+
     fn sheetOfSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error!?u32 {
         if (spec.last != null) return null;
-        var buf: [256]u8 = undefined;
-        const name = unquoteSheetSpec(&buf, spec) orelse return null;
+        const name = try self.unquoteSpec(spec);
         return self.sheetIndexOf(name);
+    }
+
+    /// `unquoteSheetSpec` sized by the token, not a fixed buffer: a
+    /// sheet name the inventories accepted is one the walk must be able
+    /// to look up, whatever its length (Codex #202 r4 F3).
+    fn unquoteSpec(self: *Resolver, spec: engine.parser.SheetSpec) Error![]const u8 {
+        if (!spec.quoted) return spec.first;
+        const buf = try self.arena.alloc(u8, spec.first.len);
+        return unquoteSheetSpec(buf, spec) orelse spec.first;
     }
 };
 
 /// A cell, a whole-column span or a whole-row span — the reference
-/// nodes that denote a fixed area.
-fn isStaticRef(n: engine.parser.Node) bool {
+/// nodes that denote a fixed area — as bounds.
+fn staticBounds(n: engine.parser.Node) ?Bounds {
     return switch (n) {
-        .ref_cell, .ref_full_col, .ref_full_row => true,
-        else => false,
+        .ref_cell => |c| .{ .rect = .{
+            .tl_col = c.cell.col.oneBased(),
+            .tl_row = c.cell.row.oneBased(),
+            .br_col = c.cell.col.oneBased(),
+            .br_row = c.cell.row.oneBased(),
+        } },
+        .ref_full_col => |fc| .{ .whole_columns = .{
+            .first_col = @min(fc.first.col.oneBased(), fc.last.col.oneBased()),
+            .last_col = @max(fc.first.col.oneBased(), fc.last.col.oneBased()),
+        } },
+        .ref_full_row => |fr| .{ .whole_rows = .{
+            .first_row = @min(fr.first.row.oneBased(), fr.last.row.oneBased()),
+            .last_row = @max(fr.first.row.oneBased(), fr.last.row.oneBased()),
+        } },
+        else => null,
     };
+}
+
+/// `lhs:rhs` over two static references of one kind — two cells make a
+/// rectangle (corners normalised), two column spans or two row spans
+/// merge. Mixed kinds denote an area Excel accepts but this reader
+/// does not bound.
+fn rangeBounds(lhs: engine.parser.Node, rhs: engine.parser.Node) ?Bounds {
+    const a = staticBounds(lhs) orelse return null;
+    const b = staticBounds(rhs) orelse return null;
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return null;
+    return switch (a) {
+        .rect => |ra| .{ .rect = .{
+            .tl_col = @min(ra.tl_col, b.rect.tl_col),
+            .tl_row = @min(ra.tl_row, b.rect.tl_row),
+            .br_col = @max(ra.br_col, b.rect.br_col),
+            .br_row = @max(ra.br_row, b.rect.br_row),
+        } },
+        .whole_columns => |ca| .{ .whole_columns = .{
+            .first_col = @min(ca.first_col, b.whole_columns.first_col),
+            .last_col = @max(ca.last_col, b.whole_columns.last_col),
+        } },
+        .whole_rows => |ra| .{ .whole_rows = .{
+            .first_row = @min(ra.first_row, b.whole_rows.first_row),
+            .last_row = @max(ra.last_row, b.whole_rows.last_row),
+        } },
+    };
+}
+
+/// A decoded `ref` as bounds: `A1:C4` / `A1` (corners in either order —
+/// the bounds are the normalised rectangle; the S7a splice parser stays
+/// strict), `A:C` (letters on both sides), `1:4` (digits on both sides).
+/// Plain `ST_Ref` spellings only: uppercase, no `$`, no leading zero.
+/// Null on anything else — bounds are evidence, and an unparseable
+/// spelling is none.
+pub fn parseBounds(ref: []const u8) ?Bounds {
+    const cell_opts: coords.CellParseOptions = .{ .case = .upper_only };
+    const colon = std.mem.indexOfScalar(u8, ref, ':') orelse {
+        const c = coords.parseCell(ref, cell_opts) catch return null;
+        return .{ .rect = .{ .tl_col = c.col.oneBased(), .tl_row = c.row.oneBased(), .br_col = c.col.oneBased(), .br_row = c.row.oneBased() } };
+    };
+    const lhs = ref[0..colon];
+    const rhs = ref[colon + 1 ..];
+    if (lhs.len == 0 or rhs.len == 0) return null;
+    if (coords.parseCell(lhs, cell_opts)) |a| {
+        const b = coords.parseCell(rhs, cell_opts) catch return null;
+        return .{ .rect = .{
+            .tl_col = @min(a.col.oneBased(), b.col.oneBased()),
+            .tl_row = @min(a.row.oneBased(), b.row.oneBased()),
+            .br_col = @max(a.col.oneBased(), b.col.oneBased()),
+            .br_row = @max(a.row.oneBased(), b.row.oneBased()),
+        } };
+    } else |_| {}
+    if (allLetters(lhs) and allLetters(rhs)) {
+        // Uppercase only and inside the grid — the spelling `ST_Ref` and
+        // the S7a rectangle parser accept.
+        const a = coords.parseColNumber(lhs, .{ .case = .upper_only }) catch return null;
+        const b = coords.parseColNumber(rhs, .{ .case = .upper_only }) catch return null;
+        return .{ .whole_columns = .{ .first_col = @min(a, b), .last_col = @max(a, b) } };
+    }
+    if (allDigits(lhs) and allDigits(rhs)) {
+        if (lhs[0] == '0' or rhs[0] == '0') return null;
+        const a = std.fmt.parseInt(u32, lhs, 10) catch return null;
+        const b = std.fmt.parseInt(u32, rhs, 10) catch return null;
+        if (a == 0 or b == 0 or a > zlsx.max_row or b > zlsx.max_row) return null;
+        return .{ .whole_rows = .{ .first_row = @min(a, b), .last_row = @max(a, b) } };
+    }
+    return null;
+}
+
+fn allLetters(s: []const u8) bool {
+    for (s) |ch| if (ch < 'A' or ch > 'Z') return false;
+    return true;
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |ch| if (ch < '0' or ch > '9') return false;
+    return true;
+}
+
+/// The table part's `ref`, raw — the first real `<table` open tag's
+/// attribute, read by the scanner the table editor reads it with.
+fn tableRefRaw(src: []const u8) ?[]const u8 {
+    const hit = (wbxml.findTagOpen(src, 0, "table") catch return null) orelse return null;
+    return wbxml.getAttr(src[hit.attrs_start..hit.attrs_end], "ref");
 }
 
 /// The engine's shipped fold, arena-owned. Null when the fold refuses
@@ -1144,6 +1749,11 @@ pub const fixture = struct {
         /// `<worksheetSource sheet="Nope" ref="A1:C4"/>` — a sheet
         /// the workbook does not have.
         dangling,
+        /// `<cacheSource type="consolidation">` with two range sets:
+        /// `<rangeSet sheet="Data" ref="A1:C4"/>` and
+        /// `<rangeSet name="PivotSrc"/>`, the name's body
+        /// `Report!$A$1:$B$2` — so the second set reads the HOST sheet.
+        consolidation,
     };
 
     pub const cache_id: u32 = 7;
@@ -1169,15 +1779,16 @@ pub const fixture = struct {
         defer store.deinit();
 
         const source: []const u8 = switch (kind) {
-            .sheet_ref => "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>",
-            .table_name => "<worksheetSource name=\"SalesTbl\"/>",
-            .defined_name => "<worksheetSource name=\"PivotSrc\"/>",
-            .external => "<worksheetSource r:id=\"rIdExt\" sheet=\"Sheet1\" ref=\"A1:C4\"/>",
-            .dangling => "<worksheetSource sheet=\"Nope\" ref=\"A1:C4\"/>",
+            .sheet_ref => "<cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:C4\"/></cacheSource>",
+            .table_name => "<cacheSource type=\"worksheet\"><worksheetSource name=\"SalesTbl\"/></cacheSource>",
+            .defined_name => "<cacheSource type=\"worksheet\"><worksheetSource name=\"PivotSrc\"/></cacheSource>",
+            .external => "<cacheSource type=\"worksheet\"><worksheetSource r:id=\"rIdExt\" sheet=\"Sheet1\" ref=\"A1:C4\"/></cacheSource>",
+            .dangling => "<cacheSource type=\"worksheet\"><worksheetSource sheet=\"Nope\" ref=\"A1:C4\"/></cacheSource>",
+            .consolidation => "<cacheSource type=\"consolidation\"><consolidation autoPage=\"0\"><rangeSets count=\"2\"><rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C4\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/></rangeSets></consolidation></cacheSource>",
         };
         const cache_def = try std.fmt.allocPrint(allocator,
             \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" refreshedBy="zlsx" refreshedDate="45000.5" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="3"><cacheSource type="worksheet">{s}</cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"><sharedItems count="2"><s v="East"/><s v="West"/></sharedItems></cacheField><cacheField name="Qty" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" containsInteger="1" minValue="3" maxValue="5"/></cacheField><cacheField name="Price" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" minValue="1.5" maxValue="3.5"/></cacheField></cacheFields></pivotCacheDefinition>
+            \\<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" refreshedBy="zlsx" refreshedDate="45000.5" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="3">{s}<cacheFields count="3"><cacheField name="Region" numFmtId="0"><sharedItems count="2"><s v="East"/><s v="West"/></sharedItems></cacheField><cacheField name="Qty" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" containsInteger="1" minValue="3" maxValue="5"/></cacheField><cacheField name="Price" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" minValue="1.5" maxValue="3.5"/></cacheField></cacheFields></pivotCacheDefinition>
         , .{source});
         defer allocator.free(cache_def);
         try store.addPart(
@@ -1243,15 +1854,38 @@ pub const fixture = struct {
         // Workbook: the cache list, and for the defined-name kind the
         // name itself. `<definedNames>` precedes `<pivotCaches>` in the
         // schema, and both precede `</workbook>`.
-        const wb_tail: []const u8 = if (kind == .defined_name)
-            "<definedNames><definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName></definedNames><pivotCaches><pivotCache cacheId=\"7\" r:id=\"rIdPC1\"/></pivotCaches>"
-        else
-            "<pivotCaches><pivotCache cacheId=\"7\" r:id=\"rIdPC1\"/></pivotCaches>";
+        const wb_tail: []const u8 = switch (kind) {
+            .defined_name => "<definedNames><definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName></definedNames><pivotCaches><pivotCache cacheId=\"7\" r:id=\"rIdPC1\"/></pivotCaches>",
+            .consolidation => "<definedNames><definedName name=\"PivotSrc\">Report!$A$1:$B$2</definedName></definedNames><pivotCaches><pivotCache cacheId=\"7\" r:id=\"rIdPC1\"/></pivotCaches>",
+            else => "<pivotCaches><pivotCache cacheId=\"7\" r:id=\"rIdPC1\"/></pivotCaches>",
+        };
         try spliceBefore(allocator, &store, "xl/workbook.xml", "</workbook>", wb_tail);
         try spliceBefore(allocator, &store, "xl/_rels/workbook.xml.rels", "</Relationships>",
             \\<Relationship Id="rIdPC1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/>
         );
 
+        try store.save(io, path);
+    }
+
+    /// Add an empty third sheet, `Third` (index 2), to a written fixture
+    /// — for the cases where two sheets cannot tell a right answer from
+    /// a wrong one (a name scoped to one sheet reading a third).
+    pub fn addThirdSheet(allocator: Allocator, io: std.Io, path: []const u8) !void {
+        var store = try PartStore.open(allocator, io, path);
+        defer store.deinit();
+        try store.addPart(
+            "xl/worksheets/sheet3.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/></worksheet>
+            ,
+        );
+        try spliceBefore(allocator, &store, "xl/workbook.xml", "</sheets>",
+            \\<sheet name="Third" sheetId="3" r:id="rIdS3"/>
+        );
+        try spliceBefore(allocator, &store, "xl/_rels/workbook.xml.rels", "</Relationships>",
+            \\<Relationship Id="rIdS3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
+        );
         try store.save(io, path);
     }
 
@@ -1971,13 +2605,19 @@ test "collect: allocation failure at every point leaves nothing behind" {
     defer tt.deinit();
     // The defined-name kind exercises the sheet folds, the symbol table
     // and the body parser; the table-name kind adds the table index.
-    const kinds = [_]fixture.SourceKind{ .defined_name, .table_name };
+    // The consolidation kind adds a second resolution per cache; the
+    // last iteration walks a name closure (a dynamic body through a
+    // second name and a structured reference).
+    const kinds = [_]fixture.SourceKind{ .defined_name, .table_name, .consolidation, .defined_name };
     for (kinds, 0..) |kind, k| {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "alloc_fail_{d}.xlsx", .{k});
         const path = try tt.path(testing.allocator, io, name);
         defer testing.allocator.free(path);
         try fixture.write(testing.allocator, io, path, kind);
+        if (k == kinds.len - 1) {
+            try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1</definedName><definedName name=\"PivotSrc\">OFFSET(Anchor,0,0,COUNTA(Data!$A:$A),3)</definedName>");
+        }
         var store = try PartStore.open(testing.allocator, io, path);
         defer store.deinit();
         const wb_part = (try store.part("xl/workbook.xml")).?;
@@ -2160,6 +2800,528 @@ test "mayReadFromSheet: an unresolved source may be any sheet; external and non-
         try testing.expect(o.pivots.caches[0].definition.source.type == .unknown);
         try testing.expect(o.pivots.mayReadFromSheet(1));
     }
+}
+
+fn expectRect(b: ?Bounds, tl_col: u32, tl_row: u32, br_col: u32, br_row: u32) !void {
+    const r = (b orelse return error.TestExpectedBounds).rect;
+    try testing.expectEqual(edit.Rect{ .tl_col = tl_col, .tl_row = tl_row, .br_col = br_col, .br_row = br_row }, r);
+}
+
+fn expectA1(b: ?Bounds, want: []const u8) !void {
+    var buf: [Bounds.format_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(want, (b orelse return error.TestExpectedBounds).formatA1(&buf) orelse return error.TestExpectedBounds);
+}
+
+test "bounds: every spelling that proves an area carries it, and one that does not carries none" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_bounds.xlsx");
+    defer testing.allocator.free(path);
+
+    // A direct `ref`.
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try expectRect(r.bounds, 1, 1, 3, 4);
+        try expectA1(r.bounds, "A1:C4");
+    }
+    // A table's `ref`.
+    try fixture.write(testing.allocator, io, path, .table_name);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(ResolvedVia.table, r.via);
+        try expectRect(r.bounds, 1, 1, 3, 4);
+    }
+    // A static name body, in each of its shapes.
+    const Case = struct { body: []const u8, a1: []const u8 };
+    const cases = [_]Case{
+        .{ .body = "Data!$A$1:$C$4", .a1 = "A1:C4" },
+        .{ .body = "Data!$C$4:$A$1", .a1 = "A1:C4" },
+        .{ .body = "Data!$A$1", .a1 = "A1:A1" },
+        .{ .body = "Data!$A:$C", .a1 = "A:C" },
+        .{ .body = "Data!$C:$A", .a1 = "A:C" },
+        .{ .body = "Data!$1:$4", .a1 = "1:4" },
+        // Absolute on purpose: a name body with a relative reference is
+        // one the engine refuses to reference (`relative_reference_name`),
+        // and S6 made that refuse the read.
+        .{ .body = "'Data'!$B$2:data!$C$3", .a1 = "B2:C3" },
+        // Parentheses keep a reference a reference (Codex r4 F2).
+        .{ .body = "(Data!$A$1:$C$4)", .a1 = "A1:C4" },
+        .{ .body = "((Data!$A$1))", .a1 = "A1:A1" },
+    };
+    for (cases) |case| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", case.body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 0), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.defined_name, r.via);
+        try expectA1(r.bounds, case.a1);
+    }
+    // A range whose ends are static references of different kinds
+    // names the sheet, as before S7b-1, with no bounds (Codex r1 F1).
+    for ([_][]const u8{ "Data!$A$1:$C:$C", "Data!$A:$A:$B$2", "Data!$1:$1:$C$4" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 0), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.defined_name, r.via);
+        try testing.expect(r.bounds == null);
+        try testing.expect(o.pivots.readsFromSheet(0) and !o.pivots.mayReadFromSheet(1));
+    }
+    // A reversed direct `ref` is the same rectangle (Codex r1 F6).
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "ref=\"A1:C4\"", "ref=\"C4:A1\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "A1:C4");
+        try testing.expectEqualStrings("C4:A1", o.pivots.caches[0].source.ref.?);
+    }
+    // `sheet` + `name`, no `ref`: the sheet is the identity, the carrier
+    // lends its bounds when it is on that sheet (Codex r1 F4).
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"SalesTbl\"/>", "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try expectA1(r.bounds, "A1:C4");
+    }
+    // The carrier is looked up from the stated sheet: its scoped name
+    // shadows the workbook one there (Codex r2 F3).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Rate\">Report!$A$1:$A$2</definedName><definedName name=\"Rate\" localSheetId=\"1\">Report!$C$3:$D$4</definedName>");
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource sheet=\"Report\" name=\"Rate\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 1), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try expectA1(r.bounds, "C3:D4");
+    }
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource sheet=\"Report\" name=\"PivotSrc\"/>");
+    {
+        // The name's area is on `Data`; the source says `Report` — the
+        // sheet wins, the bounds are not lent across sheets.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 1), r.sheet_idx);
+        try testing.expectEqual(ResolvedVia.sheet_attr, r.via);
+        try testing.expect(r.bounds == null);
+    }
+    // `Data!$A:$C` is whole columns, not a rectangle; `Data!$1:$4` whole rows.
+    {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "Data!$A:$C");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const b = o.pivots.caches[0].resolution.sheet.bounds.?;
+        try testing.expectEqual(@as(u32, 1), b.whole_columns.first_col);
+        try testing.expectEqual(@as(u32, 3), b.whole_columns.last_col);
+    }
+    // A `sheet` attribute alone names a sheet and proves no area; so
+    // does a `ref` the rectangle parser rejects.
+    for ([_][]const u8{ "<worksheetSource sheet=\"Data\"/>", "<worksheetSource sheet=\"Data\" ref=\"A1:C\"/>" }) |spelling| {
+        try fixture.write(testing.allocator, io, path, .sheet_ref);
+        try patchPart(io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", spelling);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 0), r.sheet_idx);
+        try testing.expect(r.bounds == null);
+        try testing.expect(o.pivots.dependsOnSheet(0));
+    }
+    // A table whose `ref` is not a rectangle is a table part the table
+    // editor cannot read, and the index refuses the read (S6) — so a
+    // table-spelled source that resolves always carries its bounds.
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/tables/table1.xml", "ref=\"A1:C4\" totalsRowShown", "ref=\"A1:C\" totalsRowShown");
+    try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, path));
+}
+
+test "formatA1: a value outside the grid formats as nothing, not a panic (Codex r4 F4)" {
+    var buf: [Bounds.format_buf_len]u8 = undefined;
+    const bad = [_]Bounds{
+        .{ .whole_columns = .{ .first_col = 0, .last_col = 1 } },
+        .{ .whole_rows = .{ .first_row = 0, .last_row = 1 } },
+        .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 0, .br_row = 1 } },
+        .{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 16385, .br_row = 1 } },
+        .{ .whole_rows = .{ .first_row = 5, .last_row = 4 } },
+    };
+    for (bad) |b| try testing.expect(b.formatA1(&buf) == null);
+    try testing.expectEqualStrings("A1:A1", (Bounds{ .rect = .{ .tl_col = 1, .tl_row = 1, .br_col = 1, .br_row = 1 } }).formatA1(&buf).?);
+}
+
+test "parseBounds: rectangles, whole columns, whole rows, and nothing else" {
+    try expectA1(parseBounds("A1:C4"), "A1:C4");
+    try expectA1(parseBounds("C4:A1"), "A1:C4");
+    try expectA1(parseBounds("A4:C1"), "A1:C4");
+    try expectA1(parseBounds("B7"), "B7:B7");
+    try expectA1(parseBounds("XFD1048576:A1"), "A1:XFD1048576");
+    try expectA1(parseBounds("A:C"), "A:C");
+    try expectA1(parseBounds("C:A"), "A:C");
+    try expectA1(parseBounds("XFD:XFD"), "XFD:XFD");
+    try expectA1(parseBounds("3:9"), "3:9");
+    try expectA1(parseBounds("9:3"), "3:9");
+    try expectA1(parseBounds("1:1048576"), "1:1048576");
+    for ([_][]const u8{ "", ":", "A:", ":C", "A1:C", "A:C4", "a:c", "a1:c4", "XFE:XFE", "XFE1:XFE1", "A0:C4", "A01:C4", "0:4", "01:4", "1:04", "1:1048577", "A:C:D", "$A:$C", "$A$1:$C$4", "A1:C4 " }) |bad| {
+        try testing.expect(parseBounds(bad) == null);
+    }
+}
+
+fn expectUnresolved(r: SourceResolution, why: Unresolved.Why, sheets: []const u32) !void {
+    if (r != .unresolved) return error.TestExpectedUnresolved;
+    try testing.expectEqual(why, r.unresolved.why);
+    try testing.expectEqualSlices(u32, sheets, r.unresolved.sheets);
+}
+
+test "unresolved: the provenance says why, and which sheets the spelling still proves" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_provenance.xlsx");
+    defer testing.allocator.free(path);
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+
+    // A dangling sheet proves nothing.
+    try fixture.write(testing.allocator, io, path, .dangling);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .dangling_sheet, &.{});
+        try testing.expect(!o.pivots.dependsOnSheet(0) and !o.pivots.dependsOnSheet(1));
+    }
+    // A dynamic body: the sheet it reads is proven, not bounded.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET(Report!$D$1,0,0,4,3)");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+        try testing.expect(o.pivots.dependsOnSheet(1) and !o.pivots.dependsOnSheet(0));
+        // The S7a question is unchanged: an unresolved source may be anywhere.
+        try testing.expect(o.pivots.mayReadFromSheet(0) and o.pivots.mayReadFromSheet(1));
+        try testing.expect(!o.pivots.readsFromSheet(1));
+    }
+    // Through another name: `PivotSrc = OFFSET(Anchor,…)`, `Anchor = Report!$D$1`.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1</definedName><definedName name=\"PivotSrc\">OFFSET(anchor,0,0,COUNTA(Data!$A:$A),3)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    // A 3D span proves every sheet between its ends — quoted or not —
+    // and a reversed or dangling one is `#REF!`, proving nothing
+    // (Codex r1 F3); a union proves both sides.
+    for ([_][]const u8{ "SUM(Data:Report!$A$1)", "SUM('Data:Report'!$A$1)", "SUM(data:REPORT!$A$1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    for ([_][]const u8{ "SUM(Report:Data!$A$1)", "SUM(Data:Nope!$A$1)", "SUM('Nope:Report'!$A$1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A sheet-scoped name shadowing a workbook one is its own
+    // dependency: `N` from the workbook reads `Report`, `Report!N` is
+    // the Report-scoped `N` reading `Data` (Codex r1 F2). Visited by
+    // identity, not spelling, both are walked.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Report!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Data!$C$3</definedName><definedName name=\"PivotSrc\">OFFSET(N,0,0,1,1)+OFFSET(Report!N,0,0,1,1)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Report!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Data!$C$3</definedName><definedName name=\"PivotSrc\">OFFSET(N,0,0,1,1)</definedName>");
+    {
+        // Unqualified from the workbook scope: the workbook `N` only.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    // A workbook-scoped body resolves its unqualified names from the
+    // sheet that invoked it: `Report!W`, `W = N`, and the Report-scoped
+    // `N` reads `Third` (Codex r2 F1).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.addThirdSheet(testing.allocator, io, path);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\" localSheetId=\"1\">Third!$A$1</definedName><definedName name=\"PivotSrc\">OFFSET(Report!W,0,0,1,1)</definedName><definedName name=\"W\">N</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 3), o.pivots.sheet_names.len);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 1, 2 });
+    }
+    // A span qualifier looks the name up from every member: the
+    // workbook `N` reads `Data`, the Report-scoped `N` reads `Third`
+    // (Codex r2 F2).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try fixture.addThirdSheet(testing.allocator, io, path);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"N\">Data!$A$1</definedName><definedName name=\"N\" localSheetId=\"1\">Third!$D$1</definedName><definedName name=\"PivotSrc\">SUM('Data:Report'!N)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1, 2 });
+    }
+    // A name the engine refuses to reference contributes nothing — it
+    // does not fall through to a table of the same spelling (Codex r2 F5).
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">OFFSET(SalesTbl,0,0,1,1)</definedName><definedName name=\"SalesTbl\" function=\"1\">SalesTbl</definedName></definedNames><pivotCaches>");
+    try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A chain of any length reaches its end: `PivotSrc = _D0 + _W`,
+    // `_D0 = _D1`, …, `_D99 = _W`, `_W = _Target`, `_Target = Report!$A$1`
+    // — a depth cap once cut `_Target` off on the deep path and the
+    // shallow `_W` was then skipped as visited (Codex r3 F1).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    {
+        var names: std.ArrayListUnmanaged(u8) = .empty;
+        defer names.deinit(testing.allocator);
+        try names.appendSlice(testing.allocator, "<definedName name=\"PivotSrc\">_D0+_W</definedName>");
+        var k: u32 = 0;
+        while (k < 100) : (k += 1) {
+            const line = if (k == 99)
+                try std.fmt.allocPrint(testing.allocator, "<definedName name=\"_D{d}\">_W</definedName>", .{k})
+            else
+                try std.fmt.allocPrint(testing.allocator, "<definedName name=\"_D{d}\">_D{d}</definedName>", .{ k, k + 1 });
+            defer testing.allocator.free(line);
+            try names.appendSlice(testing.allocator, line);
+        }
+        try names.appendSlice(testing.allocator, "<definedName name=\"_Target\">Report!$A$1</definedName><definedName name=\"_W\">_Target</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", names.items);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    // A qualifier that names nothing is `#REF!`: the name behind it is
+    // not looked up from the enclosing scope instead (Codex r3 F2).
+    for ([_][]const u8{ "OFFSET(Nope!_N,0,0,1,1)", "OFFSET(Report:Data!_N,0,0,1,1)" }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"_N\">Report!$A$1</definedName><definedName name=\"PivotSrc\">PLACEHOLDER</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "PLACEHOLDER", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A body the parser refuses (an external workbook reference beside
+    // a local one) still proves the local sheets it names (Codex r4 F1).
+    for ([_][]const u8{
+        "OFFSET(Data!$A$1,0,0,MAX(1,'[Book.xlsx]Sheet1'!$A$1),1)",
+        "OFFSET('Data'!$A$1,0,0,[Book.xlsx]Sheet1!$A$1,1)",
+        "OFFSET(data!$A$1,0,0,[Book.xlsx]Sheet1!$A$1,1)",
+    }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // A refused body still proves a 3D span's members (Codex r6 F1).
+    for ([_][]const u8{
+        "OFFSET(Report!$A$1,0,0,MAX(1,SUM(Data:Report!$A$1),'[Book.xlsx]Sheet1'!$A$1),1)",
+        "OFFSET(Report!$A$1,0,0,MAX(1,SUM('Data:Report'!$A$1),'[Book.xlsx]Sheet1'!$A$1),1)",
+    }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    // A refused body still queues the names and tables it spells
+    // (Codex r5 F1): `Anchor` reads `Report`; `SalesTbl` is on `Data`.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$A$1</definedName><definedName name=\"PivotSrc\">OFFSET(Anchor,0,0,MAX(1,'[Book.xlsx]Sheet1'!$A$1),1)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{1});
+    }
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">OFFSET(SalesTbl[Qty],0,0,[Book.xlsx]Sheet1!$A$1,1)</definedName></definedNames><pivotCaches>");
+    try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // `INDIRECT` with a literal reads what the literal spells: a sheet
+    // reference, or a name; an unqualified cell proves nothing
+    // (Codex r5 F2).
+    const Indirect = struct { body: []const u8, sheets: []const u32 };
+    for ([_]Indirect{
+        .{ .body = "OFFSET(INDIRECT(\"Report!$A$1\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT(\"'Report'!A1\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(indirect(\"Anchor\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT((\"Report!$A$1\")),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(_xlfn.INDIRECT(\"Report!$A$1\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT(\"A1\"),0,0,2,2)", .sheets = &.{} },
+        .{ .body = "OFFSET(INDIRECT(\"Nope!A1\"),0,0,2,2)", .sheets = &.{} },
+    }) |case| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$B$2</definedName><definedName name=\"PivotSrc\">PLACEHOLDER</definedName>");
+        try patchPart(io, path, "xl/workbook.xml", "PLACEHOLDER", case.body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, case.sheets);
+    }
+    // A sheet name longer than any fixed buffer is still looked up
+    // (Codex r4 F3): the workbook accepts it, so must the walk.
+    {
+        const long = "L" ** 300;
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "<sheet name=\"Data\"", "<sheet name=\"" ++ long ++ "\"");
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "OFFSET('" ++ long ++ "'!$A$1,0,0,1,1)");
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // A value-position name resolves as written: `_xlfn.Anchor` is not
+    // `Anchor` (Codex r1 F5).
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1</definedName><definedName name=\"PivotSrc\">OFFSET(_xlfn.Anchor,0,0,1,1)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", "(Report!$A$1:$B$2,Data!$A$1:$C$4)");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
+    // A cycle terminates and proves nothing.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Loop\">PivotSrc*2</definedName><definedName name=\"PivotSrc\">Loop+1</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{});
+    }
+    // A structured reference proves the table's host.
+    try fixture.write(testing.allocator, io, path, .table_name);
+    try patchPart(io, path, "xl/workbook.xml", "<pivotCaches>", "<definedNames><definedName name=\"PivotSrc\">SUM(SalesTbl[Qty])</definedName></definedNames><pivotCaches>");
+    try patchPart(io, path, def_part, "name=\"SalesTbl\"", "name=\"PivotSrc\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
+    }
+    // A name nobody defined.
+    try fixture.write(testing.allocator, io, path, .defined_name);
+    try patchPart(io, path, def_part, "name=\"PivotSrc\"", "name=\"Nope\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .dangling_name, &.{});
+    }
+    // An `r:id` the relationships cannot place: the `sheet` beside it
+    // is the evidence — a local one proves that sheet, a dangling one
+    // proves nothing.
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, def_part, "<worksheetSource sheet=\"Data\"", "<worksheetSource r:id=\"rIdNope\" sheet=\"Data\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unplaceable_rid, &.{0});
+        try testing.expect(o.pivots.dependsOnSheet(0) and !o.pivots.dependsOnSheet(1));
+    }
+    try fixture.write(testing.allocator, io, path, .dangling);
+    try patchPart(io, path, def_part, "<worksheetSource sheet=\"Nope\"", "<worksheetSource r:id=\"rIdNope\" sheet=\"Nope\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unplaceable_rid, &.{});
+    }
+    // A `ref` on no sheet; no locator at all.
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, def_part, "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "<worksheetSource ref=\"A1:C4\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .sheetless_ref, &.{});
+    }
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    try patchPart(io, path, def_part, "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "<worksheetSource/>");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .no_locator, &.{});
+    }
+    // An external source proves nothing local: `dependsOnSheet` is false everywhere.
+    try fixture.write(testing.allocator, io, path, .external);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.pivots.caches[0].resolution == .external);
+        try testing.expect(!o.pivots.dependsOnSheet(0) and !o.pivots.dependsOnSheet(1));
+    }
+}
+
+test "collect: the consolidation fixture — one resolution per range set, each bounded, both sheets depended on" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "pivot_consolidation.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .consolidation);
+
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try expectFixtureShape(&o);
+    const c = o.pivots.caches[0];
+    try testing.expect(c.definition.source.type == .consolidation);
+    try testing.expect(c.resolution == .none);
+    try testing.expectEqual(@as(usize, 2), c.range_set_resolutions.len);
+    try testing.expectEqualStrings("Data", c.range_set_sources[0].sheet.?);
+    try testing.expectEqualStrings("A1:C4", c.range_set_sources[0].ref.?);
+    try testing.expectEqualStrings("PivotSrc", c.range_set_sources[1].name.?);
+    const s0 = c.range_set_resolutions[0].sheet;
+    try testing.expectEqual(@as(u32, 0), s0.sheet_idx);
+    try testing.expectEqual(ResolvedVia.sheet_attr, s0.via);
+    try expectA1(s0.bounds, "A1:C4");
+    const s1 = c.range_set_resolutions[1].sheet;
+    try testing.expectEqual(@as(u32, 1), s1.sheet_idx);
+    try testing.expectEqual(ResolvedVia.defined_name, s1.via);
+    try expectA1(s1.bounds, "A1:B2");
+    // Each set's `ref` span points at the live bytes, for the splice.
+    const span = c.definition.source.range_sets[0].ref_span.?;
+    try testing.expectEqualStrings("A1:C4", c.raw_xml[span.start..span.end]);
+    try testing.expect(c.definition.source.range_sets[1].ref_span == null);
+    try testing.expect(o.pivots.dependsOnSheet(0) and o.pivots.dependsOnSheet(1));
+    try testing.expect(o.pivots.readsFromSheet(0) and o.pivots.readsFromSheet(1));
+    try testing.expect(o.pivots.hostsPivot(1) and !o.pivots.hostsPivot(0));
 }
 
 test "edit: the splice lands on the parser's span — past a decoy, through an entity" {

@@ -123,6 +123,8 @@ pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;
 pub const PivotSourceResolution = pivots.SourceResolution;
+pub const PivotSourceBounds = pivots.Bounds;
+pub const PivotSourceUnresolved = pivots.Unresolved;
 pub const ResolvedStyle = workbook_mod.ResolvedStyle;
 pub const WorkbookError = workbook_mod.Error;
 /// M6 (§12.2): what `Workbook.evaluate` returns — the CLI is the first
