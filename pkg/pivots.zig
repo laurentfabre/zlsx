@@ -1933,6 +1933,149 @@ pub const edit = struct {
         return if (moved.eql(b)) null else moved;
     }
 
+    // ─── S7b-3: the refresh marker ─────────────────────────────────
+    //
+    // The cache is a snapshot of the source range at `refreshedDate`.
+    // An edit that changes what the range HOLDS — not merely where it
+    // sits — leaves that snapshot describing rows the range no longer
+    // has, and zlsx is headless: nobody clicks *Refresh* after a
+    // scripted edit. So a cache whose source content an edit may have
+    // changed is marked to refresh at open with Excel's own option,
+    // `refreshOnLoad="1"` (`docs/plans/s7b-cache-policy.md` §5, A1),
+    // under ONE predicate wherever it appears — *the edit may have
+    // changed the source's content, and is not a proven pure shift*:
+    //
+    //   · a source with a finite rectangle marks when the edited row
+    //     is inside it (an insert adds a blank record, a delete drops
+    //     one); an edit above it is a proven shift, below it a no-op,
+    //     and neither marks — the part stays byte-faithful to what
+    //     Excel writes after the same edit;
+    //   · a whole-column source marks on every admitted row edit (row 1
+    //     refuses) and on no column edit — inside refuses (S7c),
+    //     outside is a shift; `Data!$A:$C` is byte-identical under
+    //     every row edit, its content is not;
+    //   · an unbounded name body marks on any row or column edit of a
+    //     sheet its closure references, because no shift can be
+    //     proven for it;
+    //   · a cell write (`setCell`, an appended row) marks under the
+    //     same predicate at save time (§7 Q3): inside a rectangle, in
+    //     a whole-column source's columns or a whole-row source's
+    //     rows, anywhere on the sheet a `sheet`-only spelling claims,
+    //     anywhere on a referenced sheet of an unbounded source —
+    //     `cellWriteChangesSource`, applied by `Workbook`'s save.
+    //
+    // A2 — `invalid="1"`, the spec's "needs refreshing" state flag —
+    // is the same write to another attribute; whether Excel acts on
+    // it at open is oracle-pending (§6, oracle 3), so A1 ships and
+    // `marker_attr` is the one place the answer lands. Best-effort by
+    // the doc's own terms: inert under `enableRefresh="0"` (left as
+    // the user set it) and under a programmatic open; refreshes every
+    // consumer of a shared cache.
+
+    /// The root attribute the marker sets — A1 (`refreshOnLoad`) until
+    /// the `invalid` oracle says A2.
+    pub const marker_attr = "refreshOnLoad";
+    /// The attribute as inserted on a root that lacks it.
+    pub const marker_insert = " " ++ marker_attr ++ "=\"1\"";
+
+    /// Does the definition already carry the marker — nothing to write?
+    /// The one read that pairs with `marker_attr`.
+    pub fn markerSet(def: *const pivot_xml.CacheDefinition) bool {
+        return def.refresh_on_load;
+    }
+
+    /// Does a row / column edit change what one bounds HOLDS, rather
+    /// than where it is? Decided for an edit the range semantics
+    /// admit — a refusal never reaches the marker — so a delete at the
+    /// top row counts (the headerless-table case `table_edit` admits;
+    /// every other carrier refused it before asking).
+    pub fn editChangesContent(b: Bounds, axis: Axis, idx_1based: u32, kind: Kind) bool {
+        return switch (b) {
+            .rect => |r| switch (axis) {
+                .row => rowEditInside(r.tl_row, r.br_row, idx_1based, kind),
+                // Inside is the field schema and refuses (S7c);
+                // outside is a shift.
+                .col => false,
+            },
+            // Every row of the sheet is inside whole columns (row 1,
+            // the header, refuses); a column inside refuses, outside
+            // shifts.
+            .whole_columns => axis == .row,
+            .whole_rows => |r| switch (axis) {
+                .row => rowEditInside(r.first_row, r.last_row, idx_1based, kind),
+                // Every column is inside: refused before this.
+                .col => false,
+            },
+        };
+    }
+
+    /// §2.2's two *content changed* rows: an insert strictly inside
+    /// (`r1 < i ≤ r2`; at `r1` it is a shift), a delete anywhere in
+    /// the span (`r1 ≤ i ≤ r2`; at `r1` it is the admitted headerless
+    /// case).
+    fn rowEditInside(r1: u32, r2: u32, idx_1based: u32, kind: Kind) bool {
+        return switch (kind) {
+            .insert => idx_1based > r1 and idx_1based <= r2,
+            .delete => idx_1based >= r1 and idx_1based <= r2,
+        };
+    }
+
+    /// The predicate for a cell write at (`row`, `col`), 1-based, on
+    /// sheet `sheet_idx`: inside a source's finite rectangle, or
+    /// anywhere on a sheet an unbounded name body's closure references.
+    /// A resolved spelling that bounds nothing (`sheet` alone) claims
+    /// the whole sheet. A spelling that proves no local range — external,
+    /// dangling, an `r:id` the reader could not place — never marks: a
+    /// mark would ask Excel to refresh at open a source it may not
+    /// have, where leaving the snapshot is the state every workbook is
+    /// in after a cell edit (§3).
+    pub fn cellWriteChangesSource(res: SourceResolution, sheet_idx: u32, row: u32, col: u32) bool {
+        switch (res) {
+            .external, .none => return false,
+            .unresolved => |u| return u.why == .unbounded_body and std.mem.indexOfScalar(u32, u.sheets, sheet_idx) != null,
+            .sheet => |s| {
+                if (s.sheet_idx != sheet_idx) return false;
+                const b = s.bounds orelse return true;
+                return switch (b) {
+                    .rect => |r| row >= r.tl_row and row <= r.br_row and col >= r.tl_col and col <= r.br_col,
+                    .whole_columns => |c| col >= c.first_col and col <= c.last_col,
+                    .whole_rows => |r| row >= r.first_row and row <= r.last_row,
+                };
+            },
+        }
+    }
+
+    /// Mark one definition for refresh — the save-time half of the
+    /// predicate, for a cell write `cellWriteChangesSource` admitted.
+    /// A fresh buffer the caller owns, or null when the marker is
+    /// already set (the part is then byte-preserved).
+    pub fn markForRefresh(allocator: Allocator, cache: *const PivotCache) EditError!?[]u8 {
+        var one = [_]Splice{markerSplice(cache.raw_xml, &cache.definition) orelse return null};
+        return try spliceAll(allocator, cache.raw_xml, &one);
+    }
+
+    /// The marker as a splice on `src`, the bytes `def` was parsed
+    /// from: a present attribute has its value replaced (`0` → `1`),
+    /// an absent one is inserted before the root's `>` — the shared
+    /// attribute writer substitutes values it meets and has no
+    /// insertion path, and neither corpus definition carries the
+    /// attribute. Null when the definition already carries it.
+    fn markerSplice(src: []const u8, def: *const pivot_xml.CacheDefinition) ?Splice {
+        if (markerSet(def)) return null;
+        var sp: Splice = .{ .span = undefined, .buf = undefined, .len = 0 };
+        if (def.rootAttrValueSpan(src, marker_attr)) |span| {
+            sp.span = span;
+            sp.buf[0] = '1';
+            sp.len = 1;
+        } else {
+            comptime assert(marker_insert.len <= Bounds.format_buf_len);
+            sp.span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end };
+            @memcpy(sp.buf[0..marker_insert.len], marker_insert);
+            sp.len = marker_insert.len;
+        }
+        return sp;
+    }
+
     /// Rewrite one `pivotCacheDefinitionN.xml` part for a row / col
     /// edit on sheet `sheet_idx` — the S7b splice. Every source the
     /// cache reads on that sheet, `worksheetSource` and each `rangeSet`
@@ -1944,9 +2087,11 @@ pub const edit = struct {
     /// sweep — and a source on another sheet, in another workbook, or
     /// placed nowhere is left alone. Refuses per §7 Q4: an unplaceable
     /// `r:id` whose `sheet` is this sheet, a spelling that claims the
-    /// sheet and bounds nothing. Returns a fresh buffer the caller
-    /// owns, or null when no spelling changes (the part is then
-    /// byte-preserved).
+    /// sheet and bounds nothing. When any source's content changed
+    /// under the edit (the S7b-3 predicate above), the root gains the
+    /// refresh marker in the same rebuild. Returns a fresh buffer the
+    /// caller owns, or null when nothing in the part changes (it is
+    /// then byte-preserved).
     pub fn applyToCacheDefinition(
         allocator: Allocator,
         cache: *const PivotCache,
@@ -1960,25 +2105,32 @@ pub const edit = struct {
         defer splices.deinit(allocator);
 
         const def = &cache.definition;
+        var changed = false;
         if (def.source.worksheet) |ws| {
-            try sourceSplice(allocator, &splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind);
+            changed = (try sourceSplice(allocator, &splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind)) or changed;
         }
         // The walk resolved every set it parsed; a definition that
         // disagrees with its own resolutions is not one this row read.
         if (def.source.range_sets.len != cache.range_set_resolutions.len) return error.MalformedPivotXml;
         for (def.source.range_sets, cache.range_set_resolutions) |rs, res| {
-            try sourceSplice(allocator, &splices, rs, res, sheet_idx, axis, idx_1based, kind);
+            changed = (try sourceSplice(allocator, &splices, rs, res, sheet_idx, axis, idx_1based, kind)) or changed;
+        }
+        if (changed) {
+            if (markerSplice(cache.raw_xml, def)) |sp| try splices.append(allocator, sp);
         }
         if (splices.items.len == 0) return null;
+        return try spliceAll(allocator, cache.raw_xml, splices.items);
+    }
 
-        // In span order: the part is rebuilt from its own bytes with
-        // each value swapped in place, so no span moves under another.
-        std.mem.sort(Splice, splices.items, {}, Splice.before);
-        const src = cache.raw_xml;
+    /// `src` rebuilt from its own bytes with each splice swapped in
+    /// place, in span order, so no span moves under another. An
+    /// insertion is a splice with an empty span.
+    fn spliceAll(allocator: Allocator, src: []const u8, splices: []Splice) EditError![]u8 {
+        std.mem.sort(Splice, splices, {}, Splice.before);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
         var pos: usize = 0;
-        for (splices.items) |sp| {
+        for (splices) |sp| {
             assert(pos <= sp.span.start and sp.span.start <= sp.span.end and sp.span.end <= src.len);
             try out.appendSlice(allocator, src[pos..sp.span.start]);
             try out.appendSlice(allocator, sp.text());
@@ -2002,6 +2154,9 @@ pub const edit = struct {
         }
     };
 
+    /// One source under the edit: its `ref` splice appended when it has
+    /// one, its refusal raised, and whether the edit changed what it
+    /// holds — the marker's input.
     fn sourceSplice(
         allocator: Allocator,
         splices: *std.ArrayListUnmanaged(Splice),
@@ -2011,11 +2166,11 @@ pub const edit = struct {
         axis: Axis,
         idx_1based: u32,
         kind: Kind,
-    ) EditError!void {
+    ) EditError!bool {
         switch (res) {
-            .external, .none => return,
+            .external, .none => return false,
             .unresolved => |u| {
-                if (std.mem.indexOfScalar(u32, u.sheets, sheet_idx) == null) return;
+                if (std.mem.indexOfScalar(u32, u.sheets, sheet_idx) == null) return false;
                 switch (u.why) {
                     // The `sheet` beside an `r:id` the reader could not
                     // place: it may be this sheet, and its `ref` cannot
@@ -2023,14 +2178,16 @@ pub const edit = struct {
                     .unplaceable_rid => return error.PivotSourceEditUnsafe,
                     // A name body reaching this sheet without bounding
                     // it: the body moves under the name sweep, whose
-                    // dry-run is the workbook's (Q4 ii). Nothing here.
-                    .unbounded_body => return,
+                    // dry-run is the workbook's (Q4 ii). Nothing to
+                    // move here — and no shift to prove, so the
+                    // content may have changed.
+                    .unbounded_body => return true,
                     // These prove no sheet; `sheets` is empty for them.
-                    .dangling_sheet, .dangling_name, .sheetless_ref, .no_locator => return,
+                    .dangling_sheet, .dangling_name, .sheetless_ref, .no_locator => return false,
                 }
             },
             .sheet => |s| {
-                if (s.sheet_idx != sheet_idx) return;
+                if (s.sheet_idx != sheet_idx) return false;
                 // Claims the sheet, bounds nothing: `sheet` alone, a
                 // `ref` the bounds parser rejects, a name the reader
                 // could not place on that sheet (Q4 iv).
@@ -2047,14 +2204,18 @@ pub const edit = struct {
                     // (Codex #203 r1 REL-102).
                     .table => {
                         if (axis == .col) _ = try shiftSourceBounds(bounds, axis, idx_1based, kind);
-                        return;
+                        return editChangesContent(bounds, axis, idx_1based, kind);
                     },
                     .ref, .defined_name => {},
                 }
-                const moved = (try shiftSourceBounds(bounds, axis, idx_1based, kind)) orelse return;
+                // Refusals first: a content change is judged only on an
+                // admitted edit.
+                const shifted = try shiftSourceBounds(bounds, axis, idx_1based, kind);
+                const changed = editChangesContent(bounds, axis, idx_1based, kind);
+                const moved = shifted orelse return changed;
                 // Only a spelling with its own `ref` is respelled; a
                 // name-spelled area moves with the name's body.
-                if (s.carrier != .ref) return;
+                if (s.carrier != .ref) return changed;
                 const span = ws.ref_span orelse return error.MalformedPivotXml;
                 var sp: Splice = .{ .span = span, .buf = undefined, .len = 0 };
                 // A rectangle keeps the single-cell spelling `A1`;
@@ -2065,6 +2226,7 @@ pub const edit = struct {
                 };
                 sp.len = text.len;
                 try splices.append(allocator, sp);
+                return changed;
             },
         }
     }
@@ -3873,9 +4035,9 @@ test "edit: a direct whole-row or whole-column ref is respelled like its rectang
         var o = try Opened.open(testing.allocator, io, rows);
         defer o.deinit(testing.allocator);
         try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "1:4");
-        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"2:5\"/>");
-        try expectCacheSource(testing.allocator, &o, 0, .row, 3, .insert, "<worksheetSource sheet=\"Data\" ref=\"1:5\"/>");
-        try expectCacheSource(testing.allocator, &o, 0, .row, 4, .delete, "<worksheetSource sheet=\"Data\" ref=\"1:3\"/>");
+        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"2:5\"/>", false);
+        try expectCacheSource(testing.allocator, &o, 0, .row, 3, .insert, "<worksheetSource sheet=\"Data\" ref=\"1:5\"/>", true);
+        try expectCacheSource(testing.allocator, &o, 0, .row, 4, .delete, "<worksheetSource sheet=\"Data\" ref=\"1:3\"/>", true);
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 1, .insert));
         try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 5, .insert)) == null);
@@ -3887,16 +4049,18 @@ test "edit: a direct whole-row or whole-column ref is respelled like its rectang
     var o = try Opened.open(testing.allocator, io, cols);
     defer o.deinit(testing.allocator);
     try expectA1(o.pivots.caches[0].resolution.sheet.bounds, "B:D");
-    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .col, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .delete, "<worksheetSource sheet=\"Data\" ref=\"A:C\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>", false);
+    try expectCacheSource(testing.allocator, &o, 0, .col, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"C:E\"/>", false);
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .delete, "<worksheetSource sheet=\"Data\" ref=\"A:C\"/>", false);
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 3, .insert));
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 4, .delete));
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 5, .insert)) == null);
-    // Row 1 is the header; other rows change nothing in the spelling.
+    // Row 1 is the header; every other row is inside the columns —
+    // nothing in the spelling moves, and the content changed: marked.
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .insert));
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
-    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .delete)) == null);
+    try expectMarkedOnly(testing.allocator, &o, 0, .row, 2, .delete);
+    try expectMarkedOnly(testing.allocator, &o, 0, .row, 9, .insert);
 }
 
 /// The fixture's cache definition under one edit on one sheet: the
@@ -3905,19 +4069,49 @@ fn cacheEdit(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis
     return edit.applyToCacheDefinition(alloc, &o.pivots.caches[0], sheet_idx, axis, idx, kind);
 }
 
-fn expectCacheSource(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis, idx: u32, kind: edit.Kind, want_source: []const u8) !void {
+/// The rewritten part holds `want_source` where the source element was,
+/// and its root is the original's — plus the refresh marker, inserted
+/// before the root's `>`, exactly when `marked`. Nothing else differs.
+fn expectCacheSource(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis, idx: u32, kind: edit.Kind, want_source: []const u8, marked: bool) !void {
     const out = (try cacheEdit(alloc, o, sheet_idx, axis, idx, kind)) orelse return error.TestExpectedMove;
     defer alloc.free(out);
-    // The source element is the one thing that changed.
     const src = o.pivots.caches[0].raw_xml;
     const at = std.mem.indexOf(u8, out, want_source) orelse {
         std.debug.print("want {s}\nin   {s}\n", .{ want_source, out });
         return error.TestExpectedMove;
     };
     const old_open = std.mem.indexOf(u8, src, "<cacheSource").?;
-    try testing.expectEqualStrings(src[0..old_open], out[0..old_open]);
+    const want_head = if (marked)
+        try markedPart(alloc, src[0..old_open])
+    else
+        try alloc.dupe(u8, src[0..old_open]);
+    defer alloc.free(want_head);
+    try testing.expectEqualStrings(want_head, out[0..want_head.len]);
     const tail_from = std.mem.indexOf(u8, src, "<cacheFields").?;
     try testing.expectEqualStrings(src[tail_from..], out[at + want_source.len ..][std.mem.indexOf(u8, out[at + want_source.len ..], "<cacheFields").?..]);
+}
+
+/// The edit changes nothing in the part but the marker: the rewrite is
+/// the original with ` refreshOnLoad="1"` inserted on the root and not
+/// one other byte — a table-named or defined-name source under an edit
+/// inside its rectangle, an unbounded source under any edit of a sheet
+/// it references.
+fn expectMarkedOnly(alloc: Allocator, o: *const Opened, sheet_idx: u32, axis: edit.Axis, idx: u32, kind: edit.Kind) !void {
+    const out = (try cacheEdit(alloc, o, sheet_idx, axis, idx, kind)) orelse return error.TestExpectedMark;
+    defer alloc.free(out);
+    const want = try markedPart(alloc, o.pivots.caches[0].raw_xml);
+    defer alloc.free(want);
+    try testing.expectEqualStrings(want, out);
+}
+
+/// `bytes` (a definition, or its prefix up to `<cacheSource`) with
+/// ` refreshOnLoad="1"` inserted before the root open tag's `>` — what
+/// a marked part must read, spelled independently of the splice under
+/// test. The fixture's root carries no `>` inside an attribute value.
+fn markedPart(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const root = std.mem.indexOf(u8, bytes, "<pivotCacheDefinition") orelse return error.TestExpectedMark;
+    const gt = std.mem.indexOfScalarPos(u8, bytes, root, '>') orelse return error.TestExpectedMark;
+    return std.mem.concat(alloc, u8, &.{ bytes[0..gt], edit.marker_insert, bytes[gt..] });
 }
 
 test "edit: a sheet+ref source is respelled at the parser's span; another sheet's edit leaves the part alone" {
@@ -3937,10 +4131,10 @@ test "edit: a sheet+ref source is respelled at the parser's span; another sheet'
     try testing.expectEqual(SourceCarrier.ref, o.pivots.caches[0].resolution.sheet.carrier);
 
     // `Data` (0) feeds `A1:C4`.
-    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"A2:C5\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<worksheetSource sheet=\"Data\" ref=\"A1:C3\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"B1:D4\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>", true);
+    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"A2:C5\"/>", false);
+    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<worksheetSource sheet=\"Data\" ref=\"A1:C3\"/>", true);
+    try expectCacheSource(testing.allocator, &o, 0, .col, 1, .insert, "<worksheetSource sheet=\"Data\" ref=\"B1:D4\"/>", false);
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 5, .insert)) == null);
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 4, .delete)) == null);
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
@@ -3967,19 +4161,20 @@ test "edit: a consolidation definition splices each set at its own span" {
         defer o.deinit(testing.allocator);
         // Set 1 reads `Report!A1:B2` through `PivotSrc`: a `Report` row
         // edit judges its rectangle (the header row refuses) and
-        // moves nothing here — the name's body is the name sweep's.
+        // moves nothing here — the name's body is the name sweep's;
+        // a delete inside drops a record and marks the definition.
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 1, .row, 1, .delete));
         try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
-        try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 2, .delete)) == null);
+        try expectMarkedOnly(testing.allocator, &o, 1, .row, 2, .delete);
         // Set 0 is `Data!A1:C4` by `sheet` + `ref`.
-        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/>");
+        try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/>", false);
     }
     try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<rangeSet i1=\"1\" name=\"PivotSrc\"/>", "<rangeSet i1=\"1\" sheet=\"Data\" ref=\"A6:C9\"/>");
     var o = try Opened.open(testing.allocator, io, path);
     defer o.deinit(testing.allocator);
-    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .row, 5, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C4\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>");
-    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C3\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A5:C8\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 1, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>", false);
+    try expectCacheSource(testing.allocator, &o, 0, .row, 5, .insert, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C4\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A7:C10\"/>", false);
+    try expectCacheSource(testing.allocator, &o, 0, .row, 3, .delete, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C3\"/><rangeSet i1=\"1\" sheet=\"Data\" ref=\"A5:C8\"/>", true);
     // One set's refusal is the definition's.
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 6, .delete));
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 10, .insert)) == null);
@@ -3999,9 +4194,14 @@ test "edit: a table-named source moves with its table; a defined-name source wit
         var o = try Opened.open(testing.allocator, io, table);
         defer o.deinit(testing.allocator);
         // The row axis is `table_edit`'s: header and collapse refuse
-        // there, with the table's own `headerRowCount` knowledge.
-        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
-        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) == null);
+        // there, with the table's own `headerRowCount` knowledge — so
+        // the top-row delete reaching here is the admitted headerless
+        // case, a content change. Inside marks; at or above the top
+        // row an insert is the table's shift and leaves the part alone.
+        try expectMarkedOnly(testing.allocator, &o, 0, .row, 1, .delete);
+        try expectMarkedOnly(testing.allocator, &o, 0, .row, 2, .insert);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .insert)) == null);
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 5, .insert)) == null);
         // The column axis inside the table is the field schema.
         try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 1, .insert)) == null);
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
@@ -4023,7 +4223,7 @@ test "edit: a table-named source moves with its table; a defined-name source wit
         try testing.expectEqual(ResolvedVia.sheet_attr, s.via);
         try testing.expectEqual(SourceCarrier.table, s.carrier);
         try expectA1(s.bounds, "A1:C4");
-        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+        try expectMarkedOnly(testing.allocator, &o, 0, .row, 1, .delete);
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
     }
     // The same spelling naming a table on ANOTHER sheet bounds nothing.
@@ -4045,8 +4245,12 @@ test "edit: a table-named source moves with its table; a defined-name source wit
     defer o.deinit(testing.allocator);
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 1, .delete));
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
-    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) == null);
-    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 4, .delete)) == null);
+    // Inside `Data!$A$1:$C$4`: the body is the name sweep's, the
+    // content change is the marker's. Above: a shift, nothing.
+    try expectMarkedOnly(testing.allocator, &o, 0, .row, 2, .insert);
+    try expectMarkedOnly(testing.allocator, &o, 0, .row, 4, .delete);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .insert)) == null);
+    try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 1, .insert)) == null);
     try testing.expectEqual(SourceCarrier.defined_name, o.pivots.caches[0].resolution.sheet.carrier);
     // The names the sweep's dry-run judges: the source name itself.
     const keys = namesOf(o.pivots.caches[0].resolution);
@@ -4080,9 +4284,149 @@ test "collect: a name-spelled source carries its closure's names — the root an
     try testing.expectEqualStrings("Anchor", u.names[1].identifier);
     try testing.expectEqual(@as(?u32, null), u.names[1].scope);
     // Unbounded on `Report`: nothing to move, nothing refused here —
-    // the body is the name sweep's, whose dry-run is the workbook's.
-    try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .delete)) == null);
+    // the body is the name sweep's, whose dry-run is the workbook's —
+    // and no shift to prove, so any edit of `Report` marks, on either
+    // axis. `Data` is not in the closure: untouched.
+    try expectMarkedOnly(testing.allocator, &o, 1, .row, 1, .delete);
+    try expectMarkedOnly(testing.allocator, &o, 1, .row, 9, .insert);
+    try expectMarkedOnly(testing.allocator, &o, 1, .col, 1, .insert);
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+}
+
+test "edit: the marker is an upsert — inserted on a root that lacks it, replaced in place on one that spells it 0, left alone once set" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const path = try tt.path(testing.allocator, io, "s7b_marker_upsert.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        // Absent (both corpus definitions): inserted before the root's
+        // `>`, after the last attribute, beside the moved `ref`.
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(!edit.markerSet(&o.pivots.caches[0].definition));
+        const out = (try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) orelse return error.TestExpectedMark;
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "recordCount=\"3\" refreshOnLoad=\"1\"><cacheSource") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "ref=\"A1:C5\"") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "refreshOnLoad"));
+        // The same part reparses, and the reader sees the option set.
+        var def = try pivot_xml.parseCacheDefinition(testing.allocator, out);
+        defer def.deinit(testing.allocator);
+        try testing.expect(def.refresh_on_load);
+        // The save-time write on an unmarked part: the marker alone.
+        const marked = (try edit.markForRefresh(testing.allocator, &o.pivots.caches[0])) orelse return error.TestExpectedMark;
+        defer testing.allocator.free(marked);
+        const want = try markedPart(testing.allocator, o.pivots.caches[0].raw_xml);
+        defer testing.allocator.free(want);
+        try testing.expectEqualStrings(want, marked);
+    }
+    // Present and off, single-quoted, with whitespace around `=`: the
+    // value is replaced where it sits and nothing is inserted.
+    try fixture.patchPart(testing.allocator, io, path, def_part, " recordCount=\"3\">", " refreshOnLoad = '0' recordCount=\"3\" >");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try testing.expect(!edit.markerSet(&o.pivots.caches[0].definition));
+        const out = (try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) orelse return error.TestExpectedMark;
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, " refreshOnLoad = '1' recordCount=\"3\" ><cacheSource") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "refreshOnLoad"));
+        // A pure shift replaces nothing: `0` stays as the user set it.
+        const shifted = (try cacheEdit(testing.allocator, &o, 0, .row, 1, .insert)) orelse return error.TestExpectedMove;
+        defer testing.allocator.free(shifted);
+        try testing.expect(std.mem.indexOf(u8, shifted, " refreshOnLoad = '0' ") != null);
+    }
+    // Present and on (`true` is the schema's other spelling): nothing to
+    // write — the `ref` still moves, the root is byte-identical, and
+    // the save-time write is a no-op.
+    try fixture.patchPart(testing.allocator, io, path, def_part, " refreshOnLoad = '0' ", " refreshOnLoad=\"true\" ");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.expect(edit.markerSet(&o.pivots.caches[0].definition));
+    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>", false);
+    try testing.expect((try edit.markForRefresh(testing.allocator, &o.pivots.caches[0])) == null);
+}
+
+test "edit: the cell-write predicate — inside a rectangle, on a whole-column source's columns, anywhere on an unbounded source's sheet, nowhere for what proves no local range" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const path = try tt.path(testing.allocator, io, "s7b_marker_cells.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution;
+        // `Data!A1:C4`: the four corners are in, one past each edge is out.
+        try testing.expect(edit.cellWriteChangesSource(r, 0, 1, 1));
+        try testing.expect(edit.cellWriteChangesSource(r, 0, 4, 3));
+        try testing.expect(edit.cellWriteChangesSource(r, 0, 2, 2));
+        try testing.expect(!edit.cellWriteChangesSource(r, 0, 5, 1));
+        try testing.expect(!edit.cellWriteChangesSource(r, 0, 1, 4));
+        try testing.expect(!edit.cellWriteChangesSource(r, 1, 2, 2));
+    }
+    try fixture.patchPart(testing.allocator, io, path, def_part, "ref=\"A1:C4\"", "ref=\"B:C\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution;
+        try testing.expect(edit.cellWriteChangesSource(r, 0, 100000, 2));
+        try testing.expect(!edit.cellWriteChangesSource(r, 0, 1, 1));
+        try testing.expect(!edit.cellWriteChangesSource(r, 0, 1, 4));
+    }
+    // `sheet` alone claims the whole sheet.
+    try fixture.patchPart(testing.allocator, io, path, def_part, " ref=\"B:C\"", "");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution;
+        try testing.expect(r.sheet.bounds == null);
+        try testing.expect(edit.cellWriteChangesSource(r, 0, 7, 7));
+        try testing.expect(!edit.cellWriteChangesSource(r, 1, 7, 7));
+    }
+    const ext = try tt.path(testing.allocator, io, "s7b_marker_cells_ext.xlsx");
+    defer testing.allocator.free(ext);
+    try fixture.write(testing.allocator, io, ext, .external);
+    {
+        var o = try Opened.open(testing.allocator, io, ext);
+        defer o.deinit(testing.allocator);
+        try testing.expect(!edit.cellWriteChangesSource(o.pivots.caches[0].resolution, 0, 1, 1));
+        try testing.expect(!edit.cellWriteChangesSource(o.pivots.caches[0].resolution, 1, 1, 1));
+    }
+    // An unbounded body reaching `Report` (1) through `Anchor`: every
+    // cell of `Report`, no cell of `Data`. An `r:id` the reader cannot
+    // place proves no local range and never marks, though the sweep
+    // refuses its `sheet` (Q4 i) — a mark would ask Excel to refresh
+    // at open a source it may not have.
+    const name = try tt.path(testing.allocator, io, "s7b_marker_cells_name.xlsx");
+    defer testing.allocator.free(name);
+    try fixture.write(testing.allocator, io, name, .defined_name);
+    try fixture.patchPart(testing.allocator, io, name, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"Anchor\">Report!$D$1</definedName><definedName name=\"PivotSrc\">OFFSET(Anchor,0,0,4,3)</definedName>");
+    {
+        var o = try Opened.open(testing.allocator, io, name);
+        defer o.deinit(testing.allocator);
+        const r = o.pivots.caches[0].resolution;
+        try testing.expectEqual(Unresolved.Why.unbounded_body, r.unresolved.why);
+        try testing.expect(edit.cellWriteChangesSource(r, 1, 1000, 50));
+        try testing.expect(!edit.cellWriteChangesSource(r, 0, 1, 1));
+    }
+    try fixture.patchPart(testing.allocator, io, name, def_part, "<worksheetSource name=\"PivotSrc\"/>", "<worksheetSource r:id=\"rIdNone\" sheet=\"Data\" ref=\"A1:C4\"/>");
+    var o = try Opened.open(testing.allocator, io, name);
+    defer o.deinit(testing.allocator);
+    const r = o.pivots.caches[0].resolution;
+    try testing.expectEqual(Unresolved.Why.unplaceable_rid, r.unresolved.why);
+    try testing.expectEqualSlices(u32, &.{0}, r.unresolved.sheets);
+    try testing.expect(!edit.cellWriteChangesSource(r, 0, 2, 2));
+    try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 2, .insert));
 }
 
 test "collect: a locator under a source type the reader does not know is authoritative (S7b gate, Q5)" {
@@ -4103,7 +4447,7 @@ test "collect: a locator under a source type the reader does not know is authori
     try testing.expectEqual(@as(u32, 0), c.resolution.sheet.sheet_idx);
     try expectA1(c.resolution.sheet.bounds, "A1:C4");
     try testing.expect(o.pivots.dependsOnSheet(0) and !o.pivots.dependsOnSheet(1));
-    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>");
+    try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>", true);
     // Without a locator the type names no sheet, as before.
     try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource sheet=\"Data\" ref=\"A1:C4\"/>", "");
     var o2 = try Opened.open(testing.allocator, io, path);
