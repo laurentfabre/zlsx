@@ -6169,6 +6169,9 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         .{ .name = "hexfloat", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>0x1p0</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
         .{ .name = "underscore", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>1_0</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
         .{ .name = "hexitem", .part = def_part, .old = "minValue=\"3\" maxValue=\"5\"/>", .new = "minValue=\"3\" maxValue=\"5\" count=\"1\"><n v=\"0x1p0\"/></sharedItems>", .err = error.MalformedPivotXml, .shift_ok = true },
+        // An inventory with items whose records are inline (Codex #205
+        // r11 REL-1101): not one shape.
+        .{ .name = "inline_with_items", .part = def_part, .old = "minValue=\"3\" maxValue=\"5\"/>", .new = "minValue=\"3\" maxValue=\"99\" count=\"1\"><n v=\"99\"/></sharedItems>", .err = error.PivotEditUnsafe, .shift_ok = true },
         // A `t` this view does not know is not a number (Codex #205 r8
         // REL-801).
         .{ .name = "bogus_t", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\" t=\"bogus\"><v>3</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },

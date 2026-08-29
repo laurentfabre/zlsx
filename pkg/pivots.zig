@@ -2775,6 +2775,11 @@ pub const engine = struct {
                 }
                 try items.append(arena, item);
             }
+            // Records spelt inline beside an inventory that holds items
+            // are not one shape: an inline rebuild would emit the
+            // attribute-only element and drop every item a consumer
+            // indexes (Codex #205 r11 REL-1101).
+            if (spelt_indexed == false and si.items.len > 0) return error.PivotShapeUnsupported;
             const was_indexed = spelt_indexed orelse (si.items.len > 0);
 
             // Pass one: what the column holds — whether the records can
@@ -6043,11 +6048,33 @@ test "engine: a main-namespace binding first introduced below the root refuses; 
     // A binding introduced on a record refuses the read.
     try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords count=\"1\"><r xmlns=\"" ++ main_ns ++ "\"><x v=\"0\"/></r></pivotCacheRecords>", null));
     // Every value kind, explicitly closed around nothing, reads — one
-    // per record, a record being one value per field.
-    for ([_][]const u8{ "<x v=\"0\"></x>", "<n v=\"1\"></n>", "<s v=\"q\"></s>", "<m></m>", "<b v=\"1\"></b>", "<d v=\"2024-01-01T00:00:00\"></d>", "<e v=\"#N/A\"></e>" }) |one| {
-        const part = try std.mem.concat(arena, u8, &.{ rec_head, "<r>", one, "</r></pivotCacheRecords>" });
-        const rb = try engine.rebuild(arena, &cache, &rows, part, null);
+    // per record, a record being one value per field: `<x>` against
+    // the stocked inventory, the inline kinds against an item-less one
+    // (inline records beside items are not one shape — r11 REL-1101).
+    {
+        const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"></x></r></pivotCacheRecords>", null);
         try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    }
+    const inline_xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\"/></cacheField></cacheFields></pivotCacheDefinition>";
+    const inline_cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, inline_xml),
+        .field_names = &.{"V"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = inline_xml,
+    };
+    const number_rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    for ([_][]const u8{ "<n v=\"1\"></n>", "<s v=\"q\"></s>", "<m></m>", "<b v=\"1\"></b>", "<d v=\"2024-01-01T00:00:00\"></d>", "<e v=\"#N/A\"></e>" }) |one| {
+        const part = try std.mem.concat(arena, u8, &.{ rec_head, "<r>", one, "</r></pivotCacheRecords>" });
+        const rb = try engine.rebuild(arena, &inline_cache, &number_rows, part, null);
+        try testing.expectEqualStrings(rec_head ++ "<r><n v=\"1\"/></r></pivotCacheRecords>", rb.records.?);
     }
 }
 
@@ -6354,4 +6381,33 @@ test "engine: the records say what was indexed — an explicit count=\"0\" keeps
     const none = try engine.rebuild(arena, &cache, &rows, null, null);
     const none_out = try edit.spliceAll(arena, xml, none.splices);
     try testing.expect(std.mem.indexOf(u8, none_out, "minValue=\"1\" maxValue=\"2\"/></cacheField>") != null);
+}
+
+test "engine: inline records beside an inventory that holds items refuse — an inline rebuild would drop what a consumer indexes; the same inventory with `<x>` records keeps it (Codex #205 r11 REL-1101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"99\" maxValue=\"99\" count=\"1\"><n v=\"99\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>";
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{"V"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><n v=\"1\"/></r></pivotCacheRecords>", null));
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "minValue=\"1\" maxValue=\"99\" count=\"2\"><n v=\"99\"/><n v=\"1\"/></sharedItems>") != null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"1\"/></r></pivotCacheRecords>", rb.records.?);
 }
