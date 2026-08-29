@@ -2264,14 +2264,17 @@ pub const edit = struct {
     /// `src` rebuilt from its own bytes with each splice swapped in
     /// place, in span order, so no span moves under another. An
     /// insertion is a splice with an empty span; two insertions at one
-    /// position keep their order (the sort is stable).
+    /// position keep their order (the sort is stable). A span that is
+    /// reversed, overlaps an earlier one or reaches past `src` is
+    /// `MalformedPivotXml` — a public seam answers, it does not assert
+    /// (Codex #205 r7 REL-701).
     pub fn spliceAll(allocator: Allocator, src: []const u8, splices: []Splice) EditError![]u8 {
         std.mem.sort(Splice, splices, {}, Splice.before);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
         var pos: usize = 0;
         for (splices) |sp| {
-            assert(pos <= sp.span.start and sp.span.start <= sp.span.end and sp.span.end <= src.len);
+            if (pos > sp.span.start or sp.span.start > sp.span.end or sp.span.end > src.len) return error.MalformedPivotXml;
             try out.appendSlice(allocator, src[pos..sp.span.start]);
             try out.appendSlice(allocator, sp.text);
             pos = sp.span.end;
@@ -6115,4 +6118,19 @@ test "engine: a qualified attribute on the inventory element, a record or a valu
             try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml.items));
         }
     }
+}
+
+test "edit: spliceAll answers a reversed, overlapping or out-of-range span with MalformedPivotXml, never an assertion (Codex #205 r7 REL-701)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = "abcdef";
+    var reversed = [_]edit.Splice{.{ .span = .{ .start = 3, .end = 2 }, .text = "" }};
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &reversed));
+    var past = [_]edit.Splice{.{ .span = .{ .start = 0, .end = src.len + 1 }, .text = "" }};
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &past));
+    var overlapping = [_]edit.Splice{ .{ .span = .{ .start = 0, .end = 2 }, .text = "X" }, .{ .span = .{ .start = 1, .end = 3 }, .text = "Y" } };
+    try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &overlapping));
+    var fine = [_]edit.Splice{ .{ .span = .{ .start = 4, .end = 6 }, .text = "Z" }, .{ .span = .{ .start = 1, .end = 1 }, .text = "-" }, .{ .span = .{ .start = 1, .end = 3 }, .text = "" } };
+    try testing.expectEqualStrings("a-dZ", try edit.spliceAll(arena, src, &fine));
 }

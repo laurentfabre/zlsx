@@ -42,6 +42,7 @@ const recalc_txn = @import("recalc_txn.zig");
 /// their own to run under.
 const recalc_run = @import("recalc_run.zig");
 const typed_parts = @import("typed_parts/root.zig");
+const wbxml_typed = @import("typed_parts/workbook_xml.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
 const embedding_part = @import("embedding_part.zig");
@@ -6706,14 +6707,7 @@ pub const Workbook = struct {
     fn nowSerial(self: *Workbook) Error!?f64 {
         const io = self.clock orelse return null;
         const wb_part = (try self.store.part("xl/workbook.xml")) orelse return null;
-        const date_system = switch (try engine.calc.parseCalcState(self.allocator, wb_part.bytes)) {
-            .ok => |c| blk: {
-                var calc = c;
-                defer calc.deinit(self.allocator);
-                break :blk calc.date_system;
-            },
-            .refused => return null,
-        };
+        const date_system = (try epochOf(wb_part.bytes)) orelse return null;
         const ts = std.Io.Clock.now(.real, io);
         const secs = @as(f64, @floatFromInt(ts.nanoseconds)) / 1e9;
         // Unix epoch = serial 25569 under 1900, 24107 under 1904.
@@ -6721,6 +6715,33 @@ pub const Workbook = struct {
             .d1900 => @as(f64, 25569.0),
             .d1904 => @as(f64, 24107.0),
         };
+    }
+
+    /// `workbookPr@date1904` read on its own — not through the
+    /// calc-state parser, whose refusals (`fullPrecision="0"`, a policy
+    /// the recalculator does not evaluate) are no reason to lose a
+    /// refresh date (Codex #205 r7 REL-702). Absent is 1900, the
+    /// schema's default. Null when the part does not read as one tree
+    /// under the pivot scanner, or the attribute is not a boolean: a
+    /// refresh under an epoch that does not read is not dated.
+    fn epochOf(xml: []const u8) Error!?engine.run_inputs.DateSystem {
+        const px = typed_parts.pivot_xml;
+        const root = px.scanRoot(xml, "workbook") catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        var kids = px.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+        while (kids.next() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        }) |k| {
+            if (!std.mem.eql(u8, k.local, "workbookPr")) continue;
+            const raw = wbxml_typed.getAttr(k.attrs(xml), "date1904") orelse return .d1900;
+            if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return .d1904;
+            if (std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return .d1900;
+            return null;
+        }
+        return .d1900;
     }
 
     /// S7b-3, the save-time half of the refresh marker (§7 Q3 — one

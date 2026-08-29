@@ -6536,6 +6536,41 @@ test "S7b-4: a prepared collection is this edit's or nothing — another index, 
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "recordCount=\"4\"") != null);
 }
 
+test "S7b-4: refreshedDate survives a calc policy the recalculator refuses, under either epoch (Codex #205 r7 REL-702)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    for ([_]bool{ false, true }) |d1904| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r7_epoch_{d}.xlsx", .{@intFromBool(d1904)});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        // A precision-as-displayed policy the recalculator refuses; the
+        // epoch beside it still reads.
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "<pivotCaches", "<calcPr fullPrecision=\"0\"/><pivotCaches");
+        if (d1904) try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "<sheets>", "<workbookPr date1904=\"1\"/><sheets>");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try wb.insertRow(0, 2);
+        const cd = (try wb.store.part(def_part)).?;
+        const at = std.mem.indexOf(u8, cd.bytes, "refreshedDate=\"") orelse return error.TestExpectedRefreshedDate;
+        const from = at + "refreshedDate=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, cd.bytes, from, '"') orelse return error.TestExpectedRefreshedDate;
+        const serial = try std.fmt.parseFloat(f64, cd.bytes[from..end]);
+        // 2026-08-29 is serial 46263 under 1900 and 1462 less under
+        // 1904; the bounds hold for years either side.
+        if (d1904) {
+            try std.testing.expect(serial > 44000 and serial < 45500);
+        } else {
+            try std.testing.expect(serial > 46000 and serial < 47000);
+        }
+    }
+}
+
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───
 //
 // A row edit inside a source rectangle marks the cache in the sweep; a
