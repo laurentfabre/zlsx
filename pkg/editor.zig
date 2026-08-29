@@ -6164,6 +6164,9 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         // A coordinate twice (Codex #205 r4 REL-404).
         .{ .name = "duprow", .part = sheet_part, .old = "<row r=\"3\">", .new = "<row r=\"2\"><c r=\"C2\"><v>9</v></c></row><row r=\"3\">", .err = error.MalformedSheetXml, .shift_ok = true },
         .{ .name = "dupcell", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>3</v></c><c r=\"B2\"><v>4</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
+        // A `t` this view does not know is not a number (Codex #205 r8
+        // REL-801).
+        .{ .name = "bogus_t", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\" t=\"bogus\"><v>3</v></c>", .err = error.PivotEditUnsafe, .shift_ok = true },
         // Not the strict grid spelling (Codex #205 r6 REL-603).
         .{ .name = "leadingzero", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B02\"><v>3</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
         .{ .name = "pastxfd", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"XFE2\"><v>3</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
@@ -6568,6 +6571,59 @@ test "S7b-4: refreshedDate survives a calc policy the recalculator refuses, unde
         } else {
             try std.testing.expect(serial > 46000 and serial < 47000);
         }
+    }
+}
+
+test "S7b-4: a number or an SST index spelt with character references reads by what it is; a table count written but not a number refuses the graph (Codex #205 r8 REL-802, REL-803)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rec_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    const sheet_part = "xl/worksheets/sheet1.xml";
+    const table_part = "xl/tables/table1.xml";
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r8_refs_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r8_refs_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"C2\"><v>1.5</v></c>", "<c r=\"C2\"><v>1&#x2E;5</v></c>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"A2\" t=\"s\"><v>3</v></c>", "<c r=\"A2\" t=\"s\"><v>&#51;</v></c>");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteRow(0, 4);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, def_part, rec_part, 2);
+        const rec = (try store.part(rec_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r>") != null);
+    }
+    const Case = struct { name: []const u8, new: []const u8 };
+    const counts = [_]Case{
+        .{ .name = "totals_bogus", .new = "ref=\"A1:C4\" totalsRowCount=\"bogus\" totalsRowShown=\"0\"" },
+        .{ .name = "header_empty", .new = "ref=\"A1:C4\" headerRowCount=\"\" totalsRowShown=\"0\"" },
+        .{ .name = "header_negative", .new = "ref=\"A1:C4\" headerRowCount=\"-1\" totalsRowShown=\"0\"" },
+    };
+    for (counts) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r8_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", case.new);
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.MalformedPivotXml, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part(rec_part)).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
     }
 }
 

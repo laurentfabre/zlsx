@@ -2726,7 +2726,13 @@ pub const engine = struct {
                         if (blank_at == null) blank_at = idx;
                     },
                     .n => {
-                        const lex = it.v orelse return error.MalformedPivotXml;
+                        // The value as written may spell itself with
+                        // references (`&#49;`); it is matched by what
+                        // it is (Codex #205 r8 REL-802).
+                        const lex = decodeLexical(arena, it.v orelse return error.MalformedPivotXml) catch |e| switch (e) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.MalformedPivotXml,
+                        };
                         const x = parseNumber(lex) orelse return error.MalformedPivotXml;
                         const gop = try by_number.getOrPut(arena, numberKey(x));
                         if (!gop.found_existing) gop.value_ptr.* = idx;
@@ -6133,4 +6139,43 @@ test "edit: spliceAll answers a reversed, overlapping or out-of-range span with 
     try testing.expectError(error.MalformedPivotXml, edit.spliceAll(arena, src, &overlapping));
     var fine = [_]edit.Splice{ .{ .span = .{ .start = 4, .end = 6 }, .text = "Z" }, .{ .span = .{ .start = 1, .end = 1 }, .text = "-" }, .{ .span = .{ .start = 1, .end = 3 }, .text = "" } };
     try testing.expectEqualStrings("a-dZ", try edit.spliceAll(arena, src, &fine));
+}
+
+test "engine: a retained number spelt with a character reference matches by value; an `xmlnsfoo:` prefix is a prefix (Codex #205 r8 REL-802, REL-804)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const xml = head ++ "<sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" count=\"1\"><n v=\"&#49;\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .number = "1" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    // Matched, not appended: one item, kept as written, the extrema
+    // spelt by the item's decoded lexical.
+    try testing.expect(std.mem.indexOf(u8, out, "minValue=\"1\" maxValue=\"1\" count=\"1\"><n v=\"&#49;\"/></sharedItems>") != null);
+
+    const sneaky = [_][]const u8{
+        head ++ "<sharedItems xmlns:xmlnsfoo=\"urn:vendor\" xmlnsfoo:meta=\"x\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail,
+        head ++ "<sharedItems xmlns:xmlnsfoo=\"urn:vendor\" count=\"1\"><s xmlnsfoo:meta=\"x\" v=\"a\"/></sharedItems>" ++ tail,
+    };
+    for (sneaky) |s| {
+        const def = try pivot_xml.parseCacheDefinition(arena, s);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
 }

@@ -1071,7 +1071,9 @@ fn preflight(xml: []const u8) Error!void {
 pub fn hasQualifiedAttr(attrs: []const u8) bool {
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
-        if (std.mem.startsWith(u8, a.name, "xmlns")) continue;
+        // The declarations themselves, exactly: `xmlnsfoo:meta` is a
+        // qualified attribute like any other (Codex #205 r8 REL-804).
+        if (std.mem.eql(u8, a.name, "xmlns") or std.mem.startsWith(u8, a.name, "xmlns:")) continue;
         if (std.mem.indexOfScalar(u8, a.name, ':') != null) return true;
     }
     return false;

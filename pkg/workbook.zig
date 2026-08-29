@@ -6614,12 +6614,17 @@ pub const Workbook = struct {
         cell: sheet_xml_mod.Cell,
         date_styles: *std.AutoHashMapUnmanaged(u32, bool),
     ) Error!pivots_mod.engine.Value {
+        // A `t` this view does not know is not a number by default
+        // (Codex #205 r8 REL-801).
+        if (cell.cell_type_invalid) return error.PivotEditUnsafe;
         switch (cell.cell_type) {
             .number => {
                 // An empty `<c/>` is a blank; a formula without a
-                // cached value is one Excel would compute first.
-                const raw = std.mem.trim(u8, cell.raw_value orelse "", " \t\r\n");
-                if (raw.len == 0) return if (cell.formula != null) error.PivotEditUnsafe else .blank;
+                // cached value is one Excel would compute first. The
+                // text is XML: `1&#x2E;5` is `1.5` (r8 REL-802).
+                const trimmed = std.mem.trim(u8, cell.raw_value orelse "", " \t\r\n");
+                if (trimmed.len == 0) return if (cell.formula != null) error.PivotEditUnsafe else .blank;
+                const raw = try pivotSourceLexical(arena, trimmed);
                 if (pivots_mod.engine.parseNumber(raw) == null) return error.PivotEditUnsafe;
                 // A style the cell names but the view could not read
                 // is not "unstyled" (Codex #205 r5 REL-504).
@@ -6635,7 +6640,8 @@ pub const Workbook = struct {
                 return .{ .number = raw };
             },
             .shared_string => {
-                const raw = std.mem.trim(u8, cell.raw_value orelse return error.PivotEditUnsafe, " \t\r\n");
+                const trimmed = std.mem.trim(u8, cell.raw_value orelse return error.PivotEditUnsafe, " \t\r\n");
+                const raw = try pivotSourceLexical(arena, trimmed);
                 const idx = std.fmt.parseInt(u32, raw, 10) catch return error.PivotEditUnsafe;
                 const sst_view = (try self.sst()) orelse return error.PivotEditUnsafe;
                 if (idx >= sst_view.entries.len) return error.PivotEditUnsafe;
@@ -6654,6 +6660,16 @@ pub const Workbook = struct {
             .formula_string => return .{ .string = try pivotSourceText(arena, .formula_string_value, cell.raw_value orelse return error.PivotEditUnsafe) },
             .inline_string, .boolean, .error_value, .date => return error.PivotEditUnsafe,
         }
+    }
+
+    /// A scalar's text with its character references resolved — what
+    /// the number or index IS, as opposed to how the part spelt it
+    /// (Codex #205 r8 REL-802).
+    fn pivotSourceLexical(arena: Allocator, raw: []const u8) Error![]const u8 {
+        return engine.decode.decodeCarrier(arena, .lexical, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PivotEditUnsafe,
+        };
     }
 
     fn pivotSourceText(arena: Allocator, site: engine.decode.Site, raw: []const u8) Error![]const u8 {

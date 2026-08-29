@@ -44,6 +44,10 @@ pub const Cell = struct {
     /// rather than read it as General (Codex #205 r5 REL-504).
     style_invalid: bool = false,
     cell_type: CellType,
+    /// `t` was written but names no type this view knows: `cell_type`
+    /// is `.number` by the schema's default, and the cell is not one
+    /// the S7b-4 rebuild reads (Codex #205 r8 REL-801).
+    cell_type_invalid: bool = false,
     /// Raw inner text of `<v>` (or `<is><t>` for inline strings).
     /// Borrows. No XML-entity decoding — caller decodes if needed.
     raw_value: ?[]const u8,
@@ -539,7 +543,10 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
         };
         const style_idx: ?u32 = parseU32Attr(c_attrs, "s");
         const style_invalid = attrAt(c_attrs, "s") != null and style_idx == null;
-        const cell_type = parseCellType(attrAt(c_attrs, "t"));
+        const type_raw = attrAt(c_attrs, "t");
+        const cell_type_known = parseCellType(type_raw);
+        const cell_type = cell_type_known orelse .number;
+        const cell_type_invalid = type_raw != null and cell_type_known == null;
 
         const self_closing = c_open_end > c_open and row_body[c_open_end - 1] == '/';
         var raw_value: ?[]const u8 = null;
@@ -560,6 +567,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
             .style_idx = style_idx,
             .style_invalid = style_invalid,
             .cell_type = cell_type,
+            .cell_type_invalid = cell_type_invalid,
             .raw_value = raw_value,
             .formula = formula,
         });
@@ -568,7 +576,9 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
     return try cells.toOwnedSlice(a);
 }
 
-fn parseCellType(raw: ?[]const u8) CellType {
+/// The schema's default (`.number`) for an absent `t`; null for a `t`
+/// this view does not know — the caller keeps that provenance.
+fn parseCellType(raw: ?[]const u8) ?CellType {
     const t = raw orelse return .number;
     if (std.mem.eql(u8, t, "n")) return .number;
     if (std.mem.eql(u8, t, "s")) return .shared_string;
@@ -577,7 +587,7 @@ fn parseCellType(raw: ?[]const u8) CellType {
     if (std.mem.eql(u8, t, "inlineStr")) return .inline_string;
     if (std.mem.eql(u8, t, "e")) return .error_value;
     if (std.mem.eql(u8, t, "d")) return .date;
-    return .number;
+    return null;
 }
 
 fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {
