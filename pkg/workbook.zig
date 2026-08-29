@@ -970,6 +970,11 @@ pub const Workbook = struct {
     /// workbook built from a bare store, whose rebuilt caches drop the
     /// attribute rather than keep a stale one.
     clock: ?std.Io = null,
+    /// S7b-4: how many cache rebuilds this workbook has run — one per
+    /// cache per content-changing row edit, on either path; the
+    /// Editor's pre-flight is the one run its sweep installs (Codex
+    /// #205 r1 PERF-101 pins it).
+    pivot_rebuilds: u32 = 0,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -5710,7 +5715,7 @@ pub const Workbook = struct {
     /// rewriter-call wiring) are tracked in
     /// `docs/plans/refusal-audit.md`.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert });
+        try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }
 
     /// Delete row `row` (1-based) in sheet `sheet_idx`. Every row
@@ -5718,7 +5723,7 @@ pub const Workbook = struct {
     /// dropped. Same refusal contract + cross-sheet-rewrite
     /// limitations as `insertRow`.
     pub fn deleteRow(self: *Workbook, sheet_idx: u32, row: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete });
+        try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete }, null);
     }
 
     /// Insert a blank column at position `before_col` (1-based, A=1)
@@ -5727,22 +5732,54 @@ pub const Workbook = struct {
     /// `insertRow`; cross-sheet rewrite is the same iter-er-5
     /// follow-up.
     pub fn insertColumn(self: *Workbook, sheet_idx: u32, before_col_1based: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert });
+        try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert }, null);
     }
 
     /// Delete column `col_1based` in sheet `sheet_idx`. Every
     /// column > `col_1based` shifts left by 1.
     pub fn deleteColumn(self: *Workbook, sheet_idx: u32, col_1based: u32) Error!void {
-        try self.applySheetEditTransform(sheet_idx, .{ .col = col_1based, .kind = .delete });
+        try self.applySheetEditTransform(sheet_idx, .{ .col = col_1based, .kind = .delete }, null);
     }
 
-    const SheetEditSpec = struct {
+    pub const SheetEditSpec = struct {
         row: ?u32 = null,
         col: ?u32 = null,
         kind: sheet_edit.RowEditKind,
     };
 
-    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec) Error!void {
+    /// S7a / S7b: the pivot parts one row / col edit replaces — the
+    /// definitions, records and consumers the sweep installs —
+    /// collected before any mutation. The Editor pre-flights the edit
+    /// through `preflightPivotEditsForSheet` and hands the result to
+    /// `applySheetEdit`, so the S7b-4 rebuild — a read of the whole
+    /// source rectangle — runs once per edit rather than once for the
+    /// pre-flight and again for the sweep (Codex #205 r1 PERF-101).
+    /// Good for that one edit over the store as it was collected on;
+    /// the caller mutates nothing in between.
+    pub const PreparedPivotEdits = struct {
+        sheet_part_name: []const u8,
+        axis: pivots_mod.edit.Axis,
+        idx_1based: u32,
+        kind: pivots_mod.edit.Kind,
+        patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty,
+
+        pub fn deinit(self: *PreparedPivotEdits, allocator: Allocator) void {
+            for (self.patches.items) |it| allocator.free(it.bytes);
+            self.patches.deinit(allocator);
+            allocator.free(self.sheet_part_name);
+            self.* = undefined;
+        }
+    };
+
+    /// A row / col edit with the pivot parts the Editor already
+    /// collected: the four wrappers above with `prepared` threaded
+    /// through to the pivot sweep, which installs that collection
+    /// instead of computing it a second time.
+    pub fn applySheetEdit(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: *PreparedPivotEdits) Error!void {
+        try self.applySheetEditTransform(sheet_idx, spec, prepared);
+    }
+
+    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         // The direct `Workbook` path validates the position itself (the
         // Editor does too): every sweep below spells 1-based, and a 0
@@ -5810,7 +5847,7 @@ pub const Workbook = struct {
                 .delete => .delete,
             },
         );
-        try self.applyPivotEditsForSheet(part_name, spec);
+        try self.applyPivotEditsForSheet(part_name, spec, prepared);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
         // #192 F1): formula text spells PRE-edit positions, and
@@ -6091,19 +6128,25 @@ pub const Workbook = struct {
     /// definition marked `refreshOnLoad="1"` in the same rewrite
     /// (S7b-3, `pivots.edit`'s marker section); a proven shift does
     /// not mark, and the part stays byte-identical but for `ref`.
+    ///
+    /// Returns the collection itself, for `applySheetEdit` to install
+    /// — the caller owns it (`PreparedPivotEdits.deinit`).
     pub fn preflightPivotEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
-    ) Error!void {
-        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
-        defer {
-            for (patches.items) |it| self.allocator.free(it.bytes);
-            patches.deinit(self.allocator);
-        }
-        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
+    ) Error!PreparedPivotEdits {
+        var prepared: PreparedPivotEdits = .{
+            .sheet_part_name = try self.allocator.dupe(u8, sheet_part_name),
+            .axis = axis,
+            .idx_1based = idx_1based,
+            .kind = kind,
+        };
+        errdefer prepared.deinit(self.allocator);
+        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &prepared.patches);
+        return prepared;
     }
 
     /// The typed graph when it must be read for this edit: the sheet's
@@ -6376,7 +6419,7 @@ pub const Workbook = struct {
     /// midway leaves every part as it was. Byte-identical rewrites (the
     /// pivot sits below / right of the edit, the source is elsewhere)
     /// are not installed, so the SHA-256 passthrough holds for them.
-    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec) Error!void {
+    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
         std.debug.assert(idx_1based >= 1);
         const axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
@@ -6384,6 +6427,13 @@ pub const Workbook = struct {
             .insert => .insert,
             .delete => .delete,
         };
+        if (prepared) |p| {
+            // The pre-flight's own collection, for this very edit.
+            std.debug.assert(std.mem.eql(u8, p.sheet_part_name, sheet_part_name));
+            std.debug.assert(p.axis == axis and p.idx_1based == idx_1based and p.kind == kind);
+            if (p.patches.items.len > 0) try self.store.replaceParts(p.patches.items);
+            return;
+        }
         var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer {
             for (patches.items) |it| self.allocator.free(it.bytes);
@@ -6425,6 +6475,7 @@ pub const Workbook = struct {
         // rewriter's refusal, reached first here on the Editor's path.
         if (kind == .delete and idx_1based < src.rect.tl_row + src.header_rows) return error.PivotEditUnsafe;
         const eng = pivots_mod.engine;
+        self.pivot_rebuilds +|= 1;
         const all = try self.readPivotSourceRows(arena, sheet_idx, src.rect);
         const width: usize = src.rect.br_col - src.rect.tl_col + 1;
         if (src.header_rows == 1) {
@@ -6474,11 +6525,20 @@ pub const Workbook = struct {
             r.* = cells;
         }
         var date_styles: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+        // A row or cell without its `r` is one the typed view could not
+        // place, and the rectangle cannot be read around it (Codex #205
+        // r1 REL-103).
+        if (view.unaddressed_rows > 0) return error.PivotEditUnsafe;
         for (view.rows) |row| {
             if (row.row_idx < rect.tl_row or row.row_idx > rect.br_row) continue;
+            if (row.unaddressed_cells > 0) return error.PivotEditUnsafe;
             const out = grid[row.row_idx - rect.tl_row];
             for (row.cells) |cell| {
+                // The whole reference, and its row must be the row that
+                // holds it: an `A999` inside `<row r="2">` is not A2.
                 const col = sheet_edit.parseColFromA1(cell.ref) orelse return error.MalformedSheetXml;
+                const cell_row = sheet_edit.parseRowFromA1(cell.ref) orelse return error.MalformedSheetXml;
+                if (cell_row != row.row_idx) return error.MalformedSheetXml;
                 if (col < rect.tl_col or col > rect.br_col) continue;
                 out[col - rect.tl_col] = try self.pivotSourceValue(arena, cell, &date_styles);
             }
@@ -6520,7 +6580,10 @@ pub const Workbook = struct {
                     },
                 }
             },
-            .formula_string => return .{ .string = try pivotSourceText(arena, .formula_string_value, cell.raw_value orelse "") },
+            // `t="str"` without a `<v>` is a formula Excel has not
+            // computed, like the numeric case above — not the empty
+            // string an empty `<v/>` spells (Codex #205 r1 REL-104).
+            .formula_string => return .{ .string = try pivotSourceText(arena, .formula_string_value, cell.raw_value orelse return error.PivotEditUnsafe) },
             .inline_string, .boolean, .error_value, .date => return error.PivotEditUnsafe,
         }
     }

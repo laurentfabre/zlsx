@@ -52,6 +52,10 @@ pub const Row = struct {
     height: ?f64,
     custom_height: bool,
     hidden: bool,
+    /// `<c>` elements of this row without an `r` — not in `cells`,
+    /// since the view has no coordinate for them. A reader that needs
+    /// the row whole (the S7b-4 rebuild) refuses when this is not 0.
+    unaddressed_cells: u32 = 0,
 };
 
 pub const MergeRange = struct {
@@ -100,6 +104,11 @@ pub const SheetXml = struct {
     validations: []DataValidation,
     conditional_formats: []ConditionalFormat,
     freeze: ?FreezePane,
+    /// `<row>` elements without a usable `r` — not in `rows`, since the
+    /// view has no coordinate for them (the Editor's own scanner numbers
+    /// them implicitly). A reader that needs the grid whole refuses
+    /// when this is not 0.
+    unaddressed_rows: u32 = 0,
     /// Owns the spine slices. `null` only when no allocations were
     /// performed — `parse` always sets it. Kept optional so a
     /// caller-constructed empty `SheetXml` (e.g. in tests) can free
@@ -166,7 +175,8 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
     const dim = parseDimension(sanitized);
     const freeze = parseFreezePane(sanitized);
 
-    const rows = try parseRows(a, sanitized);
+    var unaddressed_rows: u32 = 0;
+    const rows = try parseRows(a, sanitized, &unaddressed_rows);
     const merges = try parseMerges(a, sanitized);
     const hyperlinks = try parseHyperlinks(a, sanitized);
     const validations = try parseValidations(a, sanitized);
@@ -180,6 +190,7 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
         .validations = validations,
         .conditional_formats = cfs,
         .freeze = freeze,
+        .unaddressed_rows = unaddressed_rows,
         .arena = arena,
     };
 }
@@ -425,7 +436,7 @@ fn parseBoolAttr(attrs: []const u8, key: []const u8) bool {
 
 // ─── <sheetData><row><c>… ────────────────────────────────────────────
 
-fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
+fn parseRows(a: std.mem.Allocator, xml: []const u8, unaddressed: *u32) ParseError![]Row {
     assert(xml.len > 0);
 
     const sd_start = indexOfTag(xml, 0, "<sheetData") orelse return &.{};
@@ -452,14 +463,17 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
         const row_attrs = body[row_open + "<row".len .. row_open_end];
 
         const row_idx_raw = attrAt(row_attrs, "r") orelse {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         };
         const row_idx = std.fmt.parseInt(u32, row_idx_raw, 10) catch {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         };
         if (row_idx == 0) {
+            unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
         }
@@ -471,11 +485,12 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
         // Self-closing `<row r="N"/>` — empty row.
         const self_closing = row_open_end > row_open and body[row_open_end - 1] == '/';
         var cells: []Cell = &.{};
+        var unaddressed_cells: u32 = 0;
         if (!self_closing) {
             const row_close = std.mem.indexOfPos(u8, body, row_open_end, "</row>") orelse
                 return error.MalformedXml;
             const row_body = body[row_open_end + 1 .. row_close];
-            cells = try parseCells(a, row_body);
+            cells = try parseCells(a, row_body, &unaddressed_cells);
             probe = row_close + "</row>".len;
         } else {
             probe = row_open_end + 1;
@@ -487,13 +502,14 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8) ParseError![]Row {
             .height = height,
             .custom_height = custom_height,
             .hidden = hidden,
+            .unaddressed_cells = unaddressed_cells,
         });
     }
 
     return try rows.toOwnedSlice(a);
 }
 
-fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
+fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) ParseError![]Cell {
     assert(row_body.len < (1 << 31));
 
     var cells: std.ArrayListUnmanaged(Cell) = .empty;
@@ -512,6 +528,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8) ParseError![]Cell {
         const c_attrs = row_body[c_open + "<c".len .. c_open_end];
 
         const ref = attrAt(c_attrs, "r") orelse {
+            unaddressed.* +|= 1;
             probe = c_open_end + 1;
             continue;
         };

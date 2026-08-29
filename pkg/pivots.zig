@@ -2522,6 +2522,7 @@ pub const engine = struct {
         for (def.fields) |f| {
             if (f.formula != null or !f.database_field or f.has_other_children) return error.PivotShapeUnsupported;
             const si = f.shared_items orelse return error.PivotShapeUnsupported;
+            if (si.has_other_children) return error.PivotShapeUnsupported;
             if (si.contains_date or si.min_date != null or si.max_date != null) return error.PivotShapeUnsupported;
             if (si.count) |n| {
                 if (n != si.items.len) return error.MalformedPivotXml;
@@ -2760,6 +2761,10 @@ pub const engine = struct {
         while (kids.next() catch |e| return mapRecordsParse(e)) |k| {
             if (!std.mem.eql(u8, k.local, "r")) return error.PivotShapeUnsupported;
         }
+        // A direct child under another prefix is one the walk did not
+        // classify; a part rebuilt whole would drop it (Codex #205 r1
+        // REL-102).
+        if (kids.skipped > 0) return error.PivotShapeUnsupported;
         const p = try qualified(arena, root.prefix);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(arena, xml[0..root.hit.attrs_start]);
@@ -2822,7 +2827,7 @@ pub const engine = struct {
     /// `containsInteger`'s reading: integral and within a 32-bit int —
     /// a hint Excel sets for such fields, safe to leave unset.
     fn isInteger(x: f64) bool {
-        return @trunc(x) == x and @abs(x) <= 2147483647;
+        return @trunc(x) == x and x >= -2147483648.0 and x <= 2147483647.0;
     }
 
     /// One key per numeric value: `-0` and `0` are one item.
@@ -5567,4 +5572,125 @@ test "engine: the plan names the rectangle for the carriers the slice reads and 
         const plan = try edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .row, 2, .insert);
         try testing.expect(plan.changed and plan.rebuild == null);
     }
+}
+
+// ─── Codex #205 round 1 ──────────────────────────────────────────────
+
+test "engine: a close tag padded with whitespace bounds the inventory span — the splice takes the whole element, on either prefix (Codex #205 r1 REL-101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const plain = "<?xml version=\"1.0\"?><pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems \t></cacheField></cacheFields></pivotCacheDefinition>";
+    const strict = "<x:pivotCacheDefinition xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\"><x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems\n></x:cacheField></x:cacheFields></x:pivotCacheDefinition>";
+    const cases = [_]struct { xml: []const u8, want: []const u8 }{
+        .{ .xml = plain, .want = "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems \t>" },
+        .{ .xml = strict, .want = "<x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems\n>" },
+    };
+    for (cases) |c| {
+        const def = try pivot_xml.parseCacheDefinition(arena, c.xml);
+        const span = def.fields[0].shared_items.?.span;
+        try testing.expectEqualStrings(c.want, c.xml[span.start..span.end]);
+    }
+    // Rebuilt: the padded close is gone with the element, the part
+    // still one readable tree.
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = null,
+        .definition = try pivot_xml.parseCacheDefinition(arena, plain),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = plain,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "b" }}};
+    const rb = try engine.rebuild(arena, &cache, &rows, null, null);
+    const out = try edit.spliceAll(arena, plain, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "<sharedItems count=\"2\"><s v=\"a\"/><s v=\"b\"/></sharedItems></cacheField>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\t>") == null);
+    _ = try pivot_xml.parseCacheDefinition(arena, out);
+}
+
+test "engine: a namespace alias or rebinding below the root refuses the part; a foreign direct child reads but refuses the rebuild (Codex #205 r1 REL-102)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const strict_ns = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const inventory = "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>";
+
+    // Refused whole: the main namespace under another prefix on a
+    // descendant (either spelling of the URI), the default namespace
+    // rebound, the root's prefix rebound, and a root whose one main
+    // binding is not its own prefix.
+    const refused = [_][]const u8{
+        head ++ "<sharedItems count=\"1\" xmlns:y=\"" ++ main_ns ++ "\"><y:s v=\"a\"/></sharedItems>" ++ tail,
+        head ++ inventory ++ "<y:fieldGroup xmlns:y=\"" ++ strict_ns ++ "\" base=\"0\"/>" ++ tail,
+        head ++ inventory ++ "<fieldGroup xmlns=\"urn:vendor\" base=\"0\"/>" ++ tail,
+        "<x:pivotCacheDefinition xmlns:x=\"" ++ main_ns ++ "\"><x:cacheSource type=\"worksheet\"><x:worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></x:cacheSource><x:cacheFields count=\"1\"><x:cacheField name=\"K\" numFmtId=\"0\" xmlns:x=\"urn:vendor\"><x:sharedItems count=\"1\"><x:s v=\"a\"/></x:sharedItems></x:cacheField></x:cacheFields></x:pivotCacheDefinition>",
+        "<pivotCacheDefinition xmlns:y=\"" ++ main_ns ++ "\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource></pivotCacheDefinition>",
+    };
+    for (refused) |xml| try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, xml));
+
+    // A redundant redeclaration of the root's own binding changes
+    // nothing; a vendor prefix bound to a vendor URI is nobody's.
+    {
+        const def = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\" xmlns=\"" ++ main_ns ++ "\" xmlns:z=\"urn:vendor\"><s v=\"a\"/></sharedItems>" ++ tail);
+        try engine.checkShape(&def);
+    }
+
+    // A foreign direct child where the schema names only its own:
+    // read and flagged; the rebuild, which would regenerate around it,
+    // refuses.
+    const foreign = [_][]const u8{
+        head ++ "<sharedItems count=\"1\"><s v=\"a\"/><z:s xmlns:z=\"urn:vendor\" v=\"b\"/></sharedItems>" ++ tail,
+        head ++ inventory ++ "<z:fieldGroup xmlns:z=\"urn:vendor\" base=\"0\"/>" ++ tail,
+        head ++ inventory ++ "</cacheField></cacheFields><z:kpis xmlns:z=\"urn:vendor\"/></pivotCacheDefinition>",
+    };
+    for (foreign) |xml| {
+        const def = try pivot_xml.parseCacheDefinition(arena, xml);
+        try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&def));
+    }
+
+    // The records part: an aliased record refuses the read, a foreign
+    // direct child refuses the rebuild — neither is dropped.
+    const def_xml = head ++ inventory ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const aliased = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><y:r xmlns:y=\"" ++ main_ns ++ "\"><y:x v=\"0\"/></y:r></pivotCacheRecords>";
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, aliased, null));
+    const vendor = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r><z:r xmlns:z=\"urn:vendor\"/></pivotCacheRecords>";
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, vendor, null));
+    const clean = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords>";
+    const rb = try engine.rebuild(arena, &cache, &rows, clean, null);
+    try testing.expectEqualStrings(clean, rb.records.?);
+}
+
+test "engine: containsInteger's 32-bit interval is the signed one, both ends in (Codex #205 r1 REL-105)" {
+    try testing.expect(engine.isInteger(-2147483648));
+    try testing.expect(engine.isInteger(2147483647));
+    try testing.expect(engine.isInteger(0));
+    try testing.expect(!engine.isInteger(-2147483649));
+    try testing.expect(!engine.isInteger(2147483648));
+    try testing.expect(!engine.isInteger(1.5));
 }

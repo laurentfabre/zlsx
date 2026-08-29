@@ -162,6 +162,10 @@ pub const SharedItems = struct {
     /// The inventory's children in document order; empty for the
     /// attribute-only form a data-only numeric field takes.
     items: []Item = &.{},
+    /// A direct child not under the part's prefix — a foreign element
+    /// where the schema names only items — which `items` cannot hold
+    /// and no rebuild can keep (Codex #205 r1 REL-102).
+    has_other_children: bool = false,
 
     /// One inventory item. Kinds beyond the six the schema names
     /// (`<s>`, `<n>`, `<m>`, `<b>`, `<d>`, `<e>`) read as `.other`.
@@ -236,7 +240,8 @@ pub const CacheDefinition = struct {
     /// `cacheFields` and `extLst` — `cacheHierarchies`, `kpis`,
     /// `tupleCache`, `calculatedItems`, `calculatedMembers`,
     /// `dimensions`, `measureGroups`, `maps`: OLAP and calculated
-    /// shapes the S7b-4 rebuild refuses.
+    /// shapes the S7b-4 rebuild refuses. Or a direct child under
+    /// another prefix, which the schema does not place there.
     has_other_children: bool,
 
     /// Release the spines. Pass the allocator `parseCacheDefinition`
@@ -312,6 +317,9 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
             def.has_other_children = true;
         }
     }
+    // A direct child under another prefix is a foreign element where
+    // the schema names only its own (Codex #205 r1 REL-102).
+    if (kids.skipped > 0) def.has_other_children = true;
     if (!have_source) return error.MalformedXml;
     return def;
 }
@@ -401,6 +409,7 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
                 field.has_other_children = true;
             }
         }
+        if (inner.skipped > 0) field.has_other_children = true;
         try out.append(allocator, field);
     }
     return out.toOwnedSlice(allocator);
@@ -408,7 +417,7 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
 
 fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error!SharedItems {
     var si = try sharedItemsAttrs(el.attrs(xml));
-    si.span = .{ .start = el.hit.open_lt, .end = elementEnd(el, p, "sharedItems") };
+    si.span = .{ .start = el.hit.open_lt, .end = el.after };
     var items: std.ArrayListUnmanaged(SharedItems.Item) = .empty;
     errdefer items.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
@@ -429,17 +438,9 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .simple = k.hit.self_closing,
         });
     }
+    si.has_other_children = kids.skipped > 0;
     si.items = try items.toOwnedSlice(allocator);
     return si;
-}
-
-/// One past `el` including its close tag: for a self-closing element
-/// the byte after `/>`, otherwise the byte after `</p:local>` — the
-/// close the preflight guaranteed matches the open.
-fn elementEnd(el: Child, p: []const u8, local: []const u8) usize {
-    if (el.hit.self_closing) return el.hit.after_tag_close;
-    const qname_len = if (p.len > 0) p.len + 1 + local.len else local.len;
-    return el.end + "</".len + qname_len + ">".len;
 }
 
 fn sharedItemsAttrs(attrs: []const u8) Error!SharedItems {
@@ -960,6 +961,11 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         if (declaredBinding(attrs, prefix)) |uri| {
             if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
         }
+        // And the one main binding there is must be the root's own: a
+        // `<pivotCacheDefinition xmlns:y="…/main">` puts every `y:`
+        // child under a prefix this parser does not match (Codex #205
+        // r1 REL-102).
+        if (countBindings(attrs, &main_ns_uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
         const env = try (NsEnv{}).forChild(attrs);
         for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const body_end = try endOfQ(xml, hit, qname);
@@ -977,11 +983,14 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
 /// innermost open one (so `<a><b></a></b>` and a child closing after
 /// its root are refused); a second element once the root — explicit
 /// or self-closing — has closed; an element still open at the end.
+/// And the namespace hygiene the one-prefix walk rests on, below the
+/// root (`checkDescendantBindings`).
 fn preflight(xml: []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedXml;
     var stack: [max_depth][]const u8 = undefined;
     var depth: usize = 0;
     var root_closed = false;
+    var root_prefix: []const u8 = "";
     var i: usize = if (std.mem.startsWith(u8, xml, "\xEF\xBB\xBF")) 3 else 0;
     while (i < xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
@@ -1013,6 +1022,12 @@ fn preflight(xml: []const u8) Error!void {
         while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
         const qname = xml[lt + 1 .. j];
         const tag_end = try attributesEnd(xml, j);
+        if (depth == 0) {
+            root_prefix = if (std.mem.indexOfScalar(u8, qname, ':')) |c| qname[0..c] else "";
+        } else {
+            const attrs_end = tag_end.after_gt - @as(usize, if (tag_end.self_closing) 2 else 1);
+            try checkDescendantBindings(xml[j..attrs_end], root_prefix);
+        }
         if (!tag_end.self_closing) {
             if (depth >= max_depth) return error.MalformedXml;
             stack[depth] = qname;
@@ -1029,6 +1044,30 @@ fn preflight(xml: []const u8) Error!void {
 fn isBlank(s: []const u8) bool {
     for (s) |c| if (!std.ascii.isWhitespace(c)) return false;
     return true;
+}
+
+/// The namespace hygiene the one-prefix walk rests on, checked on
+/// every element below the root: a descendant that binds another
+/// prefix (or the default) to the main namespace would hide a
+/// main-namespace child under a spelling the walk steps over, and one
+/// that rebinds the root's prefix to a foreign URI would pass a foreign
+/// child off as one of the root's. Excel writes neither; a part that
+/// does is refused whole (Codex #205 r1 REL-102). A redundant
+/// redeclaration of the root's own binding changes nothing and passes.
+fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8) Error!void {
+    if (std.mem.indexOf(u8, attrs, "xmlns") == null) return;
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        const declared: []const u8 = if (std.mem.eql(u8, a.name, "xmlns"))
+            ""
+        else if (std.mem.startsWith(u8, a.name, "xmlns:"))
+            a.name["xmlns:".len..]
+        else
+            continue;
+        const binds_main = isOneOf(a.value, &main_ns_uris);
+        const is_root_prefix = std.mem.eql(u8, declared, root_prefix);
+        if (binds_main != is_root_prefix) return error.MalformedXml;
+    }
 }
 
 const TagEnd = struct { after_gt: usize, self_closing: bool };
@@ -1080,6 +1119,11 @@ pub const Child = struct {
     /// One past the child: the byte after its `/>`, or the `<` of its
     /// close tag.
     end: usize,
+    /// One past the child's last byte: after its `/>`, or after the
+    /// `>` of its close tag — which the markup may pad (`</s >`), so
+    /// no arithmetic on `end` and the name reaches it (Codex #205 r1
+    /// REL-101). Where the next sibling can start.
+    after: usize,
     /// The relationships-namespace environment inside this child.
     env: NsEnv,
 
@@ -1099,6 +1143,11 @@ pub const Children = struct {
     env: NsEnv,
     cursor: usize,
     end: usize,
+    /// Direct children stepped over for not being under the parent's
+    /// prefix. A reader that regenerates the parent's body (S7b-4)
+    /// cannot carry what it did not classify, and asks (Codex #205 r1
+    /// REL-102).
+    skipped: usize = 0,
 
     pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8, env: NsEnv) Children {
         return .{
@@ -1127,16 +1176,18 @@ pub const Children = struct {
             const qname = xml[lt + 1 .. j];
             const hit = (wbxml.findTagOpen(xml, lt, qname) catch |e| return narrow(e)) orelse
                 return error.MalformedXml;
-            const child_end = try endOfQ(xml, hit, qname);
-            self.cursor = if (hit.self_closing) child_end else child_end + "</".len + qname.len + ">".len;
+            const extent = try extentOfQ(xml, hit, qname);
+            self.cursor = extent.after;
             if (localUnder(qname, self.prefix)) |local| {
                 return .{
                     .local = local,
                     .hit = hit,
-                    .end = child_end,
+                    .end = extent.close_lt,
+                    .after = extent.after,
                     .env = try self.env.forChild(xml[hit.attrs_start..hit.attrs_end]),
                 };
             }
+            self.skipped += 1;
         }
         return null;
     }
@@ -1152,9 +1203,18 @@ fn localUnder(qname: []const u8, prefix: []const u8) ?[]const u8 {
     return if (prefix.len == 0) qname else null;
 }
 
-fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
-    if (hit.self_closing) return hit.after_tag_close;
+/// Where an element ends: `close_lt` is the `<` of its close tag —
+/// the bound its children walk under — and `after` is one past that
+/// tag's `>`. Both are the byte after `/>` for a self-closing element.
+const Extent = struct { close_lt: usize, after: usize };
+
+fn extentOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!Extent {
+    if (hit.self_closing) return .{ .close_lt = hit.after_tag_close, .after = hit.after_tag_close };
     return closeOfQ(xml, hit, qname);
+}
+
+fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
+    return (try extentOfQ(xml, hit, qname)).close_lt;
 }
 
 /// The `<` of the close tag matching the open tag at `hit`, by depth:
@@ -1162,7 +1222,7 @@ fn endOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
 /// is. None of these schemas nest an element in itself, but a scanner
 /// that took the first `</…>` would pair the wrong tags on a part that
 /// does, and read the outer element's children as the inner one's.
-fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
+fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!Extent {
     assert(!hit.self_closing);
     var depth: usize = 1;
     var cursor = hit.after_tag_close;
@@ -1174,7 +1234,7 @@ fn closeOfQ(xml: []const u8, hit: wbxml.TagHit, qname: []const u8) Error!usize {
             scan = inner.after_tag_close;
         }
         depth -= 1;
-        if (depth == 0) return close.lt;
+        if (depth == 0) return .{ .close_lt = close.lt, .after = close.after_gt };
         cursor = close.after_gt;
     }
 }
