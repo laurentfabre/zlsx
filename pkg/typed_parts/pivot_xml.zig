@@ -195,6 +195,10 @@ pub const CacheDefinition = struct {
     /// `<cacheFields count>` as written, for a consistency check
     /// against `fields.len`.
     fields_count_attr: ?u32,
+    /// The root element's attribute region — from just past the tag
+    /// name to the `>` (or the `/` of a self-close). S7b-3's upsert
+    /// target: a root attribute the part lacks is inserted at `end`.
+    root_attrs: Span,
 
     /// Release the spines. Pass the allocator `parseCacheDefinition`
     /// was given; a caller that parsed into an arena never calls this.
@@ -202,6 +206,18 @@ pub const CacheDefinition = struct {
         allocator.free(self.fields);
         allocator.free(self.source.range_sets);
         self.* = undefined;
+    }
+
+    /// Where the value of root attribute `name` sits in `xml` (the
+    /// bytes this definition was parsed from), quotes excluded; null
+    /// when the root does not carry it. The same scan the parser's
+    /// own attribute reads use, so a value it found is one this span
+    /// addresses.
+    pub fn rootAttrValueSpan(self: CacheDefinition, xml: []const u8, name: []const u8) ?Span {
+        assert(self.root_attrs.start <= self.root_attrs.end and self.root_attrs.end <= xml.len);
+        const attrs = xml[self.root_attrs.start..self.root_attrs.end];
+        const value = wbxml.getAttr(attrs, name) orelse return null;
+        return spanOf(xml, value);
     }
 };
 
@@ -229,6 +245,7 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
         .source = .{},
         .fields = &.{},
         .fields_count_attr = null,
+        .root_attrs = .{ .start = root.hit.attrs_start, .end = root.hit.attrs_end },
     };
     errdefer def.deinit(allocator);
 

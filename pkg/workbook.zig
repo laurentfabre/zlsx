@@ -3489,7 +3489,9 @@ pub const Workbook = struct {
     ///
     /// On success: every Worksheet's delta map is empty and any
     /// previously-cached `SheetXml` view is invalidated (next access
-    /// re-parses from the new bytes).
+    /// re-parses from the new bytes). A staged write inside a pivot
+    /// source marks its cache definition `refreshOnLoad="1"` first
+    /// (`markPivotCachesForCellWrites`, S7b-3).
     ///
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
@@ -3524,6 +3526,12 @@ pub const Workbook = struct {
         if (self.workbook_xml_plan.defined_names.items.len > 0) {
             try self.applyWorkbookXmlPlanDefinedNames();
         }
+
+        // Phase 0b (S7b-3): the refresh marker for staged cell writes —
+        // before the sheet phases consume the deltas and appends it
+        // reads, after the workbook.xml image the graph walk parses
+        // is final.
+        try self.markPivotCachesForCellWrites();
 
         // Phase 1: SST extension. Walk every worksheet's deltas for
         // `.shared_string` values and build a single text → index
@@ -6066,8 +6074,12 @@ pub const Workbook = struct {
     /// reader could not bound (its body moves under the name sweep), a
     /// dangling spelling, an external one, a whole-column body, a cache
     /// under a source `type` the reader does not know whose locator
-    /// names another sheet or no sheet (§7 Q5). The refresh marker on a
-    /// content change is S7b's next piece.
+    /// names another sheet or no sheet (§7 Q5). A source whose content
+    /// the edit may have changed — the edited row inside its rectangle,
+    /// or any edit of a sheet an unbounded source references — has its
+    /// definition marked `refreshOnLoad="1"` in the same rewrite
+    /// (S7b-3, `pivots.edit`'s marker section); a proven shift does
+    /// not mark, and the part stays byte-identical but for `ref`.
     pub fn preflightPivotEditsForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
@@ -6352,6 +6364,104 @@ pub const Workbook = struct {
         }
         try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
         if (patches.items.len > 0) try self.store.replaceParts(patches.items);
+    }
+
+    /// S7b-3, the save-time half of the refresh marker (§7 Q3 — one
+    /// rule): a staged cell write — `setCell`, an appended row — that
+    /// lands inside a source's resolved rectangle, or on a sheet an
+    /// unbounded source's closure references, marks that cache to
+    /// refresh at open (`pivots.edit.cellWriteChangesSource`), as a
+    /// row edit inside the rectangle does in the sweep. A write outside
+    /// every source leaves every definition byte-identical. The graph
+    /// is read once per save, only when a sheet has staged writes and
+    /// the workbook carries a cache (the sweep's string gate); the
+    /// marks install all-or-nothing through `replaceParts`. A graph
+    /// that cannot be read marks nothing: the marker is best-effort,
+    /// the snapshot it would have flagged is the state the file was
+    /// already in, and a save is not where an edit the editor admitted
+    /// is refused.
+    fn markPivotCachesForCellWrites(self: *Workbook) Error!void {
+        var any_writes = false;
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0 or ws.appended_rows.items.len > 0) {
+                any_writes = true;
+                break;
+            }
+        }
+        if (!any_writes) return;
+        if (!(try self.carriesPivotCache())) return;
+        var p = self.pivotTables() catch |e| switch (e) {
+            error.MalformedPivotXml => return,
+            else => |other| return other,
+        };
+        defer p.deinit();
+        if (p.caches.len == 0) return;
+
+        const a = self.allocator;
+        const affected = try a.alloc(bool, p.caches.len);
+        defer a.free(affected);
+        @memset(affected, false);
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() == 0 and ws.appended_rows.items.len == 0) continue;
+            for (p.caches, affected) |*c, *hit| {
+                if (hit.* or pivots_mod.edit.markerSet(&c.definition)) continue;
+                hit.* = try self.sheetWritesChangeCache(ws, c);
+            }
+        }
+
+        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
+        defer {
+            for (patches.items) |it| a.free(it.bytes);
+            patches.deinit(a);
+        }
+        for (p.caches, affected) |*c, hit| {
+            if (!hit) continue;
+            const out = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+            errdefer a.free(out);
+            try patches.append(a, .{ .name = c.part_name, .bytes = out });
+        }
+        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
+    }
+
+    /// Does any staged write on `ws` land where cache `c` reads? Deltas
+    /// at their own coordinates; appended rows where the emitter will
+    /// place them — after the sheet's highest row, one per row, one
+    /// column per cell — with an empty cell counting as no write. An
+    /// append that would run past the grid is the emitter's refusal,
+    /// not this pass's.
+    fn sheetWritesChangeCache(self: *Workbook, ws: *Worksheet, c: *const pivots_mod.PivotCache) Error!bool {
+        const sheet_idx = ws.sheet_idx;
+        var depends = pivots_mod.resolutionDependsOn(c.resolution, sheet_idx);
+        for (c.range_set_resolutions) |r| depends = depends or pivots_mod.resolutionDependsOn(r, sheet_idx);
+        if (!depends) return false;
+
+        var keys = ws.deltas.keyIterator();
+        while (keys.next()) |ref| {
+            if (cacheReadsCell(c, sheet_idx, ref.row, ref.col)) return true;
+        }
+        if (ws.appended_rows.items.len == 0) return false;
+        const part_name = try ws.resolvePartName();
+        const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+        const start_row: u64 = @as(u64, appendXmlFindHighestRow(part.bytes)) + 1;
+        for (ws.appended_rows.items, 0..) |cells, ri| {
+            const row64 = start_row + ri;
+            if (row64 > zlsx.max_row) break;
+            const row: u32 = @intCast(row64);
+            for (cells, 1..) |cell, col| {
+                if (cell == .empty) continue;
+                if (col > zlsx.max_col_1based) break;
+                if (cacheReadsCell(c, sheet_idx, row, @intCast(col))) return true;
+            }
+        }
+        return false;
+    }
+
+    fn cacheReadsCell(c: *const pivots_mod.PivotCache, sheet_idx: u32, row: u32, col: u32) bool {
+        if (pivots_mod.edit.cellWriteChangesSource(c.resolution, sheet_idx, row, col)) return true;
+        for (c.range_set_resolutions) |r| {
+            if (pivots_mod.edit.cellWriteChangesSource(r, sheet_idx, row, col)) return true;
+        }
+        return false;
     }
 
     /// tbl: walk the sheet's `<tableParts>` block, resolve each
