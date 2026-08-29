@@ -6024,6 +6024,51 @@ test "S7b: a #REF! inside a string literal neither masks a new one nor counts as
         std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$3,INDIRECT(\"#REF!\"))") != null);
 }
 
+test "S7b: a name body the sweep never rewrites refuses the edit of a sheet its source depends on (Codex r3 REL-301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b_cdata_src.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .defined_name);
+    // A CDATA body: well-formed, the same range, and one the name sweep
+    // leaves as written (#188 r8). The resolver still proves `Data`
+    // from the text, so the cache depends on it.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/workbook.xml", "<definedName name=\"PivotSrc\">Data!$A$1:$C$4</definedName>", "<definedName name=\"PivotSrc\"><![CDATA[Data!$A$1:$C$4]]></definedName>");
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        {
+            var p = try wb.pivotTables();
+            defer p.deinit();
+            try std.testing.expect(p.dependsOnSheet(0) and !p.dependsOnSheet(1));
+        }
+        const parts = [_][]const u8{ "xl/workbook.xml", "xl/worksheets/sheet1.xml", "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotTables/pivotTable1.xml" };
+        var before: [parts.len][]u8 = undefined;
+        var filled: usize = 0;
+        defer for (before[0..filled]) |b| std.testing.allocator.free(b);
+        for (parts, 0..) |name, i| {
+            before[i] = try std.testing.allocator.dupe(u8, (try wb.store.part(name)).?.bytes);
+            filled += 1;
+        }
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 9));
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertColumn(0, 1));
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        // The host is not a sheet the name depends on: its pivot moves.
+        try wb.insertRow(1, 1);
+        const pt = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "<location ref=\"A4:B7\"") != null);
+    }
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
+    try ed.insertRow(1, 1);
+}
+
 // ─── S7a: the output-location lift ───────────────────────────────────
 //
 // A sheet that only HOSTS a pivot is editable: `location@ref` — the one

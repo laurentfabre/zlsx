@@ -4107,18 +4107,30 @@ pub const Workbook = struct {
     /// loop reading freed memory on the sheet-scope branch. This impl
     /// collects ALL rewrites FIRST, then performs the splice +
     /// `replacePart` + re-parse in a single transactional step.
-    /// One defined name's body under `edit`, decoded: the new body
-    /// when the rewrite changes it, null when it does not or when the
-    /// body is one the sweep never touches. The one computation behind
-    /// `rewriteAllDefinedNames` and the S7b pivot guard's dry-run of
-    /// it, so the guard judges exactly the body the sweep would write.
+    /// What the defined-name sweep does to one body under `edit`.
+    const DefinedNameRewrite = union(enum) {
+        /// The rewrite leaves the body as it is.
+        unchanged,
+        /// The new decoded body — the caller owns it.
+        rewritten: []u8,
+        /// A body the sweep never touches (embedded markup): left as
+        /// written, whatever the edit does to what it references.
+        unrewritable,
+    };
+
+    /// One defined name's body under `edit`. The one computation behind
+    /// `rewriteAllDefinedNames` and the S7b pivot guard's dry-run of it,
+    /// so the guard judges exactly the body the sweep would write — and
+    /// sees the body the sweep would NOT write, which for a source a
+    /// cache reads through is a refusal, not a pass (Codex #203 r3
+    /// REL-301).
     fn rewrittenDefinedNameBody(
         self: *Workbook,
         dn_idx: usize,
         sheet_order: []const []const u8,
         edit: zlsx.formula_rewriter.RewriteEdit,
         target_sheet: ?[]const u8,
-    ) Error!?[]u8 {
+    ) Error!DefinedNameRewrite {
         const a = self.allocator;
         const dn = self.workbook.defined_names[dn_idx];
         // Resolve `on_sheet`: null for workbook-scope, sheet name
@@ -4152,7 +4164,7 @@ pub const Workbook = struct {
         // inside a comment. Splicing such a span would expose
         // the decoy as live markup. Conservative: never rewrite
         // a markup-bearing body (Codex #188 r8).
-        if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) return null;
+        if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) return .unrewritable;
 
         // Decode-in: `dn.formula` is raw XML inner text (still
         // entity-escaped); the rewriter operates on decoded text
@@ -4163,9 +4175,9 @@ pub const Workbook = struct {
         const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx);
         if (std.mem.eql(u8, rewritten, decoded)) {
             a.free(rewritten);
-            return null;
+            return .unchanged;
         }
-        return rewritten;
+        return .{ .rewritten = rewritten };
     }
 
     pub fn rewriteAllDefinedNames(
@@ -4195,7 +4207,10 @@ pub const Workbook = struct {
         }
 
         for (self.workbook.defined_names, 0..) |_, dn_idx| {
-            const rewritten = (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target_sheet)) orelse continue;
+            const rewritten = switch (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target_sheet)) {
+                .rewritten => |body| body,
+                .unchanged, .unrewritable => continue,
+            };
             errdefer a.free(rewritten);
             try new_bodies.put(a, dn_idx, rewritten);
         }
@@ -6178,7 +6193,11 @@ pub const Workbook = struct {
     /// range; either would leave the source unresolved and Excel's own
     /// refresh failing (`docs/plans/s7b-cache-policy.md` §2.2). A name
     /// already spelling `#REF!` is not this edit's doing and does not
-    /// refuse (Q4 iii: a dangling spelling is admitted).
+    /// refuse (Q4 iii: a dangling spelling is admitted) — only one the
+    /// edit adds to. A body the sweep never rewrites (embedded markup)
+    /// refuses when the source it serves depends on the edited sheet:
+    /// the grid would move under a reference the sweep leaves as
+    /// written (Codex #203 r3 REL-301).
     fn refuseNameSourcesTheSweepBreaks(
         self: *Workbook,
         p: *const pivots_mod.Pivots,
@@ -6217,21 +6236,23 @@ pub const Workbook = struct {
         defer a.free(judged);
         @memset(judged, false);
         for (p.caches) |c| {
-            try self.judgeNameKeys(pivots_mod.namesOf(c.resolution), judged, sheet_order, edit, target);
-            for (c.range_set_resolutions) |r| try self.judgeNameKeys(pivots_mod.namesOf(r), judged, sheet_order, edit, target);
+            try self.judgeNameKeys(c.resolution, sheet_idx, judged, sheet_order, edit, target);
+            for (c.range_set_resolutions) |r| try self.judgeNameKeys(r, sheet_idx, judged, sheet_order, edit, target);
         }
     }
 
     fn judgeNameKeys(
         self: *Workbook,
-        keys: []const pivots_mod.NameKey,
+        res: pivots_mod.SourceResolution,
+        sheet_idx: u32,
         judged: []bool,
         sheet_order: []const []const u8,
         edit: zlsx.formula_rewriter.RewriteEdit,
         target: []const u8,
     ) Error!void {
         const a = self.allocator;
-        for (keys) |key| {
+        const depends = pivots_mod.resolutionDependsOn(res, sheet_idx);
+        for (pivots_mod.namesOf(res)) |key| {
             for (self.workbook.defined_names, 0..) |dn, dn_idx| {
                 if (judged[dn_idx]) continue;
                 if (dn.local_sheet_id != key.scope) continue;
@@ -6244,9 +6265,21 @@ pub const Workbook = struct {
                 };
                 defer a.free(ident);
                 if (!std.mem.eql(u8, ident, key.identifier)) continue;
-                judged[dn_idx] = true;
-                const rewritten = (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target)) orelse break;
+                const rewritten = switch (try self.rewrittenDefinedNameBody(dn_idx, sheet_order, edit, target)) {
+                    .rewritten => |body| body,
+                    .unchanged => {
+                        judged[dn_idx] = true;
+                        break;
+                    },
+                    // Not judged: the same name may serve another
+                    // source that does depend on this sheet.
+                    .unrewritable => {
+                        if (depends) return error.PivotEditUnsafe;
+                        break;
+                    },
+                };
                 defer a.free(rewritten);
+                judged[dn_idx] = true;
                 const after_count = countRefErrorsOutsideQuotes(rewritten);
                 if (after_count == 0) break;
                 const before = try store_mod.decodeXmlEntities(a, dn.formula);

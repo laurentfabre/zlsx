@@ -214,6 +214,17 @@ pub const SourceResolution = union(enum) {
     };
 };
 
+/// Does one resolution depend on this sheet — resolved to it, or
+/// unresolved with the sheet among what its spelling proves? The per-
+/// resolution half of `Pivots.dependsOnSheet`.
+pub fn resolutionDependsOn(r: SourceResolution, sheet_idx: u32) bool {
+    return switch (r) {
+        .sheet => |s| s.sheet_idx == sheet_idx,
+        .unresolved => |u| std.mem.indexOfScalar(u32, u.sheets, sheet_idx) != null,
+        .external, .none => false,
+    };
+}
+
 /// The defined names a resolution reads through, whichever arm holds
 /// them — empty for the arms that read through none.
 pub fn namesOf(r: SourceResolution) []const NameKey {
@@ -411,11 +422,7 @@ pub const Pivots = struct {
     }
 
     fn dependsOn(r: SourceResolution, sheet_idx: u32) bool {
-        return switch (r) {
-            .sheet => |s| s.sheet_idx == sheet_idx,
-            .unresolved => |u| std.mem.indexOfScalar(u32, u.sheets, sheet_idx) != null,
-            .external, .none => false,
-        };
+        return resolutionDependsOn(r, sheet_idx);
     }
 
     fn mayResolveTo(r: SourceResolution, sheet_idx: u32) bool {
