@@ -27,6 +27,7 @@
 //! resolution and can land in a follow-up.
 
 const std = @import("std");
+const wbxml = @import("workbook_xml.zig");
 const assert = std.debug.assert;
 
 // ─── Public types ─────────────────────────────────────────────────────
@@ -329,6 +330,13 @@ fn attrValue(attrs: []const u8, name: []const u8) ?[]const u8 {
 
 fn attrU32(attrs: []const u8, name: []const u8) ?u32 {
     const raw = attrValue(attrs, name) orelse return null;
+    // The value the schema types, not its spelling: `numFmtId="&#49;"`
+    // is 1 (Codex #205 r10 REL-1002).
+    if (std.mem.indexOfScalar(u8, raw, '&') != null) {
+        var buf: [32]u8 = undefined;
+        const decoded = wbxml.decodeScalarAttr(&buf, raw) orelse return null;
+        return std.fmt.parseInt(u32, decoded, 10) catch null;
+    }
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
 

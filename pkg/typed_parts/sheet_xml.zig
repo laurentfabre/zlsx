@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const wbxml = @import("workbook_xml.zig");
 
 // ─── Public types ────────────────────────────────────────────────────
 
@@ -422,6 +423,19 @@ fn parseFreezePane(xml: []const u8) ?FreezePane {
     return null;
 }
 
+/// An attribute's text with its character references resolved, when
+/// it has any: the value the schema types, not its spelling
+/// (`r="B&#50;"` is `B2` — Codex #205 r10 REL-1002). A reference that
+/// does not resolve to a short ASCII scalar leaves the text as written,
+/// for its parser to refuse. Arena-owned when decoded.
+fn scalarAttr(a: std.mem.Allocator, attrs: []const u8, key: []const u8) ParseError!?[]const u8 {
+    const raw = attrAt(attrs, key) orelse return null;
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+    var buf: [64]u8 = undefined;
+    const decoded = wbxml.decodeScalarAttr(&buf, raw) orelse return raw;
+    return try a.dupe(u8, decoded);
+}
+
 fn parseU32Attr(attrs: []const u8, key: []const u8) ?u32 {
     const raw = attrAt(attrs, key) orelse return null;
     if (raw.len == 0) return null;
@@ -471,7 +485,7 @@ fn parseRows(a: std.mem.Allocator, xml: []const u8, unaddressed: *u32) ParseErro
         const row_open_end = findTagEnd(body, row_open) orelse return error.MalformedXml;
         const row_attrs = body[row_open + "<row".len .. row_open_end];
 
-        const row_idx_raw = attrAt(row_attrs, "r") orelse {
+        const row_idx_raw = (try scalarAttr(a, row_attrs, "r")) orelse {
             unaddressed.* +|= 1;
             probe = row_open_end + 1;
             continue;
@@ -536,14 +550,15 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
         const c_open_end = findTagEnd(row_body, c_open) orelse return error.MalformedXml;
         const c_attrs = row_body[c_open + "<c".len .. c_open_end];
 
-        const ref = attrAt(c_attrs, "r") orelse {
+        const ref = (try scalarAttr(a, c_attrs, "r")) orelse {
             unaddressed.* +|= 1;
             probe = c_open_end + 1;
             continue;
         };
-        const style_idx: ?u32 = parseU32Attr(c_attrs, "s");
-        const style_invalid = attrAt(c_attrs, "s") != null and style_idx == null;
-        const type_raw = attrAt(c_attrs, "t");
+        const style_raw = try scalarAttr(a, c_attrs, "s");
+        const style_idx: ?u32 = if (style_raw) |v| (if (v.len == 0) null else std.fmt.parseInt(u32, v, 10) catch null) else null;
+        const style_invalid = style_raw != null and style_idx == null;
+        const type_raw = try scalarAttr(a, c_attrs, "t");
         const cell_type_known = parseCellType(type_raw);
         const cell_type = cell_type_known orelse .number;
         const cell_type_invalid = type_raw != null and cell_type_known == null;

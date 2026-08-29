@@ -6675,6 +6675,74 @@ test "S7b-4: a number or an SST index spelt with character references reads by w
     }
 }
 
+test "S7b-4: a row or cell reference, a style or type, a table ref or count spelt with character references reads by what it is (Codex #205 r10 REL-1002)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rec_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    const sheet_part = "xl/worksheets/sheet1.xml";
+    const table_part = "xl/tables/table1.xml";
+    {
+        // `<row r="&#50;">`, `<c r="B&#50;" t="&#110;">`, `<c r="A&#50;"
+        // t="&#115;">`: the row reads, the cells read.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r10_refs_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r10_refs_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<row r=\"2\">", "<row r=\"&#50;\">");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"B2\"><v>3</v></c>", "<c r=\"B&#50;\" t=\"&#110;\"><v>3</v></c>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"A2\" t=\"s\"><v>3</v></c>", "<c r=\"A&#50;\" t=\"&#115;\"><v>3</v></c>");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteRow(0, 4);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, def_part, rec_part, 2);
+        const rec = (try store.part(rec_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r>") != null);
+    }
+    {
+        // `s="&#49;"` under a date style is the date it names: refused.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r10_style_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        {
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"&#49;&#52;\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>");
+            try store.save(io, src);
+        }
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "<c r=\"C2\"><v>1.5</v></c>", "<c r=\"C2\" s=\"&#49;\"><v>1.5</v></c>");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 4));
+    }
+    {
+        // A table `ref` and counts with references: headerless, its
+        // names the schema, its one totals row not a record.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r10_table_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r10_table_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1&#58;C5\" headerRowCount=\"&#48;\" totalsRowCount=\"&#49;\" totalsRowShown=\"1\"");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "</sheetData>", "<row r=\"5\"><c r=\"B5\"><f>SUBTOTAL(109,SalesTbl[Qty])</f></c></row></sheetData>");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        // Four data rows (the old header row is data) and the blank.
+        try expectRebuilt(&store, def_part, rec_part, 5);
+    }
+}
+
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───
 //
 // A row edit inside a source rectangle marks the cache in the sweep; a

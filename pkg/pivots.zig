@@ -2556,8 +2556,13 @@ pub const engine = struct {
         for (rows) |r| if (r.len != def.fields.len) return error.MalformedPivotXml;
 
         const p = try qualified(arena, def.prefix);
+        // The records as written say how each field spelt its values —
+        // `<x>` into the inventory, or inline — which is what "stays
+        // inline" is measured against (Codex #205 r10 REL-1001).
+        const spelt = if (records_xml) |xml| try inspectRecords(arena, xml, def.fields.len) else try arena.alloc(?bool, def.fields.len);
+        if (records_xml == null) @memset(spelt, null);
         const fields = try arena.alloc(Field, def.fields.len);
-        for (def.fields, 0..) |f, k| fields[k] = try Field.build(arena, f.shared_items.?, rows, k, p);
+        for (def.fields, 0..) |f, k| fields[k] = try Field.build(arena, f.shared_items.?, rows, k, p, spelt[k]);
 
         var splices: std.ArrayListUnmanaged(edit.Splice) = .empty;
         for (def.fields, fields) |f, built| {
@@ -2727,7 +2732,12 @@ pub const engine = struct {
             }
         };
 
-        fn build(arena: Allocator, si: pivot_xml.SharedItems, rows: []const Row, k: usize, p: []const u8) RebuildError!Field {
+        /// `spelt_indexed` is how the records as written spelt this
+        /// field — `<x>` into the inventory, or a value inline — when
+        /// there was a record to read it from; without one, an
+        /// inventory with items is the enumerated one. An explicit
+        /// `count` alone says nothing (Codex #205 r10 REL-1001).
+        fn build(arena: Allocator, si: pivot_xml.SharedItems, rows: []const Row, k: usize, p: []const u8, spelt_indexed: ?bool) RebuildError!Field {
             var items: std.ArrayListUnmanaged(Item) = .empty;
             var by_string: std.StringHashMapUnmanaged(u32) = .empty;
             var by_number: std.AutoHashMapUnmanaged(u64, u32) = .empty;
@@ -2765,7 +2775,7 @@ pub const engine = struct {
                 }
                 try items.append(arena, item);
             }
-            const was_indexed = si.count != null or si.items.len > 0;
+            const was_indexed = spelt_indexed orelse (si.items.len > 0);
 
             // Pass one: what the column holds — whether the records can
             // stay inline.
@@ -2898,25 +2908,24 @@ pub const engine = struct {
         }
     };
 
-    /// The records part: the root tag as written with `count` set,
-    /// one `<r>` per row — `<x v>` for an indexed field, `<n v>` /
-    /// `<m/>` inline for the rest — and the close. A records part
-    /// carrying anything but records (an `extLst`) is a shape this
-    /// slice does not carry over.
-    fn renderRecords(arena: Allocator, xml: []const u8, fields: []const Field, rows: []const Row) RebuildError![]u8 {
+    /// The records part as written, checked to be a shape the rebuild
+    /// carries — one `<r>` per record, each holding exactly one value
+    /// element per field, childless, under the part's prefix, with no
+    /// qualified attribute, nothing else anywhere (Codex #205 r3
+    /// REL-304, r4 REL-403, r6 REL-602) — and read for how each field
+    /// spelt its values: `<x>` into the inventory (true), inline
+    /// (false), or unknown where no record spoke (null). A field spelt
+    /// both ways is not one shape (r10 REL-1001).
+    fn inspectRecords(arena: Allocator, xml: []const u8, field_count: usize) RebuildError![]?bool {
+        const spelt = try arena.alloc(?bool, field_count);
+        @memset(spelt, null);
         const root = pivot_xml.scanRoot(xml, "pivotCacheRecords") catch |e| return mapRecordsParse(e);
         var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
         while (kids.next() catch |e| return mapRecordsParse(e)) |k| {
             if (!std.mem.eql(u8, k.local, "r")) return error.PivotShapeUnsupported;
-            // A record carries no attribute (CT_Record); one that does
-            // is content the regenerated part would lose (Codex #205
-            // r6 REL-602).
             if (pivot_xml.hasAnyAttr(k.attrs(xml))) return error.PivotShapeUnsupported;
-            // Inside a record, only the value elements, childless,
-            // under the part's prefix, with no qualified attribute:
-            // anything else is a shape the regenerated part would
-            // silently lose (Codex #205 r3 REL-304, r6 REL-602).
             var vals = pivot_xml.Children.init(xml, k.hit, k.end, root.prefix, k.env);
+            var j: usize = 0;
             while (vals.next() catch |e| return mapRecordsParse(e)) |v| {
                 if (v.local.len != 1) return error.PivotShapeUnsupported;
                 switch (v.local[0]) {
@@ -2925,14 +2934,26 @@ pub const engine = struct {
                 }
                 if (pivot_xml.hasQualifiedAttr(v.attrs(xml))) return error.PivotShapeUnsupported;
                 if (!pivot_xml.isBlank(xml[v.hit.after_tag_close..v.end])) return error.PivotShapeUnsupported;
+                if (j >= field_count) return error.PivotShapeUnsupported;
+                const is_x = v.local[0] == 'x';
+                if (spelt[j]) |was| {
+                    if (was != is_x) return error.PivotShapeUnsupported;
+                } else spelt[j] = is_x;
+                j += 1;
             }
+            if (j != field_count) return error.PivotShapeUnsupported;
             if (vals.skipped > 0 or vals.other) return error.PivotShapeUnsupported;
         }
-        // A direct child under another prefix is one the walk did not
-        // classify, and character data between the records is content
-        // it did not carry; a part rebuilt whole would drop either
-        // (Codex #205 r1 REL-102, r4 REL-403).
         if (kids.skipped > 0 or kids.other) return error.PivotShapeUnsupported;
+        return spelt;
+    }
+
+    /// The records part: the root tag as written with `count` set,
+    /// one `<r>` per row — `<x v>` for an indexed field, `<n v>` /
+    /// `<m/>` inline for the rest — the close, and whatever followed
+    /// the root. Runs after `inspectRecords` read the part.
+    fn renderRecords(arena: Allocator, xml: []const u8, fields: []const Field, rows: []const Row) RebuildError![]u8 {
+        const root = pivot_xml.scanRoot(xml, "pivotCacheRecords") catch |e| return mapRecordsParse(e);
         const p = try qualified(arena, root.prefix);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(arena, xml[0..root.hit.attrs_start]);
@@ -6021,9 +6042,13 @@ test "engine: a main-namespace binding first introduced below the root refuses; 
     for (unsupported) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
     // A binding introduced on a record refuses the read.
     try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords count=\"1\"><r xmlns=\"" ++ main_ns ++ "\"><x v=\"0\"/></r></pivotCacheRecords>", null));
-    // Every value kind, explicitly closed around nothing, reads.
-    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"></x></r><r><n v=\"1\"/><s v=\"q\"/><m/><b v=\"1\"/><d v=\"2024-01-01T00:00:00\"/><e v=\"#N/A\"/></r></pivotCacheRecords>", null);
-    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    // Every value kind, explicitly closed around nothing, reads — one
+    // per record, a record being one value per field.
+    for ([_][]const u8{ "<x v=\"0\"></x>", "<n v=\"1\"></n>", "<s v=\"q\"></s>", "<m></m>", "<b v=\"1\"></b>", "<d v=\"2024-01-01T00:00:00\"></d>", "<e v=\"#N/A\"></e>" }) |one| {
+        const part = try std.mem.concat(arena, u8, &.{ rec_head, "<r>", one, "</r></pivotCacheRecords>" });
+        const rb = try engine.rebuild(arena, &cache, &rows, part, null);
+        try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    }
 }
 
 test "engine: a records part shared by two definitions is a graph that refuses (Codex #205 r3 REL-301)" {
@@ -6285,4 +6310,48 @@ test "engine: parseNumber reads the xsd:double grammar and nothing wider; a rebu
         const rb = try engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"0\"/><!-- keep -->", null);
         try testing.expectEqualStrings("<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\"><r><x v=\"0\"/></r></pivotCacheRecords><!-- keep -->", rb.records.?);
     }
+}
+
+test "engine: the records say what was indexed — an explicit count=\"0\" keeps an inline field inline; a field spelt both ways, or a record of the wrong arity, refuses (Codex #205 r10 REL-1001)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const xml = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:B2\"/></cacheSource><cacheFields count=\"2\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField><cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"1\" count=\"0\"/></cacheField></cacheFields></pivotCacheDefinition>";
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, xml),
+        .field_names = &.{ "K", "V" },
+        .field_formulas = &.{ null, null },
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = xml,
+    };
+    const rows = [_]engine.Row{ &.{ .{ .string = "a" }, .{ .number = "1" } }, &.{ .{ .string = "b" }, .{ .number = "2" } } };
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    // Inline as written: stays inline, the `count="0"` gone with the
+    // attribute-only form.
+    const rb = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/></r></pivotCacheRecords>", null);
+    const out = try edit.spliceAll(arena, xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, out, "<cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"2\"/></cacheField>") != null);
+    try testing.expectEqualStrings("<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"2\"><r><x v=\"0\"/><n v=\"1\"/></r><r><x v=\"1\"/><n v=\"2\"/></r></pivotCacheRecords>", rb.records.?);
+    // Indexed as written (an inventory the definition does not show
+    // is not this slice's to invent): refused by the inventory, which
+    // has no item for index 0 — the records are read first.
+    const indexed = try engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><x v=\"0\"/></r></pivotCacheRecords>", null);
+    const indexed_out = try edit.spliceAll(arena, xml, indexed.splices);
+    try testing.expect(std.mem.indexOf(u8, indexed_out, "<cacheField name=\"V\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"1\" maxValue=\"2\" count=\"2\"><n v=\"1\"/><n v=\"2\"/></sharedItems></cacheField>") != null);
+    // Spelt both ways, or the wrong arity: not one shape.
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/></r><r><x v=\"0\"/><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, rec_head ++ "<r><x v=\"0\"/><n v=\"1\"/><n v=\"1\"/></r></pivotCacheRecords>", null));
+    // No records part: an inventory with items is the enumerated one.
+    const none = try engine.rebuild(arena, &cache, &rows, null, null);
+    const none_out = try edit.spliceAll(arena, xml, none.splices);
+    try testing.expect(std.mem.indexOf(u8, none_out, "minValue=\"1\" maxValue=\"2\"/></cacheField>") != null);
 }

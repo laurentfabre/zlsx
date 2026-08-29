@@ -207,7 +207,10 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
     // malformed non-element constructs read as "no table here".
     const hit = (wbxml.findTagOpen(src, 0, "table") catch return null) orelse return null;
     const attrs = src[hit.attrs_start..hit.attrs_end];
-    const ref = getAttr(attrs, "ref") orelse return null;
+    // The values the schema types, not their spellings: `ref="A1&#58;C4"`
+    // is `A1:C4` (Codex #205 r10 REL-1002).
+    var ref_buf: [64]u8 = undefined;
+    const ref = scalar(&ref_buf, getAttr(attrs, "ref") orelse return null) orelse return null;
     const range = parseRange(ref) orelse return null;
     // REL-A501 + REL-A509: distinguish "explicit 0" from
     // "default 1". Malformed (un-parseable) values fall
@@ -218,8 +221,9 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
     var hrc: u32 = 1;
     var hrc_explicit_zero = false;
     var hrc_invalid = false;
-    if (getAttr(attrs, "headerRowCount")) |v| {
-        if (std.fmt.parseInt(u32, v, 10) catch null) |n| {
+    var hrc_buf: [32]u8 = undefined;
+    if (getAttr(attrs, "headerRowCount")) |raw| {
+        if (parseCount(&hrc_buf, raw)) |n| {
             hrc = n;
             if (n == 0) hrc_explicit_zero = true;
         } else {
@@ -228,8 +232,9 @@ fn parseTableHeader(src: []const u8) ?TableHeader {
     }
     var trc: u32 = 0;
     var trc_invalid = false;
-    if (getAttr(attrs, "totalsRowCount")) |v| {
-        if (std.fmt.parseInt(u32, v, 10) catch null) |n| trc = n else trc_invalid = true;
+    var trc_buf: [32]u8 = undefined;
+    if (getAttr(attrs, "totalsRowCount")) |raw| {
+        if (parseCount(&trc_buf, raw)) |n| trc = n else trc_invalid = true;
     }
     return .{
         .tag = .{ .start = hit.open_lt, .after_open = hit.after_tag_close },
@@ -251,6 +256,19 @@ const Range = struct {
     tl_row: u32,
     br_row: u32,
 };
+
+/// An attribute's text with its character references resolved into
+/// `buf`, when it has any; the text itself otherwise. Null when the
+/// references do not resolve to a short ASCII scalar.
+fn scalar(buf: []u8, raw: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
+    return wbxml.decodeScalarAttr(buf, raw);
+}
+
+fn parseCount(buf: []u8, raw: []const u8) ?u32 {
+    const text = scalar(buf, raw) orelse return null;
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
 
 fn parseRange(ref: []const u8) ?Range {
     const colon = std.mem.indexOfScalar(u8, ref, ':');
