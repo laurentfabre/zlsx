@@ -840,6 +840,16 @@ pub fn renameTableColumn(
 /// references resolve against, still XML-encoded. Null when the
 /// part has no parseable `<table>` tag or neither attribute.
 /// Public for the Workbook's locate-table-by-name scan.
+/// The table's `headerRowCount` — 1 by default (ECMA-376 §18.5.1.2),
+/// 0 for a headerless table whose field names live in
+/// `<tableColumns>`; an unparseable value reads as the default, as
+/// the editor's own header check treats it. Null when the part is not
+/// one this module reads (no `<table ref>` rectangle).
+pub fn tableHeaderRowCount(src: []const u8) ?u32 {
+    const hdr = parseTableHeader(src) orelse return null;
+    return hdr.header_row_count;
+}
+
 pub fn tableDisplayNameRaw(src: []const u8) ?[]const u8 {
     const hdr = parseTableHeader(src) orelse return null;
     const attrs = src[hdr.tag.start + "<table".len .. hdr.tag.after_open - 1];

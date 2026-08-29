@@ -5470,6 +5470,26 @@ fn markedDefinition(alloc: Allocator, bytes: []const u8) ![]u8 {
     return std.mem.concat(alloc, u8, &.{ bytes[0..gt], pivots_mod.edit.marker_insert, bytes[gt..] });
 }
 
+/// S7b-4: the definition counts `n` records and is dated by the
+/// edit's wall clock (a serial past 2026-01-01); the records part's
+/// root counts `n` and holds exactly `n` `<r>` elements.
+fn expectRebuilt(store: *store_mod.PartStore, def_part: []const u8, rec_part: []const u8, n: usize) !void {
+    const cd = (try store.part(def_part)) orelse return error.PartNotFound;
+    const count_attr = try std.fmt.allocPrint(std.testing.allocator, "recordCount=\"{d}\"", .{n});
+    defer std.testing.allocator.free(count_attr);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, count_attr) != null);
+    const at = std.mem.indexOf(u8, cd.bytes, "refreshedDate=\"") orelse return error.TestExpectedRefreshedDate;
+    const from = at + "refreshedDate=\"".len;
+    const end = std.mem.indexOfScalarPos(u8, cd.bytes, from, '"') orelse return error.TestExpectedRefreshedDate;
+    const serial = try std.fmt.parseFloat(f64, cd.bytes[from..end]);
+    try std.testing.expect(serial > 46023);
+    const rec = (try store.part(rec_part)) orelse return error.PartNotFound;
+    const rec_count = try std.fmt.allocPrint(std.testing.allocator, " count=\"{d}\">", .{n});
+    defer std.testing.allocator.free(rec_count);
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes, rec_count) != null);
+    try std.testing.expectEqual(n, std.mem.count(u8, rec.bytes, "<r>"));
+}
+
 fn cacheDefinitionBytes(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     var store = try store_mod.PartStore.open(alloc, io, path);
     defer store.deinit();
@@ -5499,8 +5519,15 @@ test "S7b: a sheet+ref source sheet is admitted, and worksheetSource@ref moves (
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "A1:C4") == null);
     // The insert was INSIDE the range — a blank record the snapshot
-    // lacks — so the cache is marked to refresh at open (S7b-3, A1).
+    // lacks — so the cache is marked to refresh at open (S7b-3, A1) …
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    // … and the snapshot IS the new range (S7b-4): four records, the
+    // blank one first, each inventory grown by the blank alone.
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 4);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"3\" maxValue=\"5\"/>") != null);
+    const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"4\"><r><x v=\"2\"/><m/><m/></r><r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r>") != null);
 }
 
 test "S6 audit: a table-named source stays valid because the table rewriter moves the table" {
@@ -5527,6 +5554,9 @@ test "S6 audit: a table-named source stays valid because the table rewriter move
     const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource name=\"SalesTbl\"/>") != null);
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    // S7b-4: rebuilt from the table's rectangle — the header row is
+    // the field names, the blank row is the first record.
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 4);
     const tbl = (try store.part("xl/tables/table1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C4\"") == null);
@@ -5584,6 +5614,20 @@ test "S7b: the corpus fixture — the host-and-source sheet moves its pivot and 
     // which carries the attribute as Excel wrote it — are marked.
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition2.xml", true);
+    // S7b-4: and rebuilt from their tables as Excel wrote them — one
+    // blank record each, first; every inventory kept in its order and
+    // grown by the blank; the extremes the sheet's own lexicals;
+    // Excel's extension list kept.
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 51);
+    try std.testing.expect(std.mem.indexOf(u8, cd1.bytes, "<cacheField name=\"Species\" numFmtId=\"0\"><sharedItems containsBlank=\"1\" count=\"4\"><s v=\"virginica\"/><s v=\"setosa\"/><s v=\"versicolor\"/><m/></sharedItems></cacheField>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cd1.bytes, "<cacheField name=\"Sepal Length\" numFmtId=\"0\"><sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" minValue=\"4.4000000000000004\" maxValue=\"7.9\"/></cacheField>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cd1.bytes, "<x14:pivotCacheDefinition pivotCacheId=\"2\"/>") != null);
+    const rec1 = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec1.bytes, "count=\"51\"><r><m/><m/><m/><m/><x v=\"3\"/></r><r><n v=\"6.4\"/><n v=\"2.7\"/><n v=\"5.3\"/><n v=\"1.9\"/><x v=\"0\"/></r>") != null);
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition2.xml", "xl/pivotCache/pivotCacheRecords2.xml", 30);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<cacheField name=\"cyl\" numFmtId=\"0\"><sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"4\" maxValue=\"8\" count=\"4\"><n v=\"6\"/><n v=\"4\"/><n v=\"8\"/><m/></sharedItems></cacheField>") != null);
+    const rec2 = (try store.part("xl/pivotCache/pivotCacheRecords2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec2.bytes, "count=\"30\"><r><m/><x v=\"3\"/><m/><m/><m/><m/><m/><m/><m/><x v=\"3\"/><m/></r><r><n v=\"21\"/><x v=\"0\"/><n v=\"160\"/>") != null);
 }
 
 // ─── S7b: the source-rows lift ───────────────────────────────────────
@@ -5624,12 +5668,16 @@ test "S7b: row edits on a sheet+ref source sheet move worksheetSource@ref like a
     defer store.deinit();
     const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" ref=\"A2:C5\"/>") != null);
-    // Nothing else in the definition moved: the records and the
-    // inventories are the snapshot as saved — flagged, by the marker,
-    // as one Excel is to refresh at open, since two of the three edits
-    // changed what the range holds.
-    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "recordCount=\"3\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems count=\"2\"><s v=\"East\"/><s v=\"West\"/></sharedItems>") != null);
+    // Two of the three edits changed what the range holds, and the
+    // snapshot followed each (S7b-4): the first insert added a blank
+    // record at the top, the delete removed `East`, 3 — three records,
+    // the blank first; `East` stays an item (its other record, and a
+    // consumer's index). Marked, as one Excel refreshes at open.
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsString=\"0\" containsBlank=\"1\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"4\" maxValue=\"5\"/>") != null);
+    const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"3\"><r><x v=\"2\"/><m/><m/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r><r><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r></pivotCacheRecords>") != null);
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
 }
 
@@ -5789,10 +5837,14 @@ test "S7b: a defined-name source refuses the endpoint delete the name sweep woul
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource name=\"PivotSrc\"/>") != null);
 
     // A name already spelling `#REF!` is not this edit's doing: the
-    // dangling class, admitted while the edit leaves its body alone
-    // (§7 Q4 iii) — and refused when the edit adds a `#REF!` of its
-    // own (the count, not a flag: Codex r2 REL-203), here the delete
-    // of the one anchor the body still had.
+    // dangling class, admitted where the edit leaves its body alone
+    // (§7 Q4 iii — the host's edit) — refused when the edit adds a
+    // `#REF!` of its own (the count, not a flag: Codex r2 REL-203),
+    // here the delete of the one anchor the body still had — and,
+    // since S7b-4, refused for any other `Data` edit too: the body
+    // names the sheet without bounding it, so the edit is a content
+    // change with no rectangle to rebuild the snapshot from (S7b-3
+    // marked and admitted).
     const broken = try tt.path(std.testing.allocator, io, "s7b_name_broken_src.xlsx");
     defer std.testing.allocator.free(broken);
     try pivots_mod.fixture.write(std.testing.allocator, io, broken, .defined_name);
@@ -5800,7 +5852,7 @@ test "S7b: a defined-name source refuses the endpoint delete the name sweep woul
     var ed2 = try Editor.open(std.testing.allocator, io, broken);
     defer ed2.deinit();
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed2.deleteRow(0, 1));
-    try ed2.deleteRow(0, 3);
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed2.deleteRow(0, 3));
     try ed2.insertRow(1, 1);
 }
 
@@ -5821,11 +5873,14 @@ test "S7b: a name reaching the host through another name is dry-run through its 
     defer ed.deinit();
     try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(1, 4));
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 1));
-    try ed.deleteRow(1, 2);
+    // S7b-4: a `Report` edit the sweep would survive is still a content
+    // change of a source with no rectangle — refused at the engine's
+    // edge. `Data` is outside the closure: admitted.
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 2));
     try ed.insertRow(0, 1);
 }
 
-test "S7b: a whole-column name body admits row edits without a coordinate change and refuses row 1" {
+test "S7b: a whole-column name body shifts under a column edit beside it and refuses every row edit — no rectangle to rebuild from (S7b-4)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -5842,16 +5897,20 @@ test "S7b: a whole-column name body admits row edits without a coordinate change
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
     try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 2));
-    try ed.insertRow(0, 2);
-    try ed.deleteRow(0, 4);
+    // Every row of the sheet is inside whole columns: a row edit
+    // changes their content, and there is no finite rectangle to
+    // rebuild the snapshot from — refused (S7b-3 admitted and marked).
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 4));
+    // A column beside them is a proven shift: the body moves, and
+    // nothing marks.
     try ed.insertColumn(0, 1);
     try ed.save(io, dst);
     var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
     defer store.deinit();
     const wb_xml = (try store.part("xl/workbook.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, wb_xml.bytes, "<definedName name=\"PivotSrc\">Data!$B:$D</definedName>") != null);
-    // No rectangle, so no shift to prove: the row edits marked it.
-    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", false);
 }
 
 test "S7b: the consolidation fixture — the direct set is respelled, the named set follows its body, the host still moves" {
@@ -5867,8 +5926,11 @@ test "S7b: the consolidation fixture — the direct set is respelled, the named 
     try pivots_mod.fixture.write(std.testing.allocator, io, src, .consolidation);
     var ed = try Editor.open(std.testing.allocator, io, src);
     defer ed.deinit();
-    // Set 0: `Data!A1:C4` by `sheet` + `ref`.
-    try ed.insertRow(0, 2);
+    // Set 0: `Data!A1:C4` by `sheet` + `ref` — an insert inside it
+    // changes the consolidated content, which the S7b-4 engine does not
+    // rebuild: refused. Above it, the set shifts.
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try ed.insertRow(0, 1);
     // Set 1: `PivotSrc` = `Report!$A$1:$B$2`, on the host — its header
     // row refuses, an insert above it moves the body and the pivot.
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 1));
@@ -5877,13 +5939,177 @@ test "S7b: the consolidation fixture — the direct set is respelled, the named 
     var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
     defer store.deinit();
     const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
-    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A1:C5\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<rangeSet i1=\"0\" sheet=\"Data\" ref=\"A2:C5\"/><rangeSet i1=\"1\" name=\"PivotSrc\"/>") != null);
     const wb_xml = (try store.part("xl/workbook.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, wb_xml.bytes, "<definedName name=\"PivotSrc\">Report!$A$2:$B$3</definedName>") != null);
     const pt = (try store.part("xl/pivotTables/pivotTable1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "<location ref=\"A4:B7\"") != null);
-    // Set 0's insert was inside it: one definition, one marker.
-    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    // Both sets shifted: no content change, no marker.
+    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", false);
+}
+
+// ─── S7b-4: the engine's first slice ─────────────────────────────────
+//
+// A row edit that changes a source's content no longer leaves the
+// snapshot as saved: the cache is REBUILT from the cells — records,
+// every inventory, `recordCount`, `refreshedDate` — in the same
+// install as the `ref` move, still marked so Excel's refresh at open
+// lays the consumers out over it (`docs/plans/s7b-cache-policy.md`
+// §9, S7b-4). What the slice does not evaluate refuses the edit.
+
+test "S7b-4: a calculated field refuses the edit that needs a rebuild and admits the pure shift beside it — the snapshot byte-preserved" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b4_calc_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b4_calc_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", "<cacheFields count=\"3\">", "<cacheFields count=\"4\">");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", "</cacheFields>", "<cacheField name=\"Total\" numFmtId=\"0\" formula=\"Qty*Price\" databaseField=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" minValue=\"4.5\" maxValue=\"17.5\"/></cacheField></cacheFields>");
+    const original = try cacheDefinitionBytes(std.testing.allocator, io, src);
+    defer std.testing.allocator.free(original);
+
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 3));
+    try ed.insertRow(0, 1);
+    try ed.insertRow(0, 9);
+    try ed.save(io, dst);
+    const after = try cacheDefinitionBytes(std.testing.allocator, io, dst);
+    defer std.testing.allocator.free(after);
+    const want = try pivotPartWithRef(std.testing.allocator, original, "ref=\"A1:C4\"", "ref=\"A2:C5\"");
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, after);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"3\"") != null);
+}
+
+test "S7b-4: a header that is not the field names, a boolean, a date-formatted number, an inline string and an uncomputed formula refuse before any mutation; a computed formula reads as its value" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 };
+    const refusals = [_]Case{
+        .{ .name = "header", .part = "xl/pivotCache/pivotCacheDefinition1.xml", .old = "name=\"Region\"", .new = "name=\"Area\"" },
+        .{ .name = "bool", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\" t=\"b\"><v>1</v></c>" },
+        .{ .name = "error", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\" t=\"e\"><v>#N/A</v></c>" },
+        .{ .name = "inline", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"A2\" t=\"s\"><v>3</v></c>", .new = "<c r=\"A2\" t=\"inlineStr\"><is><t>East</t></is></c>" },
+        .{ .name = "formula", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><f>1+2</f></c>" },
+        .{ .name = "date", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"C2\"><v>1.5</v></c>", .new = "<c r=\"C2\" s=\"1\"><v>1.5</v></c>" },
+    };
+    for (refusals) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_refuse_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        if (std.mem.eql(u8, case.name, "date")) {
+            // The fixture writes no styles part; add one whose style 1
+            // is the built-in short date (`numFmtId` 14).
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart(
+                "xl/styles.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+                \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+                \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>
+                ,
+            );
+            try store.save(io, src);
+        }
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, case.part, case.old, case.new);
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 3));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?.bytes);
+        // A pure shift reads no cell and is still admitted.
+        try wb.insertRow(0, 1);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+
+    // Computed formulas are their cached values: a number, a string.
+    const src = try tt.path(std.testing.allocator, io, "s7b4_formula_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b4_formula_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet1.xml", "<c r=\"B2\"><v>3</v></c>", "<c r=\"B2\"><f>1+2</f><v>3</v></c>");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet1.xml", "<c r=\"A3\" t=\"s\"><v>4</v></c>", "<c r=\"A3\" t=\"str\"><f>\"We\"&amp;\"st\"</f><v>West</v></c>");
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try ed.deleteRow(0, 4);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 2);
+    const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"2\"><r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r></pivotCacheRecords>") != null);
+}
+
+test "S7b-4: a workbook from a bare store has no clock — its rebuilt definition drops refreshedDate; a records part with an extension list refuses; a cache without one rebuilds its definition alone" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_noclock_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        const store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+        var wb = try Workbook.fromStore(std.testing.allocator, store);
+        defer wb.deinit();
+        try std.testing.expect(wb.clock == null);
+        try wb.insertRow(0, 2);
+        const cd = (try wb.store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "refreshedDate") == null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "refreshedBy=\"zlsx\" createdVersion=\"6\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "recordCount=\"4\" refreshOnLoad=\"1\">") != null);
+    }
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_ext_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/pivotCacheRecords1.xml", "</pivotCacheRecords>", "<extLst/></pivotCacheRecords>");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.insertRow(0, 1);
+    }
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_norec_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_norec_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        // No `r:id`: the definition names no records part.
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", " r:id=\"rId1\"", "");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "recordCount=\"4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>") != null);
+        const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "count=\"3\"") != null);
+    }
 }
 
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───
@@ -6285,8 +6511,12 @@ test "S7b: a sheet+name source on a headerless table admits the top-row delete t
     const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>") != null);
     // The admitted top-row delete dropped a record: a content change,
-    // marked (§2.2's headerless exception).
+    // marked (§2.2's headerless exception) — and rebuilt with no header
+    // row to check (S7b-4): the table's four rows were all data, three
+    // remain, and `Region`'s inventory is untouched.
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems count=\"2\"><s v=\"East\"/><s v=\"West\"/></sharedItems>") != null);
 }
 
 test "S7b: the direct Workbook path refuses a table source's header-row delete before any part changes (Codex r2 REL-202)" {
@@ -6333,14 +6563,21 @@ test "S7b: a #REF! inside a string literal neither masks a new one nor counts as
     defer ed.deinit();
     // The endpoint delete introduces a real `#REF!` beside the literal.
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 4));
-    // An interior delete leaves the literal as the body's only one.
-    try ed.deleteRow(0, 3);
+    // An interior delete leaves the literal as the body's only one —
+    // the count would admit it; since S7b-4 the body, which the reader
+    // cannot bound, refuses every `Data` edit at the engine's edge
+    // instead (`Workbook.countRefErrorsOutsideQuotes` pins the count).
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 3));
+    // The host is outside the closure: its edit moves the pivot and
+    // leaves the body, literal and all, as written.
+    try ed.insertRow(1, 1);
     try ed.save(io, dst);
     var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
     defer store.deinit();
     const wb_xml = (try store.part("xl/workbook.xml")).?;
-    try std.testing.expect(std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$3,INDIRECT(&quot;#REF!&quot;))") != null or
-        std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$3,INDIRECT(\"#REF!\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$4,INDIRECT(&quot;#REF!&quot;))") != null or
+        std.mem.indexOf(u8, wb_xml.bytes, "IF(TRUE,Data!$A$1:$C$4,INDIRECT(\"#REF!\"))") != null);
+    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", false);
 }
 
 test "S7b: a name body the sweep never rewrites refuses the edit of a sheet its source depends on (Codex r3 REL-301)" {
@@ -6641,7 +6878,7 @@ test "S7a: Workbook.insertRow refuses whole — a second hosted pivot's refusal 
     try std.testing.expectEqualStrings("A9:B11", p.tables[1].location_ref);
 }
 
-test "S7b: a source the reader cannot bound is admitted while its body survives the name sweep, refused where the sweep would spell #REF! (was S7a REL-033)" {
+test "S7b: a source the reader cannot bound refuses every edit of a sheet its closure names — the sweep's #REF! and the engine's missing rectangle alike (was S7a REL-033)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -6672,21 +6909,23 @@ test "S7b: a source the reader cannot bound is admitted while its body survives 
     const pt0 = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, pt0.bytes, "ref=\"A3:B6\"") != null);
     // Row 2 is above the rectangle (`A3:B6`) and below the anchor: the
-    // pivot shifts, the body is untouched, the source still unbounded.
-    try wb.deleteRow(1, 2);
+    // body would survive the sweep — but the source is unbounded, so
+    // the edit is a content change with no rectangle to rebuild the
+    // snapshot from. S7b-3 admitted it and marked the cache; the
+    // S7b-4 engine's edge refuses it, and nothing moves — on the
+    // direct path and the Editor's alike.
+    try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(1, 2));
     const pt = (try wb.store.part("xl/pivotTables/pivotTable1.xml")).?;
-    try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "ref=\"A2:B5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "ref=\"A3:B6\"") != null);
     const wbx = (try wb.store.part("xl/workbook.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, wbx.bytes, "OFFSET(Report!$D$1,0,0,4,3)") != null);
-    // No rectangle to prove a shift by: the admitted `Report` edit
-    // marks the cache in the same sweep (S7b-3), on the direct path.
-    try expectMarked(&wb.store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    try expectMarked(&wb.store, "xl/pivotCache/pivotCacheDefinition1.xml", false);
 
     var ed = try Editor.open(std.testing.allocator, io, src);
     defer ed.deinit();
     try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(1, 4));
     try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 1));
-    try ed.deleteRow(1, 2);
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 2));
     // The dangling spelling names no sheet of this workbook: admitted
     // untouched (§7 Q4 iii), and the host-only lift moves the pivot.
     const dangling = try tt.path(std.testing.allocator, io, "s7a_dangling_src.xlsx");

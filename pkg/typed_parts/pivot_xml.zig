@@ -155,6 +155,31 @@ pub const SharedItems = struct {
     max_value: ?[]const u8 = null,
     min_date: ?[]const u8 = null,
     max_date: ?[]const u8 = null,
+    /// The element's own bytes in the part — `<sharedItems …/>`, or
+    /// `<sharedItems …>` through `</sharedItems>`. S7b-4's splice
+    /// target: the rebuild replaces the inventory whole.
+    span: Span = .{ .start = 0, .end = 0 },
+    /// The inventory's children in document order; empty for the
+    /// attribute-only form a data-only numeric field takes.
+    items: []Item = &.{},
+
+    /// One inventory item. Kinds beyond the six the schema names
+    /// (`<s>`, `<n>`, `<m>`, `<b>`, `<d>`, `<e>`) read as `.other`.
+    pub const Item = struct {
+        kind: Kind,
+        /// `v`, raw as written; null for `<m/>` and for an item
+        /// without one.
+        v: ?[]const u8,
+        /// The item's bytes, `<` through `/>`, for a rebuild that
+        /// keeps it as written; the open tag alone when the item has
+        /// children.
+        raw: []const u8,
+        /// Self-closing — an item with children (`<s><tpls>…`, OLAP
+        /// members) is not, and no rebuild here can keep it.
+        simple: bool,
+
+        pub const Kind = enum { s, n, m, b, d, e, other };
+    };
 };
 
 pub const CacheField = struct {
@@ -167,6 +192,10 @@ pub const CacheField = struct {
     /// `databaseField` — false for a calculated or group field.
     database_field: bool = true,
     shared_items: ?SharedItems = null,
+    /// A main-namespace child other than `sharedItems` and `extLst`
+    /// — `fieldGroup` (grouping), `mpMap` — a shape the S7b-4 rebuild
+    /// refuses rather than rewrite around.
+    has_other_children: bool = false,
 };
 
 pub const CacheDefinition = struct {
@@ -199,10 +228,23 @@ pub const CacheDefinition = struct {
     /// name to the `>` (or the `/` of a self-close). S7b-3's upsert
     /// target: a root attribute the part lacks is inserted at `end`.
     root_attrs: Span,
+    /// The root's namespace prefix without the colon (empty when the
+    /// main namespace is the default) — what a child this reader
+    /// writes back (S7b-4) must carry to be one of the root's.
+    prefix: []const u8,
+    /// A main-namespace root child other than `cacheSource`,
+    /// `cacheFields` and `extLst` — `cacheHierarchies`, `kpis`,
+    /// `tupleCache`, `calculatedItems`, `calculatedMembers`,
+    /// `dimensions`, `measureGroups`, `maps`: OLAP and calculated
+    /// shapes the S7b-4 rebuild refuses.
+    has_other_children: bool,
 
     /// Release the spines. Pass the allocator `parseCacheDefinition`
     /// was given; a caller that parsed into an arena never calls this.
     pub fn deinit(self: *CacheDefinition, allocator: Allocator) void {
+        for (self.fields) |f| {
+            if (f.shared_items) |si| allocator.free(si.items);
+        }
         allocator.free(self.fields);
         allocator.free(self.source.range_sets);
         self.* = undefined;
@@ -246,6 +288,8 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
         .fields = &.{},
         .fields_count_attr = null,
         .root_attrs = .{ .start = root.hit.attrs_start, .end = root.hit.attrs_end },
+        .prefix = root.prefix,
+        .has_other_children = false,
     };
     errdefer def.deinit(allocator);
 
@@ -264,6 +308,8 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
             have_fields = true;
             def.fields_count_attr = try u32Attr(k.attrs(xml), "count");
             def.fields = try parseCacheFields(allocator, xml, k, root.prefix);
+        } else if (!std.mem.eql(u8, k.local, "extLst")) {
+            def.has_other_children = true;
         }
     }
     if (!have_source) return error.MalformedXml;
@@ -328,7 +374,12 @@ fn parseWorksheetSource(xml: []const u8, el: Child) WorksheetSource {
 
 fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]CacheField {
     var out: std.ArrayListUnmanaged(CacheField) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        for (out.items) |f| {
+            if (f.shared_items) |si| allocator.free(si.items);
+        }
+        out.deinit(allocator);
+    }
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
         if (!std.mem.eql(u8, k.local, "cacheField")) continue;
@@ -340,18 +391,58 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .formula = wbxml.getAttr(attrs, "formula"),
             .database_field = try boolAttr(attrs, "databaseField", true),
         };
+        errdefer if (field.shared_items) |si| allocator.free(si.items);
         var inner = Children.init(xml, k.hit, k.end, p, k.env);
         while (try inner.next()) |c| {
-            if (!std.mem.eql(u8, c.local, "sharedItems")) continue;
-            if (field.shared_items != null) return error.MalformedXml;
-            field.shared_items = try parseSharedItems(c.attrs(xml));
+            if (std.mem.eql(u8, c.local, "sharedItems")) {
+                if (field.shared_items != null) return error.MalformedXml;
+                field.shared_items = try parseSharedItems(allocator, xml, c, p);
+            } else if (!std.mem.eql(u8, c.local, "extLst")) {
+                field.has_other_children = true;
+            }
         }
         try out.append(allocator, field);
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn parseSharedItems(attrs: []const u8) Error!SharedItems {
+fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error!SharedItems {
+    var si = try sharedItemsAttrs(el.attrs(xml));
+    si.span = .{ .start = el.hit.open_lt, .end = elementEnd(el, p, "sharedItems") };
+    var items: std.ArrayListUnmanaged(SharedItems.Item) = .empty;
+    errdefer items.deinit(allocator);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try kids.next()) |k| {
+        const kind: SharedItems.Item.Kind = if (k.local.len == 1) switch (k.local[0]) {
+            's' => .s,
+            'n' => .n,
+            'm' => .m,
+            'b' => .b,
+            'd' => .d,
+            'e' => .e,
+            else => .other,
+        } else .other;
+        try items.append(allocator, .{
+            .kind = kind,
+            .v = wbxml.getAttr(k.attrs(xml), "v"),
+            .raw = xml[k.hit.open_lt..k.hit.after_tag_close],
+            .simple = k.hit.self_closing,
+        });
+    }
+    si.items = try items.toOwnedSlice(allocator);
+    return si;
+}
+
+/// One past `el` including its close tag: for a self-closing element
+/// the byte after `/>`, otherwise the byte after `</p:local>` — the
+/// close the preflight guaranteed matches the open.
+fn elementEnd(el: Child, p: []const u8, local: []const u8) usize {
+    if (el.hit.self_closing) return el.hit.after_tag_close;
+    const qname_len = if (p.len > 0) p.len + 1 + local.len else local.len;
+    return el.end + "</".len + qname_len + ">".len;
+}
+
+fn sharedItemsAttrs(attrs: []const u8) Error!SharedItems {
     return .{
         .count = try u32Attr(attrs, "count"),
         .contains_semi_mixed_types = try boolAttr(attrs, "containsSemiMixedTypes", true),
