@@ -992,6 +992,7 @@ fn preflight(xml: []const u8) Error!void {
     var depth: usize = 0;
     var root_closed = false;
     var root_prefix: []const u8 = "";
+    var root_bound = false;
     var i: usize = if (std.mem.startsWith(u8, xml, "\xEF\xBB\xBF")) 3 else 0;
     while (i < xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse break;
@@ -1023,11 +1024,12 @@ fn preflight(xml: []const u8) Error!void {
         while (j < xml.len and !isNameBoundary(xml[j])) j += 1;
         const qname = xml[lt + 1 .. j];
         const tag_end = try attributesEnd(xml, j);
+        const attrs_end = tag_end.after_gt - @as(usize, if (tag_end.self_closing) 2 else 1);
         if (depth == 0) {
             root_prefix = if (std.mem.indexOfScalar(u8, qname, ':')) |c| qname[0..c] else "";
+            root_bound = declaredBinding(xml[j..attrs_end], root_prefix) != null;
         } else {
-            const attrs_end = tag_end.after_gt - @as(usize, if (tag_end.self_closing) 2 else 1);
-            try checkDescendantBindings(xml[j..attrs_end], root_prefix);
+            try checkDescendantBindings(xml[j..attrs_end], root_prefix, root_bound);
         }
         if (!tag_end.self_closing) {
             if (depth >= max_depth) return error.MalformedXml;
@@ -1042,7 +1044,7 @@ fn preflight(xml: []const u8) Error!void {
     if (!isBlank(xml[i..])) return error.MalformedXml;
 }
 
-fn isBlank(s: []const u8) bool {
+pub fn isBlank(s: []const u8) bool {
     for (s) |c| if (!std.ascii.isWhitespace(c)) return false;
     return true;
 }
@@ -1054,8 +1056,11 @@ fn isBlank(s: []const u8) bool {
 /// that rebinds the root's prefix to a foreign URI would pass a foreign
 /// child off as one of the root's. Excel writes neither; a part that
 /// does is refused whole (Codex #205 r1 REL-102). A redundant
-/// redeclaration of the root's own binding changes nothing and passes.
-fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8) Error!void {
+/// redeclaration of the root's own binding changes nothing and passes
+/// — redundant, that is, only when the root made it: a binding first
+/// introduced below the root lives on an element a rebuild may
+/// regenerate without it (Codex #205 r3 REL-302).
+fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_bound: bool) Error!void {
     if (std.mem.indexOf(u8, attrs, "xmlns") == null) return;
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
@@ -1068,6 +1073,7 @@ fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8) Error!voi
         const binds_main = isOneOf(a.value, &main_ns_uris);
         const is_root_prefix = std.mem.eql(u8, declared, root_prefix);
         if (binds_main != is_root_prefix) return error.MalformedXml;
+        if (binds_main and !root_bound) return error.MalformedXml;
     }
 }
 

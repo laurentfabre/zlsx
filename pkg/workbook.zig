@@ -6475,11 +6475,18 @@ pub const Workbook = struct {
         // rewriter's refusal, reached first here on the Editor's path.
         if (kind == .delete and idx_1based < src.rect.tl_row + src.header_rows) return error.PivotEditUnsafe;
         const eng = pivots_mod.engine;
+        // Before any read: the rectangle's width is the field schema
+        // (a disagreement is S7c's column edit), and its area is
+        // bounded — `engine.max_rebuild_cells` (Codex #205 r3
+        // PERF-301).
+        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
+        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
+        if (c.field_names.len != width) return error.PivotEditUnsafe;
+        const area = std.math.mul(usize, width, height) catch return error.PivotEditUnsafe;
+        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
         self.pivot_rebuilds +|= 1;
         const all = try self.readPivotSourceRows(arena, sheet_idx, src.rect);
-        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
         if (src.header_rows == 1) {
-            if (c.field_names.len != width) return error.PivotEditUnsafe;
             for (all[0], c.field_names) |v, name| switch (v) {
                 .string => |s| if (!std.mem.eql(u8, s, name)) return error.PivotEditUnsafe,
                 .number, .blank => return error.PivotEditUnsafe,
@@ -6518,12 +6525,13 @@ pub const Workbook = struct {
         const view = try ws.ensureParsed();
         const width: usize = rect.br_col - rect.tl_col + 1;
         const height: usize = rect.br_row - rect.tl_row + 1;
+        // Rows the sheet has no cell in share one blank row: the read
+        // costs the sheet's cells inside the rectangle, not its area
+        // (Codex #205 r3 PERF-301).
+        const blank_row = try arena.alloc(eng.Value, width);
+        @memset(blank_row, .blank);
         const grid = try arena.alloc([]eng.Value, height);
-        for (grid) |*r| {
-            const cells = try arena.alloc(eng.Value, width);
-            @memset(cells, .blank);
-            r.* = cells;
-        }
+        @memset(grid, blank_row);
         var date_styles: std.AutoHashMapUnmanaged(u32, bool) = .empty;
         // A row or cell without its `r` is one the typed view could not
         // place, and the rectangle cannot be read around it (Codex #205
@@ -6532,7 +6540,7 @@ pub const Workbook = struct {
         for (view.rows) |row| {
             if (row.row_idx < rect.tl_row or row.row_idx > rect.br_row) continue;
             if (row.unaddressed_cells > 0) return error.PivotEditUnsafe;
-            const out = grid[row.row_idx - rect.tl_row];
+            const gi = row.row_idx - rect.tl_row;
             for (row.cells) |cell| {
                 // The whole reference, and its row must be the row that
                 // holds it: an `A999` inside `<row r="2">` is not A2.
@@ -6540,7 +6548,12 @@ pub const Workbook = struct {
                 const cell_row = sheet_edit.parseRowFromA1(cell.ref) orelse return error.MalformedSheetXml;
                 if (cell_row != row.row_idx) return error.MalformedSheetXml;
                 if (col < rect.tl_col or col > rect.br_col) continue;
-                out[col - rect.tl_col] = try self.pivotSourceValue(arena, cell, &date_styles);
+                if (grid[gi].ptr == blank_row.ptr) {
+                    const own = try arena.alloc(eng.Value, width);
+                    @memset(own, .blank);
+                    grid[gi] = own;
+                }
+                grid[gi][col - rect.tl_col] = try self.pivotSourceValue(arena, cell, &date_styles);
             }
         }
         const rows = try arena.alloc(eng.Row, height);

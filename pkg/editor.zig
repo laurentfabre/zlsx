@@ -6263,6 +6263,83 @@ test "S7b-4: a numeric cell under a style the workbook cannot spell — a locale
     }
 }
 
+test "S7b-4: two definitions naming one records part refuse every edit; a rectangle wider than the schema or past the cell budget refuses before any read; a tall sparse source reads by its cells (Codex #205 r3 REL-301, PERF-301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rec_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r3_shared_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.writeWithOrphanCache(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels", "Target=\"pivotCacheRecords2.xml\"", "Target=\"pivotCacheRecords1.xml\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectError(error.MalformedPivotXml, wb.insertRow(0, 2));
+        try std.testing.expectError(error.MalformedPivotXml, wb.insertRow(0, 1));
+        try std.testing.expectEqualStrings(before, (try wb.store.part(rec_part)).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+    {
+        // Sixteen thousand columns for three fields: refused before a
+        // cell is read.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r3_wide_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "ref=\"A1:C4\"", "ref=\"A1:XFD1048576\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqual(@as(u32, 0), wb.pivot_rebuilds);
+    }
+    {
+        // Seventeen fields over the whole column height: past the
+        // budget, refused before a cell is read.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r3_budget_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        var extra: std.ArrayListUnmanaged(u8) = .empty;
+        defer extra.deinit(std.testing.allocator);
+        for (0..14) |i| try extra.writer(std.testing.allocator).print("<cacheField name=\"F{d}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"0\" maxValue=\"0\"/></cacheField>", .{i});
+        try extra.appendSlice(std.testing.allocator, "</cacheFields>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "<cacheFields count=\"3\">", "<cacheFields count=\"17\">");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "</cacheFields>", extra.items);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "ref=\"A1:C4\"", "ref=\"A1:Q1048576\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqual(@as(u32, 0), wb.pivot_rebuilds);
+    }
+    {
+        // Six thousand rows of which three hold cells: read and rebuilt,
+        // the blank rows as blank records.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r3_tall_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r3_tall_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "ref=\"A1:C4\"", "ref=\"A1:C6000\"");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try std.testing.expectEqual(@as(u32, 1), ed.workbook.pivot_rebuilds);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, def_part, rec_part, 6000);
+        const cd = (try store.part(def_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "ref=\"A1:C6001\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>") != null);
+    }
+}
+
 // ─── S7b-3: the refresh marker for cell writes (§7 Q3 — one rule) ───
 //
 // A row edit inside a source rectangle marks the cache in the sweep; a
