@@ -163,8 +163,9 @@ pub const SharedItems = struct {
     /// attribute-only form a data-only numeric field takes.
     items: []Item = &.{},
     /// A direct child not under the part's prefix — a foreign element
-    /// where the schema names only items — which `items` cannot hold
-    /// and no rebuild can keep (Codex #205 r1 REL-102).
+    /// where the schema names only items — or character data between
+    /// the items, which `items` cannot hold and no rebuild can keep
+    /// (Codex #205 r1 REL-102, r4 REL-403).
     has_other_children: bool = false,
 
     /// One inventory item. Kinds beyond the six the schema names
@@ -439,7 +440,7 @@ fn parseSharedItems(allocator: Allocator, xml: []const u8, el: Child, p: []const
             .simple = isBlank(xml[k.hit.after_tag_close..k.end]),
         });
     }
-    si.has_other_children = kids.skipped > 0;
+    si.has_other_children = kids.skipped > 0 or kids.other;
     si.items = try items.toOwnedSlice(allocator);
     return si;
 }
@@ -1094,7 +1095,13 @@ fn attributesEnd(xml: []const u8, from: usize) Error!TagEnd {
             return error.MalformedXml;
         }
         if (!isNameStart(xml[j])) return error.MalformedXml;
+        const name_start = j;
         while (j < xml.len and xml[j] != '=' and !std.ascii.isWhitespace(xml[j]) and xml[j] != '<' and xml[j] != '>' and xml[j] != '/') j += 1;
+        // A name twice on one tag is not XML, and a writer that
+        // replaced the first value would leave the second standing
+        // (Codex #205 r4 REL-405). The pairs before it are whole.
+        var seen: AttrIter = .{ .attrs = xml[from..name_start] };
+        while (seen.next()) |a| if (std.mem.eql(u8, a.name, xml[name_start..j])) return error.MalformedXml;
         while (j < xml.len and std.ascii.isWhitespace(xml[j])) j += 1;
         if (j >= xml.len or xml[j] != '=') return error.MalformedXml;
         j += 1;
@@ -1155,6 +1162,11 @@ pub const Children = struct {
     /// cannot carry what it did not classify, and asks (Codex #205 r1
     /// REL-102).
     skipped: usize = 0,
+    /// Something between the children that is not a child and not
+    /// whitespace — character data, a comment, CDATA, a processing
+    /// instruction — which a regenerated body would lose (Codex #205
+    /// r4 REL-403). Complete once `next` has returned null.
+    other: bool = false,
 
     pub fn init(xml: []const u8, parent: wbxml.TagHit, parent_end: usize, prefix: []const u8, env: NsEnv) Children {
         return .{
@@ -1169,10 +1181,18 @@ pub const Children = struct {
     pub fn next(self: *Children) Error!?Child {
         const xml = self.xml;
         while (self.cursor < self.end) {
-            const lt = std.mem.indexOfScalarPos(u8, xml, self.cursor, '<') orelse return null;
-            if (lt >= self.end) return null;
+            const lt = std.mem.indexOfScalarPos(u8, xml, self.cursor, '<') orelse {
+                self.noteGap(self.end);
+                return null;
+            };
+            if (lt >= self.end) {
+                self.noteGap(self.end);
+                return null;
+            }
+            self.noteGap(lt);
             const skip_to = wbxml.skipNonElement(xml, lt) catch |e| return narrow(e);
             if (skip_to != lt) {
+                self.other = true;
                 self.cursor = skip_to;
                 continue;
             }
@@ -1197,6 +1217,10 @@ pub const Children = struct {
             self.skipped += 1;
         }
         return null;
+    }
+
+    fn noteGap(self: *Children, to: usize) void {
+        if (to > self.cursor and !isBlank(self.xml[self.cursor..to])) self.other = true;
     }
 };
 

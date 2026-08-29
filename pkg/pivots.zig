@@ -218,6 +218,14 @@ pub const SourceResolution = union(enum) {
         /// one, whose field names come from `<tableColumns>`. What
         /// the S7b-4 rebuild splits the rectangle by.
         header_rows: u32 = 1,
+        /// Rows at the bottom of `bounds` that are a table's totals
+        /// (`totalsRowCount`), not data; 0 for every other carrier
+        /// (Codex #205 r4 REL-401).
+        totals_rows: u32 = 0,
+        /// A table's `<tableColumn>` names, decoded, in order — a
+        /// headerless table's field names (Codex #205 r4 REL-402);
+        /// empty for every other carrier.
+        columns: []const []const u8 = &.{},
     };
 };
 
@@ -878,6 +886,14 @@ const Resolver = struct {
         bounds: ?Bounds,
         /// The table's `headerRowCount` (default 1).
         header_rows: u32,
+        /// The table's `totalsRowCount` (default 0).
+        totals_rows: u32,
+        /// The table's `<tableColumn>` names, decoded, in order.
+        columns: []const []const u8,
+
+        fn shape(self: TableEntry) TableShape {
+            return .{ .header_rows = self.header_rows, .totals_rows = self.totals_rows, .columns = self.columns };
+        }
     };
 
     fn deinit(self: *Resolver) void {
@@ -913,12 +929,12 @@ const Resolver = struct {
             // `sheet` names the sheet; a `ref` bounds it, else a `name`
             // beside it may (a table or a static name on that same
             // sheet — Codex #202 r1 F4). The sheet wins on identity.
-            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), .ref, &.{}, 1);
+            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), .ref, &.{}, .{});
             if (ws.name) |raw_name| {
                 const carrier = try self.carrierBounds(idx, raw_name);
-                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.kind, carrier.names, carrier.header_rows);
+                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.kind, carrier.names, carrier.shape);
             }
-            return try self.local(idx, .sheet_attr, null, .none, &.{}, 1);
+            return try self.local(idx, .sheet_attr, null, .none, &.{}, .{});
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -931,7 +947,7 @@ const Resolver = struct {
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
                     const cl = try self.closure(n);
-                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, .defined_name, cl.names, 1);
+                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, .defined_name, cl.names, .{});
                     return unresolved(.unbounded_body, cl.sheets, cl.names);
                 },
                 .refused => return error.MalformedPivotXml,
@@ -939,7 +955,7 @@ const Resolver = struct {
             }
             const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{}, &.{});
             for (try self.ensureTables()) |t| {
-                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, .table, &.{}, t.header_rows);
+                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, .table, &.{}, t.shape());
             }
             return unresolved(.dangling_name, &.{}, &.{});
         }
@@ -950,7 +966,15 @@ const Resolver = struct {
         return .{ .unresolved = .{ .why = why, .sheets = sheets, .names = names } };
     }
 
-    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey, header_rows: u32) Error!SourceResolution {
+    /// A table's shape beyond its bounds: what the rectangle's rows
+    /// are, and what its columns are called.
+    const TableShape = struct {
+        header_rows: u32 = 1,
+        totals_rows: u32 = 0,
+        columns: []const []const u8 = &.{},
+    };
+
+    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey, shape: TableShape) Error!SourceResolution {
         if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{}, &.{});
         return .{ .sheet = .{
             .sheet_idx = sheet_idx,
@@ -960,11 +984,13 @@ const Resolver = struct {
             .bounds = bounds,
             .carrier = if (bounds == null) .none else carrier,
             .names = names,
-            .header_rows = header_rows,
+            .header_rows = shape.header_rows,
+            .totals_rows = shape.totals_rows,
+            .columns = shape.columns,
         } };
     }
 
-    const Carrier = struct { bounds: ?Bounds, kind: SourceCarrier, names: []const NameKey, header_rows: u32 = 1 };
+    const Carrier = struct { bounds: ?Bounds, kind: SourceCarrier, names: []const NameKey, shape: TableShape = .{} };
 
     /// The bounds a `name` beside a `sheet` lends the source, when the
     /// carrier is on that sheet: a static defined-name body, else a
@@ -999,7 +1025,7 @@ const Resolver = struct {
         for (tables) |t| {
             if (!std.mem.eql(u8, t.folded, folded)) continue;
             const on_sheet = t.sheet_idx == sheet_idx;
-            return .{ .bounds = if (on_sheet) t.bounds else null, .kind = if (on_sheet) .table else .none, .names = &.{}, .header_rows = t.header_rows };
+            return .{ .bounds = if (on_sheet) t.bounds else null, .kind = if (on_sheet) .table else .none, .names = &.{}, .shape = t.shape() };
         }
         return none;
     }
@@ -1082,7 +1108,14 @@ const Resolver = struct {
                     bounds = parseBounds(try decodeLexical(self.arena, ref_raw));
                 }
                 const header_rows = table_edit.tableHeaderRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
-                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows });
+                const totals_rows = table_edit.tableTotalsRowCount(table_part.bytes) orelse return error.MalformedPivotXml;
+                const raw_columns = (table_edit.tableColumnNamesRaw(self.arena, table_part.bytes) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.MalformedPivotXml,
+                }) orelse return error.MalformedPivotXml;
+                const columns = try self.arena.alloc([]const u8, raw_columns.len);
+                for (raw_columns, 0..) |raw_col, k| columns[k] = try decode(self.arena, .table_column_name, raw_col);
+                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows, .totals_rows = totals_rows, .columns = columns });
             }
         }
         self.tables = try entries.toOwnedSlice(self.arena);
@@ -2120,6 +2153,10 @@ pub const edit = struct {
     pub const RebuildSource = struct {
         rect: Rect,
         header_rows: u32,
+        /// A table's totals rows at the bottom of `rect` — not data.
+        totals_rows: u32 = 0,
+        /// A table's column names — a headerless table's field names.
+        columns: []const []const u8 = &.{},
     };
 
     /// Plan one `pivotCacheDefinitionN.xml` part's rewrite for a row /
@@ -2158,7 +2195,7 @@ pub const edit = struct {
                 if (def.source.type == .worksheet) {
                     if (r.local) |local| {
                         if (local.bounds) |b| {
-                            if (b == .rect) plan.rebuild = .{ .rect = b.rect, .header_rows = local.header_rows };
+                            if (b == .rect) plan.rebuild = .{ .rect = b.rect, .header_rows = local.header_rows, .totals_rows = local.totals_rows, .columns = local.columns };
                         }
                     }
                 }
@@ -2837,12 +2874,13 @@ pub const engine = struct {
                 }
                 if (!pivot_xml.isBlank(xml[v.hit.after_tag_close..v.end])) return error.PivotShapeUnsupported;
             }
-            if (vals.skipped > 0) return error.PivotShapeUnsupported;
+            if (vals.skipped > 0 or vals.other) return error.PivotShapeUnsupported;
         }
         // A direct child under another prefix is one the walk did not
-        // classify; a part rebuilt whole would drop it (Codex #205 r1
-        // REL-102).
-        if (kids.skipped > 0) return error.PivotShapeUnsupported;
+        // classify, and character data between the records is content
+        // it did not carry; a part rebuilt whole would drop either
+        // (Codex #205 r1 REL-102, r4 REL-403).
+        if (kids.skipped > 0 or kids.other) return error.PivotShapeUnsupported;
         const p = try qualified(arena, root.prefix);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(arena, xml[0..root.hit.attrs_start]);
@@ -5923,4 +5961,50 @@ test "engine: a records part shared by two definitions is a graph that refuses (
     }
     try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels", "Target=\"pivotCacheRecords2.xml\"", "Target=\"pivotCacheRecords1.xml\"");
     try testing.expectError(error.MalformedPivotXml, Opened.open(testing.allocator, io, path));
+}
+
+test "engine: character data or a comment between the children of a records part, a record or an inventory refuses; a name twice on one tag refuses the part (Codex #205 r4 REL-403, REL-405)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const head = "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\">";
+    const tail = "</cacheField></cacheFields></pivotCacheDefinition>";
+    const def_xml = head ++ "<sharedItems count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail;
+    const cache: PivotCache = .{
+        .cache_id = null,
+        .part_name = "xl/pivotCache/pivotCacheDefinition1.xml",
+        .records_part_name = "xl/pivotCache/pivotCacheRecords1.xml",
+        .definition = try pivot_xml.parseCacheDefinition(arena, def_xml),
+        .field_names = &.{"K"},
+        .field_formulas = &.{null},
+        .source = .{},
+        .resolution = .none,
+        .range_set_sources = &.{},
+        .range_set_resolutions = &.{},
+        .consumer_count = 0,
+        .raw_xml = def_xml,
+    };
+    const rows = [_]engine.Row{&.{.{ .string = "a" }}};
+    const rec_head = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">";
+    const lossy = [_][]const u8{
+        rec_head ++ "opaque<r><x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r>head<x v=\"0\"/></r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/>tail</r></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/></r>trailer</pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/></r><!-- lost --></pivotCacheRecords>",
+        rec_head ++ "<r><x v=\"0\"/><![CDATA[lost]]></r></pivotCacheRecords>",
+    };
+    for (lossy) |xml| try testing.expectError(error.PivotShapeUnsupported, engine.rebuild(arena, &cache, &rows, xml, null));
+    // Whitespace between and around is nothing.
+    const spaced = "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\">\n  <r>\n    <x v=\"0\"/>\n  </r>\n</pivotCacheRecords>";
+    const rb = try engine.rebuild(arena, &cache, &rows, spaced, null);
+    try testing.expectEqualStrings(rec_head ++ "<r><x v=\"0\"/></r></pivotCacheRecords>", rb.records.?);
+    // An inventory with text between its items.
+    const chatty = try pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\"><s v=\"a\"/>junk</sharedItems>" ++ tail);
+    try testing.expectError(error.PivotShapeUnsupported, engine.checkShape(&chatty));
+    // A duplicated attribute, on either root.
+    try testing.expectError(error.MalformedPivotXml, engine.rebuild(arena, &cache, &rows, "<pivotCacheRecords xmlns=\"" ++ main_ns ++ "\" count=\"1\" count=\"2\"><r><x v=\"0\"/></r></pivotCacheRecords>", null));
+    try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, "<pivotCacheDefinition xmlns=\"" ++ main_ns ++ "\" recordCount=\"1\" recordCount=\"2\"><cacheSource type=\"worksheet\"><worksheetSource sheet=\"Data\" ref=\"A1:A2\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"K\" numFmtId=\"0\"><sharedItems count=\"1\"><s v=\"a\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>"));
+    try testing.expectError(error.MalformedXml, pivot_xml.parseCacheDefinition(arena, head ++ "<sharedItems count=\"1\" count=\"1\"><s v=\"a\"/></sharedItems>" ++ tail));
 }

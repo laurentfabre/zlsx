@@ -6161,6 +6161,9 @@ test "S7b-4: a cell whose reference is not its row's, a cell or row without one,
         // An alias of the main namespace is a graph that does not read:
         // every edit of the sheet refuses, the pure shift included.
         .{ .name = "alias", .part = def_part, .old = "<s v=\"West\"/>", .new = "<y:s xmlns:y=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" v=\"West\"/>", .err = error.MalformedPivotXml, .shift_ok = false },
+        // A coordinate twice (Codex #205 r4 REL-404).
+        .{ .name = "duprow", .part = sheet_part, .old = "<row r=\"3\">", .new = "<row r=\"2\"><c r=\"C2\"><v>9</v></c></row><row r=\"3\">", .err = error.MalformedSheetXml, .shift_ok = true },
+        .{ .name = "dupcell", .part = sheet_part, .old = "<c r=\"B2\"><v>3</v></c>", .new = "<c r=\"B2\"><v>3</v></c><c r=\"B2\"><v>4</v></c>", .err = error.MalformedSheetXml, .shift_ok = true },
     };
     for (cases) |case| {
         const file = try std.fmt.allocPrint(std.testing.allocator, "s7b4_r1_{s}.xlsx", .{case.name});
@@ -6341,6 +6344,82 @@ test "S7b-4: two definitions naming one records part refuse every edit; a rectan
         const cd = (try store.part(def_part)).?;
         try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "ref=\"A1:C6001\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>") != null);
+    }
+}
+
+test "S7b-4: a table's totals row is not a record — its delete refuses, an insert above it appends a data row; a headerless table's column names must be the field names (Codex #205 r4 REL-401, REL-402)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const def_part = "xl/pivotCache/pivotCacheDefinition1.xml";
+    const rec_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    const table_part = "xl/tables/table1.xml";
+    const sheet_part = "xl/worksheets/sheet1.xml";
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r4_totals_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r4_totals_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C5\" totalsRowCount=\"1\" totalsRowShown=\"1\"");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, sheet_part, "</sheetData>", "<row r=\"5\"><c r=\"B5\"><f>SUBTOTAL(109,SalesTbl[Qty])</f><v>12</v></c></row></sheetData>");
+        {
+            var wb = try Workbook.open(std.testing.allocator, io, src);
+            defer wb.deinit();
+            const before = try std.testing.allocator.dupe(u8, (try wb.store.part(rec_part)).?.bytes);
+            defer std.testing.allocator.free(before);
+            // The totals row is not a data row to delete.
+            try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 5));
+            try std.testing.expectEqualStrings(before, (try wb.store.part(rec_part)).?.bytes);
+            try std.testing.expectEqual(@as(u32, 0), wb.pivot_rebuilds);
+        }
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 3);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        // Three data rows and the inserted blank: the totals row's 12
+        // is nowhere in the records.
+        try expectRebuilt(&store, def_part, rec_part, 4);
+        const rec = (try store.part(rec_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "12") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"2\"/><m/><m/></r><r><x v=\"1\"/><n v=\"4\"/><n v=\"2.5\"/></r><r><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r>") != null);
+        const tbl = (try store.part(table_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C6\"") != null);
+    }
+    {
+        // Headerless: the column names are the schema.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r4_headerless_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "name=\"Region\"", "name=\"Area\"");
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqual(@as(u32, 0), wb.pivot_rebuilds);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+    {
+        // Headerless and named as the fields: the first row is data.
+        const src = try tt.path(std.testing.allocator, io, "s7b4_r4_headerless_ok_src.xlsx");
+        defer std.testing.allocator.free(src);
+        const dst = try tt.path(std.testing.allocator, io, "s7b4_r4_headerless_ok_dst.xlsx");
+        defer std.testing.allocator.free(dst);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, table_part, "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, def_part, rec_part, 5);
     }
 }
 

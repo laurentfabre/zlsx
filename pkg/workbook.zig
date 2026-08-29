@@ -6484,6 +6484,18 @@ pub const Workbook = struct {
         if (c.field_names.len != width) return error.PivotEditUnsafe;
         const area = std.math.mul(usize, width, height) catch return error.PivotEditUnsafe;
         if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
+        // A table's totals rows span the bottom of its `ref` and are
+        // not records (Codex #205 r4 REL-401): a delete on one is not
+        // a data edit; an insert at one appends a data row above it.
+        if (src.header_rows + src.totals_rows >= height) return error.PivotEditUnsafe;
+        if (kind == .delete and idx_1based > src.rect.br_row - src.totals_rows) return error.PivotEditUnsafe;
+        // A headerless table's field names are its `<tableColumn>`
+        // names (Codex #205 r4 REL-402); a headered one's are checked
+        // on the header row once read.
+        if (src.header_rows == 0) {
+            if (src.columns.len != c.field_names.len) return error.PivotEditUnsafe;
+            for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
+        }
         self.pivot_rebuilds +|= 1;
         const all = try self.readPivotSourceRows(arena, sheet_idx, src.rect);
         if (src.header_rows == 1) {
@@ -6492,7 +6504,7 @@ pub const Workbook = struct {
                 .number, .blank => return error.PivotEditUnsafe,
             };
         }
-        const data = all[src.header_rows..];
+        const data = all[src.header_rows .. all.len - src.totals_rows];
         const after = eng.rowsAfterEdit(arena, data, width, src.rect.tl_row + src.header_rows, idx_1based, kind) catch |e| return mapEngineError(e);
         const records_xml: ?[]const u8 = if (c.records_part_name) |n|
             ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
@@ -6532,6 +6544,13 @@ pub const Workbook = struct {
         @memset(blank_row, .blank);
         const grid = try arena.alloc([]eng.Value, height);
         @memset(grid, blank_row);
+        // A coordinate twice — two `<row>` of one `r`, two `<c>` of one
+        // `r` — is a grid with two values for one cell, which no
+        // record can hold (Codex #205 r4 REL-404).
+        const seen_row = try arena.alloc(bool, height);
+        @memset(seen_row, false);
+        const seen_cell = try arena.alloc(?[]bool, height);
+        @memset(seen_cell, null);
         var date_styles: std.AutoHashMapUnmanaged(u32, bool) = .empty;
         // A row or cell without its `r` is one the typed view could not
         // place, and the rectangle cannot be read around it (Codex #205
@@ -6541,6 +6560,8 @@ pub const Workbook = struct {
             if (row.row_idx < rect.tl_row or row.row_idx > rect.br_row) continue;
             if (row.unaddressed_cells > 0) return error.PivotEditUnsafe;
             const gi = row.row_idx - rect.tl_row;
+            if (seen_row[gi]) return error.MalformedSheetXml;
+            seen_row[gi] = true;
             for (row.cells) |cell| {
                 // The whole reference, and its row must be the row that
                 // holds it: an `A999` inside `<row r="2">` is not A2.
@@ -6552,8 +6573,14 @@ pub const Workbook = struct {
                     const own = try arena.alloc(eng.Value, width);
                     @memset(own, .blank);
                     grid[gi] = own;
+                    const own_seen = try arena.alloc(bool, width);
+                    @memset(own_seen, false);
+                    seen_cell[gi] = own_seen;
                 }
-                grid[gi][col - rect.tl_col] = try self.pivotSourceValue(arena, cell, &date_styles);
+                const ci = col - rect.tl_col;
+                if (seen_cell[gi].?[ci]) return error.MalformedSheetXml;
+                seen_cell[gi].?[ci] = true;
+                grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
             }
         }
         const rows = try arena.alloc(eng.Row, height);
