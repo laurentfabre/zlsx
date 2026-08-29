@@ -1128,6 +1128,19 @@ const Resolver = struct {
             if (try self.textNamesSheet(body, name)) try addSheet(self.gpa, sheets, @intCast(idx));
         }
         const folded_body = (try fold(self.arena, body)) orelse return;
+        // 3D spans, `First:Last!` bare or `'First:Last'!` quoted, in tab
+        // order — every member between the ends (Codex #202 r6 F1).
+        const folds = try self.ensureSheetFolds();
+        for (folds, 0..) |first, i| {
+            for (folds[i..], i..) |last, j| {
+                const bare = try std.mem.concat(self.arena, u8, &.{ first, ":", last, "!" });
+                const quoted = try std.mem.concat(self.arena, u8, &.{ "'", first, ":", last, "'!" });
+                if (std.mem.indexOf(u8, folded_body, bare) != null or std.mem.indexOf(u8, folded_body, quoted) != null) {
+                    var k: u32 = @intCast(i);
+                    while (k <= j) : (k += 1) try addSheet(self.gpa, sheets, k);
+                }
+            }
+        }
         if (self.ensureSymbols()) |symbols| {
             for (symbols.names) |*n| {
                 if (textHasWord(folded_body, n.folded)) try walk.enqueue(self.gpa, .{ .name = n, .scope = scopeOf(n) orelse scope });
@@ -1211,7 +1224,16 @@ const Resolver = struct {
             .call => |c| {
                 const args = ast.children(c.args);
                 if (args.len > 0 and isIndirect(ast, c.callee)) {
-                    switch (ast.node(args[0])) {
+                    // Through any parentheses around the literal (Codex
+                    // #202 r6 F2).
+                    var arg = args[0];
+                    while (true) {
+                        switch (ast.node(arg)) {
+                            .paren => |pn| arg = pn.child,
+                            else => break,
+                        }
+                    }
+                    switch (ast.node(arg)) {
                         .string => |lit| {
                             const text = try unquoteStringLiteral(self.arena, lit.text);
                             try self.walkBody(text, scope, sheets, walk);
@@ -3122,6 +3144,17 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         defer o.deinit(testing.allocator);
         try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{0});
     }
+    // A refused body still proves a 3D span's members (Codex r6 F1).
+    for ([_][]const u8{
+        "OFFSET(Report!$A$1,0,0,MAX(1,SUM(Data:Report!$A$1),'[Book.xlsx]Sheet1'!$A$1),1)",
+        "OFFSET(Report!$A$1,0,0,MAX(1,SUM('Data:Report'!$A$1),'[Book.xlsx]Sheet1'!$A$1),1)",
+    }) |body| {
+        try fixture.write(testing.allocator, io, path, .defined_name);
+        try patchPart(io, path, "xl/workbook.xml", "Data!$A$1:$C$4", body);
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        try expectUnresolved(o.pivots.caches[0].resolution, .unbounded_body, &.{ 0, 1 });
+    }
     // A refused body still queues the names and tables it spells
     // (Codex r5 F1): `Anchor` reads `Report`; `SalesTbl` is on `Data`.
     try fixture.write(testing.allocator, io, path, .defined_name);
@@ -3147,6 +3180,8 @@ test "unresolved: the provenance says why, and which sheets the spelling still p
         .{ .body = "OFFSET(INDIRECT(\"Report!$A$1\"),0,0,2,2)", .sheets = &.{1} },
         .{ .body = "OFFSET(INDIRECT(\"'Report'!A1\"),0,0,2,2)", .sheets = &.{1} },
         .{ .body = "OFFSET(indirect(\"Anchor\"),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(INDIRECT((\"Report!$A$1\")),0,0,2,2)", .sheets = &.{1} },
+        .{ .body = "OFFSET(_xlfn.INDIRECT(\"Report!$A$1\"),0,0,2,2)", .sheets = &.{1} },
         .{ .body = "OFFSET(INDIRECT(\"A1\"),0,0,2,2)", .sheets = &.{} },
         .{ .body = "OFFSET(INDIRECT(\"Nope!A1\"),0,0,2,2)", .sheets = &.{} },
     }) |case| {
