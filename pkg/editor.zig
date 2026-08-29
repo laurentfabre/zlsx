@@ -5880,6 +5880,92 @@ test "S7b: spellings that claim the edited sheet without a range refuse; ones th
     try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<cacheSource type=\"zlsxFuture\"><worksheetSource sheet=\"Data\" ref=\"A2:C5\"/>") != null);
 }
 
+test "S7b: a listed cache whose workbook relationship is absent or mistyped refuses every sheet — the gate sees the list (Codex r1 REL-101)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    // The pivot table's own relationship still reaches the cache; only
+    // the workbook's edge is wrong. Before the fix the source sheet was
+    // admitted with the graph unread — and its `ref` left stale.
+    const mistyped = try tt.path(std.testing.allocator, io, "s7b_rel_mistyped_src.xlsx");
+    defer std.testing.allocator.free(mistyped);
+    try pivots_mod.fixture.write(std.testing.allocator, io, mistyped, .sheet_ref);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, mistyped, "xl/_rels/workbook.xml.rels", "relationships/pivotCacheDefinition\" Target=\"pivotCache/pivotCacheDefinition1.xml\"", "relationships/pivotCacheDefinitionX\" Target=\"pivotCache/pivotCacheDefinition1.xml\"");
+    {
+        var ed = try Editor.open(std.testing.allocator, io, mistyped);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 9));
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(1, 1));
+    }
+    const absent = try tt.path(std.testing.allocator, io, "s7b_rel_absent_src.xlsx");
+    defer std.testing.allocator.free(absent);
+    try pivots_mod.fixture.write(std.testing.allocator, io, absent, .sheet_ref);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, absent, "xl/_rels/workbook.xml.rels", "<Relationship Id=\"rIdPC1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition\" Target=\"pivotCache/pivotCacheDefinition1.xml\"/>", "");
+    {
+        var ed = try Editor.open(std.testing.allocator, io, absent);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+    // A workbook with no pivot at all, listing a cache it cannot reach:
+    // the documented workbook-wide refusal, from a sheet hosting nothing.
+    const dangling = try tt.path(std.testing.allocator, io, "s7b_dangling_list_src.xlsx");
+    defer std.testing.allocator.free(dangling);
+    {
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Only");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, dangling);
+    }
+    {
+        var ed = try Editor.open(std.testing.allocator, io, dangling);
+        defer ed.deinit();
+        try ed.insertRow(0, 1);
+    }
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, dangling, "xl/workbook.xml", "</workbook>", "<pivotCaches><pivotCache cacheId=\"1\" r:id=\"rIdNone\"/></pivotCaches></workbook>");
+    var ed = try Editor.open(std.testing.allocator, io, dangling);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+    try ed.setCell(0, 2, 0, .{ .integer = 2 });
+}
+
+test "S7b: a sheet+name source on a headerless table admits the top-row delete the table rewriter admits (Codex r1 REL-102)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b_sheet_table_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b_sheet_table_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"SalesTbl\"/>", "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>");
+    {
+        // With the default header the table rewriter refuses.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 1));
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(0, 2));
+    }
+    // `headerRowCount="0"`: the field names come from `<tableColumns>`,
+    // the top row is data, and its delete shrinks the table.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/tables/table1.xml", "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A1:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try ed.deleteRow(0, 1);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    const tbl = (try store.part("xl/tables/table1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, tbl.bytes, "ref=\"A1:C3\"") != null);
+    const cd = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>") != null);
+}
+
 // ─── S7a: the output-location lift ───────────────────────────────────
 //
 // A sheet that only HOSTS a pivot is editable: `location@ref` — the one

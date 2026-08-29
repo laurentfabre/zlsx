@@ -195,6 +195,9 @@ pub const SourceResolution = union(enum) {
         via: ResolvedVia,
         /// The area read, when the spelling proves one (S7b's rectangle).
         bounds: ?Bounds,
+        /// What `bounds` came from, and so what a row edit moves.
+        /// `.none` exactly when `bounds` is null.
+        carrier: SourceCarrier = .none,
         /// The defined names the spelling reads through (`NameKey`):
         /// the source name and its closure for a defined-name source,
         /// or a name beside a `sheet` attribute; empty for a direct
@@ -212,6 +215,24 @@ pub fn namesOf(r: SourceResolution) []const NameKey {
         .external, .none => &.{},
     };
 }
+
+/// What carries a local source's coordinate — the thing a row edit
+/// moves. Distinct from `ResolvedVia`, which says what named the
+/// SHEET: `<worksheetSource sheet="Data" name="SalesTbl"/>` is placed
+/// by its `sheet` attribute and bounded by a table part (Codex #203
+/// r1 REL-102).
+pub const SourceCarrier = enum {
+    /// The spelling's own `ref` — spliced at `ref_span`.
+    ref,
+    /// A table part's `ref` — `table_edit` moves it, with the table's
+    /// own header knowledge.
+    table,
+    /// A defined name's body — the name sweep moves it.
+    defined_name,
+    /// Nothing bounds the source: `sheet` alone, a name the reader
+    /// could not place on that sheet.
+    none,
+};
 
 /// The decoded spellings of one `worksheetSource` / `rangeSet` — what
 /// a reader shows next to the resolution the spellings led to.
@@ -732,6 +753,23 @@ fn findOrAddCache(
     return caches.items.len - 1;
 }
 
+/// Does `xl/workbook.xml` list a cache — a main-namespace
+/// `<pivotCaches>` under the root, by the same scanner `collect` reads
+/// it with? The S7b guard's cheap gate, beside the relationship types:
+/// a `<pivotCaches>` entry whose relationship is absent or mistyped is
+/// a graph `collect` refuses, and the refusal must be reachable from a
+/// sheet that hosts nothing (Codex #203 r1 REL-101). A root the
+/// scanner cannot read answers true for the same reason — the walk,
+/// not this gate, decides what it means.
+pub fn workbookListsCaches(wb_xml: []const u8) bool {
+    const root = pivot_xml.scanRoot(wb_xml, "workbook") catch return true;
+    var kids = pivot_xml.Children.init(wb_xml, root.hit, root.body_end, root.prefix, root.env);
+    while (kids.next() catch return true) |k| {
+        if (std.mem.eql(u8, k.local, "pivotCaches")) return true;
+    }
+    return false;
+}
+
 /// Trailing-segment match, case-insensitive: the one thing the Strict
 /// and Transitional relationship URIs share. Same rule as
 /// `Workbook.preflightPivotEditsForSheet`.
@@ -842,12 +880,12 @@ const Resolver = struct {
             // `sheet` names the sheet; a `ref` bounds it, else a `name`
             // beside it may (a table or a static name on that same
             // sheet — Codex #202 r1 F4). The sheet wins on identity.
-            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), &.{});
+            if (ws.ref != null) return try self.local(idx, .sheet_attr, try self.boundsOfRef(ws.ref), .ref, &.{});
             if (ws.name) |raw_name| {
                 const carrier = try self.carrierBounds(idx, raw_name);
-                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.names);
+                return try self.local(idx, .sheet_attr, carrier.bounds, carrier.kind, carrier.names);
             }
-            return try self.local(idx, .sheet_attr, null, &.{});
+            return try self.local(idx, .sheet_attr, null, .none, &.{});
         }
         if (ws.name) |raw_name| {
             const name = try decode(self.arena, .pivot_source_name, raw_name);
@@ -860,7 +898,7 @@ const Resolver = struct {
             switch (try symbols.resolveName(self.gpa, null, name)) {
                 .name => |n| {
                     const cl = try self.closure(n);
-                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, cl.names);
+                    if (try self.areaOfBody(n.body)) |area| return try self.local(area.sheet_idx, .defined_name, area.bounds, .defined_name, cl.names);
                     return unresolved(.unbounded_body, cl.sheets, cl.names);
                 },
                 .refused => return error.MalformedPivotXml,
@@ -868,7 +906,7 @@ const Resolver = struct {
             }
             const folded = (try fold(self.arena, name)) orelse return unresolved(.dangling_name, &.{}, &.{});
             for (try self.ensureTables()) |t| {
-                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, &.{});
+                if (std.mem.eql(u8, t.folded, folded)) return try self.local(t.sheet_idx, .table, t.bounds, .table, &.{});
             }
             return unresolved(.dangling_name, &.{}, &.{});
         }
@@ -879,7 +917,7 @@ const Resolver = struct {
         return .{ .unresolved = .{ .why = why, .sheets = sheets, .names = names } };
     }
 
-    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, names: []const NameKey) Error!SourceResolution {
+    fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey) Error!SourceResolution {
         if (sheet_idx >= self.sheet_parts.len) return unresolved(.dangling_sheet, &.{}, &.{});
         return .{ .sheet = .{
             .sheet_idx = sheet_idx,
@@ -887,11 +925,12 @@ const Resolver = struct {
             .part_name = self.sheet_parts[sheet_idx],
             .via = via,
             .bounds = bounds,
+            .carrier = if (bounds == null) .none else carrier,
             .names = names,
         } };
     }
 
-    const Carrier = struct { bounds: ?Bounds, names: []const NameKey };
+    const Carrier = struct { bounds: ?Bounds, kind: SourceCarrier, names: []const NameKey };
 
     /// The bounds a `name` beside a `sheet` lends the source, when the
     /// carrier is on that sheet: a static defined-name body, else a
@@ -900,7 +939,7 @@ const Resolver = struct {
     /// also hands back its closure, bounded or not: its body moves with
     /// the grid, and the S7b guard dry-runs that move.
     fn carrierBounds(self: *Resolver, sheet_idx: u32, raw_name: []const u8) Error!Carrier {
-        const none: Carrier = .{ .bounds = null, .names = &.{} };
+        const none: Carrier = .{ .bounds = null, .kind = .none, .names = &.{} };
         const name = try decode(self.arena, .pivot_source_name, raw_name);
         const symbols = self.ensureSymbols() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -911,8 +950,9 @@ const Resolver = struct {
         switch (try symbols.resolveName(self.gpa, engine.SheetIndex.fromInt(sheet_idx), name)) {
             .name => |n| {
                 const cl = try self.closure(n);
-                const area = (try self.areaOfBody(n.body)) orelse return .{ .bounds = null, .names = cl.names };
-                return .{ .bounds = if (area.sheet_idx == sheet_idx) area.bounds else null, .names = cl.names };
+                const area = (try self.areaOfBody(n.body)) orelse return .{ .bounds = null, .kind = .none, .names = cl.names };
+                const on_sheet = area.sheet_idx == sheet_idx;
+                return .{ .bounds = if (on_sheet) area.bounds else null, .kind = if (on_sheet) .defined_name else .none, .names = cl.names };
             },
             .refused => return none,
             .table, .not_found => {},
@@ -923,7 +963,9 @@ const Resolver = struct {
             else => return none,
         };
         for (tables) |t| {
-            if (std.mem.eql(u8, t.folded, folded)) return .{ .bounds = if (t.sheet_idx == sheet_idx) t.bounds else null, .names = &.{} };
+            if (!std.mem.eql(u8, t.folded, folded)) continue;
+            const on_sheet = t.sheet_idx == sheet_idx;
+            return .{ .bounds = if (on_sheet) t.bounds else null, .kind = if (on_sheet) .table else .none, .names = &.{} };
         }
         return none;
     }
@@ -1886,7 +1928,8 @@ pub const edit = struct {
     /// cache reads on that sheet, `worksheetSource` and each `rangeSet`
     /// alike, passes the range semantics above; the ones that carry
     /// their own coordinate (`sheet` + `ref`) are respelled at the
-    /// parser's `ref_span` (each set at its own), the rest move with their carrier — a table
+    /// parser's `ref_span` — each set at its own, the part rebuilt from
+    /// its raw bytes in span order — the rest move with their carrier — a table
     /// part under `table_edit`, a defined name's body under the name
     /// sweep — and a source on another sheet, in another workbook, or
     /// placed nowhere is left alone. Refuses per §7 Q4: an unplaceable
@@ -1978,27 +2021,32 @@ pub const edit = struct {
             },
             .sheet => |s| {
                 if (s.sheet_idx != sheet_idx) return;
-                // Claims the sheet, bounds nothing: `sheet` alone, or a
-                // `ref` the bounds parser rejects (Q4 iv).
+                // Claims the sheet, bounds nothing: `sheet` alone, a
+                // `ref` the bounds parser rejects, a name the reader
+                // could not place on that sheet (Q4 iv).
                 const bounds = s.bounds orelse return error.PivotSourceEditUnsafe;
-                switch (s.via) {
+                switch (s.carrier) {
+                    .none => unreachable, // bounds and carrier are set together
                     // A table carries its own row rules — `table_edit`
                     // refuses a header-row or collapsing delete and
                     // admits the top row of a `headerRowCount="0"` table
                     // — and moves its own `ref`; only the column axis,
-                    // the field schema, is judged here.
+                    // the field schema, is judged here. Whether the
+                    // sheet came from the table or from a `sheet`
+                    // attribute beside its name makes no difference
+                    // (Codex #203 r1 REL-102).
                     .table => {
                         if (axis == .col) _ = try shiftSourceBounds(bounds, axis, idx_1based, kind);
                         return;
                     },
-                    .sheet_attr, .defined_name => {},
+                    .ref, .defined_name => {},
                 }
                 const moved = try shiftSourceBounds(bounds, axis, idx_1based, kind);
                 // Only a spelling with its own `ref` is respelled; a
                 // name-spelled area moves with the name's body, and a
                 // whole-column spelling has no coordinate to move.
-                const span = ws.ref_span orelse return;
-                if (s.via != .sheet_attr) return;
+                if (s.carrier != .ref) return;
+                const span = ws.ref_span orelse return error.MalformedPivotXml;
                 const r = moved orelse return;
                 if (r.eql(bounds.rect)) return;
                 var sp: Splice = .{ .span = span, .buf = undefined, .len = 0 };
@@ -3819,6 +3867,7 @@ test "edit: a sheet+ref source is respelled at the parser's span; another sheet'
     try testing.expectEqualStrings("xl/worksheets/sheet1.xml", o.pivots.sheet_parts[0]);
     try testing.expectEqual(@as(?u32, 0), o.pivots.sheetIndexOfPart("xl/worksheets/sheet1.xml"));
     try testing.expectEqual(@as(?u32, null), o.pivots.sheetIndexOfPart("xl/worksheets/sheet9.xml"));
+    try testing.expectEqual(SourceCarrier.ref, o.pivots.caches[0].resolution.sheet.carrier);
 
     // `Data` (0) feeds `A1:C4`.
     try expectCacheSource(testing.allocator, &o, 0, .row, 2, .insert, "<worksheetSource sheet=\"Data\" ref=\"A1:C5\"/>");
@@ -3892,6 +3941,35 @@ test "edit: a table-named source moves with its table; a defined-name source wit
         try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 3, .delete));
         try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 4, .delete)) == null);
         try testing.expectEqual(@as(usize, 0), namesOf(o.pivots.caches[0].resolution).len);
+        try testing.expectEqual(SourceCarrier.table, o.pivots.caches[0].resolution.sheet.carrier);
+    }
+    // `sheet` beside the table's name: placed by the attribute, bounded
+    // by the table — and judged as a table (Codex #203 r1 REL-102).
+    const beside = try tt.path(testing.allocator, io, "s7b_edit_sheet_table.xlsx");
+    defer testing.allocator.free(beside);
+    try fixture.write(testing.allocator, io, beside, .table_name);
+    try fixture.patchPart(testing.allocator, io, beside, "xl/pivotCache/pivotCacheDefinition1.xml", "<worksheetSource name=\"SalesTbl\"/>", "<worksheetSource sheet=\"Data\" name=\"SalesTbl\"/>");
+    {
+        var o = try Opened.open(testing.allocator, io, beside);
+        defer o.deinit(testing.allocator);
+        const s = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(ResolvedVia.sheet_attr, s.via);
+        try testing.expectEqual(SourceCarrier.table, s.carrier);
+        try expectA1(s.bounds, "A1:C4");
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
+    }
+    // The same spelling naming a table on ANOTHER sheet bounds nothing.
+    try fixture.patchPart(testing.allocator, io, beside, "xl/pivotCache/pivotCacheDefinition1.xml", "sheet=\"Data\" name=", "sheet=\"Report\" name=");
+    {
+        var o = try Opened.open(testing.allocator, io, beside);
+        defer o.deinit(testing.allocator);
+        const s = o.pivots.caches[0].resolution.sheet;
+        try testing.expectEqual(@as(u32, 1), s.sheet_idx);
+        try testing.expectEqual(SourceCarrier.none, s.carrier);
+        try testing.expect(s.bounds == null);
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 1, .row, 9, .insert));
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 1, .delete)) == null);
     }
     const name = try tt.path(testing.allocator, io, "s7b_edit_name.xlsx");
     defer testing.allocator.free(name);
@@ -3902,6 +3980,7 @@ test "edit: a table-named source moves with its table; a defined-name source wit
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 2, .insert));
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 2, .insert)) == null);
     try testing.expect((try cacheEdit(testing.allocator, &o, 0, .row, 4, .delete)) == null);
+    try testing.expectEqual(SourceCarrier.defined_name, o.pivots.caches[0].resolution.sheet.carrier);
     // The names the sweep's dry-run judges: the source name itself.
     const keys = namesOf(o.pivots.caches[0].resolution);
     try testing.expectEqual(@as(usize, 1), keys.len);
@@ -4037,6 +4116,17 @@ test "edit: spellings that claim the edited sheet without a range refuse; the on
     try testing.expectEqual(Unresolved.Why.unplaceable_rid, o.pivots.caches[0].resolution.unresolved.why);
     try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .row, 9, .insert));
     try testing.expect((try cacheEdit(testing.allocator, &o, 1, .row, 1, .insert)) == null);
+}
+
+test "workbookListsCaches: a main-namespace <pivotCaches> under the root, and nothing else" {
+    try testing.expect(workbookListsCaches("<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets/><pivotCaches><pivotCache cacheId=\"1\" r:id=\"rId9\"/></pivotCaches></workbook>"));
+    try testing.expect(workbookListsCaches("<x:workbook xmlns:x=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"><x:pivotCaches/></x:workbook>"));
+    try testing.expect(!workbookListsCaches("<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets/></workbook>"));
+    // A vendor element of the same local name is not the list; a
+    // comment that spells it is not either.
+    try testing.expect(!workbookListsCaches("<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:v=\"urn:v\"><extLst><ext><v:pivotCaches/></ext></extLst><!-- <pivotCaches/> --></workbook>"));
+    // A root the scanner cannot read is the walk's to refuse.
+    try testing.expect(workbookListsCaches("<workbook"));
 }
 
 fn cacheEditForFailures(allocator: Allocator, o: *const Opened) !void {

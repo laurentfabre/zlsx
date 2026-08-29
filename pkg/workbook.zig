@@ -6055,11 +6055,14 @@ pub const Workbook = struct {
 
     /// The typed graph when it must be read for this edit: the sheet's
     /// relationships name a pivot table part (it hosts one), or the
-    /// workbook's relationships name a cache definition (some sheet
-    /// may be a source). Null otherwise — the common case, which must
-    /// not pay for a parse. A cache no `<pivotCaches>` relationship
-    /// reaches is one Excel does not load; its host's own rels still
-    /// gate the host edit.
+    /// workbook carries a cache — a relationship of the cache-definition
+    /// type, or a `<pivotCaches>` list in `xl/workbook.xml` (whose
+    /// entries the walk requires to resolve: a listed cache with no
+    /// relationship is a graph that refuses, from every sheet). Null
+    /// otherwise — the common case, which must not pay for a parse. A
+    /// cache reachable only through a pivot table's own relationship is
+    /// one Excel does not load; its host's own rels still gate the host
+    /// edit.
     fn pivotsForEdit(self: *Workbook, sheet_part_name: []const u8) Error!?pivots_mod.Pivots {
         var hosts = false;
         for (self.store.rels(sheet_part_name)) |rel| {
@@ -6069,15 +6072,16 @@ pub const Workbook = struct {
                 return error.PivotEditUnsafe;
             }
         }
-        if (!hosts and !self.carriesPivotCache()) return null;
+        if (!hosts and !(try self.carriesPivotCache())) return null;
         return try self.pivotTables();
     }
 
-    fn carriesPivotCache(self: *Workbook) bool {
+    fn carriesPivotCache(self: *Workbook) Error!bool {
         for (self.store.rels("xl/workbook.xml")) |rel| {
             if (pivots_mod.relLeafIs(rel.type, "pivotCacheDefinition")) return true;
         }
-        return false;
+        const wb_part = (try self.store.part("xl/workbook.xml")) orelse return false;
+        return pivots_mod.workbookListsCaches(wb_part.bytes);
     }
 
     /// Is `p.tables[i]` a pivot this edit moves? False for a pivot on
