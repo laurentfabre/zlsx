@@ -6307,7 +6307,11 @@ test "S7b-4: two definitions naming one records part refuse every edit; a rectan
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
         var extra: std.ArrayListUnmanaged(u8) = .empty;
         defer extra.deinit(std.testing.allocator);
-        for (0..14) |i| try extra.writer(std.testing.allocator).print("<cacheField name=\"F{d}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"0\" maxValue=\"0\"/></cacheField>", .{i});
+        for (0..14) |i| {
+            const one = try std.fmt.allocPrint(std.testing.allocator, "<cacheField name=\"F{d}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\" containsInteger=\"1\" minValue=\"0\" maxValue=\"0\"/></cacheField>", .{i});
+            defer std.testing.allocator.free(one);
+            try extra.appendSlice(std.testing.allocator, one);
+        }
         try extra.appendSlice(std.testing.allocator, "</cacheFields>");
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "<cacheFields count=\"3\">", "<cacheFields count=\"17\">");
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, def_part, "</cacheFields>", extra.items);
