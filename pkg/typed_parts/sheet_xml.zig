@@ -58,6 +58,11 @@ pub const Cell = struct {
     /// `raw_value` is the first `<t>` alone. Borrows. Null for every
     /// other cell.
     inline_body: ?[]const u8 = null,
+    /// The `<is>` was not the cell's one direct child — nested under
+    /// another element, or spelt twice: a reader that carries the
+    /// string refuses rather than take a decoy (Codex #206 r23
+    /// REL-2302).
+    inline_invalid: bool = false,
 };
 
 pub const Row = struct {
@@ -571,13 +576,18 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
         var raw_value: ?[]const u8 = null;
         var formula: ?[]const u8 = null;
         var inline_body: ?[]const u8 = null;
+        var inline_invalid = false;
         if (!self_closing) {
             const c_close = std.mem.indexOfPos(u8, row_body, c_open_end, "</c>") orelse
                 return error.MalformedXml;
             const c_body = row_body[c_open_end + 1 .. c_close];
             raw_value = extractCellValue(c_body, cell_type);
             formula = extractInner(c_body, "<f", "</f>");
-            if (cell_type == .inline_string) inline_body = extractInlineBody(c_body);
+            if (cell_type == .inline_string) {
+                const found = extractInlineBodyChecked(c_body);
+                inline_body = found.body;
+                inline_invalid = found.invalid;
+            }
             probe = c_close + "</c>".len;
         } else {
             probe = c_open_end + 1;
@@ -591,6 +601,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
             .cell_type_invalid = cell_type_invalid,
             .raw_value = raw_value,
             .inline_body = inline_body,
+            .inline_invalid = inline_invalid,
             .formula = formula,
         });
     }
@@ -622,6 +633,45 @@ fn closeTagAt(xml: []const u8, at: usize, name: []const u8) ?usize {
     while (i < xml.len and std.ascii.isWhitespace(xml[i])) i += 1;
     if (i >= xml.len or xml[i] != '>') return null;
     return i + 1;
+}
+
+const InlineBody = struct { body: ?[]const u8, invalid: bool };
+
+/// `extractInlineBody` with its structure judged: the `<is>` must be
+/// the cell's one direct child. An `<is>` nested under another
+/// element (a decoy the shallow read would take), or a second one,
+/// is `invalid` (Codex #206 r23 REL-2302).
+fn extractInlineBodyChecked(c_body: []const u8) InlineBody {
+    var depth: usize = 0;
+    var direct: usize = 0;
+    var nested = false;
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, c_body, pos, '<')) |lt| {
+        if (lt + 1 >= c_body.len) return .{ .body = null, .invalid = true };
+        const c = c_body[lt + 1];
+        if (c == '!' or c == '?') {
+            pos = wbxml.skipNonElement(c_body, lt) catch return .{ .body = null, .invalid = true };
+            continue;
+        }
+        const end = findTagEnd(c_body, lt) orelse return .{ .body = null, .invalid = true };
+        if (c == '/') {
+            if (depth == 0) return .{ .body = null, .invalid = true };
+            depth -= 1;
+            pos = end + 1;
+            continue;
+        }
+        var j = lt + 1;
+        while (j < c_body.len and !std.ascii.isWhitespace(c_body[j]) and c_body[j] != '/' and c_body[j] != '>') j += 1;
+        const name = c_body[lt + 1 .. j];
+        const self_closing = c_body[end - 1] == '/';
+        if (std.mem.eql(u8, name, "is")) {
+            if (depth == 0) direct += 1 else nested = true;
+        }
+        if (!self_closing) depth += 1;
+        pos = end + 1;
+    }
+    if (nested or direct > 1 or depth != 0) return .{ .body = null, .invalid = true };
+    return .{ .body = extractInlineBody(c_body), .invalid = false };
 }
 
 /// The inner bytes of `<is>…</is>`, when the cell has one — the

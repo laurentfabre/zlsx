@@ -9698,3 +9698,54 @@ test "S7b-5: a count-only shared-string rewrite reads the table as one document 
     try ed.save(io, dst);
     try expectMarkerOnly(io, src, dst);
 }
+
+test "S7b-5: a consumer host with staged appends refuses the edit; an <is> nested under another element is not the cell's (Codex #206 r23 REL-2301, REL-2302)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r23_dst.xlsx");
+    defer a.free(dst);
+    {
+        const src = try tt.path(a, io, "s7b5_r23_appends.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        const row = [_]Cell{.{ .string = "pending" }};
+        const rows = [_][]const Cell{&row};
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.appendRows(1, &rows);
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const host = try wb.sheet(1);
+        try host.appendRows(&rows);
+        const before = try a.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        try std.testing.expectEqual(@as(usize, 1), host.appended_rows.items.len);
+    }
+    const Case = struct { name: []const u8, rows: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "nested_is", .rows = "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><foo><is><t>decoy</t></is></foo></c></row></sheetData>" },
+        .{ .name = "nested_then_direct", .rows = "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><foo><is><t>decoy</t></is></foo><is><t>Row Labels</t></is></c></row></sheetData>" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r23_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", case.rows);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        // A host that does not read as a grid surfaces as such.
+        try std.testing.expectError(error.MalformedSheetXml, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}

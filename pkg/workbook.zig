@@ -3558,10 +3558,11 @@ pub const Workbook = struct {
         // Phase 0b (S7b-3 + S7b-5): the refresh marker for staged
         // cell writes, and the rebuild of every cache and consumer a
         // write lands in — before the sheet phases consume the deltas
-        // and appends it reads (the host cells it writes go straight
-        // to the parts, which the sheet phase then re-emits with the
-        // remaining deltas over them), after the workbook.xml image
-        // the graph walk parses is final.
+        // and appends it reads (a re-laid host's cells and its own
+        // staged writes go to the part in one splice, the pivot's
+        // cells winning where they meet, and no delta of that host is
+        // left for the sheet phase), after the workbook.xml image the
+        // graph walk parses is final.
         try self.refreshPivotCachesForCellWrites();
 
         // Phase 1: SST extension. Walk every worksheet's deltas for
@@ -6352,6 +6353,11 @@ pub const Workbook = struct {
             const ci = t.cache orelse continue;
             const rb = &(rebuilt[ci] orelse continue);
             if (try consumerSeenBefore(&p, i)) continue;
+            // A host with staged appends: the emitter places them
+            // after the sheet's last row, which a grown rectangle
+            // moves — refused, as the save leaves such a host to the
+            // marker (Codex #206 r23 REL-2301).
+            if ((try self.sheet(t.sheet_idx)).appended_rows.items.len > 0) return error.PivotEditUnsafe;
             const base = table_bytes[i] orelse t.raw_xml;
             const map = HostRowMap.forEdit(t.sheet_idx == sheet_idx, axis, idx_1based, kind);
             // With the host's staged writes laid over it: they are
@@ -6635,10 +6641,17 @@ pub const Workbook = struct {
                     // The typed view keeps an inline string's first
                     // `<t>` only; a rich one is its runs joined (Codex
                     // #206 r5 REL-503).
-                    .inline_string => if (cell.inline_body) |body| {
-                        hc.text = try inlineStringText(arena, body);
-                    } else if (cell.raw_value) |raw| {
-                        hc.text = try sst_xml_mod.decodeText(arena, raw);
+                    .inline_string => {
+                        // An `<is>` that is not the cell's one direct
+                        // child — nested under another element, or
+                        // twice — is not a string this reader carries
+                        // (Codex #206 r23 REL-2302).
+                        if (cell.inline_invalid) return error.MalformedSheetXml;
+                        if (cell.inline_body) |body| {
+                            hc.text = try inlineStringText(arena, body);
+                        } else if (cell.raw_value) |raw| {
+                            hc.text = try sst_xml_mod.decodeText(arena, raw);
+                        }
                     },
                     else => {},
                 }
@@ -8470,15 +8483,64 @@ pub const Workbook = struct {
             }
             if (!undecided) break;
             if (!moved) {
-                for (state) |*st| if (st.* == .undecided) {
-                    st.* = .dropped;
+                // Nothing peels: every undecided node has an undecided
+                // predecessor, so a cycle sits among them. Only the
+                // nodes ON a cycle fall — one that merely reads from
+                // a cycle stands once the cycle's writes are withdrawn
+                // (Codex #206 r23 REL-2303).
+                // Judged all before any falls: a node dropped mid-pass
+                // would hide the cycle from the next one.
+                var cyclic: [256]bool = [_]bool{false} ** 256;
+                if (n > cyclic.len) return error.OutOfMemory;
+                var any_cyclic = false;
+                for (0..n) |j| {
+                    if (state[j] != .undecided) continue;
+                    cyclic[j] = reachesItself(edges, state, n, j);
+                    if (cyclic[j]) any_cyclic = true;
+                }
+                for (0..n) |j| if (cyclic[j]) {
+                    state[j] = .dropped;
                 };
-                break;
+                if (!any_cyclic) {
+                    for (state) |*st| if (st.* == .undecided) {
+                        st.* = .dropped;
+                    };
+                    break;
+                }
             }
         }
         const kept = try arena.alloc(bool, n);
         for (state, kept) |st, *k| k.* = st == .kept;
         return kept;
+    }
+
+    /// Does `j` reach itself through undecided nodes? A bounded walk
+    /// over the edge matrix — `n` is the cache count.
+    fn reachesItself(edges: []const bool, state: anytype, n: usize, j: usize) bool {
+        var visited: [256]bool = [_]bool{false} ** 256;
+        if (n > visited.len) return true; // too many to walk: conservative
+        var stack: [256]usize = undefined;
+        var top: usize = 0;
+        for (0..n) |k| {
+            if (k != j and edges[j * n + k] and state[k] == .undecided and !visited[k]) {
+                visited[k] = true;
+                stack[top] = k;
+                top += 1;
+            }
+        }
+        while (top > 0) {
+            top -= 1;
+            const x = stack[top];
+            if (edges[x * n + j]) return true;
+            for (0..n) |k| {
+                if (k != x and edges[x * n + k] and state[k] == .undecided and !visited[k]) {
+                    visited[k] = true;
+                    stack[top] = k;
+                    top += 1;
+                }
+            }
+        }
+        return false;
     }
 
     const StagedRefresh = struct {
@@ -25287,6 +25349,16 @@ test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a 
         edges[2 * 3 + 1] = true;
         const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
         try std.testing.expectEqualSlices(bool, &.{ true, true, false }, kept);
+    }
+    // A ↔ B with A → C: the cycle falls, its reader stands once the
+    // cycle's writes are withdrawn (Codex #206 r23 REL-2303).
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 1] = true;
+        edges[1 * 3 + 0] = true;
+        edges[0 * 3 + 2] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ false, false, true }, kept);
     }
     // A ↔ B: a cycle, both fall; C beside it stands.
     {
