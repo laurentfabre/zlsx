@@ -9605,3 +9605,61 @@ test "S7b-5: a sheetData or dimension nested under another element is not the ro
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: a host's own staged writes go into the pivot's splice, byte-preservingly; a crossed close, a second top-level element, a wrapped shared-string root, an empty inline string (Codex #206 r21 REL-2101, SEC-2103, SEC-2104, REL-2102)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r21_dst.xlsx");
+    defer a.free(dst);
+    {
+        const src = try tt.path(a, io, "s7b5_r21_deltas.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        const kept_row = "<row r=\"2\" ht=\"30\" customHeight=\"1\"><c r=\"D2\"><f t=\"shared\" ref=\"D2:D3\" si=\"0\">A1*2</f><v>0</v></c></row>";
+        const rows = try std.mem.concat(a, u8, &.{ "</row>", kept_row, "</sheetData><!--<sheetData/>-->" });
+        defer a.free(rows);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", rows);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.setCell(1, 9, 4, .{ .string = "note" });
+        try ed.setCell(1, 9, 5, .{ .integer = 7 });
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const host = (try store.part("xl/worksheets/sheet2.xml")).?.bytes;
+        try std.testing.expect(std.mem.indexOf(u8, host, kept_row) != null);
+        try std.testing.expect(std.mem.indexOf(u8, host, "</sheetData><!--<sheetData/>-->") != null);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "E9", .{ .text = "note" });
+        try expectHostCell(&wb, 1, "F9", .{ .number = 7 });
+        try expectHostCell(&wb, 1, "A6", .{ .text = "Central" });
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    }
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "crossed_close", .part = "xl/worksheets/sheet2.xml", .old = "<sheetData>", .new = "<foo></worksheet><sheetData/></foo><sheetData>" },
+        .{ .name = "second_top_level", .part = "xl/worksheets/sheet2.xml", .old = "</worksheet>", .new = "</worksheet><foo><sheetData/></foo>" },
+        .{ .name = "wrapped_sst", .part = "xl/sharedStrings.xml", .old = "<sst ", .new = "<wrapper><sst/></wrapper><sst " },
+        .{ .name = "empty_inline", .part = "xl/worksheets/sheet2.xml", .old = "</row></sheetData>", .new = "</row><row r=\"7\"><c r=\"A7\" t=\"inlineStr\"><is/></c></row></sheetData>" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r21_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, case.part, case.old, case.new);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}

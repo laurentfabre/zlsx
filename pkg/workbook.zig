@@ -6608,7 +6608,9 @@ pub const Workbook = struct {
                 const pre: CellRef = .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
                 if (pre.row != row.row_idx) return error.MalformedSheetXml;
                 const post = (try map.map(pre)) orelse continue;
-                var hc: HostCell = .{ .occupied = cell.raw_value != null or cell.formula != null, .text = null, .style = cell.style_idx };
+                // An inline string with nothing in it (`<is/>`) is a
+                // value all the same (Codex #206 r21 REL-2102).
+                var hc: HostCell = .{ .occupied = cell.raw_value != null or cell.formula != null or cell.inline_body != null, .text = null, .style = cell.style_idx };
                 if (cell.cell_type_invalid or cell.style_invalid) {
                     hc.occupied = true;
                     hc.style = null;
@@ -6924,8 +6926,58 @@ pub const Workbook = struct {
             .shared_string => |txt| try strings.append(a, txt),
             else => {},
         };
+        // The host's own staged writes go in the same splice, the
+        // pivot's cells winning where they meet — one emit per host,
+        // byte-preserving, instead of the sheet phase regenerating
+        // `<sheetData>` whole for what remained (Codex #206 r21
+        // REL-2101). Their strings join the plan below.
+        var merged_sheets: std.ArrayListUnmanaged(HostSheetWrites) = .empty;
+        errdefer {
+            for (merged_sheets.items) |*ps| {
+                ps.deltas.deinit(a);
+                ps.styles.deinit(a);
+            }
+            merged_sheets.deinit(a);
+        }
+        for (host_writes) |hw| {
+            var slot: ?*HostSheetWrites = null;
+            for (merged_sheets.items) |*ps| if (ps.sheet_idx == hw.sheet_idx) {
+                slot = ps;
+            };
+            if (slot == null) {
+                try merged_sheets.append(a, .{ .sheet_idx = hw.sheet_idx, .part_name = hw.sheet_part_name });
+                slot = &merged_sheets.items[merged_sheets.items.len - 1];
+            }
+            const ps = slot.?;
+            for (hw.cells) |c| {
+                // Two pivots writing one cell are two rectangles that
+                // overlap, which Excel refuses (Codex #206 r3 REL-303).
+                const gop = try ps.deltas.getOrPut(a, c.ref);
+                if (gop.found_existing) return error.PivotEditUnsafe;
+                gop.value_ptr.* = c.value;
+                try ps.styles.put(a, c.ref, c.style);
+            }
+        }
+        for (merged_sheets.items) |*ps| {
+            const ws = try self.sheet(ps.sheet_idx);
+            var it = ws.deltas.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                if (ps.deltas.contains(ref)) continue;
+                try ps.deltas.put(a, ref, entry.value_ptr.*);
+                var ref_buf: [16]u8 = undefined;
+                const existing = try ws.cellByRef(formatA1Ref(&ref_buf, ref));
+                try ps.styles.put(a, ref, if (existing) |c| c.style_idx else null);
+                switch (entry.value_ptr.*) {
+                    .shared_string => |txt| try strings.append(a, txt),
+                    else => {},
+                }
+            }
+        }
         var out: RenderedHostWrites = .{ .plan = try self.sstPlanForStrings(strings.items) };
         errdefer out.deinit(a);
+        out.sheets = merged_sheets;
+        merged_sheets = .empty;
         // A workbook with strings on a pivot host and no shared-string
         // table is not one Excel wrote; adding the part, its
         // relationship and its content type is a mutation outside the
@@ -6952,25 +7004,6 @@ pub const Workbook = struct {
                 a.free(stripped);
             } else {
                 out.sst_bytes = stripped;
-            }
-        }
-        for (host_writes) |hw| {
-            var slot: ?*HostSheetWrites = null;
-            for (out.sheets.items) |*ps| if (ps.sheet_idx == hw.sheet_idx) {
-                slot = ps;
-            };
-            if (slot == null) {
-                try out.sheets.append(a, .{ .sheet_idx = hw.sheet_idx, .part_name = hw.sheet_part_name });
-                slot = &out.sheets.items[out.sheets.items.len - 1];
-            }
-            const ps = slot.?;
-            for (hw.cells) |c| {
-                // Two pivots writing one cell are two rectangles that
-                // overlap, which Excel refuses (Codex #206 r3 REL-303).
-                const gop = try ps.deltas.getOrPut(a, c.ref);
-                if (gop.found_existing) return error.PivotEditUnsafe;
-                gop.value_ptr.* = c.value;
-                try ps.styles.put(a, c.ref, c.style);
             }
         }
         for (out.sheets.items) |*ps| {
@@ -7018,7 +7051,8 @@ pub const Workbook = struct {
         // may spell any of it (Codex #206 r4 SEC-401) — and the root's
         // own direct child, not one nested under another element
         // (r20 SEC-2001).
-        const sd_tag = (try rootChild(src, "sheetData")) orelse return error.NoSheetData;
+        const sd_tag = (try scanDocument(src, "worksheet", "sheetData")).child orelse return error.NoSheetData;
+        const dim_tag = (try scanDocument(src, "worksheet", "dimension")).child;
         var pos: usize = 0;
         const sd_self_closing = src[sd_tag.after_open - 2] == '/';
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -7027,7 +7061,7 @@ pub const Workbook = struct {
 
         // Everything before the rows, the dimension widened on the way.
         const head_end: usize = if (sd_self_closing) sd_tag.start else sd_tag.after_open;
-        try appendWithDimension(a, &out, src[0..head_end], cells.items);
+        try appendWithDimension(a, &out, src, head_end, dim_tag, cells.items);
         if (sd_self_closing) try out.appendSlice(a, "<sheetData>");
 
         var next: usize = 0; // into `cells`
@@ -7158,14 +7192,27 @@ pub const Workbook = struct {
         return try out.toOwnedSlice(a);
     }
 
-    /// The root's direct child named `name`, by a depth-tracked walk
-    /// over the part: null when the root has none; malformed when it
-    /// has two, or when the name appears at any other depth — a
-    /// decoy under another element that a shallower search would
-    /// take for the grid (Codex #206 r20 SEC-2001).
-    fn rootChild(src: []const u8, name: []const u8) Error!?zlsx.TagOpen {
-        var found: ?zlsx.TagOpen = null;
+    /// One XML document read whole: exactly one document element,
+    /// named `root_name`, every close the open it closes, nothing but
+    /// comments and processing instructions outside the root (Codex
+    /// #206 r21 SEC-2103, SEC-2104) — and, when asked, the root's one
+    /// direct child named `child_name`: an occurrence at any other
+    /// depth, or a second one, is malformed (r20 SEC-2001).
+    const DocScan = struct {
+        root: zlsx.TagOpen,
+        /// The `<` of the root's close tag; the root's `after_open`
+        /// for a self-closing root.
+        root_close_lt: usize,
+        child: ?zlsx.TagOpen,
+    };
+
+    fn scanDocument(src: []const u8, root_name: []const u8, child_name: ?[]const u8) Error!DocScan {
+        const max_depth = 64;
+        var stack: [max_depth][]const u8 = undefined;
         var depth: usize = 0;
+        var root: ?zlsx.TagOpen = null;
+        var root_close_lt: ?usize = null;
+        var child: ?zlsx.TagOpen = null;
         var pos: usize = 0;
         while (try nextMarkup(src, pos, src.len)) |m| {
             pos = m.after;
@@ -7173,19 +7220,38 @@ pub const Workbook = struct {
                 .non_element => {},
                 .close => {
                     if (depth == 0) return error.MalformedSheetXml;
+                    if (!closeTagIs(src, m, stack[depth - 1])) return error.MalformedSheetXml;
                     depth -= 1;
+                    if (depth == 0) root_close_lt = m.lt;
                 },
                 .open => {
+                    if (root_close_lt != null) return error.MalformedSheetXml;
+                    var j = m.lt + 1;
+                    while (j < src.len and src[j] != ' ' and src[j] != '\t' and src[j] != '\n' and src[j] != '\r' and src[j] != '/' and src[j] != '>') j += 1;
+                    const name = src[m.lt + 1 .. j];
+                    if (name.len == 0) return error.MalformedSheetXml;
                     const self_closing = src[m.after - 2] == '/';
-                    if (sheet_edit.matchTagAt(src, m.lt, name)) |t| {
-                        if (depth != 1 or found != null) return error.MalformedSheetXml;
-                        found = t;
+                    const t: zlsx.TagOpen = .{ .start = m.lt, .after_open = m.after };
+                    if (depth == 0) {
+                        if (root != null or !std.mem.eql(u8, name, root_name)) return error.MalformedSheetXml;
+                        root = t;
+                        if (self_closing) root_close_lt = m.after;
+                    } else if (child_name) |cn| {
+                        if (std.mem.eql(u8, name, cn)) {
+                            if (depth != 1 or child != null) return error.MalformedSheetXml;
+                            child = t;
+                        }
                     }
-                    if (!self_closing) depth += 1;
+                    if (!self_closing) {
+                        if (depth >= max_depth) return error.MalformedSheetXml;
+                        stack[depth] = name;
+                        depth += 1;
+                    }
                 },
             }
         }
-        return found;
+        if (depth != 0) return error.MalformedSheetXml;
+        return .{ .root = root orelse return error.MalformedSheetXml, .root_close_lt = root_close_lt orelse return error.MalformedSheetXml, .child = child };
     }
 
     /// The next markup at or after `pos` and before `end`: a comment,
@@ -7199,7 +7265,9 @@ pub const Workbook = struct {
 
     fn nextMarkup(src: []const u8, pos: usize, end: usize) Error!?Markup {
         const lt = std.mem.indexOfScalarPos(u8, src, pos, '<') orelse return null;
-        if (lt >= end or lt + 1 >= src.len) return error.MalformedSheetXml;
+        // A `<` at or past `end` is the caller's bound, not markup.
+        if (lt >= end) return null;
+        if (lt + 1 >= src.len) return error.MalformedSheetXml;
         const c = src[lt + 1];
         if (c == '!' or c == '?') {
             const after = wbxml_typed.skipNonElement(src, lt) catch return error.MalformedSheetXml;
@@ -7315,14 +7383,33 @@ pub const Workbook = struct {
                 try out.appendSlice(a, try std.fmt.bufPrint(&ibuf, "{d}", .{idx}));
                 try out.appendSlice(a, "</v></c>");
             },
-            // The planner writes nothing else.
-            else => return error.MalformedXml,
+            // The host's own staged writes, spelt as the sheet phase
+            // spells them (r21 REL-2101).
+            .string => |txt| {
+                try out.appendSlice(a, " t=\"inlineStr\"><is><t");
+                if (txt.len > 0 and (txt[0] == ' ' or txt[txt.len - 1] == ' ')) try out.appendSlice(a, " xml:space=\"preserve\"");
+                try out.append(a, '>');
+                try appendXmlEscapedText(a, out, txt);
+                try out.appendSlice(a, "</t></is></c>");
+            },
+            .boolean => |b| {
+                try out.appendSlice(a, " t=\"b\"><v>");
+                try out.appendSlice(a, if (b) "1" else "0");
+                try out.appendSlice(a, "</v></c>");
+            },
+            .formula => |f| {
+                try out.appendSlice(a, "><f>");
+                try appendXmlEscapedText(a, out, f);
+                try out.appendSlice(a, "</f></c>");
+            },
+            .deleted => unreachable,
         }
     }
 
     /// `src` (the part up to the rows) with `<dimension ref>` widened
     /// to cover the planned cells — a part without one is left so.
-    fn appendWithDimension(a: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8, cells: []const PlannedCell) Error!void {
+    fn appendWithDimension(a: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8, head_end: usize, dim: ?zlsx.TagOpen, cells: []const PlannedCell) Error!void {
+        const head = src[0..head_end];
         var rect: ?pivots_mod.edit.Rect = null;
         for (cells) |c| {
             if (c.value == .deleted) continue;
@@ -7334,18 +7421,23 @@ pub const Workbook = struct {
             } else rect = .{ .tl_row = c.ref.row, .tl_col = c.ref.col, .br_row = c.ref.row, .br_col = c.ref.col };
         }
         const want = rect orelse {
-            try out.appendSlice(a, src);
+            try out.appendSlice(a, head);
             return;
         };
-        // The element by the walk (a comment may spell one), the
-        // root's own direct child (r20 SEC-2001).
-        const t = (try rootChild(src, "dimension")) orelse {
-            try out.appendSlice(a, src);
+        // The element as the document scan placed it — the root's
+        // own direct child (r20 SEC-2001, r21 SEC-2103); one past the
+        // rows is not in the head.
+        const t = dim orelse {
+            try out.appendSlice(a, head);
             return;
         };
+        if (t.after_open > head_end) {
+            try out.appendSlice(a, head);
+            return;
+        }
         const attrs = std.mem.trimEnd(u8, src[t.start + "<dimension".len .. t.after_open - 1], " \t\r\n/");
         const raw = wbxml_typed.getAttr(attrs, "ref") orelse {
-            try out.appendSlice(a, src);
+            try out.appendSlice(a, head);
             return;
         };
         var buf: [64]u8 = undefined;
@@ -7361,7 +7453,7 @@ pub const Workbook = struct {
         // and close, stays (Codex #206 r4 REL-405).
         try out.appendSlice(a, src[0..t.start]);
         try sheet_edit.writeWithReplacedAttr(a, out, src, t, "<dimension".len, "ref", new_ref);
-        try out.appendSlice(a, src[t.after_open..]);
+        try out.appendSlice(a, src[t.after_open..head_end]);
     }
 
     /// A `<row r>` decoded and read as a row number.
@@ -7440,14 +7532,11 @@ pub const Workbook = struct {
                 view.deinit(a);
                 ws.parsed = null;
             }
-            var it = ps.deltas.keyIterator();
-            while (it.next()) |ref| {
-                if (ws.deltas.fetchRemove(ref.*)) |kv| switch (kv.value) {
-                    .string, .shared_string => |txt| a.free(txt),
-                    .formula => |f| a.free(f),
-                    else => {},
-                };
-            }
+            // Every staged write of the host went into the splice —
+            // the pivot's cells over it where they met — so none is
+            // left for the sheet phase to re-emit (r21 REL-2101).
+            freeDeltaStrings(a, &ws.deltas);
+            ws.deltas.clearAndFree(a);
         }
     }
 
@@ -10000,17 +10089,14 @@ fn emitSstXmlForExtension(
     // The root by the markup walk — a comment, CDATA section or
     // processing instruction may spell one, and a `>` inside a quoted
     // attribute is not the tag's end (Codex #206 r15 SEC-1506).
-    var root: ?zlsx.TagOpen = null;
-    var pos: usize = 0;
-    while (try Workbook.nextMarkup(src_xml, pos, src_xml.len)) |m| {
-        pos = m.after;
-        if (m.kind != .open) continue;
-        if (sheet_edit.matchTagAt(src_xml, m.lt, "sst")) |t| {
-            root = t;
-            break;
-        }
-    }
-    const sst_tag = root orelse return error.MalformedXml;
+    // The one document element, `<sst>`, its close the one that
+    // closes it (Codex #206 r21 SEC-2104): a table wrapped in another
+    // element, or one beside a decoy, refuses.
+    const doc = Workbook.scanDocument(src_xml, "sst", null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedXml,
+    };
+    const sst_tag = doc.root;
     const sst_open = sst_tag.start;
     const sst_open_gt = sst_tag.after_open - 1;
     const is_self_closing = src_xml[sst_open_gt - 1] == '/';
@@ -10067,20 +10153,14 @@ fn emitSstXmlForExtension(
     // by the walk, past any spelling of it in a comment — then append
     // new entries (plain then rich), then `</sst>` + trailing.
     const body_start = sst_open_gt + 1;
-    var close_at: ?usize = null;
+    // A root inside the root is a table whose entries the parser and
+    // the writer would number differently (Codex #206 r17 SEC-1701).
     var bpos = body_start;
-    while (try Workbook.nextMarkup(src_xml, bpos, src_xml.len)) |m| {
+    while (try Workbook.nextMarkup(src_xml, bpos, doc.root_close_lt)) |m| {
         bpos = m.after;
-        // A root inside the root is a table whose entries the parser
-        // and the writer would number differently (Codex #206 r17
-        // SEC-1701): refused, not walked around.
         if (m.kind == .open and sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
-        if (m.kind == .close and Workbook.closeTagIs(src_xml, m, "sst")) {
-            close_at = m.lt;
-            break;
-        }
     }
-    const close = close_at orelse return error.MalformedXml;
+    const close = doc.root_close_lt;
     try out.appendSlice(allocator, src_xml[body_start..close]);
     try appendNewSiEntries(allocator, &out, new_strings);
     try appendNewRichSiEntries(allocator, &out, new_rich);
