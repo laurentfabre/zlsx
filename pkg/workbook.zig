@@ -6535,6 +6535,38 @@ pub const Workbook = struct {
 
     const HostGrid = std.AutoHashMapUnmanaged(CellRef, HostCell);
 
+    /// The typed reader and the splicer know the host's cells, rows
+    /// and merges by their unprefixed names: a part that binds the
+    /// main namespace to a prefix, or rebinds the default below the
+    /// root, spells cells they cannot see (Codex #206 r18 REL-1801)
+    /// — refused before anything is planned over it, as the pivot
+    /// parts' own hygiene check refuses an alias.
+    fn hostNamespaceHygiene(xml: []const u8) Error!void {
+        const uris = typed_parts.pivot_xml.main_ns_uris;
+        var pos: usize = 0;
+        var root_seen = false;
+        while (try nextMarkup(xml, pos, xml.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            var j = m.lt + 1;
+            while (j < xml.len and xml[j] != ' ' and xml[j] != '\t' and xml[j] != '\n' and xml[j] != '\r' and xml[j] != '/' and xml[j] != '>') j += 1;
+            const attrs = xml[j .. m.after - 1];
+            var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+            while (it.next()) |a| {
+                const is_default = std.mem.eql(u8, a.name, "xmlns");
+                const is_prefixed = std.mem.startsWith(u8, a.name, "xmlns:");
+                if (!is_default and !is_prefixed) continue;
+                var main = false;
+                for (uris) |u| if (std.mem.eql(u8, a.value, u)) {
+                    main = true;
+                };
+                if (is_prefixed and main) return error.PivotEditUnsafe;
+                if (is_default and root_seen) return error.PivotEditUnsafe;
+            }
+            root_seen = true;
+        }
+    }
+
     /// The host's merged ranges in post-edit coordinates — a blank
     /// merge holds no `<c>`, so the grid alone cannot see it in a
     /// grown rectangle's way (Codex #206 r1 REL-103). A merge the
@@ -6561,6 +6593,8 @@ pub const Workbook = struct {
     fn readHostGrid(self: *Workbook, arena: Allocator, sheet_idx: u32, map: HostRowMap, with_writes: bool) Error!HostGrid {
         var grid: HostGrid = .{};
         const ws = try self.sheet(sheet_idx);
+        const part = (try self.store.part(try ws.resolvePartName())) orelse return error.MissingSheetPart;
+        try hostNamespaceHygiene(part.bytes);
         const view = try ws.ensureParsed();
         for (view.rows) |row| {
             for (row.cells) |cell| {

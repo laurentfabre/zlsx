@@ -9527,3 +9527,40 @@ test "S7b-5: a shared-string root nested in the root refuses the edit and leaves
     try ed.save(io, dst);
     try expectMarkerOnly(io, src, dst);
 }
+
+test "S7b-5: a host that aliases or rebinds the main namespace refuses the edit and leaves the save at the marker (Codex #206 r18 REL-1801)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r18_dst.xlsx");
+    defer a.free(dst);
+    const Case = struct { name: []const u8, rows: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "alias", .rows = "</row><row r=\"7\"><x:c xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" r=\"A7\"><v>1</v></x:c></row></sheetData>" },
+        .{ .name = "rebind", .rows = "</row><row r=\"7\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><c r=\"A7\"><v>1</v></c></row></sheetData>" },
+        .{ .name = "alias_merge", .rows = "</row></sheetData><x:mergeCells xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\"><x:mergeCell ref=\"A7:B7\"/></x:mergeCells>" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r18_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", case.rows);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}
