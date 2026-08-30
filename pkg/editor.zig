@@ -10114,3 +10114,52 @@ test "S7b-5: an <si> after the extension list or nested under another element re
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: entity-spelled item, axis-item and showDataAs enums are their decoded values — the form is admitted on both paths (Codex #206 r31 REL-3101)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r31_dst.xlsx");
+    defer a.free(dst);
+    const pt = "xl/pivotTables/pivotTable1.xml";
+    // Replacing `A3` (West, one record) keeps two groups — Central at
+    // `A5`; replacing `A2` (one of East's two) makes three — at `A6`.
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8, row: u32 = 3, at: []const u8 = "A5", total: []const u8 = "B6" };
+    const cases = [_]Case{
+        .{ .name = "control_a3", .old = "t=\"grand\"", .new = "t=\"grand\"" },
+        .{ .name = "control_a2", .old = "t=\"grand\"", .new = "t=\"grand\"", .row = 2, .at = "A6", .total = "B7" },
+        .{ .name = "item_default", .old = "t=\"default\"", .new = "t=\"def&#x61;ult\"" },
+        .{ .name = "axis_grand", .old = "t=\"grand\"", .new = "t=\"gr&#x61;nd\"" },
+        .{ .name = "show_data_as", .old = "baseField=\"0\"", .new = "showDataAs=\"nor&#x6d;al\" baseField=\"0\"" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        const src = try tt.path(a, io, case.name);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, pt, case.old, case.new);
+        {
+            var ed = try Editor.open(a, io, src);
+            defer ed.deinit();
+            try ed.insertRow(0, 2);
+            try ed.save(io, dst);
+            var wb = try Workbook.open(a, io, dst);
+            defer wb.deinit();
+            try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+            try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+        }
+        {
+            var ed = try Editor.open(a, io, src);
+            defer ed.deinit();
+            try ed.setCell(0, case.row, 0, .{ .string = "Central" });
+            try ed.save(io, dst);
+            var wb = try Workbook.open(a, io, dst);
+            defer wb.deinit();
+            try expectHostCell(&wb, 1, case.at, .{ .text = "Central" });
+            try expectHostCell(&wb, 1, case.total, .{ .number = 12 });
+        }
+    }
+}

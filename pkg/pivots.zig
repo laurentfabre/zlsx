@@ -3191,7 +3191,7 @@ pub const engine = struct {
             if (it.t) |t| {
                 // One subtotal item, last; an item that is both a
                 // cache item and a derived one is neither.
-                if (!std.mem.eql(u8, t, "default") or default_item or it.x != null) return error.PivotShapeUnsupported;
+                if (!attrIs(t, "default") or default_item or it.x != null) return error.PivotShapeUnsupported;
                 default_item = true;
                 continue;
             }
@@ -3426,7 +3426,7 @@ pub const engine = struct {
         for (ri.items) |it| {
             if (it.other_attrs or it.has_other_children or it.r != null or it.i != null) return error.PivotShapeUnsupported;
             if (it.t) |t| {
-                if (!std.mem.eql(u8, t, "grand") or seen_grand) return error.PivotShapeUnsupported;
+                if (!attrIs(t, "grand") or seen_grand) return error.PivotShapeUnsupported;
                 seen_grand = true;
                 if (it.xs.len != 1) return error.PivotShapeUnsupported;
             } else {
@@ -3474,7 +3474,7 @@ pub const engine = struct {
         // The data fields.
         for (def.data_fields) |df| {
             if (df.fld >= def.fields.len) return error.MalformedPivotXml;
-            if (df.show_data_as) |s| if (!std.mem.eql(u8, s, "normal")) return error.PivotShapeUnsupported;
+            if (df.show_data_as) |s| if (!attrIs(s, "normal")) return error.PivotShapeUnsupported;
             // Text under a numeric aggregate is skipped, as SUM skips
             // it on the grid; `count` counts it. The dispersions need
             // Excel's own summation order to agree to the bit.
@@ -3483,6 +3483,15 @@ pub const engine = struct {
                 .std_dev, .std_dev_p, .variance, .variance_p, .unknown => return error.PivotShapeUnsupported,
             }
         }
+    }
+
+    /// An enum-valued attribute kept as written says `want` by its
+    /// decoded value — `def&#x61;ult` is `default` (Codex #206 r31
+    /// REL-3101); one that does not decode says nothing.
+    fn attrIs(raw: []const u8, want: []const u8) bool {
+        var buf: [32]u8 = undefined;
+        const v = wbxml.decodeScalarAttr(&buf, raw) orelse return false;
+        return std.mem.eql(u8, v, want);
     }
 
     /// Root display options that change what the cells hold, which
