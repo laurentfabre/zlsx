@@ -979,6 +979,12 @@ pub const Workbook = struct {
     /// Editor's pre-flight is the one run its sweep installs (Codex
     /// #205 r1 PERF-101 pins it).
     pivot_rebuilds: u32 = 0,
+    /// Bumped by every staged cell write (`Worksheet.setCell`,
+    /// `deleteCell`, `appendRows`): a pre-flighted pivot collection
+    /// read the host's staged writes for its occupancy check, so a
+    /// write staged after it ages the collection as a store mutation
+    /// does (Codex #206 r6 REL-601).
+    staged_writes: u64 = 0,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -5769,6 +5775,8 @@ pub const Workbook = struct {
         owner: *const Workbook,
         /// `PartStore.mutations` at collection.
         mutations: u64,
+        /// `Workbook.staged_writes` at collection.
+        staged_writes: u64,
         sheet_part_name: []const u8,
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
@@ -6202,6 +6210,7 @@ pub const Workbook = struct {
         var prepared: PreparedPivotEdits = .{
             .owner = self,
             .mutations = self.store.mutations,
+            .staged_writes = self.staged_writes,
             .sheet_part_name = try self.allocator.dupe(u8, sheet_part_name),
             .axis = axis,
             .idx_1based = idx_1based,
@@ -7374,7 +7383,7 @@ pub const Workbook = struct {
         // The pre-flight's own collection, for this very edit, on
         // this workbook, over this store as it was: anything else
         // is a token for another edit (Codex #205 r6 REL-605).
-        const same = p.owner == self and p.mutations == self.store.mutations and
+        const same = p.owner == self and p.mutations == self.store.mutations and p.staged_writes == self.staged_writes and
             std.mem.eql(u8, p.sheet_part_name, sheet_part_name) and
             p.axis == axis and p.idx_1based == idx_1based and p.kind == kind;
         if (!same) return error.PivotEditUnsafe;
@@ -7886,10 +7895,18 @@ pub const Workbook = struct {
             }
         }
         if (!any_writes) return;
-        if (!(try self.carriesPivotCache())) return;
+        // The graph is read best-effort at save: a part that cannot be
+        // read — malformed, a corrupt entry, one past the decompression
+        // caps — marks nothing and the save proceeds; only a resource
+        // failure is the save's (Codex #206 r6 REL-603).
+        const carries = self.carriesPivotCache() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        if (!carries) return;
         var p = self.pivotTables() catch |e| switch (e) {
-            error.MalformedPivotXml => return,
-            else => |other| return other,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
         };
         defer p.deinit();
         if (p.caches.len == 0) return;
@@ -10402,6 +10419,7 @@ pub const Worksheet = struct {
         };
 
         try self.deltas.put(a, cr, stored);
+        self.workbook.staged_writes +%= 1;
     }
 
     /// Stage a deletion for cell `ref`. After `Workbook.save`, the
@@ -10483,6 +10501,7 @@ pub const Worksheet = struct {
             // Capacity reserved above — appendAssumeCapacity is
             // infallible from here.
             self.appended_rows.appendAssumeCapacity(owned);
+            self.workbook.staged_writes +%= 1;
         }
     }
 

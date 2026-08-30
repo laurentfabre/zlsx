@@ -8485,6 +8485,9 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole �
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r6 REL-602: the area's own `field`.
+        .{ .name = "chart_area_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" field=\"0\"/></chartFormat></chartFormats><pivotTableStyleInfo" },
+        .{ .name = "chart_area_values", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" field=\"4294967294\"/></chartFormat></chartFormats><pivotTableStyleInfo", .admitted = true },
         .{ .name = "chart_on_values", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo", .admitted = true },
         .{ .name = "no_row_items", .old = "<rowItems count=\"3\"><i><x/></i><i><x v=\"1\"/></i><i t=\"grand\"><x/></i></rowItems>", .new = "" },
     };
@@ -9022,4 +9025,33 @@ test "S7b-5: a staged write over a source cell the read refuses is read as the w
         try expectHostCell(&wb, 1, "A3", .{ .text = "Étiquettes de lignes" });
         try expectHostCell(&wb, 1, "A7", .{ .text = "Total général" });
     }
+}
+
+test "S7b-5: a write staged on the host after the pre-flight ages the prepared collection — refused, the write kept (Codex #206 r6 REL-601)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r6_token.xlsx");
+    defer a.free(src);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const parts = [_][]const u8{ "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml", "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", "xl/pivotTables/pivotTable1.xml" };
+    var before: [parts.len][]u8 = undefined;
+    for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+    defer for (before) |b| a.free(b);
+    var prepared = try wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 2, .insert);
+    defer prepared.deinit(a);
+    // `Report!A7` is the row the grown rectangle would take.
+    const host = try wb.sheet(1);
+    try host.setCell("A7", .{ .shared_string = "note" });
+    try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 2, .kind = .insert }, &prepared));
+    for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+    try std.testing.expect(host.deltas.contains(.{ .row = 7, .col = 1 }));
+    // Pre-flighted again over the staged write, the edit refuses on its
+    // own terms: the growth cell is taken.
+    try std.testing.expectError(error.PivotEditUnsafe, wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 2, .insert));
 }

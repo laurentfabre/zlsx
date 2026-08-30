@@ -1010,6 +1010,12 @@ fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFo
         var areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
         while (try areas.next()) |pa| {
             if (!std.mem.eql(u8, pa.local, "pivotArea")) return .other;
+            // The area's own `field` names a field as a reference does
+            // (Codex #206 r6 REL-602).
+            if (try u32Attr(pa.attrs(xml), "field")) |field| {
+                if (field != 4294967294) return .other;
+                any_field = true;
+            }
             var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
             while (try refs_blocks.next()) |rb| {
                 if (!std.mem.eql(u8, rb.local, "references")) return .other;
