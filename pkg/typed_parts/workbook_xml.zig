@@ -124,11 +124,28 @@ pub const WorkbookXml = struct {
 /// module docstring for the full lifetime contract.
 pub fn parse(allocator: std.mem.Allocator, xml: []const u8) Error!WorkbookXml {
     assert(@TypeOf(xml) == []const u8);
-    // Empty input cannot describe a valid workbook root.
-    if (xml.len == 0) return error.MissingRoot;
-
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
+    return parseWith(&arena, xml);
+}
+
+/// `parse` over a private copy of `xml`: the view borrows every name
+/// and `r:id` from the bytes it was given, so a caller whose bytes are
+/// transient (a patched `workbook.xml` not yet in the store — the
+/// pre-write parse a transactional `addSheet` needs) parses this way
+/// and the copy lives in the view's arena, freed by `deinit`.
+pub fn parseOwning(allocator: std.mem.Allocator, xml: []const u8) Error!WorkbookXml {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const copy = try arena.allocator().dupe(u8, xml);
+    return parseWith(&arena, copy);
+}
+
+/// The parse proper. `arena` is the caller's — on error the caller
+/// frees it, on success the returned view takes it over by value.
+fn parseWith(arena: *std.heap.ArenaAllocator, xml: []const u8) Error!WorkbookXml {
+    // Empty input cannot describe a valid workbook root.
+    if (xml.len == 0) return error.MissingRoot;
     const arena_alloc = arena.allocator();
 
     // Locate the `<workbook` root. We search for the prefix and
@@ -160,7 +177,7 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) Error!WorkbookXml {
         .sheets = sheets_slice,
         .defined_names = defined_names_slice,
         .calc = calc,
-        .arena = arena,
+        .arena = arena.*,
     };
 }
 

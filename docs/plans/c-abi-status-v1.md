@@ -364,8 +364,9 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 | The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
 | The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
-| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix) | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
-| `TableNotFound`, `TableColumnNotFound`, `TableColumnNameInUse` | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
+| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing, the table-shaped `SheetIndexOutOfRange` (decision S3a-9) |
+| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
+| | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
 
 The list is `c_abi.zig::structural_refusals`, one place. The editor folds
@@ -402,13 +403,31 @@ a failed growth as `WriteFailed`, which the builder maps to
 `OutOfMemory` so the boundary answers `-3`, never a generic `-1`
 (Codex #207 r1 REL-103; pinned by an allocation-failure sweep).
 
-**Two more boundary mappings** (decisions S3a-6, S3a-7): the typed
-worksheet parser's `MalformedXml` / `UnexpectedEof` — reached lazily by a
-sheet delete and by the sweeps — cross from the structural exports as
-`MalformedSheetXml` (`failStructural`); a pivot part the store cannot
-materialise (a bad CRC, a broken stream) makes `zlsx_editor_pivots_ndjson`
-refuse as `MalformedPivotXml`, with `OutOfMemory` and `ZipBombSuspected`
-keeping their own statuses.
+**Two more mappings** (decisions S3a-6, S3a-7): a worksheet part the
+typed parser cannot read — reached lazily by a sheet delete and by the
+sweeps — is the sheet transform's own `MalformedSheetXml`, spelled so at
+the one call site (`Worksheet.ensureParsed`) rather than renamed at the
+boundary, where a generic `MalformedXml` from any other part would have
+been mislabelled (r3 REL-302); a pivot part the store cannot materialise
+(a bad CRC, a broken stream) makes `zlsx_editor_pivots_ndjson` refuse as
+`MalformedPivotXml`, with `OutOfMemory` and `ZipBombSuspected` keeping
+their own statuses.
+
+**`addSheet` is all-or-nothing** (decision S3a-8, r3 REL-305):
+`Workbook.addSheet` builds both patched parts, parses the fresh view over
+its own copy (`workbook_xml.parseOwning`) and grows the slot table before
+the first store write, then adds the part and replaces the two references
+as one atomic pair; `Editor.addSheet` computes the part name ahead
+(`Workbook.nextSheetPartName`) and allocates its mirror before the
+mutation, so nothing after it can fail. An allocation failure anywhere
+leaves the workbook and the view as they were (pinned by
+`checkAllAllocationFailures` over `Workbook.addSheet` in
+`pkg/workbook.zig`; the editor's mirror is allocation-free after the
+mutation by construction — the sweep cannot run through `Editor.open`,
+whose reader path aborts under an injected failure, a pre-existing
+reader defect noted for a follow-up); the one residue is an unreferenced
+empty part when `replaceParts` fails after `addPart` — `deleteSheet`'s
+orphan trade-off.
 
 **Known hole, inherited:** `Editor.renameSheet` / `deleteSheet` do not
 rewrite a pivot cache's `worksheetSource@sheet` / `rangeSet@sheet`; a
@@ -419,14 +438,19 @@ the lift belongs to the S7 family on every surface at once.
 
 **Tests** (`src/c_abi.zig`, "S3a …"): a boundary round trip whose saved
 grid is checked in the sheet part; the editor's verdicts, the
-transform's (`RowEditExceedsMaxRow`, `SplitPaneNotSupported`) and the
-lazy reads' (`MalformedSheetXml` from a sheet delete, `MalformedPivotXml`
-from a corrupted part) each driven through the exports with the name in
-both the diag and `errbuf` and `plane == NONE`, plus every member of
-`structural_refusals` through `failMapped`; every `-1` class with the
-diag left as prep left it; `StructSizeTooSmall` leaving the diag
-byte-for-byte; a `0xAA` canary tail across a generic failure and a
-refusal, before and after release; the pivots buffer equal to the package writer's frozen
+transform's (`RowEditExceedsMaxRow`, `SplitPaneNotSupported`), the lazy
+reads' (`MalformedSheetXml` from a sheet delete, `MalformedPivotXml` from
+a corrupted part) and the workbook's own (`InternalSheetNameTooLong`)
+each driven through the exports with the name in both the diag and
+`errbuf` and `plane == NONE`, plus every member of `structural_refusals`
+through `failMapped`; the `-1` classes driven through the exports —
+`SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange`,
+`InvalidInput`, `InvalidSheetName`, `InvalidTableColumnName`,
+`TableNotFound`, `TableColumnNotFound`, `RowEditRequiresCleanSheet`,
+`ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState`,
+`NullOutPointer`, `StructSizeTooSmall` — with the diag left as prep left
+it; `StructSizeTooSmall` leaving the diag byte-for-byte; a `0xAA` canary
+tail across a generic failure and a refusal, before and after release; the pivots buffer equal to the package writer's frozen
 record, `(NULL, 0)` on a plain workbook, `-2 MalformedPivotXml` on a
 broken graph; `statusOf` pinned on both vocabularies. The header compile
 gate (`tests/c_abi_smoke.c`) takes every S3a address and `#error`s
@@ -447,9 +471,13 @@ without either macro.
    into `*UnsafeForSheet`; a growth failure in the pivots buffer is
    `-3`. The Python leg bounds every index to `[0, 2³²)` before ctypes
    narrows it (`ValueError`).
-6. The typed worksheet parser's `MalformedXml` / `UnexpectedEof` cross
-   from the structural exports as `MalformedSheetXml`.
+6. A worksheet part the typed parser cannot read is `MalformedSheetXml`
+   at `Worksheet.ensureParsed` itself — every surface, one name.
 7. A pivot part the store cannot materialise refuses the pivots read as
    `MalformedPivotXml`; `OutOfMemory` / `ZipBombSuspected` keep theirs.
-8. The `worksheetSource@sheet` hole under sheet rename / delete is
-   inherited and documented, not lifted here.
+8. `addSheet` is all-or-nothing under allocation failure, on the
+   workbook and on the editor.
+9. `TableNotFound` / `TableColumnNotFound` are selectors — `-1`, like a
+   sheet index — not refusals; `TableColumnNameInUse` stays `-2`.
+10. The `worksheetSource@sheet` hole under sheet rename / delete is
+    inherited and documented, not lifted here.

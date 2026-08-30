@@ -5009,19 +5009,34 @@ pub const Workbook = struct {
     ///   - `error.MissingWorkbookPart` / `error.MissingWorkbookRels`
     ///     if the prerequisite parts have been spliced away.
     ///
-    /// **Atomicity.** Like `addImage`, the mutation is not perfectly
-    /// transactional across the four PartStore writes; ordering
-    /// (addPart → rels → workbook.xml → view-refresh) keeps the
-    /// workbook consistent right up to the workbook.xml splice.
-    /// A failure between addPart and the workbook.xml patch leaves
-    /// the part in the store unreferenced; cleanup ships with
-    /// `removePart` in a future iter.
+    /// **Atomicity** (S3a, Codex #207 r3 REL-305). Every allocation
+    /// and every parse runs BEFORE the first store write: the two
+    /// patched parts are built, the fresh workbook view is parsed over
+    /// its own copy of the patched bytes (`workbook_xml.parseOwning`),
+    /// the slot table is grown — then the part is added and the two
+    /// references replace as one atomic pair (`PartStore.replaceParts`),
+    /// and the in-memory commit that follows cannot fail. A failure
+    /// leaves the workbook exactly as it was, with one documented
+    /// exception: `replaceParts` failing after `addPart` leaves the
+    /// empty part in the store unreferenced — the orphan-part
+    /// trade-off `deleteSheet` already lives with.
     ///
     /// **Pointer lifetime.** The returned `*Worksheet` (and any
     /// `*Worksheet` previously returned by `Workbook.sheet`) is
     /// invalidated by the next structural mutation (`addSheet`,
     /// `deleteSheet`) — those calls reallocate `self.worksheets`.
     /// Re-fetch via `wb.sheet(idx)` after structural edits.
+    /// The part name the next `addSheet` will create — `xl/worksheets/sheetN.xml`
+    /// with N past every worksheet part the store holds, orphans included
+    /// (a deleted sheet's part stays; `deleteSheet`'s trade-off), so a
+    /// number taken from the rels alone would re-collide. Public so an
+    /// editor mirroring the part names can compute it BEFORE the mutation
+    /// and allocate nothing after (S3a, Codex #207 r3 REL-305).
+    pub fn nextSheetPartName(self: *const Workbook, buf: *[64]u8) Error![]const u8 {
+        const next_path_num = (try nextMaxSheetPathNumFromStore(&self.store)) + 1;
+        return std.fmt.bufPrint(buf, "xl/worksheets/sheet{d}.xml", .{next_path_num}) catch unreachable;
+    }
+
     pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
         try validateSheetName(name);
         if (self.worksheets.len >= std.math.maxInt(u32)) return error.TooManySheets;
@@ -5046,15 +5061,8 @@ pub const Workbook = struct {
         // high-water marks.
         const next_sheet_id = nextMaxNumericAttr(wb_part.bytes, "sheetId=\"") + 1;
         const next_rid_num = nextMaxNumericAttr(rels_part.bytes, "Id=\"rId") + 1;
-        // Path number must avoid orphan worksheet parts too — when
-        // a sheet is deleted via `Workbook.deleteSheet`, the part
-        // remains in PartStore (orphan-part v1 trade-off). Computing
-        // the next slot purely from rels would re-collide on the
-        // orphan's path. Walk PartStore instead.
-        const next_path_num = (try nextMaxSheetPathNumFromStore(&self.store)) + 1;
-
         var path_buf: [64]u8 = undefined;
-        const new_path = try std.fmt.bufPrint(&path_buf, "xl/worksheets/sheet{d}.xml", .{next_path_num});
+        const new_path = try self.nextSheetPartName(&path_buf);
         var rid_buf: [32]u8 = undefined;
         const new_rid = try std.fmt.bufPrint(&rid_buf, "rId{d}", .{next_rid_num});
 
@@ -5063,27 +5071,15 @@ pub const Workbook = struct {
             "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
             "<sheetData/></worksheet>";
 
-        try self.store.addPart(
-            new_path,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
-            empty_body,
-        );
-
-        // workbook.xml.rels: add `<Relationship Id="rIdN" Type="…/worksheet" Target="worksheets/sheetN.xml"/>`.
+        // workbook.xml.rels: `<Relationship Id="rIdN" Type="…/worksheet" Target="worksheets/sheetN.xml"/>`;
+        // workbook.xml: `<sheet name="…" sheetId="N" r:id="rIdN"/>`. Both
+        // built, and the fresh view parsed over its own copy, before the
+        // store sees anything — the view must count one sheet more.
         const new_rels_xml = try patchWorkbookRelsAddSheet(self.allocator, rels_part.bytes, new_rid, new_path);
         defer self.allocator.free(new_rels_xml);
-        try self.store.replacePart("xl/_rels/workbook.xml.rels", new_rels_xml);
-
-        // workbook.xml: add `<sheet name="…" sheetId="N" r:id="rIdN"/>`.
         const new_wb_xml = try patchWorkbookXmlAddSheet(self.allocator, wb_part.bytes, name, next_sheet_id, new_rid);
         defer self.allocator.free(new_wb_xml);
-        try self.store.replacePart("xl/workbook.xml", new_wb_xml);
-
-        // Re-parse workbook.xml. The patch added one sheet so the
-        // fresh view's sheet count must equal the old view's + 1.
-        const wb_part2 = (try self.store.part("xl/workbook.xml")) orelse
-            return error.MissingWorkbookPart;
-        var fresh = try workbook_xml_mod.parse(self.allocator, wb_part2.bytes);
+        var fresh = try workbook_xml_mod.parseOwning(self.allocator, new_wb_xml);
         errdefer fresh.deinit(self.allocator);
         if (fresh.sheets.len != self.workbook.sheets.len + 1) {
             return error.SheetCountMismatch;
@@ -5105,7 +5101,20 @@ pub const Workbook = struct {
         // the realloc.
         for (new_slots) |*ws| ws.workbook = self;
 
+        // The store writes: the part first (a failure here references
+        // nothing), then the two references as one atomic pair.
+        try self.store.addPart(
+            new_path,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            empty_body,
+        );
+        try self.store.replaceParts(&.{
+            .{ .name = "xl/_rels/workbook.xml.rels", .bytes = new_rels_xml },
+            .{ .name = "xl/workbook.xml", .bytes = new_wb_xml },
+        });
+
         // Commit: swap workbook view, free old slots, install new.
+        // Nothing below can fail.
         self.workbook.deinit(self.allocator);
         self.workbook = fresh;
         self.allocator.free(self.worksheets);
@@ -10917,7 +10926,14 @@ pub const Worksheet = struct {
         const part_name = try self.resolvePartName();
         const wb = self.workbook;
         const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
-        self.parsed = try sheet_xml_mod.parse(wb.allocator, part.bytes);
+        // A worksheet part the typed parser cannot read is, to every
+        // caller, the sheet transform's own verdict — one name for
+        // "this sheet's XML is not readable" on every surface (S3a,
+        // Codex #207 r3 REL-302), not the parser's two.
+        self.parsed = sheet_xml_mod.parse(wb.allocator, part.bytes) catch |e| switch (e) {
+            error.MalformedXml, error.UnexpectedEof => return Error.MalformedSheetXml,
+            else => |x| return x,
+        };
         return &self.parsed.?;
     }
 
@@ -25535,4 +25551,47 @@ test "S7b-5: extending a self-closing shared-string root opens it whole — no s
         try std.testing.expect(doc.child != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "uniqueCount=\"1\"") != null);
     }
+}
+
+// ─── S3a (Codex #207 r3 REL-305): addSheet is all-or-nothing ─────────
+
+fn addSheetForFailures(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var wb = try Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    const sheets_before = wb.sheetCount();
+    const wb_before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/workbook.xml")).?.bytes);
+    defer std.testing.allocator.free(wb_before);
+    const rels_before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/_rels/workbook.xml.rels")).?.bytes);
+    defer std.testing.allocator.free(rels_before);
+    _ = wb.addSheet("Fresh") catch |e| {
+        // A failed add leaves no trace in the view or the two parts it
+        // would have patched (an empty worksheet part may remain
+        // unreferenced — the documented orphan trade-off).
+        try std.testing.expectEqual(sheets_before, wb.sheetCount());
+        try std.testing.expectEqualStrings(wb_before, (try wb.store.part("xl/workbook.xml")).?.bytes);
+        try std.testing.expectEqualStrings(rels_before, (try wb.store.part("xl/_rels/workbook.xml.rels")).?.bytes);
+        return e;
+    };
+    try std.testing.expectEqual(sheets_before + 1, wb.sheetCount());
+    try std.testing.expectEqualStrings("Fresh", wb.workbook.sheets[sheets_before].name);
+}
+
+test "S3a: an addSheet that fails on any allocation leaves the workbook and its view untouched" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const src = try std.fs.path.join(std.testing.allocator, &.{ dir, "s3a_addsheet_oom.xlsx" });
+    defer std.testing.allocator.free(src);
+    {
+        var w = zlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try w.save(io, src);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, addSheetForFailures, .{ io, src });
 }

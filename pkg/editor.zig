@@ -748,28 +748,29 @@ pub const Editor = struct {
         // against `workbook.sheets` — that view reflects the
         // post-rename names because Editor.renameSheet now patches
         // the workbook view in-memory too (see below).
+        // Everything the mirror needs is allocated BEFORE the workbook
+        // mutates (S3a, Codex #207 r3 REL-305): the part name the
+        // workbook will pick is computed ahead from the same store walk
+        // `Workbook.addSheet` does, so nothing after the mutation can
+        // fail and strand a sheet this mirror does not know. Path
+        // strings live in the editor allocator — Editor.deinit frees
+        // per-entry.
+        var path_buf: [64]u8 = undefined;
+        const part_name = try self.workbook.nextSheetPartName(&path_buf);
+        const new_path = try self.allocator.dupe(u8, part_name);
+        errdefer self.allocator.free(new_path);
+        const old_paths = self.sheet_paths;
+        const new_paths = try self.allocator.alloc([]const u8, old_paths.len + 1);
+        errdefer self.allocator.free(new_paths);
+
         const ws = self.workbook.addSheet(name) catch |err| switch (err) {
             error.SheetNameInUse => return error.DuplicateSheetName,
             else => return err,
         };
-        // Capture sheet_idx + part name BEFORE any future structural
-        // mutation invalidates the *Worksheet pointer.
         const new_idx = ws.sheet_idx;
-        const part_name = try ws.resolvePartName();
 
-        // Mirror in self.sheet_paths so editor-level paths
-        // (scanWorksheet, setCell, etc.) resolve the new index.
-        // Path string is duped into the editor allocator —
-        // Editor.deinit frees per-entry via `self.allocator.free`.
-        const new_path = try self.allocator.dupe(u8, part_name);
-        errdefer self.allocator.free(new_path);
-
-        const old_paths = self.sheet_paths;
-        const new_paths = try self.allocator.alloc([]const u8, old_paths.len + 1);
-        errdefer self.allocator.free(new_paths);
         @memcpy(new_paths[0..old_paths.len], old_paths);
         new_paths[old_paths.len] = new_path;
-
         self.sheet_paths = new_paths;
         self.allocator.free(old_paths);
         return new_idx;

@@ -3554,8 +3554,15 @@ class Editor:
     def _u32(name: str, value) -> int:
         """Bound an index before ctypes narrows it: ``c_uint32`` wraps
         modulo 2³², so ``2**32`` would reach the C side as 0 and edit
-        sheet 0 / row 0 unchecked (Codex #207 r1 REL-101)."""
-        v = int(value)
+        sheet 0 / row 0 unchecked (Codex #207 r1 REL-101). Integers
+        only — ``operator.index``, so ``0.9`` and ``"2"`` are
+        ``TypeError``, never truncated (r3 REL-301); ``bool`` is refused
+        too, an index is not a flag."""
+        import operator
+
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer, not bool")
+        v = operator.index(value)
         if v < 0 or v > 0xFFFFFFFF:
             raise ValueError(f"{name} must be in [0, 4294967295], got {value!r}")
         return v
@@ -3693,9 +3700,11 @@ class Editor:
         every structured reference workbook-wide (``Table1[Old]``, bare
         ``[Old]`` / ``[@Old]`` inside the table), defined names,
         hyperlink locations, DV / CF and the header cell's text.
-        Refusals: ``TableNotFound``, ``TableColumnNotFound``,
-        ``TableColumnNameInUse``; ``InvalidTableColumnName`` is a
-        :class:`ZlsxError`."""
+        A table or column the workbook does not have is a selector,
+        like a sheet index — ``TableNotFound`` / ``TableColumnNotFound``
+        raise :class:`ZlsxError`, as does ``InvalidTableColumnName``; a
+        name another column holds is the workbook's —
+        ``TableColumnNameInUse`` raises :class:`ZlsxRefusal`."""
         self._require_structural("zlsx_editor_rename_table_column")
         parts = [table.encode("utf-8"), old_name.encode("utf-8"), new_name.encode("utf-8")]
         bufs = [(ctypes.c_ubyte * max(len(p), 1)).from_buffer_copy(p or b"\0") for p in parts]

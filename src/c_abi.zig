@@ -5893,7 +5893,9 @@ export fn zlsx_sheet_writer_write_row_with_formulas_v2(
 /// read, a grid it would push past its edge, a name the workbook holds.
 /// `statusOf` checks it after the fourteen planes; a name here crosses
 /// as -2, every other error the editor raises (an index, a name, a
-/// sequencing rule — statements about the call) as -1. The editor folds
+/// selector that names nothing — `TableNotFound` is the table-shaped
+/// `SheetIndexOutOfRange` (Codex #207 r3 REL-304) — a sequencing rule:
+/// statements about the call) as -1. The editor folds
 /// most of its pre-flights into the two `*UnsafeForSheet` names; the
 /// rest reach the boundary as the transform or a later sweep spells
 /// them (Codex #207 r1 REL-102), and a caller sees the precise cause.
@@ -5903,8 +5905,6 @@ const structural_refusals = [_]anyerror{
     error.ColEditUnsafeForSheet,
     error.CannotDeleteLastSheet,
     error.DuplicateSheetName,
-    error.TableNotFound,
-    error.TableColumnNotFound,
     error.TableColumnNameInUse,
     error.MalformedPivotXml,
     // The worksheet transform's, raised by its pre-mutation probe.
@@ -5930,6 +5930,19 @@ const structural_refusals = [_]anyerror{
     error.MalformedDrawingRels,
     error.MissingSheetPart,
     error.NoSheetData,
+    // The workbook's own structure, found broken on the way — a name
+    // the workbook holds that no rename argument can fix, a part or a
+    // relationship the archive lost (Codex #207 r3 REL-303).
+    error.InternalSheetNameTooLong,
+    error.MissingRelationship,
+    error.SheetElementNotFound,
+    error.RelationshipElementNotFound,
+    error.SheetCountMismatch,
+    error.MissingWorkbookPart,
+    error.MissingWorkbookRels,
+    error.MissingContentTypes,
+    error.MalformedContentTypes,
+    error.ContentTypesOverrideNotFound,
     // The workbook layer's spellings of two editor verdicts, should a
     // path ever surface them unfolded.
     error.LastSheetUndeletable,
@@ -5941,20 +5954,6 @@ fn isStructuralRefusal(e: anyerror) bool {
         if (e == r) return true;
     }
     return false;
-}
-
-/// The structural exports' failure path. The typed worksheet parse
-/// (`Worksheet.ensureParsed`, reached lazily by a sheet delete and by
-/// the sweeps) spells a part it cannot read as the parser's own
-/// `MalformedXml` / `UnexpectedEof`; at this boundary those are the
-/// sheet transform's `MalformedSheetXml` — a statement about the
-/// workbook, -2 (Codex #207 r2 REL-202). Nothing else is renamed.
-fn failStructural(e: anyerror, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) i32 {
-    const mapped: anyerror = switch (e) {
-        error.MalformedXml, error.UnexpectedEof => error.MalformedSheetXml,
-        else => e,
-    };
-    return failMapped(mapped, diag, err_buf, err_buf_len);
 }
 
 /// The handle check every S3a export shares. NULL is a statement about
@@ -6007,7 +6006,7 @@ export fn zlsx_editor_insert_row(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.insertRow(sheet_idx, before_row) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6025,7 +6024,7 @@ export fn zlsx_editor_delete_row(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteRow(sheet_idx, row) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6045,7 +6044,7 @@ export fn zlsx_editor_insert_column(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const col_1 = colOneBased(before_col, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.insertColumn(sheet_idx, col_1) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6063,7 +6062,7 @@ export fn zlsx_editor_delete_column(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const col_1 = colOneBased(col, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteColumn(sheet_idx, col_1) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6091,15 +6090,17 @@ export fn zlsx_editor_add_sheet(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const name = bytesArg(name_ptr, name_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const idx = state.inner.addSheet(name) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     if (out_sheet_idx) |o| o.* = idx;
     return ZLSX_OK;
 }
 
 /// Rename sheet `sheet_idx` to `name`. Cross-sheet references
-/// (`'Old'!A1`, defined names, hyperlink locations, DV / CF, pivot
-/// sources) follow the rename.
+/// (`'Old'!A1`, defined names, hyperlink locations, DV / CF, `<xm:f>`)
+/// follow the rename; a pivot cache's `worksheetSource@sheet` does NOT
+/// (the Zig editor's hole, stated in the header) and reads back as
+/// `"resolved":null`.
 export fn zlsx_editor_rename_sheet(
     ed: ?*Editor,
     sheet_idx: u32,
@@ -6113,7 +6114,7 @@ export fn zlsx_editor_rename_sheet(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const name = bytesArg(name_ptr, name_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.renameSheet(sheet_idx, name) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6133,7 +6134,7 @@ export fn zlsx_editor_delete_sheet(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteSheet(sheet_idx) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6141,7 +6142,10 @@ export fn zlsx_editor_delete_sheet(
 /// Rename column `old_name` of table `table_name` to `new_name`: the
 /// `<tableColumn>`, the table's own formulas, every structured
 /// reference workbook-wide, defined names, hyperlink locations, DV /
-/// CF, and the header cell's text. Names are plain (decoded) text.
+/// CF, and the header cell's text. Names are plain (decoded) text. A
+/// table or column the workbook does not have is a selector, like a
+/// sheet index — -1 `TableNotFound` / `TableColumnNotFound`; a name
+/// another column holds is the workbook's — -2 `TableColumnNameInUse`.
 export fn zlsx_editor_rename_table_column(
     ed: ?*Editor,
     table_ptr: ?[*]const u8,
@@ -6160,7 +6164,7 @@ export fn zlsx_editor_rename_table_column(
     const old = bytesArg(old_ptr, old_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const new = bytesArg(new_ptr, new_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.renameTableColumn(table, old, new) catch |e| {
-        return failStructural(e, diag, err_buf, err_buf_len);
+        return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -7203,11 +7207,16 @@ test "S3a rename_table_column: the table part and the header cell follow the new
     const old = "Qty";
     const new = "Quantity";
     try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, new.ptr, new.len, &diag, &err_buf, err_buf.len));
-    // The old name is gone (a fresh target, so the name-in-use check
-    // that precedes the lookup stays out of the way).
+    // The old name is gone: a selector that names nothing is about the
+    // call, -1 (a fresh target, so the name-in-use check that precedes
+    // the lookup stays out of the way). An empty new name likewise.
     const other = "Count";
-    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, other.ptr, other.len, &diag, &err_buf, err_buf.len));
-    try std.testing.expectEqualStrings("TableColumnNotFound", diagName(&diag));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, other.ptr, other.len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("TableColumnNotFound", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(u8, 0), diag.error_name[0]);
+    const price = "Price";
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, price.ptr, price.len, null, 0, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidTableColumnName", std.mem.sliceTo(&err_buf, 0));
     try std.testing.expectEqual(plane_none, diag.plane);
     zlsx_diag_release(&diag);
     try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
@@ -7237,7 +7246,6 @@ test "S3a refusals: -2, the error name in the diag, no plane, errbuf agrees" {
         .{ .name = "RowEditUnsafeForSheet", .status = 0 },
         .{ .name = "ColEditUnsafeForSheet", .status = 0 },
         .{ .name = "DuplicateSheetName", .status = 0 },
-        .{ .name = "TableNotFound", .status = 0 },
         .{ .name = "TableColumnNameInUse", .status = 0 },
     };
     for (cases) |c| {
@@ -7253,11 +7261,6 @@ test "S3a refusals: -2, the error name in the diag, no plane, errbuf agrees" {
         else if (std.mem.eql(u8, c.name, "DuplicateSheetName")) blk: {
             const dup = "report";
             break :blk zlsx_editor_add_sheet(ed, dup.ptr, dup.len, null, &diag, &err_buf, err_buf.len);
-        } else if (std.mem.eql(u8, c.name, "TableNotFound")) blk: {
-            const t = "Nope";
-            const o = "Qty";
-            const n = "Quantity";
-            break :blk zlsx_editor_rename_table_column(ed, t.ptr, t.len, o.ptr, o.len, n.ptr, n.len, &diag, &err_buf, err_buf.len);
         } else blk: {
             const t = "SalesTbl";
             const o = "Qty";
@@ -7332,6 +7335,11 @@ test "S3a contract violations: -1 with the name in errbuf, the diag untouched or
     const t = "T";
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_rename_table_column(ed, t.ptr, t.len, null, 1, t.ptr, t.len, &diag, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    // A table the workbook does not have is a selector — the
+    // table-shaped SheetIndexOutOfRange.
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_rename_table_column(ed, t.ptr, t.len, t.ptr, t.len, bad.ptr, bad.len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("TableNotFound", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(u8, 0), diag.error_name[0]);
 
     // A staged cell write makes the sheet unclean for a structural
     // edit: a sequencing statement, -1, never a refusal.
@@ -7339,6 +7347,8 @@ test "S3a contract violations: -1 with the name in errbuf, the diag untouched or
     try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 1, 0, &cell, &err_buf, err_buf.len));
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("RowEditRequiresCleanSheet", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_insert_column(ed, 0, 0, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("ColEditRequiresCleanSheet", std.mem.sliceTo(&err_buf, 0));
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_delete_sheet(ed, 1, &diag, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("SheetDeleteRequiresCleanState", std.mem.sliceTo(&err_buf, 0));
 
@@ -7559,13 +7569,19 @@ test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the 
         try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqual(plane_none, diag.plane);
     }
-    // The parser's two names map at the boundary; nothing else is renamed.
+    // A sheet name the workbook already holds past the rename's 128-byte
+    // internal bound: nothing the caller passes can fix it, -2.
     {
+        const path = try writeS3aFixture(io, &tt, "s3a_longname.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "name=\"Second\"", "name=\"" ++ ("S" ** 130) ++ "\"");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
         var diag = freshDiag();
-        try std.testing.expectEqual(ZLSX_REFUSED, failStructural(error.UnexpectedEof, &diag, &err_buf, err_buf.len));
-        try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
-        try std.testing.expectEqual(ZLSX_ERROR, failStructural(error.SheetIndexOutOfRange, &diag, &err_buf, err_buf.len));
-        try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+        const nm = "Fine";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_sheet(ed, 1, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InternalSheetNameTooLong", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
     }
     // A pivot part whose payload the store cannot materialise: the
     // archive opens (the central directory is intact), the read refuses
@@ -7610,6 +7626,11 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedDrawingXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.InternalSheetNameTooLong));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableNotFound));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableColumnNotFound));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidTableColumnName));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.MalformedXml));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WriteFailed));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetHasUnsavedMutations));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.RowEditRequiresCleanSheet));

@@ -2619,9 +2619,9 @@ def test_editor_structural_refusals_are_typed(tmp_path):
         with pytest.raises(zlsx.ZlsxRefusal) as info:
             ed.rename_sheet(0, "SECOND")
         assert info.value.error_name == "DuplicateSheetName"
-        with pytest.raises(zlsx.ZlsxRefusal) as info:
-            ed.rename_table_column("Nope", "A", "B")
-        assert info.value.error_name == "TableNotFound"
+        with pytest.raises(zlsx.ZlsxError, match="TableNotFound") as info:
+            ed.rename_table_column("Nope", "A", "B")   # a selector, like a sheet index
+        assert not isinstance(info.value, zlsx.ZlsxRefusal)
         ed.delete_sheet(1)
         with pytest.raises(zlsx.ZlsxRefusal) as info:
             ed.delete_sheet(0)
@@ -2759,3 +2759,58 @@ def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path)
         assert ed.save_to_buffer() == src.read_bytes()
     with zlsx.open(src) as book:
         assert [book.sheet(i).name for i in range(2)] == ["Data", "Second"]
+
+
+def test_editor_structural_indices_reject_lossy_coercion(tmp_path):
+    """`int(0.9)` is 0: an index that is not an integer is a TypeError,
+    never truncated into a different cell; bool is refused too."""
+    _require_structural()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+
+    class OnlyInt:
+        def __int__(self):
+            return 1
+
+    with zlsx.edit(src) as ed:
+        for bad in (0.9, 1.0, "2", True, OnlyInt(), None):
+            for call in (
+                lambda: ed.insert_row(bad, 1),
+                lambda: ed.insert_row(0, bad),
+                lambda: ed.delete_column(0, bad),
+                lambda: ed.rename_sheet(bad, "X"),
+                lambda: ed.delete_sheet(bad),
+            ):
+                with pytest.raises(TypeError):
+                    call()
+        assert ed.save_to_buffer() == src.read_bytes()
+
+
+def test_editor_rename_table_column_round_trip_on_corpus(tmp_path):
+    """Table2 on `IrisSample` (the corpus pivot workbook): rename
+    `Species` → `Kind`, save, reopen — the header cell carries the new
+    name, the pivot whose cache reads Table2 still resolves it, and the
+    old name is now a selector that names nothing."""
+    _require_structural()
+    import zlsx._ffi as ffi
+    if not ffi._HAS_PIVOTS:
+        pytest.skip("pivots read not exposed in loaded libzlsx")
+    src = _skip_if_missing("openxlsx_loadExample.xlsx")
+    out = tmp_path / "renamed.xlsx"
+
+    with zlsx.edit(src) as ed:
+        ed.rename_table_column("Table2", "Species", "Kind")
+        with pytest.raises(zlsx.ZlsxError, match="TableColumnNotFound") as info:
+            ed.rename_table_column("Table2", "Species", "Other")
+        assert not isinstance(info.value, zlsx.ZlsxRefusal)
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.rename_table_column("Table2", "Kind", "Sepal Width")
+        assert info.value.error_name == "TableColumnNameInUse"
+        ed.save(out)
+
+    with zlsx.open(out) as book:
+        header = next(iter(book.sheet("IrisSample").rows()))
+        assert header[:5] == ["Sepal Length", "Sepal Width", "Petal Length", "Petal Width", "Kind"]
+    sources = [p["cache"]["source"] for p in zlsx.pivots(out) if p["kind"] == "pivot"]
+    table2 = [s for s in sources if s["name"] == "Table2"]
+    assert table2 and table2[0]["resolved"]["via"] == "table"

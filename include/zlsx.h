@@ -1747,9 +1747,10 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     reads from, would collapse a table or delete its header row, or
  *     a carrier the scan cannot read is in the way;
  *   CannotDeleteLastSheet, DuplicateSheetName (add / rename, compared
- *     ASCII case-insensitively), TableNotFound, TableColumnNotFound,
- *     TableColumnNameInUse, MalformedPivotXml (the pivot graph cannot
- *     be read whole);
+ *     ASCII case-insensitively), TableColumnNameInUse,
+ *     MalformedPivotXml (the pivot graph cannot be read whole), the
+ *     workbook's own structure found broken (InternalSheetNameTooLong,
+ *     MissingRelationship, SheetCountMismatch, …);
  *   with their precise names, the worksheet transform's own verdicts
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
@@ -1760,8 +1761,9 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     pivot part the archive cannot materialise as MalformedPivotXml.
  * What fails (-1) is a statement about the call: SheetIndexOutOfRange,
  * RowIndexOutOfRange, ColumnIndexOutOfRange, InvalidSheetName,
- * InvalidTableColumnName, InvalidInput (NULL where bytes are
- * required), and the sequencing errors RowEditRequiresCleanSheet /
+ * InvalidTableColumnName, TableNotFound / TableColumnNotFound (a
+ * selector that names nothing, like a sheet index), InvalidInput (NULL
+ * where bytes are required), and the sequencing errors RowEditRequiresCleanSheet /
  * ColEditRequiresCleanSheet / SheetDeleteRequiresCleanState — a
  * structural edit needs the sheet (the workbook, for a sheet delete)
  * free of staged cell writes and appended rows: save first.
