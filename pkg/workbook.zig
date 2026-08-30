@@ -6564,7 +6564,10 @@ pub const Workbook = struct {
                 // Every binding is read, or none is trusted: a region
                 // the walk cannot finish hides the bindings after
                 // its first bad token, and a name spelt twice is
-                // not one binding (Codex #206 r29 SEC-2901).
+                // not one binding (Codex #206 r29 SEC-2901). The
+                // pivot parts' own ceiling bounds the rescan (Codex
+                // #206 r30 PERF-3002).
+                if (seen >= 256) return error.PivotEditUnsafe;
                 var prior: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
                 var k: usize = 0;
                 while (k < seen) : (k += 1) {
@@ -7047,6 +7050,7 @@ pub const Workbook = struct {
             // `<si>` in the main namespace only when the table binds
             // it as the host must (Codex #206 r28 SEC-2801).
             try hostNamespaceHygiene(existing.bytes);
+            try checkSstEntryPlacement(existing.bytes, out.plan.base_index);
             const extended: []u8 = if (out.plan.has_new_strings)
                 try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items, out.plan.base_index)
             else
@@ -10244,6 +10248,7 @@ fn emitSstXmlForExtension(
     const sst_open = sst_tag.start;
     const sst_open_gt = sst_tag.after_open - 1;
     const is_self_closing = src_xml[sst_open_gt - 1] == '/';
+    try checkSstEntryPlacement(src_xml, existing_si_count);
 
     // `existing_si_count` is the parsed table's entry count — what
     // the new indices continue from — never the part's own
@@ -10299,13 +10304,6 @@ fn emitSstXmlForExtension(
     // by the walk, past any spelling of it in a comment — then append
     // new entries (plain then rich), then `</sst>` + trailing.
     const body_start = sst_open_gt + 1;
-    // A root inside the root is a table whose entries the parser and
-    // the writer would number differently (Codex #206 r17 SEC-1701).
-    var bpos = body_start;
-    while (try Workbook.nextMarkup(src_xml, bpos, doc.root_close_lt)) |m| {
-        bpos = m.after;
-        if (m.kind == .open and sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
-    }
     // New entries go before a trailing `<extLst>` — `CT_Sst` orders
     // its entries before the extension list (Codex #206 r24
     // REL-2401) — else before the root's close.
@@ -10315,6 +10313,49 @@ fn emitSstXmlForExtension(
     try appendNewRichSiEntries(allocator, &out, new_rich);
     try out.appendSlice(allocator, src_xml[close..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// The table's entries are the root's direct `<si>` children before
+/// its trailing `<extLst>`, `expected` of them — the count the view
+/// parsed and the cells index by. An `<si>` nested under another
+/// element or written after the extension list is counted by the
+/// view but not by Excel, and the entries appended before it would
+/// take the numbers the cells expect of it (Codex #206 r30
+/// SEC-3001); a root inside the root is the same disagreement (r17
+/// SEC-1701).
+fn checkSstEntryPlacement(src_xml: []const u8, expected: u32) Error!void {
+    const doc = Workbook.scanDocument(src_xml, "sst", "extLst") catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedXml,
+    };
+    const gt = doc.root.after_open - 1;
+    if (src_xml[gt - 1] == '/') {
+        if (expected != 0) return error.MalformedXml;
+        return;
+    }
+    const close = if (doc.child) |ext| ext.start else doc.root_close_lt;
+    var depth: usize = 0;
+    var direct: u32 = 0;
+    var pos = doc.root.after_open;
+    while (try Workbook.nextMarkup(src_xml, pos, doc.root_close_lt)) |m| {
+        pos = m.after;
+        switch (m.kind) {
+            .non_element => continue,
+            .close => {
+                if (depth == 0) return error.MalformedXml;
+                depth -= 1;
+                continue;
+            },
+            .open => {},
+        }
+        if (sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
+        if (sheet_edit.matchTagAt(src_xml, m.lt, "si") != null) {
+            if (depth != 0 or m.lt >= close) return error.MalformedXml;
+            direct = std.math.add(u32, direct, 1) catch return error.MalformedXml;
+        }
+        if (src_xml[m.after - 2] != '/') depth += 1;
+    }
+    if (depth != 0 or direct != expected) return error.MalformedXml;
 }
 
 /// Build a complete `xl/sharedStrings.xml` from scratch. Used when

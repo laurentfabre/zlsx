@@ -10069,3 +10069,48 @@ test "S7b-5: a malformed token or a duplicate name in a root's attributes refuse
         try expectHostCell(&out, 1, "B6", .{ .number = 12 });
     }
 }
+
+test "S7b-5: an <si> after the extension list or nested under another element refuses (its number and the cells' disagree); a root with more attributes than the ceiling refuses (Codex #206 r30 SEC-3001, PERF-3002)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r30_dst.xlsx");
+    defer a.free(dst);
+    const main_ns = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+    var many: std.ArrayListUnmanaged(u8) = .empty;
+    defer many.deinit(a);
+    try many.appendSlice(a, main_ns);
+    for (0..257) |i| try many.print(a, " a{d}=\"{d}\"", .{ i, i });
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "sst_si_after_ext", .part = "xl/sharedStrings.xml", .old = "</sst>", .new = "<extLst><ext uri=\"{x}\"/></extLst><si><t xml:space=\"preserve\">Late</t></si></sst>" },
+        .{ .name = "sst_si_nested", .part = "xl/sharedStrings.xml", .old = "</sst>", .new = "<foo><si><t xml:space=\"preserve\">Nested</t></si></foo></sst>" },
+        .{ .name = "host_257_attrs", .part = "xl/worksheets/sheet2.xml", .old = main_ns, .new = many.items },
+        .{ .name = "sst_257_attrs", .part = "xl/sharedStrings.xml", .old = main_ns, .new = many.items },
+    };
+    const parts = [_][]const u8{ "xl/worksheets/sheet2.xml", "xl/sharedStrings.xml", "xl/pivotTables/pivotTable1.xml", "xl/pivotCache/pivotCacheRecords1.xml" };
+    for (cases) |case| {
+        const src = try tt.path(a, io, case.name);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, case.part, case.old, case.new);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var before: [parts.len][]u8 = undefined;
+        for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+        defer for (before) |b| a.free(b);
+        if (wb.insertRow(0, 2)) |_| return error.TestUnexpectedResult else |err| switch (err) {
+            error.PivotEditUnsafe, error.MalformedSheetXml, error.MalformedXml => {},
+            else => return err,
+        }
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}
