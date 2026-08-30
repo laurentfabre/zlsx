@@ -2552,3 +2552,182 @@ def test_engine_fingerprint_names_identity():
     assert fp.startswith("zlsx ")
     for component in ("excel_fp_rules_v1", "rng_v1", "collation_v1"):
         assert component in fp
+
+
+# ── S3a: structural edits + the pivots read through the C ABI ─────────
+#
+# The Zig `Editor` has carried these since Phase 3e; S3a is the parity
+# row that lets them cross the boundary. Every refusal is a typed
+# `ZlsxRefusal` (status -2, `error_name` from the diag); statements
+# about the call stay plain `ZlsxError`s.
+
+
+def _require_structural():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_STRUCTURAL_EDITS:
+        pytest.skip("structural edits not exposed in loaded libzlsx (requires 0.9.0+)")
+
+
+def _three_by_three(path):
+    with zlsx.write(path) as w:
+        s = w.add_sheet("Data")
+        s.write_row([1, 2, 3])
+        s.write_row([4, 5, 6])
+        s.write_row([7, 8, 9])
+        w.add_sheet("Second").write_row(["two"])
+
+
+def test_editor_structural_edits_round_trip(tmp_path):
+    """insert_row / delete_column / insert_column / delete_row /
+    add_sheet / rename_sheet / delete_sheet, then save → the reader
+    sees the shifted grid and the new sheet list."""
+    _require_structural()
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    _three_by_three(src)
+
+    with zlsx.edit(src) as ed:
+        ed.insert_row(0, 2)        # [1,2,3] / blank / [4,5,6] / [7,8,9]
+        ed.delete_column(0, 0)     # [2,3] / blank / [5,6] / [8,9]
+        ed.insert_column(0, 0)     # [_,2,3] / blank / [_,5,6] / [_,8,9]
+        ed.delete_row(0, 4)        # drops [_,8,9]
+        assert ed.add_sheet("Third") == 2
+        ed.rename_sheet(1, "Renamed")
+        ed.delete_sheet(2)
+        ed.save(out)
+
+    with zlsx.open(out) as book:
+        assert [book.sheet(i).name for i in range(2)] == ["Data", "Renamed"]
+        rows = list(book.sheet(0).rows())
+        # The reader skips the blank row; the two surviving data rows
+        # start with the inserted blank column.
+        assert rows == [[None, 2, 3], [None, 5, 6]]
+        assert list(book.sheet(1).rows()) == [["two"]]
+
+
+def test_editor_structural_refusals_are_typed(tmp_path):
+    _require_structural()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+
+    with zlsx.edit(src) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.add_sheet("data")            # ASCII case-insensitive duplicate
+        assert info.value.error_name == "DuplicateSheetName"
+        assert isinstance(info.value, zlsx.ZlsxError)
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.rename_sheet(0, "SECOND")
+        assert info.value.error_name == "DuplicateSheetName"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.rename_table_column("Nope", "A", "B")
+        assert info.value.error_name == "TableNotFound"
+        ed.delete_sheet(1)
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_sheet(0)
+        assert info.value.error_name == "CannotDeleteLastSheet"
+        assert "CannotDeleteLastSheet" in str(info.value)
+
+
+def test_editor_structural_call_errors_are_plain_zlsx_errors(tmp_path):
+    _require_structural()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+
+    with zlsx.edit(src) as ed:
+        for call, name in (
+            (lambda: ed.insert_row(9, 1), "SheetIndexOutOfRange"),
+            (lambda: ed.delete_row(0, 0), "RowIndexOutOfRange"),
+            (lambda: ed.insert_column(0, 16384), "ColumnIndexOutOfRange"),
+            (lambda: ed.add_sheet(""), "InvalidSheetName"),
+            (lambda: ed.rename_sheet(0, "a:b"), "InvalidSheetName"),
+        ):
+            with pytest.raises(zlsx.ZlsxError) as info:
+                call()
+            assert not isinstance(info.value, zlsx.ZlsxRefusal)
+            assert name in str(info.value)
+        # A staged cell write makes the sheet unclean for a structural
+        # edit — a sequencing error, not a refusal.
+        ed.set_cell(0, 1, 0, 42)
+        with pytest.raises(zlsx.ZlsxError, match="RowEditRequiresCleanSheet") as info:
+            ed.insert_row(0, 1)
+        assert not isinstance(info.value, zlsx.ZlsxRefusal)
+
+    ed = zlsx.edit(src)
+    ed.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.insert_row(0, 1)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.pivots()
+
+
+def test_editor_structural_edits_carry_the_rewriters_pivot_footprint_refuses(tmp_path):
+    """The corpus pivot workbook: a row edit inside a hosted pivot's
+    rectangle refuses (`RowEditUnsafeForSheet`), one above it lifts
+    the pivot in step and `pivots()` reports the moved location."""
+    _require_structural()
+    import zlsx._ffi as ffi
+    if not ffi._HAS_PIVOTS:
+        pytest.skip("pivots read not exposed in loaded libzlsx")
+    src = _skip_if_missing("openxlsx_loadExample.xlsx")
+    work = tmp_path / "pivot.xlsx"
+    work.write_bytes(src.read_bytes())
+
+    before = zlsx.pivots(work)
+    hosts = [p for p in before if p["kind"] == "pivot"]
+    assert hosts, "corpus workbook carries pivot tables"
+    host = hosts[0]
+    ref = host["location"]["ref"]
+    top = int("".join(ch for ch in ref.split(":")[0] if ch.isdigit()))
+
+    with zlsx.edit(work) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_row(host["sheet_idx"], top)
+        assert info.value.error_name == "RowEditUnsafeForSheet"
+        ed.insert_row(host["sheet_idx"], 1)
+        after = ed.pivots()
+    moved = [p for p in after if p["kind"] == "pivot" and p["name"] == host["name"]][0]
+    moved_top = int("".join(ch for ch in moved["location"]["ref"].split(":")[0] if ch.isdigit()))
+    assert moved_top == top + 1
+
+
+def test_pivots_frozen_shape_on_corpus_and_empty_on_plain_workbook(tmp_path):
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_PIVOTS:
+        pytest.skip("pivots read not exposed in loaded libzlsx (requires 0.9.0+)")
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    assert zlsx.pivots(plain) == []
+    with zlsx.edit(plain) as ed:
+        assert ed.pivots() == []
+
+    src = _skip_if_missing("openxlsx_loadExample.xlsx")
+    records = zlsx.pivots(src)
+    pivots = [r for r in records if r["kind"] == "pivot"]
+    assert len(pivots) == 2
+    frozen_keys = [
+        "kind", "sheet", "sheet_idx", "name", "part", "location", "rows", "cols",
+        "pages", "values", "data_caption", "grand_totals", "style", "cache",
+    ]
+    for p in pivots:
+        assert list(p.keys()) == frozen_keys
+        assert set(p["location"]) == {"ref", "first_header_row", "first_data_row", "first_data_col"}
+        for axis in p["rows"] + p["cols"] + p["pages"]:
+            assert axis == {"values": True} or set(axis) == {"field", "idx"}
+        for v in p["values"]:
+            assert set(v) == {"name", "field", "idx", "subtotal", "show_data_as", "num_fmt_id"}
+        assert set(p["grand_totals"]) == {"rows", "cols"}
+        cache = p["cache"]
+        assert set(cache) == {
+            "id", "part", "records_part", "record_count", "refreshed_by", "refreshed_date",
+            "refresh_on_load", "save_data", "source", "fields",
+        }
+        assert cache["source"]["type"] == "worksheet"
+        # Both corpus caches are table-named and resolve to a local sheet.
+        assert cache["source"]["resolved"]["via"] == "table"
+        assert cache["source"]["unresolved"] is None
+        for f in cache["fields"]:
+            assert set(f) == {"name", "num_fmt_id", "formula", "items", "types", "min", "max"}
+    # No orphan caches in the corpus workbook.
+    assert all(r["kind"] == "pivot" for r in records)

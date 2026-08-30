@@ -1,11 +1,11 @@
 /*
- * M9a1/M9a2 header compile gate. Compiled (never linked, never run) as
+ * M9a1/M9a2/S3a header compile gate. Compiled (never linked, never run) as
  * part of `zig build test`, so the header side of the 3-file
  * transaction is verified by a C compiler rather than by eye:
  *   - the header parses as C;
  *   - every ZLSX_HAS_* feature macro is defined;
- *   - every M9a1/M9a2 export has a prototype (their addresses are
- *     taken);
+ *   - every M9a1/M9a2/S3a export has a prototype (their addresses
+ *     are taken);
  *   - struct sizes match the layout the design note pins
  *     (docs/plans/c-abi-status-v1.md) on this target.
  */
@@ -37,6 +37,12 @@
 #endif
 #if !defined(ZLSX_HAS_FORMULAS_V2)
 #error "ZLSX_HAS_FORMULAS_V2 missing"
+#endif
+#if !defined(ZLSX_HAS_STRUCTURAL_EDITS)
+#error "ZLSX_HAS_STRUCTURAL_EDITS missing"
+#endif
+#if !defined(ZLSX_HAS_PIVOTS)
+#error "ZLSX_HAS_PIVOTS missing"
 #endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
@@ -76,5 +82,19 @@ static const void *const m9a2_exports[] = {
 
 const void *zlsx_c_abi_smoke_anchor(void);
 const void *zlsx_c_abi_smoke_anchor(void) { return m9a1_exports[0]; }
+static const void *const s3a_exports[] = {
+    (const void *)&zlsx_editor_insert_row,
+    (const void *)&zlsx_editor_delete_row,
+    (const void *)&zlsx_editor_insert_column,
+    (const void *)&zlsx_editor_delete_column,
+    (const void *)&zlsx_editor_add_sheet,
+    (const void *)&zlsx_editor_rename_sheet,
+    (const void *)&zlsx_editor_delete_sheet,
+    (const void *)&zlsx_editor_rename_table_column,
+    (const void *)&zlsx_editor_pivots_ndjson,
+};
+
 const void *zlsx_c_abi_smoke_anchor_m9a2(void);
 const void *zlsx_c_abi_smoke_anchor_m9a2(void) { return m9a2_exports[0]; }
+const void *zlsx_c_abi_smoke_anchor_s3a(void);
+const void *zlsx_c_abi_smoke_anchor_s3a(void) { return s3a_exports[0]; }

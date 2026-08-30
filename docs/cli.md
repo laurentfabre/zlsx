@@ -143,6 +143,7 @@ stays valid). `zlsx pivots` names the sheet every pivot reads from
 | `add-sheet` | `--new-name NAME --out P` | Append a new empty sheet |
 | `rename-sheet` | `--sheet N --new-name NAME --out P` | Rename a sheet (Unicode-aware duplicate check) |
 | `delete-sheet` | `--sheet N --out P` | Drop a sheet (cannot drop the last one) |
+| `rename-table-column` | `--table NAME --old-name OLD --new-name NEW --out P` | Rename a column of a named table; the `<tableColumn>`, the table's formulas, every structured reference workbook-wide (`Table1[Old]`, bare `[Old]` / `[@Old]` inside the table), defined names, hyperlinks, DV / CF and the header cell follow. Exit 3 on `TableNotFound` / `TableColumnNotFound` / `TableColumnNameInUse` / `InvalidTableColumnName` |
 | `scrub-metadata` | `--out P` | Strip `docProps` identity metadata (author, last-modified-by, company, …) — elements are removed outright, not blanked; cell data is byte-preserved |
 
 ```bash

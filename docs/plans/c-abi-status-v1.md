@@ -330,3 +330,81 @@ builds is dead by construction and removed.
 5. `zlsx_buffer_release` stages with the buffer exports (M9a2).
 6. Build hash in a dedicated `fingerprint_config` options module; CLI
    build cache unaffected by commits.
+
+## 10. S3a — structural edits + the `pivots` read (2026-08-30)
+
+The `Editor`'s structural edits and S6's `pivots` NDJSON shape cross the
+boundary under the §2 contract — new exports, so `zlsx_status_v1`, never
+the legacy `0/-1`. Nine exports, one header macro pair, one probe group:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_insert_row` / `_delete_row` / `_insert_column` / `_delete_column` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_add_sheet` / `_rename_sheet` / `_delete_sheet` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_rename_table_column` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_pivots_ndjson` (+ `zlsx_buffer_release`) | `_HAS_PIVOTS` | `ZLSX_HAS_PIVOTS` |
+
+**Naming** (the S3a–e gate question): the M9a2 precedent holds — a new
+export takes its bare name under the status contract; the `_v2` suffix
+is reserved for a name a legacy export already owns
+(`zlsx_sheet_writer_write_row_with_formulas_v2`). None of the S3a names
+collide, so none carry a suffix. No new struct crosses: the exports take
+scalars, `(ptr, len)` byte strings and the existing `zlsx_diag_v1`.
+
+**The refusal vocabulary** (decision S3a-1). §2 maps `Formula*` planes to
+`-2`; the structural edits have a vocabulary of their own, and the same
+rule applies — a refusal is a statement about the *workbook*, a failure
+a statement about the *call*. `statusOf` checks one more list after the
+fourteen planes (`c_abi.zig::structural_refusals`); the diag carries the
+name with `plane = ZLSX_PLANE_NONE` and an empty census:
+
+| `-2` (`ZLSX_REFUSED`, `diag.error_name`) | `-1` (`ZLSX_ERROR`, `errbuf`) |
+|---|---|
+| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, a carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
+| `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
+| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix) | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
+| `TableNotFound`, `TableColumnNotFound`, `TableColumnNameInUse` | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
+| `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
+
+The Python leg mirrors the split: `-2` raises `ZlsxRefusal(error_name)`
+(the new base class; `ZlsxFormulaRefusal` now derives from it and is
+chosen when the diag names a plane), `-1` raises a plain `ZlsxError`.
+
+**Coordinates**: rows 1-based, columns 0-based (A = 0) — what
+`zlsx_editor_set_cell` and `zlsx_census_entry_v1` already spell; the Zig
+editor's 1-based column API is converted at the boundary. Sheet indices
+0-based; `zlsx_editor_add_sheet` writes `UINT32_MAX` to `*out_sheet_idx`
+on entry and the new index on `ZLSX_OK`.
+
+**`zlsx_editor_pivots_ndjson`** (decision S3a-2): the S6 gate froze a
+record *shape*, and the shape is text. The export hands over the NDJSON
+bytes themselves — `pkg/pivot_ndjson.zig`, the one writer `zlsx pivots`
+prints through too — in a library-allocated buffer released with
+`zlsx_buffer_release`; a workbook without pivots is `ZLSX_OK` with
+`(NULL, 0)`. A typed struct graph would have been a second spelling of a
+frozen contract, drifting on its own schedule. Python parses one JSON
+object per line (`Editor.pivots()` / `zlsx.pivots(path)`); a C caller
+parses with whatever it has. The read runs over the editor's current
+state, staged edits included.
+
+**Tests** (`src/c_abi.zig`, "S3a …"): a boundary round trip whose saved
+grid is checked in the sheet part; every refusal in the table above with
+the name in both the diag and `errbuf` and `plane == NONE`; every `-1`
+class with the diag left as prep left it; `StructSizeTooSmall` leaving
+the diag byte-for-byte; a `0xAA` canary tail across a refusal and a
+generic failure; the pivots buffer equal to the package writer's frozen
+record, `(NULL, 0)` on a plain workbook, `-2 MalformedPivotXml` on a
+broken graph; `statusOf` pinned on both vocabularies. The header compile
+gate (`tests/c_abi_smoke.c`) takes every S3a address and `#error`s
+without either macro.
+
+## 11. Decisions index (S3a)
+
+1. Structural refusals are a second `-2` vocabulary next to the planes,
+   with `plane = ZLSX_PLANE_NONE`; sequencing and argument errors stay
+   `-1`.
+2. The pivots read crosses as the frozen NDJSON bytes, not a struct
+   graph; one writer serves the CLI and the ABI.
+3. Bare names, no `_v2` — nothing collides.
+4. Columns 0-based at the boundary, converted to the editor's 1-based
+   API; `UINT32_MAX` refused before the conversion.

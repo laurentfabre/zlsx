@@ -1661,3 +1661,70 @@ if _HAS_FORMULAS_V2:
         ctypes.c_size_t,
     ]
     lib.zlsx_sheet_writer_write_row_with_formulas_v2.restype = ctypes.c_int32
+
+# ---- S3a: structural edits + the pivots read (libzlsx 0.9.0+) --------
+#
+# zlsx_status_v1 exports: every one takes a nullable zlsx_diag_v1 and
+# returns ZLSX_OK / ZLSX_ERROR / ZLSX_REFUSED / ZLSX_NOMEM. Rows are
+# 1-based, columns 0-based, names are (ptr, len) UTF-8. Probed as one
+# group: a dylib has all of them or none.
+
+ZLSX_NO_SHEET_IDX = 0xFFFFFFFF
+
+_STRUCTURAL_EDIT_SYMBOLS = (
+    "zlsx_editor_insert_row",
+    "zlsx_editor_delete_row",
+    "zlsx_editor_insert_column",
+    "zlsx_editor_delete_column",
+    "zlsx_editor_add_sheet",
+    "zlsx_editor_rename_sheet",
+    "zlsx_editor_delete_sheet",
+    "zlsx_editor_rename_table_column",
+)
+_HAS_STRUCTURAL_EDITS = all(hasattr(lib, s) for s in _STRUCTURAL_EDIT_SYMBOLS)
+if _HAS_STRUCTURAL_EDITS:
+    _diag_tail = [ctypes.POINTER(DiagV1), ctypes.c_char_p, ctypes.c_size_t]
+    for _sym in ("zlsx_editor_insert_row", "zlsx_editor_delete_row",
+                 "zlsx_editor_insert_column", "zlsx_editor_delete_column"):
+        _fn = getattr(lib, _sym)
+        _fn.argtypes = [editor_handle, ctypes.c_uint32, ctypes.c_uint32] + _diag_tail
+        _fn.restype = ctypes.c_int32
+
+    lib.zlsx_editor_add_sheet.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_ubyte),  # name
+        ctypes.c_size_t,                 # name_len
+        ctypes.POINTER(ctypes.c_uint32), # out_sheet_idx (nullable)
+    ] + _diag_tail
+    lib.zlsx_editor_add_sheet.restype = ctypes.c_int32
+
+    lib.zlsx_editor_rename_sheet.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,                 # sheet_idx
+        ctypes.POINTER(ctypes.c_ubyte),  # name
+        ctypes.c_size_t,                 # name_len
+    ] + _diag_tail
+    lib.zlsx_editor_rename_sheet.restype = ctypes.c_int32
+
+    lib.zlsx_editor_delete_sheet.argtypes = [editor_handle, ctypes.c_uint32] + _diag_tail
+    lib.zlsx_editor_delete_sheet.restype = ctypes.c_int32
+
+    lib.zlsx_editor_rename_table_column.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # table_name
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # old_name
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # new_name
+    ] + _diag_tail
+    lib.zlsx_editor_rename_table_column.restype = ctypes.c_int32
+
+_HAS_PIVOTS = hasattr(lib, "zlsx_editor_pivots_ndjson") and hasattr(lib, "zlsx_buffer_release")
+if _HAS_PIVOTS:
+    lib.zlsx_editor_pivots_ndjson.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_pivots_ndjson.restype = ctypes.c_int32

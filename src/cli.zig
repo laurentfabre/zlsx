@@ -70,6 +70,11 @@ const Subcommand = enum {
     add_sheet,
     rename_sheet,
     delete_sheet,
+    /// S3a: rename a column of a named table — `<tableColumn name>`
+    /// and every structured reference workbook-wide follow
+    /// (`Editor.renameTableColumn`). Requires `--table NAME`,
+    /// `--old-name OLD`, `--new-name NEW` and `--out PATH`.
+    rename_table_column,
     /// Z3: strip identifying document metadata (docProps/core.xml,
     /// docProps/app.xml, docProps/custom.xml) and save to `--out`.
     /// Cell data is untouched — this is the metadata counterpart to
@@ -220,6 +225,11 @@ const Args = struct {
     /// Distinct from `sheet_name` (the sheet selector) — name conflict
     /// is resolved at runtime per-subcommand.
     new_sheet_name: ?[]const u8 = null,
+    /// S3a: the table and the column `rename-table-column` renames.
+    /// Set via `--table NAME` / `--old-name OLD`; the new name rides
+    /// `--new-name`.
+    table_name: ?[]const u8 = null,
+    old_column_name: ?[]const u8 = null,
     /// iter-sst-4: opt into the lazy SST backend (`Book.openSstLazy`).
     /// Workbooks with millions of unique strings skip the eager
     /// decode arena; resolution happens on first cell access. See
@@ -268,6 +278,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--row") or
             std.mem.eql(u8, a, "--col") or
             std.mem.eql(u8, a, "--new-name") or
+            std.mem.eql(u8, a, "--table") or
+            std.mem.eql(u8, a, "--old-name") or
             std.mem.eql(u8, a, "--vectors") or
             std.mem.eql(u8, a, "--model") or
             std.mem.eql(u8, a, "--column") or
@@ -290,6 +302,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "add-sheet")) return .add_sheet;
         if (std.mem.eql(u8, a, "rename-sheet")) return .rename_sheet;
         if (std.mem.eql(u8, a, "delete-sheet")) return .delete_sheet;
+        if (std.mem.eql(u8, a, "rename-table-column")) return .rename_table_column;
         if (std.mem.eql(u8, a, "meta")) return .meta;
         if (std.mem.eql(u8, a, "list-sheets")) return .list_sheets;
         if (std.mem.eql(u8, a, "scrub-metadata")) return .scrub_metadata;
@@ -334,7 +347,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--sheet-glob", "--output",    "--out",     "--ref",
         "--value",      "--row",       "--col",     "--new-name",
         "--vectors",    "--model",     "--column",  "--coverage",
-        "--id",         "--dtype",
+        "--id",         "--dtype",     "--table",   "--old-name",
     };
     // Context-aware splitter: the token IMMEDIATELY following a
     // value-bearing flag is its literal value and must pass through
@@ -410,7 +423,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -459,6 +472,14 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.new_sheet_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--table")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.table_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--old-name")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.old_column_name = argv[i];
         } else if (std.mem.eql(u8, a, "--sheet")) {
             if (!workbook_scoped and (out.sheet_name != null or out.all_sheets or out.sheet_glob != null))
                 return ArgError.SheetArgConflict;
@@ -646,7 +667,8 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "delete-column") or
                     std.mem.eql(u8, a, "add-sheet") or
                     std.mem.eql(u8, a, "rename-sheet") or
-                    std.mem.eql(u8, a, "delete-sheet"))
+                    std.mem.eql(u8, a, "delete-sheet") or
+                    std.mem.eql(u8, a, "rename-table-column"))
                 {
                     continue;
                 }
@@ -665,7 +687,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -677,7 +699,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -709,7 +731,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -718,7 +740,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -768,7 +790,10 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.col_letter != null and !(detected_sub == .insert_column or detected_sub == .delete_column)) {
         return ArgError.BadArgValue;
     }
-    if (out.new_sheet_name != null and !(detected_sub == .add_sheet or detected_sub == .rename_sheet)) {
+    if (out.new_sheet_name != null and !(detected_sub == .add_sheet or detected_sub == .rename_sheet or detected_sub == .rename_table_column)) {
+        return ArgError.BadArgValue;
+    }
+    if ((out.table_name != null or out.old_column_name != null) and detected_sub != .rename_table_column) {
         return ArgError.BadArgValue;
     }
     if (out.cell_ref != null and detected_sub != .set_cell) {
@@ -792,6 +817,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .rename_table_column,
         .scrub_metadata,
         .embed,
         => {},
@@ -1009,6 +1035,11 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     sheet. Required: --out PATH, --new-name NAME.
         \\  rename-sheet       load-modify-save: rename a sheet. Required:
         \\                     --out PATH, --sheet N, --new-name NAME.
+        \\  rename-table-column
+        \\                     load-modify-save: rename a column of a named
+        \\                     table; every structured reference follows.
+        \\                     Required: --out PATH, --table NAME,
+        \\                     --old-name OLD, --new-name NEW.
         \\  delete-sheet       load-modify-save: drop a sheet (cannot drop
         \\                     the last remaining sheet). Required:
         \\                     --out PATH, --sheet N.
@@ -1102,20 +1133,11 @@ fn colLetter(buf: *[8]u8, idx: usize) []const u8 {
     return buf[0..n];
 }
 
+/// The one JSON escaper every surface shares (`pkg/json_text.zig`):
+/// the C ABI's NDJSON buffers and these records spell a string the
+/// same way by construction.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0x08 => try w.writeAll("\\b"),
-        0x0c => try w.writeAll("\\f"),
-        0...0x07, 0x0b, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
-    };
-    try w.writeByte('"');
+    return zlsx_pkg.json_text.writeString(w, s);
 }
 
 fn writeJsonCell(w: *std.Io.Writer, cell: xlsx.Cell) !void {
@@ -1953,6 +1975,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet => return try runAddSheetCommand(alloc, proc_io, args, err),
         .rename_sheet => return try runRenameSheetCommand(alloc, proc_io, args, err),
         .delete_sheet => return try runDeleteSheetCommand(alloc, proc_io, args, err),
+        .rename_table_column => return try runRenameTableColumnCommand(alloc, proc_io, args, err),
         .scrub_metadata => return try runScrubMetadataCommand(alloc, proc_io, args, err),
         .embed => return try runEmbedCommand(alloc, proc_io, args, out, err),
         // The legacy --list-sheets flag overrides every read
@@ -2060,6 +2083,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .rename_table_column,
         .scrub_metadata,
         .embed,
         .pivots,
@@ -2115,6 +2139,7 @@ fn runMain(init: std.process.Init) !u8 {
         .add_sheet,
         .rename_sheet,
         .delete_sheet,
+        .rename_table_column,
         .scrub_metadata,
         .embed,
         .pivots,
@@ -4040,7 +4065,7 @@ fn runPivotsCommand(
             try writeCompactSheetPrologue(out, pt.sheet_name, pt.sheet_idx);
             last_prologue = pt.sheet_idx;
         }
-        try writePivotRecord(out, &pivots, pt, compact);
+        try zlsx_pkg.pivots.ndjson.writeTable(out, &pivots, pt, if (compact) .compact else .full);
     }
 
     if (filter == null and args.sheet_glob == null) {
@@ -4055,256 +4080,11 @@ fn runPivotsCommand(
                 },
                 .emit => {},
             }
-            try out.writeAll("{\"kind\":\"pivot_cache\",\"cache\":");
-            try writePivotCacheObject(out, &pivots, c);
-            try out.writeAll("}\n");
+            try zlsx_pkg.pivots.ndjson.writeCacheRecord(out, &pivots, c);
         }
     }
     try out.flush();
     return 0;
-}
-
-fn writePivotRecord(
-    out: *std.Io.Writer,
-    pivots: *const zlsx_pkg.Pivots,
-    pt: zlsx_pkg.PivotTable,
-    compact: bool,
-) !void {
-    const def = &pt.definition;
-    try out.writeAll("{\"kind\":\"pivot\"");
-    if (!compact) {
-        try out.writeAll(",\"sheet\":");
-        try writeJsonString(out, pt.sheet_name);
-        try out.print(",\"sheet_idx\":{d}", .{pt.sheet_idx});
-    }
-    try out.writeAll(",\"name\":");
-    try writeJsonString(out, pt.name);
-    try out.writeAll(",\"part\":");
-    try writeJsonString(out, pt.part_name);
-    try out.writeAll(",\"location\":{\"ref\":");
-    try writeJsonString(out, pt.location_ref);
-    try out.writeAll(",\"first_header_row\":");
-    try writeJsonOptU32(out, def.location.first_header_row);
-    try out.writeAll(",\"first_data_row\":");
-    try writeJsonOptU32(out, def.location.first_data_row);
-    try out.writeAll(",\"first_data_col\":");
-    try writeJsonOptU32(out, def.location.first_data_col);
-    try out.writeAll("},\"rows\":");
-    try writePivotAxis(out, pivots, pt, def.row_fields);
-    try out.writeAll(",\"cols\":");
-    try writePivotAxis(out, pivots, pt, def.col_fields);
-    try out.writeAll(",\"pages\":[");
-    for (def.page_fields, 0..) |pf, i| {
-        if (i > 0) try out.writeByte(',');
-        switch (pf.fld) {
-            .values => try out.writeAll("{\"values\":true}"),
-            .field => |ordinal| {
-                try out.writeAll("{\"field\":");
-                try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
-                try out.print(",\"idx\":{d}}}", .{ordinal});
-            },
-        }
-    }
-    try out.writeAll("],\"values\":[");
-    for (def.data_fields, 0..) |df, i| {
-        if (i > 0) try out.writeByte(',');
-        try out.writeAll("{\"name\":");
-        try writeJsonOptString(out, pt.data_field_names[i]);
-        try out.writeAll(",\"field\":");
-        try writeJsonOptString(out, pivots.fieldName(pt, df.fld));
-        try out.print(",\"idx\":{d},\"subtotal\":", .{df.fld});
-        try writeJsonString(out, if (df.subtotal == .unknown) (df.subtotal_raw orelse "unknown") else df.subtotal.xmlName());
-        try out.writeAll(",\"show_data_as\":");
-        try writeJsonOptString(out, df.show_data_as);
-        try out.writeAll(",\"num_fmt_id\":");
-        try writeJsonOptU32(out, df.num_fmt_id);
-        try out.writeByte('}');
-    }
-    try out.writeAll("],\"data_caption\":");
-    try writeJsonOptString(out, pt.data_caption);
-    try out.print(",\"grand_totals\":{{\"rows\":{},\"cols\":{}}},\"style\":", .{ def.row_grand_totals, def.col_grand_totals });
-    try writeJsonOptString(out, pt.style_name);
-    try out.writeAll(",\"cache\":");
-    if (pivots.cacheOf(pt)) |c| try writePivotCacheObject(out, pivots, c.*) else try out.writeAll("null");
-    try out.writeAll("}\n");
-}
-
-/// `[{"field":"Region","idx":0},{"values":true}]` — a row or column
-/// axis: pivot-field ordinals resolved to their cache-field names, the
-/// values axis (`x="-2"`) as its own marker.
-fn writePivotAxis(
-    out: *std.Io.Writer,
-    pivots: *const zlsx_pkg.Pivots,
-    pt: zlsx_pkg.PivotTable,
-    axis: []const zlsx_pkg.typed_parts.pivot_xml.AxisField,
-) !void {
-    try out.writeByte('[');
-    for (axis, 0..) |af, i| {
-        if (i > 0) try out.writeByte(',');
-        switch (af) {
-            .values => try out.writeAll("{\"values\":true}"),
-            .field => |ordinal| {
-                try out.writeAll("{\"field\":");
-                try writeJsonOptString(out, pivots.fieldName(pt, ordinal));
-                try out.print(",\"idx\":{d}}}", .{ordinal});
-            },
-        }
-    }
-    try out.writeByte(']');
-}
-
-fn writePivotCacheObject(out: *std.Io.Writer, pivots: *const zlsx_pkg.Pivots, c: zlsx_pkg.PivotCache) !void {
-    const def = &c.definition;
-    try out.writeAll("{\"id\":");
-    try writeJsonOptU32(out, c.cache_id);
-    try out.writeAll(",\"part\":");
-    try writeJsonString(out, c.part_name);
-    try out.writeAll(",\"records_part\":");
-    try writeJsonOptString(out, c.records_part_name);
-    try out.writeAll(",\"record_count\":");
-    try writeJsonOptU32(out, def.record_count);
-    try out.writeAll(",\"refreshed_by\":");
-    try writeJsonOptString(out, def.refreshed_by);
-    // `refreshedDate` is the serial Excel writes; a producer that wrote
-    // only the ISO form (`refreshedDateIso`) still gets a date here.
-    try out.writeAll(",\"refreshed_date\":");
-    try writeJsonOptString(out, def.refreshed_date orelse def.refreshed_date_iso);
-    try out.print(",\"refresh_on_load\":{},\"save_data\":{},\"source\":", .{ def.refresh_on_load, def.save_data });
-    try writePivotSource(out, pivots, c);
-    try out.writeAll(",\"fields\":[");
-    for (def.fields, 0..) |f, i| {
-        if (i > 0) try out.writeByte(',');
-        try out.writeAll("{\"name\":");
-        try writeJsonString(out, c.field_names[i]);
-        try out.writeAll(",\"num_fmt_id\":");
-        try writeJsonOptU32(out, f.num_fmt_id);
-        try out.writeAll(",\"formula\":");
-        try writeJsonOptString(out, c.field_formulas[i]);
-        try out.writeAll(",\"items\":");
-        try writeJsonOptU32(out, if (f.shared_items) |si| si.count else null);
-        try out.writeAll(",\"types\":");
-        if (f.shared_items) |si| try writeSharedItemTypes(out, si) else try out.writeAll("null");
-        try out.writeAll(",\"min\":");
-        try writeJsonOptString(out, if (f.shared_items) |si| (si.min_value orelse si.min_date) else null);
-        try out.writeAll(",\"max\":");
-        try writeJsonOptString(out, if (f.shared_items) |si| (si.max_value orelse si.max_date) else null);
-        try out.writeByte('}');
-    }
-    try out.writeAll("]}");
-}
-
-/// The `containsX` inventory as a list of the kinds present, in a fixed
-/// order: `string`, `number`, `integer`, `blank`, `date`, `mixed`.
-fn writeSharedItemTypes(out: *std.Io.Writer, si: zlsx_pkg.typed_parts.pivot_xml.SharedItems) !void {
-    try out.writeByte('[');
-    var first = true;
-    const kinds = [_]struct { on: bool, name: []const u8 }{
-        .{ .on = si.contains_string, .name = "string" },
-        .{ .on = si.contains_number, .name = "number" },
-        .{ .on = si.contains_integer, .name = "integer" },
-        .{ .on = si.contains_blank, .name = "blank" },
-        .{ .on = si.contains_date, .name = "date" },
-        .{ .on = si.contains_mixed_types, .name = "mixed" },
-    };
-    for (kinds) |k| {
-        if (!k.on) continue;
-        if (!first) try out.writeByte(',');
-        first = false;
-        try out.print("\"{s}\"", .{k.name});
-    }
-    try out.writeByte(']');
-}
-
-fn writePivotSource(out: *std.Io.Writer, pivots: *const zlsx_pkg.Pivots, c: zlsx_pkg.PivotCache) !void {
-    const src = &c.definition.source;
-    switch (src.type) {
-        .worksheet => {
-            try out.writeAll("{\"type\":\"worksheet\",");
-            try writePivotSourceSpelling(out, pivots, c.source, c.resolution);
-            try out.writeByte('}');
-        },
-        .consolidation => {
-            try out.writeAll("{\"type\":\"consolidation\",\"range_sets\":[");
-            for (c.range_set_sources, 0..) |sp, i| {
-                if (i > 0) try out.writeByte(',');
-                try out.writeByte('{');
-                try writePivotSourceSpelling(out, pivots, sp, c.range_set_resolutions[i]);
-                try out.writeByte('}');
-            }
-            try out.writeAll("]}");
-        },
-        .external => {
-            try out.writeAll("{\"type\":\"external\",\"connection_id\":");
-            try writeJsonOptU32(out, src.connection_id);
-            try out.writeByte('}');
-        },
-        .scenario => try out.writeAll("{\"type\":\"scenario\"}"),
-        .unknown => {
-            try out.writeAll("{\"type\":\"unknown\",\"raw\":");
-            try writeJsonOptString(out, src.type_raw);
-            try out.writeByte('}');
-        },
-    }
-}
-
-/// `"sheet":…,"ref":…,"name":…,"resolved":…,"unresolved":…` (no braces,
-/// no leading comma) — the spellings as written and what they led to: a
-/// local sheet (`{"sheet":"Data","sheet_idx":0,"via":"sheet_attr",
-/// "bounds":"A1:C4"}` — `bounds` the A1 area the spelling proves, or
-/// `null`), another workbook (`{"external":"…"}`), or `null` when the
-/// spelling names nothing this workbook has — in which case
-/// `unresolved` says why and which sheets it still proves (S7b-1).
-fn writePivotSourceSpelling(
-    out: *std.Io.Writer,
-    pivots: *const zlsx_pkg.Pivots,
-    sp: zlsx_pkg.pivots.SourceSpelling,
-    res: zlsx_pkg.PivotSourceResolution,
-) !void {
-    try out.writeAll("\"sheet\":");
-    try writeJsonOptString(out, sp.sheet);
-    try out.writeAll(",\"ref\":");
-    try writeJsonOptString(out, sp.ref);
-    try out.writeAll(",\"name\":");
-    try writeJsonOptString(out, sp.name);
-    try out.writeAll(",\"resolved\":");
-    switch (res) {
-        .sheet => |s| {
-            try out.writeAll("{\"sheet\":");
-            try writeJsonString(out, s.sheet_name);
-            try out.print(",\"sheet_idx\":{d},\"via\":\"{s}\",\"bounds\":", .{ s.sheet_idx, @tagName(s.via) });
-            var buf: [zlsx_pkg.pivots.Bounds.format_buf_len]u8 = undefined;
-            try writeJsonOptString(out, if (s.bounds) |b| b.formatA1(&buf) else null);
-            try out.writeByte('}');
-        },
-        .external => |target| {
-            try out.writeAll("{\"external\":");
-            try writeJsonString(out, target);
-            try out.writeByte('}');
-        },
-        .unresolved, .none => try out.writeAll("null"),
-    }
-    try out.writeAll(",\"unresolved\":");
-    switch (res) {
-        .unresolved => |u| {
-            try out.print("{{\"why\":\"{s}\",\"sheets\":[", .{@tagName(u.why)});
-            for (u.sheets, 0..) |idx, k| {
-                if (k > 0) try out.writeByte(',');
-                try out.writeAll("{\"sheet\":");
-                try writeJsonOptString(out, if (idx < pivots.sheet_names.len) pivots.sheet_names[idx] else null);
-                try out.print(",\"sheet_idx\":{d}}}", .{idx});
-            }
-            try out.writeAll("]}");
-        },
-        .sheet, .external, .none => try out.writeAll("null"),
-    }
-}
-
-fn writeJsonOptString(w: *std.Io.Writer, s: ?[]const u8) !void {
-    if (s) |v| try writeJsonString(w, v) else try w.writeAll("null");
-}
-
-fn writeJsonOptU32(w: *std.Io.Writer, v: ?u32) !void {
-    if (v) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
 }
 
 /// Emit `{…}` for a BorderSide or `null` when the side has no style.
@@ -5042,6 +4822,58 @@ fn runDeleteSheetCommand(
     return 0;
 }
 
+/// S3a: `zlsx rename-table-column <file> --table T --old-name A
+/// --new-name B --out P`. Routes through `Editor.renameTableColumn`;
+/// its refusals (`TableNotFound`, `TableColumnNotFound`,
+/// `TableColumnNameInUse`, `InvalidTableColumnName`) exit 3 like every
+/// other refused structural edit.
+fn runRenameTableColumnCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    err: *std.Io.Writer,
+) !u8 {
+    const out_path = args.out_path orelse {
+        try err.writeAll("zlsx: rename-table-column requires --out PATH\n");
+        try err.flush();
+        return 1;
+    };
+    const table = args.table_name orelse {
+        try err.writeAll("zlsx: rename-table-column requires --table NAME\n");
+        try err.flush();
+        return 1;
+    };
+    const old_name = args.old_column_name orelse {
+        try err.writeAll("zlsx: rename-table-column requires --old-name OLD\n");
+        try err.flush();
+        return 1;
+    };
+    const new_name = args.new_sheet_name orelse {
+        try err.writeAll("zlsx: rename-table-column requires --new-name NEW\n");
+        try err.flush();
+        return 1;
+    };
+
+    var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer ed.deinit();
+
+    ed.renameTableColumn(table, old_name, new_name) catch |e| {
+        try err.print("zlsx: renameTableColumn {s}[{s}] -> '{s}': {s}\n", .{ table, old_name, new_name, @errorName(e) });
+        try err.flush();
+        return 3;
+    };
+    ed.save(io, out_path) catch |e| {
+        try err.print("zlsx: save '{s}': {s}\n", .{ out_path, @errorName(e) });
+        try err.flush();
+        return 5;
+    };
+    return 0;
+}
+
 fn jsonValueToCell(v: std.json.Value) !xlsx.Cell {
     return switch (v) {
         .null => .{ .empty = {} },
@@ -5403,6 +5235,60 @@ test "runAddSheetCommand + runRenameSheetCommand + runDeleteSheetCommand round-t
         defer book.deinit();
         try std.testing.expectEqual(@as(usize, 1), book.sheets.len);
         try std.testing.expectEqualStrings("Renamed", book.sheets[0].name);
+    }
+}
+
+test "runRenameTableColumnCommand: the table part follows the new name; a missing table exits 3; flags are parsed and fenced" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(std.testing.allocator, io, "cli_rtc_src.xlsx");
+    defer std.testing.allocator.free(src_path);
+    const out_path = try tt.path(std.testing.allocator, io, "cli_rtc_out.xlsx");
+    defer std.testing.allocator.free(out_path);
+    try zlsx_pkg.pivots.fixture.write(std.testing.allocator, io, src_path, .table_name);
+
+    var err_buf: [512]u8 = undefined;
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const argv = [_][]const u8{ "rename-table-column", src_path, "--table", "SalesTbl", "--old-name", "Qty", "--new-name", "Quantity", "--out", out_path };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.rename_table_column, a.subcommand);
+        try std.testing.expectEqualStrings("SalesTbl", a.table_name.?);
+        try std.testing.expectEqualStrings("Qty", a.old_column_name.?);
+        try std.testing.expectEqualStrings("Quantity", a.new_sheet_name.?);
+        try std.testing.expectEqual(@as(u8, 0), try runRenameTableColumnCommand(std.testing.allocator, io, a, &err_w));
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(std.testing.allocator, io, out_path);
+        defer wb.deinit();
+        const part = (try wb.store.part("xl/tables/table1.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, part.bytes, "name=\"Quantity\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, part.bytes, "name=\"Qty\"") == null);
+    }
+    // A table the workbook does not have: exit 3, the name in the diagnostic.
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{ .file = src_path, .subcommand = .rename_table_column, .out_path = out_path, .table_name = "Nope", .old_column_name = "Qty", .new_sheet_name = "Q" };
+        try std.testing.expectEqual(@as(u8, 3), try runRenameTableColumnCommand(std.testing.allocator, io, a, &err_w));
+        try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "TableNotFound") != null);
+    }
+    // Each required flag missing is exit 1.
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const a: Args = .{ .file = src_path, .subcommand = .rename_table_column, .out_path = out_path, .table_name = "SalesTbl", .new_sheet_name = "Q" };
+        try std.testing.expectEqual(@as(u8, 1), try runRenameTableColumnCommand(std.testing.allocator, io, a, &err_w));
+    }
+    // The table flags belong to this sub-command alone.
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--table", "T" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rename-sheet", "f.xlsx", "--sheet", "0", "--old-name", "T", "--new-name", "U", "--out", "o.xlsx" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
 }
 
