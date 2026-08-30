@@ -6514,7 +6514,12 @@ pub const Workbook = struct {
                     },
                     else => {},
                 }
-                try grid.put(arena, post, hc);
+                // A coordinate twice is a grid with two cells in one
+                // place, which nothing can be laid out over (Codex
+                // #206 r3 REL-303).
+                const gop = try grid.getOrPut(arena, post);
+                if (gop.found_existing) return error.MalformedSheetXml;
+                gop.value_ptr.* = hc;
             }
         }
         // A save: the staged writes are what the sheet is about to
@@ -6724,19 +6729,269 @@ pub const Workbook = struct {
             }
             const ps = slot.?;
             for (hw.cells) |c| {
-                try ps.deltas.put(a, c.ref, c.value);
+                // Two pivots writing one cell are two rectangles that
+                // overlap, which Excel refuses (Codex #206 r3 REL-303).
+                const gop = try ps.deltas.getOrPut(a, c.ref);
+                if (gop.found_existing) return error.PivotEditUnsafe;
+                gop.value_ptr.* = c.value;
                 try ps.styles.put(a, c.ref, c.style);
             }
         }
         for (out.sheets.items) |*ps| {
-            const ws = try self.sheet(ps.sheet_idx);
-            const view = try ws.ensureParsed();
             const part = (try self.store.part(ps.part_name)) orelse return error.MissingSheetPart;
-            const new_xml = try emitSheetWithDeltasStyled(a, part.bytes, view, &ps.deltas, &out.plan, &ps.styles);
+            const new_xml = try spliceHostCells(a, part.bytes, ps, &out.plan);
             errdefer a.free(new_xml);
             try out.patches.append(a, .{ .name = ps.part_name, .bytes = new_xml });
         }
         return out;
+    }
+
+    /// One planned cell as the splicer orders it.
+    const PlannedCell = struct {
+        ref: CellRef,
+        value: CellValue,
+        style: ?u32,
+
+        fn before(_: void, x: PlannedCell, y: PlannedCell) bool {
+            if (x.ref.row != y.ref.row) return x.ref.row < y.ref.row;
+            return x.ref.col < y.ref.col;
+        }
+    };
+
+    /// The host part with the planned cells spliced in and every
+    /// other byte as written — the rows' attributes, the cells the
+    /// pivot does not name (a shared formula's `t`/`si`/`ref`, an
+    /// `<extLst>`), whatever sits between them. The typed emitter
+    /// regenerates `<sheetData>` whole and would drop all of that on
+    /// a sheet the user never edited (Codex #206 r3 REL-302). Rows
+    /// and cells are walked in the part's order, which must be
+    /// ascending; a coordinate twice, one that does not read, or a
+    /// `<c>` without its close is `MalformedSheetXml`. `<dimension>`
+    /// is widened to cover the planned cells.
+    fn spliceHostCells(a: Allocator, src: []const u8, ps: *const HostSheetWrites, plan: *const SstExtensionPlan) Error![]u8 {
+        var cells: std.ArrayListUnmanaged(PlannedCell) = .empty;
+        defer cells.deinit(a);
+        var it = ps.deltas.iterator();
+        while (it.next()) |e| {
+            try cells.append(a, .{ .ref = e.key_ptr.*, .value = e.value_ptr.*, .style = (ps.styles.get(e.key_ptr.*) orelse null) });
+        }
+        std.mem.sort(PlannedCell, cells.items, {}, PlannedCell.before);
+
+        const sd = sheet_edit.matchTagAt(src, std.mem.indexOf(u8, src, "<sheetData") orelse return error.NoSheetData, "sheetData") orelse return error.NoSheetData;
+        const sd_self_closing = src[sd.after_open - 2] == '/';
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.ensureTotalCapacity(a, src.len + 64 * cells.items.len);
+
+        // Everything before the rows, the dimension widened on the way.
+        var head_end = sd.after_open;
+        if (sd_self_closing) head_end = sd.start;
+        try appendWithDimension(a, &out, src[0..head_end], cells.items);
+        if (sd_self_closing) try out.appendSlice(a, "<sheetData>");
+
+        const body_end: usize = if (sd_self_closing) sd.after_open else (std.mem.indexOfPos(u8, src, sd.after_open, "</sheetData>") orelse return error.NoSheetData);
+        var pos: usize = if (sd_self_closing) sd.after_open else sd.after_open;
+        var next: usize = 0; // into `cells`
+        var last_row: u32 = 0;
+        while (pos < body_end) {
+            const lt = std.mem.indexOfScalarPos(u8, src, pos, '<') orelse break;
+            if (lt >= body_end) break;
+            const t = sheet_edit.matchTagAt(src, lt, "row") orelse {
+                // Not a row: whatever it is passes through to the next `<`.
+                try out.appendSlice(a, src[pos .. lt + 1]);
+                pos = lt + 1;
+                continue;
+            };
+            try out.appendSlice(a, src[pos..lt]);
+            const attrs = src[t.start + "<row".len .. t.after_open - 1];
+            const trimmed = std.mem.trimEnd(u8, attrs, " \t\r\n/");
+            const r = try rowNumberOf(wbxml_typed.getAttr(trimmed, "r") orelse return error.MalformedSheetXml);
+            if (r <= last_row) return error.MalformedSheetXml;
+            last_row = r;
+            // Planned rows the part does not have, before this one.
+            while (next < cells.items.len and cells.items[next].ref.row < r) {
+                next = try emitPlannedRow(a, &out, cells.items, next, plan);
+            }
+            const self_closing = src[t.after_open - 2] == '/';
+            const row_end: usize = if (self_closing) t.after_open else ((std.mem.indexOfPos(u8, src, t.after_open, "</row>") orelse return error.MalformedSheetXml) + "</row>".len);
+            if (next >= cells.items.len or cells.items[next].ref.row != r) {
+                try out.appendSlice(a, src[t.start..row_end]);
+                pos = row_end;
+                continue;
+            }
+            // This row gains, replaces or loses cells: its open tag as
+            // written (turned into an open/close pair if self-closing),
+            // its cells walked in column order.
+            if (self_closing) {
+                try out.appendSlice(a, src[t.start .. t.after_open - 2]);
+                try out.append(a, '>');
+            } else {
+                try out.appendSlice(a, src[t.start..t.after_open]);
+            }
+            var cpos = t.after_open;
+            const cells_end: usize = if (self_closing) t.after_open else row_end - "</row>".len;
+            var last_col: u32 = 0;
+            while (cpos < cells_end) {
+                const clt = std.mem.indexOfScalarPos(u8, src, cpos, '<') orelse break;
+                if (clt >= cells_end) break;
+                const ct = sheet_edit.matchTagAt(src, clt, "c") orelse {
+                    try out.appendSlice(a, src[cpos .. clt + 1]);
+                    cpos = clt + 1;
+                    continue;
+                };
+                try out.appendSlice(a, src[cpos..clt]);
+                const cattrs = std.mem.trimEnd(u8, src[ct.start + "<c".len .. ct.after_open - 1], " \t\r\n/");
+                const cref = try cellRefOf(wbxml_typed.getAttr(cattrs, "r") orelse return error.MalformedSheetXml);
+                if (cref.row != r or cref.col <= last_col) return error.MalformedSheetXml;
+                last_col = cref.col;
+                const c_self = src[ct.after_open - 2] == '/';
+                const c_end: usize = if (c_self) ct.after_open else ((std.mem.indexOfPos(u8, src, ct.after_open, "</c>") orelse return error.MalformedSheetXml) + "</c>".len);
+                // Planned cells left of this one.
+                while (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col < cref.col) : (next += 1) {
+                    try emitPlannedCell(a, &out, cells.items[next], plan);
+                }
+                if (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col == cref.col) {
+                    try emitPlannedCell(a, &out, cells.items[next], plan);
+                    next += 1;
+                } else {
+                    try out.appendSlice(a, src[ct.start..c_end]);
+                }
+                cpos = c_end;
+            }
+            try out.appendSlice(a, src[cpos..cells_end]);
+            while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                try emitPlannedCell(a, &out, cells.items[next], plan);
+            }
+            try out.appendSlice(a, "</row>");
+            pos = row_end;
+        }
+        try out.appendSlice(a, src[pos..body_end]);
+        while (next < cells.items.len) {
+            next = try emitPlannedRow(a, &out, cells.items, next, plan);
+        }
+        if (sd_self_closing) try out.appendSlice(a, "</sheetData>");
+        try out.appendSlice(a, src[body_end..]);
+        return try out.toOwnedSlice(a);
+    }
+
+    /// A row the part lacks: `<row r="N">` and its planned cells (a
+    /// `.deleted` cell has nothing to delete). Returns the index past
+    /// the row's cells.
+    fn emitPlannedRow(a: Allocator, out: *std.ArrayListUnmanaged(u8), cells: []const PlannedCell, from: usize, plan: *const SstExtensionPlan) Error!usize {
+        const r = cells[from].ref.row;
+        var end = from;
+        var any = false;
+        while (end < cells.len and cells[end].ref.row == r) : (end += 1) {
+            if (cells[end].value != .deleted) any = true;
+        }
+        if (!any) return end;
+        try out.appendSlice(a, "<row r=\"");
+        var buf: [16]u8 = undefined;
+        try out.appendSlice(a, try std.fmt.bufPrint(&buf, "{d}", .{r}));
+        try out.appendSlice(a, "\">");
+        for (cells[from..end]) |c| try emitPlannedCell(a, out, c, plan);
+        try out.appendSlice(a, "</row>");
+        return end;
+    }
+
+    /// One planned cell: a shared string, a number, an empty cell
+    /// (`<c r=".." s=".."/>`, Excel's spelling of a pivot cell with
+    /// nothing in it), or nothing at all for `.deleted`.
+    fn emitPlannedCell(a: Allocator, out: *std.ArrayListUnmanaged(u8), c: PlannedCell, plan: *const SstExtensionPlan) Error!void {
+        if (c.value == .deleted) return;
+        var ref_buf: [16]u8 = undefined;
+        try out.appendSlice(a, "<c r=\"");
+        try out.appendSlice(a, formatA1Ref(&ref_buf, c.ref));
+        try out.append(a, '"');
+        if (c.style) |st| {
+            var sbuf: [16]u8 = undefined;
+            try out.appendSlice(a, " s=\"");
+            try out.appendSlice(a, try std.fmt.bufPrint(&sbuf, "{d}", .{st}));
+            try out.append(a, '"');
+        }
+        switch (c.value) {
+            .blank => try out.appendSlice(a, "/>"),
+            .number => |n| {
+                var nbuf: [64]u8 = undefined;
+                try out.appendSlice(a, "><v>");
+                try out.appendSlice(a, try std.fmt.bufPrint(&nbuf, "{d}", .{n}));
+                try out.appendSlice(a, "</v></c>");
+            },
+            .shared_string => |txt| {
+                const idx = plan.indexOf(txt) orelse return error.MalformedXml;
+                var ibuf: [16]u8 = undefined;
+                try out.appendSlice(a, " t=\"s\"><v>");
+                try out.appendSlice(a, try std.fmt.bufPrint(&ibuf, "{d}", .{idx}));
+                try out.appendSlice(a, "</v></c>");
+            },
+            // The planner writes nothing else.
+            else => return error.MalformedXml,
+        }
+    }
+
+    /// `src` (the part up to the rows) with `<dimension ref>` widened
+    /// to cover the planned cells — a part without one is left so.
+    fn appendWithDimension(a: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8, cells: []const PlannedCell) Error!void {
+        var rect: ?pivots_mod.edit.Rect = null;
+        for (cells) |c| {
+            if (c.value == .deleted) continue;
+            if (rect) |*r| {
+                r.tl_row = @min(r.tl_row, c.ref.row);
+                r.tl_col = @min(r.tl_col, c.ref.col);
+                r.br_row = @max(r.br_row, c.ref.row);
+                r.br_col = @max(r.br_col, c.ref.col);
+            } else rect = .{ .tl_row = c.ref.row, .tl_col = c.ref.col, .br_row = c.ref.row, .br_col = c.ref.col };
+        }
+        const want = rect orelse {
+            try out.appendSlice(a, src);
+            return;
+        };
+        const at = std.mem.indexOf(u8, src, "<dimension") orelse {
+            try out.appendSlice(a, src);
+            return;
+        };
+        const t = sheet_edit.matchTagAt(src, at, "dimension") orelse {
+            try out.appendSlice(a, src);
+            return;
+        };
+        const attrs = std.mem.trimEnd(u8, src[t.start + "<dimension".len .. t.after_open - 1], " \t\r\n/");
+        const raw = wbxml_typed.getAttr(attrs, "ref") orelse {
+            try out.appendSlice(a, src);
+            return;
+        };
+        var buf: [64]u8 = undefined;
+        const decoded = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        var r = pivots_mod.edit.parseRect(decoded) orelse return error.MalformedSheetXml;
+        r.tl_row = @min(r.tl_row, want.tl_row);
+        r.tl_col = @min(r.tl_col, want.tl_col);
+        r.br_row = @max(r.br_row, want.br_row);
+        r.br_col = @max(r.br_col, want.br_col);
+        var ref_buf: [pivots_mod.Bounds.format_buf_len]u8 = undefined;
+        const new_ref = pivots_mod.edit.formatRect(&ref_buf, r) catch return error.MalformedSheetXml;
+        try out.appendSlice(a, src[0..t.start]);
+        try out.appendSlice(a, "<dimension ref=\"");
+        try out.appendSlice(a, new_ref);
+        try out.appendSlice(a, "\"/>");
+        try out.appendSlice(a, src[t.after_open..]);
+    }
+
+    /// A `<row r>` decoded and read as a row number.
+    fn rowNumberOf(raw: []const u8) Error!u32 {
+        var buf: [32]u8 = undefined;
+        const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        if (v.len == 0 or v[0] == '0') return error.MalformedSheetXml;
+        for (v) |d| if (!std.ascii.isDigit(d)) return error.MalformedSheetXml;
+        const r = std.fmt.parseInt(u32, v, 10) catch return error.MalformedSheetXml;
+        if (r == 0 or r > zlsx.max_row) return error.MalformedSheetXml;
+        return r;
+    }
+
+    /// A `<c r>` decoded and read by the strict grid parser.
+    fn cellRefOf(raw: []const u8) Error!CellRef {
+        var buf: [32]u8 = undefined;
+        const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        const parsed = coords.parseCell(v, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
+        return .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
     }
 
     /// The rendered host writes installed with `extra` (a caller's
@@ -8633,22 +8888,6 @@ fn emitSheetWithDeltas(
     deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
     sst_plan: *const SstExtensionPlan,
 ) Error![]u8 {
-    return emitSheetWithDeltasStyled(allocator, source, view, deltas, sst_plan, null);
-}
-
-/// `emitSheetWithDeltas` with a style per delta cell: where `styles`
-/// names a ref, that style (or none, for null) replaces whatever the
-/// original cell wore — the S7b-5 pivot cells carry the style of the
-/// old rectangle's row of the same kind, which is not the style of the
-/// cell that happened to sit at that position.
-fn emitSheetWithDeltasStyled(
-    allocator: Allocator,
-    source: []const u8,
-    view: *const sheet_xml_mod.SheetXml,
-    deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
-    sst_plan: *const SstExtensionPlan,
-    styles: ?*const std.AutoHashMapUnmanaged(CellRef, ?u32),
-) Error![]u8 {
     assert(source.len > 0);
 
     const sd_idx = std.mem.indexOf(u8, source, "<sheetData") orelse
@@ -8675,7 +8914,7 @@ fn emitSheetWithDeltasStyled(
     try out.appendSlice(allocator, source[0..prefix_end]);
     if (is_self_closing) try out.appendSlice(allocator, "<sheetData>");
 
-    try emitSheetData(allocator, &out, view, deltas, sst_plan, styles);
+    try emitSheetData(allocator, &out, view, deltas, sst_plan);
 
     if (is_self_closing) try out.appendSlice(allocator, "</sheetData>");
     try out.appendSlice(allocator, source[suffix_start..]);
@@ -8707,7 +8946,6 @@ fn emitSheetData(
     view: *const sheet_xml_mod.SheetXml,
     deltas: *const std.AutoHashMapUnmanaged(CellRef, CellValue),
     sst_plan: *const SstExtensionPlan,
-    styles: ?*const std.AutoHashMapUnmanaged(CellRef, ?u32),
 ) Error!void {
     // 1. Collect existing cells (override with delta if matching).
     var merged: std.ArrayList(MergedCell) = .empty;
@@ -8729,7 +8967,7 @@ fn emitSheetData(
             };
             const mc: MergedCell = if (overlay) |dv| .{
                 .ref = cr,
-                .style_idx = if (styles) |st| (st.get(cr) orelse c.style_idx) else c.style_idx,
+                .style_idx = c.style_idx,
                 .payload = .{ .delta = dv },
             } else .{
                 .ref = cr,
@@ -8754,7 +8992,7 @@ fn emitSheetData(
         if (entry.value_ptr.* == .deleted) continue;
         try merged.append(allocator, .{
             .ref = entry.key_ptr.*,
-            .style_idx = if (styles) |st| (st.get(entry.key_ptr.*) orelse null) else null,
+            .style_idx = null,
             .payload = .{ .delta = entry.value_ptr.* },
         });
     }
@@ -9236,8 +9474,12 @@ fn emitSstXmlForExtension(
         }
         break :blk countSiOpens(src_xml);
     };
-    const new_si_count: u32 = @intCast(new_strings.len + new_rich.len);
-    const total_si: u32 = existing_si_count + new_si_count;
+    // The counts are the part's own (`uniqueCount` is taken on
+    // trust above): added with a check, not trapped on (Codex #206
+    // r3 SEC-301).
+    const new_total = std.math.add(usize, new_strings.len, new_rich.len) catch return error.MalformedXml;
+    const new_si_count = std.math.cast(u32, new_total) orelse return error.MalformedXml;
+    const total_si = std.math.add(u32, existing_si_count, new_si_count) catch return error.MalformedXml;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
