@@ -6551,6 +6551,7 @@ pub const Workbook = struct {
         const uris = typed_parts.pivot_xml.main_ns_uris;
         var pos: usize = 0;
         var root_seen = false;
+        var root_bound = false;
         while (try nextMarkup(xml, pos, xml.len)) |m| {
             pos = m.after;
             if (m.kind != .open) continue;
@@ -6579,7 +6580,12 @@ pub const Workbook = struct {
                 // cells the splicer writes are not cells (Codex #206
                 // r26 SEC-2601), as the pivot parts' root check has it.
                 if (is_default and !main) return error.PivotEditUnsafe;
+                if (is_default and main) root_bound = true;
             }
+            // A root with no default binding at all spells its cells
+            // in no namespace — not SpreadsheetML's (Codex #206 r27
+            // SEC-2701).
+            if (!root_seen and !root_bound) return error.PivotEditUnsafe;
             root_seen = true;
         }
     }
@@ -7083,7 +7089,12 @@ pub const Workbook = struct {
         // Everything before the rows, the dimension widened on the way.
         const head_end: usize = if (sd_self_closing) sd_tag.start else sd_tag.after_open;
         try appendWithDimension(a, &out, src, head_end, dim_tag, cells.items);
-        if (sd_self_closing) try out.appendSlice(a, "<sheetData>");
+        // A self-closing `<sheetData …/>` opens with its attributes as
+        // written (Codex #206 r27 REL-2703).
+        if (sd_self_closing) {
+            try out.appendSlice(a, src[sd_tag.start .. sd_tag.after_open - 2]);
+            try out.append(a, '>');
+        }
 
         var next: usize = 0; // into `cells`
         var last_row: u32 = 0;
@@ -7148,6 +7159,7 @@ pub const Workbook = struct {
                 var cpos = t.after_open;
                 var last_col: u32 = 0;
                 var row_closed = false;
+                var cells_closed = false;
                 while (try nextMarkup(src, cpos, src.len)) |cm| {
                     switch (cm.kind) {
                         .non_element => {
@@ -7174,14 +7186,24 @@ pub const Workbook = struct {
                     }
                     const ct = sheet_edit.matchTagAt(src, cm.lt, "c") orelse {
                         // Not a cell: a row or `sheetData` here is
-                        // not a grid; anything else is stepped over
-                        // whole, its subtree verbatim (r16 SEC-1601).
+                        // not a grid; anything else — the row's
+                        // `<extLst>` — ends the cells (`CT_Row` puts
+                        // them first), so the planned ones still due
+                        // go before it (Codex #206 r27 REL-2702), and
+                        // it is stepped over whole, its subtree
+                        // verbatim (r16 SEC-1601).
                         if (sheet_edit.matchTagAt(src, cm.lt, "row") != null or sheet_edit.matchTagAt(src, cm.lt, "sheetData") != null) return error.MalformedSheetXml;
+                        try out.appendSlice(a, src[cpos..cm.lt]);
+                        while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                            try emitPlannedCell(a, &out, cells.items[next], plan);
+                        }
+                        cells_closed = true;
                         const skip_to: usize = if (src[cm.after - 2] == '/') cm.after else try elementEnd(src, cm);
-                        try out.appendSlice(a, src[cpos..skip_to]);
+                        try out.appendSlice(a, src[cm.lt..skip_to]);
                         cpos = skip_to;
                         continue;
                     };
+                    if (cells_closed) return error.MalformedSheetXml;
                     try out.appendSlice(a, src[cpos..cm.lt]);
                     const cattrs = std.mem.trimEnd(u8, src[ct.start + "<c".len .. ct.after_open - 1], " \t\r\n/");
                     const cref = try cellRefOf(wbxml_typed.getAttr(cattrs, "r") orelse return error.MalformedSheetXml);

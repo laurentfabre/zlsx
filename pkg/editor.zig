@@ -9845,3 +9845,74 @@ test "S7b-5: a host root bound to a foreign default namespace refuses; the Stric
         try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
     }
 }
+
+test "S7b-5: a host root with no default binding refuses; a planned cell goes before a row's extension list; a self-closing sheetData keeps its attributes (Codex #206 r27 SEC-2701, REL-2702, REL-2703)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r27_dst.xlsx");
+    defer a.free(dst);
+    const main_ns = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+    {
+        const src = try tt.path(a, io, "s7b5_r27_unbound.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", main_ns, "xmlns:z=\"urn:z\"");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        // Row 4 holds one cell and an extension list: the pivot's `B4`
+        // lands between them.
+        const src = try tt.path(a, io, "s7b5_r27_row_ext.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"4\"><c r=\"A4\"/><extLst><ext uri=\"{x}\"/></extLst></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const host = (try store.part("xl/worksheets/sheet2.xml")).?.bytes;
+        const b4 = std.mem.indexOf(u8, host, "<c r=\"B4\"").?;
+        const ext = std.mem.indexOf(u8, host, "<extLst><ext uri=\"{x}\"/></extLst></row>").?;
+        try std.testing.expect(b4 < ext);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+    }
+    {
+        // The old rows commented out, a self-closing `<sheetData>` with
+        // attributes in their place: it opens as written.
+        const src = try tt.path(a, io, "s7b5_r27_self_closing.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", "<sheetData xmlns:z=\"urn:z\" z:k=\"v\"/><!--");
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</sheetData>", "-->");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<sheetData xmlns:z=\"urn:z\" z:k=\"v\"><row r=\"3\">");
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "</row></sheetData><!--");
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    }
+}
