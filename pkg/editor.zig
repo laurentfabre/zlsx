@@ -9542,6 +9542,9 @@ test "S7b-5: a host that aliases or rebinds the main namespace refuses the edit 
         .{ .name = "alias", .rows = "</row><row r=\"7\"><x:c xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" r=\"A7\"><v>1</v></x:c></row></sheetData>" },
         .{ .name = "rebind", .rows = "</row><row r=\"7\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><c r=\"A7\"><v>1</v></c></row></sheetData>" },
         .{ .name = "alias_merge", .rows = "</row></sheetData><x:mergeCells xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\"><x:mergeCell ref=\"A7:B7\"/></x:mergeCells>" },
+        // Codex #206 r19 SEC-1901: the binding spelt with a reference.
+        .{ .name = "alias_entity", .rows = "</row><row r=\"7\"><x:c xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/mai&#x6e;\" r=\"A7\"><v>1</v></x:c></row></sheetData>" },
+        .{ .name = "alias_merge_entity", .rows = "</row></sheetData><x:mergeCells xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/mai&#x6e;\" count=\"1\"><x:mergeCell ref=\"A7:B7\"/></x:mergeCells>" },
     };
     for (cases) |case| {
         const file = try std.fmt.allocPrint(a, "s7b5_r18_{s}.xlsx", .{case.name});

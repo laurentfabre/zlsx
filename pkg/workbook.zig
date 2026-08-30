@@ -6556,8 +6556,14 @@ pub const Workbook = struct {
                 const is_default = std.mem.eql(u8, a.name, "xmlns");
                 const is_prefixed = std.mem.startsWith(u8, a.name, "xmlns:");
                 if (!is_default and !is_prefixed) continue;
+                // The binding is the value decoded — `mai&#x6e;` is
+                // `main` (Codex #206 r19 SEC-1901); one that does
+                // not decode, or is longer than any namespace, is not
+                // one this reader can rule out.
+                var buf: [256]u8 = undefined;
+                const decoded = wbxml_typed.decodeScalarAttr(&buf, a.value) orelse return error.PivotEditUnsafe;
                 var main = false;
-                for (uris) |u| if (std.mem.eql(u8, a.value, u)) {
+                for (uris) |u| if (std.mem.eql(u8, decoded, u)) {
                     main = true;
                 };
                 if (is_prefixed and main) return error.PivotEditUnsafe;
