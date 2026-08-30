@@ -3550,6 +3550,16 @@ class Editor:
                 "(requires 0.9.0+); upgrade libzlsx"
             )
 
+    @staticmethod
+    def _u32(name: str, value) -> int:
+        """Bound an index before ctypes narrows it: ``c_uint32`` wraps
+        modulo 2³², so ``2**32`` would reach the C side as 0 and edit
+        sheet 0 / row 0 unchecked (Codex #207 r1 REL-101)."""
+        v = int(value)
+        if v < 0 or v > 0xFFFFFFFF:
+            raise ValueError(f"{name} must be in [0, 4294967295], got {value!r}")
+        return v
+
     def _structural_call(self, symbol: str, fn, *args) -> None:
         """One zlsx_status_v1 call: ZLSX_REFUSED raises the typed
         :class:`ZlsxRefusal` from the diag, any other failure a
@@ -3579,14 +3589,22 @@ class Editor:
           from, would collapse a table or delete its header row, or a
           carrier the scan cannot read is in the way.
 
+        * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
+          1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
+          — a split pane the rewriter does not shift; ``Malformed*`` /
+          ``*CoordinateOverflow`` — a sheet, drawing, VML, comments or
+          table part the walkers cannot read or move.
+
         Errors (:class:`ZlsxError`): ``SheetIndexOutOfRange``,
         ``RowIndexOutOfRange`` (0 or past 1048576), and
         ``RowEditRequiresCleanSheet`` — the sheet has unsaved
-        :meth:`set_cell` / :meth:`append_rows` writes; save first."""
+        :meth:`set_cell` / :meth:`append_rows` writes; save first.
+        Indices outside ``[0, 2**32)`` raise ``ValueError`` before the
+        call."""
         self._require_structural("zlsx_editor_insert_row")
         self._structural_call(
             "zlsx_editor_insert_row", _ffi.lib.zlsx_editor_insert_row,
-            self._handle, int(sheet_idx), int(before_row),
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("before_row", before_row),
         )
 
     def delete_row(self, sheet_idx: int, row: int) -> None:
@@ -3596,7 +3614,7 @@ class Editor:
         self._require_structural("zlsx_editor_delete_row")
         self._structural_call(
             "zlsx_editor_delete_row", _ffi.lib.zlsx_editor_delete_row,
-            self._handle, int(sheet_idx), int(row),
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("row", row),
         )
 
     def insert_column(self, sheet_idx: int, before_col: int) -> None:
@@ -3608,7 +3626,7 @@ class Editor:
         self._require_structural("zlsx_editor_insert_column")
         self._structural_call(
             "zlsx_editor_insert_column", _ffi.lib.zlsx_editor_insert_column,
-            self._handle, int(sheet_idx), int(before_col),
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("before_col", before_col),
         )
 
     def delete_column(self, sheet_idx: int, col: int) -> None:
@@ -3616,7 +3634,7 @@ class Editor:
         self._require_structural("zlsx_editor_delete_column")
         self._structural_call(
             "zlsx_editor_delete_column", _ffi.lib.zlsx_editor_delete_column,
-            self._handle, int(sheet_idx), int(col),
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("col", col),
         )
 
     def add_sheet(self, name: str) -> int:
@@ -3645,7 +3663,7 @@ class Editor:
         buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
         self._structural_call(
             "zlsx_editor_rename_sheet", _ffi.lib.zlsx_editor_rename_sheet,
-            self._handle, int(sheet_idx), buf, len(raw),
+            self._handle, self._u32("sheet_idx", sheet_idx), buf, len(raw),
         )
 
     def delete_sheet(self, sheet_idx: int) -> None:
@@ -3658,7 +3676,7 @@ class Editor:
         self._require_structural("zlsx_editor_delete_sheet")
         self._structural_call(
             "zlsx_editor_delete_sheet", _ffi.lib.zlsx_editor_delete_sheet,
-            self._handle, int(sheet_idx),
+            self._handle, self._u32("sheet_idx", sheet_idx),
         )
 
     def rename_table_column(self, table: str, old_name: str, new_name: str) -> None:

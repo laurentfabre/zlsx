@@ -1749,7 +1749,13 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *   CannotDeleteLastSheet, DuplicateSheetName (add / rename, compared
  *     ASCII case-insensitively), TableNotFound, TableColumnNotFound,
  *     TableColumnNameInUse, MalformedPivotXml (the pivot graph cannot
- *     be read whole).
+ *     be read whole);
+ *   with their precise names, the worksheet transform's own verdicts
+ *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
+ *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
+ *     read or move (every Malformed* / *CoordinateOverflow part,
+ *     PivotEditUnsafe, MissingSheetPart, NoSheetData) — the full list is
+ *     docs/plans/c-abi-status-v1.md §10.
  * What fails (-1) is a statement about the call: SheetIndexOutOfRange,
  * RowIndexOutOfRange, ColumnIndexOutOfRange, InvalidSheetName,
  * InvalidTableColumnName, InvalidInput (NULL where bytes are

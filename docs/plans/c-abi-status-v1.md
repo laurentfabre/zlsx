@@ -360,11 +360,22 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 
 | `-2` (`ZLSX_REFUSED`, `diag.error_name`) | `-1` (`ZLSX_ERROR`, `errbuf`) |
 |---|---|
-| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, a carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
+| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
+| The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
+| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
 | `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix) | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
 | `TableNotFound`, `TableColumnNotFound`, `TableColumnNameInUse` | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
+
+The list is `c_abi.zig::structural_refusals`, one place. The editor folds
+its own pre-flights into the two `*UnsafeForSheet` names; what the
+transform's probe and the later sweeps raise reaches the boundary
+unfolded, so a caller sees the precise cause (`RowEditExceedsMaxRow`
+rather than "unsafe") — Codex #207 r1 REL-102. Sequencing errors and
+the transform's post-probe contract (a sweep failing after the probe
+passed: discard the editor, reopen — `Workbook.applySheetEditTransform`)
+are unchanged by this row.
 
 The Python leg mirrors the split: `-2` raises `ZlsxRefusal(error_name)`
 (the new base class; `ZlsxFormulaRefusal` now derives from it and is
@@ -385,7 +396,11 @@ prints through too — in a library-allocated buffer released with
 frozen contract, drifting on its own schedule. Python parses one JSON
 object per line (`Editor.pivots()` / `zlsx.pivots(path)`); a C caller
 parses with whatever it has. The read runs over the editor's current
-state, staged edits included.
+state, staged edits included. The buffer is built by
+`c_abi.zig::pivotsNdjsonOwned(alloc, wb)`: the allocating writer reports
+a failed growth as `WriteFailed`, which the builder maps to
+`OutOfMemory` so the boundary answers `-3`, never a generic `-1`
+(Codex #207 r1 REL-103; pinned by an allocation-failure sweep).
 
 **Tests** (`src/c_abi.zig`, "S3a …"): a boundary round trip whose saved
 grid is checked in the sheet part; every refusal in the table above with
@@ -408,3 +423,8 @@ without either macro.
 3. Bare names, no `_v2` — nothing collides.
 4. Columns 0-based at the boundary, converted to the editor's 1-based
    API; `UINT32_MAX` refused before the conversion.
+5. The transform's and the sweeps' workbook-safety errors cross with
+   their precise names (one list, `structural_refusals`), not folded
+   into `*UnsafeForSheet`; a growth failure in the pivots buffer is
+   `-3`. The Python leg bounds every index to `[0, 2³²)` before ctypes
+   narrows it (`ValueError`).

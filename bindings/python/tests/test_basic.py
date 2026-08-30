@@ -2731,3 +2731,31 @@ def test_pivots_frozen_shape_on_corpus_and_empty_on_plain_workbook(tmp_path):
             assert set(f) == {"name", "num_fmt_id", "formula", "items", "types", "min", "max"}
     # No orphan caches in the corpus workbook.
     assert all(r["kind"] == "pivot" for r in records)
+
+
+def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path):
+    """c_uint32 wraps modulo 2**32: without a guard, rename_sheet(2**32, …)
+    would rename sheet 0. Every integer-bearing structural method rejects
+    out-of-range values before the FFI call, and the workbook is untouched."""
+    _require_structural()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+    with zlsx.edit(src) as ed:
+        for bad in (2**32, 2**32 + 1, -1, -(2**32) + 1):
+            for call in (
+                lambda: ed.insert_row(bad, 1),
+                lambda: ed.insert_row(0, bad),
+                lambda: ed.delete_row(bad, 1),
+                lambda: ed.delete_row(0, bad),
+                lambda: ed.insert_column(bad, 0),
+                lambda: ed.insert_column(0, bad),
+                lambda: ed.delete_column(bad, 0),
+                lambda: ed.delete_column(0, bad),
+                lambda: ed.rename_sheet(bad, "X"),
+                lambda: ed.delete_sheet(bad),
+            ):
+                with pytest.raises(ValueError, match="4294967295"):
+                    call()
+        assert ed.save_to_buffer() == src.read_bytes()
+    with zlsx.open(src) as book:
+        assert [book.sheet(i).name for i in range(2)] == ["Data", "Second"]

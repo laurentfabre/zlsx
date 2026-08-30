@@ -244,6 +244,7 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableNotFound` / `TableColumnNotFound` / `TableColumnNameInUse` | `rename_table_column` |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
+| `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit` / `Malformed*` / `*CoordinateOverflow` | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read |
 
 `ZlsxRefusal` is a `ZlsxError`; `ZlsxFormulaRefusal` (the engine's
 Plane-2 refusals) now derives from it. Statements about the *call* stay
@@ -253,7 +254,8 @@ plain `ZlsxError`s named after the cause: `SheetIndexOutOfRange`,
 `RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` /
 `SheetDeleteRequiresCleanState` — a structural edit needs the sheet (the
 workbook, for a sheet delete) free of unsaved `set_cell` / `append_rows`
-writes; save first.
+writes; save first. Indices outside `[0, 2**32)` raise `ValueError`
+before the call (ctypes would otherwise wrap them).
 
 `Editor.pivots()` returns the records `zlsx pivots` prints
 ([docs/cli.md](../../docs/cli.md), "pivots"), parsed from the same bytes:

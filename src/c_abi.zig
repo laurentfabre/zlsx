@@ -5888,9 +5888,17 @@ export fn zlsx_sheet_writer_write_row_with_formulas_v2(
 // -1 with the error name in `errbuf`. Contract: docs/plans/c-abi-status-v1.md §10.
 
 /// The refusal vocabulary of the structural edits and the pivots read
-/// (§10). `statusOf` checks it after the fourteen planes; a name here
-/// crosses as -2, every other error the editor raises as -1.
+/// (§10): every error an edit raises that is a statement about the
+/// WORKBOOK — a construct the rewriter will not shift, a part it cannot
+/// read, a grid it would push past its edge, a name the workbook holds.
+/// `statusOf` checks it after the fourteen planes; a name here crosses
+/// as -2, every other error the editor raises (an index, a name, a
+/// sequencing rule — statements about the call) as -1. The editor folds
+/// most of its pre-flights into the two `*UnsafeForSheet` names; the
+/// rest reach the boundary as the transform or a later sweep spells
+/// them (Codex #207 r1 REL-102), and a caller sees the precise cause.
 const structural_refusals = [_][]const u8{
+    // The editor's own verdicts.
     "RowEditUnsafeForSheet",
     "ColEditUnsafeForSheet",
     "CannotDeleteLastSheet",
@@ -5899,6 +5907,33 @@ const structural_refusals = [_][]const u8{
     "TableColumnNotFound",
     "TableColumnNameInUse",
     "MalformedPivotXml",
+    // The worksheet transform's, raised by its pre-mutation probe.
+    "RowEditExceedsMaxRow",
+    "ColEditExceedsMaxCol",
+    "SplitPaneNotSupported",
+    "MalformedPaneSplit",
+    "MalformedSheetXml",
+    // The sweeps' — a carrier the walkers cannot read or move.
+    "MalformedDrawingXml",
+    "DrawingCoordinateOverflow",
+    "MalformedVmlDrawing",
+    "VmlCoordinateOverflow",
+    "MalformedCommentsXml",
+    "MalformedTableXml",
+    "TableCoordinateOverflow",
+    "TableCollapseUnsafe",
+    "TableHeaderRowDeleteUnsafe",
+    "PivotEditUnsafe",
+    "MalformedExtensionXml",
+    "MalformedSheetRels",
+    "MalformedWorkbookRels",
+    "MalformedDrawingRels",
+    "MissingSheetPart",
+    "NoSheetData",
+    // The workbook layer's spellings of two editor verdicts, should a
+    // path ever surface them unfolded.
+    "LastSheetUndeletable",
+    "SheetNameInUse",
 };
 
 fn isStructuralRefusal(name: []const u8) bool {
@@ -6147,22 +6182,32 @@ export fn zlsx_editor_pivots_ndjson(
     };
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
 
-    var pv = state.inner.workbook.pivotTables() catch |e| {
+    const bytes = pivotsNdjsonOwned(gpa, &state.inner.workbook) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
     };
-    defer pv.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    zlsx_pkg.pivots.ndjson.writeAll(&out.writer, &pv) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
-    };
-    if (out.written().len == 0) return ZLSX_OK;
-    const bytes = out.toOwnedSlice() catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
-    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
     op.* = bytes.ptr;
     ol.* = bytes.len;
     return ZLSX_OK;
+}
+
+/// The pivots records as one owned buffer in `alloc`. The allocating
+/// writer reports a failed growth as `WriteFailed`; at this boundary
+/// that is an allocation failure and crosses as `-3`, not as a generic
+/// error (Codex #207 r1 REL-103). Every other error is the graph
+/// read's.
+fn pivotsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
+    var pv = try wb.pivotTables();
+    defer pv.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.pivots.ndjson.writeAll(&out.writer, &pv) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
 }
 
 // ─── M9a1 tests ──────────────────────────────────────────────────────
@@ -7373,10 +7418,87 @@ test "S3a pivots_ndjson: the package writer's bytes, empty on a plain workbook, 
     }
 }
 
+test "S3a refusals from the transform and the sweeps: the precise name crosses as -2" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const sheet_part = "xl/worksheets/sheet1.xml";
+
+    // A cell past the grid: the transform's pre-mutation probe refuses
+    // the insert with its own name. (A pivot-free workbook: on a pivot
+    // SOURCE sheet the S7b source read meets the strict parser first and
+    // the verdict is `MalformedSheetXml` — also -2, a different name.)
+    {
+        const path = try writeS3aFixture(io, &tt, "s3a_maxrow.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, sheet_part, "<c r=\"B2\"><v>5</v></c>", "<c r=\"B1048577\"><v>5</v></c>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 0, 2, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("RowEditExceedsMaxRow", diagName(&diag));
+        try std.testing.expectEqualStrings("RowEditExceedsMaxRow", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    // A split pane (pixel offsets) the rewriter does not shift.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3a_splitpane.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, sheet_part, "<sheetData>", "<sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"2400\" topLeftCell=\"A5\" activePane=\"bottomLeft\" state=\"split\"/></sheetView></sheetViews><sheetData>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_delete_column(ed, 0, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("SplitPaneNotSupported", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        // Refused before any mutation: the sheet part is untouched.
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+}
+
+fn pivotsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try pivotsNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+test "S3a pivots_ndjson: every allocation failure while writing is OutOfMemory, never WriteFailed" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(alloc, io, "s3a_pivots_oom.xlsx");
+    defer alloc.free(path);
+    try zlsx_pkg.pivots.fixture.writeWithOrphanCache(alloc, io, path, .sheet_ref);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, pivotsNdjsonForFailures, .{&wb});
+    try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
+
 test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.RowEditUnsafeForSheet));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.CannotDeleteLastSheet));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedPivotXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.RowEditExceedsMaxRow));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.ColEditExceedsMaxCol));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.SplitPaneNotSupported));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedDrawingXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WriteFailed));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetHasUnsavedMutations));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.RowEditRequiresCleanSheet));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetIndexOutOfRange));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidSheetName));
