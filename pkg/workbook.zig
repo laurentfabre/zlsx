@@ -10194,8 +10194,10 @@ fn emitSstXmlForExtension(
     try out.appendSlice(allocator, src_xml[0 .. sst_open + "<sst".len]);
 
     // Walk the original attribute blob, replacing count/uniqueCount.
+    // A self-closing root's `/` is not an attribute (Codex #206 r25
+    // REL-2501): the blob ends before it.
     const attr_start = sst_open + "<sst".len;
-    const attr_end = sst_open_gt; // index of `>` (or `/>` slash)
+    const attr_end = if (is_self_closing) sst_open_gt - 1 else sst_open_gt;
     try writePatchedSstAttrs(
         allocator,
         &out,
@@ -25395,5 +25397,24 @@ test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a 
         edges[0 * 2 + 1] = true;
         const kept = try Workbook.peelStagings(arena, &edges, &.{ true, false }, 2);
         try std.testing.expectEqualSlices(bool, &.{ true, false }, kept);
+    }
+}
+
+test "S7b-5: extending a self-closing shared-string root opens it whole — no slash left among the attributes (Codex #206 r25 REL-2501)" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"0\" uniqueCount=\"0\"/>",
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" />",
+        "<?xml version=\"1.0\"?>\n<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>",
+    };
+    for (cases) |src| {
+        const out = try emitSstXmlForExtension(a, src, &.{"x"}, &.{}, 0);
+        defer a.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "/ ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "<sst/") == null);
+        try std.testing.expect(std.mem.endsWith(u8, out, "<si><t>x</t></si></sst>"));
+        const doc = try Workbook.scanDocument(out, "sst", "si");
+        try std.testing.expect(doc.child != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "uniqueCount=\"1\"") != null);
     }
 }
