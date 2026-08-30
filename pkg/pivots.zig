@@ -3173,6 +3173,7 @@ pub const engine = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.MalformedXml => return error.MalformedPivotXml,
         };
+        try validateRebuild(rb);
         try checkTableShape(arena, &def, cache, rb);
 
         const rf: u32 = def.row_fields[0].field;
@@ -3306,6 +3307,33 @@ pub const engine = struct {
             else => return error.MalformedPivotXml,
         };
         return .{ .table_xml = table, .rect = rect, .old_rect = old_rect, .cells = cells.items, .old_kinds = old_kinds };
+    }
+
+    /// A `Rebuild` is public: one `rebuild` made holds these by
+    /// construction, one a caller assembled is checked before anything
+    /// indexes by it (Codex #206 r7 REL-701) — the rows count the
+    /// records and are one value per field; an indexed field names
+    /// one inventory item per row, of a kind the slice lays out; an
+    /// inline field's rows are numbers or blanks.
+    fn validateRebuild(rb: *const Rebuild) RebuildError!void {
+        if (rb.rows.len != rb.record_count) return error.MalformedPivotXml;
+        for (rb.rows) |r| if (r.len != rb.fields.len) return error.MalformedPivotXml;
+        for (rb.fields, 0..) |f, k| {
+            if (f.index_of_row.len != rb.rows.len) return error.MalformedPivotXml;
+            for (f.items) |it| switch (it.kind) {
+                .s, .n, .m => {},
+                else => return error.MalformedPivotXml,
+            };
+            if (f.indexed) {
+                for (f.index_of_row) |i| if (i >= f.items.len) return error.MalformedPivotXml;
+            } else {
+                for (rb.rows) |r| switch (r[k]) {
+                    .blank => {},
+                    .number => |lex| if (parseNumber(lex) == null) return error.MalformedPivotXml,
+                    .string => return error.MalformedPivotXml,
+                };
+            }
+        }
     }
 
     /// The consumer forms this slice lays out; everything else refuses
@@ -7122,4 +7150,65 @@ test "S7b-5 oracle: the corpus pivots re-laid from their own records reproduce e
     }
     // 5 × 5 cells on `IrisSample`, 5 × 4 on `mtCars Pivot`.
     try testing.expectEqual(@as(usize, 45), checked);
+}
+
+test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed, never indexed (Codex #206 r7 REL-701)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b5_r7_rebuild.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const t = o.pivots.tables[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const good = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
+    _ = try engine.layout(arena, t.raw_xml, cache, &good, .{});
+
+    // A row index past the inventory.
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        const idx = try arena.dupe(u32, good.fields[0].index_of_row);
+        idx[1] = 99;
+        fields[0].index_of_row = idx;
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // Fewer indices than rows.
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        fields[0].index_of_row = good.fields[0].index_of_row[0..1];
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // A short row, and a count that is not the rows'.
+    {
+        var rb = good;
+        const rows = try arena.dupe(engine.Row, good.rows);
+        rows[2] = rows[2][0..2];
+        rb.rows = rows;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        var counted = good;
+        counted.record_count = 7;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &counted, .{}));
+    }
+    // An inline field's row that is not a number.
+    {
+        var rb = good;
+        const rows = try arena.dupe(engine.Row, good.rows);
+        const row = try arena.dupe(engine.Value, rows[0]);
+        row[1] = .{ .number = "0x1p0" };
+        rows[0] = row;
+        rb.rows = rows;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
 }

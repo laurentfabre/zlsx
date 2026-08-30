@@ -6563,25 +6563,33 @@ pub const Workbook = struct {
         return grid;
     }
 
-    /// An inline string whole: every `<t>` of its `<is>` body, decoded
-    /// and joined — the view's `raw_value` is the first run alone.
+    /// An inline string whole: every `<t>` element of its `<is>` body,
+    /// decoded and joined — the view's `raw_value` is the first run
+    /// alone. A comment, CDATA section or processing instruction in
+    /// the body is not a run and not text (Codex #206 r7 REL-702); a
+    /// `<t>` without its close is `MalformedSheetXml`.
     fn inlineStringText(arena: Allocator, body: []const u8) Error![]const u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, body, pos, "<t")) |lt| {
-            const gt = std.mem.indexOfScalarPos(u8, body, lt, '>') orelse break;
-            const boundary: u8 = if (lt + 2 < body.len) body[lt + 2] else 0;
-            if (boundary != '>' and boundary != ' ' and boundary != '\t' and boundary != '\n' and boundary != '\r' and boundary != '/') {
-                pos = lt + 2;
-                continue;
+        while (try nextMarkup(body, pos, body.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            const t = zlsx.TagOpen{ .start = m.lt, .after_open = m.after };
+            if (sheet_edit.matchTagAt(body, m.lt, "t") == null) continue;
+            if (body[t.after_open - 2] == '/') continue;
+            // The text: everything up to `</t>` that is not markup.
+            var tpos = t.after_open;
+            var closed = false;
+            while (try nextMarkup(body, tpos, body.len)) |tm| {
+                try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[tpos..tm.lt]));
+                tpos = tm.after;
+                if (tm.kind == .close and closeTagIs(body, tm, "t")) {
+                    closed = true;
+                    break;
+                }
             }
-            if (body[gt - 1] == '/') {
-                pos = gt + 1;
-                continue;
-            }
-            const close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
-            try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[gt + 1 .. close]));
-            pos = close + "</t>".len;
+            if (!closed) return error.MalformedSheetXml;
+            pos = tpos;
         }
         return out.items;
     }

@@ -612,12 +612,42 @@ fn parseCellType(raw: ?[]const u8) ?CellType {
     return null;
 }
 
-/// The inner bytes of `<is>…</is>`, when the cell has one.
+/// The inner bytes of `<is>…</is>`, when the cell has one — the
+/// element, not a spelling of it inside a comment, CDATA section or
+/// processing instruction (Codex #206 r7 REL-702).
 fn extractInlineBody(c_body: []const u8) ?[]const u8 {
-    const is_open = std.mem.indexOf(u8, c_body, "<is") orelse return null;
-    const is_open_end = findTagEnd(c_body, is_open) orelse return null;
-    const is_close = std.mem.indexOfPos(u8, c_body, is_open_end, "</is>") orelse return null;
-    return c_body[is_open_end + 1 .. is_close];
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, c_body, pos, '<')) |lt| {
+        if (lt + 1 >= c_body.len) return null;
+        const c = c_body[lt + 1];
+        if (c == '!' or c == '?') {
+            pos = wbxml.skipNonElement(c_body, lt) catch return null;
+            continue;
+        }
+        const is_open_end = findTagEnd(c_body, lt) orelse return null;
+        const name_end = lt + 1 + "is".len;
+        const is_is = name_end <= c_body.len and std.mem.eql(u8, c_body[lt + 1 .. name_end], "is") and
+            (name_end == is_open_end or std.ascii.isWhitespace(c_body[name_end]) or c_body[name_end] == '/');
+        if (!is_is) {
+            pos = is_open_end + 1;
+            continue;
+        }
+        if (c_body[is_open_end - 1] == '/') return c_body[is_open_end..is_open_end];
+        // The close by the walk, past any comment inside.
+        var inner = is_open_end + 1;
+        while (std.mem.indexOfScalarPos(u8, c_body, inner, '<')) |ilt| {
+            if (ilt + 1 >= c_body.len) return null;
+            const ic = c_body[ilt + 1];
+            if (ic == '!' or ic == '?') {
+                inner = wbxml.skipNonElement(c_body, ilt) catch return null;
+                continue;
+            }
+            if (std.mem.startsWith(u8, c_body[ilt..], "</is>")) return c_body[is_open_end + 1 .. ilt];
+            inner = (findTagEnd(c_body, ilt) orelse return null) + 1;
+        }
+        return null;
+    }
+    return null;
 }
 
 fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {

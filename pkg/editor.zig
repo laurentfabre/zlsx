@@ -9055,3 +9055,42 @@ test "S7b-5: a write staged on the host after the pre-flight ages the prepared c
     // own terms: the growth cell is taken.
     try std.testing.expectError(error.PivotEditUnsafe, wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 2, .insert));
 }
+
+test "S7b-5: a comment or processing instruction between an inline caption's runs is not a run; a decoy <is> in a comment is not the element; an unterminated run refuses (Codex #206 r7 REL-702)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r7_dst.xlsx");
+    defer a.free(dst);
+    {
+        const src = try tt.path(a, io, "s7b5_r7_decoys.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><!--<is><t>fake</t></is>--><is><r><t>Étiquettes </t></r><!--<t>fake</t>--><?pi <t>fake</t>?><r><t>de lignes</t></r></is></c></row><row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><r><t>Total <!--x--></t></r><r><t>général</t></r></is></c></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Étiquettes de lignes" });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Total général" });
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r7_unterminated.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><r><t>Row Labels</r></is></c></row></sheetData>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}
