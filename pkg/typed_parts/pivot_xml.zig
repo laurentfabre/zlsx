@@ -725,6 +725,14 @@ pub const TableDefinition = struct {
     col_items: ?AxisItems = null,
     chart_formats: ChartFormats = .none,
     has_ext_lst: bool = false,
+    /// The axis and data wrappers (`rowFields`, `colFields`,
+    /// `pageFields`, `dataFields`) carried content their reader does
+    /// not classify — a child that is not their field, one under
+    /// another prefix, markup between children, an attribute besides
+    /// `count`, a field with a body (Codex #206 r10 REL-1002).
+    axes_other: bool = false,
+    /// A wrapper's `count` disagrees with its children.
+    axes_count_mismatch: bool = false,
     /// Root children this reader does not lay out — `formats`,
     /// `conditionalFormats`, `filters`, the OLAP hierarchies, a name
     /// the schema does not list — and anything the one-prefix walk
@@ -811,19 +819,23 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
         } else if (std.mem.eql(u8, k.local, "rowFields")) {
             if (seen.contains(.rows)) return error.MalformedXml;
             seen.insert(.rows);
-            def.row_fields = try parseAxisFields(allocator, xml, k, p);
+            def.row_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "field", def.row_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "colFields")) {
             if (seen.contains(.cols)) return error.MalformedXml;
             seen.insert(.cols);
-            def.col_fields = try parseAxisFields(allocator, xml, k, p);
+            def.col_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "field", def.col_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pageFields")) {
             if (seen.contains(.pages)) return error.MalformedXml;
             seen.insert(.pages);
-            def.page_fields = try parsePageFields(allocator, xml, k, p);
+            def.page_fields = try parsePageFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "pageField", def.page_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "dataFields")) {
             if (seen.contains(.data)) return error.MalformedXml;
             seen.insert(.data);
-            def.data_fields = try parseDataFields(allocator, xml, k, p);
+            def.data_fields = try parseDataFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "dataField", def.data_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pivotTableStyleInfo")) {
             if (seen.contains(.style)) return error.MalformedXml;
             seen.insert(.style);
@@ -1051,16 +1063,35 @@ fn axisFromXml(s: []const u8) ?Axis {
     return null;
 }
 
-fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]AxisField {
+fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]AxisField {
     var out: std.ArrayListUnmanaged(AxisField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "field")) continue;
+        if (!std.mem.eql(u8, k.local, "field")) {
+            def.axes_other = true;
+            continue;
+        }
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
         try out.append(allocator, try ordinalOrValues(x));
     }
+    if (kids.skipped > 0 or kids.other) def.axes_other = true;
     return out.toOwnedSlice(allocator);
+}
+
+/// What a wrapper says of itself against what it holds: an attribute
+/// besides `count`, a `count` that is not its children.
+fn noteWrapper(xml: []const u8, el: Child, child: []const u8, n: usize, def: *TableDefinition) Error!void {
+    _ = child;
+    const attrs = el.attrs(xml);
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        if (!std.mem.eql(u8, a.name, "count")) def.axes_other = true;
+    }
+    if (try u32Attr(attrs, "count")) |c| {
+        if (c != n) def.axes_count_mismatch = true;
+    }
 }
 
 /// `-2` is the values axis; any other negative ordinal names no field
@@ -1071,12 +1102,19 @@ fn ordinalOrValues(x: i32) Error!AxisField {
     return error.MalformedXml;
 }
 
-fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PageField {
+fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]PageField {
     var out: std.ArrayListUnmanaged(PageField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    defer if (kids.skipped > 0 or kids.other) {
+        def.axes_other = true;
+    };
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "pageField")) continue;
+        if (!std.mem.eql(u8, k.local, "pageField")) {
+            def.axes_other = true;
+            continue;
+        }
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const attrs = k.attrs(xml);
         const fld = (try i32Attr(attrs, "fld")) orelse return error.MalformedXml;
         try out.append(allocator, .{
@@ -1090,12 +1128,21 @@ fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
     return out.toOwnedSlice(allocator);
 }
 
-fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]DataField {
+fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]DataField {
     var out: std.ArrayListUnmanaged(DataField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    defer if (kids.skipped > 0 or kids.other) {
+        def.axes_other = true;
+    };
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "dataField")) continue;
+        if (!std.mem.eql(u8, k.local, "dataField")) {
+            def.axes_other = true;
+            continue;
+        }
+        // A data field's body is an `<extLst>` at most; the slice
+        // regenerates none of it and refuses any.
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const attrs = k.attrs(xml);
         var df: DataField = .{
             .name = wbxml.getAttr(attrs, "name"),

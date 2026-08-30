@@ -3331,8 +3331,31 @@ pub const engine = struct {
                 else => return error.MalformedPivotXml,
             };
             if (f.indexed) {
-                for (f.index_of_row) |i| if (i >= f.items.len) return error.MalformedPivotXml;
+                // Each row's value is the item its index names (Codex
+                // #206 r10 REL-1003).
+                for (f.index_of_row, rb.rows) |i, r| {
+                    if (i >= f.items.len) return error.MalformedPivotXml;
+                    const it = f.items[i];
+                    switch (r[k]) {
+                        .blank => if (it.kind != .m) return error.MalformedPivotXml,
+                        .number => |lex| {
+                            const x = parseNumber(lex) orelse return error.MalformedPivotXml;
+                            if (it.kind != .n or numberKey(x) != numberKey(it.num)) return error.MalformedPivotXml;
+                        },
+                        .string => |txt| {
+                            if (it.kind != .s) return error.MalformedPivotXml;
+                            const fa = fold(std.heap.page_allocator, txt) catch return error.MalformedPivotXml;
+                            defer if (fa) |v| std.heap.page_allocator.free(v);
+                            const fb = fold(std.heap.page_allocator, it.text) catch return error.MalformedPivotXml;
+                            defer if (fb) |v| std.heap.page_allocator.free(v);
+                            const ka = fa orelse return error.MalformedPivotXml;
+                            const kb = fb orelse return error.MalformedPivotXml;
+                            if (!std.mem.eql(u8, ka, kb)) return error.MalformedPivotXml;
+                        },
+                    }
+                }
             } else {
+                if (f.items.len != 0) return error.MalformedPivotXml;
                 for (rb.rows) |r| switch (r[k]) {
                     .blank => {},
                     .number => |lex| if (parseNumber(lex) == null) return error.MalformedPivotXml,
@@ -3346,7 +3369,8 @@ pub const engine = struct {
     /// before a cell is computed. Malformed where the part disagrees
     /// with itself or with the cache it reads.
     fn checkTableShape(arena: Allocator, def: *const pivot_xml.TableDefinition, cache: *const PivotCache, rb: *const Rebuild) RebuildError!void {
-        if (def.has_other_children or def.chart_formats == .other) return error.PivotShapeUnsupported;
+        if (def.has_other_children or def.chart_formats == .other or def.axes_other) return error.PivotShapeUnsupported;
+        if (def.axes_count_mismatch) return error.MalformedPivotXml;
         if (def.page_fields.len != 0 or def.data_on_rows or !def.compact) return error.PivotShapeUnsupported;
         // The one form has its grand total; a layout without one, or
         // with the column totals off, is not oracled (Codex #206 r8
@@ -7220,6 +7244,22 @@ test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed,
         rows[0] = row;
         rb.rows = rows;
         try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // A row whose index names another item than its value, an inline
+    // field with an inventory (Codex #206 r10 REL-1003).
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        const idx = try arena.dupe(u32, good.fields[0].index_of_row);
+        idx[1] = 0; // `West` indexed as `East`
+        fields[0].index_of_row = idx;
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        var inline_items = good;
+        const f2 = try arena.dupe(engine.Field, good.fields);
+        f2[1].items = good.fields[0].items;
+        inline_items.fields = f2;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &inline_items, .{}));
     }
     // An indexed numeric item whose spelling is not the grammar's, or
     // not its value (Codex #206 r8 REL-802).

@@ -8485,6 +8485,12 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole �
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r10 REL-1002: the axis and data wrappers.
+        .{ .name = "row_fields_count", .old = "<rowFields count=\"1\">", .new = "<rowFields count=\"2\">", .direct = error.MalformedPivotXml },
+        .{ .name = "data_fields_stray", .old = "<dataFields count=\"1\">", .new = "<dataFields count=\"1\"><foo/>" },
+        .{ .name = "row_fields_attr", .old = "<rowFields count=\"1\">", .new = "<rowFields count=\"1\" foo=\"1\">" },
+        .{ .name = "field_body", .old = "<field x=\"0\"/>", .new = "<field x=\"0\">x</field>" },
+        .{ .name = "data_field_comment", .old = "<dataFields count=\"1\">", .new = "<dataFields count=\"1\"><!-- x -->" },
         // Codex #206 r9 REL-902: content under `<pivotFields>` that is
         // not a field — a stray element, one under another prefix.
         .{ .name = "fields_stray", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"3\"><foo/>" },
@@ -9143,4 +9149,64 @@ test "S7b-5: a pivot whose source is another pivot's rectangle — the edit refu
     var wb = try Workbook.open(a, io, dst);
     defer wb.deinit();
     try expectHostCell(&wb, 1, "A6", .{ .text = "Central" });
+}
+
+/// A pivot on the orphan cache 8 (`Report!A1:A1`, one field), hosted
+/// on `Report` at `location` — a pivot no edit of `Data` touches.
+fn addConsumerOnOrphanCache(io: std.Io, path: []const u8, location: []const u8) !void {
+    const a = std.testing.allocator;
+    var store = try store_mod.PartStore.open(a, io, path);
+    defer store.deinit();
+    const def = try std.mem.concat(a, u8, &.{
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" name=\"PivotTable2\" cacheId=\"8\" dataCaption=\"Values\" updatedVersion=\"6\" minRefreshableVersion=\"3\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" createdVersion=\"6\" indent=\"0\" outline=\"1\" outlineData=\"1\" multipleFieldFilters=\"0\"><location ",
+        location,
+        " firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"1\"><pivotField axis=\"axisRow\" showAll=\"0\"><items count=\"1\"><item t=\"default\"/></items></pivotField></pivotFields><rowFields count=\"1\"><field x=\"0\"/></rowFields><rowItems count=\"1\"><i t=\"grand\"><x/></i></rowItems><colItems count=\"1\"><i/></colItems></pivotTableDefinition>",
+    });
+    defer a.free(def);
+    try store.addPart("xl/pivotTables/pivotTable2.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml", def);
+    try store.addPart(
+        "xl/pivotTables/_rels/pivotTable2.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition2.xml"/></Relationships>
+        ,
+    );
+    try store.save(io, path);
+    try pivots_mod.fixture.patchPart(a, io, path, "xl/worksheets/_rels/sheet2.xml.rels", "</Relationships>", "<Relationship Id=\"rIdPT2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable2.xml\"/></Relationships>");
+}
+
+test "S7b-5: a rectangle may not grow into another pivot's declared footprint, even one with no cell there — the edit refuses, the save marks alone (Codex #206 r10 REL-1001)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r10_footprint.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r10_footprint_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.writeWithOrphanCache(a, io, src, .sheet_ref);
+    // `A7:B10`, right under `A3:B6`, no cell written there.
+    try addConsumerOnOrphanCache(io, src, "ref=\"A7:B10\"");
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const before = try a.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+    defer a.free(before);
+    try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+    try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try ed.setCell(0, 2, 0, .{ .string = "Central" });
+    try ed.save(io, dst);
+    try expectMarkerOnly(io, src, dst);
+    // A delete shrinks the rectangle: no footprint in the way.
+    var ed2 = try Editor.open(a, io, src);
+    defer ed2.deinit();
+    try ed2.deleteRow(0, 3);
+    try ed2.save(io, dst);
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    try expectPartHas(&store, pt_part, "<location ref=\"A3:B5\"");
 }

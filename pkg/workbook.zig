@@ -6360,6 +6360,7 @@ pub const Workbook = struct {
             const merges = try self.hostMerges(arena, t.sheet_idx, map);
             const captions = try self.hostCaptions(arena, base, &p.caches[ci], &grid);
             const lay = pivots_mod.engine.layout(arena, base, &p.caches[ci], rb, captions) catch |e| return mapEngineError(e);
+            try self.refuseOverOtherPivots(arena, &p, i, lay.rect, table_bytes);
             table_bytes[i] = lay.table_xml;
             try self.planPivotHostWrite(prepared, t, lay, &grid, merges);
         }
@@ -6398,6 +6399,28 @@ pub const Workbook = struct {
             rehearsal.deinit(self.allocator);
         }
         try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
+    }
+
+    /// A re-laid rectangle may not reach another pivot's declared
+    /// footprint on the same host — one whose cells are absent or
+    /// empty is invisible to the occupancy check (Codex #206 r10
+    /// REL-1001). `table_bytes[j]`, when set, is that pivot's part as
+    /// it will be (moved, or re-laid), so the footprint compared is
+    /// the post-edit one. Two relationships to one part are one pivot.
+    fn refuseOverOtherPivots(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, i: usize, rect: pivots_mod.edit.Rect, table_bytes: []const ?[]const u8) Error!void {
+        _ = self;
+        const t = p.tables[i];
+        for (p.tables, 0..) |u, j| {
+            if (j == i or u.sheet_idx != t.sheet_idx or std.mem.eql(u8, u.part_name, t.part_name)) continue;
+            const bytes = table_bytes[j] orelse u.raw_xml;
+            const def = typed_parts.pivot_xml.parseTableDefinition(arena, bytes) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.MalformedPivotXml,
+            };
+            const fp = pivots_mod.edit.footprintOf(arena, def) catch |e| return mapPivotEditError(e);
+            const other: pivots_mod.edit.Rect = .{ .tl_col = fp.rect.tl_col, .tl_row = fp.first_row, .br_col = fp.last_col, .br_row = fp.rect.br_row };
+            if (rectsIntersect(rect, other)) return error.PivotEditUnsafe;
+        }
     }
 
     /// Does a host cell written at `ref` (post-edit coordinates, on
@@ -8093,7 +8116,7 @@ pub const Workbook = struct {
         for (p.tables, 0..) |t, i| {
             if (t.cache != ci) continue;
             if (try consumerSeenBefore(p, i)) continue;
-            const write = try self.planConsumerForSave(arena, t, c, &rb);
+            const write = try self.planConsumerForSave(arena, p, i, c, &rb);
             if (!std.mem.eql(u8, write.table_xml, t.raw_xml)) try tables.append(arena, .{ .part_name = t.part_name, .bytes = write.table_xml });
             try host_writes.append(arena, write.host);
         }
@@ -8108,7 +8131,8 @@ pub const Workbook = struct {
     /// sheet's last row, which a grown rectangle may have moved), a
     /// form the layout refuses, a rectangle that would grow over a
     /// cell or a merge.
-    fn planConsumerForSave(self: *Workbook, arena: Allocator, t: pivots_mod.PivotTable, c: *const pivots_mod.PivotCache, rb: *const pivots_mod.engine.Rebuild) Error!ConsumerWrite {
+    fn planConsumerForSave(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, i: usize, c: *const pivots_mod.PivotCache, rb: *const pivots_mod.engine.Rebuild) Error!ConsumerWrite {
+        const t = p.tables[i];
         const host = try self.sheet(t.sheet_idx);
         if (host.appended_rows.items.len > 0) return error.PivotEditUnsafe;
         const map = HostRowMap.forEdit(false, .row, 1, .insert);
@@ -8117,6 +8141,9 @@ pub const Workbook = struct {
         const merges = try self.hostMerges(arena, t.sheet_idx, map);
         const captions = try self.hostCaptions(arena, t.raw_xml, c, &grid);
         const lay = pivots_mod.engine.layout(arena, t.raw_xml, c, rb, captions) catch |e| return mapEngineError(e);
+        const none = try arena.alloc(?[]const u8, p.tables.len);
+        @memset(none, null);
+        try self.refuseOverOtherPivots(arena, p, i, lay.rect, none);
         const write = try planHostWriteCells(arena, t, lay, &grid, merges);
         return .{ .table_xml = lay.table_xml, .host = write };
     }
