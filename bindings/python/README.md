@@ -220,7 +220,7 @@ with zlsx.edit("report.xlsx") as ed:
     ed.insert_row(0, 2)                    # a blank row 2; everything below shifts
     ed.delete_column(0, 3)                 # column D goes; E.. become D..
     idx = ed.add_sheet("Archive")          # -> 2
-    ed.rename_sheet(1, "Summary 2026")     # 'Old'!A1 references follow
+    ed.rename_sheet(1, "Summary 2026")     # 'Old'!A1 references follow (not a pivot's worksheetSource@sheet — see below)
     ed.rename_table_column("Sales", "Qty", "Quantity")   # Sales[Qty] follows too
     ed.save("report.xlsx")
 
@@ -233,7 +233,11 @@ carries — formulas in every dialect (A1, 3D, R1C1, structured
 references), defined names, hyperlinks, DV / CF, merges, panes,
 autoFilter, tables, drawings, comments, `<xm:f>` extensions, a hosted
 pivot's rectangle and a cache's source range (a source whose content
-changes is rebuilt at save). Where the workbook cannot be kept consistent
+changes is rebuilt during the edit and committed by `save`). One hole
+the row inherits from the Zig editor: `rename_sheet` / `delete_sheet`
+do not rewrite a pivot cache's `worksheetSource@sheet`, so a source
+spelled by sheet name goes stale and `pivots()` reports it as
+`"resolved": null`. Where the workbook cannot be kept consistent
 the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 `error_name` says why:
 

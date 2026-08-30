@@ -5000,7 +5000,7 @@ fn statusOf(e: anyerror) i32 {
     }
     // S3a: the structural edits' and the pivots read's own vocabulary —
     // no plane, but a statement about the workbook all the same.
-    if (isStructuralRefusal(@errorName(e))) return ZLSX_REFUSED;
+    if (isStructuralRefusal(e)) return ZLSX_REFUSED;
     return ZLSX_ERROR;
 }
 
@@ -5897,50 +5897,64 @@ export fn zlsx_sheet_writer_write_row_with_formulas_v2(
 /// most of its pre-flights into the two `*UnsafeForSheet` names; the
 /// rest reach the boundary as the transform or a later sweep spells
 /// them (Codex #207 r1 REL-102), and a caller sees the precise cause.
-const structural_refusals = [_][]const u8{
+const structural_refusals = [_]anyerror{
     // The editor's own verdicts.
-    "RowEditUnsafeForSheet",
-    "ColEditUnsafeForSheet",
-    "CannotDeleteLastSheet",
-    "DuplicateSheetName",
-    "TableNotFound",
-    "TableColumnNotFound",
-    "TableColumnNameInUse",
-    "MalformedPivotXml",
+    error.RowEditUnsafeForSheet,
+    error.ColEditUnsafeForSheet,
+    error.CannotDeleteLastSheet,
+    error.DuplicateSheetName,
+    error.TableNotFound,
+    error.TableColumnNotFound,
+    error.TableColumnNameInUse,
+    error.MalformedPivotXml,
     // The worksheet transform's, raised by its pre-mutation probe.
-    "RowEditExceedsMaxRow",
-    "ColEditExceedsMaxCol",
-    "SplitPaneNotSupported",
-    "MalformedPaneSplit",
-    "MalformedSheetXml",
+    error.RowEditExceedsMaxRow,
+    error.ColEditExceedsMaxCol,
+    error.SplitPaneNotSupported,
+    error.MalformedPaneSplit,
+    error.MalformedSheetXml,
     // The sweeps' — a carrier the walkers cannot read or move.
-    "MalformedDrawingXml",
-    "DrawingCoordinateOverflow",
-    "MalformedVmlDrawing",
-    "VmlCoordinateOverflow",
-    "MalformedCommentsXml",
-    "MalformedTableXml",
-    "TableCoordinateOverflow",
-    "TableCollapseUnsafe",
-    "TableHeaderRowDeleteUnsafe",
-    "PivotEditUnsafe",
-    "MalformedExtensionXml",
-    "MalformedSheetRels",
-    "MalformedWorkbookRels",
-    "MalformedDrawingRels",
-    "MissingSheetPart",
-    "NoSheetData",
+    error.MalformedDrawingXml,
+    error.DrawingCoordinateOverflow,
+    error.MalformedVmlDrawing,
+    error.VmlCoordinateOverflow,
+    error.MalformedCommentsXml,
+    error.MalformedTableXml,
+    error.TableCoordinateOverflow,
+    error.TableCollapseUnsafe,
+    error.TableHeaderRowDeleteUnsafe,
+    error.PivotEditUnsafe,
+    error.MalformedExtensionXml,
+    error.MalformedSheetRels,
+    error.MalformedWorkbookRels,
+    error.MalformedDrawingRels,
+    error.MissingSheetPart,
+    error.NoSheetData,
     // The workbook layer's spellings of two editor verdicts, should a
     // path ever surface them unfolded.
-    "LastSheetUndeletable",
-    "SheetNameInUse",
+    error.LastSheetUndeletable,
+    error.SheetNameInUse,
 };
 
-fn isStructuralRefusal(name: []const u8) bool {
+fn isStructuralRefusal(e: anyerror) bool {
     for (structural_refusals) |r| {
-        if (std.mem.eql(u8, r, name)) return true;
+        if (e == r) return true;
     }
     return false;
+}
+
+/// The structural exports' failure path. The typed worksheet parse
+/// (`Worksheet.ensureParsed`, reached lazily by a sheet delete and by
+/// the sweeps) spells a part it cannot read as the parser's own
+/// `MalformedXml` / `UnexpectedEof`; at this boundary those are the
+/// sheet transform's `MalformedSheetXml` — a statement about the
+/// workbook, -2 (Codex #207 r2 REL-202). Nothing else is renamed.
+fn failStructural(e: anyerror, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) i32 {
+    const mapped: anyerror = switch (e) {
+        error.MalformedXml, error.UnexpectedEof => error.MalformedSheetXml,
+        else => e,
+    };
+    return failMapped(mapped, diag, err_buf, err_buf_len);
 }
 
 /// The handle check every S3a export shares. NULL is a statement about
@@ -5993,7 +6007,7 @@ export fn zlsx_editor_insert_row(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.insertRow(sheet_idx, before_row) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6011,7 +6025,7 @@ export fn zlsx_editor_delete_row(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteRow(sheet_idx, row) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6031,7 +6045,7 @@ export fn zlsx_editor_insert_column(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const col_1 = colOneBased(before_col, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.insertColumn(sheet_idx, col_1) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6049,7 +6063,7 @@ export fn zlsx_editor_delete_column(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const col_1 = colOneBased(col, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteColumn(sheet_idx, col_1) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6077,7 +6091,7 @@ export fn zlsx_editor_add_sheet(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const name = bytesArg(name_ptr, name_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const idx = state.inner.addSheet(name) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     if (out_sheet_idx) |o| o.* = idx;
     return ZLSX_OK;
@@ -6099,7 +6113,7 @@ export fn zlsx_editor_rename_sheet(
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const name = bytesArg(name_ptr, name_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.renameSheet(sheet_idx, name) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6119,7 +6133,7 @@ export fn zlsx_editor_delete_sheet(
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.deleteSheet(sheet_idx) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6146,7 +6160,7 @@ export fn zlsx_editor_rename_table_column(
     const old = bytesArg(old_ptr, old_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const new = bytesArg(new_ptr, new_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.renameTableColumn(table, old, new) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+        return failStructural(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
 }
@@ -6200,7 +6214,15 @@ export fn zlsx_editor_pivots_ndjson(
 /// error (Codex #207 r1 REL-103). Every other error is the graph
 /// read's.
 fn pivotsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
-    var pv = try wb.pivotTables();
+    // A part the store cannot materialise (a bad CRC, a broken deflate
+    // stream, a name the archive lost) is the graph that cannot be read
+    // whole — `MalformedPivotXml`, like every other reason the read
+    // refuses (Codex #207 r2 REL-203). Memory and the archive-wide
+    // decompression budget keep their own statuses.
+    var pv = wb.pivotTables() catch |e| switch (e) {
+        error.OutOfMemory, error.ZipBombSuspected => return e,
+        else => return error.MalformedPivotXml,
+    };
     defer pv.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -7341,6 +7363,13 @@ test "S3a contract violations: -1 with the name in errbuf, the diag untouched or
     try std.testing.expectEqual(plane_none, bd.plane);
     zlsx_diag_release(bd);
     for (big[@sizeOf(CDiag)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    const dup = "second";
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_add_sheet(ed, dup.ptr, dup.len, null, bd, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("DuplicateSheetName", diagName(bd));
+    try std.testing.expectEqual(plane_none, bd.plane);
+    for (big[@sizeOf(CDiag)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    zlsx_diag_release(bd);
+    for (big[@sizeOf(CDiag)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
 }
 
 test "S3a pivots_ndjson: the package writer's bytes, empty on a plain workbook, refused on a broken graph" {
@@ -7485,6 +7514,90 @@ test "S3a pivots_ndjson: every allocation failure while writing is OutOfMemory, 
     defer wb.deinit();
     try std.testing.checkAllAllocationFailures(alloc, pivotsNdjsonForFailures, .{&wb});
     try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
+
+/// Flip one byte deep inside the stored payload of `part` (the local
+/// header precedes the central directory, so the first occurrence of
+/// the name is the local one): the central directory stays valid, the
+/// editor opens, and the part fails when the store materialises it.
+fn corruptPartPayload(alloc: std.mem.Allocator, io: std.Io, path: []const u8, part: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 24));
+    defer alloc.free(bytes);
+    const name_at = std.mem.indexOf(u8, bytes, part) orelse return error.TestUnexpectedResult;
+    const hdr = name_at - 30;
+    if (!std.mem.eql(u8, bytes[hdr..][0..4], "PK\x03\x04")) return error.TestUnexpectedResult;
+    const csize = std.mem.readInt(u32, bytes[hdr + 18 ..][0..4], .little);
+    const nlen = std.mem.readInt(u16, bytes[hdr + 26 ..][0..2], .little);
+    const elen = std.mem.readInt(u16, bytes[hdr + 28 ..][0..2], .little);
+    const payload = bytes[name_at + nlen + elen ..][0..csize];
+    payload[payload.len / 2] ^= 0xFF;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the call's" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    // A worksheet the typed parser cannot read, met when a sheet delete
+    // parses the sheet it drops: `MalformedSheetXml`, -2.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3a_lazy_sheet.xlsx");
+        defer alloc.free(path);
+        // The parser tolerates a lost close tag; it refuses a part
+        // without its root element.
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet2.xml", "<worksheet ", "<wsheet ");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_delete_sheet(ed, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    // The parser's two names map at the boundary; nothing else is renamed.
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, failStructural(error.UnexpectedEof, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+        try std.testing.expectEqual(ZLSX_ERROR, failStructural(error.SheetIndexOutOfRange, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    }
+    // A pivot part whose payload the store cannot materialise: the
+    // archive opens (the central directory is intact), the read refuses
+    // as `MalformedPivotXml` with nothing handed out.
+    {
+        const path = try tt.path(alloc, io, "s3a_lazy_pivot.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.write(alloc, io, path, .sheet_ref);
+        try corruptPartPayload(alloc, io, path, "xl/pivotTables/pivotTable1.xml");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_pivots_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedPivotXml", diagName(&diag));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+}
+
+test "S3a: every member of the structural vocabulary crosses as -2 with its name in the diag and errbuf" {
+    var err_buf: [128]u8 = undefined;
+    for (structural_refusals) |r| {
+        var diag = freshDiag();
+        try std.testing.expect(prepDiag(&diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_REFUSED, failMapped(r, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(@errorName(r), diagName(&diag));
+        try std.testing.expectEqualStrings(@errorName(r), std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(usize, 0), diag.census_len);
+    }
 }
 
 test "S3a: the structural vocabulary maps to -2 and nothing else does" {

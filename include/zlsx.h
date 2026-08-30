@@ -1755,7 +1755,9 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
  *     read or move (every Malformed* / *CoordinateOverflow part,
  *     PivotEditUnsafe, MissingSheetPart, NoSheetData) — the full list is
- *     docs/plans/c-abi-status-v1.md §10.
+ *     docs/plans/c-abi-status-v1.md §10; the typed worksheet parser's
+ *     MalformedXml / UnexpectedEof cross as MalformedSheetXml, and a
+ *     pivot part the archive cannot materialise as MalformedPivotXml.
  * What fails (-1) is a statement about the call: SheetIndexOutOfRange,
  * RowIndexOutOfRange, ColumnIndexOutOfRange, InvalidSheetName,
  * InvalidTableColumnName, InvalidInput (NULL where bytes are
@@ -1768,9 +1770,10 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  * zlsx_editor_save_to_buffer commit it, with every cross-part
  * rewriter the Zig editor carries (formulas in every dialect, defined
  * names, hyperlinks, DV / CF, merges, panes, autoFilter, tables,
- * drawings, comments, `<xm:f>` extensions, pivot locations and
- * sources). Rows are 1-based; columns 0-based (A = 0), as
- * zlsx_editor_set_cell spells them; sheet indices 0-based. */
+ * drawings, comments, `<xm:f>` extensions, and — under a row / column
+ * edit — pivot locations and sources). Rows are 1-based; columns
+ * 0-based (A = 0), as zlsx_editor_set_cell spells them; sheet indices
+ * 0-based. */
 
 /* Insert a blank row before `before_row`; rows at or below it shift
  * down by one. */
@@ -1802,13 +1805,18 @@ int32_t zlsx_editor_add_sheet(zlsx_editor_t * ed,
         uint32_t * out_sheet_idx,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
-/* Rename sheet `sheet_idx`; cross-sheet references follow. */
+/* Rename sheet `sheet_idx`; cross-sheet references (formulas, defined
+ * names, hyperlinks, DV / CF, <xm:f>) follow. A pivot cache's
+ * worksheetSource@sheet does NOT (a Zig-editor hole this row inherits):
+ * the spelling goes stale and zlsx_editor_pivots_ndjson reports it as
+ * "resolved":null. */
 int32_t zlsx_editor_rename_sheet(zlsx_editor_t * ed,
         uint32_t sheet_idx, const uint8_t * name, size_t name_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
 /* Delete sheet `sheet_idx` (never the last one); references into it
- * become #REF!, indices above it shift down by one. */
+ * become #REF!, indices above it shift down by one. A pivot cache that
+ * read the sheet by name keeps the stale spelling (see rename). */
 int32_t zlsx_editor_delete_sheet(zlsx_editor_t * ed,
         uint32_t sheet_idx,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

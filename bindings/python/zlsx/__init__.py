@@ -3580,7 +3580,8 @@ class Editor:
         ``sheet_idx``; every row at or below it shifts down by one and
         every reference the rewriters know moves in step (a hosted
         pivot's output rectangle and a cache's source range included;
-        a cache whose source content changes is rebuilt at save).
+        a cache whose source content changes is rebuilt during the edit
+        and committed by :meth:`save`).
 
         Refusals (:class:`ZlsxRefusal`, ``error_name``):
 
@@ -3657,7 +3658,12 @@ class Editor:
     def rename_sheet(self, sheet_idx: int, name: str) -> None:
         """Rename sheet ``sheet_idx``; cross-sheet references
         (``'Old'!A1``, defined names, hyperlink locations, DV / CF,
-        pivot sources) follow. Same name rules as :meth:`add_sheet`."""
+        ``<xm:f>`` extensions) follow. A pivot cache whose source is
+        spelled by sheet name (``worksheetSource@sheet``) does **not**
+        — the spelling goes stale and :meth:`pivots` reports it as
+        ``"resolved": null`` (a Zig-editor hole this row inherits, listed
+        in ``docs/plans/surface-matrix.md`` footnote ¹⁹). Same name
+        rules as :meth:`add_sheet`."""
         self._require_structural("zlsx_editor_rename_sheet")
         raw = name.encode("utf-8")
         buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
@@ -3670,6 +3676,8 @@ class Editor:
         """Delete sheet ``sheet_idx``. Refuses the last sheet
         (``CannotDeleteLastSheet``); references into the deleted sheet
         collapse to ``#REF!``; every index above it shifts down by one.
+        A pivot cache that read the deleted sheet by name keeps the
+        stale spelling (see :meth:`rename_sheet`).
         Needs a clean editor — no unsaved cell writes or appended rows
         on any sheet (``SheetDeleteRequiresCleanState``, a
         :class:`ZlsxError`: save first)."""
