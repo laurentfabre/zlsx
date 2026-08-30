@@ -344,6 +344,12 @@ the legacy `0/-1`. Nine exports, one header macro pair, one probe group:
 | `zlsx_editor_rename_table_column` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
 | `zlsx_editor_pivots_ndjson` (+ `zlsx_buffer_release`) | `_HAS_PIVOTS` | `ZLSX_HAS_PIVOTS` |
 
+Each probe also requires the release symbols the Python wrappers call
+unconditionally: `_HAS_STRUCTURAL_EDITS` needs `zlsx_diag_release`,
+`_HAS_PIVOTS` needs it and `zlsx_buffer_release`, each probed and
+configured on its own rather than borrowed from an unrelated feature's
+block (r6 REL-601).
+
 **Naming** (the S3a–e gate question): the M9a2 precedent holds — a new
 export takes its bare name under the status contract; the `_v2` suffix
 is reserved for a name a legacy export already owns
@@ -364,7 +370,7 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 | The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
 | The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
-| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing, the table-shaped `SheetIndexOutOfRange` (decision S3a-9) |
+| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing among the workbook's readable tables (decision S3a-9); a `<tablePart>` whose relationship, part or display name is broken refuses instead (`MissingRelationship` / `MalformedTableXml`, r6 REL-604) |
 | The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
 | | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
@@ -494,7 +500,8 @@ without either macro.
     failure stays the documented discard-and-reopen contract.
 13. `zlsx_editor_close` tears down the handle's `std.Io.Threaded`, as
     `zlsx_book_close` always did.
-14. A carrier part a structural path reads lazily — drawing, VML,
+14. A carrier part a structural path reads lazily — the `<xm:f>`
+    pre-flight's whole-workbook sheet scan included (r6 REL-603) — drawing, VML,
     comments, table — that the store cannot materialise is that
     carrier's own verdict (`Workbook.carrierPart`: `MalformedDrawingXml`
     / `MalformedVmlDrawing` / `MalformedCommentsXml` /
@@ -502,3 +509,8 @@ without either macro.
     `OutOfMemory` / `ZipBombSuspected` keep theirs. The three
     identifier increments of `addSheet` are checked
     (`IdSpaceExhausted`).
+15. A `Worksheet.setCell` overwrite installs the replacement before it
+    frees the displaced owned value (`getOrPut`, the one fallible
+    step first): an allocation failure leaves the previous delta live
+    and the handle closable (r6 REL-602; allocation-failure sweep in
+    `pkg/workbook.zig`).

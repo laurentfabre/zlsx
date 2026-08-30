@@ -7613,6 +7613,46 @@ test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the 
         try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_delete_sheet(ed, 1, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
         try std.testing.expectEqual(plane_none, diag.plane);
+        // The same verdict from a row edit on the OTHER sheet: the
+        // `<xm:f>` pre-flight reads every sheet lazily (r6 REL-603).
+        diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+    }
+    // A `<tablePart>` whose relationship is gone, and a table part
+    // without its display name: workbook damage, not a wrong selector
+    // (r6 REL-604).
+    {
+        const path = try tt.path(alloc, io, "s3a_table_norel.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.write(alloc, io, path, .table_name);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "<tablePart r:id=\"rIdT1\"/>", "<tablePart r:id=\"rIdZZ\"/>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        const tbl = "SalesTbl";
+        const old = "Qty";
+        const new = "Quantity";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, new.ptr, new.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MissingRelationship", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    {
+        const path = try tt.path(alloc, io, "s3a_table_noname.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.write(alloc, io, path, .table_name);
+        // Both spellings go — the lookup falls back from displayName
+        // to name, so a part with either still resolves.
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/tables/table1.xml", " name=\"SalesTbl\" displayName=\"SalesTbl\"", "");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        const tbl = "SalesTbl";
+        const old = "Qty";
+        const new = "Quantity";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, new.ptr, new.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedTableXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
     }
     // A workbook.xml the splice cannot patch (no `</sheets>` — the open
     // parser needs only the `<sheet>` entries): the workbook's own

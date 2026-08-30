@@ -2819,3 +2819,14 @@ def test_editor_rename_table_column_round_trip_on_corpus(tmp_path):
     sources = [p["cache"]["source"] for p in zlsx.pivots(out) if p["kind"] == "pivot"]
     table2 = [s for s in sources if s["name"] == "Table2"]
     assert table2 and table2[0]["resolved"]["via"] == "table"
+
+
+def test_s3a_capability_probes_require_their_release_symbols():
+    """A capability whose wrappers call a release function must not be
+    advertised without it — the probes fold the prerequisites in."""
+    import zlsx._ffi as ffi
+    if ffi._HAS_STRUCTURAL_EDITS:
+        assert ffi._HAS_DIAG_RELEASE and hasattr(ffi.lib, "zlsx_diag_release")
+    if ffi._HAS_PIVOTS:
+        assert ffi._HAS_DIAG_RELEASE and ffi._HAS_BUFFER_RELEASE
+        assert hasattr(ffi.lib, "zlsx_buffer_release")

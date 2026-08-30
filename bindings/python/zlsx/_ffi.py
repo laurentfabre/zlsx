@@ -1666,10 +1666,30 @@ if _HAS_FORMULAS_V2:
 #
 # zlsx_status_v1 exports: every one takes a nullable zlsx_diag_v1 and
 # returns ZLSX_OK / ZLSX_ERROR / ZLSX_REFUSED / ZLSX_NOMEM. Rows are
-# 1-based, columns 0-based, names are (ptr, len) UTF-8. Probed as one
-# group: a dylib has all of them or none.
+# 1-based, columns 0-based, names are (ptr, len) UTF-8. Two capability
+# probes — structural edits, pivots — and each also requires the
+# release symbols its Python wrappers call unconditionally
+# (`zlsx_diag_release`; the pivots read adds `zlsx_buffer_release`), so
+# a feature-stripped dylib never advertises a capability it cannot
+# clean up after (Codex #207 r6 REL-601).
 
 ZLSX_NO_SHEET_IDX = 0xFFFFFFFF
+
+# Probed and configured on their own: the same symbols are configured
+# under the M9a1/M9a2 probes when those features are present, but the
+# S3a capabilities must not depend on unrelated features carrying the
+# declarations for them.
+_HAS_DIAG_RELEASE = hasattr(lib, "zlsx_diag_release")
+if _HAS_DIAG_RELEASE:
+    lib.zlsx_diag_release.argtypes = [ctypes.POINTER(DiagV1)]
+    lib.zlsx_diag_release.restype = None
+_HAS_BUFFER_RELEASE = hasattr(lib, "zlsx_buffer_release")
+if _HAS_BUFFER_RELEASE:
+    lib.zlsx_buffer_release.argtypes = [
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_buffer_release.restype = None
 
 _STRUCTURAL_EDIT_SYMBOLS = (
     "zlsx_editor_insert_row",
@@ -1681,7 +1701,7 @@ _STRUCTURAL_EDIT_SYMBOLS = (
     "zlsx_editor_delete_sheet",
     "zlsx_editor_rename_table_column",
 )
-_HAS_STRUCTURAL_EDITS = all(hasattr(lib, s) for s in _STRUCTURAL_EDIT_SYMBOLS)
+_HAS_STRUCTURAL_EDITS = _HAS_DIAG_RELEASE and all(hasattr(lib, s) for s in _STRUCTURAL_EDIT_SYMBOLS)
 if _HAS_STRUCTURAL_EDITS:
     _diag_tail = [ctypes.POINTER(DiagV1), ctypes.c_char_p, ctypes.c_size_t]
     for _sym in ("zlsx_editor_insert_row", "zlsx_editor_delete_row",
@@ -1717,7 +1737,7 @@ if _HAS_STRUCTURAL_EDITS:
     ] + _diag_tail
     lib.zlsx_editor_rename_table_column.restype = ctypes.c_int32
 
-_HAS_PIVOTS = hasattr(lib, "zlsx_editor_pivots_ndjson") and hasattr(lib, "zlsx_buffer_release")
+_HAS_PIVOTS = hasattr(lib, "zlsx_editor_pivots_ndjson") and _HAS_BUFFER_RELEASE and _HAS_DIAG_RELEASE
 if _HAS_PIVOTS:
     lib.zlsx_editor_pivots_ndjson.argtypes = [
         editor_handle,

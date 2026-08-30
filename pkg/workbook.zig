@@ -3869,7 +3869,10 @@ pub const Workbook = struct {
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
             const part_name = try ws.resolvePartName();
-            const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+            // Lazily materialised here on a pivotless workbook: a
+            // payload the store cannot read is the sheet's verdict
+            // (Codex #207 r6 REL-603).
+            const part = (try self.carrierPart(part_name, error.MalformedSheetXml)) orelse return error.MissingSheetPart;
             var pos: usize = 0;
             while (try sheet_edit.nextXmFormula(part.bytes, pos)) |f| pos = f.next;
         }
@@ -4912,13 +4915,17 @@ pub const Workbook = struct {
             const rels = self.store.rels(sheet_part_name);
             var rid_iter = TablePartRidIterator.init(sheet_part.bytes);
             while (rid_iter.next()) |rid| {
-                const target = relTargetForId(rels, rid) orelse continue;
-                const part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
-                // The table lookup materialises every table part on
-                // the way to the one named: a payload the store cannot
-                // read is that carrier's verdict here too.
-                const part = (try self.carrierPart(part_name, error.MalformedTableXml)) orelse continue;
-                const display_raw = table_edit.tableDisplayNameRaw(part.bytes) orelse continue;
+                // A `<tablePart r:id>` whose relationship, target,
+                // part or display name is broken is workbook damage,
+                // not "no such table" — refusing here beats reporting
+                // the caller's selector as wrong (Codex #207 r6
+                // REL-604). The lenient `continue`s that remain are
+                // the resolution-parity ones: a display name the
+                // codec refuses simply does not match.
+                const target = relTargetForId(rels, rid) orelse return error.MissingRelationship;
+                const part_name = (try self.store.resolve(sheet_part_name, target)) orelse return error.MissingRelationship;
+                const part = (try self.carrierPart(part_name, error.MalformedTableXml)) orelse return error.MalformedTableXml;
+                const display_raw = table_edit.tableDisplayNameRaw(part.bytes) orelse return error.MalformedTableXml;
                 // STRING-carrier decode (entities + ST_Xstring) —
                 // resolution parity with the engine, which reads
                 // `displayName="Sales_x0041_"` as SalesA. A part
@@ -11126,17 +11133,6 @@ pub const Worksheet = struct {
         const cr = try parseA1Ref(ref);
         const a = self.workbook.allocator;
 
-        // Free any previous heap allocation for this ref so a
-        // string/formula/shared_string overwrite doesn't leak.
-        if (self.deltas.get(cr)) |prev| {
-            switch (prev) {
-                .string => |s| a.free(s),
-                .shared_string => |s| a.free(s),
-                .formula => |f| a.free(f),
-                else => {},
-            }
-        }
-
         const stored: CellValue = switch (value) {
             .string => |s| blk: {
                 if (!isXmlSafeText(s)) return error.MalformedXml;
@@ -11159,7 +11155,21 @@ pub const Worksheet = struct {
             else => {},
         };
 
-        try self.deltas.put(a, cr, stored);
+        // Install first, free the displaced owned value after — the
+        // old order (free, then allocate the replacement) left a freed
+        // slice in the map when the dupe failed, and `deinit` would
+        // free it again (S3a, Codex #207 r6 REL-602). `getOrPut` is
+        // the only fallible step and it precedes the free.
+        const gop = try self.deltas.getOrPut(a, cr);
+        if (gop.found_existing) {
+            switch (gop.value_ptr.*) {
+                .string => |s| a.free(s),
+                .shared_string => |s| a.free(s),
+                .formula => |f| a.free(f),
+                else => {},
+            }
+        }
+        gop.value_ptr.* = stored;
         self.workbook.staged_writes +%= 1;
     }
 
@@ -25677,4 +25687,40 @@ test "S3a: a deleteSheet that fails on any allocation leaves a handle whose view
         try w.save(io, src);
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, deleteSheetForFailures, .{ io, src });
+}
+
+// ─── S3a (Codex #207 r6 REL-602): a setCell overwrite that fails keeps the old delta ──
+
+fn setCellOverwriteForFailures(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var wb = try Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    try ws.setCell("A1", .{ .string = "first" });
+    ws.setCell("A1", .{ .string = "second" }) catch |e| {
+        // The displaced delta must still be the map's live value — the
+        // deinit above frees it exactly once, and the failing
+        // allocator's accounting catches a double free or a leak.
+        return e;
+    };
+    try ws.setCell("A1", .{ .formula = "1+2" });
+}
+
+test "S3a: a setCell overwrite that fails on any allocation leaves the previous delta intact" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const src = try std.fs.path.join(std.testing.allocator, &.{ dir, "s3a_setcell_oom.xlsx" });
+    defer std.testing.allocator.free(src);
+    {
+        var w = zlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var a = try w.addSheet("Data");
+        try a.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try w.save(io, src);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, setCellOverwriteForFailures, .{ io, src });
 }
