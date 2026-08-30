@@ -518,7 +518,83 @@ pub const PivotField = struct {
     /// Number of `<item>` children of `<items>` — the field's distinct
     /// items as the pivot last saw them.
     item_count: u32 = 0,
+    /// `sortType` — how the field's items order on a refresh: `manual`
+    /// (the schema's default) keeps the written order and appends a
+    /// new item after it, `ascending` / `descending` re-sort them.
+    sort_type: SortType = .manual,
+    /// The raw `sortType` spelling when it is none of the three.
+    sort_type_raw: ?[]const u8 = null,
+    /// The raw attributes region of `<pivotField …>`, for a rebuild
+    /// that regenerates the element and must carry its attributes
+    /// verbatim (S7b-5).
+    attrs: []const u8 = "",
+    /// The whole element: from its `<` to one past its close.
+    span: Span = .{ .start = 0, .end = 0 },
+    /// The `<items>` children, in order. `has_items` tells an empty
+    /// `<items/>` from no element at all; `items_count` is the
+    /// element's own `count`, `items_other_attrs` any attribute on it
+    /// besides `count` — which a regenerated element would not carry.
+    items: []Item = &.{},
+    has_items: bool = false,
+    items_count: ?u32 = null,
+    items_other_attrs: bool = false,
+    /// Children other than `<items>` — `autoSortScope`, `extLst` —
+    /// and whatever the one-prefix walk stepped over or read between
+    /// children, which a regenerated element would drop.
+    has_other_children: bool = false,
+
+    pub const SortType = enum { manual, ascending, descending, unknown };
+
+    /// One `<item>` of a pivot field: the cache item it names (`x`)
+    /// or the kind of derived item it is (`t` — `default` is the
+    /// field's subtotal, `grand`, `blank`, `data`, …).
+    pub const Item = struct {
+        x: ?u32 = null,
+        /// Raw `t` spelling, when present.
+        t: ?[]const u8 = null,
+        /// `m` — the item is missing from the source (retained in
+        /// the cache, absent from the records).
+        missing: bool = false,
+        /// Any attribute besides `x`, `t` and `m` — `h` (hidden by a
+        /// filter), `sd`, `c`, `d`, `e`, `f`, `s`, `n` — which an
+        /// evaluation must honour or refuse.
+        other_attrs: bool = false,
+    };
 };
+
+/// `<rowItems>` / `<colItems>`: the axis's laid-out items as the
+/// pivot last computed them, each `<i>` one output row / column.
+pub const AxisItems = struct {
+    /// The whole element, `<` to one past its close.
+    span: Span,
+    count: ?u32,
+    /// Any attribute besides `count`.
+    other_attrs: bool = false,
+    items: []AxisItem,
+};
+
+/// One `<i>` of an axis: its type (`t` — absent for a data item,
+/// `grand` for the grand total, `default` for a subtotal, …), the
+/// repeat count `r`, the data-field index `i`, and its `<x v>`
+/// children — one per axis field from the `r`-th on, `v` absent
+/// meaning 0.
+pub const AxisItem = struct {
+    t: ?[]const u8 = null,
+    r: ?u32 = null,
+    i: ?u32 = null,
+    xs: []u32 = &.{},
+    /// Any attribute besides `t`, `r`, `i`.
+    other_attrs: bool = false,
+    /// A child that is not an `<x>`, an `<x>` with an attribute
+    /// besides `v`, or markup between children.
+    has_other_children: bool = false,
+};
+
+/// What `<chartFormats>` references: nothing (absent), the values
+/// axis alone (`field="4294967294"` — a data field's series, which no
+/// row-axis layout moves), or a field's items, which a re-laid axis
+/// would leave pointing elsewhere.
+pub const ChartFormats = enum { none, values_only, other };
 
 /// A pivot-field ordinal, or the values axis — spelled `x="-2"` on
 /// `<field>` and `fld="-2"` on `<pageField>`. Any other negative
@@ -613,6 +689,16 @@ pub const StyleInfo = struct {
 };
 
 pub const TableDefinition = struct {
+    /// The root's namespace prefix (`x` for `<x:pivotTableDefinition>`),
+    /// empty for the default namespace — what a regenerated child
+    /// element spells its tags under.
+    prefix: []const u8 = "",
+    /// The root's raw attributes region, for a reader judging the
+    /// display options this view does not model.
+    root_attrs: []const u8 = "",
+    /// `rowHeaderCaption` — the row-labels header's explicit caption.
+    /// Raw.
+    row_header_caption: ?[]const u8 = null,
     /// `name` (ST_Xstring, required). Raw.
     name: []const u8,
     /// `cacheId` (required) — matches a `<pivotCache cacheId>` in
@@ -640,18 +726,44 @@ pub const TableDefinition = struct {
     page_fields: []PageField,
     data_fields: []DataField,
     style: ?StyleInfo,
+    /// `<rowItems>` / `<colItems>` as written, when present.
+    row_items: ?AxisItems = null,
+    col_items: ?AxisItems = null,
+    chart_formats: ChartFormats = .none,
+    has_ext_lst: bool = false,
+    /// The axis and data wrappers (`rowFields`, `colFields`,
+    /// `pageFields`, `dataFields`) carried content their reader does
+    /// not classify — a child that is not their field, one under
+    /// another prefix, markup between children, an attribute besides
+    /// `count`, a field with a body (Codex #206 r10 REL-1002).
+    axes_other: bool = false,
+    /// A wrapper's `count` disagrees with its children.
+    axes_count_mismatch: bool = false,
+    /// Root children this reader does not lay out — `formats`,
+    /// `conditionalFormats`, `filters`, the OLAP hierarchies, a name
+    /// the schema does not list — and anything the one-prefix walk
+    /// stepped over: an evaluation that cannot honour them refuses.
+    has_other_children: bool = false,
 
     /// Release the spines. Pass the allocator `parseTableDefinition`
     /// was given; a caller that parsed into an arena never calls this.
     pub fn deinit(self: *TableDefinition, allocator: Allocator) void {
+        for (self.fields) |f| allocator.free(f.items);
         allocator.free(self.fields);
         allocator.free(self.row_fields);
         allocator.free(self.col_fields);
         allocator.free(self.page_fields);
         allocator.free(self.data_fields);
+        if (self.row_items) |ri| freeAxisItems(allocator, ri);
+        if (self.col_items) |ci| freeAxisItems(allocator, ci);
         self.* = undefined;
     }
 };
+
+fn freeAxisItems(allocator: Allocator, ai: AxisItems) void {
+    for (ai.items) |it| allocator.free(it.xs);
+    allocator.free(ai.items);
+}
 
 /// Parse one `pivotTableN.xml` part.
 pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDefinition {
@@ -661,6 +773,9 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
     const p = root.prefix;
 
     var def: TableDefinition = .{
+        .prefix = p,
+        .root_attrs = attrs,
+        .row_header_caption = wbxml.getAttr(attrs, "rowHeaderCaption"),
         .name = wbxml.getAttr(attrs, "name") orelse return error.MalformedXml,
         .cache_id = (try u32Attr(attrs, "cacheId")) orelse return error.MalformedXml,
         .data_caption = wbxml.getAttr(attrs, "dataCaption"),
@@ -708,23 +823,28 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
         } else if (std.mem.eql(u8, k.local, "pivotFields")) {
             if (seen.contains(.fields)) return error.MalformedXml;
             seen.insert(.fields);
-            def.fields = try parsePivotFields(allocator, xml, k, p);
+            def.fields = try parsePivotFields(allocator, xml, k, p, &def.has_other_children);
+            try noteWrapper(xml, k, "pivotField", def.fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "rowFields")) {
             if (seen.contains(.rows)) return error.MalformedXml;
             seen.insert(.rows);
-            def.row_fields = try parseAxisFields(allocator, xml, k, p);
+            def.row_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "field", def.row_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "colFields")) {
             if (seen.contains(.cols)) return error.MalformedXml;
             seen.insert(.cols);
-            def.col_fields = try parseAxisFields(allocator, xml, k, p);
+            def.col_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "field", def.col_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pageFields")) {
             if (seen.contains(.pages)) return error.MalformedXml;
             seen.insert(.pages);
-            def.page_fields = try parsePageFields(allocator, xml, k, p);
+            def.page_fields = try parsePageFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "pageField", def.page_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "dataFields")) {
             if (seen.contains(.data)) return error.MalformedXml;
             seen.insert(.data);
-            def.data_fields = try parseDataFields(allocator, xml, k, p);
+            def.data_fields = try parseDataFields(allocator, xml, k, p, &def);
+            try noteWrapper(xml, k, "dataField", def.data_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pivotTableStyleInfo")) {
             if (seen.contains(.style)) return error.MalformedXml;
             seen.insert(.style);
@@ -737,8 +857,23 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
                 .show_col_stripes = try boolAttr(s, "showColStripes", false),
                 .show_last_column = try boolAttr(s, "showLastColumn", false),
             };
+        } else if (std.mem.eql(u8, k.local, "rowItems")) {
+            if (def.row_items != null) return error.MalformedXml;
+            def.row_items = try parseAxisItems(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "colItems")) {
+            if (def.col_items != null) return error.MalformedXml;
+            def.col_items = try parseAxisItems(allocator, xml, k, p);
+        } else if (std.mem.eql(u8, k.local, "chartFormats")) {
+            // Two blocks are not one; the stricter reading wins.
+            const cf = try classifyChartFormats(xml, k, p);
+            def.chart_formats = if (def.chart_formats == .other or cf == .other) .other else cf;
+        } else if (std.mem.eql(u8, k.local, "extLst")) {
+            def.has_ext_lst = true;
+        } else {
+            def.has_other_children = true;
         }
     }
+    if (kids.skipped > 0 or kids.other) def.has_other_children = true;
     // `<location>` is required: without it the pivot has no output
     // rectangle, and the output rectangle is the one thing every
     // consumer of this part — the S7a lift included — exists for.
@@ -746,12 +881,21 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
     return def;
 }
 
-fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PivotField {
+fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, other_children: *bool) Error![]PivotField {
     var out: std.ArrayListUnmanaged(PivotField) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        for (out.items) |f| allocator.free(f.items);
+        out.deinit(allocator);
+    }
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "pivotField")) continue;
+        // A child that is not a field — under this prefix or another,
+        // or markup between them — is content the wrapper's reader
+        // did not classify (Codex #206 r9 REL-902).
+        if (!std.mem.eql(u8, k.local, "pivotField")) {
+            other_children.* = true;
+            continue;
+        }
         const attrs = k.attrs(xml);
         var f: PivotField = .{
             .name = wbxml.getAttr(attrs, "name"),
@@ -766,17 +910,172 @@ fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             f.axis = if (wbxml.decodeScalarAttr(&buf, ax)) |d| axisFromXml(d) else null;
             if (f.axis == null) f.axis_raw = ax;
         }
+        if (wbxml.getAttr(attrs, "sortType")) |st| {
+            var buf: [32]u8 = undefined;
+            f.sort_type = if (wbxml.decodeScalarAttr(&buf, st)) |d| sortTypeFromXml(d) else .unknown;
+            if (f.sort_type == .unknown) f.sort_type_raw = st;
+        }
+        f.attrs = attrs;
+        f.span = .{ .start = k.hit.open_lt, .end = k.after };
+        var items_out: std.ArrayListUnmanaged(PivotField.Item) = .empty;
+        errdefer items_out.deinit(allocator);
         var inner = Children.init(xml, k.hit, k.end, p, k.env);
         while (try inner.next()) |c| {
-            if (!std.mem.eql(u8, c.local, "items")) continue;
+            if (!std.mem.eql(u8, c.local, "items")) {
+                f.has_other_children = true;
+                continue;
+            }
+            // Two `<items>` are not one list.
+            if (f.has_items) return error.MalformedXml;
+            f.has_items = true;
+            const ca = c.attrs(xml);
+            f.items_count = try u32Attr(ca, "count");
+            var cai: AttrIter = .{ .attrs = ca };
+            while (cai.next()) |a| {
+                if (!std.mem.eql(u8, a.name, "count")) f.items_other_attrs = true;
+            }
             var items = Children.init(xml, c.hit, c.end, p, c.env);
             while (try items.next()) |it| {
-                if (std.mem.eql(u8, it.local, "item")) f.item_count += 1;
+                if (!std.mem.eql(u8, it.local, "item")) {
+                    f.has_other_children = true;
+                    continue;
+                }
+                f.item_count += 1;
+                const ia = it.attrs(xml);
+                var item: PivotField.Item = .{ .x = try u32Attr(ia, "x"), .t = wbxml.getAttr(ia, "t"), .missing = try boolAttr(ia, "m", false) };
+                var ai: AttrIter = .{ .attrs = ia };
+                while (ai.next()) |a| {
+                    if (!std.mem.eql(u8, a.name, "x") and !std.mem.eql(u8, a.name, "t") and !std.mem.eql(u8, a.name, "m")) item.other_attrs = true;
+                }
+                // An `<item>` is childless; a body is not one this
+                // reader classifies.
+                if (!it.hit.self_closing and !isBlank(xml[it.hit.after_tag_close..it.end])) f.has_other_children = true;
+                try items_out.append(allocator, item);
             }
+            if (items.skipped > 0 or items.other) f.has_other_children = true;
         }
+        if (inner.skipped > 0 or inner.other) f.has_other_children = true;
+        f.items = try items_out.toOwnedSlice(allocator);
+        errdefer allocator.free(f.items);
         try out.append(allocator, f);
     }
+    if (kids.skipped > 0 or kids.other) other_children.* = true;
     return out.toOwnedSlice(allocator);
+}
+
+fn sortTypeFromXml(s: []const u8) PivotField.SortType {
+    if (std.mem.eql(u8, s, "manual")) return .manual;
+    if (std.mem.eql(u8, s, "ascending")) return .ascending;
+    if (std.mem.eql(u8, s, "descending")) return .descending;
+    return .unknown;
+}
+
+/// `<rowItems>` / `<colItems>`: each `<i>` with its `<x v>` children.
+fn parseAxisItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error!AxisItems {
+    var out: std.ArrayListUnmanaged(AxisItem) = .empty;
+    errdefer {
+        for (out.items) |it| allocator.free(it.xs);
+        out.deinit(allocator);
+    }
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "i")) return error.MalformedXml;
+        const attrs = k.attrs(xml);
+        var item: AxisItem = .{
+            .t = wbxml.getAttr(attrs, "t"),
+            .r = try u32Attr(attrs, "r"),
+            .i = try u32Attr(attrs, "i"),
+        };
+        var ai: AttrIter = .{ .attrs = attrs };
+        while (ai.next()) |a| {
+            if (!std.mem.eql(u8, a.name, "t") and !std.mem.eql(u8, a.name, "r") and !std.mem.eql(u8, a.name, "i")) item.other_attrs = true;
+        }
+        var xs: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer xs.deinit(allocator);
+        var inner = Children.init(xml, k.hit, k.end, p, k.env);
+        while (try inner.next()) |x| {
+            if (!std.mem.eql(u8, x.local, "x")) {
+                item.has_other_children = true;
+                continue;
+            }
+            const xa = x.attrs(xml);
+            var xi: AttrIter = .{ .attrs = xa };
+            while (xi.next()) |a| {
+                if (!std.mem.eql(u8, a.name, "v")) item.has_other_children = true;
+            }
+            if (!x.hit.self_closing and !isBlank(xml[x.hit.after_tag_close..x.end])) item.has_other_children = true;
+            try xs.append(allocator, (try u32Attr(xa, "v")) orelse 0);
+        }
+        if (inner.skipped > 0 or inner.other) item.has_other_children = true;
+        item.xs = try xs.toOwnedSlice(allocator);
+        errdefer allocator.free(item.xs);
+        try out.append(allocator, item);
+    }
+    // Stepped-over or stray markup inside the axis is a layout this
+    // reader did not read whole.
+    if (kids.skipped > 0 or kids.other) return error.MalformedXml;
+    var other_attrs = false;
+    var eai: AttrIter = .{ .attrs = el.attrs(xml) };
+    while (eai.next()) |a| {
+        if (!std.mem.eql(u8, a.name, "count")) other_attrs = true;
+    }
+    return .{
+        .span = .{ .start = el.hit.open_lt, .end = el.after },
+        .count = try u32Attr(el.attrs(xml), "count"),
+        .other_attrs = other_attrs,
+        .items = try out.toOwnedSlice(allocator),
+    };
+}
+
+/// What the block's `<reference field>` attributes name. Anything the
+/// walk cannot read whole — a stepped-over child, a `field` that is
+/// not a number — reads as `.other`, the reading that refuses.
+fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFormats {
+    const values_axis: u32 = 4294967294;
+    var any_area = false;
+    var formats = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try formats.next()) |cf| {
+        if (!std.mem.eql(u8, cf.local, "chartFormat")) return .other;
+        var areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
+        while (try areas.next()) |pa| {
+            if (!std.mem.eql(u8, pa.local, "pivotArea")) return .other;
+            // Every area must be proven to select the values axis and
+            // nothing else — by its own `field`, its `axis`, or a
+            // reference — with no selector naming a field, a row,
+            // column or page axis (Codex #206 r6 REL-602, r15
+            // REL-1504). An area proving nothing refuses.
+            var proven = false;
+            const pattrs = pa.attrs(xml);
+            if (try u32Attr(pattrs, "field")) |field| {
+                if (field != values_axis) return .other;
+                proven = true;
+            }
+            if (wbxml.getAttr(pattrs, "axis")) |ax| {
+                var buf: [32]u8 = undefined;
+                const v = wbxml.decodeScalarAttr(&buf, ax) orelse return .other;
+                if (!std.mem.eql(u8, v, "axisValues")) return .other;
+                proven = true;
+            }
+            var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
+            while (try refs_blocks.next()) |rb| {
+                if (!std.mem.eql(u8, rb.local, "references")) return .other;
+                var refs = Children.init(xml, rb.hit, rb.end, p, rb.env);
+                while (try refs.next()) |r| {
+                    if (!std.mem.eql(u8, r.local, "reference")) return .other;
+                    const field = (try u32Attr(r.attrs(xml), "field")) orelse return .other;
+                    if (field != values_axis) return .other;
+                    proven = true;
+                }
+                if (refs.skipped > 0 or refs.other) return .other;
+            }
+            if (refs_blocks.skipped > 0 or refs_blocks.other) return .other;
+            if (!proven) return .other;
+            any_area = true;
+        }
+        if (areas.skipped > 0 or areas.other) return .other;
+    }
+    if (formats.skipped > 0 or formats.other) return .other;
+    return if (any_area) .values_only else .none;
 }
 
 fn axisFromXml(s: []const u8) ?Axis {
@@ -787,16 +1086,35 @@ fn axisFromXml(s: []const u8) ?Axis {
     return null;
 }
 
-fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]AxisField {
+fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]AxisField {
     var out: std.ArrayListUnmanaged(AxisField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "field")) continue;
+        if (!std.mem.eql(u8, k.local, "field")) {
+            def.axes_other = true;
+            continue;
+        }
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
         try out.append(allocator, try ordinalOrValues(x));
     }
+    if (kids.skipped > 0 or kids.other) def.axes_other = true;
     return out.toOwnedSlice(allocator);
+}
+
+/// What a wrapper says of itself against what it holds: an attribute
+/// besides `count`, a `count` that is not its children.
+fn noteWrapper(xml: []const u8, el: Child, child: []const u8, n: usize, def: *TableDefinition) Error!void {
+    _ = child;
+    const attrs = el.attrs(xml);
+    var it: AttrIter = .{ .attrs = attrs };
+    while (it.next()) |a| {
+        if (!std.mem.eql(u8, a.name, "count")) def.axes_other = true;
+    }
+    if (try u32Attr(attrs, "count")) |c| {
+        if (c != n) def.axes_count_mismatch = true;
+    }
 }
 
 /// `-2` is the values axis; any other negative ordinal names no field
@@ -807,12 +1125,19 @@ fn ordinalOrValues(x: i32) Error!AxisField {
     return error.MalformedXml;
 }
 
-fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PageField {
+fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]PageField {
     var out: std.ArrayListUnmanaged(PageField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    defer if (kids.skipped > 0 or kids.other) {
+        def.axes_other = true;
+    };
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "pageField")) continue;
+        if (!std.mem.eql(u8, k.local, "pageField")) {
+            def.axes_other = true;
+            continue;
+        }
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const attrs = k.attrs(xml);
         const fld = (try i32Attr(attrs, "fld")) orelse return error.MalformedXml;
         try out.append(allocator, .{
@@ -826,12 +1151,21 @@ fn parsePageFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
     return out.toOwnedSlice(allocator);
 }
 
-fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]DataField {
+fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, def: *TableDefinition) Error![]DataField {
     var out: std.ArrayListUnmanaged(DataField) = .empty;
     errdefer out.deinit(allocator);
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    defer if (kids.skipped > 0 or kids.other) {
+        def.axes_other = true;
+    };
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "dataField")) continue;
+        if (!std.mem.eql(u8, k.local, "dataField")) {
+            def.axes_other = true;
+            continue;
+        }
+        // A data field's body is an `<extLst>` at most; the slice
+        // regenerates none of it and refuses any.
+        if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
         const attrs = k.attrs(xml);
         var df: DataField = .{
             .name = wbxml.getAttr(attrs, "name"),
@@ -1352,14 +1686,19 @@ fn narrow(err: wbxml.Error) Error {
     };
 }
 
-/// Walks `name="value"` pairs of a preflighted attributes region.
-const AttrIter = struct {
+/// Walks `name="value"` pairs of an attributes region. A region that
+/// is not pairs to its end stops the walk with `malformed` set — a
+/// reader that must see EVERY binding (the namespace hygiene) tells
+/// that from exhaustion (Codex #206 r29 SEC-2901); a preflighted
+/// region never sets it.
+pub const AttrIter = struct {
     attrs: []const u8,
     i: usize = 0,
+    malformed: bool = false,
 
-    const Pair = struct { name: []const u8, value: []const u8 };
+    pub const Pair = struct { name: []const u8, value: []const u8 };
 
-    fn next(self: *AttrIter) ?Pair {
+    pub fn next(self: *AttrIter) ?Pair {
         const attrs = self.attrs;
         var i = self.i;
         while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
@@ -1367,17 +1706,28 @@ const AttrIter = struct {
         const name_start = i;
         while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
         const name = attrs[name_start..i];
-        while (i < attrs.len and (attrs[i] == '=' or std.ascii.isWhitespace(attrs[i]))) i += 1;
-        if (i >= attrs.len) return null;
-        if (attrs[i] != '"' and attrs[i] != '\'') return null;
+        if (name.len == 0) return self.stop();
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        if (i >= attrs.len or attrs[i] != '=') return self.stop();
+        i += 1;
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        if (i >= attrs.len) return self.stop();
+        if (attrs[i] != '"' and attrs[i] != '\'') return self.stop();
         const quote = attrs[i];
         i += 1;
         const val_start = i;
         while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return self.stop();
         const value = attrs[val_start..i];
-        if (i < attrs.len) i += 1;
+        i += 1;
         self.i = i;
         return .{ .name = name, .value = value };
+    }
+
+    fn stop(self: *AttrIter) ?Pair {
+        self.malformed = true;
+        self.i = self.attrs.len;
+        return null;
     }
 };
 

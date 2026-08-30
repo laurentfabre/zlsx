@@ -2139,7 +2139,7 @@ pub const edit = struct {
     /// attribute writer substitutes values it meets and has no
     /// insertion path, and neither corpus definition carries the
     /// attribute. Null when the definition already carries it.
-    fn markerSplice(src: []const u8, def: *const pivot_xml.CacheDefinition) ?Splice {
+    pub fn markerSplice(src: []const u8, def: *const pivot_xml.CacheDefinition) ?Splice {
         if (markerSet(def)) return null;
         if (def.rootAttrValueSpan(src, marker_attr)) |span| return .{ .span = span, .text = "1" };
         return .{ .span = .{ .start = def.root_attrs.end, .end = def.root_attrs.end }, .text = marker_insert };
@@ -2180,6 +2180,21 @@ pub const edit = struct {
         /// A table's column names — a headerless table's field names.
         columns: []const []const u8 = &.{},
     };
+
+    /// The rectangle a cache is rebuilt from with no edit to apply —
+    /// a save with staged cell writes (S7b-5, §7 Q3): a
+    /// `worksheet`-type source resolved to a finite rectangle. Null
+    /// for every other source, which a save marks and leaves.
+    pub fn rebuildSourceOf(cache: *const PivotCache) ?RebuildSource {
+        if (cache.definition.source.type != .worksheet) return null;
+        const local = switch (cache.resolution) {
+            .sheet => |l| l,
+            else => return null,
+        };
+        const b = local.bounds orelse return null;
+        if (b != .rect) return null;
+        return .{ .rect = b.rect, .header_rows = local.header_rows, .totals_rows = local.totals_rows, .columns = local.columns };
+    }
 
     /// Plan one `pivotCacheDefinitionN.xml` part's rewrite for a row /
     /// col edit on sheet `sheet_idx` — the S7b splice. Every source the
@@ -2406,7 +2421,7 @@ pub const edit = struct {
         return .{ .col = col, .row = row };
     }
 
-    fn formatRect(buf: *[Bounds.format_buf_len]u8, r: Rect) ![]const u8 {
+    pub fn formatRect(buf: *[Bounds.format_buf_len]u8, r: Rect) ![]const u8 {
         var tl_buf: [8]u8 = undefined;
         var br_buf: [8]u8 = undefined;
         const tl_len = try coords.writeColNumberLetters(&tl_buf, r.tl_col);
@@ -2537,6 +2552,11 @@ pub const engine = struct {
         /// cache names no records part.
         records: ?[]u8,
         record_count: u32,
+        /// The rebuilt fields — each one's final item list and, per
+        /// data row, the item it indexes — and the rows they were
+        /// built from: what the consumers' slice lays out (S7b-5).
+        fields: []const Field,
+        rows: []const Row,
     };
 
     /// Rebuild `cache` from `rows`, the data rows of its source
@@ -2605,7 +2625,7 @@ pub const engine = struct {
         }
 
         const records = if (records_xml) |xml| try renderRecords(arena, xml, fields, rows) else null;
-        return .{ .splices = try splices.toOwnedSlice(arena), .records = records, .record_count = @intCast(rows.len) };
+        return .{ .splices = try splices.toOwnedSlice(arena), .records = records, .record_count = @intCast(rows.len), .fields = fields, .rows = rows };
     }
 
     /// The definition shapes this slice rebuilds — everything else
@@ -2670,7 +2690,7 @@ pub const engine = struct {
     }
 
     /// One field's rebuilt inventory and how its records spell it.
-    const Field = struct {
+    pub const Field = struct {
         /// The rebuilt `<sharedItems …>` element.
         xml: []const u8,
         /// Records spell this field as `<x v>` into the inventory;
@@ -2678,8 +2698,11 @@ pub const engine = struct {
         indexed: bool,
         /// Per data row, the item index — meaningful when `indexed`.
         index_of_row: []const u32,
+        /// The final inventory: the items as written, in their order,
+        /// then the appended ones. Empty for an inline field.
+        items: []const Item,
 
-        const Item = struct {
+        pub const Item = struct {
             /// As written, for an item the inventory already had.
             raw: ?[]const u8,
             /// The value: a number's `f64` and lexical (`<n>`), a
@@ -2909,7 +2932,7 @@ pub const engine = struct {
             } else {
                 try out.appendSlice(arena, "/>");
             }
-            return .{ .xml = out.items, .indexed = indexed, .index_of_row = index_of_row };
+            return .{ .xml = out.items, .indexed = indexed, .index_of_row = index_of_row, .items = items.items };
         }
     };
 
@@ -2951,6 +2974,59 @@ pub const engine = struct {
         }
         if (kids.skipped > 0 or kids.other) return error.PivotShapeUnsupported;
         return spelt;
+    }
+
+    /// The records part read back as rows — what `rebuild` would read
+    /// from the source if the snapshot were current. `<x v>` resolves
+    /// through the inventory as written (`<s>` its text, `<n>` its
+    /// value, `<m>` a blank); an inline value stands as spelt. Refuses
+    /// what `inspectRecords` refuses, and a value kind the cache slice
+    /// does not carry (`<b>`, `<d>`, `<e>`).
+    pub fn rowsFromRecords(arena: Allocator, cache: *const PivotCache, xml: []const u8) RebuildError![]const Row {
+        const def = &cache.definition;
+        try checkShape(def);
+        _ = try inspectRecords(arena, xml, def.fields.len);
+        const root = pivot_xml.scanRoot(xml, "pivotCacheRecords") catch |e| return mapRecordsParse(e);
+        var out: std.ArrayListUnmanaged(Row) = .empty;
+        var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+        while (kids.next() catch |e| return mapRecordsParse(e)) |k| {
+            const row = try arena.alloc(Value, def.fields.len);
+            var vals = pivot_xml.Children.init(xml, k.hit, k.end, root.prefix, k.env);
+            var j: usize = 0;
+            while (vals.next() catch |e| return mapRecordsParse(e)) |v| : (j += 1) {
+                const attrs = v.attrs(xml);
+                switch (v.local[0]) {
+                    'x' => {
+                        const idx = (pivot_xml.u32Attr(attrs, "v") catch |e| return mapRecordsParse(e)) orelse 0;
+                        const si = def.fields[j].shared_items.?;
+                        if (idx >= si.items.len) return error.MalformedPivotXml;
+                        const it = si.items[idx];
+                        row[j] = switch (it.kind) {
+                            .s => .{ .string = try decodeItem(arena, it.v orelse return error.MalformedPivotXml) },
+                            .n => .{ .number = try lexicalOf(arena, it.v orelse return error.MalformedPivotXml) },
+                            .m => .blank,
+                            else => unreachable, // checkShape
+                        };
+                    },
+                    'n' => row[j] = .{ .number = try lexicalOf(arena, wbxml.getAttr(attrs, "v") orelse return error.MalformedPivotXml) },
+                    's' => row[j] = .{ .string = try decodeItem(arena, wbxml.getAttr(attrs, "v") orelse return error.MalformedPivotXml) },
+                    'm' => row[j] = .blank,
+                    else => return error.PivotShapeUnsupported,
+                }
+            }
+            try out.append(arena, row);
+        }
+        return out.items;
+    }
+
+    /// A numeric attribute's value as a number's lexical.
+    fn lexicalOf(arena: Allocator, raw: []const u8) RebuildError![]const u8 {
+        const lex = decodeLexical(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        if (parseNumber(lex) == null) return error.MalformedPivotXml;
+        return lex;
     }
 
     /// The records part: the root tag as written with `count` set,
@@ -3018,6 +3094,677 @@ pub const engine = struct {
     /// parser reads more (`0x1p0`, `1_0`, `inf`), none of which a cache
     /// may spell, so the grammar is checked first (Codex #205 r9
     /// REL-901).
+    // ─── S7b-5: the consumers — items, layout, output cells ─────────
+    //
+    // The second slice lays every consumer of a rebuilt cache out
+    // again: the row field's `<items>` (the written order kept, a new
+    // inventory item appended after it — `sortType="manual"`, the
+    // schema's default — or every item re-sorted under `ascending`),
+    // `<rowItems>` (one per item with a record, then the grand total),
+    // `location@ref` (the rectangle the rows now fill) and the cells
+    // of the host rectangle: the header row (the row-labels caption
+    // the host already spells, then each data field's caption), one
+    // row per item with its aggregates, the grand total. What it lays
+    // out is the one report form the corpus and the fixture carry —
+    // compact, one row field, the values axis across (or one data
+    // field), no page, column or hidden item, plain aggregates (sum,
+    // count, countNums, average, min, max, product) — and every other
+    // form refuses (`PivotShapeUnsupported`), as the cache slice does.
+    //
+    // Two of Excel's spellings the layout takes on faith, oracle
+    // pending: a group with no value to aggregate (an inserted blank
+    // row's `(blank)` item) is an empty cell, not 0; a manual-sort
+    // field appends its new item after the written ones.
+
+    /// The captions the host rectangle already spells — Excel writes
+    /// them in its UI language, so a rebuild reuses what is there
+    /// rather than the English default. Null when the host has no
+    /// such cell (a first layout, a caption that is not text).
+    pub const Captions = struct {
+        row_labels: ?[]const u8 = null,
+        grand_total: ?[]const u8 = null,
+        blank: ?[]const u8 = null,
+    };
+
+    /// One cell of the laid-out rectangle, in the coordinates of the
+    /// definition's `location@ref`.
+    pub const OutCell = struct {
+        row: u32,
+        col: u32,
+        value: union(enum) {
+            blank,
+            /// An xsd:double lexical — an aggregate spelt shortest
+            /// round-trip, or a numeric item's spelling as inventoried.
+            number: []const u8,
+            /// Decoded text.
+            string: []const u8,
+        },
+        kind: RowKind,
+    };
+
+    pub const RowKind = enum { header, item, grand };
+
+    /// A consumer re-laid: the part and the cells.
+    pub const Layout = struct {
+        /// The part with the row field's `<pivotField>`, `<rowItems>`
+        /// and `location@ref` regenerated; every other byte as given.
+        table_xml: []u8,
+        /// The rectangle the cells fill.
+        rect: edit.Rect,
+        /// The rectangle the part named before — the cells to clear
+        /// where the new one no longer covers them.
+        old_rect: edit.Rect,
+        /// Row-major, header first.
+        cells: []const OutCell,
+        /// The old rectangle's row kinds, top to bottom, for a caller
+        /// carrying styles from the old cells to the new by kind.
+        old_kinds: []const RowKind,
+    };
+
+    /// Lay one consumer of `cache` out over `rb`, its rebuilt cache.
+    /// `table_xml` is the consumer part as it is to be laid out — for
+    /// a host on the edited sheet, after the S7a `location@ref` move,
+    /// so the rectangle is spelt in post-edit coordinates. Refuses a
+    /// form the slice does not lay out; a part that disagrees with
+    /// itself (an item naming no inventory entry, a `location` a row
+    /// short of its `rowItems`) is malformed.
+    pub fn layout(arena: Allocator, table_xml: []const u8, cache: *const PivotCache, rb: *const Rebuild, captions: Captions) RebuildError!Layout {
+        const def = pivot_xml.parseTableDefinition(arena, table_xml) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedXml => return error.MalformedPivotXml,
+        };
+        try validateRebuild(arena, rb);
+        try checkTableShape(arena, &def, cache, rb);
+
+        const rf: u32 = def.row_fields[0].field;
+        const pf = def.fields[rf];
+        const field = rb.fields[rf];
+
+        // The item list: as written, then what the inventory gained,
+        // then re-sorted when the field asks; `<item t="default"/>`
+        // stays last where the part had it.
+        var order: std.ArrayListUnmanaged(u32) = .empty;
+        const referenced = try arena.alloc(bool, field.items.len);
+        @memset(referenced, false);
+        var default_item = false;
+        for (pf.items) |it| {
+            if (it.t) |t| {
+                // One subtotal item, last; an item that is both a
+                // cache item and a derived one is neither.
+                if (!attrIs(t, "default") or default_item or it.x != null) return error.PivotShapeUnsupported;
+                default_item = true;
+                continue;
+            }
+            if (default_item) return error.PivotShapeUnsupported;
+            const x = it.x orelse return error.MalformedPivotXml;
+            if (x >= field.items.len or referenced[x]) return error.MalformedPivotXml;
+            referenced[x] = true;
+            try order.append(arena, x);
+        }
+        for (field.items, 0..) |_, k| {
+            if (!referenced[k]) try order.append(arena, @intCast(k));
+        }
+        if (pf.sort_type == .ascending) try sortItems(arena, field, order.items);
+
+        // Records per item.
+        const counts = try arena.alloc(u32, field.items.len);
+        @memset(counts, 0);
+        for (field.index_of_row) |k| counts[k] += 1;
+
+        // The rows shown: items with a record, in item-list order
+        // (`showAll="0"`, the one setting the slice lays out).
+        var shown: std.ArrayListUnmanaged(u32) = .empty; // positions in `order`
+        for (order.items, 0..) |k, pos| {
+            if (counts[k] > 0) try shown.append(arena, @intCast(pos));
+        }
+
+        // The rectangle.
+        const old = edit.footprintOf(arena, def) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        const old_rect = old.rect;
+        const old_items = def.row_items.?;
+        const old_kinds = try arena.alloc(RowKind, old_items.items.len + 1);
+        old_kinds[0] = .header;
+        for (old_items.items, 1..) |it, i| old_kinds[i] = if (it.t == null) .item else .grand;
+        const old_height: usize = old_rect.br_row - old_rect.tl_row + 1;
+        if (old_height != old_kinds.len) return error.MalformedPivotXml;
+        const width: usize = 1 + def.data_fields.len;
+        if (old_rect.br_col - old_rect.tl_col + 1 != width) return error.MalformedPivotXml;
+        const grand = def.row_grand_totals;
+        const height: usize = 1 + shown.items.len + @intFromBool(grand);
+        if (height > zlsx.max_row or @as(u64, old_rect.tl_row) + height - 1 > zlsx.max_row) return error.PivotShapeUnsupported;
+        const rect: edit.Rect = .{
+            .tl_col = old_rect.tl_col,
+            .tl_row = old_rect.tl_row,
+            .br_col = old_rect.br_col,
+            .br_row = @intCast(@as(u64, old_rect.tl_row) + height - 1),
+        };
+
+        // The cells.
+        var cells: std.ArrayListUnmanaged(OutCell) = .empty;
+        // The header's caption: the definition's own where it spells
+        // one (`rowHeaderCaption`), else the host's, else the default.
+        const row_labels: []const u8 = if (def.row_header_caption) |c| try decodeItem(arena, c) else captions.row_labels orelse "Row Labels";
+        try cells.append(arena, .{ .row = rect.tl_row, .col = rect.tl_col, .value = .{ .string = row_labels }, .kind = .header });
+        for (def.data_fields, 0..) |df, j| {
+            const caption = if (df.name) |n| try decodeItem(arena, n) else try defaultCaption(arena, df.subtotal, cache.field_names[df.fld]);
+            try cells.append(arena, .{ .row = rect.tl_row, .col = rect.tl_col + 1 + @as(u32, @intCast(j)), .value = .{ .string = caption }, .kind = .header });
+        }
+        const groups = try arena.alloc(std.ArrayListUnmanaged(u32), field.items.len);
+        @memset(groups, .empty);
+        for (field.index_of_row, 0..) |k, i| try groups[k].append(arena, @intCast(i));
+        const folded = try arena.alloc(Agg, def.data_fields.len);
+        @memset(folded, .{});
+        var r: u32 = rect.tl_row + 1;
+        for (shown.items) |pos| {
+            const k = order.items[pos];
+            const it = field.items[k];
+            const label: OutCell = .{
+                .row = r,
+                .col = rect.tl_col,
+                .kind = .item,
+                .value = switch (it.kind) {
+                    .n => .{ .number = it.lex },
+                    .s => .{ .string = it.text },
+                    .m => .{ .string = captions.blank orelse "(blank)" },
+                    else => unreachable, // checkShape
+                },
+            };
+            try cells.append(arena, label);
+            for (def.data_fields, 0..) |df, j| {
+                const agg = aggregateGroup(rb, df.fld, groups[k].items);
+                folded[j].fold(agg);
+                try cells.append(arena, .{ .row = r, .col = rect.tl_col + 1 + @as(u32, @intCast(j)), .value = try renderAgg(arena, df, agg), .kind = .item });
+            }
+            r += 1;
+        }
+        if (grand) {
+            const caption = if (def.grand_total_caption) |c| try decodeItem(arena, c) else captions.grand_total orelse "Grand Total";
+            try cells.append(arena, .{ .row = r, .col = rect.tl_col, .value = .{ .string = caption }, .kind = .grand });
+            // Every record once, in record order — the rows of the
+            // shown items, which under `showAll="0"` is every record.
+            var all: std.ArrayListUnmanaged(u32) = .empty;
+            for (rb.fields[rf].index_of_row, 0..) |k, i| {
+                if (counts[k] > 0) try all.append(arena, @intCast(i));
+            }
+            for (def.data_fields, 0..) |df, j| {
+                var total = aggregateGroup(rb, df.fld, all.items);
+                if (df.subtotal == .sum) total.sum = folded[j].sum;
+                if (df.subtotal == .product) total.prod = folded[j].prod;
+                try cells.append(arena, .{ .row = r, .col = rect.tl_col + 1 + @as(u32, @intCast(j)), .value = try renderAgg(arena, df, total), .kind = .grand });
+            }
+        }
+
+        // The part: three splices, in span order.
+        const p = try qualified(arena, def.prefix);
+        var splices: [3]edit.Splice = undefined;
+        splices[0] = .{ .span = pf.span, .text = try renderPivotField(arena, p, pf, order.items, counts, default_item) };
+        splices[1] = .{ .span = old_items.span, .text = try renderRowItems(arena, p, shown.items, grand) };
+        var ref_buf: [Bounds.format_buf_len]u8 = undefined;
+        const new_ref = edit.formatRect(&ref_buf, rect) catch return error.PivotShapeUnsupported;
+        splices[2] = .{ .span = def.location.ref_span, .text = try arena.dupe(u8, new_ref) };
+        const table = edit.spliceAll(arena, table_xml, &splices) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        return .{ .table_xml = table, .rect = rect, .old_rect = old_rect, .cells = cells.items, .old_kinds = old_kinds };
+    }
+
+    /// A `Rebuild` is public: one `rebuild` made holds these by
+    /// construction, one a caller assembled is checked before anything
+    /// indexes by it (Codex #206 r7 REL-701) — the rows count the
+    /// records and are one value per field; an indexed field names
+    /// one inventory item per row, of a kind the slice lays out; an
+    /// inline field's rows are numbers or blanks.
+    fn validateRebuild(arena: Allocator, rb: *const Rebuild) RebuildError!void {
+        // `rebuild` never makes an empty one (Codex #206 r14 REL-1401).
+        if (rb.rows.len == 0 or rb.rows.len != rb.record_count) return error.MalformedPivotXml;
+        for (rb.rows) |r| if (r.len != rb.fields.len) return error.MalformedPivotXml;
+        for (rb.fields, 0..) |f, k| {
+            if (f.index_of_row.len != rb.rows.len) return error.MalformedPivotXml;
+            for (f.items) |it| switch (it.kind) {
+                .s, .m => {},
+                // A number's spelling and its value are one thing
+                // (Codex #206 r8 REL-802).
+                .n => {
+                    const x = parseNumber(it.lex) orelse return error.MalformedPivotXml;
+                    if (!std.math.isFinite(it.num) or x != it.num) return error.MalformedPivotXml;
+                },
+                else => return error.MalformedPivotXml,
+            };
+            if (f.indexed) {
+                // Each row's value is the item its index names (Codex
+                // #206 r10 REL-1003).
+                for (f.index_of_row, rb.rows) |i, r| {
+                    if (i >= f.items.len) return error.MalformedPivotXml;
+                    const it = f.items[i];
+                    switch (r[k]) {
+                        .blank => if (it.kind != .m) return error.MalformedPivotXml,
+                        .number => |lex| {
+                            const x = parseNumber(lex) orelse return error.MalformedPivotXml;
+                            if (it.kind != .n or numberKey(x) != numberKey(it.num)) return error.MalformedPivotXml;
+                        },
+                        .string => |txt| {
+                            if (it.kind != .s) return error.MalformedPivotXml;
+                            // An allocation failure is its own error,
+                            // never "malformed" (Codex #206 r11
+                            // REL-1101).
+                            const ka = try foldForValidation(arena, txt);
+                            const kb = try foldForValidation(arena, it.text);
+                            if (!std.mem.eql(u8, ka, kb)) return error.MalformedPivotXml;
+                        },
+                    }
+                }
+            } else {
+                if (f.items.len != 0) return error.MalformedPivotXml;
+                for (rb.rows) |r| switch (r[k]) {
+                    .blank => {},
+                    .number => |lex| if (parseNumber(lex) == null) return error.MalformedPivotXml,
+                    .string => return error.MalformedPivotXml,
+                };
+            }
+        }
+    }
+
+    fn foldForValidation(arena: Allocator, s: []const u8) RebuildError![]const u8 {
+        const folded = fold(arena, s) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        return folded orelse error.MalformedPivotXml;
+    }
+
+    /// The consumer forms this slice lays out; everything else refuses
+    /// before a cell is computed. Malformed where the part disagrees
+    /// with itself or with the cache it reads.
+    fn checkTableShape(arena: Allocator, def: *const pivot_xml.TableDefinition, cache: *const PivotCache, rb: *const Rebuild) RebuildError!void {
+        if (def.has_other_children or def.chart_formats == .other or def.axes_other) return error.PivotShapeUnsupported;
+        if (def.axes_count_mismatch) return error.MalformedPivotXml;
+        if (def.page_fields.len != 0 or def.data_on_rows or !def.compact) return error.PivotShapeUnsupported;
+        try checkRootDisplayAttrs(def.root_attrs);
+        // The one form has its grand total; a layout without one, or
+        // with the column totals off, is not oracled (Codex #206 r8
+        // REL-801).
+        if (!def.row_grand_totals or !def.col_grand_totals) return error.PivotShapeUnsupported;
+        if (def.fields.len != cache.definition.fields.len or rb.fields.len != def.fields.len) return error.MalformedPivotXml;
+        // A cache is public too: its decoded spines are parallel to
+        // its definition's fields by construction, and checked here
+        // before anything indexes by them (Codex #206 r12 REL-1203).
+        if (cache.field_names.len != def.fields.len or cache.field_formulas.len != def.fields.len) return error.MalformedPivotXml;
+        if (def.row_fields.len != 1 or def.row_fields[0] != .field) return error.PivotShapeUnsupported;
+        const rf = def.row_fields[0].field;
+        if (rf >= def.fields.len) return error.MalformedPivotXml;
+        if (def.data_fields.len == 0) return error.PivotShapeUnsupported;
+        // The values axis: across, or nowhere for a single data field.
+        switch (def.col_fields.len) {
+            0 => if (def.data_fields.len != 1) return error.PivotShapeUnsupported,
+            1 => if (def.col_fields[0] != .values) return error.PivotShapeUnsupported,
+            else => return error.PivotShapeUnsupported,
+        }
+        // `<colItems>` as Excel lays the values axis out: one `<i>`
+        // per data field, `<x v>` its index, `i` its index past the
+        // first — left as written, since no row edit changes it.
+        const ci = def.col_items orelse return error.PivotShapeUnsupported;
+        if (ci.items.len != def.data_fields.len or ci.other_attrs) return error.PivotShapeUnsupported;
+        if (ci.count) |n| if (n != ci.items.len) return error.MalformedPivotXml;
+        for (ci.items, 0..) |it, j| {
+            if (it.t != null or it.r != null or it.other_attrs or it.has_other_children) return error.PivotShapeUnsupported;
+            if (def.col_fields.len == 0) {
+                if (it.xs.len != 0 or it.i != null) return error.PivotShapeUnsupported;
+            } else {
+                if (it.xs.len != 1 or it.xs[0] != j) return error.PivotShapeUnsupported;
+                if ((it.i orelse 0) != j) return error.PivotShapeUnsupported;
+            }
+        }
+        // `<rowItems>` as written: data items then the grand total.
+        const ri = def.row_items orelse return error.PivotShapeUnsupported;
+        if (ri.other_attrs) return error.PivotShapeUnsupported;
+        if (ri.count) |n| if (n != ri.items.len) return error.MalformedPivotXml;
+        var seen_grand = false;
+        for (ri.items) |it| {
+            if (it.other_attrs or it.has_other_children or it.r != null or it.i != null) return error.PivotShapeUnsupported;
+            if (it.t) |t| {
+                if (!attrIs(t, "grand") or seen_grand) return error.PivotShapeUnsupported;
+                seen_grand = true;
+                if (it.xs.len != 1) return error.PivotShapeUnsupported;
+            } else {
+                if (seen_grand or it.xs.len != 1) return error.PivotShapeUnsupported;
+            }
+        }
+        if (seen_grand != def.row_grand_totals) return error.PivotShapeUnsupported;
+        // The location's counts, as the form has them.
+        // The schema requires all three offsets; the form has its
+        // data at (1, 1) and its header row at 0 or 1 — the two the
+        // corpus and the fixture spell (Codex #206 r15 REL-1505).
+        const loc = def.location;
+        const fhr = loc.first_header_row orelse return error.MalformedPivotXml;
+        const fdr = loc.first_data_row orelse return error.MalformedPivotXml;
+        const fdc = loc.first_data_col orelse return error.MalformedPivotXml;
+        if (fdr != 1 or fdc != 1 or fhr > 1) return error.PivotShapeUnsupported;
+        if (loc.row_page_count != null or loc.col_page_count != null) return error.PivotShapeUnsupported;
+        // The row field.
+        const pf = def.fields[rf];
+        if (pf.axis != .row or !pf.has_items or pf.has_other_children or pf.show_all or pf.items_other_attrs) return error.PivotShapeUnsupported;
+        if (pf.items_count) |n| if (n != pf.items.len) return error.MalformedPivotXml;
+        if (pf.sort_type != .manual and pf.sort_type != .ascending) return error.PivotShapeUnsupported;
+        try checkRowFieldAttrs(pf.attrs);
+        for (pf.items) |it| if (it.other_attrs) return error.PivotShapeUnsupported;
+        if (!rb.fields[rf].indexed) return error.PivotShapeUnsupported;
+        // Each `<rowItems>` data item names one position of the row
+        // field's list — a cache item, once; the grand total names
+        // position 0 (Codex #206 r2 REL-202).
+        const named = try arena.alloc(bool, pf.items.len);
+        @memset(named, false);
+        for (ri.items) |it| {
+            const pos = it.xs[0];
+            if (it.t != null) {
+                if (pos != 0) return error.PivotShapeUnsupported;
+                continue;
+            }
+            if (pos >= pf.items.len or pf.items[pos].t != null or named[pos]) return error.PivotShapeUnsupported;
+            named[pos] = true;
+        }
+        // Every other field: unplaced, or a data field.
+        for (def.fields, 0..) |f, k| {
+            if (k == rf) continue;
+            if (f.axis != null or f.axis_raw != null) return error.PivotShapeUnsupported;
+        }
+        // The data fields.
+        for (def.data_fields) |df| {
+            if (df.fld >= def.fields.len) return error.MalformedPivotXml;
+            if (df.show_data_as) |s| if (!attrIs(s, "normal")) return error.PivotShapeUnsupported;
+            // Text under a numeric aggregate is skipped, as SUM skips
+            // it on the grid; `count` counts it. The dispersions need
+            // Excel's own summation order to agree to the bit.
+            switch (df.subtotal) {
+                .sum, .average, .min, .max, .product, .count, .count_nums => {},
+                .std_dev, .std_dev_p, .variance, .variance_p, .unknown => return error.PivotShapeUnsupported,
+            }
+        }
+    }
+
+    /// An enum-valued attribute kept as written says `want` by its
+    /// decoded value — `def&#x61;ult` is `default` (Codex #206 r31
+    /// REL-3101); one that does not decode says nothing.
+    pub fn attrIs(raw: []const u8, want: []const u8) bool {
+        var buf: [32]u8 = undefined;
+        const v = wbxml.decodeScalarAttr(&buf, raw) orelse return false;
+        return std.mem.eql(u8, v, want);
+    }
+
+    /// Root display options that change what the cells hold, which
+    /// the layout neither models nor oracles (Codex #206 r16
+    /// REL-1603): headers hidden, a missing-value caption, merged
+    /// labels, empty rows / columns shown, an error caption,
+    /// asterisked or non-visual totals, hidden items subtotalled.
+    fn checkRootDisplayAttrs(attrs: []const u8) RebuildError!void {
+        var it: pivot_xml.AttrIter = .{ .attrs = attrs };
+        while (it.next()) |a| {
+            const n = a.name;
+            if (std.mem.eql(u8, n, "missingCaption") or std.mem.eql(u8, n, "errorCaption")) return error.PivotShapeUnsupported;
+            const must_hold = std.mem.eql(u8, n, "showHeaders") or std.mem.eql(u8, n, "showMissing") or std.mem.eql(u8, n, "visualTotals");
+            const must_not = std.mem.eql(u8, n, "mergeItem") or std.mem.eql(u8, n, "showEmptyRow") or std.mem.eql(u8, n, "showEmptyCol") or
+                std.mem.eql(u8, n, "showError") or std.mem.eql(u8, n, "asteriskTotals") or std.mem.eql(u8, n, "subtotalHiddenItems");
+            if (!must_hold and !must_not) continue;
+            var buf: [32]u8 = undefined;
+            const v = wbxml.decodeScalarAttr(&buf, a.value) orelse return error.PivotShapeUnsupported;
+            const is_false = std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            const is_true = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+            if (must_hold and !is_true) return error.PivotShapeUnsupported;
+            if (must_not and !is_false) return error.PivotShapeUnsupported;
+        }
+        if (it.malformed) return error.PivotShapeUnsupported;
+    }
+
+    /// Attributes of the row field that would change what the layout
+    /// shows: a top-N filter (`autoShow`), a custom subtotal set, a
+    /// multi-select filter, a blank row after each item — and the
+    /// field's own `compact="0"`, which lays its labels out under
+    /// the field's name rather than `Row Labels` (Codex #206 r5
+    /// REL-501).
+    fn checkRowFieldAttrs(attrs: []const u8) RebuildError!void {
+        var it: pivot_xml.AttrIter = .{ .attrs = attrs };
+        while (it.next()) |a| {
+            const n = a.name;
+            const flagged = std.mem.eql(u8, n, "autoShow") or std.mem.eql(u8, n, "multipleItemSelectionAllowed") or
+                std.mem.eql(u8, n, "hideNewItems") or std.mem.eql(u8, n, "insertBlankRow") or
+                (std.mem.endsWith(u8, n, "Subtotal") and !std.mem.eql(u8, n, "defaultSubtotal"));
+            const must_hold = std.mem.eql(u8, n, "compact");
+            if (!flagged and !must_hold) continue;
+            var buf: [32]u8 = undefined;
+            const v = wbxml.decodeScalarAttr(&buf, a.value) orelse return error.PivotShapeUnsupported;
+            const is_false = std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            const is_true = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+            if (flagged and !is_false) return error.PivotShapeUnsupported;
+            if (must_hold and !is_true) return error.PivotShapeUnsupported;
+        }
+        if (it.malformed) return error.PivotShapeUnsupported;
+    }
+
+    /// `ascending`: numbers by value, then text under the workbook's
+    /// collation (folded, then by spelling), the blank last; ties keep
+    /// inventory order.
+    fn sortItems(arena: Allocator, field: Field, order: []u32) RebuildError!void {
+        const keys = try arena.alloc([]const u8, field.items.len);
+        for (field.items, keys) |it, *k| k.* = if (it.kind == .s) try foldOrRefuse(arena, it.text) else "";
+        const Ctx = struct {
+            items: []const Field.Item,
+            keys: []const []const u8,
+            fn rank(kind: pivot_xml.SharedItems.Item.Kind) u8 {
+                return switch (kind) {
+                    .n => 0,
+                    .s => 1,
+                    .m => 2,
+                    else => unreachable,
+                };
+            }
+            fn less(ctx: @This(), a: u32, b: u32) bool {
+                const ia = ctx.items[a];
+                const ib = ctx.items[b];
+                const ra = rank(ia.kind);
+                const rbk = rank(ib.kind);
+                if (ra != rbk) return ra < rbk;
+                switch (ia.kind) {
+                    .n => if (ia.num != ib.num) return ia.num < ib.num,
+                    .s => {
+                        switch (std.mem.order(u8, ctx.keys[a], ctx.keys[b])) {
+                            .lt => return true,
+                            .gt => return false,
+                            .eq => switch (std.mem.order(u8, ia.text, ib.text)) {
+                                .lt => return true,
+                                .gt => return false,
+                                .eq => {},
+                            },
+                        }
+                    },
+                    else => {},
+                }
+                return a < b;
+            }
+        };
+        std.sort.pdq(u32, order, Ctx{ .items = field.items, .keys = keys }, Ctx.less);
+    }
+
+    /// One value of field `k` in data row `i`, as the aggregates see it.
+    const Scalar = union(enum) { blank, number: f64, text };
+
+    fn scalarAt(rb: *const Rebuild, k: u32, i: usize) Scalar {
+        const f = rb.fields[k];
+        if (f.indexed) {
+            const it = f.items[f.index_of_row[i]];
+            return switch (it.kind) {
+                .m => .blank,
+                .n => .{ .number = it.num },
+                .s => .text,
+                else => unreachable,
+            };
+        }
+        return switch (rb.rows[i][k]) {
+            .blank => .blank,
+            .number => |lex| .{ .number = parseNumber(lex).? },
+            .string => unreachable, // a string enumerates the field
+        };
+    }
+
+    /// One data field's running aggregate over a group of rows, in
+    /// record order. The grand total is two things at once, and the
+    /// corpus fixes both to the last bit: a SUM is the fold of the
+    /// subtotals in item order (`294.80000000000007` is three group
+    /// sums added, not fifty records), while an AVERAGE is one running
+    /// sum over every record in record order, divided (mtcars:
+    /// `20.210344827586205`, which no fold of the three subtotals
+    /// gives). Count, min and max are order-blind; a product folds
+    /// like a sum (unverified either way: the corpus carries none).
+    const Agg = struct {
+        sum: f64 = 0,
+        prod: f64 = 1,
+        min: f64 = 0,
+        max: f64 = 0,
+        numbers: u64 = 0,
+        filled: u64 = 0,
+
+        fn number(self: *Agg, x: f64) void {
+            if (self.numbers == 0 or x < self.min) self.min = x;
+            if (self.numbers == 0 or x > self.max) self.max = x;
+            self.numbers += 1;
+            self.filled += 1;
+            self.sum += x;
+            self.prod *= x;
+        }
+
+        fn fold(self: *Agg, g: Agg) void {
+            if (g.numbers > 0) {
+                if (self.numbers == 0 or g.min < self.min) self.min = g.min;
+                if (self.numbers == 0 or g.max > self.max) self.max = g.max;
+                self.sum += g.sum;
+                self.prod *= g.prod;
+            }
+            self.numbers += g.numbers;
+            self.filled += g.filled;
+        }
+    };
+
+    fn aggregateGroup(rb: *const Rebuild, fld: u32, group: []const u32) Agg {
+        var agg: Agg = .{};
+        for (group) |i| switch (scalarAt(rb, fld, i)) {
+            .blank => {},
+            .text => agg.filled += 1,
+            .number => |x| agg.number(x),
+        };
+        return agg;
+    }
+
+    /// The cell an aggregate renders to: shortest round-trip, or an
+    /// empty cell where there was nothing to aggregate.
+    fn renderAgg(arena: Allocator, df: pivot_xml.DataField, agg: Agg) RebuildError!@FieldType(OutCell, "value") {
+        const n = agg.numbers;
+        const value: ?f64 = switch (df.subtotal) {
+            .sum => if (n > 0) agg.sum else null,
+            .count => if (agg.filled > 0) @as(f64, @floatFromInt(agg.filled)) else null,
+            .count_nums => if (n > 0) @as(f64, @floatFromInt(n)) else null,
+            .average => if (n > 0) agg.sum / @as(f64, @floatFromInt(n)) else null,
+            .min => if (n > 0) agg.min else null,
+            .max => if (n > 0) agg.max else null,
+            .product => if (n > 0) agg.prod else null,
+            else => unreachable, // checkTableShape
+        };
+        const x = value orelse return .blank;
+        if (!std.math.isFinite(x)) return error.PivotShapeUnsupported;
+        return .{ .number = try std.fmt.allocPrint(arena, "{d}", .{x}) };
+    }
+
+    /// `dataField@name` is what Excel always writes; a producer that
+    /// left it out gets Excel's default caption.
+    fn defaultCaption(arena: Allocator, f: pivot_xml.ConsolidateFunction, field_name: []const u8) RebuildError![]const u8 {
+        const verb: []const u8 = switch (f) {
+            .sum => "Sum",
+            .count, .count_nums => "Count",
+            .average => "Average",
+            .min => "Min",
+            .max => "Max",
+            .product => "Product",
+            else => unreachable,
+        };
+        return std.mem.concat(arena, u8, &.{ verb, " of ", field_name });
+    }
+
+    /// `<pivotField ATTRS><items count><item x/>…<item t="default"/></items></pivotField>`:
+    /// the attributes verbatim, an item missing from the records
+    /// marked `m="1"` as Excel marks a retained one.
+    fn renderPivotField(arena: Allocator, p: []const u8, pf: pivot_xml.PivotField, order: []const u32, counts: []const u32, default_item: bool) RebuildError![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.append(arena, '<');
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "pivotField");
+        if (pf.attrs.len > 0 and !isXmlSpace(pf.attrs[0])) try out.append(arena, ' ');
+        try out.appendSlice(arena, pf.attrs);
+        try out.appendSlice(arena, "><");
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "items count=\"");
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{order.len + @intFromBool(default_item)}));
+        try out.appendSlice(arena, "\">");
+        for (order) |k| {
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "item x=\"");
+            try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{k}));
+            try out.appendSlice(arena, if (counts[k] == 0) "\" m=\"1\"/>" else "\"/>");
+        }
+        if (default_item) {
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "item t=\"default\"/>");
+        }
+        try out.appendSlice(arena, "</");
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "items></");
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "pivotField>");
+        return out.items;
+    }
+
+    /// `<rowItems count><i><x/></i><i><x v="1"/></i>…<i t="grand"><x/></i></rowItems>`
+    /// — `v` is the position in the item list, omitted at 0 as Excel
+    /// omits it.
+    fn renderRowItems(arena: Allocator, p: []const u8, shown: []const u32, grand: bool) RebuildError![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.append(arena, '<');
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "rowItems count=\"");
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{shown.len + @intFromBool(grand)}));
+        try out.appendSlice(arena, "\">");
+        for (shown) |pos| {
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "i><");
+            try out.appendSlice(arena, p);
+            if (pos == 0) {
+                try out.appendSlice(arena, "x/></");
+            } else {
+                try out.appendSlice(arena, "x v=\"");
+                try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{pos}));
+                try out.appendSlice(arena, "\"/></");
+            }
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "i>");
+        }
+        if (grand) {
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "i t=\"grand\"><");
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "x/></");
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "i>");
+        }
+        try out.appendSlice(arena, "</");
+        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, "rowItems>");
+        return out.items;
+    }
+
     pub fn parseNumber(lex: []const u8) ?f64 {
         if (!isXsdDoubleLexical(lex)) return null;
         const x = std.fmt.parseFloat(f64, lex) catch return null;
@@ -6410,4 +7157,229 @@ test "engine: inline records beside an inventory that holds items refuse — an 
     const out = try edit.spliceAll(arena, xml, rb.splices);
     try testing.expect(std.mem.indexOf(u8, out, "minValue=\"1\" maxValue=\"99\" count=\"2\"><n v=\"99\"/><n v=\"1\"/></sharedItems>") != null);
     try testing.expectEqualStrings(rec_head ++ "<r><x v=\"1\"/></r></pivotCacheRecords>", rb.records.?);
+}
+
+// ─── S7b-5: the consumers — the engine's second slice ────────────────
+
+const sheet_xml_tp = @import("typed_parts/sheet_xml.zig");
+const sst_xml_tp = @import("typed_parts/sst_xml.zig");
+
+/// The cell at (row, col) in a parsed sheet, by its `r`.
+fn cellAt(view: *const sheet_xml_tp.SheetXml, row: u32, col: u32) ?sheet_xml_tp.Cell {
+    for (view.rows) |r| {
+        if (r.row_idx != row) continue;
+        for (r.cells) |c| {
+            const parsed = coords.parseCell(c.ref, .{ .case = .upper_only }) catch continue;
+            if (parsed.col.oneBased() == col) return c;
+        }
+    }
+    return null;
+}
+
+/// Every cell the layout computed against the cell the host carries:
+/// text by the shared string it names, a number by value (the
+/// spelling may differ — Excel writes some of its own with seventeen
+/// digits — the double may not), a blank by the absence of a value.
+fn expectLayoutMatchesHost(alloc: Allocator, lay: engine.Layout, sheet_bytes: []const u8, sst: *const sst_xml_tp.SstXml) !usize {
+    var view = try sheet_xml_tp.parse(alloc, sheet_bytes);
+    defer view.deinit(alloc);
+    var checked: usize = 0;
+    for (lay.cells) |c| {
+        const cell = cellAt(&view, c.row, c.col) orelse return error.TestExpectedCell;
+        switch (c.value) {
+            .string => |s| {
+                try testing.expectEqual(sheet_xml_tp.CellType.shared_string, cell.cell_type);
+                const idx = try std.fmt.parseInt(usize, cell.raw_value.?, 10);
+                const text = try sst_xml_tp.decodeText(alloc, sst.entries[idx].plain);
+                defer alloc.free(text);
+                try testing.expectEqualStrings(s, text);
+            },
+            .number => |lex| {
+                try testing.expectEqual(sheet_xml_tp.CellType.number, cell.cell_type);
+                const want = try std.fmt.parseFloat(f64, cell.raw_value.?);
+                const got = try std.fmt.parseFloat(f64, lex);
+                try testing.expectEqual(want, got);
+            },
+            .blank => try testing.expect(cell.raw_value == null),
+        }
+        checked += 1;
+    }
+    return checked;
+}
+
+test "S7b-5 oracle: the corpus pivots re-laid from their own records reproduce every cell Excel wrote, and the parts byte for byte" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sst_part = (try o.store.part("xl/sharedStrings.xml")).?;
+    var sst = try sst_xml_tp.parse(testing.allocator, sst_part.bytes);
+    defer sst.deinit(testing.allocator);
+
+    // PivotTable1: four sums over Species (50 records); PivotTable3: an
+    // average, a min and a max over cyl (29 records). Both compact,
+    // one row field, the values axis across, a grand total.
+    var checked: usize = 0;
+    for (o.pivots.tables) |t| {
+        const cache = o.pivots.cacheOf(t).?;
+        const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+        const rows = try engine.rowsFromRecords(arena, cache, rec);
+        const rb = try engine.rebuild(arena, cache, rows, rec, null);
+        const lay = try engine.layout(arena, t.raw_xml, cache, &rb, .{});
+        try testing.expect(lay.rect.eql(lay.old_rect));
+        try testing.expectEqualStrings(t.raw_xml, lay.table_xml);
+        const sheet_bytes = (try o.store.part(t.sheet_part_name)).?.bytes;
+        checked += try expectLayoutMatchesHost(testing.allocator, lay, sheet_bytes, &sst);
+    }
+    // 5 × 5 cells on `IrisSample`, 5 × 4 on `mtCars Pivot`.
+    try testing.expectEqual(@as(usize, 45), checked);
+}
+
+test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed, never indexed (Codex #206 r7 REL-701)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b5_r7_rebuild.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const t = o.pivots.tables[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const good = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
+    _ = try engine.layout(arena, t.raw_xml, cache, &good, .{});
+
+    // A row index past the inventory.
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        const idx = try arena.dupe(u32, good.fields[0].index_of_row);
+        idx[1] = 99;
+        fields[0].index_of_row = idx;
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // Fewer indices than rows.
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        fields[0].index_of_row = good.fields[0].index_of_row[0..1];
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // A short row, and a count that is not the rows'.
+    {
+        var rb = good;
+        const rows = try arena.dupe(engine.Row, good.rows);
+        rows[2] = rows[2][0..2];
+        rb.rows = rows;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        var counted = good;
+        counted.record_count = 7;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &counted, .{}));
+    }
+    // An inline field's row that is not a number.
+    {
+        var rb = good;
+        const rows = try arena.dupe(engine.Row, good.rows);
+        const row = try arena.dupe(engine.Value, rows[0]);
+        row[1] = .{ .number = "0x1p0" };
+        rows[0] = row;
+        rb.rows = rows;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // No records at all (Codex #206 r14 REL-1401).
+    {
+        var rb = good;
+        rb.rows = &.{};
+        rb.record_count = 0;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        for (fields) |*f| f.index_of_row = &.{};
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // A cache whose decoded names are not parallel to its fields, and
+    // a data field with no caption to fall back on (Codex #206 r12
+    // REL-1203).
+    {
+        var short = cache.*;
+        short.field_names = cache.field_names[0..1];
+        const nameless = try std.mem.replaceOwned(u8, arena, t.raw_xml, "<dataField name=\"Sum of Qty\" ", "<dataField ");
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, nameless, &short, &good, .{}));
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, &short, &good, .{}));
+    }
+    // A row whose index names another item than its value, an inline
+    // field with an inventory (Codex #206 r10 REL-1003).
+    {
+        var rb = good;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        const idx = try arena.dupe(u32, good.fields[0].index_of_row);
+        idx[1] = 0; // `West` indexed as `East`
+        fields[0].index_of_row = idx;
+        rb.fields = fields;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        var inline_items = good;
+        const f2 = try arena.dupe(engine.Field, good.fields);
+        f2[1].items = good.fields[0].items;
+        inline_items.fields = f2;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &inline_items, .{}));
+    }
+    // An indexed numeric item whose spelling is not the grammar's, or
+    // not its value (Codex #206 r8 REL-802).
+    {
+        const bad = [_]engine.Field.Item{
+            .{ .raw = null, .kind = .n, .lex = "0x1p0", .num = 1 },
+            .{ .raw = null, .kind = .n, .lex = "1", .num = 2 },
+            .{ .raw = null, .kind = .n, .lex = "1", .num = std.math.inf(f64) },
+        };
+        for (bad) |item| {
+            var rb = good;
+            const fields = try arena.dupe(engine.Field, good.fields);
+            const items = try arena.dupe(engine.Field.Item, good.fields[0].items);
+            items[0] = item;
+            fields[0].items = items;
+            rb.fields = fields;
+            try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        }
+    }
+}
+
+fn layoutForFailures(allocator: Allocator, table_xml: []const u8, cache: *const PivotCache, rb: *const engine.Rebuild) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    _ = try engine.layout(arena_state.allocator(), table_xml, cache, rb, .{});
+}
+
+test "S7b-5: an allocation failure anywhere in a layout is OutOfMemory, never a refusal (Codex #206 r11 REL-1101)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b5_r11_oom.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const t = o.pivots.tables[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rb = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
+    try testing.checkAllAllocationFailures(testing.allocator, layoutForFailures, .{ t.raw_xml, cache, &rb });
 }

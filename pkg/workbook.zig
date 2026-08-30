@@ -979,6 +979,12 @@ pub const Workbook = struct {
     /// Editor's pre-flight is the one run its sweep installs (Codex
     /// #205 r1 PERF-101 pins it).
     pivot_rebuilds: u32 = 0,
+    /// Bumped by every staged cell write (`Worksheet.setCell`,
+    /// `deleteCell`, `appendRows`): a pre-flighted pivot collection
+    /// read the host's staged writes for its occupancy check, so a
+    /// write staged after it ages the collection as a store mutation
+    /// does (Codex #206 r6 REL-601).
+    staged_writes: u64 = 0,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -3511,7 +3517,9 @@ pub const Workbook = struct {
     /// previously-cached `SheetXml` view is invalidated (next access
     /// re-parses from the new bytes). A staged write inside a pivot
     /// source marks its cache definition `refreshOnLoad="1"` first
-    /// (`markPivotCachesForCellWrites`, S7b-3).
+    /// (S7b-3) and, since S7b-5, rebuilds the cache and re-lays its
+    /// consumers where the engine can — a form it cannot lay out
+    /// takes the marker alone (`refreshPivotCachesForCellWrites`).
     ///
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
@@ -3547,11 +3555,15 @@ pub const Workbook = struct {
             try self.applyWorkbookXmlPlanDefinedNames();
         }
 
-        // Phase 0b (S7b-3): the refresh marker for staged cell writes —
-        // before the sheet phases consume the deltas and appends it
-        // reads, after the workbook.xml image the graph walk parses
-        // is final.
-        try self.markPivotCachesForCellWrites();
+        // Phase 0b (S7b-3 + S7b-5): the refresh marker for staged
+        // cell writes, and the rebuild of every cache and consumer a
+        // write lands in — before the sheet phases consume the deltas
+        // and appends it reads (a re-laid host's cells and its own
+        // staged writes go to the part in one splice, the pivot's
+        // cells winning where they meet, and no delta of that host is
+        // left for the sheet phase), after the workbook.xml image the
+        // graph walk parses is final.
+        try self.refreshPivotCachesForCellWrites();
 
         // Phase 1: SST extension. Walk every worksheet's deltas for
         // `.shared_string` values and build a single text → index
@@ -5766,18 +5778,48 @@ pub const Workbook = struct {
         owner: *const Workbook,
         /// `PartStore.mutations` at collection.
         mutations: u64,
+        /// `Workbook.staged_writes` at collection.
+        staged_writes: u64,
         sheet_part_name: []const u8,
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
+        /// The pivot parts — installed first in the sweep.
         patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty,
+        /// S7b-5: the output cells of every consumer re-laid — written
+        /// to their host sheets LAST in the sweep, in post-edit
+        /// coordinates, once the byte transform has moved the host's
+        /// own cells (edit first, refresh second — Excel's order: a
+        /// pivot may grow into the row an insert just opened below
+        /// it). Cells and strings live in `arena`.
+        host_writes: std.ArrayListUnmanaged(PivotHostWrite) = .empty,
+        arena: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *PreparedPivotEdits, allocator: Allocator) void {
             for (self.patches.items) |it| allocator.free(it.bytes);
             self.patches.deinit(allocator);
+            self.host_writes.deinit(allocator);
+            self.arena.deinit();
             allocator.free(self.sheet_part_name);
             self.* = undefined;
         }
+    };
+
+    /// One host sheet's cells after a consumer's re-layout.
+    pub const PivotHostWrite = struct {
+        sheet_idx: u32,
+        sheet_part_name: []const u8,
+        cells: []const PivotHostCell,
+    };
+
+    /// One cell: its value — text as a shared string, a number, a
+    /// blank (the pivot's empty cell), or `.deleted` where the old
+    /// rectangle reached and the new one does not — and the style the
+    /// old rectangle's row of the same kind wore in that column.
+    pub const PivotHostCell = struct {
+        ref: CellRef,
+        value: CellValue,
+        style: ?u32,
     };
 
     /// A row / col edit with the pivot parts the Editor already
@@ -5788,7 +5830,7 @@ pub const Workbook = struct {
         try self.applySheetEditTransform(sheet_idx, spec, prepared);
     }
 
-    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
+    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
         // One axis, exactly: a spec naming neither would unwrap
         // nothing below, one naming both is not one edit (Codex #205
         // r12 REL-1201).
@@ -5851,6 +5893,11 @@ pub const Workbook = struct {
         // pivot parts and the sheet already replaced (Codex #203 r2
         // REL-202 — the corpus' `IrisSample`, whose table starts on
         // row 1, is that shape). Dry-run them here, as the Editor does.
+        const pivot_axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
+        const pivot_kind: pivots_mod.edit.Kind = switch (spec.kind) {
+            .insert => .insert,
+            .delete => .delete,
+        };
         try self.preflightTableEditsForSheet(
             part_name,
             if (spec.row != null) .row else .col,
@@ -5860,6 +5907,14 @@ pub const Workbook = struct {
                 .delete => .delete,
             },
         );
+        // The direct `Workbook` path collects here — the same
+        // collection the Editor pre-flighted and handed in.
+        var local: ?PreparedPivotEdits = null;
+        defer if (local) |*l| l.deinit(self.allocator);
+        const prepared = prepared_in orelse blk: {
+            local = try self.preflightPivotEditsForSheet(part_name, pivot_axis, spec.row orelse spec.col.?, pivot_kind);
+            break :blk &local.?;
+        };
         try self.applyPivotEditsForSheet(part_name, spec, prepared);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
@@ -5939,6 +5994,10 @@ pub const Workbook = struct {
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
         _ = try self.rewriteAllExtensionFormulas(edit, target);
+
+        // S7b-5: the consumers' output cells, last — over the host
+        // sheets as every sweep above left them.
+        try self.applyPivotHostWrites(prepared.host_writes.items);
     }
 
     /// dr-1: rewrite the modern xdr drawing part referenced by the
@@ -6154,13 +6213,15 @@ pub const Workbook = struct {
         var prepared: PreparedPivotEdits = .{
             .owner = self,
             .mutations = self.store.mutations,
+            .staged_writes = self.staged_writes,
             .sheet_part_name = try self.allocator.dupe(u8, sheet_part_name),
             .axis = axis,
             .idx_1based = idx_1based,
             .kind = kind,
+            .arena = std.heap.ArenaAllocator.init(self.allocator),
         };
         errdefer prepared.deinit(self.allocator);
-        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &prepared.patches);
+        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &prepared);
         return prepared;
     }
 
@@ -6235,37 +6296,44 @@ pub const Workbook = struct {
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
-        patches: *std.ArrayListUnmanaged(store_mod.PartStore.Replacement),
+        prepared: *PreparedPivotEdits,
     ) Error!void {
+        const patches = &prepared.patches;
         var p = (try self.pivotsForEdit(sheet_part_name)) orelse return;
         defer p.deinit();
+        // Scratch for the plans and the rebuilt rows — freed here;
+        // what the sweep's last step needs (the cells) is copied into
+        // the collection's own arena.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-        // Hosts (S7a).
+        // Hosts (S7a): the moved part, per table, or null when the
+        // edit leaves it as written. A consumer's re-layout below
+        // starts from the moved bytes, so its rectangle is spelt in
+        // post-edit coordinates.
+        const table_bytes = try arena.alloc(?[]const u8, p.tables.len);
+        @memset(table_bytes, null);
         for (p.tables, 0..) |t, i| {
             if (!(try hostedHere(&p, i, sheet_part_name))) continue;
-            const out = pivots_mod.edit.applyToTableDefinition(self.allocator, t.raw_xml, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
-            if (std.mem.eql(u8, out, t.raw_xml)) {
-                self.allocator.free(out);
-                continue;
-            }
-            errdefer self.allocator.free(out);
-            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = out });
+            const out = pivots_mod.edit.applyToTableDefinition(arena, t.raw_xml, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
+            if (!std.mem.eql(u8, out, t.raw_xml)) table_bytes[i] = out;
         }
 
         // Sources (S7b). The edited sheet is one the walk placed — it
         // resolved every `<sheet>` of the workbook, and the part came
         // from that same list.
         const sheet_idx = p.sheetIndexOfPart(sheet_part_name) orelse return error.MalformedPivotXml;
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        for (p.caches) |*c| {
+        const rebuilt = try arena.alloc(?pivots_mod.engine.Rebuild, p.caches.len);
+        @memset(rebuilt, null);
+        for (p.caches, 0..) |*c, ci| {
             var plan = pivots_mod.edit.planCacheEdit(arena, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
             if (plan.changed) {
                 // S7b-4: the snapshot is no longer the source. Rebuild
                 // it from the cells — records, inventories, counts,
                 // date — in the same install, or refuse the edit.
                 const rb = try self.rebuildPivotCache(arena, c, plan.rebuild, sheet_idx, axis, idx_1based, kind);
+                rebuilt[ci] = rb;
                 try plan.splices.appendSlice(arena, rb.splices);
                 if (rb.records) |bytes| {
                     const dup = try self.allocator.dupe(u8, bytes);
@@ -6277,7 +6345,1353 @@ pub const Workbook = struct {
             errdefer self.allocator.free(out);
             try patches.append(self.allocator, .{ .name = c.part_name, .bytes = out });
         }
+
+        // Consumers (S7b-5): every table on a rebuilt cache is laid
+        // out again — its part from the moved bytes when it is hosted
+        // here — and its host cells planned in post-edit coordinates.
+        for (p.tables, 0..) |t, i| {
+            const ci = t.cache orelse continue;
+            const rb = &(rebuilt[ci] orelse continue);
+            if (try consumerSeenBefore(&p, i)) continue;
+            // A host with staged appends: the emitter places them
+            // after the sheet's last row, which a grown rectangle
+            // moves — refused, as the save leaves such a host to the
+            // marker (Codex #206 r23 REL-2301).
+            if ((try self.sheet(t.sheet_idx)).appended_rows.items.len > 0) return error.PivotEditUnsafe;
+            const base = table_bytes[i] orelse t.raw_xml;
+            const map = HostRowMap.forEdit(t.sheet_idx == sheet_idx, axis, idx_1based, kind);
+            // With the host's staged writes laid over it: they are
+            // what the sheet will hold, so a write in the way of a
+            // grown rectangle is a cell in the way.
+            var grid = try self.readHostGrid(arena, t.sheet_idx, map, true);
+            defer grid.deinit(arena);
+            const merges = try self.hostMerges(arena, t.sheet_idx, map);
+            const captions = try self.hostCaptions(arena, base, &p.caches[ci], &grid);
+            const lay = pivots_mod.engine.layout(arena, base, &p.caches[ci], rb, captions) catch |e| return mapEngineError(e);
+            try self.refuseOverOtherPivots(arena, &p, i, lay.rect, table_bytes);
+            table_bytes[i] = lay.table_xml;
+            try self.planPivotHostWrite(prepared, t, lay, &grid, merges);
+        }
+        for (p.tables, 0..) |t, i| {
+            const bytes = table_bytes[i] orelse continue;
+            if (std.mem.eql(u8, bytes, t.raw_xml)) continue;
+            const dup = try self.allocator.dupe(u8, bytes);
+            errdefer self.allocator.free(dup);
+            try patches.append(self.allocator, .{ .name = t.part_name, .bytes = dup });
+        }
+        // A pivot whose source is another pivot's rectangle: the cells
+        // written here are that cache's content, which this edit did
+        // not select. The sweep does not cascade — it refuses (Codex
+        // #206 r9 REL-901).
+        for (prepared.host_writes.items) |hw| {
+            const map = HostRowMap.forEdit(hw.sheet_idx == sheet_idx, axis, idx_1based, kind);
+            for (p.caches) |*c| {
+                for (hw.cells) |cell| {
+                    if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, map)) return error.PivotEditUnsafe;
+                }
+            }
+        }
+        // The host writes are rendered LAST in the sweep, over the
+        // hosts as the transform leaves them; that render must not be
+        // the first to find a host it cannot emit into (no
+        // `<sheetData>`, a part that does not parse) after every other
+        // part has moved — so it is rehearsed here, before anything
+        // is installed, and discarded (Codex #206 r2 REL-203). A host
+        // the transform will shift renders here over its pre-edit
+        // bytes: the same element boundaries, the same parse.
+        if (prepared.host_writes.items.len > 0) {
+            var rehearsal = self.renderPivotHostWrites(prepared.host_writes.items) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.PivotEditUnsafe,
+            };
+            rehearsal.deinit(self.allocator);
+        }
         try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
+    }
+
+    /// A re-laid rectangle may not reach another pivot's declared
+    /// footprint on the same host — one whose cells are absent or
+    /// empty is invisible to the occupancy check (Codex #206 r10
+    /// REL-1001). `table_bytes[j]`, when set, is that pivot's part as
+    /// it will be (moved, or re-laid), so the footprint compared is
+    /// the post-edit one. Two relationships to one part are one pivot.
+    fn refuseOverOtherPivots(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, i: usize, rect: pivots_mod.edit.Rect, table_bytes: []const ?[]const u8) Error!void {
+        _ = self;
+        const t = p.tables[i];
+        for (p.tables, 0..) |u, j| {
+            if (j == i or u.sheet_idx != t.sheet_idx or std.mem.eql(u8, u.part_name, t.part_name)) continue;
+            const bytes = table_bytes[j] orelse u.raw_xml;
+            const def = typed_parts.pivot_xml.parseTableDefinition(arena, bytes) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.MalformedPivotXml,
+            };
+            const fp = pivots_mod.edit.footprintOf(arena, def) catch |e| return mapPivotEditError(e);
+            const other: pivots_mod.edit.Rect = .{ .tl_col = fp.rect.tl_col, .tl_row = fp.first_row, .br_col = fp.last_col, .br_row = fp.rect.br_row };
+            if (rectsIntersect(rect, other)) return error.PivotEditUnsafe;
+        }
+    }
+
+    /// Does a host cell written at `ref` (post-edit coordinates, on
+    /// `sheet_idx`) land where cache `c` reads? A finite rectangle is
+    /// mapped through the edit; a source with no rectangle on that
+    /// sheet — whole columns or rows, an unbounded body — counts any
+    /// cell of the sheet.
+    fn hostCellHitsCache(c: *const pivots_mod.PivotCache, sheet_idx: u32, ref: CellRef, map: HostRowMap) bool {
+        if (resolutionHit(c.resolution, sheet_idx, ref, map)) return true;
+        for (c.range_set_resolutions) |r| if (resolutionHit(r, sheet_idx, ref, map)) return true;
+        return false;
+    }
+
+    fn resolutionHit(res: pivots_mod.SourceResolution, sheet_idx: u32, ref: CellRef, map: HostRowMap) bool {
+        if (!pivots_mod.resolutionDependsOn(res, sheet_idx)) return false;
+        switch (res) {
+            .sheet => |l| if (l.bounds) |b| if (b == .rect) {
+                // A rectangle the edit cannot place is one in the way.
+                const r = (map.mapRect(b.rect) catch return true) orelse return false;
+                return ref.row >= r.tl_row and ref.row <= r.br_row and ref.col >= r.tl_col and ref.col <= r.br_col;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    /// Is `p.tables[i]`'s part one an earlier table already named —
+    /// two relationships to one part lay it out once — and is it
+    /// hosted by one sheet only: a part two sheets host has no one
+    /// grid to write its cells on (the S7a refusal, for consumers).
+    fn consumerSeenBefore(p: *const pivots_mod.Pivots, i: usize) Error!bool {
+        const t = p.tables[i];
+        for (p.tables, 0..) |u, k| {
+            if (!std.mem.eql(u8, u.part_name, t.part_name)) continue;
+            if (!std.mem.eql(u8, u.sheet_part_name, t.sheet_part_name)) return error.PivotEditUnsafe;
+            if (k < i) return true;
+        }
+        return false;
+    }
+
+    /// Where a host's cells are after the edit: the identity on a
+    /// host that is not the edited sheet; on the edited one, rows at
+    /// or past an insert move down one, the deleted row is gone and
+    /// the rows past it move up (columns alike).
+    const HostRowMap = struct {
+        active: bool,
+        axis: pivots_mod.edit.Axis,
+        idx: u32,
+        kind: pivots_mod.edit.Kind,
+
+        fn forEdit(active: bool, axis: pivots_mod.edit.Axis, idx: u32, kind: pivots_mod.edit.Kind) HostRowMap {
+            return .{ .active = active, .axis = axis, .idx = idx, .kind = kind };
+        }
+
+        /// A rectangle after the edit: null when the edit deletes it
+        /// whole (a one-row range on the deleted row). An insert that
+        /// would push it past the grid is a shift the transform will
+        /// not make (it keeps the spelling) — refused here rather than
+        /// modelled off the grid (Codex #206 r16 REL-1602).
+        fn mapRect(self: HostRowMap, r: pivots_mod.edit.Rect) Error!?pivots_mod.edit.Rect {
+            if (!self.active) return r;
+            var out = r;
+            const lo: *u32 = if (self.axis == .row) &out.tl_row else &out.tl_col;
+            const hi: *u32 = if (self.axis == .row) &out.br_row else &out.br_col;
+            const limit: u32 = if (self.axis == .row) zlsx.max_row else zlsx.max_col_1based;
+            switch (self.kind) {
+                .insert => {
+                    if (hi.* >= self.idx and hi.* >= limit) return error.PivotEditUnsafe;
+                    if (lo.* >= self.idx) lo.* += 1;
+                    if (hi.* >= self.idx) hi.* += 1;
+                },
+                .delete => {
+                    if (lo.* == self.idx and hi.* == self.idx) return null;
+                    if (lo.* > self.idx) lo.* -= 1;
+                    if (hi.* >= self.idx) hi.* -= 1;
+                },
+            }
+            return out;
+        }
+
+        /// Null for the deleted row / column; past the grid on an
+        /// insert refuses (r16 REL-1602).
+        fn map(self: HostRowMap, ref: CellRef) Error!?CellRef {
+            if (!self.active) return ref;
+            var out = ref;
+            const v: *u32 = if (self.axis == .row) &out.row else &out.col;
+            const limit: u32 = if (self.axis == .row) zlsx.max_row else zlsx.max_col_1based;
+            switch (self.kind) {
+                .insert => if (v.* >= self.idx) {
+                    if (v.* >= limit) return error.PivotEditUnsafe;
+                    v.* += 1;
+                },
+                .delete => {
+                    if (v.* == self.idx) return null;
+                    if (v.* > self.idx) v.* -= 1;
+                },
+            }
+            return out;
+        }
+    };
+
+    /// One host cell as the layout needs it: whether it holds
+    /// anything (a value or a formula — a styled empty `<c/>` does
+    /// not), its text when it is text, its style.
+    const HostCell = struct {
+        occupied: bool,
+        text: ?[]const u8,
+        style: ?u32,
+    };
+
+    const HostGrid = std.AutoHashMapUnmanaged(CellRef, HostCell);
+
+    /// The typed reader and the splicer know the host's cells, rows
+    /// and merges by their unprefixed names: a part that binds the
+    /// main namespace to a prefix, or rebinds the default below the
+    /// root, spells cells they cannot see (Codex #206 r18 REL-1801)
+    /// — refused before anything is planned over it, as the pivot
+    /// parts' own hygiene check refuses an alias.
+    fn hostNamespaceHygiene(xml: []const u8) Error!void {
+        const uris = typed_parts.pivot_xml.main_ns_uris;
+        var pos: usize = 0;
+        var root_seen = false;
+        var root_bound = false;
+        while (try nextMarkup(xml, pos, xml.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            var j = m.lt + 1;
+            while (j < xml.len and xml[j] != ' ' and xml[j] != '\t' and xml[j] != '\n' and xml[j] != '\r' and xml[j] != '/' and xml[j] != '>') j += 1;
+            const attrs = std.mem.trimEnd(u8, xml[j .. m.after - 1], "/");
+            var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+            var seen: usize = 0;
+            while (it.next()) |a| {
+                // Every binding is read, or none is trusted: a region
+                // the walk cannot finish hides the bindings after
+                // its first bad token, and a name spelt twice is
+                // not one binding (Codex #206 r29 SEC-2901). The
+                // pivot parts' own ceiling bounds the rescan (Codex
+                // #206 r30 PERF-3002).
+                if (seen >= 256) return error.PivotEditUnsafe;
+                var prior: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+                var k: usize = 0;
+                while (k < seen) : (k += 1) {
+                    const p = prior.next() orelse break;
+                    if (std.mem.eql(u8, p.name, a.name)) return error.PivotEditUnsafe;
+                }
+                seen += 1;
+                const is_default = std.mem.eql(u8, a.name, "xmlns");
+                const is_prefixed = std.mem.startsWith(u8, a.name, "xmlns:");
+                if (!is_default and !is_prefixed) continue;
+                // The binding is the value decoded — `mai&#x6e;` is
+                // `main` (Codex #206 r19 SEC-1901); one that does
+                // not decode, or is longer than any namespace, is not
+                // one this reader can rule out.
+                var buf: [256]u8 = undefined;
+                const decoded = wbxml_typed.decodeScalarAttr(&buf, a.value) orelse return error.PivotEditUnsafe;
+                var main = false;
+                for (uris) |u| if (std.mem.eql(u8, decoded, u)) {
+                    main = true;
+                };
+                if (is_prefixed and main) return error.PivotEditUnsafe;
+                if (is_default and root_seen) return error.PivotEditUnsafe;
+                // The root's own default binding, when spelt, is the
+                // main namespace — Transitional or Strict — or the
+                // cells the splicer writes are not cells (Codex #206
+                // r26 SEC-2601), as the pivot parts' root check has it.
+                if (is_default and !main) return error.PivotEditUnsafe;
+                if (is_default and main) root_bound = true;
+            }
+            if (it.malformed) return error.PivotEditUnsafe;
+            // A root with no default binding at all spells its cells
+            // in no namespace — not SpreadsheetML's (Codex #206 r27
+            // SEC-2701).
+            if (!root_seen and !root_bound) return error.PivotEditUnsafe;
+            root_seen = true;
+        }
+    }
+
+    /// The host's merged ranges in post-edit coordinates — a blank
+    /// merge holds no `<c>`, so the grid alone cannot see it in a
+    /// grown rectangle's way (Codex #206 r1 REL-103). A merge the
+    /// edit deletes whole is dropped; one it cuts through keeps its
+    /// remaining rows / columns.
+    fn hostMerges(self: *Workbook, arena: Allocator, sheet_idx: u32, map: HostRowMap) Error![]const pivots_mod.edit.Rect {
+        const ws = try self.sheet(sheet_idx);
+        const view = try ws.ensureParsed();
+        var out: std.ArrayListUnmanaged(pivots_mod.edit.Rect) = .empty;
+        for (view.merges) |m| {
+            const decoded = try store_mod.decodeXmlEntities(arena, m.ref);
+            // A merge the reader cannot place is one in the way.
+            const r = pivots_mod.edit.parseRect(decoded) orelse return error.PivotEditUnsafe;
+            if (try map.mapRect(r)) |mapped| try out.append(arena, mapped);
+        }
+        return out.items;
+    }
+
+    /// Every cell of a host sheet, keyed by its post-edit coordinates.
+    /// Text is decoded (a shared string — plain, or its runs joined —
+    /// an inline or formula string); a cell of another kind is
+    /// occupied without text. A cell the typed view could not read
+    /// (a `t` or `s` it does not know) is occupied, with no style.
+    fn readHostGrid(self: *Workbook, arena: Allocator, sheet_idx: u32, map: HostRowMap, with_writes: bool) Error!HostGrid {
+        var grid: HostGrid = .{};
+        const ws = try self.sheet(sheet_idx);
+        const part = (try self.store.part(try ws.resolvePartName())) orelse return error.MissingSheetPart;
+        try hostNamespaceHygiene(part.bytes);
+        const view = try ws.ensureParsed();
+        for (view.rows) |row| {
+            for (row.cells) |cell| {
+                const parsed = coords.parseCell(cell.ref, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
+                const pre: CellRef = .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
+                if (pre.row != row.row_idx) return error.MalformedSheetXml;
+                const post = (try map.map(pre)) orelse continue;
+                // An inline string with nothing in it (`<is/>`) is a
+                // value all the same (Codex #206 r21 REL-2102).
+                var hc: HostCell = .{ .occupied = cell.raw_value != null or cell.formula != null or cell.inline_body != null, .text = null, .style = cell.style_idx };
+                // A style written but unreadable is not "unstyled":
+                // carried by row kind, it would be dropped from the
+                // cells laid out over it (Codex #206 r32 REL-3202).
+                // A `t` this reader does not know is a cell all the
+                // same, its style as written.
+                if (cell.style_invalid) return error.MalformedSheetXml;
+                if (cell.cell_type_invalid) {
+                    hc.occupied = true;
+                } else switch (cell.cell_type) {
+                    .shared_string => if (cell.raw_value) |raw| {
+                        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                        const idx = std.fmt.parseInt(u32, trimmed, 10) catch null;
+                        if (idx) |k| if (try self.sst()) |sst_view| if (k < sst_view.entries.len) {
+                            hc.text = switch (sst_view.entries[k]) {
+                                .plain => |t| try sst_xml_mod.decodeText(arena, t),
+                                .rich => |runs| blk: {
+                                    var out: std.ArrayListUnmanaged(u8) = .empty;
+                                    for (runs) |run| try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, run.text));
+                                    break :blk out.items;
+                                },
+                            };
+                        };
+                    },
+                    .formula_string => if (cell.raw_value) |raw| {
+                        hc.text = try sst_xml_mod.decodeText(arena, raw);
+                    },
+                    // The typed view keeps an inline string's first
+                    // `<t>` only; a rich one is its runs joined (Codex
+                    // #206 r5 REL-503).
+                    .inline_string => {
+                        // An `<is>` that is not the cell's one direct
+                        // child — nested under another element, or
+                        // twice — is not a string this reader carries
+                        // (Codex #206 r23 REL-2302).
+                        if (cell.inline_invalid) return error.MalformedSheetXml;
+                        if (cell.inline_body) |body| {
+                            hc.text = try inlineStringText(arena, body);
+                        } else if (cell.raw_value) |raw| {
+                            hc.text = try sst_xml_mod.decodeText(arena, raw);
+                        }
+                    },
+                    else => {},
+                }
+                // A coordinate twice is a grid with two cells in one
+                // place, which nothing can be laid out over (Codex
+                // #206 r3 REL-303).
+                const gop = try grid.getOrPut(arena, post);
+                if (gop.found_existing) return error.MalformedSheetXml;
+                gop.value_ptr.* = hc;
+            }
+        }
+        // A save: the staged writes are what the sheet is about to
+        // hold — a write over a cell replaces it, a deleted cell is
+        // gone.
+        if (with_writes) {
+            var it = ws.deltas.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                const prior = grid.get(ref);
+                const style: ?u32 = if (prior) |h| h.style else null;
+                // A cell staged for deletion is unoccupied and holds no
+                // text; the style it wore stays a donor for the row
+                // kind (Codex #206 r16 REL-1604).
+                const hc: HostCell = switch (entry.value_ptr.*) {
+                    .deleted, .blank => .{ .occupied = false, .text = null, .style = style },
+                    .string, .shared_string => |txt| .{ .occupied = true, .text = txt, .style = style },
+                    else => .{ .occupied = true, .text = null, .style = style },
+                };
+                try grid.put(arena, ref, hc);
+            }
+        }
+        return grid;
+    }
+
+    /// An inline string whole: every `<t>` element of its `<is>` body,
+    /// decoded and joined — the view's `raw_value` is the first run
+    /// alone. A comment, CDATA section or processing instruction in
+    /// the body is not a run and not text (Codex #206 r7 REL-702); a
+    /// `<t>` without its close is `MalformedSheetXml`.
+    fn inlineStringText(arena: Allocator, body: []const u8) Error![]const u8 {
+        // CT_Rst by structure (Codex #206 r15 REL-1503): under `<is>`,
+        // a `<t>`, an `<r>` (holding `<rPr>` and a `<t>`), an `<rPh>`
+        // (a phonetic hint, skipped whole), a childless `<phoneticPr>`;
+        // anything else, or a close that is not the open's, is a
+        // string this reader does not carry.
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var pos: usize = 0;
+        var in_run = false;
+        while (try nextMarkup(body, pos, body.len)) |m| {
+            // Character data lives in `<t>` alone; between the
+            // elements only whitespace (Codex #206 r24 REL-2403).
+            if (!typed_parts.pivot_xml.isBlank(body[pos..m.lt])) return error.MalformedSheetXml;
+            pos = m.after;
+            switch (m.kind) {
+                // A CDATA section is character data wherever it is.
+                .non_element => if (isCdataAt(body, m.lt)) return error.MalformedSheetXml else continue,
+                .close => {
+                    if (in_run and closeTagIs(body, m, "r")) {
+                        in_run = false;
+                        continue;
+                    }
+                    return error.MalformedSheetXml;
+                },
+                .open => {},
+            }
+            const self_closing = body[m.after - 2] == '/';
+            if (sheet_edit.matchTagAt(body, m.lt, "t") != null) {
+                if (self_closing) continue;
+                pos = try readInlineRun(arena, &out, body, m.after);
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "r") != null) {
+                if (self_closing) continue;
+                in_run = true;
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "rPh") != null) {
+                if (self_closing) continue;
+                pos = try skipSubtree(body, m.after, "rPh");
+            } else if (in_run and sheet_edit.matchTagAt(body, m.lt, "rPr") != null) {
+                if (self_closing) continue;
+                pos = try skipSubtree(body, m.after, "rPr");
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "phoneticPr") != null) {
+                if (!self_closing) return error.MalformedSheetXml;
+            } else {
+                return error.MalformedSheetXml;
+            }
+        }
+        if (in_run or !typed_parts.pivot_xml.isBlank(body[pos..])) return error.MalformedSheetXml;
+        return out.items;
+    }
+
+    /// The text of a `<t>` opened just before `from`, appended decoded;
+    /// a comment inside is not text, a CDATA section is its payload
+    /// as written (Codex #206 r28 REL-2801), any element is not a run.
+    fn readInlineRun(arena: Allocator, out: *std.ArrayListUnmanaged(u8), body: []const u8, from: usize) Error!usize {
+        var tpos = from;
+        while (try nextMarkup(body, tpos, body.len)) |tm| {
+            try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[tpos..tm.lt]));
+            tpos = tm.after;
+            switch (tm.kind) {
+                .non_element => {
+                    if (isCdataAt(body, tm.lt)) try out.appendSlice(arena, body[tm.lt + 9 .. tm.after - 3]);
+                    continue;
+                },
+                .close => {
+                    if (closeTagIs(body, tm, "t")) return tpos;
+                    return error.MalformedSheetXml;
+                },
+                .open => return error.MalformedSheetXml,
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    fn isCdataAt(src: []const u8, lt: usize) bool {
+        return std.mem.startsWith(u8, src[lt..], "<![CDATA[");
+    }
+
+    /// Past the close of `name`, opened just before `from`; the
+    /// subtree's own markup is not read.
+    fn skipSubtree(body: []const u8, from: usize, name: []const u8) Error!usize {
+        var ppos = from;
+        var depth: usize = 1;
+        while (try nextMarkup(body, ppos, body.len)) |pm| {
+            ppos = pm.after;
+            switch (pm.kind) {
+                .non_element => {},
+                .open => if (sheet_edit.matchTagAt(body, pm.lt, name) != null and body[pm.after - 2] != '/') {
+                    depth += 1;
+                },
+                .close => if (closeTagIs(body, pm, name)) {
+                    depth -= 1;
+                    if (depth == 0) return ppos;
+                },
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    /// The captions the host spells today, read where the part as it
+    /// is to be laid out (`base`) says they are: the header cell over
+    /// the row labels, the grand total's label, the blank item's.
+    /// Lenient — a part that is not the form the layout lays out is
+    /// refused there, not here.
+    fn hostCaptions(self: *Workbook, arena: Allocator, base: []const u8, cache: *const pivots_mod.PivotCache, grid: *const HostGrid) Error!pivots_mod.engine.Captions {
+        _ = self;
+        var captions: pivots_mod.engine.Captions = .{};
+        const px = typed_parts.pivot_xml;
+        const def = px.parseTableDefinition(arena, base) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return captions,
+        };
+        const fp = pivots_mod.edit.footprintOf(arena, def) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return captions,
+        };
+        const tl = fp.rect;
+        if (grid.get(.{ .row = tl.tl_row, .col = tl.tl_col })) |c| captions.row_labels = c.text;
+        const ri = def.row_items orelse return captions;
+        if (def.row_fields.len != 1 or def.row_fields[0] != .field) return captions;
+        const rf = def.row_fields[0].field;
+        if (rf >= def.fields.len or rf >= cache.definition.fields.len) return captions;
+        const pf = def.fields[rf];
+        const si = cache.definition.fields[rf].shared_items orelse return captions;
+        for (ri.items, 1..) |it, i| {
+            const row: u64 = @as(u64, tl.tl_row) + i;
+            if (row > zlsx.max_row) break;
+            const at: CellRef = .{ .row = @intCast(row), .col = tl.tl_col };
+            if (it.t) |t| {
+                // By its decoded value, as the shape check reads it
+                // (Codex #206 r32 REL-3201).
+                if (pivots_mod.engine.attrIs(t, "grand")) if (grid.get(at)) |c| {
+                    captions.grand_total = c.text;
+                };
+                continue;
+            }
+            if (it.xs.len != 1 or it.xs[0] >= pf.items.len) continue;
+            const x = pf.items[it.xs[0]].x orelse continue;
+            if (x >= si.items.len or si.items[x].kind != .m) continue;
+            if (grid.get(at)) |c| captions.blank = c.text;
+        }
+        return captions;
+    }
+
+    /// The host cells of one re-laid consumer: every cell of the new
+    /// rectangle, and `.deleted` for the old rectangle's cells outside
+    /// it. Refuses (`PivotEditUnsafe`) a rectangle that grows over a
+    /// cell holding anything — Excel refuses the overlap too. Styles
+    /// carry by row kind: the header's, the last item row's, the
+    /// grand total's, each per column.
+    fn planPivotHostWrite(self: *Workbook, prepared: *PreparedPivotEdits, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid, merges: []const pivots_mod.edit.Rect) Error!void {
+        const write = try planHostWriteCells(prepared.arena.allocator(), t, lay, grid, merges);
+        try prepared.host_writes.append(self.allocator, write);
+    }
+
+    fn rectsIntersect(a: pivots_mod.edit.Rect, b: pivots_mod.edit.Rect) bool {
+        return a.tl_row <= b.br_row and b.tl_row <= a.br_row and a.tl_col <= b.br_col and b.tl_col <= a.br_col;
+    }
+
+    fn planHostWriteCells(a: Allocator, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid, merges: []const pivots_mod.edit.Rect) Error!PivotHostWrite {
+        const old = lay.old_rect;
+        const new = lay.rect;
+        var cells: std.ArrayListUnmanaged(PivotHostCell) = .empty;
+        // A merged range the new rectangle reaches is in the way as an
+        // occupied cell is — one the old rectangle held too (merged
+        // labels, `mergeItem`): the slice writes one value per cell
+        // and does not maintain the merge (Codex #206 r4 REL-402).
+        for (merges) |m| {
+            if (rectsIntersect(m, new)) return error.PivotEditUnsafe;
+        }
+
+        // Style sources: the old rectangle's rows by kind.
+        var header_row: ?u32 = old.tl_row;
+        var item_row: ?u32 = null;
+        var grand_row: ?u32 = null;
+        for (lay.old_kinds, 0..) |k, i| {
+            const r: u32 = old.tl_row + @as(u32, @intCast(i));
+            switch (k) {
+                .header => header_row = r,
+                .item => item_row = r,
+                .grand => grand_row = r,
+            }
+        }
+
+        for (lay.cells) |c| {
+            const ref: CellRef = .{ .row = c.row, .col = c.col };
+            const inside_old = c.row >= old.tl_row and c.row <= old.br_row and c.col >= old.tl_col and c.col <= old.br_col;
+            if (!inside_old) if (grid.get(ref)) |h| if (h.occupied) return error.PivotEditUnsafe;
+            const src_row: ?u32 = switch (c.kind) {
+                .header => header_row,
+                .item => item_row orelse header_row,
+                .grand => grand_row orelse item_row orelse header_row,
+            };
+            const style: ?u32 = if (src_row) |r| (if (grid.get(.{ .row = r, .col = c.col })) |h| h.style else null) else null;
+            const value: CellValue = switch (c.value) {
+                .blank => .blank,
+                .number => |lex| .{ .number = std.fmt.parseFloat(f64, lex) catch return error.MalformedPivotXml },
+                .string => |txt| .{ .shared_string = try a.dupe(u8, txt) },
+            };
+            try cells.append(a, .{ .ref = ref, .value = value, .style = style });
+        }
+        var r = old.tl_row;
+        while (r <= old.br_row) : (r += 1) {
+            var col = old.tl_col;
+            while (col <= old.br_col) : (col += 1) {
+                const inside_new = r >= new.tl_row and r <= new.br_row and col >= new.tl_col and col <= new.br_col;
+                if (inside_new) continue;
+                try cells.append(a, .{ .ref = .{ .row = r, .col = col }, .value = .deleted, .style = null });
+            }
+        }
+        return .{
+            .sheet_idx = t.sheet_idx,
+            .sheet_part_name = try a.dupe(u8, t.sheet_part_name),
+            .cells = try cells.toOwnedSlice(a),
+        };
+    }
+
+    /// One host sheet's merged writes: several pivots on one sheet
+    /// emit once (their rectangles are disjoint — Excel refuses an
+    /// overlap; the growth check refuses one into another's cells).
+    const HostSheetWrites = struct {
+        sheet_idx: u32,
+        part_name: []const u8,
+        deltas: std.AutoHashMapUnmanaged(CellRef, CellValue) = .{},
+        styles: std.AutoHashMapUnmanaged(CellRef, ?u32) = .{},
+    };
+
+    /// Host writes rendered and not yet installed: every host part's
+    /// new bytes, the shared-string plan they index and, when the
+    /// table exists and gains strings, its regenerated bytes — so a
+    /// caller installs everything in one `replaceParts`, or nothing
+    /// (Codex #206 r1 REL-102).
+    const RenderedHostWrites = struct {
+        plan: SstExtensionPlan,
+        sst_bytes: ?[]u8 = null,
+        patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty,
+        sheets: std.ArrayListUnmanaged(HostSheetWrites) = .empty,
+
+        fn deinit(self: *RenderedHostWrites, a: Allocator) void {
+            self.plan.deinit(a);
+            if (self.sst_bytes) |b| a.free(b);
+            for (self.patches.items) |it| a.free(it.bytes);
+            self.patches.deinit(a);
+            for (self.sheets.items) |*ps| {
+                ps.deltas.deinit(a);
+                ps.styles.deinit(a);
+            }
+            self.sheets.deinit(a);
+            self.* = undefined;
+        }
+    };
+
+    /// S7b-5: the planned host cells rendered over the host sheets as
+    /// they are now — the strings resolved through the shared-string
+    /// table (extended as a save extends it), each host part emitted
+    /// with the cells as deltas and their styles. Reads only.
+    fn renderPivotHostWrites(self: *Workbook, host_writes: []const PivotHostWrite) Error!RenderedHostWrites {
+        const a = self.allocator;
+        var strings: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer strings.deinit(a);
+        for (host_writes) |hw| for (hw.cells) |c| switch (c.value) {
+            .shared_string => |txt| try strings.append(a, txt),
+            else => {},
+        };
+        // The host's own staged writes go in the same splice, the
+        // pivot's cells winning where they meet — one emit per host,
+        // byte-preserving, instead of the sheet phase regenerating
+        // `<sheetData>` whole for what remained (Codex #206 r21
+        // REL-2101). Their strings join the plan below.
+        var merged_sheets: std.ArrayListUnmanaged(HostSheetWrites) = .empty;
+        errdefer {
+            for (merged_sheets.items) |*ps| {
+                ps.deltas.deinit(a);
+                ps.styles.deinit(a);
+            }
+            merged_sheets.deinit(a);
+        }
+        for (host_writes) |hw| {
+            var slot: ?*HostSheetWrites = null;
+            for (merged_sheets.items) |*ps| if (ps.sheet_idx == hw.sheet_idx) {
+                slot = ps;
+            };
+            if (slot == null) {
+                try merged_sheets.append(a, .{ .sheet_idx = hw.sheet_idx, .part_name = hw.sheet_part_name });
+                slot = &merged_sheets.items[merged_sheets.items.len - 1];
+            }
+            const ps = slot.?;
+            for (hw.cells) |c| {
+                // Two pivots writing one cell are two rectangles that
+                // overlap, which Excel refuses (Codex #206 r3 REL-303).
+                const gop = try ps.deltas.getOrPut(a, c.ref);
+                if (gop.found_existing) return error.PivotEditUnsafe;
+                gop.value_ptr.* = c.value;
+                try ps.styles.put(a, c.ref, c.style);
+            }
+        }
+        for (merged_sheets.items) |*ps| {
+            const ws = try self.sheet(ps.sheet_idx);
+            var it = ws.deltas.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                if (ps.deltas.contains(ref)) continue;
+                try ps.deltas.put(a, ref, entry.value_ptr.*);
+                var ref_buf: [16]u8 = undefined;
+                const existing = try ws.cellByRef(formatA1Ref(&ref_buf, ref));
+                try ps.styles.put(a, ref, if (existing) |c| c.style_idx else null);
+                switch (entry.value_ptr.*) {
+                    .shared_string => |txt| try strings.append(a, txt),
+                    else => {},
+                }
+            }
+        }
+        var out: RenderedHostWrites = .{ .plan = try self.sstPlanForStrings(strings.items) };
+        errdefer out.deinit(a);
+        out.sheets = merged_sheets;
+        merged_sheets = .empty;
+        // A workbook with strings on a pivot host and no shared-string
+        // table is not one Excel wrote; adding the part, its
+        // relationship and its content type is a mutation outside the
+        // one batch below, so it refuses instead (Codex #206 r4
+        // SEC-404).
+        if (out.plan.has_new_strings and !out.plan.sst_part_exists) return error.PivotEditUnsafe;
+        // Host cells written or cleared change how many cells name a
+        // shared string; the table's `count` (occurrences, optional)
+        // is dropped rather than left stale or written as
+        // `uniqueCount` (Codex #206 r14 REL-1403).
+        var touches_strings = strings.items.len > 0;
+        for (host_writes) |hw| for (hw.cells) |c| {
+            if (c.value == .deleted) touches_strings = true;
+        };
+        if (touches_strings and out.plan.sst_part_exists) {
+            const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
+            // The entries the host cells name, matched or appended, are
+            // `<si>` in the main namespace only when the table binds
+            // it as the host must (Codex #206 r28 SEC-2801).
+            try hostNamespaceHygiene(existing.bytes);
+            try checkSstEntryPlacement(existing.bytes, out.plan.base_index);
+            const extended: []u8 = if (out.plan.has_new_strings)
+                try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items, out.plan.base_index)
+            else
+                try a.dupe(u8, existing.bytes);
+            defer a.free(extended);
+            const stripped = try dropSstCountAttr(a, extended);
+            if (std.mem.eql(u8, stripped, existing.bytes)) {
+                a.free(stripped);
+            } else {
+                out.sst_bytes = stripped;
+            }
+        }
+        for (out.sheets.items) |*ps| {
+            const part = (try self.store.part(ps.part_name)) orelse return error.MissingSheetPart;
+            const new_xml = try spliceHostCells(a, part.bytes, ps, &out.plan);
+            errdefer a.free(new_xml);
+            try out.patches.append(a, .{ .name = ps.part_name, .bytes = new_xml });
+        }
+        return out;
+    }
+
+    /// One planned cell as the splicer orders it.
+    const PlannedCell = struct {
+        ref: CellRef,
+        value: CellValue,
+        style: ?u32,
+
+        fn before(_: void, x: PlannedCell, y: PlannedCell) bool {
+            if (x.ref.row != y.ref.row) return x.ref.row < y.ref.row;
+            return x.ref.col < y.ref.col;
+        }
+    };
+
+    /// The host part with the planned cells spliced in and every
+    /// other byte as written — the rows' attributes, the cells the
+    /// pivot does not name (a shared formula's `t`/`si`/`ref`, an
+    /// `<extLst>`), whatever sits between them. The typed emitter
+    /// regenerates `<sheetData>` whole and would drop all of that on
+    /// a sheet the user never edited (Codex #206 r3 REL-302). Rows
+    /// and cells are walked in the part's order, which must be
+    /// ascending; a coordinate twice, one that does not read, or a
+    /// `<c>` without its close is `MalformedSheetXml`. `<dimension>`
+    /// is widened to cover the planned cells.
+    fn spliceHostCells(a: Allocator, src: []const u8, ps: *const HostSheetWrites, plan: *const SstExtensionPlan) Error![]u8 {
+        var cells: std.ArrayListUnmanaged(PlannedCell) = .empty;
+        defer cells.deinit(a);
+        var it = ps.deltas.iterator();
+        while (it.next()) |e| {
+            try cells.append(a, .{ .ref = e.key_ptr.*, .value = e.value_ptr.*, .style = (ps.styles.get(e.key_ptr.*) orelse null) });
+        }
+        std.mem.sort(PlannedCell, cells.items, {}, PlannedCell.before);
+
+        // `<sheetData>` by the walk, not by the first spelling of its
+        // name: a comment, CDATA section or processing instruction
+        // may spell any of it (Codex #206 r4 SEC-401) — and the root's
+        // own direct child, not one nested under another element
+        // (r20 SEC-2001).
+        const sd_tag = (try scanDocument(src, "worksheet", "sheetData")).child orelse return error.NoSheetData;
+        const dim_tag = (try scanDocument(src, "worksheet", "dimension")).child;
+        var pos: usize = 0;
+        const sd_self_closing = src[sd_tag.after_open - 2] == '/';
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.ensureTotalCapacity(a, src.len + 64 * cells.items.len);
+
+        // Everything before the rows, the dimension widened on the way.
+        const head_end: usize = if (sd_self_closing) sd_tag.start else sd_tag.after_open;
+        try appendWithDimension(a, &out, src, head_end, dim_tag, cells.items);
+        // A self-closing `<sheetData …/>` opens with its attributes as
+        // written (Codex #206 r27 REL-2703).
+        if (sd_self_closing) {
+            try out.appendSlice(a, src[sd_tag.start .. sd_tag.after_open - 2]);
+            try out.append(a, '>');
+        }
+
+        var next: usize = 0; // into `cells`
+        var last_row: u32 = 0;
+        var body_end: usize = sd_tag.after_open;
+        pos = sd_tag.after_open;
+        if (!sd_self_closing) {
+            var closed = false;
+            while (try nextMarkup(src, pos, src.len)) |m| {
+                switch (m.kind) {
+                    .non_element => {
+                        try out.appendSlice(a, src[pos..m.after]);
+                        pos = m.after;
+                        continue;
+                    },
+                    .close => {
+                        if (closeTagIs(src, m, "sheetData")) {
+                            body_end = m.lt;
+                            closed = true;
+                            break;
+                        }
+                        try out.appendSlice(a, src[pos..m.after]);
+                        pos = m.after;
+                        continue;
+                    },
+                    .open => {},
+                }
+                const t = sheet_edit.matchTagAt(src, m.lt, "row") orelse {
+                    if (sheet_edit.matchTagAt(src, m.lt, "c") != null or sheet_edit.matchTagAt(src, m.lt, "sheetData") != null) return error.MalformedSheetXml;
+                    const skip_to: usize = if (src[m.after - 2] == '/') m.after else try elementEnd(src, m);
+                    try refuseGridMarkupWithin(src, m.after, skip_to);
+                    try out.appendSlice(a, src[pos..skip_to]);
+                    pos = skip_to;
+                    continue;
+                };
+                try out.appendSlice(a, src[pos..m.lt]);
+                const attrs = std.mem.trimEnd(u8, src[t.start + "<row".len .. t.after_open - 1], " \t\r\n/");
+                const r = try rowNumberOf(wbxml_typed.getAttr(attrs, "r") orelse return error.MalformedSheetXml);
+                if (r <= last_row) return error.MalformedSheetXml;
+                last_row = r;
+                // Planned rows the part does not have, before this one.
+                while (next < cells.items.len and cells.items[next].ref.row < r) {
+                    next = try emitPlannedRow(a, &out, cells.items, next, plan);
+                }
+                const self_closing = src[t.after_open - 2] == '/';
+                const planned = next < cells.items.len and cells.items[next].ref.row == r;
+                if (self_closing) {
+                    if (!planned) {
+                        try out.appendSlice(a, src[t.start..t.after_open]);
+                    } else {
+                        try out.appendSlice(a, src[t.start .. t.after_open - 2]);
+                        try out.append(a, '>');
+                        while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                            try emitPlannedCell(a, &out, cells.items[next], plan);
+                        }
+                        try out.appendSlice(a, "</row>");
+                    }
+                    pos = t.after_open;
+                    continue;
+                }
+                // The row's open tag as written, then its cells in
+                // column order, everything between them verbatim.
+                try out.appendSlice(a, src[t.start..t.after_open]);
+                var cpos = t.after_open;
+                var last_col: u32 = 0;
+                var row_closed = false;
+                var cells_closed = false;
+                while (try nextMarkup(src, cpos, src.len)) |cm| {
+                    switch (cm.kind) {
+                        .non_element => {
+                            try out.appendSlice(a, src[cpos..cm.after]);
+                            cpos = cm.after;
+                            continue;
+                        },
+                        .close => {
+                            if (closeTagIs(src, cm, "row")) {
+                                try out.appendSlice(a, src[cpos..cm.lt]);
+                                while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                                    try emitPlannedCell(a, &out, cells.items[next], plan);
+                                }
+                                try out.appendSlice(a, src[cm.lt..cm.after]);
+                                cpos = cm.after;
+                                row_closed = true;
+                                break;
+                            }
+                            try out.appendSlice(a, src[cpos..cm.after]);
+                            cpos = cm.after;
+                            continue;
+                        },
+                        .open => {},
+                    }
+                    const ct = sheet_edit.matchTagAt(src, cm.lt, "c") orelse {
+                        // Not a cell: a row or `sheetData` here is
+                        // not a grid; anything else — the row's
+                        // `<extLst>` — ends the cells (`CT_Row` puts
+                        // them first), so the planned ones still due
+                        // go before it (Codex #206 r27 REL-2702), and
+                        // it is stepped over whole, its subtree
+                        // verbatim (r16 SEC-1601).
+                        if (sheet_edit.matchTagAt(src, cm.lt, "row") != null or sheet_edit.matchTagAt(src, cm.lt, "sheetData") != null) return error.MalformedSheetXml;
+                        try out.appendSlice(a, src[cpos..cm.lt]);
+                        while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                            try emitPlannedCell(a, &out, cells.items[next], plan);
+                        }
+                        cells_closed = true;
+                        const skip_to: usize = if (src[cm.after - 2] == '/') cm.after else try elementEnd(src, cm);
+                        try refuseGridMarkupWithin(src, cm.after, skip_to);
+                        try out.appendSlice(a, src[cm.lt..skip_to]);
+                        cpos = skip_to;
+                        continue;
+                    };
+                    if (cells_closed) return error.MalformedSheetXml;
+                    try out.appendSlice(a, src[cpos..cm.lt]);
+                    const cattrs = std.mem.trimEnd(u8, src[ct.start + "<c".len .. ct.after_open - 1], " \t\r\n/");
+                    const cref = try cellRefOf(wbxml_typed.getAttr(cattrs, "r") orelse return error.MalformedSheetXml);
+                    if (cref.row != r or cref.col <= last_col) return error.MalformedSheetXml;
+                    last_col = cref.col;
+                    const c_end = try cellEnd(src, ct);
+                    while (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col < cref.col) : (next += 1) {
+                        try emitPlannedCell(a, &out, cells.items[next], plan);
+                    }
+                    if (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col == cref.col) {
+                        try emitPlannedCell(a, &out, cells.items[next], plan);
+                        next += 1;
+                    } else {
+                        try out.appendSlice(a, src[ct.start..c_end]);
+                    }
+                    cpos = c_end;
+                }
+                if (!row_closed) return error.MalformedSheetXml;
+                pos = cpos;
+            }
+            if (!closed) return error.NoSheetData;
+        }
+        try out.appendSlice(a, src[pos..body_end]);
+        while (next < cells.items.len) {
+            next = try emitPlannedRow(a, &out, cells.items, next, plan);
+        }
+        if (sd_self_closing) try out.appendSlice(a, "</sheetData>");
+        try out.appendSlice(a, src[body_end..]);
+        return try out.toOwnedSlice(a);
+    }
+
+    /// One XML document read whole: exactly one document element,
+    /// named `root_name`, every close the open it closes, nothing but
+    /// comments and processing instructions outside the root (Codex
+    /// #206 r21 SEC-2103, SEC-2104) — and, when asked, the root's one
+    /// direct child named `child_name`: an occurrence at any other
+    /// depth, or a second one, is malformed (r20 SEC-2001).
+    const DocScan = struct {
+        root: zlsx.TagOpen,
+        /// The `<` of the root's close tag; the root's `after_open`
+        /// for a self-closing root.
+        root_close_lt: usize,
+        child: ?zlsx.TagOpen,
+    };
+
+    fn scanDocument(src: []const u8, root_name: []const u8, child_name: ?[]const u8) Error!DocScan {
+        const max_depth = 64;
+        var stack: [max_depth][]const u8 = undefined;
+        var depth: usize = 0;
+        var root: ?zlsx.TagOpen = null;
+        var root_close_lt: ?usize = null;
+        var child: ?zlsx.TagOpen = null;
+        // A byte-order mark before the declaration is a producer's
+        // habit, not character data.
+        var pos: usize = if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) 3 else 0;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            // Outside the root, the bytes between markup are
+            // whitespace and the markup a comment or a processing
+            // instruction — not character data, not a CDATA section,
+            // not a declaration (Codex #206 r22 SEC-2202).
+            if (depth == 0) {
+                if (!typed_parts.pivot_xml.isBlank(src[pos..m.lt])) return error.MalformedSheetXml;
+                if (m.kind == .non_element and !(std.mem.startsWith(u8, src[m.lt..], "<!--") or src[m.lt + 1] == '?')) return error.MalformedSheetXml;
+            }
+            pos = m.after;
+            switch (m.kind) {
+                .non_element => {},
+                .close => {
+                    if (depth == 0) return error.MalformedSheetXml;
+                    if (!closeTagIs(src, m, stack[depth - 1])) return error.MalformedSheetXml;
+                    depth -= 1;
+                    if (depth == 0) root_close_lt = m.lt;
+                },
+                .open => {
+                    if (root_close_lt != null) return error.MalformedSheetXml;
+                    var j = m.lt + 1;
+                    while (j < src.len and src[j] != ' ' and src[j] != '\t' and src[j] != '\n' and src[j] != '\r' and src[j] != '/' and src[j] != '>') j += 1;
+                    const name = src[m.lt + 1 .. j];
+                    if (name.len == 0) return error.MalformedSheetXml;
+                    const self_closing = src[m.after - 2] == '/';
+                    const t: zlsx.TagOpen = .{ .start = m.lt, .after_open = m.after };
+                    if (depth == 0) {
+                        if (root != null or !std.mem.eql(u8, name, root_name)) return error.MalformedSheetXml;
+                        root = t;
+                        if (self_closing) root_close_lt = m.after;
+                    } else if (child_name) |cn| {
+                        if (std.mem.eql(u8, name, cn)) {
+                            if (depth != 1 or child != null) return error.MalformedSheetXml;
+                            child = t;
+                        }
+                    }
+                    if (!self_closing) {
+                        if (depth >= max_depth) return error.MalformedSheetXml;
+                        stack[depth] = name;
+                        depth += 1;
+                    }
+                },
+            }
+        }
+        if (depth != 0) return error.MalformedSheetXml;
+        if (!typed_parts.pivot_xml.isBlank(src[pos..])) return error.MalformedSheetXml;
+        return .{ .root = root orelse return error.MalformedSheetXml, .root_close_lt = root_close_lt orelse return error.MalformedSheetXml, .child = child };
+    }
+
+    /// The next markup at or after `pos` and before `end`: a comment,
+    /// CDATA section or processing instruction (copied through whole
+    /// by every caller), a close tag, or an element's open tag.
+    const Markup = struct {
+        lt: usize,
+        after: usize,
+        kind: enum { non_element, close, open },
+    };
+
+    fn nextMarkup(src: []const u8, pos: usize, end: usize) Error!?Markup {
+        const lt = std.mem.indexOfScalarPos(u8, src, pos, '<') orelse return null;
+        // A `<` at or past `end` is the caller's bound, not markup.
+        if (lt >= end) return null;
+        if (lt + 1 >= src.len) return error.MalformedSheetXml;
+        const c = src[lt + 1];
+        if (c == '!' or c == '?') {
+            const after = wbxml_typed.skipNonElement(src, lt) catch return error.MalformedSheetXml;
+            return .{ .lt = lt, .after = after, .kind = .non_element };
+        }
+        const gt = sheet_edit.tagEnd(src, lt) orelse return error.MalformedSheetXml;
+        return .{ .lt = lt, .after = gt + 1, .kind = if (c == '/') .close else .open };
+    }
+
+    fn closeTagIs(src: []const u8, m: Markup, name: []const u8) bool {
+        const inner = std.mem.trim(u8, src[m.lt + 2 .. m.after - 1], " \t\r\n");
+        return std.mem.eql(u8, inner, name);
+    }
+
+    /// One past a `<c>` element: its `/>`, or its close tag found by
+    /// the walk (a `</c>` inside a comment is not one). A cell, a row
+    /// or a `sheetData` opened inside a cell is not a grid (Codex
+    /// #206 r16 SEC-1601); any other element inside it — a formula,
+    /// a value, an inline string, an extension — is stepped over
+    /// whole, so its close is never taken for the cell's.
+    fn cellEnd(src: []const u8, ct: zlsx.TagOpen) Error!usize {
+        if (src[ct.after_open - 2] == '/') return ct.after_open;
+        var pos = ct.after_open;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            pos = m.after;
+            switch (m.kind) {
+                .non_element => {},
+                .close => {
+                    if (closeTagIs(src, m, "c")) return m.after;
+                    return error.MalformedSheetXml;
+                },
+                .open => {
+                    if (sheet_edit.matchTagAt(src, m.lt, "c") != null or sheet_edit.matchTagAt(src, m.lt, "row") != null or sheet_edit.matchTagAt(src, m.lt, "sheetData") != null) return error.MalformedSheetXml;
+                    if (src[m.after - 2] != '/') pos = try elementEnd(src, m);
+                },
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    /// One past the element opened at `m`, by depth over its own
+    /// name — its subtree unread.
+    /// A subtree the splicer steps over whole holds no grid element:
+    /// the typed reader finds a `<row>` or `<c>` at any depth, so one
+    /// under an unknown child would be read as a cell and then spelt
+    /// again beside it (Codex #206 r29 SEC-2902).
+    fn refuseGridMarkupWithin(src: []const u8, from: usize, to: usize) Error!void {
+        var pos = from;
+        while (try nextMarkup(src, pos, to)) |x| {
+            pos = x.after;
+            if (x.kind != .open) continue;
+            if (sheet_edit.matchTagAt(src, x.lt, "row") != null or sheet_edit.matchTagAt(src, x.lt, "c") != null or sheet_edit.matchTagAt(src, x.lt, "sheetData") != null) return error.MalformedSheetXml;
+        }
+    }
+
+    fn elementEnd(src: []const u8, m: Markup) Error!usize {
+        var j = m.lt + 1;
+        while (j < src.len and src[j] != ' ' and src[j] != '\t' and src[j] != '\n' and src[j] != '\r' and src[j] != '/' and src[j] != '>') j += 1;
+        const name = src[m.lt + 1 .. j];
+        if (name.len == 0) return error.MalformedSheetXml;
+        var depth: usize = 1;
+        var pos = m.after;
+        while (try nextMarkup(src, pos, src.len)) |x| {
+            pos = x.after;
+            switch (x.kind) {
+                .non_element => {},
+                .open => if (sheet_edit.matchTagAt(src, x.lt, name) != null and src[x.after - 2] != '/') {
+                    depth += 1;
+                },
+                .close => if (closeTagIs(src, x, name)) {
+                    depth -= 1;
+                    if (depth == 0) return pos;
+                },
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    /// A row the part lacks: `<row r="N">` and its planned cells (a
+    /// `.deleted` cell has nothing to delete). Returns the index past
+    /// the row's cells.
+    fn emitPlannedRow(a: Allocator, out: *std.ArrayListUnmanaged(u8), cells: []const PlannedCell, from: usize, plan: *const SstExtensionPlan) Error!usize {
+        const r = cells[from].ref.row;
+        var end = from;
+        var any = false;
+        while (end < cells.len and cells[end].ref.row == r) : (end += 1) {
+            if (cells[end].value != .deleted) any = true;
+        }
+        if (!any) return end;
+        try out.appendSlice(a, "<row r=\"");
+        var buf: [16]u8 = undefined;
+        try out.appendSlice(a, try std.fmt.bufPrint(&buf, "{d}", .{r}));
+        try out.appendSlice(a, "\">");
+        for (cells[from..end]) |c| try emitPlannedCell(a, out, c, plan);
+        try out.appendSlice(a, "</row>");
+        return end;
+    }
+
+    /// One planned cell: a shared string, a number, an empty cell
+    /// (`<c r=".." s=".."/>`, Excel's spelling of a pivot cell with
+    /// nothing in it), or nothing at all for `.deleted`.
+    fn emitPlannedCell(a: Allocator, out: *std.ArrayListUnmanaged(u8), c: PlannedCell, plan: *const SstExtensionPlan) Error!void {
+        if (c.value == .deleted) return;
+        var ref_buf: [16]u8 = undefined;
+        try out.appendSlice(a, "<c r=\"");
+        try out.appendSlice(a, formatA1Ref(&ref_buf, c.ref));
+        try out.append(a, '"');
+        if (c.style) |st| {
+            var sbuf: [16]u8 = undefined;
+            try out.appendSlice(a, " s=\"");
+            try out.appendSlice(a, try std.fmt.bufPrint(&sbuf, "{d}", .{st}));
+            try out.append(a, '"');
+        }
+        switch (c.value) {
+            .blank => try out.appendSlice(a, "/>"),
+            .number => |n| {
+                var nbuf: [64]u8 = undefined;
+                try out.appendSlice(a, "><v>");
+                try out.appendSlice(a, try std.fmt.bufPrint(&nbuf, "{d}", .{n}));
+                try out.appendSlice(a, "</v></c>");
+            },
+            .shared_string => |txt| {
+                const idx = plan.indexOf(txt) orelse return error.MalformedXml;
+                var ibuf: [16]u8 = undefined;
+                try out.appendSlice(a, " t=\"s\"><v>");
+                try out.appendSlice(a, try std.fmt.bufPrint(&ibuf, "{d}", .{idx}));
+                try out.appendSlice(a, "</v></c>");
+            },
+            // The host's own staged writes, spelt as the sheet phase
+            // spells them (r21 REL-2101).
+            .string => |txt| {
+                try out.appendSlice(a, " t=\"inlineStr\"><is><t");
+                if (txt.len > 0 and (txt[0] == ' ' or txt[txt.len - 1] == ' ')) try out.appendSlice(a, " xml:space=\"preserve\"");
+                try out.append(a, '>');
+                try appendXmlEscapedText(a, out, txt);
+                try out.appendSlice(a, "</t></is></c>");
+            },
+            .boolean => |b| {
+                try out.appendSlice(a, " t=\"b\"><v>");
+                try out.appendSlice(a, if (b) "1" else "0");
+                try out.appendSlice(a, "</v></c>");
+            },
+            .formula => |f| {
+                try out.appendSlice(a, "><f>");
+                try appendXmlEscapedText(a, out, f);
+                try out.appendSlice(a, "</f></c>");
+            },
+            .deleted => unreachable,
+        }
+    }
+
+    /// `src` (the part up to the rows) with `<dimension ref>` widened
+    /// to cover the planned cells — a part without one is left so.
+    fn appendWithDimension(a: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8, head_end: usize, dim: ?zlsx.TagOpen, cells: []const PlannedCell) Error!void {
+        const head = src[0..head_end];
+        var rect: ?pivots_mod.edit.Rect = null;
+        for (cells) |c| {
+            if (c.value == .deleted) continue;
+            if (rect) |*r| {
+                r.tl_row = @min(r.tl_row, c.ref.row);
+                r.tl_col = @min(r.tl_col, c.ref.col);
+                r.br_row = @max(r.br_row, c.ref.row);
+                r.br_col = @max(r.br_col, c.ref.col);
+            } else rect = .{ .tl_row = c.ref.row, .tl_col = c.ref.col, .br_row = c.ref.row, .br_col = c.ref.col };
+        }
+        const want = rect orelse {
+            try out.appendSlice(a, head);
+            return;
+        };
+        // The element as the document scan placed it — the root's
+        // own direct child (r20 SEC-2001, r21 SEC-2103); one past the
+        // rows is not in the head.
+        const t = dim orelse {
+            try out.appendSlice(a, head);
+            return;
+        };
+        if (t.after_open > head_end) {
+            try out.appendSlice(a, head);
+            return;
+        }
+        const attrs = std.mem.trimEnd(u8, src[t.start + "<dimension".len .. t.after_open - 1], " \t\r\n/");
+        const raw = wbxml_typed.getAttr(attrs, "ref") orelse {
+            try out.appendSlice(a, head);
+            return;
+        };
+        var buf: [64]u8 = undefined;
+        const decoded = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        var r = pivots_mod.edit.parseRect(decoded) orelse return error.MalformedSheetXml;
+        r.tl_row = @min(r.tl_row, want.tl_row);
+        r.tl_col = @min(r.tl_col, want.tl_col);
+        r.br_row = @max(r.br_row, want.br_row);
+        r.br_col = @max(r.br_col, want.br_col);
+        var ref_buf: [pivots_mod.Bounds.format_buf_len]u8 = undefined;
+        const new_ref = pivots_mod.edit.formatRect(&ref_buf, r) catch return error.MalformedSheetXml;
+        // The attribute's value alone — the element's spelling, open
+        // and close, stays (Codex #206 r4 REL-405).
+        try out.appendSlice(a, src[0..t.start]);
+        try sheet_edit.writeWithReplacedAttr(a, out, src, t, "<dimension".len, "ref", new_ref);
+        try out.appendSlice(a, src[t.after_open..head_end]);
+    }
+
+    /// A `<row r>` decoded and read as a row number.
+    fn rowNumberOf(raw: []const u8) Error!u32 {
+        var buf: [32]u8 = undefined;
+        const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        if (v.len == 0 or v[0] == '0') return error.MalformedSheetXml;
+        for (v) |d| if (!std.ascii.isDigit(d)) return error.MalformedSheetXml;
+        const r = std.fmt.parseInt(u32, v, 10) catch return error.MalformedSheetXml;
+        if (r == 0 or r > zlsx.max_row) return error.MalformedSheetXml;
+        return r;
+    }
+
+    /// A `<c r>` decoded and read by the strict grid parser.
+    fn cellRefOf(raw: []const u8) Error!CellRef {
+        var buf: [32]u8 = undefined;
+        const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
+        const parsed = coords.parseCell(v, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
+        return .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
+    }
+
+    /// `<sst …>` without its `count` attribute; everything else as
+    /// written. A part without the attribute, or one whose root the
+    /// walk cannot find, is copied whole.
+    fn dropSstCountAttr(a: Allocator, xml: []const u8) Error![]u8 {
+        // The one document element, validated whole — the count-only
+        // rewrite reads the table too (Codex #206 r22 SEC-2201).
+        const doc = try scanDocument(xml, "sst", null);
+        {
+            const t = doc.root;
+            const attrs_start = t.start + "<sst".len;
+            const attrs = xml[attrs_start .. t.after_open - 1];
+            var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+            var prev_end: usize = 0;
+            while (it.next()) |pair| {
+                const value_end = @intFromPtr(pair.value.ptr) - @intFromPtr(attrs.ptr) + pair.value.len + 1;
+                if (std.mem.eql(u8, pair.name, "count")) {
+                    // From the end of the previous attribute (its
+                    // whitespace included) to the closing quote.
+                    return std.mem.concat(a, u8, &.{ xml[0 .. attrs_start + prev_end], xml[attrs_start + value_end .. xml.len] });
+                }
+                prev_end = value_end;
+            }
+        }
+        return a.dupe(u8, xml);
+    }
+
+    /// The rendered host writes installed with `extra` (a caller's
+    /// pivot parts) in one `replaceParts`. Then the views the bytes
+    /// replaced are dropped, and a
+    /// staged write inside a re-laid rectangle with them: the pivot's
+    /// cells are its own — the refresh overwrites a typed-over cell,
+    /// as Excel's does.
+    fn installPivotHostWrites(self: *Workbook, r: *RenderedHostWrites, extra: []const store_mod.PartStore.Replacement) Error!void {
+        const a = self.allocator;
+        var all: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
+        defer all.deinit(a);
+        try all.appendSlice(a, extra);
+        if (r.sst_bytes) |b| try all.append(a, .{ .name = "xl/sharedStrings.xml", .bytes = b });
+        try all.appendSlice(a, r.patches.items);
+        if (all.items.len > 0) try self.store.replaceParts(all.items);
+        // The table's bytes changed — with new entries or only without
+        // its count (Codex #206 r15 REL-1501): the view goes with them.
+        if (r.sst_bytes != null) {
+            if (self.sst_view) |*v| {
+                var view = v.*;
+                view.deinit(a);
+                self.sst_view = null;
+            }
+        }
+        for (r.sheets.items) |ps| {
+            const ws = try self.sheet(ps.sheet_idx);
+            if (ws.parsed) |*v| {
+                var view = v.*;
+                view.deinit(a);
+                ws.parsed = null;
+            }
+            // Every staged write of the host went into the splice —
+            // the pivot's cells over it where they met — so none is
+            // left for the sheet phase to re-emit (r21 REL-2101).
+            freeDeltaStrings(a, &ws.deltas);
+            ws.deltas.clearAndFree(a);
+        }
+    }
+
+    /// The sweep's last step: render, then install.
+    fn applyPivotHostWrites(self: *Workbook, host_writes: []const PivotHostWrite) Error!void {
+        if (host_writes.len == 0) return;
+        var rendered = try self.renderPivotHostWrites(host_writes);
+        defer rendered.deinit(self.allocator);
+        try self.installPivotHostWrites(&rendered, &.{});
+    }
+
+    /// An SST extension plan for an explicit list of strings — what
+    /// `buildSstExtensionPlan` builds from staged deltas, for the
+    /// pivot cells the sweep writes outside a save. Every string
+    /// resolves through `indexOf` afterwards: appended when the table
+    /// lacks it, matched to its existing plain entry otherwise.
+    fn sstPlanForStrings(self: *Workbook, strings: []const []const u8) Error!SstExtensionPlan {
+        var plan: SstExtensionPlan = .{};
+        errdefer plan.deinit(self.allocator);
+        if (strings.len == 0) return plan;
+        const existing_view = try self.sst();
+        if (existing_view) |view| {
+            plan.sst_part_exists = true;
+            plan.base_index = @intCast(view.entries.len);
+        }
+        var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer decode_arena.deinit();
+        const da = decode_arena.allocator();
+        var decoded_existing: [][]const u8 = &.{};
+        var is_rich_existing: []bool = &.{};
+        if (existing_view) |view| {
+            decoded_existing = try da.alloc([]const u8, view.entries.len);
+            is_rich_existing = try da.alloc(bool, view.entries.len);
+            for (view.entries, 0..) |e, i| switch (e) {
+                .plain => |t| {
+                    decoded_existing[i] = try sst_xml_mod.decodeText(da, t);
+                    is_rich_existing[i] = false;
+                },
+                .rich => {
+                    decoded_existing[i] = "";
+                    is_rich_existing[i] = true;
+                },
+            };
+        }
+        for (strings) |s| try registerSharedString(self, &plan, s, decoded_existing, is_rich_existing);
+        plan.has_new_strings = plan.new_strings.items.len > 0;
+        if (existing_view != null) {
+            for (strings) |s| try registerExistingMatch(self, &plan, s, decoded_existing, is_rich_existing);
+        }
+        return plan;
     }
 
     /// S7b: dry-run the defined-name sweep this edit will run
@@ -6434,7 +7848,7 @@ pub const Workbook = struct {
     /// midway leaves every part as it was. Byte-identical rewrites (the
     /// pivot sits below / right of the edit, the source is elsewhere)
     /// are not installed, so the SHA-256 passthrough holds for them.
-    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec, prepared: ?*PreparedPivotEdits) Error!void {
+    fn applyPivotEditsForSheet(self: *Workbook, sheet_part_name: []const u8, spec: SheetEditSpec, p: *PreparedPivotEdits) Error!void {
         const idx_1based = spec.row orelse spec.col.?;
         std.debug.assert(idx_1based >= 1);
         const axis: pivots_mod.edit.Axis = if (spec.row != null) .row else .col;
@@ -6442,24 +7856,14 @@ pub const Workbook = struct {
             .insert => .insert,
             .delete => .delete,
         };
-        if (prepared) |p| {
-            // The pre-flight's own collection, for this very edit, on
-            // this workbook, over this store as it was: anything else
-            // is a token for another edit (Codex #205 r6 REL-605).
-            const same = p.owner == self and p.mutations == self.store.mutations and
-                std.mem.eql(u8, p.sheet_part_name, sheet_part_name) and
-                p.axis == axis and p.idx_1based == idx_1based and p.kind == kind;
-            if (!same) return error.PivotEditUnsafe;
-            if (p.patches.items.len > 0) try self.store.replaceParts(p.patches.items);
-            return;
-        }
-        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
-        defer {
-            for (patches.items) |it| self.allocator.free(it.bytes);
-            patches.deinit(self.allocator);
-        }
-        try self.collectPivotEditsForSheet(sheet_part_name, axis, idx_1based, kind, &patches);
-        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
+        // The pre-flight's own collection, for this very edit, on
+        // this workbook, over this store as it was: anything else
+        // is a token for another edit (Codex #205 r6 REL-605).
+        const same = p.owner == self and p.mutations == self.store.mutations and p.staged_writes == self.staged_writes and
+            std.mem.eql(u8, p.sheet_part_name, sheet_part_name) and
+            p.axis == axis and p.idx_1based == idx_1based and p.kind == kind;
+        if (!same) return error.PivotEditUnsafe;
+        if (p.patches.items.len > 0) try self.store.replaceParts(p.patches.items);
     }
 
     /// S7b-4: rebuild one cache whose source content a row edit
@@ -6489,10 +7893,36 @@ pub const Workbook = struct {
         const src = rebuild orelse return error.PivotEditUnsafe;
         // A column edit inside a rectangle refuses before this; only a
         // row edit changes a rectangle's content.
-        if (axis != .row or src.header_rows > 1) return error.PivotEditUnsafe;
+        if (axis != .row) return error.PivotEditUnsafe;
+        // The counts are the part's own: checked before any
+        // arithmetic on them (Codex #206 r2 SEC-201).
+        const geo = try sourceGeometry(c, src);
         // The header row is the field names: its delete is the table
         // rewriter's refusal, reached first here on the Editor's path.
-        if (kind == .delete and idx_1based < src.rect.tl_row + src.header_rows) return error.PivotEditUnsafe;
+        if (kind == .delete and idx_1based < geo.first_data_row) return error.PivotEditUnsafe;
+        // A delete on a table's totals row is not a data edit.
+        if (kind == .delete and idx_1based > geo.read_rect.br_row) return error.PivotEditUnsafe;
+        const eng = pivots_mod.engine;
+        const data = try self.sourceDataRows(arena, c, src, sheet_idx, false);
+        const after = eng.rowsAfterEdit(arena, data, geo.width, geo.first_data_row, idx_1based, kind) catch |e| return mapEngineError(e);
+        return self.rebuildFromRows(arena, c, after);
+    }
+
+    /// A source rectangle's checked geometry: its width is the field
+    /// schema, its header and totals rows (the part's own counts,
+    /// added with a check) leave a data row, its area is within the
+    /// read budget, a headerless table's column names are the field
+    /// names. Every later expression on the counts uses these.
+    const SourceGeometry = struct {
+        width: usize,
+        /// The rectangle read: `rect` less its totals rows.
+        read_rect: pivots_mod.edit.Rect,
+        /// The sheet row of the first data row.
+        first_data_row: u32,
+    };
+
+    fn sourceGeometry(c: *const pivots_mod.PivotCache, src: pivots_mod.edit.RebuildSource) Error!SourceGeometry {
+        if (src.header_rows > 1) return error.PivotEditUnsafe;
         const eng = pivots_mod.engine;
         // Before any read: the rectangle's width is the field schema
         // (a disagreement is S7c's column edit), and its area is
@@ -6509,8 +7939,6 @@ pub const Workbook = struct {
         const skip = std.math.add(u32, src.header_rows, src.totals_rows) catch return error.PivotEditUnsafe;
         const height: usize = src.rect.br_row - src.rect.tl_row + 1;
         if (skip >= height) return error.PivotEditUnsafe;
-        const read_rect: pivots_mod.edit.Rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows };
-        if (kind == .delete and idx_1based > read_rect.br_row) return error.PivotEditUnsafe;
         const area = std.math.mul(usize, width, height - src.totals_rows) catch return error.PivotEditUnsafe;
         if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
         // A headerless table's field names are its `<tableColumn>`
@@ -6520,21 +7948,54 @@ pub const Workbook = struct {
             if (src.columns.len != c.field_names.len) return error.PivotEditUnsafe;
             for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
         }
-        self.pivot_rebuilds +|= 1;
-        const all = try self.readPivotSourceRows(arena, sheet_idx, read_rect);
-        if (src.header_rows == 1) {
-            for (all[0], c.field_names) |v, name| switch (v) {
-                .string => |s| if (!std.mem.eql(u8, s, name)) return error.PivotEditUnsafe,
-                .number, .blank => return error.PivotEditUnsafe,
-            };
-        }
-        const data = all[src.header_rows..];
-        const after = eng.rowsAfterEdit(arena, data, width, src.rect.tl_row + src.header_rows, idx_1based, kind) catch |e| return mapEngineError(e);
+        return .{
+            .width = width,
+            .read_rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows },
+            .first_data_row = src.rect.tl_row + src.header_rows,
+        };
+    }
+
+    /// S7b-5 (§7 Q3): the same rebuild for a save with staged cell
+    /// writes — the source read as the sheet will be once the writes
+    /// land, no row to insert or drop. Null for a source with no
+    /// rectangle to read (the save marks it instead).
+    fn rebuildPivotCacheFromWrites(self: *Workbook, arena: Allocator, c: *const pivots_mod.PivotCache) Error!?pivots_mod.engine.Rebuild {
+        const src = pivots_mod.edit.rebuildSourceOf(c) orelse return null;
+        const local = c.resolution.sheet;
+        const data = try self.sourceDataRows(arena, c, src, local.sheet_idx, true);
+        return try self.rebuildFromRows(arena, c, data);
+    }
+
+    fn rebuildFromRows(self: *Workbook, arena: Allocator, c: *const pivots_mod.PivotCache, rows: []const pivots_mod.engine.Row) Error!pivots_mod.engine.Rebuild {
         const records_xml: ?[]const u8 = if (c.records_part_name) |n|
             ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
         else
             null;
-        return eng.rebuild(arena, c, after, records_xml, try self.nowInstant(arena)) catch |e| return mapEngineError(e);
+        return pivots_mod.engine.rebuild(arena, c, rows, records_xml, try self.nowInstant(arena)) catch |e| return mapEngineError(e);
+    }
+
+    /// The source rectangle's data rows — the rectangle checked against
+    /// the cache's schema and the read budget, read (with the staged
+    /// writes laid over it when `with_writes`), the header row checked
+    /// to spell the field names, the header and totals rows dropped.
+    fn sourceDataRows(
+        self: *Workbook,
+        arena: Allocator,
+        c: *const pivots_mod.PivotCache,
+        src: pivots_mod.edit.RebuildSource,
+        sheet_idx: u32,
+        with_writes: bool,
+    ) Error![]const pivots_mod.engine.Row {
+        const geo = try sourceGeometry(c, src);
+        self.pivot_rebuilds +|= 1;
+        const all = try self.readPivotSourceRows(arena, sheet_idx, geo.read_rect, with_writes);
+        if (src.header_rows == 1) {
+            for (all[0], c.field_names) |v, name| switch (v) {
+                .string => |str| if (!std.mem.eql(u8, str, name)) return error.PivotEditUnsafe,
+                .number, .blank => return error.PivotEditUnsafe,
+            };
+        }
+        return all[src.header_rows..];
     }
 
     fn mapEngineError(e: pivots_mod.engine.RebuildError) Error {
@@ -6555,7 +8016,7 @@ pub const Workbook = struct {
     /// grammar refuses cannot be told from one) — a boolean, an error,
     /// a formula without a cached value, an inline string (the typed
     /// view keeps its first `<t>` only, which is not a rich one whole).
-    fn readPivotSourceRows(self: *Workbook, arena: Allocator, sheet_idx: u32, rect: pivots_mod.edit.Rect) Error![]const pivots_mod.engine.Row {
+    fn readPivotSourceRows(self: *Workbook, arena: Allocator, sheet_idx: u32, rect: pivots_mod.edit.Rect, with_writes: bool) Error![]const pivots_mod.engine.Row {
         const eng = pivots_mod.engine;
         const ws = try self.sheet(sheet_idx);
         const view = try ws.ensureParsed();
@@ -6576,6 +8037,7 @@ pub const Workbook = struct {
         const seen_cell = try arena.alloc(?[]bool, height);
         @memset(seen_cell, null);
         var date_styles: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+        var styles_in_rect: std.AutoHashMapUnmanaged(CellRef, ?u32) = .empty;
         // A row or cell without its `r` is one the typed view could not
         // place, and the rectangle cannot be read around it (Codex #205
         // r1 REL-103).
@@ -6607,12 +8069,98 @@ pub const Workbook = struct {
                 const ci = col - rect.tl_col;
                 if (seen_cell[gi].?[ci]) return error.MalformedSheetXml;
                 seen_cell[gi].?[ci] = true;
-                grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
+                // A cell a staged write replaces is read as the write,
+                // not as what it was (Codex #206 r5 REL-502): its
+                // style still counts, for a number's date check.
+                const replaced = with_writes and ws.deltas.contains(.{ .row = row.row_idx, .col = col });
+                if (with_writes) try styles_in_rect.put(arena, .{ .row = row.row_idx, .col = col }, cell.style_idx);
+                if (!replaced) grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
             }
         }
+        if (with_writes) try self.overlayStagedWrites(arena, ws, rect, grid, blank_row, &styles_in_rect, &date_styles);
         const rows = try arena.alloc(eng.Row, height);
         for (rows, grid) |*r, g| r.* = g;
         return rows;
+    }
+
+    /// S7b-5: the staged writes of `ws` laid over the rectangle read
+    /// from its part — a `setCell` delta at its coordinates, an
+    /// appended row where the emitter will place it — so a save
+    /// rebuilds from the sheet as it is about to be. A number under a
+    /// date style (the cell's own, or style 0 for a new cell in a
+    /// workbook with styles) refuses as the part read does; a boolean
+    /// or a formula (no cached value) refuses; a deleted or blank
+    /// write is a blank.
+    fn overlayStagedWrites(
+        self: *Workbook,
+        arena: Allocator,
+        ws: *Worksheet,
+        rect: pivots_mod.edit.Rect,
+        grid: [][]pivots_mod.engine.Value,
+        blank_row: []pivots_mod.engine.Value,
+        styles_in_rect: *std.AutoHashMapUnmanaged(CellRef, ?u32),
+        date_styles: *std.AutoHashMapUnmanaged(u32, bool),
+    ) Error!void {
+        const eng = pivots_mod.engine;
+        const width: usize = rect.br_col - rect.tl_col + 1;
+        const Put = struct {
+            fn slot(a: Allocator, g: [][]eng.Value, blank: []eng.Value, w: usize, gi: usize, ci: usize) Error!*eng.Value {
+                if (g[gi].ptr == blank.ptr) {
+                    const own = try a.alloc(eng.Value, w);
+                    @memset(own, .blank);
+                    g[gi] = own;
+                }
+                return &g[gi][ci];
+            }
+        };
+        var it = ws.deltas.iterator();
+        while (it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (ref.row < rect.tl_row or ref.row > rect.br_row or ref.col < rect.tl_col or ref.col > rect.br_col) continue;
+            const slot = try Put.slot(arena, grid, blank_row, width, ref.row - rect.tl_row, ref.col - rect.tl_col);
+            slot.* = switch (entry.value_ptr.*) {
+                .blank, .deleted => .blank,
+                .string, .shared_string => |txt| .{ .string = txt },
+                .number => |x| blk: {
+                    if (!std.math.isFinite(x)) return error.PivotEditUnsafe;
+                    const style: ?u32 = (styles_in_rect.get(ref) orelse null) orelse if ((try self.styles()) != null) @as(?u32, 0) else null;
+                    if (style) |st| if (try self.styleDescribesDate(arena, st, date_styles)) return error.PivotEditUnsafe;
+                    break :blk .{ .number = try std.fmt.allocPrint(arena, "{d}", .{x}) };
+                },
+                .boolean, .formula => return error.PivotEditUnsafe,
+            };
+        }
+        if (ws.appended_rows.items.len == 0) return;
+        const part_name = try ws.resolvePartName();
+        const part = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+        const start_row: u64 = @as(u64, appendXmlFindHighestRow(part.bytes)) + 1;
+        const style0: ?u32 = if ((try self.styles()) != null) @as(?u32, 0) else null;
+        for (ws.appended_rows.items, 0..) |cells, ri| {
+            const row64 = start_row + ri;
+            if (row64 > zlsx.max_row) break;
+            const row: u32 = @intCast(row64);
+            if (row < rect.tl_row or row > rect.br_row) continue;
+            for (cells, 1..) |cell, col| {
+                if (col > zlsx.max_col_1based) break;
+                if (col < rect.tl_col or col > rect.br_col) continue;
+                const slot = try Put.slot(arena, grid, blank_row, width, row - rect.tl_row, @as(u32, @intCast(col)) - rect.tl_col);
+                // An appended number wears style 0 — an integer as
+                // much as a float (Codex #206 r4 REL-403).
+                if (cell == .integer or cell == .number) {
+                    if (style0) |st| if (try self.styleDescribesDate(arena, st, date_styles)) return error.PivotEditUnsafe;
+                }
+                slot.* = switch (cell) {
+                    .empty => .blank,
+                    .string => |txt| .{ .string = txt },
+                    .integer => |n| .{ .number = try std.fmt.allocPrint(arena, "{d}", .{n}) },
+                    .number => |x| blk: {
+                        if (!std.math.isFinite(x)) return error.PivotEditUnsafe;
+                        break :blk .{ .number = try std.fmt.allocPrint(arena, "{d}", .{x}) };
+                    },
+                    .boolean => return error.PivotEditUnsafe,
+                };
+            }
+        }
     }
 
     fn pivotSourceValue(
@@ -6814,7 +8362,7 @@ pub const Workbook = struct {
     /// the snapshot it would have flagged is the state the file was
     /// already in, and a save is not where an edit the editor admitted
     /// is refused.
-    fn markPivotCachesForCellWrites(self: *Workbook) Error!void {
+    fn refreshPivotCachesForCellWrites(self: *Workbook) Error!void {
         var any_writes = false;
         for (self.worksheets) |*ws| {
             if (ws.deltas.count() > 0 or ws.appended_rows.items.len > 0) {
@@ -6823,10 +8371,18 @@ pub const Workbook = struct {
             }
         }
         if (!any_writes) return;
-        if (!(try self.carriesPivotCache())) return;
+        // The graph is read best-effort at save: a part that cannot be
+        // read — malformed, a corrupt entry, one past the decompression
+        // caps — marks nothing and the save proceeds; only a resource
+        // failure is the save's (Codex #206 r6 REL-603).
+        const carries = self.carriesPivotCache() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        if (!carries) return;
         var p = self.pivotTables() catch |e| switch (e) {
-            error.MalformedPivotXml => return,
-            else => |other| return other,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
         };
         defer p.deinit();
         if (p.caches.len == 0) return;
@@ -6838,23 +8394,286 @@ pub const Workbook = struct {
         for (self.worksheets) |*ws| {
             if (ws.deltas.count() == 0 and ws.appended_rows.items.len == 0) continue;
             for (p.caches, affected) |*c, *hit| {
-                if (hit.* or pivots_mod.edit.markerSet(&c.definition)) continue;
+                if (hit.*) continue;
                 hit.* = try self.sheetWritesChangeCache(ws, c);
             }
         }
 
+        // S7b-5: each affected cache rebuilt from the sheet as it is
+        // about to be, its consumers re-laid, their cells planned —
+        // where the shape allows; the marker either way. A refusal
+        // here is not a refusal of the save (the write was admitted
+        // at `setCell`): that cache takes the marker alone, as S7b-3
+        // left it, and Excel's refresh at open lays it out.
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer {
             for (patches.items) |it| a.free(it.bytes);
             patches.deinit(a);
         }
-        for (p.caches, affected) |*c, hit| {
+        var host_writes: std.ArrayListUnmanaged(PivotHostWrite) = .empty;
+        defer host_writes.deinit(a);
+        // Per cache, all or nothing: the rebuilt definition and
+        // records go in only with every consumer's part and cells;
+        // a cache with one consumer the slice cannot lay out takes
+        // the marker alone, whole (Codex #206 r1 REL-101). Only a
+        // resource failure is the save's.
+        const stagings = try arena.alloc(?StagedRefresh, p.caches.len);
+        @memset(stagings, null);
+        for (p.caches, affected, 0..) |*c, hit, ci| {
             if (!hit) continue;
-            const out = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+            stagings[ci] = self.stageCacheRefresh(arena, &p, ci, c) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+        }
+        // A pivot whose source is another pivot's rectangle reads the
+        // cells written here (Codex #206 r9 REL-901): such a cache is
+        // marked in the same install, and a rebuild it had staged is
+        // dropped, since it read those cells before they were written.
+        // Which stagings stand is decided over the writer → reader
+        // graph among them (r12 REL-1202): a staging nobody standing
+        // writes into is kept, its readers are dropped — which
+        // withdraws their writes — until nothing moves; what remains
+        // is a cycle, all of it dropped.
+        const n = p.caches.len;
+        const identity = HostRowMap.forEdit(false, .row, 1, .insert);
+        // The list is the part's own; its square is checked (Codex
+        // #206 r15 SEC-1502).
+        const edge_count = std.math.mul(usize, n, n) catch return error.OutOfMemory;
+        const edges = try arena.alloc(bool, edge_count);
+        @memset(edges, false);
+        for (stagings, 0..) |st_opt, i| {
+            const st = st_opt orelse continue;
+            for (p.caches, 0..) |*c, j| {
+                var hit = false;
+                for (st.host_writes) |hw| for (hw.cells) |cell| {
+                    if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, identity)) hit = true;
+                };
+                edges[i * n + j] = hit;
+            }
+        }
+        const candidate = try arena.alloc(bool, n);
+        for (stagings, candidate) |st, *cand| cand.* = st != null;
+        const kept = try peelStagings(arena, edges, candidate, n);
+        const downstream = try arena.alloc(bool, n);
+        @memset(downstream, false);
+        for (0..n) |i| {
+            if (!kept[i]) stagings[i] = null;
+        }
+        for (0..n) |i| {
+            if (!kept[i]) continue;
+            for (0..n) |j| if (edges[i * n + j]) {
+                downstream[j] = true;
+            };
+        }
+        for (p.caches, 0..) |*c, ci| {
+            if (!affected[ci] and !downstream[ci]) continue;
+            var splices: std.ArrayListUnmanaged(pivots_mod.edit.Splice) = .empty;
+            if (pivots_mod.edit.markerSplice(c.raw_xml, &c.definition)) |sp| try splices.append(arena, sp);
+            if (stagings[ci]) |st| {
+                try splices.appendSlice(arena, st.splices);
+                if (st.records) |bytes| {
+                    const dup = try a.dupe(u8, bytes);
+                    errdefer a.free(dup);
+                    try patches.append(a, .{ .name = c.records_part_name.?, .bytes = dup });
+                }
+                for (st.tables) |tb| {
+                    const dup = try a.dupe(u8, tb.bytes);
+                    errdefer a.free(dup);
+                    try patches.append(a, .{ .name = tb.part_name, .bytes = dup });
+                }
+                try host_writes.appendSlice(a, st.host_writes);
+            }
+            if (splices.items.len == 0) continue;
+            const out = pivots_mod.edit.spliceAll(a, c.raw_xml, splices.items) catch |e| return mapPivotEditError(e);
             errdefer a.free(out);
             try patches.append(a, .{ .name = c.part_name, .bytes = out });
         }
-        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
+        // Every host part rendered before anything is installed. A
+        // host that cannot be rendered sends every cache back to the
+        // marker alone (Codex #206 r1 REL-102).
+        var rendered: ?RenderedHostWrites = if (host_writes.items.len > 0)
+            self.renderPivotHostWrites(host_writes.items) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            }
+        else
+            null;
+        defer if (rendered) |*r| r.deinit(a);
+        if (rendered == null and host_writes.items.len > 0) {
+            for (patches.items) |it| a.free(it.bytes);
+            patches.clearRetainingCapacity();
+            for (p.caches, affected, downstream) |*c, hit, down| {
+                if (!hit and !down) continue;
+                const out = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+                errdefer a.free(out);
+                try patches.append(a, .{ .name = c.part_name, .bytes = out });
+            }
+        }
+        if (rendered) |*r| {
+            try self.installPivotHostWrites(r, patches.items);
+        } else if (patches.items.len > 0) {
+            try self.store.replaceParts(patches.items);
+        }
+    }
+
+    /// Which of the candidate stagings stand, over the writer → reader
+    /// edges among caches (`edges[i * n + j]`: `i`'s host cells land
+    /// in `j`'s source). Rounds: a candidate no undecided or kept
+    /// candidate writes into is kept; then every undecided candidate
+    /// a kept one writes into is dropped; a round that moves nothing
+    /// leaves cycles, all dropped. Pure, so a test can pin it.
+    fn peelStagings(arena: Allocator, edges: []const bool, candidate: []const bool, n: usize) Error![]bool {
+        const State = enum { undecided, kept, dropped };
+        const state = try arena.alloc(State, n);
+        for (candidate, state) |c, *st| st.* = if (c) .undecided else .dropped;
+        // A pivot writing into its own source is a cycle of one: its
+        // rebuild read the cells its layout overwrites (Codex #206 r13
+        // REL-1301).
+        for (0..n) |i| if (edges[i * n + i]) {
+            state[i] = .dropped;
+        };
+        while (true) {
+            var moved = false;
+            var undecided = false;
+            for (0..n) |j| {
+                if (state[j] != .undecided) continue;
+                undecided = true;
+                var incoming = false;
+                for (0..n) |i| {
+                    if (i == j or !edges[i * n + j]) continue;
+                    if (state[i] != .dropped) incoming = true;
+                }
+                if (!incoming) {
+                    state[j] = .kept;
+                    moved = true;
+                }
+            }
+            for (0..n) |j| {
+                if (state[j] != .undecided) continue;
+                var from_kept = false;
+                for (0..n) |i| {
+                    if (i != j and edges[i * n + j] and state[i] == .kept) from_kept = true;
+                }
+                if (from_kept) {
+                    state[j] = .dropped;
+                    moved = true;
+                }
+            }
+            if (!undecided) break;
+            if (!moved) {
+                // Nothing peels: every undecided node has an undecided
+                // predecessor, so a cycle sits among them. Only the
+                // nodes ON a cycle fall — one that merely reads from
+                // a cycle stands once the cycle's writes are withdrawn
+                // (Codex #206 r23 REL-2303).
+                // Judged all before any falls: a node dropped mid-pass
+                // would hide the cycle from the next one.
+                const cyclic = try arena.alloc(bool, n);
+                @memset(cyclic, false);
+                var any_cyclic = false;
+                for (0..n) |j| {
+                    if (state[j] != .undecided) continue;
+                    cyclic[j] = try reachesItself(arena, edges, state, n, j);
+                    if (cyclic[j]) any_cyclic = true;
+                }
+                for (0..n) |j| if (cyclic[j]) {
+                    state[j] = .dropped;
+                };
+                if (!any_cyclic) {
+                    for (state) |*st| if (st.* == .undecided) {
+                        st.* = .dropped;
+                    };
+                    break;
+                }
+            }
+        }
+        const kept = try arena.alloc(bool, n);
+        for (state, kept) |st, *k| k.* = st == .kept;
+        return kept;
+    }
+
+    /// Does `j` reach itself through undecided nodes? A walk over the
+    /// edge matrix — `n` is the cache count — on arena scratch, so a
+    /// list of any length walks (Codex #206 r24 REL-2402).
+    fn reachesItself(arena: Allocator, edges: []const bool, state: anytype, n: usize, j: usize) Error!bool {
+        const visited = try arena.alloc(bool, n);
+        @memset(visited, false);
+        const stack = try arena.alloc(usize, n);
+        var top: usize = 0;
+        for (0..n) |k| {
+            if (k != j and edges[j * n + k] and state[k] == .undecided and !visited[k]) {
+                visited[k] = true;
+                stack[top] = k;
+                top += 1;
+            }
+        }
+        while (top > 0) {
+            top -= 1;
+            const x = stack[top];
+            if (edges[x * n + j]) return true;
+            for (0..n) |k| {
+                if (k != x and edges[x * n + k] and state[k] == .undecided and !visited[k]) {
+                    visited[k] = true;
+                    stack[top] = k;
+                    top += 1;
+                }
+            }
+        }
+        return false;
+    }
+
+    const StagedRefresh = struct {
+        splices: []const pivots_mod.edit.Splice,
+        records: ?[]const u8,
+        tables: []const TablePatch,
+        host_writes: []const PivotHostWrite,
+        const TablePatch = struct { part_name: []const u8, bytes: []const u8 };
+    };
+
+    /// One cache's refresh at save, staged whole: the rebuild, and
+    /// every consumer's part and cells. Any part of it the slice
+    /// cannot do fails the whole — the caller then marks alone.
+    fn stageCacheRefresh(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize, c: *const pivots_mod.PivotCache) Error!StagedRefresh {
+        const rb = (try self.rebuildPivotCacheFromWrites(arena, c)) orelse return error.PivotEditUnsafe;
+        var tables: std.ArrayListUnmanaged(StagedRefresh.TablePatch) = .empty;
+        var host_writes: std.ArrayListUnmanaged(PivotHostWrite) = .empty;
+        for (p.tables, 0..) |t, i| {
+            if (t.cache != ci) continue;
+            if (try consumerSeenBefore(p, i)) continue;
+            const write = try self.planConsumerForSave(arena, p, i, c, &rb);
+            if (!std.mem.eql(u8, write.table_xml, t.raw_xml)) try tables.append(arena, .{ .part_name = t.part_name, .bytes = write.table_xml });
+            try host_writes.append(arena, write.host);
+        }
+        return .{ .splices = rb.splices, .records = rb.records, .tables = tables.items, .host_writes = host_writes.items };
+    }
+
+    const ConsumerWrite = struct { table_xml: []const u8, host: PivotHostWrite };
+
+    /// One consumer of a rebuilt cache at save. Refuses
+    /// (`PivotEditUnsafe`) what the slice leaves to the marker — a
+    /// host with staged appends (the emitter places them after the
+    /// sheet's last row, which a grown rectangle may have moved), a
+    /// form the layout refuses, a rectangle that would grow over a
+    /// cell or a merge.
+    fn planConsumerForSave(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, i: usize, c: *const pivots_mod.PivotCache, rb: *const pivots_mod.engine.Rebuild) Error!ConsumerWrite {
+        const t = p.tables[i];
+        const host = try self.sheet(t.sheet_idx);
+        if (host.appended_rows.items.len > 0) return error.PivotEditUnsafe;
+        const map = HostRowMap.forEdit(false, .row, 1, .insert);
+        var grid = try self.readHostGrid(arena, t.sheet_idx, map, true);
+        defer grid.deinit(arena);
+        const merges = try self.hostMerges(arena, t.sheet_idx, map);
+        const captions = try self.hostCaptions(arena, t.raw_xml, c, &grid);
+        const lay = pivots_mod.engine.layout(arena, t.raw_xml, c, rb, captions) catch |e| return mapEngineError(e);
+        const none = try arena.alloc(?[]const u8, p.tables.len);
+        @memset(none, null);
+        try self.refuseOverOtherPivots(arena, p, i, lay.rect, none);
+        const write = try planHostWriteCells(arena, t, lay, &grid, merges);
+        return .{ .table_xml = lay.table_xml, .host = write };
     }
 
     /// Does any staged write on `ws` land where cache `c` reads? Deltas
@@ -8376,6 +10195,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
             existing_part.bytes,
             plan.new_strings.items,
             plan.new_rich_strings.items,
+            plan.base_index,
         );
         defer wb.allocator.free(new_xml);
         try wb.store.replacePart("xl/sharedStrings.xml", new_xml);
@@ -8416,28 +10236,33 @@ fn emitSstXmlForExtension(
     src_xml: []const u8,
     new_strings: []const []const u8,
     new_rich: []const RichEntry,
+    existing_si_count: u32,
 ) Error![]u8 {
     assert(src_xml.len > 0);
     assert(new_strings.len > 0 or new_rich.len > 0);
 
-    // Locate `<sst …>` opening tag.
-    const sst_open = std.mem.indexOf(u8, src_xml, "<sst") orelse
-        return error.MalformedXml;
-    const sst_open_gt = std.mem.indexOfScalarPos(u8, src_xml, sst_open, '>') orelse
-        return error.MalformedXml;
-    const is_self_closing = sst_open_gt > 0 and src_xml[sst_open_gt - 1] == '/';
-
-    // Existing si count: parse uniqueCount attribute when present;
-    // otherwise count `<si` opens in the body.
-    const existing_si_count: u32 = blk: {
-        const attrs = src_xml[sst_open .. sst_open_gt + 1];
-        if (extractAttrValue(attrs, "uniqueCount")) |raw| {
-            if (std.fmt.parseInt(u32, raw, 10)) |n| break :blk n else |_| {}
-        }
-        break :blk countSiOpens(src_xml);
+    // The root by the markup walk — a comment, CDATA section or
+    // processing instruction may spell one, and a `>` inside a quoted
+    // attribute is not the tag's end (Codex #206 r15 SEC-1506).
+    // The one document element, `<sst>`, its close the one that
+    // closes it (Codex #206 r21 SEC-2104): a table wrapped in another
+    // element, or one beside a decoy, refuses.
+    const doc = Workbook.scanDocument(src_xml, "sst", "extLst") catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedXml,
     };
-    const new_si_count: u32 = @intCast(new_strings.len + new_rich.len);
-    const total_si: u32 = existing_si_count + new_si_count;
+    const sst_tag = doc.root;
+    const sst_open = sst_tag.start;
+    const sst_open_gt = sst_tag.after_open - 1;
+    const is_self_closing = src_xml[sst_open_gt - 1] == '/';
+    try checkSstEntryPlacement(src_xml, existing_si_count);
+
+    // `existing_si_count` is the parsed table's entry count — what
+    // the new indices continue from — never the part's own
+    // `uniqueCount`, which may lie. Added with a check (r3 SEC-301).
+    const new_total = std.math.add(usize, new_strings.len, new_rich.len) catch return error.MalformedXml;
+    const new_si_count = std.math.cast(u32, new_total) orelse return error.MalformedXml;
+    const total_si = std.math.add(u32, existing_si_count, new_si_count) catch return error.MalformedXml;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -8449,8 +10274,10 @@ fn emitSstXmlForExtension(
     try out.appendSlice(allocator, src_xml[0 .. sst_open + "<sst".len]);
 
     // Walk the original attribute blob, replacing count/uniqueCount.
+    // A self-closing root's `/` is not an attribute (Codex #206 r25
+    // REL-2501): the blob ends before it.
     const attr_start = sst_open + "<sst".len;
-    const attr_end = sst_open_gt; // index of `>` (or `/>` slash)
+    const attr_end = if (is_self_closing) sst_open_gt - 1 else sst_open_gt;
     try writePatchedSstAttrs(
         allocator,
         &out,
@@ -8480,16 +10307,62 @@ fn emitSstXmlForExtension(
         return try out.toOwnedSlice(allocator);
     }
 
-    // Normal form: copy body verbatim up to `</sst>`, then append
+    // Normal form: copy body verbatim up to the root's close — found
+    // by the walk, past any spelling of it in a comment — then append
     // new entries (plain then rich), then `</sst>` + trailing.
     const body_start = sst_open_gt + 1;
-    const close = std.mem.indexOfPos(u8, src_xml, body_start, "</sst>") orelse
-        return error.MalformedXml;
+    // New entries go before a trailing `<extLst>` — `CT_Sst` orders
+    // its entries before the extension list (Codex #206 r24
+    // REL-2401) — else before the root's close.
+    const close = if (doc.child) |ext| ext.start else doc.root_close_lt;
     try out.appendSlice(allocator, src_xml[body_start..close]);
     try appendNewSiEntries(allocator, &out, new_strings);
     try appendNewRichSiEntries(allocator, &out, new_rich);
     try out.appendSlice(allocator, src_xml[close..]);
     return try out.toOwnedSlice(allocator);
+}
+
+/// The table's entries are the root's direct `<si>` children before
+/// its trailing `<extLst>`, `expected` of them — the count the view
+/// parsed and the cells index by. An `<si>` nested under another
+/// element or written after the extension list is counted by the
+/// view but not by Excel, and the entries appended before it would
+/// take the numbers the cells expect of it (Codex #206 r30
+/// SEC-3001); a root inside the root is the same disagreement (r17
+/// SEC-1701).
+fn checkSstEntryPlacement(src_xml: []const u8, expected: u32) Error!void {
+    const doc = Workbook.scanDocument(src_xml, "sst", "extLst") catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedXml,
+    };
+    const gt = doc.root.after_open - 1;
+    if (src_xml[gt - 1] == '/') {
+        if (expected != 0) return error.MalformedXml;
+        return;
+    }
+    const close = if (doc.child) |ext| ext.start else doc.root_close_lt;
+    var depth: usize = 0;
+    var direct: u32 = 0;
+    var pos = doc.root.after_open;
+    while (try Workbook.nextMarkup(src_xml, pos, doc.root_close_lt)) |m| {
+        pos = m.after;
+        switch (m.kind) {
+            .non_element => continue,
+            .close => {
+                if (depth == 0) return error.MalformedXml;
+                depth -= 1;
+                continue;
+            },
+            .open => {},
+        }
+        if (sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
+        if (sheet_edit.matchTagAt(src_xml, m.lt, "si") != null) {
+            if (depth != 0 or m.lt >= close) return error.MalformedXml;
+            direct = std.math.add(u32, direct, 1) catch return error.MalformedXml;
+        }
+        if (src_xml[m.after - 2] != '/') depth += 1;
+    }
+    if (depth != 0 or direct != expected) return error.MalformedXml;
 }
 
 /// Build a complete `xl/sharedStrings.xml` from scratch. Used when
@@ -8675,7 +10548,9 @@ fn writePatchedSstAttrs(
         }
         i = value_end + 1;
     }
-    if (!saw_count) try writeCountAttr(allocator, out, " count", new_count);
+    // `count` is occurrences, optional: absent stays absent — a pivot
+    // render dropped it on purpose the same save (Codex #206 r29
+    // REL-2901); `uniqueCount` is the entries and is kept true.
     if (!saw_unique) try writeCountAttr(allocator, out, " uniqueCount", new_count);
 }
 
@@ -8760,7 +10635,9 @@ fn injectSstRelationship(allocator: Allocator, xml: []const u8) Error![]u8 {
         }
         i = num_end + 1;
     }
-    const new_id: u32 = max_id + 1;
+    // A part may spell `rId4294967295`; the next id is not a trap
+    // (Codex #206 r4 SEC-404).
+    const new_id = std.math.add(u32, max_id, 1) catch return error.MalformedXml;
 
     const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse
         return error.MalformedWorkbookRels;
@@ -9225,6 +11102,7 @@ pub const Worksheet = struct {
         };
 
         try self.deltas.put(a, cr, stored);
+        self.workbook.staged_writes +%= 1;
     }
 
     /// Stage a deletion for cell `ref`. After `Workbook.save`, the
@@ -9306,6 +11184,7 @@ pub const Worksheet = struct {
             // Capacity reserved above — appendAssumeCapacity is
             // infallible from here.
             self.appended_rows.appendAssumeCapacity(owned);
+            self.workbook.staged_writes +%= 1;
         }
     }
 
@@ -23579,4 +25458,81 @@ test "Workbook.countRefErrorsOutsideQuotes: a #REF! inside a string literal or a
     try std.testing.expectEqual(@as(usize, 1), count("'It''s #REF!'!#REF!"));
     try std.testing.expectEqual(@as(usize, 2), count("#REF!:#REF!"));
     try std.testing.expectEqual(@as(usize, 0), count("\"a\"\"#REF!\"\"b\""));
+}
+
+test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a lone reader (Codex #206 r12 REL-1202)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A pivot writing into its own source: a cycle of one, dropped.
+    {
+        const kept = try Workbook.peelStagings(arena, &.{true}, &.{true}, 1);
+        try std.testing.expectEqualSlices(bool, &.{false}, kept);
+    }
+    // A(0) → B(2) → C(1): C is visited before B; A and C stand, B falls.
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 2] = true;
+        edges[2 * 3 + 1] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ true, true, false }, kept);
+    }
+    // Three hundred candidates, a cycle among the first two: the
+    // scratch is the arena's, not a fixed array's (r24 REL-2402).
+    {
+        const n: usize = 300;
+        const edges = try arena.alloc(bool, n * n);
+        @memset(edges, false);
+        edges[0 * n + 1] = true;
+        edges[1 * n + 0] = true;
+        const cand = try arena.alloc(bool, n);
+        @memset(cand, true);
+        const kept = try Workbook.peelStagings(arena, edges, cand, n);
+        try std.testing.expect(!kept[0] and !kept[1]);
+        for (kept[2..]) |k| try std.testing.expect(k);
+    }
+    // A ↔ B with A → C: the cycle falls, its reader stands once the
+    // cycle's writes are withdrawn (Codex #206 r23 REL-2303).
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 1] = true;
+        edges[1 * 3 + 0] = true;
+        edges[0 * 3 + 2] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ false, false, true }, kept);
+    }
+    // A ↔ B: a cycle, both fall; C beside it stands.
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 1] = true;
+        edges[1 * 3 + 0] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ false, false, true }, kept);
+    }
+    // A → B where B is no candidate: A stands (B is marked by the caller).
+    {
+        var edges = [_]bool{false} ** 4;
+        edges[0 * 2 + 1] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, false }, 2);
+        try std.testing.expectEqualSlices(bool, &.{ true, false }, kept);
+    }
+}
+
+test "S7b-5: extending a self-closing shared-string root opens it whole — no slash left among the attributes (Codex #206 r25 REL-2501)" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"0\" uniqueCount=\"0\"/>",
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" />",
+        "<?xml version=\"1.0\"?>\n<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>",
+    };
+    for (cases) |src| {
+        const out = try emitSstXmlForExtension(a, src, &.{"x"}, &.{}, 0);
+        defer a.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "/ ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "<sst/") == null);
+        try std.testing.expect(std.mem.endsWith(u8, out, "<si><t>x</t></si></sst>"));
+        const doc = try Workbook.scanDocument(out, "sst", "si");
+        try std.testing.expect(doc.child != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "uniqueCount=\"1\"") != null);
+    }
 }
