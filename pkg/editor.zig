@@ -9567,3 +9567,41 @@ test "S7b-5: a host that aliases or rebinds the main namespace refuses the edit 
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: a sheetData or dimension nested under another element is not the root's — the edit refuses, the save marks alone (Codex #206 r20 SEC-2001)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r20_dst.xlsx");
+    defer a.free(dst);
+    const Case = struct { name: []const u8, before: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "nested_sheet_data", .before = "<foo><sheetData><row r=\"3\"><c r=\"A3\"/></row></sheetData></foo>" },
+        .{ .name = "nested_dimension", .before = "<foo><dimension ref=\"A1\"/></foo><dimension ref=\"A1\"/>" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r20_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        const patched = try std.mem.concat(a, u8, &.{ case.before, "<sheetData>" });
+        defer a.free(patched);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", patched);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}

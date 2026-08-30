@@ -7015,18 +7015,11 @@ pub const Workbook = struct {
 
         // `<sheetData>` by the walk, not by the first spelling of its
         // name: a comment, CDATA section or processing instruction
-        // may spell any of it (Codex #206 r4 SEC-401).
-        var sd: ?zlsx.TagOpen = null;
+        // may spell any of it (Codex #206 r4 SEC-401) — and the root's
+        // own direct child, not one nested under another element
+        // (r20 SEC-2001).
+        const sd_tag = (try rootChild(src, "sheetData")) orelse return error.NoSheetData;
         var pos: usize = 0;
-        while (try nextMarkup(src, pos, src.len)) |m| {
-            pos = m.after;
-            if (m.kind != .open) continue;
-            if (sheet_edit.matchTagAt(src, m.lt, "sheetData")) |t| {
-                sd = t;
-                break;
-            }
-        }
-        const sd_tag = sd orelse return error.NoSheetData;
         const sd_self_closing = src[sd_tag.after_open - 2] == '/';
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(a);
@@ -7163,6 +7156,36 @@ pub const Workbook = struct {
         if (sd_self_closing) try out.appendSlice(a, "</sheetData>");
         try out.appendSlice(a, src[body_end..]);
         return try out.toOwnedSlice(a);
+    }
+
+    /// The root's direct child named `name`, by a depth-tracked walk
+    /// over the part: null when the root has none; malformed when it
+    /// has two, or when the name appears at any other depth — a
+    /// decoy under another element that a shallower search would
+    /// take for the grid (Codex #206 r20 SEC-2001).
+    fn rootChild(src: []const u8, name: []const u8) Error!?zlsx.TagOpen {
+        var found: ?zlsx.TagOpen = null;
+        var depth: usize = 0;
+        var pos: usize = 0;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            pos = m.after;
+            switch (m.kind) {
+                .non_element => {},
+                .close => {
+                    if (depth == 0) return error.MalformedSheetXml;
+                    depth -= 1;
+                },
+                .open => {
+                    const self_closing = src[m.after - 2] == '/';
+                    if (sheet_edit.matchTagAt(src, m.lt, name)) |t| {
+                        if (depth != 1 or found != null) return error.MalformedSheetXml;
+                        found = t;
+                    }
+                    if (!self_closing) depth += 1;
+                },
+            }
+        }
+        return found;
     }
 
     /// The next markup at or after `pos` and before `end`: a comment,
@@ -7314,18 +7337,9 @@ pub const Workbook = struct {
             try out.appendSlice(a, src);
             return;
         };
-        // The element by the walk (a comment may spell one).
-        var dim: ?zlsx.TagOpen = null;
-        var pos: usize = 0;
-        while (try nextMarkup(src, pos, src.len)) |m| {
-            pos = m.after;
-            if (m.kind != .open) continue;
-            if (sheet_edit.matchTagAt(src, m.lt, "dimension")) |t| {
-                dim = t;
-                break;
-            }
-        }
-        const t = dim orelse {
+        // The element by the walk (a comment may spell one), the
+        // root's own direct child (r20 SEC-2001).
+        const t = (try rootChild(src, "dimension")) orelse {
             try out.appendSlice(a, src);
             return;
         };
