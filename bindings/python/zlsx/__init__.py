@@ -34,7 +34,7 @@ from typing import Iterator, List, Optional, Tuple, Union
 
 from . import _ffi
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 """Python-package version. Tracks the Zig library's major+minor; the patch
 level may drift when the binding ships a Python-only fix."""
 
@@ -71,6 +71,8 @@ __all__ = [
     "Coverage",
     "embeddings",
     "ZlsxFormulaRefusal",
+    "ZlsxRefusal",
+    "pivots",
     "FormulaSpec",
     "RecalcOptions",
     "RecalcReport",
@@ -3056,12 +3058,31 @@ class CensusEntry:
     col: int
 
 
-class ZlsxFormulaRefusal(ZlsxError):
-    """A typed Plane-2 refusal (status -2): the engine refused the run
-    rather than guessing. ``error_name`` is the Zig error name
-    (e.g. ``"FormulaUnsupportedFunction"``); ``cells`` lists the
-    refusing cells as ``(sheet, row, col)`` (row 1-based, col 0-based);
-    ``census`` carries the full entries."""
+class ZlsxRefusal(ZlsxError):
+    """A typed refusal (C status ``ZLSX_REFUSED``, -2): a statement
+    about the workbook, not about the call. zlsx refused rather than
+    guess — an edit that would land inside a pivot's footprint, a sheet
+    name the workbook already has, a table-column name another column
+    holds, the last sheet, a part it cannot read, a pivot graph it
+    cannot read whole. ``error_name`` is
+    the Zig error name (``"RowEditUnsafeForSheet"``,
+    ``"DuplicateSheetName"``, ``"CannotDeleteLastSheet"``, …); the
+    structural vocabulary is listed on :meth:`Editor.insert_row`.
+    Statements about the call (an index off the grid, a sheet, table or
+    column that does not exist, an edit on a sheet with unsaved cell
+    writes) raise a plain :class:`ZlsxError`."""
+
+    def __init__(self, error_name: str, message: Optional[str] = None):
+        super().__init__(message or error_name)
+        self.error_name = error_name
+
+
+class ZlsxFormulaRefusal(ZlsxRefusal):
+    """A typed Plane-2 refusal (status -2) from the formula engine: it
+    refused the run rather than guessing. ``error_name`` is the Zig
+    error name (e.g. ``"FormulaUnsupportedFunction"``); ``cells`` lists
+    the refusing cells as ``(sheet, row, col)`` (row 1-based, col
+    0-based); ``census`` carries the full entries."""
 
     def __init__(
         self,
@@ -3070,8 +3091,7 @@ class ZlsxFormulaRefusal(ZlsxError):
         census: List[CensusEntry],
     ):
         at = f" at {len(cells)} cell(s)" if cells else ""
-        super().__init__(f"{error_name}{at}")
-        self.error_name = error_name
+        super().__init__(error_name, f"{error_name}{at}")
         self.cells = cells
         self.census = census
 
@@ -3293,9 +3313,14 @@ def _decode_census(ptr, n) -> List[CensusEntry]:
     return out
 
 
-def _refusal_from_diag(diag) -> ZlsxFormulaRefusal:
+def _refusal_from_diag(diag) -> ZlsxRefusal:
     # ctypes returns a c_char array field as bytes cut at the first NUL.
     error_name = diag.error_name.decode("utf-8", errors="replace")
+    # A refusal without a plane is the structural vocabulary (S3a) —
+    # the diag carries a name and nothing else; a formula refusal always
+    # names one of the fourteen planes.
+    if diag.plane == _ffi.ZLSX_PLANE_NONE:
+        return ZlsxRefusal(error_name)
     census = _decode_census(diag.census, diag.census_len)
     cells = [(e.sheet, e.row, e.col) for e in census if e.row > 0]
     return ZlsxFormulaRefusal(error_name, cells, census)
@@ -3376,13 +3401,19 @@ def _path_as_ubyte(pbytes):
 
 
 class Editor:
-    """Open an existing xlsx, append rows, save.
+    """Open an existing xlsx; append rows, set cells, insert / delete
+    rows and columns, add / rename / delete sheets, rename table
+    columns, read the pivot graph; save.
 
-    Append-only v1: cell types are ``None`` / ``bool`` / ``int`` /
-    ``float`` / ``str``. Rows are buffered in memory and applied
-    atomically on :meth:`save`. The source workbook must already
-    carry an ``xl/sharedStrings.xml`` part for string appends —
-    workbooks with only inline strings raise ``NoSstInSource``.
+    Cell types are ``None`` / ``bool`` / ``int`` / ``float`` / ``str``.
+    Every mutation is staged in memory and applied atomically on
+    :meth:`save` (or :meth:`save_to_buffer`); untouched parts are
+    byte-preserved. A structural edit carries every cross-part
+    rewriter the Zig editor has (formulas in every dialect, defined
+    names, hyperlinks, DV / CF, merges, panes, autoFilter, tables,
+    drawings, comments, ``<xm:f>`` extensions, pivot locations and
+    sources), and refuses with a :class:`ZlsxRefusal` where it cannot
+    keep the workbook consistent (libzlsx 0.9.0+).
 
     Use as a context manager so the underlying handle is dropped
     deterministically::
@@ -3508,6 +3539,236 @@ class Editor:
         for edit in edits:
             row, col, value = edit
             self.set_cell(sheet_idx, row, col, value)
+
+    # ── Structural edits (S3a) ────────────────────────────────────
+
+    def _require_structural(self, symbol: str) -> None:
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_STRUCTURAL_EDITS:
+            raise RuntimeError(
+                f"loaded libzlsx does not expose {symbol} "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+
+    @staticmethod
+    def _u32(name: str, value) -> int:
+        """Bound an index before ctypes narrows it: ``c_uint32`` wraps
+        modulo 2³², so ``2**32`` would reach the C side as 0 and edit
+        sheet 0 / row 0 unchecked (Codex #207 r1 REL-101). Integers
+        only — ``operator.index``, so ``0.9`` and ``"2"`` are
+        ``TypeError``, never truncated (r3 REL-301); ``bool`` is refused
+        too, an index is not a flag."""
+        import operator
+
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer, not bool")
+        v = operator.index(value)
+        if v < 0 or v > 0xFFFFFFFF:
+            raise ValueError(f"{name} must be in [0, 4294967295], got {value!r}")
+        return v
+
+    def _structural_call(self, symbol: str, fn, *args) -> None:
+        """One zlsx_status_v1 call: ZLSX_REFUSED raises the typed
+        :class:`ZlsxRefusal` from the diag, any other failure a
+        :class:`ZlsxError` named after the error."""
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = fn(*args, ctypes.byref(diag), self._err, _ERR_BUF_LEN)
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"{symbol}: {_decode_err(self._err)}")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+
+    def insert_row(self, sheet_idx: int, before_row: int) -> None:
+        """Insert a blank row before ``before_row`` (1-based) on
+        ``sheet_idx``; every row at or below it shifts down by one and
+        every reference the rewriters know moves in step (a hosted
+        pivot's output rectangle and a cache's source range included;
+        a cache whose source content changes is rebuilt during the edit
+        and committed by :meth:`save`).
+
+        Refusals (:class:`ZlsxRefusal`, ``error_name``):
+
+        * ``RowEditUnsafeForSheet`` — the edit lands inside a hosted
+          pivot's footprint or on a host sheet a pivot also reads
+          from, would collapse a table or delete its header row, or a
+          carrier the scan cannot read is in the way.
+
+        * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
+          1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
+          — a split pane the rewriter does not shift; the carrier
+          verdicts ``MalformedSheetXml``, ``MalformedDrawingXml``,
+          ``MalformedVmlDrawing``, ``MalformedCommentsXml``,
+          ``MalformedTableXml``, ``DrawingCoordinateOverflow``,
+          ``VmlCoordinateOverflow``, ``TableCoordinateOverflow`` — a part
+          the walkers cannot read (or materialise) or move. The full
+          list is §10 of ``docs/plans/c-abi-status-v1.md``; a generic
+          ``MalformedXml`` from a rewriter's consistency guard stays a
+          plain :class:`ZlsxError`.
+
+        Errors (:class:`ZlsxError`): ``SheetIndexOutOfRange``,
+        ``RowIndexOutOfRange`` (0 or past 1048576), and
+        ``RowEditRequiresCleanSheet`` — the sheet has unsaved
+        :meth:`set_cell` / :meth:`append_rows` writes; save first.
+        Indices outside ``[0, 2**32)`` raise ``ValueError`` before the
+        call."""
+        self._require_structural("zlsx_editor_insert_row")
+        self._structural_call(
+            "zlsx_editor_insert_row", _ffi.lib.zlsx_editor_insert_row,
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("before_row", before_row),
+        )
+
+    def delete_row(self, sheet_idx: int, row: int) -> None:
+        """Delete row ``row`` (1-based) on ``sheet_idx``; rows below it
+        shift up by one. Same rewrite coverage and refusal contract as
+        :meth:`insert_row`."""
+        self._require_structural("zlsx_editor_delete_row")
+        self._structural_call(
+            "zlsx_editor_delete_row", _ffi.lib.zlsx_editor_delete_row,
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("row", row),
+        )
+
+    def insert_column(self, sheet_idx: int, before_col: int) -> None:
+        """Insert a blank column before ``before_col`` (0-based, A = 0 —
+        the same spelling as :meth:`set_cell`) on ``sheet_idx``. Same
+        rewrite coverage as :meth:`insert_row`; refuses with
+        ``ColEditUnsafeForSheet``, errors with ``ColumnIndexOutOfRange``
+        / ``ColEditRequiresCleanSheet``."""
+        self._require_structural("zlsx_editor_insert_column")
+        self._structural_call(
+            "zlsx_editor_insert_column", _ffi.lib.zlsx_editor_insert_column,
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("before_col", before_col),
+        )
+
+    def delete_column(self, sheet_idx: int, col: int) -> None:
+        """Delete column ``col`` (0-based, A = 0) on ``sheet_idx``."""
+        self._require_structural("zlsx_editor_delete_column")
+        self._structural_call(
+            "zlsx_editor_delete_column", _ffi.lib.zlsx_editor_delete_column,
+            self._handle, self._u32("sheet_idx", sheet_idx), self._u32("col", col),
+        )
+
+    def add_sheet(self, name: str) -> int:
+        """Append an empty sheet named ``name`` and return its index.
+        The name is judged by the writer's rules (31 scalars, none of
+        ``:\\/?*[]``, not ``History``; ``InvalidSheetName`` as a
+        :class:`ZlsxError`) and against every existing name, ASCII
+        case-insensitively (``DuplicateSheetName`` as a
+        :class:`ZlsxRefusal`)."""
+        self._require_structural("zlsx_editor_add_sheet")
+        raw = name.encode("utf-8")
+        buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
+        out_idx = ctypes.c_uint32(_ffi.ZLSX_NO_SHEET_IDX)
+        self._structural_call(
+            "zlsx_editor_add_sheet", _ffi.lib.zlsx_editor_add_sheet,
+            self._handle, buf, len(raw), ctypes.byref(out_idx),
+        )
+        return int(out_idx.value)
+
+    def rename_sheet(self, sheet_idx: int, name: str) -> None:
+        """Rename sheet ``sheet_idx``; cross-sheet references
+        (``'Old'!A1``, defined names, hyperlink locations, DV / CF,
+        ``<xm:f>`` extensions) follow. A pivot cache whose source is
+        spelled by sheet name (``worksheetSource@sheet``) does **not**
+        — the spelling goes stale and :meth:`pivots` reports it as
+        ``"resolved": null`` (a Zig-editor hole this row inherits, listed
+        in ``docs/plans/surface-matrix.md`` footnote ¹⁹). Same name
+        rules as :meth:`add_sheet`."""
+        self._require_structural("zlsx_editor_rename_sheet")
+        raw = name.encode("utf-8")
+        buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
+        self._structural_call(
+            "zlsx_editor_rename_sheet", _ffi.lib.zlsx_editor_rename_sheet,
+            self._handle, self._u32("sheet_idx", sheet_idx), buf, len(raw),
+        )
+
+    def delete_sheet(self, sheet_idx: int) -> None:
+        """Delete sheet ``sheet_idx``. Refuses the last sheet
+        (``CannotDeleteLastSheet``); references into the deleted sheet
+        collapse to ``#REF!``; every index above it shifts down by one.
+        A pivot cache that read the deleted sheet by name keeps the
+        stale spelling (see :meth:`rename_sheet`).
+        Needs a clean editor — no unsaved cell writes or appended rows
+        on any sheet (``SheetDeleteRequiresCleanState``, a
+        :class:`ZlsxError`: save first)."""
+        self._require_structural("zlsx_editor_delete_sheet")
+        self._structural_call(
+            "zlsx_editor_delete_sheet", _ffi.lib.zlsx_editor_delete_sheet,
+            self._handle, self._u32("sheet_idx", sheet_idx),
+        )
+
+    def rename_table_column(self, table: str, old_name: str, new_name: str) -> None:
+        """Rename column ``old_name`` of the named table ``table`` to
+        ``new_name``: the ``<tableColumn>``, the table's own formulas,
+        every structured reference workbook-wide (``Table1[Old]``, bare
+        ``[Old]`` / ``[@Old]`` inside the table), defined names,
+        hyperlink locations, DV / CF and the header cell's text.
+        A table or column the workbook does not have is a selector,
+        like a sheet index — ``TableNotFound`` / ``TableColumnNotFound``
+        raise :class:`ZlsxError`, as does ``InvalidTableColumnName``; a
+        name another column holds is the workbook's —
+        ``TableColumnNameInUse`` raises :class:`ZlsxRefusal`."""
+        self._require_structural("zlsx_editor_rename_table_column")
+        parts = [table.encode("utf-8"), old_name.encode("utf-8"), new_name.encode("utf-8")]
+        bufs = [(ctypes.c_ubyte * max(len(p), 1)).from_buffer_copy(p or b"\0") for p in parts]
+        self._structural_call(
+            "zlsx_editor_rename_table_column", _ffi.lib.zlsx_editor_rename_table_column,
+            self._handle,
+            bufs[0], len(parts[0]), bufs[1], len(parts[1]), bufs[2], len(parts[2]),
+        )
+
+    # ── Pivot tables (S6, the typed read) ─────────────────────────
+
+    def pivots(self) -> list[dict]:
+        """The pivot graph as ``zlsx pivots`` reports it: one
+        ``{"kind": "pivot", …}`` record per pivot table in host-sheet
+        order (``sheet``, ``sheet_idx``, ``name``, ``part``,
+        ``location``, ``rows``, ``cols``, ``pages``, ``values``,
+        ``data_caption``, ``grand_totals``, ``style``, ``cache``), then
+        one ``{"kind": "pivot_cache", "cache": {…}}`` record per cache
+        no table reads — the shape frozen at the S6 gate, parsed from
+        the same NDJSON bytes the CLI prints. Read over the editor's
+        current workbook state: structural edits (rows, columns,
+        sheets, table columns) are visible immediately; staged
+        :meth:`set_cell` / :meth:`append_rows` writes reach the pivot
+        graph at :meth:`save`, where a cache whose source they change
+        is rebuilt or marked — save, then read, to see them. ``[]``
+        for a workbook without pivots. A graph that cannot be read whole raises
+        :class:`ZlsxRefusal` (``MalformedPivotXml``) rather than a
+        partial inventory."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_PIVOTS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_pivots_ndjson "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        import json
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = _ffi.lib.zlsx_editor_pivots_ndjson(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"zlsx_editor_pivots_ndjson: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
 
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
@@ -3885,9 +4146,16 @@ class Editor:
 
 
 def edit(path: Union[str, Path]) -> Editor:
-    """Open an existing xlsx for append-only mutation. See
+    """Open an existing xlsx for load-modify-save mutation. See
     :class:`Editor` for the full contract."""
     return Editor(path)
+
+
+def pivots(path: Union[str, Path]) -> list[dict]:
+    """The pivot graph of the workbook at ``path`` — :meth:`Editor.pivots`
+    over a fresh editor, closed before returning."""
+    with Editor(path) as ed:
+        return ed.pivots()
 
 
 # ─── Embeddings (E5) ─────────────────────────────────────────────────

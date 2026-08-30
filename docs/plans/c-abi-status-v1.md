@@ -330,3 +330,191 @@ builds is dead by construction and removed.
 5. `zlsx_buffer_release` stages with the buffer exports (M9a2).
 6. Build hash in a dedicated `fingerprint_config` options module; CLI
    build cache unaffected by commits.
+
+## 10. S3a — structural edits + the `pivots` read (2026-08-30)
+
+The `Editor`'s structural edits and S6's `pivots` NDJSON shape cross the
+boundary under the §2 contract — new exports, so `zlsx_status_v1`, never
+the legacy `0/-1`. Nine exports, one header macro pair, one probe group:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_insert_row` / `_delete_row` / `_insert_column` / `_delete_column` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_add_sheet` / `_rename_sheet` / `_delete_sheet` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_rename_table_column` | `_HAS_STRUCTURAL_EDITS` | `ZLSX_HAS_STRUCTURAL_EDITS` |
+| `zlsx_editor_pivots_ndjson` (+ `zlsx_buffer_release`) | `_HAS_PIVOTS` | `ZLSX_HAS_PIVOTS` |
+
+Each probe also requires the release symbols the Python wrappers call
+unconditionally: `_HAS_STRUCTURAL_EDITS` needs `zlsx_diag_release`,
+`_HAS_PIVOTS` needs it and `zlsx_buffer_release`, each probed and
+configured on its own rather than borrowed from an unrelated feature's
+block (r6 REL-601).
+
+**Naming** (the S3a–e gate question): the M9a2 precedent holds — a new
+export takes its bare name under the status contract; the `_v2` suffix
+is reserved for a name a legacy export already owns
+(`zlsx_sheet_writer_write_row_with_formulas_v2`). None of the S3a names
+collide, so none carry a suffix. No new struct crosses: the exports take
+scalars, `(ptr, len)` byte strings and the existing `zlsx_diag_v1`.
+
+**The refusal vocabulary** (decision S3a-1). §2 maps `Formula*` planes to
+`-2`; the structural edits have a vocabulary of their own, and the same
+rule applies — a refusal is a statement about the *workbook*, a failure
+a statement about the *call*. `statusOf` checks one more list after the
+fourteen planes (`c_abi.zig::structural_refusals`); the diag carries the
+name with `plane = ZLSX_PLANE_NONE` and an empty census:
+
+| `-2` (`ZLSX_REFUSED`, `diag.error_name`) | `-1` (`ZLSX_ERROR`, `errbuf`) |
+|---|---|
+| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
+| The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
+| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
+| `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
+| `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing among the workbook's readable tables (decision S3a-9); a `<tablePart>` whose relationship, part or display name is broken refuses instead (`MissingRelationship` / `MalformedTableXml`, r6 REL-604) |
+| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
+| | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
+| `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
+
+The list is `c_abi.zig::structural_refusals`, one place. The editor folds
+its own pre-flights into the two `*UnsafeForSheet` names; what the
+transform's probe and the later sweeps raise reaches the boundary
+unfolded, so a caller sees the precise cause (`RowEditExceedsMaxRow`
+rather than "unsafe") — Codex #207 r1 REL-102. Sequencing errors and
+the transform's post-probe contract (a sweep failing after the probe
+passed: discard the editor, reopen — `Workbook.applySheetEditTransform`)
+are unchanged by this row.
+
+The Python leg mirrors the split: `-2` raises `ZlsxRefusal(error_name)`
+(the new base class; `ZlsxFormulaRefusal` now derives from it and is
+chosen when the diag names a plane), `-1` raises a plain `ZlsxError`.
+
+**Coordinates**: rows 1-based, columns 0-based (A = 0) — what
+`zlsx_editor_set_cell` and `zlsx_census_entry_v1` already spell; the Zig
+editor's 1-based column API is converted at the boundary. Sheet indices
+0-based; `zlsx_editor_add_sheet` writes `UINT32_MAX` to `*out_sheet_idx`
+on entry and the new index on `ZLSX_OK`.
+
+**`zlsx_editor_pivots_ndjson`** (decision S3a-2): the S6 gate froze a
+record *shape*, and the shape is text. The export hands over the NDJSON
+bytes themselves — `pkg/pivot_ndjson.zig`, the one writer `zlsx pivots`
+prints through too — in a library-allocated buffer released with
+`zlsx_buffer_release`; a workbook without pivots is `ZLSX_OK` with
+`(NULL, 0)`. A typed struct graph would have been a second spelling of a
+frozen contract, drifting on its own schedule. Python parses one JSON
+object per line (`Editor.pivots()` / `zlsx.pivots(path)`); a C caller
+parses with whatever it has. The read runs over the editor's current
+workbook state — structural edits visible immediately, staged
+`set_cell` / `append_row` writes only after `save` refreshes or marks
+the caches they touch (r7 REL-701 narrowed the claim; the alternative,
+a non-mutating overlay read, is S8-adjacent machinery this row does
+not need). The buffer is built by
+`c_abi.zig::pivotsNdjsonOwned(alloc, wb)`: the allocating writer reports
+a failed growth as `WriteFailed`, which the builder maps to
+`OutOfMemory` so the boundary answers `-3`, never a generic `-1`
+(Codex #207 r1 REL-103; pinned by an allocation-failure sweep).
+
+**Two more mappings** (decisions S3a-6, S3a-7): a worksheet part the
+typed parser cannot read — reached lazily by a sheet delete and by the
+sweeps — is the sheet transform's own `MalformedSheetXml`, spelled so at
+the one call site (`Worksheet.ensureParsed`) rather than renamed at the
+boundary, where a generic `MalformedXml` from any other part would have
+been mislabelled (r3 REL-302); a pivot part the store cannot materialise
+(a bad CRC, a broken stream) makes `zlsx_editor_pivots_ndjson` refuse as
+`MalformedPivotXml`, with `OutOfMemory` and `ZipBombSuspected` keeping
+their own statuses.
+
+**`addSheet` is all-or-nothing** (decision S3a-8, r3 REL-305):
+`Workbook.addSheet` builds both patched parts, parses the fresh view over
+its own copy (`workbook_xml.parseOwning`) and grows the slot table before
+the first store write, then adds the part and replaces the two references
+as one atomic pair; `Editor.addSheet` computes the part name ahead
+(`Workbook.nextSheetPartName`) and allocates its mirror before the
+mutation, so nothing after it can fail. An allocation failure anywhere
+leaves the workbook and the view as they were (pinned by
+`checkAllAllocationFailures` over `Workbook.addSheet` in
+`pkg/workbook.zig`; the editor's mirror is allocation-free after the
+mutation by construction — the sweep cannot run through `Editor.open`,
+whose reader path aborts under an injected failure, a pre-existing
+reader defect noted for a follow-up); the one residue is an unreferenced
+empty part when `replaceParts` fails after `addPart` — `deleteSheet`'s
+orphan trade-off.
+
+**Known hole, inherited:** `Editor.renameSheet` / `deleteSheet` do not
+rewrite a pivot cache's `worksheetSource@sheet` / `rangeSet@sheet`; a
+source spelled by sheet name goes stale and the pivots read reports it
+as `"resolved":null`. Pre-existing in the Zig editor and the CLI; the
+exports carry it unchanged, the header and the Python docs say so, and
+the lift belongs to the S7 family on every surface at once.
+
+**Tests** (`src/c_abi.zig`, "S3a …"): a boundary round trip whose saved
+grid is checked in the sheet part; the editor's verdicts, the
+transform's (`RowEditExceedsMaxRow`, `SplitPaneNotSupported`), the lazy
+reads' (`MalformedSheetXml` from a sheet delete, `MalformedPivotXml` from
+a corrupted part) and the workbook's own (`InternalSheetNameTooLong`)
+each driven through the exports with the name in both the diag and
+`errbuf` and `plane == NONE`, plus every member of `structural_refusals`
+through `failMapped`; the `-1` classes driven through the exports —
+`SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange`,
+`InvalidInput`, `InvalidSheetName`, `InvalidTableColumnName`,
+`TableNotFound`, `TableColumnNotFound`, `RowEditRequiresCleanSheet`,
+`ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState`,
+`NullOutPointer`, `StructSizeTooSmall` — with the diag left as prep left
+it; `StructSizeTooSmall` leaving the diag byte-for-byte; a `0xAA` canary
+tail across a generic failure and a refusal, before and after release; the pivots buffer equal to the package writer's frozen
+record, `(NULL, 0)` on a plain workbook, `-2 MalformedPivotXml` on a
+broken graph; `statusOf` pinned on both vocabularies. The header compile
+gate (`tests/c_abi_smoke.c`) takes every S3a address and `#error`s
+without either macro.
+
+## 11. Decisions index (S3a)
+
+1. Structural refusals are a second `-2` vocabulary next to the planes,
+   with `plane = ZLSX_PLANE_NONE`; sequencing and argument errors stay
+   `-1`.
+2. The pivots read crosses as the frozen NDJSON bytes, not a struct
+   graph; one writer serves the CLI and the ABI.
+3. Bare names, no `_v2` — nothing collides.
+4. Columns 0-based at the boundary, converted to the editor's 1-based
+   API; `UINT32_MAX` refused before the conversion.
+5. The transform's and the sweeps' workbook-safety errors cross with
+   their precise names (one list, `structural_refusals`), not folded
+   into `*UnsafeForSheet`; a growth failure in the pivots buffer is
+   `-3`. The Python leg bounds every index to `[0, 2³²)` before ctypes
+   narrows it (`ValueError`).
+6. A worksheet part the typed parser cannot read is `MalformedSheetXml`
+   at `Worksheet.ensureParsed` itself — every surface, one name.
+7. A pivot part the store cannot materialise refuses the pivots read as
+   `MalformedPivotXml`; `OutOfMemory` / `ZipBombSuspected` keep theirs.
+8. `addSheet` is all-or-nothing under allocation failure, on the
+   workbook and on the editor.
+9. `TableNotFound` / `TableColumnNotFound` are selectors — `-1`, like a
+   sheet index — not refusals; `TableColumnNameInUse` stays `-2`.
+10. The `worksheetSource@sheet` hole under sheet rename / delete is
+    inherited and documented, not lifted here.
+11. `Worksheet.ensureParsed` spells a part the store cannot materialise
+    (a CRC mismatch, a broken stream) as `MalformedSheetXml` too;
+    `xl/workbook.xml` without `</sheets>` is `MalformedWorkbookXml`. The
+    rewriters' own consistency guards ("the view no longer describes
+    these bytes", `MalformedXml`) keep the generic name and `-1`.
+12. `deleteSheet` allocates its surviving slot table (and the editor
+    its mirror) before the first mutation; the commit after the fresh
+    view parses cannot fail, so a handle that met an allocation failure
+    still agrees with itself and closes (pinned by an allocation-failure
+    sweep in `pkg/workbook.zig`). The sweeps' partial work under a
+    failure stays the documented discard-and-reopen contract.
+13. `zlsx_editor_close` tears down the handle's `std.Io.Threaded`, as
+    `zlsx_book_close` always did.
+14. A carrier part a structural path reads lazily — the `<xm:f>`
+    pre-flight's whole-workbook sheet scan included (r6 REL-603) — drawing, VML,
+    comments, table — that the store cannot materialise is that
+    carrier's own verdict (`Workbook.carrierPart`: `MalformedDrawingXml`
+    / `MalformedVmlDrawing` / `MalformedCommentsXml` /
+    `MalformedTableXml`), as the worksheet and pivot parts already were;
+    `OutOfMemory` / `ZipBombSuspected` keep theirs. The three
+    identifier increments of `addSheet` are checked
+    (`IdSpaceExhausted`).
+15. A `Worksheet.setCell` overwrite installs the replacement before it
+    frees the displaced owned value (`getOrPut`, the one fallible
+    step first): an allocation failure leaves the previous delta live
+    and the handle closable (r6 REL-602; allocation-failure sweep in
+    `pkg/workbook.zig`).

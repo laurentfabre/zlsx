@@ -162,8 +162,10 @@ zlsx_book_close(book);
 
 Link the released library from any tarball — `cc app.c -Iinclude -Llib
 -lzlsx`. The row reader and the fresh writer are exported nearly one-for-one,
-plus an editor subset (append rows, `set_cell`, save, docProps read/strip,
-recalc / evaluate) — what each surface has and lacks, per entry point, is
+plus the editor (append rows, `set_cell`, the structural edits — rows,
+columns, sheets, table columns — with their typed refusals, the `pivots`
+read, save, docProps read/strip, recalc / evaluate) — what each surface
+has and lacks, per entry point, is
 [`docs/plans/surface-matrix.md`](docs/plans/surface-matrix.md); in-memory
 workbooks come in via `zlsx_book_open_buffer` (that's what SQL UDFs over
 `BINARY` columns use) and go back out via `zlsx_writer_save_to_buffer`
@@ -417,7 +419,7 @@ contract: [docs/cli.md](docs/cli.md).**
 | Family | Commands |
 |---|---|
 | Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `pivots` · `styles` · `sst` |
-| Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` |
+| Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` · `rename-table-column` |
 | Privacy | `scrub-metadata` · `embed --strip` · `embed --prune` |
 | Embeddings | `embed --extract` · `embed --vectors` |
 | Formula | `eval` · `recalc` |

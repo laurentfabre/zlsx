@@ -118,6 +118,8 @@ pub const Worksheet = workbook_mod.Worksheet;
 /// S6: the read-only pivot graph behind `Workbook.pivotTables`. The
 /// module is exported for its fixture builder and `collect`, which
 /// walks a bare `PartStore` for callers that hold no `Workbook`.
+/// The JSON text scalars the NDJSON contracts share (S3a).
+pub const json_text = @import("json_text.zig");
 pub const pivots = @import("pivots.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;

@@ -3840,6 +3840,15 @@ pub const engine = struct {
 /// sheet 1 `Report` hosts `PivotTable1` at `A3:B6` (rows: Region;
 /// values: Sum of Qty). `cacheId` is 7, chosen to differ from every
 /// ordinal so a test that confuses the two fails.
+/// The `pivots` NDJSON records — the S6 shape, written once for the
+/// CLI and the C ABI (S3a). Lives in its own file; rooted here so its
+/// tests run under `test-pivots` and the full suite alike.
+pub const ndjson = @import("pivot_ndjson.zig");
+
+test {
+    _ = ndjson;
+}
+
 pub const fixture = struct {
     pub const SourceKind = enum {
         /// `<worksheetSource sheet="Data" ref="A1:C4"/>`

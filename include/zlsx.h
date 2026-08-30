@@ -1246,8 +1246,9 @@ int32_t zlsx_sheet_writer_add_conditional_format_data_bar(
  * boolean / empty / string cells; a source with no `xl/sharedStrings.xml`
  * part gets one created on the first string append. The editor's
  * own scanner refuses ZIP64 / multi-disk / encrypted / data-descriptor
- * archives up front. Structural edits (rows, columns, sheets) are not
- * exported yet — docs/plans/surface-matrix.md, row S3a. History:
+ * archives up front. Structural edits (rows, columns, sheets, table
+ * columns) and the `pivots` read are the zlsx_status_v1 block at the
+ * end of this header (S3a). History:
  * docs/plans/archive/load-modify-save.md.
  */
 
@@ -1730,6 +1731,131 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
 #define ZLSX_HAS_SAVE_WITH_RECALC 1
 #define ZLSX_HAS_WRITER_RECALC    1
 #define ZLSX_HAS_FORMULAS_V2      1
+
+/* ── S3a: structural edits + the pivots read (zlsx_status_v1) ───────
+ *
+ * The Editor's structural edits and the S6 `pivots` NDJSON shape,
+ * under the same status contract as the M9a1 / M9a2 exports above:
+ * ZLSX_OK, ZLSX_ERROR with the error name in `errbuf`, ZLSX_REFUSED
+ * with `diag->error_name` set and `diag->plane == ZLSX_PLANE_NONE`
+ * (these refusals carry no formula plane), ZLSX_NOMEM. `diag` is
+ * nullable on every call. Contract: docs/plans/c-abi-status-v1.md §10.
+ *
+ * What refuses (-2) is a statement about the workbook:
+ *   RowEditUnsafeForSheet / ColEditUnsafeForSheet — the edit lands
+ *     inside a hosted pivot's footprint, on a host sheet a pivot also
+ *     reads from, would collapse a table or delete its header row, or
+ *     a carrier the scan cannot read is in the way;
+ *   CannotDeleteLastSheet, DuplicateSheetName (add / rename, compared
+ *     ASCII case-insensitively), TableColumnNameInUse,
+ *     MalformedPivotXml (the pivot graph cannot be read whole), the
+ *     workbook's own structure found broken (InternalSheetNameTooLong,
+ *     MalformedWorkbookXml, IdSpaceExhausted, MissingRelationship,
+ *     SheetCountMismatch, …);
+ *   with their precise names, the worksheet transform's own verdicts
+ *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
+ *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
+ *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
+ *     MalformedCommentsXml, MalformedTableXml, the *CoordinateOverflow
+ *     trio, PivotEditUnsafe, MissingSheetPart, NoSheetData; a generic
+ *     MalformedXml from a rewriter's consistency guard stays -1) — the
+ *     full list is
+ *     docs/plans/c-abi-status-v1.md §10; the typed worksheet parser's
+ *     MalformedXml / UnexpectedEof cross as MalformedSheetXml, and a
+ *     pivot part the archive cannot materialise as MalformedPivotXml.
+ * What fails (-1) is a statement about the call: SheetIndexOutOfRange,
+ * RowIndexOutOfRange, ColumnIndexOutOfRange, InvalidSheetName,
+ * InvalidTableColumnName, TableNotFound / TableColumnNotFound (a
+ * selector that names nothing, like a sheet index), InvalidInput (NULL
+ * where bytes are required), and the sequencing errors RowEditRequiresCleanSheet /
+ * ColEditRequiresCleanSheet / SheetDeleteRequiresCleanState — a
+ * structural edit needs the sheet (the workbook, for a sheet delete)
+ * free of staged cell writes and appended rows: save first.
+ *
+ * Every edit is staged in memory; zlsx_editor_save /
+ * zlsx_editor_save_to_buffer commit it, with every cross-part
+ * rewriter the Zig editor carries (formulas in every dialect, defined
+ * names, hyperlinks, DV / CF, merges, panes, autoFilter, tables,
+ * drawings, comments, `<xm:f>` extensions, and — under a row / column
+ * edit — pivot locations and sources). Rows are 1-based; columns
+ * 0-based (A = 0), as zlsx_editor_set_cell spells them; sheet indices
+ * 0-based. */
+
+/* Insert a blank row before `before_row`; rows at or below it shift
+ * down by one. */
+int32_t zlsx_editor_insert_row(zlsx_editor_t * ed,
+        uint32_t sheet_idx, uint32_t before_row,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Delete row `row`; rows below it shift up by one. */
+int32_t zlsx_editor_delete_row(zlsx_editor_t * ed,
+        uint32_t sheet_idx, uint32_t row,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Insert a blank column before `before_col` (0-based, A = 0). */
+int32_t zlsx_editor_insert_column(zlsx_editor_t * ed,
+        uint32_t sheet_idx, uint32_t before_col,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Delete column `col` (0-based, A = 0). */
+int32_t zlsx_editor_delete_column(zlsx_editor_t * ed,
+        uint32_t sheet_idx, uint32_t col,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Append an empty sheet named `name` (`name_len` UTF-8 bytes, not
+ * NUL-terminated; judged by the fresh writer's rules). `out_sheet_idx`
+ * (nullable) receives the new index on ZLSX_OK and UINT32_MAX
+ * otherwise. */
+int32_t zlsx_editor_add_sheet(zlsx_editor_t * ed,
+        const uint8_t * name, size_t name_len,
+        uint32_t * out_sheet_idx,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Rename sheet `sheet_idx`; cross-sheet references (formulas, defined
+ * names, hyperlinks, DV / CF, <xm:f>) follow. A pivot cache's
+ * worksheetSource@sheet does NOT (a Zig-editor hole this row inherits):
+ * the spelling goes stale and zlsx_editor_pivots_ndjson reports it as
+ * "resolved":null. */
+int32_t zlsx_editor_rename_sheet(zlsx_editor_t * ed,
+        uint32_t sheet_idx, const uint8_t * name, size_t name_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Delete sheet `sheet_idx` (never the last one); references into it
+ * become #REF!, indices above it shift down by one. A pivot cache that
+ * read the sheet by name keeps the stale spelling (see rename). */
+int32_t zlsx_editor_delete_sheet(zlsx_editor_t * ed,
+        uint32_t sheet_idx,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Rename column `old_name` of table `table_name` to `new_name`: the
+ * <tableColumn>, the table's formulas, every structured reference
+ * workbook-wide, defined names, hyperlinks, DV / CF and the header
+ * cell. Names are plain (decoded) UTF-8, not NUL-terminated. */
+int32_t zlsx_editor_rename_table_column(zlsx_editor_t * ed,
+        const uint8_t * table_name, size_t table_name_len,
+        const uint8_t * old_name, size_t old_name_len,
+        const uint8_t * new_name, size_t new_name_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* The S6 `pivots` records — one {"kind":"pivot",…} line per pivot
+ * table in host-sheet order, then one {"kind":"pivot_cache",…} line
+ * per cache no table reads — as a library-allocated UTF-8 buffer,
+ * byte-for-byte what `zlsx pivots <file>` prints (docs/cli.md,
+ * "pivots"; the shape frozen at the S6 gate). Read over the editor's
+ * current workbook state: structural edits (rows, columns, sheets,
+ * table columns) are visible immediately; staged zlsx_editor_set_cell /
+ * append_row writes reach the pivot graph at save, where a cache whose
+ * source they change is rebuilt or marked — save, then read, to see
+ * them. A workbook without pivots is
+ * ZLSX_OK with (*out, *out_len) = (NULL, 0). Release with
+ * zlsx_buffer_release. */
+int32_t zlsx_editor_pivots_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Feature macros — compile-time counterpart of the dlsym probe. */
+#define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
+#define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
 
 
 #ifdef __cplusplus

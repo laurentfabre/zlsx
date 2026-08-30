@@ -206,6 +206,86 @@ currently refused.
 rule versions, target triple, build hash). Two processes may share
 recalc results only when their fingerprints match.
 
+## Structural edits & pivots
+
+libzlsx 0.9.0+ exports the editor's structural edits and the typed pivot
+read. Rows are 1-based, columns 0-based (`A = 0`, as in `set_cell`), sheet
+indices 0-based; every edit is staged and committed by `save` /
+`save_to_buffer`, and untouched parts stay byte-identical.
+
+```python
+import zlsx
+
+with zlsx.edit("report.xlsx") as ed:
+    ed.insert_row(0, 2)                    # a blank row 2; everything below shifts
+    ed.delete_column(0, 3)                 # column D goes; E.. become D..
+    idx = ed.add_sheet("Archive")          # -> 2
+    ed.rename_sheet(1, "Summary 2026")     # 'Old'!A1 references follow (not a pivot's worksheetSource@sheet — see below)
+    ed.rename_table_column("Sales", "Qty", "Quantity")   # Sales[Qty] follows too
+    ed.save("report.xlsx")
+
+for p in zlsx.pivots("report.xlsx"):       # the `zlsx pivots` records, as dicts
+    if p["kind"] != "pivot":               # "pivot_cache": a cache no table reads
+        print("orphan cache", p["cache"]["id"])
+        continue
+    cache = p["cache"]                     # null when the part reaches no cache
+    src = cache["source"] if cache else None
+    if src is None:
+        where = "no cache"
+    elif src["type"] == "worksheet":       # sheet / table / defined-name spellings
+        where = src["resolved"]            # {"sheet":…,"sheet_idx":…,"via":…,"bounds":…}, {"external":…} or None
+    elif src["type"] == "consolidation":
+        where = [rs["resolved"] for rs in src["range_sets"]]
+    else:                                  # "external", "scenario", "unknown"
+        where = src["type"]
+    print(p["name"], p["location"]["ref"], where)
+```
+
+A structural edit carries the rewriters the CLI's `insert-row` family
+carries — formulas in every dialect (A1, 3D, R1C1, structured
+references), defined names, hyperlinks, DV / CF, merges, panes,
+autoFilter, tables, drawings, comments, `<xm:f>` extensions, a hosted
+pivot's rectangle and a cache's source range (a source whose content
+changes is rebuilt during the edit and committed by `save`). One hole
+the row inherits from the Zig editor: `rename_sheet` / `delete_sheet`
+do not rewrite a pivot cache's `worksheetSource@sheet`, so a source
+spelled by sheet name goes stale and `pivots()` reports it as
+`"resolved": null`. Where the workbook cannot be kept consistent
+the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
+`error_name` says why:
+
+| `error_name` | Raised by |
+|---|---|
+| `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet` | an edit inside a hosted pivot's footprint, on a host sheet a pivot also reads from, one that would collapse a table or delete its header row, or a carrier the scan cannot read |
+| `DuplicateSheetName` | `add_sheet` / `rename_sheet` (ASCII case-insensitive) |
+| `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
+| `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
+| `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
+| `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit`, the carrier verdicts `MalformedSheetXml` / `MalformedDrawingXml` / `MalformedVmlDrawing` / `MalformedCommentsXml` / `MalformedTableXml` / `*CoordinateOverflow`, the workbook's own `MalformedWorkbookXml` / `IdSpaceExhausted` / … | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read or materialise. The list is §10 of `docs/plans/c-abi-status-v1.md`; a generic `MalformedXml` from a rewriter's consistency guard stays a plain `ZlsxError` |
+
+`ZlsxRefusal` is a `ZlsxError`; `ZlsxFormulaRefusal` (the engine's
+Plane-2 refusals) now derives from it. Statements about the *call* stay
+plain `ZlsxError`s named after the cause: `SheetIndexOutOfRange`,
+`RowIndexOutOfRange`, `ColumnIndexOutOfRange`, `InvalidSheetName`,
+`InvalidTableColumnName`, `TableNotFound` / `TableColumnNotFound` (a
+selector that names nothing, like a sheet index), and the sequencing errors
+`RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` /
+`SheetDeleteRequiresCleanState` — a structural edit needs the sheet (the
+workbook, for a sheet delete) free of unsaved `set_cell` / `append_rows`
+writes; save first. Indices are integers (`operator.index`; a float, a
+string or a bool is a `TypeError`) in `[0, 2**32)` (`ValueError`),
+checked before the call — ctypes would otherwise truncate or wrap them.
+
+`Editor.pivots()` returns the records `zlsx pivots` prints
+([docs/cli.md](../../docs/cli.md), "pivots"), parsed from the same bytes:
+`{"kind": "pivot", …}` per pivot table in host-sheet order, then
+`{"kind": "pivot_cache", …}` per cache no table reads; `[]` for a
+workbook without pivots. It reads the editor's current workbook state:
+structural edits are visible immediately — rename the host sheet and
+the record names it — while staged `set_cell` / `append_rows` writes
+reach the pivot graph at `save`, where a cache whose source they change
+is rebuilt or marked; save, then read, to see them.
+
 ## Spark (PySpark Data Source)
 
 Spark 4.0+ / DBR 15.4+ (including serverless). `pip install py-zlsx[spark]`
@@ -360,6 +440,15 @@ with zlsx.write("out.xlsx") as w:
   (numeric / int / float / bool / str cells), `set_cell` / `set_cells`,
   `doc_props` read + `strip_doc_props` scrub, atomic save, `save_to_buffer` /
   `Editor.from_bytes` for filesystem-less callers
+- Structural edits (0.9.0+): `insert_row` / `delete_row` / `insert_column` /
+  `delete_column` / `add_sheet` / `rename_sheet` / `delete_sheet` /
+  `rename_table_column`, with every cross-part rewriter (formulas in every
+  dialect, defined names, hyperlinks, DV / CF, merges, panes, autoFilter,
+  tables, drawings, comments, `<xm:f>` extensions, pivot locations and
+  sources); what cannot be kept consistent refuses with a typed
+  `ZlsxRefusal` — see *Structural edits & pivots*
+- Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
+  — the `zlsx pivots` records as dicts
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
@@ -370,8 +459,7 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.8.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
-- Structural edits (insert / delete row or column, add / rename / delete sheet) on existing workbooks — shipped in Zig and the CLI with the full cross-part rewriters (table-column rename is Zig-only); they do not reach Python yet. Row S3a of `goal_sigmoid.md`; the per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
-- Pictures — image anchors (read) and image authoring are Zig-only today (S3b / S5); charts and pivots are byte-preserved through edits but not exposed, with chart authoring deferred (D2 → S9) and pivots a later ladder row (S6)
+- Pictures — image anchors (read) and image authoring are Zig-only today (S3b / S5); charts are byte-preserved through edits but not exposed, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
 
 ## Thread safety
 
