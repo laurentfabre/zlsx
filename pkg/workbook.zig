@@ -6370,6 +6370,18 @@ pub const Workbook = struct {
             errdefer self.allocator.free(dup);
             try patches.append(self.allocator, .{ .name = t.part_name, .bytes = dup });
         }
+        // A pivot whose source is another pivot's rectangle: the cells
+        // written here are that cache's content, which this edit did
+        // not select. The sweep does not cascade — it refuses (Codex
+        // #206 r9 REL-901).
+        for (prepared.host_writes.items) |hw| {
+            const map = HostRowMap.forEdit(hw.sheet_idx == sheet_idx, axis, idx_1based, kind);
+            for (p.caches) |*c| {
+                for (hw.cells) |cell| {
+                    if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, map)) return error.PivotEditUnsafe;
+                }
+            }
+        }
         // The host writes are rendered LAST in the sweep, over the
         // hosts as the transform leaves them; that render must not be
         // the first to find a host it cannot emit into (no
@@ -6386,6 +6398,29 @@ pub const Workbook = struct {
             rehearsal.deinit(self.allocator);
         }
         try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
+    }
+
+    /// Does a host cell written at `ref` (post-edit coordinates, on
+    /// `sheet_idx`) land where cache `c` reads? A finite rectangle is
+    /// mapped through the edit; a source with no rectangle on that
+    /// sheet — whole columns or rows, an unbounded body — counts any
+    /// cell of the sheet.
+    fn hostCellHitsCache(c: *const pivots_mod.PivotCache, sheet_idx: u32, ref: CellRef, map: HostRowMap) bool {
+        if (resolutionHit(c.resolution, sheet_idx, ref, map)) return true;
+        for (c.range_set_resolutions) |r| if (resolutionHit(r, sheet_idx, ref, map)) return true;
+        return false;
+    }
+
+    fn resolutionHit(res: pivots_mod.SourceResolution, sheet_idx: u32, ref: CellRef, map: HostRowMap) bool {
+        if (!pivots_mod.resolutionDependsOn(res, sheet_idx)) return false;
+        switch (res) {
+            .sheet => |l| if (l.bounds) |b| if (b == .rect) {
+                const r = map.mapRect(b.rect) orelse return false;
+                return ref.row >= r.tl_row and ref.row <= r.br_row and ref.col >= r.tl_col and ref.col <= r.br_col;
+            },
+            else => {},
+        }
+        return true;
     }
 
     /// Is `p.tables[i]`'s part one an earlier table already named —
@@ -7952,15 +7987,48 @@ pub const Workbook = struct {
         // a cache with one consumer the slice cannot lay out takes
         // the marker alone, whole (Codex #206 r1 REL-101). Only a
         // resource failure is the save's.
+        const stagings = try arena.alloc(?StagedRefresh, p.caches.len);
+        @memset(stagings, null);
         for (p.caches, affected, 0..) |*c, hit, ci| {
             if (!hit) continue;
-            const staged: ?StagedRefresh = self.stageCacheRefresh(arena, &p, ci, c) catch |e| switch (e) {
+            stagings[ci] = self.stageCacheRefresh(arena, &p, ci, c) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => null,
             };
+        }
+        // A pivot whose source is another pivot's rectangle reads the
+        // cells written here (Codex #206 r9 REL-901): such a cache is
+        // marked in the same install — and a rebuild it had staged is
+        // dropped, since it read those cells before they were written
+        // — to a fixed point, since dropping one withdraws its writes.
+        const downstream = try arena.alloc(bool, p.caches.len);
+        @memset(downstream, false);
+        const identity = HostRowMap.forEdit(false, .row, 1, .insert);
+        var settled = false;
+        while (!settled) {
+            settled = true;
+            for (p.caches, 0..) |*c, ci| {
+                if (downstream[ci]) continue;
+                var hit = false;
+                for (stagings) |st_opt| {
+                    const st = st_opt orelse continue;
+                    for (st.host_writes) |hw| for (hw.cells) |cell| {
+                        if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, identity)) hit = true;
+                    };
+                }
+                if (!hit) continue;
+                downstream[ci] = true;
+                if (stagings[ci] != null) {
+                    stagings[ci] = null;
+                    settled = false;
+                }
+            }
+        }
+        for (p.caches, 0..) |*c, ci| {
+            if (!affected[ci] and !downstream[ci]) continue;
             var splices: std.ArrayListUnmanaged(pivots_mod.edit.Splice) = .empty;
             if (pivots_mod.edit.markerSplice(c.raw_xml, &c.definition)) |sp| try splices.append(arena, sp);
-            if (staged) |st| {
+            if (stagings[ci]) |st| {
                 try splices.appendSlice(arena, st.splices);
                 if (st.records) |bytes| {
                     const dup = try a.dupe(u8, bytes);
@@ -7993,8 +8061,8 @@ pub const Workbook = struct {
         if (rendered == null and host_writes.items.len > 0) {
             for (patches.items) |it| a.free(it.bytes);
             patches.clearRetainingCapacity();
-            for (p.caches, affected) |*c, hit| {
-                if (!hit) continue;
+            for (p.caches, affected, downstream) |*c, hit, down| {
+                if (!hit and !down) continue;
                 const out = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
                 errdefer a.free(out);
                 try patches.append(a, .{ .name = c.part_name, .bytes = out });

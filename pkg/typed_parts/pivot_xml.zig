@@ -807,7 +807,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
         } else if (std.mem.eql(u8, k.local, "pivotFields")) {
             if (seen.contains(.fields)) return error.MalformedXml;
             seen.insert(.fields);
-            def.fields = try parsePivotFields(allocator, xml, k, p);
+            def.fields = try parsePivotFields(allocator, xml, k, p, &def.has_other_children);
         } else if (std.mem.eql(u8, k.local, "rowFields")) {
             if (seen.contains(.rows)) return error.MalformedXml;
             seen.insert(.rows);
@@ -860,7 +860,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
     return def;
 }
 
-fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]PivotField {
+fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const u8, other_children: *bool) Error![]PivotField {
     var out: std.ArrayListUnmanaged(PivotField) = .empty;
     errdefer {
         for (out.items) |f| allocator.free(f.items);
@@ -868,7 +868,13 @@ fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
     }
     var kids = Children.init(xml, el.hit, el.end, p, el.env);
     while (try kids.next()) |k| {
-        if (!std.mem.eql(u8, k.local, "pivotField")) continue;
+        // A child that is not a field — under this prefix or another,
+        // or markup between them — is content the wrapper's reader
+        // did not classify (Codex #206 r9 REL-902).
+        if (!std.mem.eql(u8, k.local, "pivotField")) {
+            other_children.* = true;
+            continue;
+        }
         const attrs = k.attrs(xml);
         var f: PivotField = .{
             .name = wbxml.getAttr(attrs, "name"),
@@ -932,6 +938,7 @@ fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
         errdefer allocator.free(f.items);
         try out.append(allocator, f);
     }
+    if (kids.skipped > 0 or kids.other) other_children.* = true;
     return out.toOwnedSlice(allocator);
 }
 

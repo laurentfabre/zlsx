@@ -8485,6 +8485,10 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole �
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r9 REL-902: content under `<pivotFields>` that is
+        // not a field — a stray element, one under another prefix.
+        .{ .name = "fields_stray", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"3\"><foo/>" },
+        .{ .name = "fields_foreign", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"3\"><x14:future xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"/>" },
         // Codex #206 r8 REL-801: no grand total, or column totals off —
         // consistent with themselves, still not the one form.
         .{ .name = "no_grand_total", .old = "outline=\"1\"", .new = "outline=\"1\" rowGrandTotals=\"0\"", .old2 = "<rowItems count=\"3\"><i><x/></i><i><x v=\"1\"/></i><i t=\"grand\"><x/></i></rowItems>", .new2 = "<rowItems count=\"2\"><i><x/></i><i><x v=\"1\"/></i></rowItems>", .old3 = "ref=\"A3:B6\"", .new3 = "ref=\"A3:B5\"" },
@@ -9098,4 +9102,45 @@ test "S7b-5: a comment or processing instruction between an inline caption's run
         try ed.save(io, dst);
         try expectMarkerOnly(io, src, dst);
     }
+}
+
+test "S7b-5: a pivot whose source is another pivot's rectangle — the edit refuses, the save marks it in the same install and refreshes the upstream one (Codex #206 r9 REL-901)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r9_downstream.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r9_downstream_dst.xlsx");
+    defer a.free(dst);
+    // The orphan cache 8 reads `Report!A1:A1`; respelt to read the
+    // pivot's own rectangle `A3:B6`.
+    try pivots_mod.fixture.writeWithOrphanCache(a, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/pivotCache/pivotCacheDefinition2.xml", "sheet=\"Report\" ref=\"A1:A1\"", "sheet=\"Report\" ref=\"A3:B6\"");
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try ed.setCell(0, 2, 0, .{ .string = "Central" });
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition2.xml", true);
+    try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition2.xml", "recordCount=\"0\"");
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "A6", .{ .text = "Central" });
 }

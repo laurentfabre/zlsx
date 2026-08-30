@@ -497,7 +497,8 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 - **Automatic date decoding** — dates surface as Excel serials; opt in via
   `Rows.parseDate` / `xlsx.fromExcelSerial`.
 - **Pivot-aware edits** — pivots round-trip byte-preserved; an admitted row/col
-  edit outside a hosted pivot's footprint moves its rectangle, and a row edit
+  edit maintains a hosted pivot's rectangle (moving it when the edit is above
+  or left of it; inside it refuses), and a row edit
   (or a cell write) that changes a finite-rectangle source's *content*
   refreshes the pivot the way Excel would —
   the cache rebuilt from the cells, its consumers re-laid, their output cells
