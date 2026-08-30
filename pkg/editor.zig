@@ -9647,6 +9647,12 @@ test "S7b-5: a host's own staged writes go into the pivot's splice, byte-preserv
         .{ .name = "second_top_level", .part = "xl/worksheets/sheet2.xml", .old = "</worksheet>", .new = "</worksheet><foo><sheetData/></foo>" },
         .{ .name = "wrapped_sst", .part = "xl/sharedStrings.xml", .old = "<sst ", .new = "<wrapper><sst/></wrapper><sst " },
         .{ .name = "empty_inline", .part = "xl/worksheets/sheet2.xml", .old = "</row></sheetData>", .new = "</row><row r=\"7\"><c r=\"A7\" t=\"inlineStr\"><is/></c></row></sheetData>" },
+        // Codex #206 r22 SEC-2202: character data or a CDATA section
+        // outside the root, on the host and on the table.
+        .{ .name = "host_prefix_text", .part = "xl/worksheets/sheet2.xml", .old = "<worksheet ", .new = "junk<worksheet " },
+        .{ .name = "host_suffix_text", .part = "xl/worksheets/sheet2.xml", .old = "</worksheet>", .new = "</worksheet>junk" },
+        .{ .name = "host_top_cdata", .part = "xl/worksheets/sheet2.xml", .old = "<worksheet ", .new = "<![CDATA[x]]><worksheet " },
+        .{ .name = "sst_prefix_text", .part = "xl/sharedStrings.xml", .old = "<sst ", .new = "junk<sst " },
     };
     for (cases) |case| {
         const file = try std.fmt.allocPrint(a, "s7b5_r21_{s}.xlsx", .{case.name});
@@ -9662,4 +9668,33 @@ test "S7b-5: a host's own staged writes go into the pivot's splice, byte-preserv
         try ed.save(io, dst);
         try expectMarkerOnly(io, src, dst);
     }
+}
+
+test "S7b-5: a count-only shared-string rewrite reads the table as one document too (Codex #206 r22 SEC-2201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r22_wrapped_shrink.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r22_wrapped_shrink_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/sharedStrings.xml", "<sst ", "<wrapper><sst/></wrapper><sst ");
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const before = try a.dupe(u8, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+    defer a.free(before);
+    // A delete shrinks the rectangle with strings the table has: the
+    // count-only branch.
+    try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 3));
+    try std.testing.expectEqualStrings(before, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 3));
+    try ed.setCell(0, 3, 1, .{ .number = 9.5 });
+    try ed.save(io, dst);
+    try expectMarkerOnly(io, src, dst);
 }

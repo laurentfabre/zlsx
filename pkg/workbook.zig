@@ -7213,8 +7213,18 @@ pub const Workbook = struct {
         var root: ?zlsx.TagOpen = null;
         var root_close_lt: ?usize = null;
         var child: ?zlsx.TagOpen = null;
-        var pos: usize = 0;
+        // A byte-order mark before the declaration is a producer's
+        // habit, not character data.
+        var pos: usize = if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) 3 else 0;
         while (try nextMarkup(src, pos, src.len)) |m| {
+            // Outside the root, the bytes between markup are
+            // whitespace and the markup a comment or a processing
+            // instruction — not character data, not a CDATA section,
+            // not a declaration (Codex #206 r22 SEC-2202).
+            if (depth == 0) {
+                if (!typed_parts.pivot_xml.isBlank(src[pos..m.lt])) return error.MalformedSheetXml;
+                if (m.kind == .non_element and !(std.mem.startsWith(u8, src[m.lt..], "<!--") or src[m.lt + 1] == '?')) return error.MalformedSheetXml;
+            }
             pos = m.after;
             switch (m.kind) {
                 .non_element => {},
@@ -7251,6 +7261,7 @@ pub const Workbook = struct {
             }
         }
         if (depth != 0) return error.MalformedSheetXml;
+        if (!typed_parts.pivot_xml.isBlank(src[pos..])) return error.MalformedSheetXml;
         return .{ .root = root orelse return error.MalformedSheetXml, .root_close_lt = root_close_lt orelse return error.MalformedSheetXml, .child = child };
     }
 
@@ -7479,11 +7490,11 @@ pub const Workbook = struct {
     /// written. A part without the attribute, or one whose root the
     /// walk cannot find, is copied whole.
     fn dropSstCountAttr(a: Allocator, xml: []const u8) Error![]u8 {
-        var pos: usize = 0;
-        while (try nextMarkup(xml, pos, xml.len)) |m| {
-            pos = m.after;
-            if (m.kind != .open) continue;
-            const t = sheet_edit.matchTagAt(xml, m.lt, "sst") orelse continue;
+        // The one document element, validated whole — the count-only
+        // rewrite reads the table too (Codex #206 r22 SEC-2201).
+        const doc = try scanDocument(xml, "sst", null);
+        {
+            const t = doc.root;
             const attrs_start = t.start + "<sst".len;
             const attrs = xml[attrs_start .. t.after_open - 1];
             var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
@@ -7497,7 +7508,6 @@ pub const Workbook = struct {
                 }
                 prev_end = value_end;
             }
-            break;
         }
         return a.dupe(u8, xml);
     }
