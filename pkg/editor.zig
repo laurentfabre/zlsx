@@ -8452,9 +8452,22 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool = false };
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool = false, old2: ?[]const u8 = null, new2: []const u8 = "", direct: anyerror = error.PivotEditUnsafe };
     const cases = [_]Case{
         .{ .name = "page", .old = "<dataFields count=\"1\">", .new = "<pageFields count=\"1\"><pageField fld=\"2\" hier=\"-1\"/></pageFields><dataFields count=\"1\">" },
+        // Codex #206 r1 REL-104: a container whose count disagrees
+        // with its children, a second subtotal item, an item both
+        // cached and derived, a grand total without its `<x>`, an
+        // attribute on a container the layout regenerates â€” refused
+        // before mutation rather than normalised.
+        .{ .name = "items_count", .old = "<items count=\"3\">", .new = "<items count=\"9\">", .direct = error.MalformedPivotXml },
+        .{ .name = "row_items_count", .old = "<rowItems count=\"3\">", .new = "<rowItems count=\"2\">", .direct = error.MalformedPivotXml },
+        .{ .name = "col_items_count", .old = "<colItems count=\"1\">", .new = "<colItems count=\"2\">", .direct = error.MalformedPivotXml },
+        .{ .name = "grand_without_x", .old = "<i t=\"grand\"><x/></i>", .new = "<i t=\"grand\"/>" },
+        .{ .name = "two_defaults", .old = "<item t=\"default\"/></items>", .new = "<item t=\"default\"/><item t=\"default\"/></items>", .old2 = "<items count=\"3\">", .new2 = "<items count=\"4\">" },
+        .{ .name = "x_and_t", .old = "<item x=\"0\"/>", .new = "<item x=\"0\" t=\"default\"/>" },
+        .{ .name = "items_attr", .old = "<items count=\"3\">", .new = "<items count=\"3\" foo=\"1\">" },
+        .{ .name = "row_items_attr", .old = "<rowItems count=\"3\">", .new = "<rowItems count=\"3\" foo=\"1\">" },
         .{ .name = "col_field", .old = "<dataFields count=\"1\">", .new = "<colFields count=\"1\"><field x=\"2\"/></colFields><dataFields count=\"1\">" },
         .{ .name = "show_all", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"1\">" },
         .{ .name = "hidden_item", .old = "<item x=\"1\"/>", .new = "<item x=\"1\" h=\"1\"/>" },
@@ -8475,6 +8488,7 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         defer std.testing.allocator.free(src);
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, case.old, case.new);
+        if (case.old2) |old2| try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, old2, case.new2);
         var wb = try Workbook.open(std.testing.allocator, io, src);
         defer wb.deinit();
         const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
@@ -8484,7 +8498,7 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
             try expectPartHas(&wb.store, pt_part, "<location ref=\"A3:B7\"");
             continue;
         }
-        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectError(case.direct, wb.insertRow(0, 2));
         try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
         var ed = try Editor.open(std.testing.allocator, io, src);
         defer ed.deinit();
@@ -8492,5 +8506,135 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         // A shift stays a shift: row 1 is above the source, and no
         // cache is rebuilt, so the form is not asked.
         try ed.insertRow(0, 1);
+    }
+}
+
+/// A second consumer of the fixture's cache on `Report`, `A10:B13`,
+/// with a page field the slice does not lay out.
+fn addUnsupportedConsumer(io: std.Io, path: []const u8) !void {
+    const a = std.testing.allocator;
+    var store = try store_mod.PartStore.open(a, io, path);
+    defer store.deinit();
+    try store.addPart(
+        "xl/pivotTables/pivotTable2.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable2" cacheId="7" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6" indent="0" outline="1" outlineData="1" multipleFieldFilters="0"><location ref="A10:B13" firstHeaderRow="1" firstDataRow="1" firstDataCol="1" rowPageCount="1" colPageCount="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField dataField="1" showAll="0"/><pivotField axis="axisPage" showAll="0"><items count="1"><item t="default"/></items></pivotField></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="3"><i><x/></i><i><x v="1"/></i><i t="grand"><x/></i></rowItems><colItems count="1"><i/></colItems><pageFields count="1"><pageField fld="2" hier="-1"/></pageFields><dataFields count="1"><dataField name="Sum of Qty" fld="1" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>
+        ,
+    );
+    try store.addPart(
+        "xl/pivotTables/_rels/pivotTable2.xml.rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+        \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>
+        ,
+    );
+    try store.save(io, path);
+    try pivots_mod.fixture.patchPart(a, io, path, "xl/worksheets/_rels/sheet2.xml.rels", "</Relationships>", "<Relationship Id=\"rIdPT2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable2.xml\"/></Relationships>");
+}
+
+/// Every pivot part and the host byte-identical to `original`, save
+/// for the marker on the definition.
+fn expectMarkerOnly(io: std.Io, original: []const u8, saved: []const u8) !void {
+    const a = std.testing.allocator;
+    var before = try store_mod.PartStore.open(a, io, original);
+    defer before.deinit();
+    var after = try store_mod.PartStore.open(a, io, saved);
+    defer after.deinit();
+    const same = [_][]const u8{ "xl/pivotCache/pivotCacheRecords1.xml", "xl/pivotTables/pivotTable1.xml", "xl/worksheets/sheet2.xml", "xl/sharedStrings.xml" };
+    for (same) |name| {
+        const b = (try before.part(name)) orelse return error.PartNotFound;
+        const c = (try after.part(name)) orelse return error.PartNotFound;
+        try std.testing.expectEqualStrings(b.bytes, c.bytes);
+    }
+    if (try before.part("xl/pivotTables/pivotTable2.xml")) |b| {
+        const c = (try after.part("xl/pivotTables/pivotTable2.xml")) orelse return error.PartNotFound;
+        try std.testing.expectEqualStrings(b.bytes, c.bytes);
+    }
+    const def = (try before.part("xl/pivotCache/pivotCacheDefinition1.xml")) orelse return error.PartNotFound;
+    const marked = try markedDefinition(a, def.bytes);
+    defer a.free(marked);
+    const got = (try after.part("xl/pivotCache/pivotCacheDefinition1.xml")) orelse return error.PartNotFound;
+    try std.testing.expectEqualStrings(marked, got.bytes);
+}
+
+test "S7b-5: a cache with one consumer the slice cannot lay out takes the marker alone at save, whole â€” no rebuilt records, no re-laid sibling; the edit path refuses whole (Codex #206 r1 REL-101)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b5_r1_two_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b5_r1_two_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    try addUnsupportedConsumer(io, src);
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 3, 1, .{ .number = 9.5 });
+        try ed.save(io, dst);
+    }
+    try expectMarkerOnly(io, src, dst);
+    var wb = try Workbook.open(std.testing.allocator, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 0, "B3", .{ .number = 9.5 });
+    var ed = try Editor.open(std.testing.allocator, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+}
+
+test "S7b-5: a host part the cells cannot be rendered into, or a blank merge in a grown rectangle's way, leaves the save at the marker alone and refuses the edit (Codex #206 r1 REL-102, REL-103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const dst = try tt.path(std.testing.allocator, io, "s7b5_r1_host_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    {
+        // No `<sheetData>` on the host: the layout plans, the render
+        // cannot emit â€” nothing but the marker is installed, and the
+        // write inside the source is saved.
+        const src = try tt.path(std.testing.allocator, io, "s7b5_r1_nosd.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", "<sd>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "</sheetData>", "</sd>");
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 3, 1, .{ .number = 9.5 });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 0, "B3", .{ .number = 9.5 });
+    }
+    {
+        // A blank merged range `A7:B7` right below `A3:B6`: no `<c>`
+        // marks it, the grown rectangle would write under it.
+        const src = try tt.path(std.testing.allocator, io, "s7b5_r1_merge.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/sheet2.xml", "</sheetData>", "</sheetData><mergeCells count=\"1\"><mergeCell ref=\"A7:B7\"/></mergeCells>");
+        {
+            var ed = try Editor.open(std.testing.allocator, io, src);
+            defer ed.deinit();
+            try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+            try ed.setCell(0, 2, 0, .{ .string = "Central" });
+            try ed.save(io, dst);
+        }
+        try expectMarkerOnly(io, src, dst);
+        // A merge the rectangle does not reach is no obstacle: the
+        // delete shrinks it.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteRow(0, 3);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectPartHas(&store, pt_part, "<location ref=\"A3:B5\"");
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<mergeCell ref=\"A7:B7\"/>");
     }
 }

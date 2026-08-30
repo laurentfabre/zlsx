@@ -531,9 +531,13 @@ pub const PivotField = struct {
     /// The whole element: from its `<` to one past its close.
     span: Span = .{ .start = 0, .end = 0 },
     /// The `<items>` children, in order. `has_items` tells an empty
-    /// `<items/>` from no element at all.
+    /// `<items/>` from no element at all; `items_count` is the
+    /// element's own `count`, `items_other_attrs` any attribute on it
+    /// besides `count` — which a regenerated element would not carry.
     items: []Item = &.{},
     has_items: bool = false,
+    items_count: ?u32 = null,
+    items_other_attrs: bool = false,
     /// Children other than `<items>` — `autoSortScope`, `extLst` —
     /// and whatever the one-prefix walk stepped over or read between
     /// children, which a regenerated element would drop.
@@ -564,6 +568,8 @@ pub const AxisItems = struct {
     /// The whole element, `<` to one past its close.
     span: Span,
     count: ?u32,
+    /// Any attribute besides `count`.
+    other_attrs: bool = false,
     items: []AxisItem,
 };
 
@@ -895,6 +901,12 @@ fn parsePivotFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             // Two `<items>` are not one list.
             if (f.has_items) return error.MalformedXml;
             f.has_items = true;
+            const ca = c.attrs(xml);
+            f.items_count = try u32Attr(ca, "count");
+            var cai: AttrIter = .{ .attrs = ca };
+            while (cai.next()) |a| {
+                if (!std.mem.eql(u8, a.name, "count")) f.items_other_attrs = true;
+            }
             var items = Children.init(xml, c.hit, c.end, p, c.env);
             while (try items.next()) |it| {
                 if (!std.mem.eql(u8, it.local, "item")) {
@@ -974,9 +986,15 @@ fn parseAxisItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u
     // Stepped-over or stray markup inside the axis is a layout this
     // reader did not read whole.
     if (kids.skipped > 0 or kids.other) return error.MalformedXml;
+    var other_attrs = false;
+    var eai: AttrIter = .{ .attrs = el.attrs(xml) };
+    while (eai.next()) |a| {
+        if (!std.mem.eql(u8, a.name, "count")) other_attrs = true;
+    }
     return .{
         .span = .{ .start = el.hit.open_lt, .end = el.after },
         .count = try u32Attr(el.attrs(xml), "count"),
+        .other_attrs = other_attrs,
         .items = try out.toOwnedSlice(allocator),
     };
 }

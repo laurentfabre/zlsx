@@ -3188,7 +3188,9 @@ pub const engine = struct {
         var default_item = false;
         for (pf.items) |it| {
             if (it.t) |t| {
-                if (!std.mem.eql(u8, t, "default")) return error.PivotShapeUnsupported;
+                // One subtotal item, last; an item that is both a
+                // cache item and a derived one is neither.
+                if (!std.mem.eql(u8, t, "default") or default_item or it.x != null) return error.PivotShapeUnsupported;
                 default_item = true;
                 continue;
             }
@@ -3326,7 +3328,8 @@ pub const engine = struct {
         // per data field, `<x v>` its index, `i` its index past the
         // first — left as written, since no row edit changes it.
         const ci = def.col_items orelse return error.PivotShapeUnsupported;
-        if (ci.items.len != def.data_fields.len) return error.PivotShapeUnsupported;
+        if (ci.items.len != def.data_fields.len or ci.other_attrs) return error.PivotShapeUnsupported;
+        if (ci.count) |n| if (n != ci.items.len) return error.MalformedPivotXml;
         for (ci.items, 0..) |it, j| {
             if (it.t != null or it.r != null or it.other_attrs or it.has_other_children) return error.PivotShapeUnsupported;
             if (def.col_fields.len == 0) {
@@ -3338,13 +3341,15 @@ pub const engine = struct {
         }
         // `<rowItems>` as written: data items then the grand total.
         const ri = def.row_items orelse return error.PivotShapeUnsupported;
+        if (ri.other_attrs) return error.PivotShapeUnsupported;
+        if (ri.count) |n| if (n != ri.items.len) return error.MalformedPivotXml;
         var seen_grand = false;
         for (ri.items) |it| {
             if (it.other_attrs or it.has_other_children or it.r != null or it.i != null) return error.PivotShapeUnsupported;
             if (it.t) |t| {
                 if (!std.mem.eql(u8, t, "grand") or seen_grand) return error.PivotShapeUnsupported;
                 seen_grand = true;
-                if (it.xs.len > 1) return error.PivotShapeUnsupported;
+                if (it.xs.len != 1) return error.PivotShapeUnsupported;
             } else {
                 if (seen_grand or it.xs.len != 1) return error.PivotShapeUnsupported;
             }
@@ -3356,7 +3361,8 @@ pub const engine = struct {
         if (loc.row_page_count != null or loc.col_page_count != null) return error.PivotShapeUnsupported;
         // The row field.
         const pf = def.fields[rf];
-        if (pf.axis != .row or !pf.has_items or pf.has_other_children or pf.show_all) return error.PivotShapeUnsupported;
+        if (pf.axis != .row or !pf.has_items or pf.has_other_children or pf.show_all or pf.items_other_attrs) return error.PivotShapeUnsupported;
+        if (pf.items_count) |n| if (n != pf.items.len) return error.MalformedPivotXml;
         if (pf.sort_type != .manual and pf.sort_type != .ascending) return error.PivotShapeUnsupported;
         try checkRowFieldAttrs(pf.attrs);
         for (pf.items) |it| if (it.other_attrs) return error.PivotShapeUnsupported;

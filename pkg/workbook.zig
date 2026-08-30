@@ -6348,10 +6348,11 @@ pub const Workbook = struct {
             // grown rectangle is a cell in the way.
             var grid = try self.readHostGrid(arena, t.sheet_idx, map, true);
             defer grid.deinit(arena);
+            const merges = try self.hostMerges(arena, t.sheet_idx, map);
             const captions = try self.hostCaptions(arena, base, &p.caches[ci], &grid);
             const lay = pivots_mod.engine.layout(arena, base, &p.caches[ci], rb, captions) catch |e| return mapEngineError(e);
             table_bytes[i] = lay.table_xml;
-            try self.planPivotHostWrite(prepared, t, lay, &grid);
+            try self.planPivotHostWrite(prepared, t, lay, &grid, merges);
         }
         for (p.tables, 0..) |t, i| {
             const bytes = table_bytes[i] orelse continue;
@@ -6391,6 +6392,27 @@ pub const Workbook = struct {
             return .{ .active = active, .axis = axis, .idx = idx, .kind = kind };
         }
 
+        /// A rectangle after the edit: null when the edit deletes it
+        /// whole (a one-row range on the deleted row).
+        fn mapRect(self: HostRowMap, r: pivots_mod.edit.Rect) ?pivots_mod.edit.Rect {
+            if (!self.active) return r;
+            var out = r;
+            const lo: *u32 = if (self.axis == .row) &out.tl_row else &out.tl_col;
+            const hi: *u32 = if (self.axis == .row) &out.br_row else &out.br_col;
+            switch (self.kind) {
+                .insert => {
+                    if (lo.* >= self.idx) lo.* += 1;
+                    if (hi.* >= self.idx) hi.* += 1;
+                },
+                .delete => {
+                    if (lo.* == self.idx and hi.* == self.idx) return null;
+                    if (lo.* > self.idx) lo.* -= 1;
+                    if (hi.* >= self.idx) hi.* -= 1;
+                },
+            }
+            return out;
+        }
+
         /// Null for the deleted row / column.
         fn map(self: HostRowMap, ref: CellRef) ?CellRef {
             if (!self.active) return ref;
@@ -6419,6 +6441,24 @@ pub const Workbook = struct {
     };
 
     const HostGrid = std.AutoHashMapUnmanaged(CellRef, HostCell);
+
+    /// The host's merged ranges in post-edit coordinates — a blank
+    /// merge holds no `<c>`, so the grid alone cannot see it in a
+    /// grown rectangle's way (Codex #206 r1 REL-103). A merge the
+    /// edit deletes whole is dropped; one it cuts through keeps its
+    /// remaining rows / columns.
+    fn hostMerges(self: *Workbook, arena: Allocator, sheet_idx: u32, map: HostRowMap) Error![]const pivots_mod.edit.Rect {
+        const ws = try self.sheet(sheet_idx);
+        const view = try ws.ensureParsed();
+        var out: std.ArrayListUnmanaged(pivots_mod.edit.Rect) = .empty;
+        for (view.merges) |m| {
+            const decoded = try store_mod.decodeXmlEntities(arena, m.ref);
+            // A merge the reader cannot place is one in the way.
+            const r = pivots_mod.edit.parseRect(decoded) orelse return error.PivotEditUnsafe;
+            if (map.mapRect(r)) |mapped| try out.append(arena, mapped);
+        }
+        return out.items;
+    }
 
     /// Every cell of a host sheet, keyed by its post-edit coordinates.
     /// Text is decoded (a shared string — plain, or its runs joined —
@@ -6535,15 +6575,29 @@ pub const Workbook = struct {
     /// cell holding anything — Excel refuses the overlap too. Styles
     /// carry by row kind: the header's, the last item row's, the
     /// grand total's, each per column.
-    fn planPivotHostWrite(self: *Workbook, prepared: *PreparedPivotEdits, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid) Error!void {
-        const write = try planHostWriteCells(prepared.arena.allocator(), t, lay, grid);
+    fn planPivotHostWrite(self: *Workbook, prepared: *PreparedPivotEdits, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid, merges: []const pivots_mod.edit.Rect) Error!void {
+        const write = try planHostWriteCells(prepared.arena.allocator(), t, lay, grid, merges);
         try prepared.host_writes.append(self.allocator, write);
     }
 
-    fn planHostWriteCells(a: Allocator, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid) Error!PivotHostWrite {
+    fn rectsIntersect(a: pivots_mod.edit.Rect, b: pivots_mod.edit.Rect) bool {
+        return a.tl_row <= b.br_row and b.tl_row <= a.br_row and a.tl_col <= b.br_col and b.tl_col <= a.br_col;
+    }
+
+    fn rectContains(outer: pivots_mod.edit.Rect, inner: pivots_mod.edit.Rect) bool {
+        return inner.tl_row >= outer.tl_row and inner.br_row <= outer.br_row and inner.tl_col >= outer.tl_col and inner.br_col <= outer.br_col;
+    }
+
+    fn planHostWriteCells(a: Allocator, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid, merges: []const pivots_mod.edit.Rect) Error!PivotHostWrite {
         const old = lay.old_rect;
         const new = lay.rect;
         var cells: std.ArrayListUnmanaged(PivotHostCell) = .empty;
+        // A merged range the new rectangle reaches, unless the old one
+        // held it whole (a pivot's own merged labels), is in the way
+        // as an occupied cell is.
+        for (merges) |m| {
+            if (rectsIntersect(m, new) and !rectContains(old, m)) return error.PivotEditUnsafe;
+        }
 
         // Style sources: the old rectangle's rows by kind.
         var header_row: ?u32 = old.tl_row;
@@ -6591,15 +6645,46 @@ pub const Workbook = struct {
         };
     }
 
-    /// S7b-5, the sweep's last step: the planned host cells written
-    /// over the host sheets as every other sweep left them — the
-    /// strings through the shared-string table (extended first, as a
-    /// save extends it), every host part in one `replaceParts`.
-    /// Writes to one sheet from several pivots merge into one emit —
-    /// their rectangles are disjoint (Excel refuses an overlap; the
-    /// growth check above refuses one into another's cells).
-    fn applyPivotHostWrites(self: *Workbook, host_writes: []const PivotHostWrite) Error!void {
-        if (host_writes.len == 0) return;
+    /// One host sheet's merged writes: several pivots on one sheet
+    /// emit once (their rectangles are disjoint — Excel refuses an
+    /// overlap; the growth check refuses one into another's cells).
+    const HostSheetWrites = struct {
+        sheet_idx: u32,
+        part_name: []const u8,
+        deltas: std.AutoHashMapUnmanaged(CellRef, CellValue) = .{},
+        styles: std.AutoHashMapUnmanaged(CellRef, ?u32) = .{},
+    };
+
+    /// Host writes rendered and not yet installed: every host part's
+    /// new bytes, the shared-string plan they index and, when the
+    /// table exists and gains strings, its regenerated bytes — so a
+    /// caller installs everything in one `replaceParts`, or nothing
+    /// (Codex #206 r1 REL-102).
+    const RenderedHostWrites = struct {
+        plan: SstExtensionPlan,
+        sst_bytes: ?[]u8 = null,
+        patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty,
+        sheets: std.ArrayListUnmanaged(HostSheetWrites) = .empty,
+
+        fn deinit(self: *RenderedHostWrites, a: Allocator) void {
+            self.plan.deinit(a);
+            if (self.sst_bytes) |b| a.free(b);
+            for (self.patches.items) |it| a.free(it.bytes);
+            self.patches.deinit(a);
+            for (self.sheets.items) |*ps| {
+                ps.deltas.deinit(a);
+                ps.styles.deinit(a);
+            }
+            self.sheets.deinit(a);
+            self.* = undefined;
+        }
+    };
+
+    /// S7b-5: the planned host cells rendered over the host sheets as
+    /// they are now — the strings resolved through the shared-string
+    /// table (extended as a save extends it), each host part emitted
+    /// with the cells as deltas and their styles. Reads only.
+    fn renderPivotHostWrites(self: *Workbook, host_writes: []const PivotHostWrite) Error!RenderedHostWrites {
         const a = self.allocator;
         var strings: std.ArrayListUnmanaged([]const u8) = .empty;
         defer strings.deinit(a);
@@ -6607,39 +6692,20 @@ pub const Workbook = struct {
             .shared_string => |txt| try strings.append(a, txt),
             else => {},
         };
-        var plan = try self.sstPlanForStrings(strings.items);
-        defer plan.deinit(a);
-        if (plan.has_new_strings) {
-            try applySstExtensionPlan(self, &plan);
-            if (self.sst_view) |*v| {
-                var view = v.*;
-                view.deinit(a);
-                self.sst_view = null;
-            }
-        }
-
-        const PerSheet = struct {
-            sheet_idx: u32,
-            part_name: []const u8,
-            deltas: std.AutoHashMapUnmanaged(CellRef, CellValue) = .{},
-            styles: std.AutoHashMapUnmanaged(CellRef, ?u32) = .{},
-        };
-        var sheets: std.ArrayListUnmanaged(PerSheet) = .empty;
-        defer {
-            for (sheets.items) |*ps| {
-                ps.deltas.deinit(a);
-                ps.styles.deinit(a);
-            }
-            sheets.deinit(a);
+        var out: RenderedHostWrites = .{ .plan = try self.sstPlanForStrings(strings.items) };
+        errdefer out.deinit(a);
+        if (out.plan.has_new_strings and out.plan.sst_part_exists) {
+            const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
+            out.sst_bytes = try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items);
         }
         for (host_writes) |hw| {
-            var slot: ?*PerSheet = null;
-            for (sheets.items) |*ps| if (ps.sheet_idx == hw.sheet_idx) {
+            var slot: ?*HostSheetWrites = null;
+            for (out.sheets.items) |*ps| if (ps.sheet_idx == hw.sheet_idx) {
                 slot = ps;
             };
             if (slot == null) {
-                try sheets.append(a, .{ .sheet_idx = hw.sheet_idx, .part_name = hw.sheet_part_name });
-                slot = &sheets.items[sheets.items.len - 1];
+                try out.sheets.append(a, .{ .sheet_idx = hw.sheet_idx, .part_name = hw.sheet_part_name });
+                slot = &out.sheets.items[out.sheets.items.len - 1];
             }
             const ps = slot.?;
             for (hw.cells) |c| {
@@ -6647,31 +6713,47 @@ pub const Workbook = struct {
                 try ps.styles.put(a, c.ref, c.style);
             }
         }
-
-        var patches: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
-        defer {
-            for (patches.items) |it| a.free(it.bytes);
-            patches.deinit(a);
-        }
-        for (sheets.items) |*ps| {
+        for (out.sheets.items) |*ps| {
             const ws = try self.sheet(ps.sheet_idx);
             const view = try ws.ensureParsed();
             const part = (try self.store.part(ps.part_name)) orelse return error.MissingSheetPart;
-            const new_xml = try emitSheetWithDeltasStyled(a, part.bytes, view, &ps.deltas, &plan, &ps.styles);
+            const new_xml = try emitSheetWithDeltasStyled(a, part.bytes, view, &ps.deltas, &out.plan, &ps.styles);
             errdefer a.free(new_xml);
-            try patches.append(a, .{ .name = ps.part_name, .bytes = new_xml });
+            try out.patches.append(a, .{ .name = ps.part_name, .bytes = new_xml });
         }
-        try self.store.replaceParts(patches.items);
-        for (sheets.items) |ps| {
+        return out;
+    }
+
+    /// The rendered host writes installed with `extra` (a caller's
+    /// pivot parts) in one `replaceParts`; a shared-string table the
+    /// workbook lacked is added first (the one step outside the
+    /// batch). Then the views the bytes replaced are dropped, and a
+    /// staged write inside a re-laid rectangle with them: the pivot's
+    /// cells are its own — the refresh overwrites a typed-over cell,
+    /// as Excel's does.
+    fn installPivotHostWrites(self: *Workbook, r: *RenderedHostWrites, extra: []const store_mod.PartStore.Replacement) Error!void {
+        const a = self.allocator;
+        if (r.plan.has_new_strings and !r.plan.sst_part_exists) try applySstExtensionPlan(self, &r.plan);
+        var all: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
+        defer all.deinit(a);
+        try all.appendSlice(a, extra);
+        if (r.sst_bytes) |b| try all.append(a, .{ .name = "xl/sharedStrings.xml", .bytes = b });
+        try all.appendSlice(a, r.patches.items);
+        if (all.items.len > 0) try self.store.replaceParts(all.items);
+        if (r.plan.has_new_strings) {
+            if (self.sst_view) |*v| {
+                var view = v.*;
+                view.deinit(a);
+                self.sst_view = null;
+            }
+        }
+        for (r.sheets.items) |ps| {
             const ws = try self.sheet(ps.sheet_idx);
             if (ws.parsed) |*v| {
                 var view = v.*;
                 view.deinit(a);
                 ws.parsed = null;
             }
-            // The pivot's cells are its own: a staged write inside a
-            // re-laid rectangle is overwritten by the refresh, as
-            // Excel's refresh overwrites a typed-over pivot cell.
             var it = ps.deltas.keyIterator();
             while (it.next()) |ref| {
                 if (ws.deltas.fetchRemove(ref.*)) |kv| switch (kv.value) {
@@ -6681,6 +6763,14 @@ pub const Workbook = struct {
                 };
             }
         }
+    }
+
+    /// The sweep's last step: render, then install.
+    fn applyPivotHostWrites(self: *Workbook, host_writes: []const PivotHostWrite) Error!void {
+        if (host_writes.len == 0) return;
+        var rendered = try self.renderPivotHostWrites(host_writes);
+        defer rendered.deinit(self.allocator);
+        try self.installPivotHostWrites(&rendered, &.{});
     }
 
     /// An SST extension plan for an explicit list of strings — what
@@ -7406,67 +7496,109 @@ pub const Workbook = struct {
         }
         var host_writes: std.ArrayListUnmanaged(PivotHostWrite) = .empty;
         defer host_writes.deinit(a);
-        const table_bytes = try arena.alloc(?[]const u8, p.tables.len);
-        @memset(table_bytes, null);
+        // Per cache, all or nothing: the rebuilt definition and
+        // records go in only with every consumer's part and cells;
+        // a cache with one consumer the slice cannot lay out takes
+        // the marker alone, whole (Codex #206 r1 REL-101). Only a
+        // resource failure is the save's.
         for (p.caches, affected, 0..) |*c, hit, ci| {
             if (!hit) continue;
+            const staged: ?StagedRefresh = self.stageCacheRefresh(arena, &p, ci, c) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
             var splices: std.ArrayListUnmanaged(pivots_mod.edit.Splice) = .empty;
             if (pivots_mod.edit.markerSplice(c.raw_xml, &c.definition)) |sp| try splices.append(arena, sp);
-            const rebuilt: ?pivots_mod.engine.Rebuild = self.rebuildPivotCacheFromWrites(arena, c) catch |e| switch (e) {
-                error.PivotEditUnsafe, error.MalformedPivotXml, error.MalformedSheetXml => null,
-                else => |other| return other,
-            };
-            if (rebuilt) |rb| {
-                try splices.appendSlice(arena, rb.splices);
-                if (rb.records) |bytes| {
+            if (staged) |st| {
+                try splices.appendSlice(arena, st.splices);
+                if (st.records) |bytes| {
                     const dup = try a.dupe(u8, bytes);
                     errdefer a.free(dup);
                     try patches.append(a, .{ .name = c.records_part_name.?, .bytes = dup });
                 }
-                for (p.tables, 0..) |t, i| {
-                    if (t.cache != ci) continue;
-                    const write = self.planConsumerForSave(arena, &p, i, c, &rb) catch |e| switch (e) {
-                        error.PivotEditUnsafe, error.MalformedPivotXml, error.MalformedSheetXml => continue,
-                        else => |other| return other,
-                    } orelse continue;
-                    table_bytes[i] = write.table_xml;
-                    try host_writes.append(a, write.host);
+                for (st.tables) |tb| {
+                    const dup = try a.dupe(u8, tb.bytes);
+                    errdefer a.free(dup);
+                    try patches.append(a, .{ .name = tb.part_name, .bytes = dup });
                 }
+                try host_writes.appendSlice(a, st.host_writes);
             }
             if (splices.items.len == 0) continue;
             const out = pivots_mod.edit.spliceAll(a, c.raw_xml, splices.items) catch |e| return mapPivotEditError(e);
             errdefer a.free(out);
             try patches.append(a, .{ .name = c.part_name, .bytes = out });
         }
-        for (p.tables, 0..) |t, i| {
-            const bytes = table_bytes[i] orelse continue;
-            if (std.mem.eql(u8, bytes, t.raw_xml)) continue;
-            const dup = try a.dupe(u8, bytes);
-            errdefer a.free(dup);
-            try patches.append(a, .{ .name = t.part_name, .bytes = dup });
+        // Every host part rendered before anything is installed. A
+        // host that cannot be rendered sends every cache back to the
+        // marker alone (Codex #206 r1 REL-102).
+        var rendered: ?RenderedHostWrites = if (host_writes.items.len > 0)
+            self.renderPivotHostWrites(host_writes.items) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            }
+        else
+            null;
+        defer if (rendered) |*r| r.deinit(a);
+        if (rendered == null and host_writes.items.len > 0) {
+            for (patches.items) |it| a.free(it.bytes);
+            patches.clearRetainingCapacity();
+            for (p.caches, affected) |*c, hit| {
+                if (!hit) continue;
+                const out = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+                errdefer a.free(out);
+                try patches.append(a, .{ .name = c.part_name, .bytes = out });
+            }
         }
-        if (patches.items.len > 0) try self.store.replaceParts(patches.items);
-        try self.applyPivotHostWrites(host_writes.items);
+        if (rendered) |*r| {
+            try self.installPivotHostWrites(r, patches.items);
+        } else if (patches.items.len > 0) {
+            try self.store.replaceParts(patches.items);
+        }
+    }
+
+    const StagedRefresh = struct {
+        splices: []const pivots_mod.edit.Splice,
+        records: ?[]const u8,
+        tables: []const TablePatch,
+        host_writes: []const PivotHostWrite,
+        const TablePatch = struct { part_name: []const u8, bytes: []const u8 };
+    };
+
+    /// One cache's refresh at save, staged whole: the rebuild, and
+    /// every consumer's part and cells. Any part of it the slice
+    /// cannot do fails the whole — the caller then marks alone.
+    fn stageCacheRefresh(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize, c: *const pivots_mod.PivotCache) Error!StagedRefresh {
+        const rb = (try self.rebuildPivotCacheFromWrites(arena, c)) orelse return error.PivotEditUnsafe;
+        var tables: std.ArrayListUnmanaged(StagedRefresh.TablePatch) = .empty;
+        var host_writes: std.ArrayListUnmanaged(PivotHostWrite) = .empty;
+        for (p.tables, 0..) |t, i| {
+            if (t.cache != ci) continue;
+            if (try consumerSeenBefore(p, i)) continue;
+            const write = try self.planConsumerForSave(arena, t, c, &rb);
+            if (!std.mem.eql(u8, write.table_xml, t.raw_xml)) try tables.append(arena, .{ .part_name = t.part_name, .bytes = write.table_xml });
+            try host_writes.append(arena, write.host);
+        }
+        return .{ .splices = rb.splices, .records = rb.records, .tables = tables.items, .host_writes = host_writes.items };
     }
 
     const ConsumerWrite = struct { table_xml: []const u8, host: PivotHostWrite };
 
-    /// One consumer of a rebuilt cache at save: null when the slice
-    /// leaves it to the marker — a part two sheets host or a second
-    /// relationship names, a host with staged appends (the emitter
-    /// places them after the sheet's last row, which a grown rectangle
-    /// may have moved), a form the layout refuses, a rectangle that
-    /// would grow over a cell.
-    fn planConsumerForSave(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, i: usize, c: *const pivots_mod.PivotCache, rb: *const pivots_mod.engine.Rebuild) Error!?ConsumerWrite {
-        const t = p.tables[i];
-        if (try consumerSeenBefore(p, i)) return null;
+    /// One consumer of a rebuilt cache at save. Refuses
+    /// (`PivotEditUnsafe`) what the slice leaves to the marker — a
+    /// host with staged appends (the emitter places them after the
+    /// sheet's last row, which a grown rectangle may have moved), a
+    /// form the layout refuses, a rectangle that would grow over a
+    /// cell or a merge.
+    fn planConsumerForSave(self: *Workbook, arena: Allocator, t: pivots_mod.PivotTable, c: *const pivots_mod.PivotCache, rb: *const pivots_mod.engine.Rebuild) Error!ConsumerWrite {
         const host = try self.sheet(t.sheet_idx);
-        if (host.appended_rows.items.len > 0) return null;
-        var grid = try self.readHostGrid(arena, t.sheet_idx, HostRowMap.forEdit(false, .row, 1, .insert), true);
+        if (host.appended_rows.items.len > 0) return error.PivotEditUnsafe;
+        const map = HostRowMap.forEdit(false, .row, 1, .insert);
+        var grid = try self.readHostGrid(arena, t.sheet_idx, map, true);
         defer grid.deinit(arena);
+        const merges = try self.hostMerges(arena, t.sheet_idx, map);
         const captions = try self.hostCaptions(arena, t.raw_xml, c, &grid);
         const lay = pivots_mod.engine.layout(arena, t.raw_xml, c, rb, captions) catch |e| return mapEngineError(e);
-        const write = try planHostWriteCells(arena, t, lay, &grid);
+        const write = try planHostWriteCells(arena, t, lay, &grid, merges);
         return .{ .table_xml = lay.table_xml, .host = write };
     }
 
