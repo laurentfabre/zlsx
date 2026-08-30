@@ -6182,8 +6182,12 @@ export fn zlsx_editor_rename_table_column(
 /// table in host-sheet order, then one `{"kind":"pivot_cache",…}` line
 /// per cache no table reads — as a library-allocated UTF-8 buffer,
 /// byte-for-byte what `zlsx pivots <file>` prints (`docs/cli.md`,
-/// "pivots"). Read over the editor's current state, staged edits
-/// included. A workbook without pivots is ZLSX_OK with `(NULL, 0)`.
+/// "pivots"). Read over the editor's current workbook state:
+/// structural edits are visible immediately; staged `set_cell` /
+/// `append_row` writes reach the pivot graph at save (a cache whose
+/// source they change is rebuilt or marked then, S7b) — save, then
+/// read, to see them (Codex #207 r7 REL-701). A workbook without
+/// pivots is ZLSX_OK with `(NULL, 0)`.
 /// A graph that cannot be read whole refuses (`MalformedPivotXml`,
 /// -2). Release with `zlsx_buffer_release`.
 export fn zlsx_editor_pivots_ndjson(
@@ -7433,6 +7437,41 @@ test "S3a pivots_ndjson: the package writer's bytes, empty on a plain workbook, 
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_pivots_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expect(out_ptr == null);
+    }
+    // The timing the contract states (r7 REL-701): a staged cell write
+    // inside the source is invisible to the read until save; the saved
+    // workbook reopens with the cache rebuilt and marked.
+    {
+        const path = try tt.path(alloc, io, "s3a_pivots_staged.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.write(alloc, io, path, .sheet_ref);
+        const out_path = try tt.path(alloc, io, "s3a_pivots_staged_out.xlsx");
+        defer alloc.free(out_path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        // B2 (Qty of the first record) 3 → 9: inside the source rect.
+        const cell = toCCell(.{ .integer = 9 });
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 2, 1, &cell, &err_buf, err_buf.len));
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_pivots_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        // Byte-for-byte the pre-write record: the staged delta has not
+        // reached the graph.
+        try std.testing.expectEqualStrings(zlsx_pkg.pivots.ndjson.fixture_sheet_ref_record, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+        const ed2 = zlsx_editor_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed2);
+        out_ptr = null;
+        out_len = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_pivots_ndjson(ed2, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const got = out_ptr.?[0..out_len];
+        // The save refreshed the cache: marked, and the write visible
+        // in the rebuilt inventory (Qty max 5 → 9).
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"refresh_on_load\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"max\":\"9\"") != null);
     }
     // No pivots: success, nothing to release.
     {

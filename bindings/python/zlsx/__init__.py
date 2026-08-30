@@ -3732,8 +3732,12 @@ class Editor:
         one ``{"kind": "pivot_cache", "cache": {…}}`` record per cache
         no table reads — the shape frozen at the S6 gate, parsed from
         the same NDJSON bytes the CLI prints. Read over the editor's
-        current state, staged edits included; ``[]`` for a workbook
-        without pivots. A graph that cannot be read whole raises
+        current workbook state: structural edits (rows, columns,
+        sheets, table columns) are visible immediately; staged
+        :meth:`set_cell` / :meth:`append_rows` writes reach the pivot
+        graph at :meth:`save`, where a cache whose source they change
+        is rebuilt or marked — save, then read, to see them. ``[]``
+        for a workbook without pivots. A graph that cannot be read whole raises
         :class:`ZlsxRefusal` (``MalformedPivotXml``) rather than a
         partial inventory."""
         if not self._handle:

@@ -280,8 +280,11 @@ checked before the call — ctypes would otherwise truncate or wrap them.
 ([docs/cli.md](../../docs/cli.md), "pivots"), parsed from the same bytes:
 `{"kind": "pivot", …}` per pivot table in host-sheet order, then
 `{"kind": "pivot_cache", …}` per cache no table reads; `[]` for a
-workbook without pivots. It reads the editor's current state, staged
-edits included — rename the host sheet and the record names it.
+workbook without pivots. It reads the editor's current workbook state:
+structural edits are visible immediately — rename the host sheet and
+the record names it — while staged `set_cell` / `append_rows` writes
+reach the pivot graph at `save`, where a cache whose source they change
+is rebuilt or marked; save, then read, to see them.
 
 ## Spark (PySpark Data Source)
 

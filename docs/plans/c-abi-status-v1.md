@@ -403,7 +403,11 @@ prints through too — in a library-allocated buffer released with
 frozen contract, drifting on its own schedule. Python parses one JSON
 object per line (`Editor.pivots()` / `zlsx.pivots(path)`); a C caller
 parses with whatever it has. The read runs over the editor's current
-state, staged edits included. The buffer is built by
+workbook state — structural edits visible immediately, staged
+`set_cell` / `append_row` writes only after `save` refreshes or marks
+the caches they touch (r7 REL-701 narrowed the claim; the alternative,
+a non-mutating overlay read, is S8-adjacent machinery this row does
+not need). The buffer is built by
 `c_abi.zig::pivotsNdjsonOwned(alloc, wb)`: the allocating writer reports
 a failed growth as `WriteFailed`, which the builder maps to
 `OutOfMemory` so the boundary answers `-3`, never a generic `-1`
