@@ -8479,6 +8479,8 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole �
         .{ .name = "std_dev", .old = "fld=\"1\" baseField", .new = "fld=\"1\" subtotal=\"stdDev\" baseField" },
         .{ .name = "percent", .old = "fld=\"1\" baseField", .new = "fld=\"1\" showDataAs=\"percentOfTotal\" baseField" },
         .{ .name = "tabular", .old = "outline=\"1\"", .new = "outline=\"1\" compact=\"0\"" },
+        // Codex #206 r5 REL-501: the field's own `compact="0"`.
+        .{ .name = "field_tabular", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" compact=\"0\">" },
         .{ .name = "descending", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" sortType=\"descending\">" },
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
@@ -8974,4 +8976,50 @@ test "S7b-5: a product grand total folds the subtotals as a sum does (Codex #206
     try expectHostCell(&wb, 1, "B4", .{ .number = 0.06999999999999999 });
     try expectHostCell(&wb, 1, "B5", .{ .number = 3 });
     try expectHostCell(&wb, 1, "B6", .{ .number = 0.20999999999999996 });
+}
+
+test "S7b-5: a staged write over a source cell the read refuses is read as the write; a rich inline caption is joined whole (Codex #206 r5 REL-502, REL-503)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r5_dst.xlsx");
+    defer a.free(dst);
+    {
+        // `B3` holds an uncomputed formula — refused as read — and a
+        // staged 9 replaces it: the rebuild sees 9.
+        const src = try tt.path(a, io, "s7b5_r5_overlay.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet1.xml", "<c r=\"B3\"><v>4</v></c>", "<c r=\"B3\"><f>2+2</f></c>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 3, 1, .{ .integer = 9 });
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheRecords1.xml", "<r><x v=\"1\"/><n v=\"9\"/><n v=\"2.5\"/></r>");
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "B5", .{ .number = 9 });
+        try expectHostCell(&wb, 1, "B6", .{ .number = 17 });
+    }
+    {
+        // The host's captions as two-run inline strings.
+        const src = try tt.path(a, io, "s7b5_r5_rich.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><r><t>Étiquettes </t></r><r><rPr><b/></rPr><t>de lignes</t></r></is></c></row><row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><r><t>Total </t></r><r><t>général</t></r></is></c></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Étiquettes de lignes" });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Total général" });
+    }
 }

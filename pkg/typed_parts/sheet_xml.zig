@@ -54,6 +54,10 @@ pub const Cell = struct {
     raw_value: ?[]const u8,
     /// Raw inner text of `<f>`. Borrows. Not rewritten.
     formula: ?[]const u8,
+    /// An inline string's whole `<is>` body, raw — its runs, where
+    /// `raw_value` is the first `<t>` alone. Borrows. Null for every
+    /// other cell.
+    inline_body: ?[]const u8 = null,
 };
 
 pub const Row = struct {
@@ -566,12 +570,14 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
         const self_closing = c_open_end > c_open and row_body[c_open_end - 1] == '/';
         var raw_value: ?[]const u8 = null;
         var formula: ?[]const u8 = null;
+        var inline_body: ?[]const u8 = null;
         if (!self_closing) {
             const c_close = std.mem.indexOfPos(u8, row_body, c_open_end, "</c>") orelse
                 return error.MalformedXml;
             const c_body = row_body[c_open_end + 1 .. c_close];
             raw_value = extractCellValue(c_body, cell_type);
             formula = extractInner(c_body, "<f", "</f>");
+            if (cell_type == .inline_string) inline_body = extractInlineBody(c_body);
             probe = c_close + "</c>".len;
         } else {
             probe = c_open_end + 1;
@@ -584,6 +590,7 @@ fn parseCells(a: std.mem.Allocator, row_body: []const u8, unaddressed: *u32) Par
             .cell_type = cell_type,
             .cell_type_invalid = cell_type_invalid,
             .raw_value = raw_value,
+            .inline_body = inline_body,
             .formula = formula,
         });
     }
@@ -603,6 +610,14 @@ fn parseCellType(raw: ?[]const u8) ?CellType {
     if (std.mem.eql(u8, t, "e")) return .error_value;
     if (std.mem.eql(u8, t, "d")) return .date;
     return null;
+}
+
+/// The inner bytes of `<is>…</is>`, when the cell has one.
+fn extractInlineBody(c_body: []const u8) ?[]const u8 {
+    const is_open = std.mem.indexOf(u8, c_body, "<is") orelse return null;
+    const is_open_end = findTagEnd(c_body, is_open) orelse return null;
+    const is_close = std.mem.indexOfPos(u8, c_body, is_open_end, "</is>") orelse return null;
+    return c_body[is_open_end + 1 .. is_close];
 }
 
 fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {

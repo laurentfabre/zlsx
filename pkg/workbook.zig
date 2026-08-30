@@ -6509,7 +6509,15 @@ pub const Workbook = struct {
                             };
                         };
                     },
-                    .inline_string, .formula_string => if (cell.raw_value) |raw| {
+                    .formula_string => if (cell.raw_value) |raw| {
+                        hc.text = try sst_xml_mod.decodeText(arena, raw);
+                    },
+                    // The typed view keeps an inline string's first
+                    // `<t>` only; a rich one is its runs joined (Codex
+                    // #206 r5 REL-503).
+                    .inline_string => if (cell.inline_body) |body| {
+                        hc.text = try inlineStringText(arena, body);
+                    } else if (cell.raw_value) |raw| {
                         hc.text = try sst_xml_mod.decodeText(arena, raw);
                     },
                     else => {},
@@ -6544,6 +6552,29 @@ pub const Workbook = struct {
             }
         }
         return grid;
+    }
+
+    /// An inline string whole: every `<t>` of its `<is>` body, decoded
+    /// and joined — the view's `raw_value` is the first run alone.
+    fn inlineStringText(arena: Allocator, body: []const u8) Error![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, body, pos, "<t")) |lt| {
+            const gt = std.mem.indexOfScalarPos(u8, body, lt, '>') orelse break;
+            const boundary: u8 = if (lt + 2 < body.len) body[lt + 2] else 0;
+            if (boundary != '>' and boundary != ' ' and boundary != '\t' and boundary != '\n' and boundary != '\r' and boundary != '/') {
+                pos = lt + 2;
+                continue;
+            }
+            if (body[gt - 1] == '/') {
+                pos = gt + 1;
+                continue;
+            }
+            const close = std.mem.indexOfPos(u8, body, gt + 1, "</t>") orelse break;
+            try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[gt + 1 .. close]));
+            pos = close + "</t>".len;
+        }
+        return out.items;
     }
 
     /// The captions the host spells today, read where the part as it
@@ -7553,8 +7584,12 @@ pub const Workbook = struct {
                 const ci = col - rect.tl_col;
                 if (seen_cell[gi].?[ci]) return error.MalformedSheetXml;
                 seen_cell[gi].?[ci] = true;
-                grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
+                // A cell a staged write replaces is read as the write,
+                // not as what it was (Codex #206 r5 REL-502): its
+                // style still counts, for a number's date check.
+                const replaced = with_writes and ws.deltas.contains(.{ .row = row.row_idx, .col = col });
                 if (with_writes) try styles_in_rect.put(arena, .{ .row = row.row_idx, .col = col }, cell.style_idx);
+                if (!replaced) grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
             }
         }
         if (with_writes) try self.overlayStagedWrites(arena, ws, rect, grid, blank_row, &styles_in_rect, &date_styles);

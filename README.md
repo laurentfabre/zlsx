@@ -501,10 +501,11 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
   that changes a source's *content* refreshes the pivot the way Excel would —
   the cache rebuilt from the cells, its consumers re-laid, their output cells
   rewritten (S7b, `goal_sigmoid.md`) — for the report forms the engine lays
-  out (one row field, the values axis, plain aggregates); every other form
-  refuses the edit rather than corrupt it, and the cache is still marked to
-  refresh at open. The typed read, `Workbook.pivotTables` / `zlsx pivots`,
-  names every host and source sheet.
+  out (one row field, the values axis, plain aggregates). Every rebuilt
+  cache stays marked to refresh at open; a form the engine does not lay out
+  refuses a structural edit rather than corrupt it, and leaves a cell-write
+  save at that marker alone. The typed read, `Workbook.pivotTables` /
+  `zlsx pivots`, names every host and source sheet.
 - **Chart authoring** — extraction is in; typed chart emission is not. Image
   authoring exists on the `Workbook` editing layer only (writer matrix
   footnote ⁵); the fresh `Writer` has none yet.

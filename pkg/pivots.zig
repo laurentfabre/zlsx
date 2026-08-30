@@ -3403,7 +3403,10 @@ pub const engine = struct {
 
     /// Attributes of the row field that would change what the layout
     /// shows: a top-N filter (`autoShow`), a custom subtotal set, a
-    /// multi-select filter, a blank row after each item.
+    /// multi-select filter, a blank row after each item — and the
+    /// field's own `compact="0"`, which lays its labels out under
+    /// the field's name rather than `Row Labels` (Codex #206 r5
+    /// REL-501).
     fn checkRowFieldAttrs(attrs: []const u8) RebuildError!void {
         var it: pivot_xml.AttrIter = .{ .attrs = attrs };
         while (it.next()) |a| {
@@ -3411,10 +3414,14 @@ pub const engine = struct {
             const flagged = std.mem.eql(u8, n, "autoShow") or std.mem.eql(u8, n, "multipleItemSelectionAllowed") or
                 std.mem.eql(u8, n, "hideNewItems") or std.mem.eql(u8, n, "insertBlankRow") or
                 (std.mem.endsWith(u8, n, "Subtotal") and !std.mem.eql(u8, n, "defaultSubtotal"));
-            if (!flagged) continue;
+            const must_hold = std.mem.eql(u8, n, "compact");
+            if (!flagged and !must_hold) continue;
             var buf: [32]u8 = undefined;
             const v = wbxml.decodeScalarAttr(&buf, a.value) orelse return error.PivotShapeUnsupported;
-            if (!(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"))) return error.PivotShapeUnsupported;
+            const is_false = std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            const is_true = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+            if (flagged and !is_false) return error.PivotShapeUnsupported;
+            if (must_hold and !is_true) return error.PivotShapeUnsupported;
         }
     }
 
