@@ -844,8 +844,27 @@ pub fn matchTagAt(src: []const u8, i: usize, tag: []const u8) ?TagOpen {
     if (!std.mem.eql(u8, src[i + 1 .. i + 1 + tag.len], tag)) return null;
     const c = src[after];
     if (c != ' ' and c != '\t' and c != '\n' and c != '\r' and c != '/' and c != '>') return null;
-    const gt = std.mem.indexOfScalarPos(u8, src, i, '>') orelse return null;
+    const gt = tagEnd(src, i) orelse return null;
     return .{ .start = i, .after_open = gt + 1 };
+}
+
+/// The `>` that closes the start tag opened at `lt` — a `>` inside a
+/// quoted attribute value is data, not the end (Codex #206 r13
+/// REL-1302). Null when the tag never closes.
+pub fn tagEnd(src: []const u8, lt: usize) ?usize {
+    var i = lt + 1;
+    var quote: ?u8 = null;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (quote) |q| {
+            if (c == q) quote = null;
+        } else if (c == '"' or c == '\'') {
+            quote = c;
+        } else if (c == '>') {
+            return i;
+        }
+    }
+    return null;
 }
 
 fn processRowTag(

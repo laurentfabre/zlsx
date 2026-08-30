@@ -9214,3 +9214,54 @@ test "S7b-5: a rectangle may not grow into another pivot's declared footprint, e
     defer store.deinit();
     try expectPartHas(&store, pt_part, "<location ref=\"A3:B5\"");
 }
+
+test "S7b-5: a pivot whose rectangle overlaps its own source — the edit refuses, the save marks alone; a `>` inside a quoted attribute is not a tag's end (Codex #206 r13 REL-1301, REL-1302)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r13_dst.xlsx");
+    defer a.free(dst);
+    {
+        // The pivot at `A7:B10` on `Data`, and a source `A1:C9` that
+        // reaches into it.
+        const src = try tt.path(a, io, "s7b5_r13_self.xlsx");
+        defer a.free(src);
+        try writeHostOnSourceFixture(io, src, false);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", "ref=\"A1:C4\"", "ref=\"A1:C9\"");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        try expectPartHas(&store, "xl/worksheets/sheet1.xml", "<c r=\"A10\" s=\"7\" t=\"inlineStr\"><is><t>Total général</t></is></c>");
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r13_quoted.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"4\" xml:lang=\"a>b\"><c r=\"A4\" xml:lang=\"c>d\" t=\"inlineStr\"><is><t>East</t></is></c><c r=\"D4\" xml:lang=\"e>f\"><v>1</v></c></row></sheetData>");
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", "<dimension xml:lang=\"g>h\" ref=\"A1\"/><sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<dimension xml:lang=\"g>h\" ref=\"A1:B7\"/>");
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<row r=\"4\" xml:lang=\"a>b\"><c r=\"A4\"");
+        try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<c r=\"D4\" xml:lang=\"e>f\"><v>1</v></c></row>");
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    }
+}

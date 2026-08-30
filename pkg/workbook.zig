@@ -7048,7 +7048,7 @@ pub const Workbook = struct {
             const after = wbxml_typed.skipNonElement(src, lt) catch return error.MalformedSheetXml;
             return .{ .lt = lt, .after = after, .kind = .non_element };
         }
-        const gt = std.mem.indexOfScalarPos(u8, src, lt, '>') orelse return error.MalformedSheetXml;
+        const gt = sheet_edit.tagEnd(src, lt) orelse return error.MalformedSheetXml;
         return .{ .lt = lt, .after = gt + 1, .kind = if (c == '/') .close else .open };
     }
 
@@ -8117,6 +8117,12 @@ pub const Workbook = struct {
         const State = enum { undecided, kept, dropped };
         const state = try arena.alloc(State, n);
         for (candidate, state) |c, *st| st.* = if (c) .undecided else .dropped;
+        // A pivot writing into its own source is a cycle of one: its
+        // rebuild read the cells its layout overwrites (Codex #206 r13
+        // REL-1301).
+        for (0..n) |i| if (edges[i * n + i]) {
+            state[i] = .dropped;
+        };
         while (true) {
             var moved = false;
             var undecided = false;
@@ -24943,6 +24949,11 @@ test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    // A pivot writing into its own source: a cycle of one, dropped.
+    {
+        const kept = try Workbook.peelStagings(arena, &.{true}, &.{true}, 1);
+        try std.testing.expectEqualSlices(bool, &.{false}, kept);
+    }
     // A(0) → B(2) → C(1): C is visited before B; A and C stand, B falls.
     {
         var edges = [_]bool{false} ** 9;
