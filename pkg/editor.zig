@@ -8452,7 +8452,7 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool = false, old2: ?[]const u8 = null, new2: []const u8 = "", direct: anyerror = error.PivotEditUnsafe };
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool = false, old2: ?[]const u8 = null, new2: []const u8 = "", old3: ?[]const u8 = null, new3: []const u8 = "", direct: anyerror = error.PivotEditUnsafe };
     const cases = [_]Case{
         .{ .name = "page", .old = "<dataFields count=\"1\">", .new = "<pageFields count=\"1\"><pageField fld=\"2\" hier=\"-1\"/></pageFields><dataFields count=\"1\">" },
         // Codex #206 r1 REL-104: a container whose count disagrees
@@ -8485,6 +8485,10 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r8 REL-801: no grand total, or column totals off â€”
+        // consistent with themselves, still not the one form.
+        .{ .name = "no_grand_total", .old = "outline=\"1\"", .new = "outline=\"1\" rowGrandTotals=\"0\"", .old2 = "<rowItems count=\"3\"><i><x/></i><i><x v=\"1\"/></i><i t=\"grand\"><x/></i></rowItems>", .new2 = "<rowItems count=\"2\"><i><x/></i><i><x v=\"1\"/></i></rowItems>", .old3 = "ref=\"A3:B6\"", .new3 = "ref=\"A3:B5\"" },
+        .{ .name = "col_grand_totals_off", .old = "outline=\"1\"", .new = "outline=\"1\" colGrandTotals=\"0\"" },
         // Codex #206 r6 REL-602: the area's own `field`.
         .{ .name = "chart_area_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" field=\"0\"/></chartFormat></chartFormats><pivotTableStyleInfo" },
         .{ .name = "chart_area_values", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" field=\"4294967294\"/></chartFormat></chartFormats><pivotTableStyleInfo", .admitted = true },
@@ -8499,6 +8503,7 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, case.old, case.new);
         if (case.old2) |old2| try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, old2, case.new2);
+        if (case.old3) |old3| try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, old3, case.new3);
         var wb = try Workbook.open(std.testing.allocator, io, src);
         defer wb.deinit();
         const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);

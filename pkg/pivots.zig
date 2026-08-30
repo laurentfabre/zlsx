@@ -3321,7 +3321,13 @@ pub const engine = struct {
         for (rb.fields, 0..) |f, k| {
             if (f.index_of_row.len != rb.rows.len) return error.MalformedPivotXml;
             for (f.items) |it| switch (it.kind) {
-                .s, .n, .m => {},
+                .s, .m => {},
+                // A number's spelling and its value are one thing
+                // (Codex #206 r8 REL-802).
+                .n => {
+                    const x = parseNumber(it.lex) orelse return error.MalformedPivotXml;
+                    if (!std.math.isFinite(it.num) or x != it.num) return error.MalformedPivotXml;
+                },
                 else => return error.MalformedPivotXml,
             };
             if (f.indexed) {
@@ -3342,6 +3348,10 @@ pub const engine = struct {
     fn checkTableShape(arena: Allocator, def: *const pivot_xml.TableDefinition, cache: *const PivotCache, rb: *const Rebuild) RebuildError!void {
         if (def.has_other_children or def.chart_formats == .other) return error.PivotShapeUnsupported;
         if (def.page_fields.len != 0 or def.data_on_rows or !def.compact) return error.PivotShapeUnsupported;
+        // The one form has its grand total; a layout without one, or
+        // with the column totals off, is not oracled (Codex #206 r8
+        // REL-801).
+        if (!def.row_grand_totals or !def.col_grand_totals) return error.PivotShapeUnsupported;
         if (def.fields.len != cache.definition.fields.len or rb.fields.len != def.fields.len) return error.MalformedPivotXml;
         if (def.row_fields.len != 1 or def.row_fields[0] != .field) return error.PivotShapeUnsupported;
         const rf = def.row_fields[0].field;
@@ -7210,5 +7220,23 @@ test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed,
         rows[0] = row;
         rb.rows = rows;
         try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // An indexed numeric item whose spelling is not the grammar's, or
+    // not its value (Codex #206 r8 REL-802).
+    {
+        const bad = [_]engine.Field.Item{
+            .{ .raw = null, .kind = .n, .lex = "0x1p0", .num = 1 },
+            .{ .raw = null, .kind = .n, .lex = "1", .num = 2 },
+            .{ .raw = null, .kind = .n, .lex = "1", .num = std.math.inf(f64) },
+        };
+        for (bad) |item| {
+            var rb = good;
+            const fields = try arena.dupe(engine.Field, good.fields);
+            const items = try arena.dupe(engine.Field.Item, good.fields[0].items);
+            items[0] = item;
+            fields[0].items = items;
+            rb.fields = fields;
+            try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+        }
     }
 }
