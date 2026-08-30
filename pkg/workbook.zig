@@ -10017,6 +10017,10 @@ fn emitSstXmlForExtension(
     var bpos = body_start;
     while (try Workbook.nextMarkup(src_xml, bpos, src_xml.len)) |m| {
         bpos = m.after;
+        // A root inside the root is a table whose entries the parser
+        // and the writer would number differently (Codex #206 r17
+        // SEC-1701): refused, not walked around.
+        if (m.kind == .open and sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
         if (m.kind == .close and Workbook.closeTagIs(src_xml, m, "sst")) {
             close_at = m.lt;
             break;

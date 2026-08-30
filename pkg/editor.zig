@@ -9500,3 +9500,30 @@ test "S7b-5: a cell inside a cell is not a grid; a padded `</is >` is a caption,
         try expectHostCell(&wb, 1, "A3", .{ .text = "Région" });
     }
 }
+
+test "S7b-5: a shared-string root nested in the root refuses the edit and leaves the save at the marker (Codex #206 r17 SEC-1701)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r17_nested_sst.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r17_nested_sst_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/sharedStrings.xml", "><si>", "><sst></sst><si>");
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const before = try a.dupe(u8, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+    defer a.free(before);
+    try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+    try std.testing.expectEqualStrings(before, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    try ed.setCell(0, 2, 0, .{ .string = "Central" });
+    try ed.save(io, dst);
+    try expectMarkerOnly(io, src, dst);
+}
