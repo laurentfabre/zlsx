@@ -8485,6 +8485,10 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole �
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r16 REL-1603: display options that change the cells.
+        .{ .name = "show_headers_off", .old = "outline=\"1\"", .new = "outline=\"1\" showHeaders=\"0\"" },
+        .{ .name = "missing_caption", .old = "outline=\"1\"", .new = "outline=\"1\" showMissing=\"1\" missingCaption=\"N/A\"" },
+        .{ .name = "merge_item", .old = "outline=\"1\"", .new = "outline=\"1\" mergeItem=\"1\"" },
         // Codex #206 r15 REL-1504: an area selecting by axis, or proving
         // nothing.
         .{ .name = "chart_area_axis_row", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" axis=\"axisRow\"/></chartFormat></chartFormats><pivotTableStyleInfo" },
@@ -9385,5 +9389,114 @@ test "S7b-5: a decoy shared-string root, a quoted `>` on it and a lying uniqueCo
         try std.testing.expect((try wb.sst()).?.total_count != null);
         try wb.deleteRow(0, 3);
         try std.testing.expect((try wb.sst()).?.total_count == null);
+    }
+}
+
+test "S7b-5: a cell inside a cell is not a grid; a padded `</is >` is a caption, and a cell; a merge the insert would push off the grid refuses; a deleted delta keeps its style donor; rowHeaderCaption is the header (Codex #206 r16 SEC-1601, REL-1601, REL-1602, REL-1604, REL-1603)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r16_dst.xlsx");
+    defer a.free(dst);
+    {
+        // A cell directly inside a cell is no grid: refused, marker
+        // alone at save.
+        const src = try tt.path(a, io, "s7b5_r16_nested.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"4\"><c r=\"A4\"><c r=\"Z99\"><v>1</v></c><v>2</v></c></row></sheetData>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        // The rehearsed render refuses it, as the typed refusal.
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+        // One wrapped in an element the walk steps over whole is
+        // replaced with its wrapper — no stray close left behind.
+        const wrapped = try tt.path(a, io, "s7b5_r16_wrapped.xlsx");
+        defer a.free(wrapped);
+        try pivots_mod.fixture.write(a, io, wrapped, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, wrapped, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"4\"><c r=\"A4\"><foo><c r=\"Z99\"><v>1</v></c></foo><v>2</v></c><c r=\"D4\"><bar><c r=\"Z98\"/></bar><v>3</v></c></row></sheetData>");
+        var ed2 = try Editor.open(a, io, wrapped);
+        defer ed2.deinit();
+        try ed2.insertRow(0, 2);
+        try ed2.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const host = (try store.part("xl/worksheets/sheet2.xml")).?.bytes;
+        try std.testing.expect(std.mem.indexOf(u8, host, "<foo>") == null);
+        try std.testing.expect(std.mem.indexOf(u8, host, "<c r=\"D4\"><bar><c r=\"Z98\"/></bar><v>3</v></c></row>") != null);
+        var wb2 = try Workbook.open(a, io, dst);
+        defer wb2.deinit();
+        try expectHostCell(&wb2, 1, "A4", .{ .text = "East" });
+    }
+    {
+        // `</is >` on the header caption and on a cell right under the
+        // rectangle: the caption is kept, the cell is in the way.
+        const src = try tt.path(a, io, "s7b5_r16_padded.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>Étiquettes de lignes</t></is ></c></row><row r=\"7\"><c r=\"A7\" t=\"inlineStr\"><is><t>note</t></is ></c></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.deleteRow(0, 3);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Étiquettes de lignes" });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "note" });
+    }
+    {
+        // A blank merge on the grid's last row of the edited host.
+        const src = try tt.path(a, io, "s7b5_r16_edge.xlsx");
+        defer a.free(src);
+        try writeHostOnSourceFixture(io, src, false);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet1.xml", "</sheetData>", "</sheetData><mergeCells count=\"1\"><mergeCell ref=\"D1048576:E1048576\"/></mergeCells>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    }
+    {
+        // The grand total's label deleted in the same save: its style
+        // still dresses the regenerated grand-total row.
+        const src = try tt.path(a, io, "s7b5_r16_donor.xlsx");
+        defer a.free(src);
+        try writeHostOnSourceFixture(io, src, false);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        const host = try ed.workbook.sheet(0);
+        try host.deleteCell("A10");
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        // The label the user deleted is gone as a caption to reuse —
+        // the default stands — but its style dresses the new row.
+        try expectHostCell(&wb, 0, "A11", .{ .text = "Grand Total" });
+        try expectHostStyle(&wb, 0, "A11", 7);
+        try expectHostStyle(&wb, 0, "B11", 8);
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r16_caption.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "outline=\"1\"", "outline=\"1\" rowHeaderCaption=\"R&#233;gion\"");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Région" });
     }
 }

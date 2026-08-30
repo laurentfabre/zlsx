@@ -3244,7 +3244,10 @@ pub const engine = struct {
 
         // The cells.
         var cells: std.ArrayListUnmanaged(OutCell) = .empty;
-        try cells.append(arena, .{ .row = rect.tl_row, .col = rect.tl_col, .value = .{ .string = captions.row_labels orelse "Row Labels" }, .kind = .header });
+        // The header's caption: the definition's own where it spells
+        // one (`rowHeaderCaption`), else the host's, else the default.
+        const row_labels: []const u8 = if (def.row_header_caption) |c| try decodeItem(arena, c) else captions.row_labels orelse "Row Labels";
+        try cells.append(arena, .{ .row = rect.tl_row, .col = rect.tl_col, .value = .{ .string = row_labels }, .kind = .header });
         for (def.data_fields, 0..) |df, j| {
             const caption = if (df.name) |n| try decodeItem(arena, n) else try defaultCaption(arena, df.subtotal, cache.field_names[df.fld]);
             try cells.append(arena, .{ .row = rect.tl_row, .col = rect.tl_col + 1 + @as(u32, @intCast(j)), .value = .{ .string = caption }, .kind = .header });
@@ -3380,6 +3383,7 @@ pub const engine = struct {
         if (def.has_other_children or def.chart_formats == .other or def.axes_other) return error.PivotShapeUnsupported;
         if (def.axes_count_mismatch) return error.MalformedPivotXml;
         if (def.page_fields.len != 0 or def.data_on_rows or !def.compact) return error.PivotShapeUnsupported;
+        try checkRootDisplayAttrs(def.root_attrs);
         // The one form has its grand total; a layout without one, or
         // with the column totals off, is not oracled (Codex #206 r8
         // REL-801).
@@ -3478,6 +3482,29 @@ pub const engine = struct {
                 .sum, .average, .min, .max, .product, .count, .count_nums => {},
                 .std_dev, .std_dev_p, .variance, .variance_p, .unknown => return error.PivotShapeUnsupported,
             }
+        }
+    }
+
+    /// Root display options that change what the cells hold, which
+    /// the layout neither models nor oracles (Codex #206 r16
+    /// REL-1603): headers hidden, a missing-value caption, merged
+    /// labels, empty rows / columns shown, an error caption,
+    /// asterisked or non-visual totals, hidden items subtotalled.
+    fn checkRootDisplayAttrs(attrs: []const u8) RebuildError!void {
+        var it: pivot_xml.AttrIter = .{ .attrs = attrs };
+        while (it.next()) |a| {
+            const n = a.name;
+            if (std.mem.eql(u8, n, "missingCaption") or std.mem.eql(u8, n, "errorCaption")) return error.PivotShapeUnsupported;
+            const must_hold = std.mem.eql(u8, n, "showHeaders") or std.mem.eql(u8, n, "showMissing") or std.mem.eql(u8, n, "visualTotals");
+            const must_not = std.mem.eql(u8, n, "mergeItem") or std.mem.eql(u8, n, "showEmptyRow") or std.mem.eql(u8, n, "showEmptyCol") or
+                std.mem.eql(u8, n, "showError") or std.mem.eql(u8, n, "asteriskTotals") or std.mem.eql(u8, n, "subtotalHiddenItems");
+            if (!must_hold and !must_not) continue;
+            var buf: [32]u8 = undefined;
+            const v = wbxml.decodeScalarAttr(&buf, a.value) orelse return error.PivotShapeUnsupported;
+            const is_false = std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            const is_true = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+            if (must_hold and !is_true) return error.PivotShapeUnsupported;
+            if (must_not and !is_false) return error.PivotShapeUnsupported;
         }
     }
 

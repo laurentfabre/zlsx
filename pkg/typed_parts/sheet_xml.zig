@@ -612,6 +612,18 @@ fn parseCellType(raw: ?[]const u8) ?CellType {
     return null;
 }
 
+/// `</name>` at `at`, its `>` padded by whitespace or not: one past
+/// the `>`, or null.
+fn closeTagAt(xml: []const u8, at: usize, name: []const u8) ?usize {
+    if (at + 2 + name.len > xml.len) return null;
+    if (xml[at] != '<' or xml[at + 1] != '/') return null;
+    if (!std.mem.eql(u8, xml[at + 2 .. at + 2 + name.len], name)) return null;
+    var i = at + 2 + name.len;
+    while (i < xml.len and std.ascii.isWhitespace(xml[i])) i += 1;
+    if (i >= xml.len or xml[i] != '>') return null;
+    return i + 1;
+}
+
 /// The inner bytes of `<is>…</is>`, when the cell has one — the
 /// element, not a spelling of it inside a comment, CDATA section or
 /// processing instruction (Codex #206 r7 REL-702).
@@ -642,7 +654,7 @@ fn extractInlineBody(c_body: []const u8) ?[]const u8 {
                 inner = wbxml.skipNonElement(c_body, ilt) catch return null;
                 continue;
             }
-            if (std.mem.startsWith(u8, c_body[ilt..], "</is>")) return c_body[is_open_end + 1 .. ilt];
+            if (closeTagAt(c_body, ilt, "is") != null) return c_body[is_open_end + 1 .. ilt];
             inner = (findTagEnd(c_body, ilt) orelse return null) + 1;
         }
         return null;
@@ -655,10 +667,9 @@ fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {
         // `<is><t>text</t></is>` — also accept attribute-bearing
         // `<t xml:space="preserve">`. We use the prefix-match form
         // so we don't lose whitespace-significant strings.
-        const is_open = std.mem.indexOf(u8, c_body, "<is") orelse return null;
-        const is_open_end = findTagEnd(c_body, is_open) orelse return null;
-        const is_close = std.mem.indexOfPos(u8, c_body, is_open_end, "</is>") orelse return null;
-        const is_body = c_body[is_open_end + 1 .. is_close];
+        // The body as `extractInlineBody` finds it — by the walk, its
+        // close padded or not (Codex #206 r16 REL-1601).
+        const is_body = extractInlineBody(c_body) orelse return null;
         return extractInner(is_body, "<t", "</t>");
     }
     return extractInner(c_body, "<v", "</v>");

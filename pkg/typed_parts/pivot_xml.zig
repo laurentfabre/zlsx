@@ -693,6 +693,12 @@ pub const TableDefinition = struct {
     /// empty for the default namespace — what a regenerated child
     /// element spells its tags under.
     prefix: []const u8 = "",
+    /// The root's raw attributes region, for a reader judging the
+    /// display options this view does not model.
+    root_attrs: []const u8 = "",
+    /// `rowHeaderCaption` — the row-labels header's explicit caption.
+    /// Raw.
+    row_header_caption: ?[]const u8 = null,
     /// `name` (ST_Xstring, required). Raw.
     name: []const u8,
     /// `cacheId` (required) — matches a `<pivotCache cacheId>` in
@@ -768,6 +774,8 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
 
     var def: TableDefinition = .{
         .prefix = p,
+        .root_attrs = attrs,
+        .row_header_caption = wbxml.getAttr(attrs, "rowHeaderCaption"),
         .name = wbxml.getAttr(attrs, "name") orelse return error.MalformedXml,
         .cache_id = (try u32Attr(attrs, "cacheId")) orelse return error.MalformedXml,
         .data_caption = wbxml.getAttr(attrs, "dataCaption"),

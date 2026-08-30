@@ -3517,7 +3517,9 @@ pub const Workbook = struct {
     /// previously-cached `SheetXml` view is invalidated (next access
     /// re-parses from the new bytes). A staged write inside a pivot
     /// source marks its cache definition `refreshOnLoad="1"` first
-    /// (`markPivotCachesForCellWrites`, S7b-3).
+    /// (S7b-3) and, since S7b-5, rebuilds the cache and re-lays its
+    /// consumers where the engine can — a form it cannot lay out
+    /// takes the marker alone (`refreshPivotCachesForCellWrites`).
     ///
     /// iter-wb-4 m1 limits: numeric / boolean / blank values only.
     /// m2: strings + formulas. m4: shared-string mode (`<c t="s">`).
@@ -6438,7 +6440,8 @@ pub const Workbook = struct {
         if (!pivots_mod.resolutionDependsOn(res, sheet_idx)) return false;
         switch (res) {
             .sheet => |l| if (l.bounds) |b| if (b == .rect) {
-                const r = map.mapRect(b.rect) orelse return false;
+                // A rectangle the edit cannot place is one in the way.
+                const r = (map.mapRect(b.rect) catch return true) orelse return false;
                 return ref.row >= r.tl_row and ref.row <= r.br_row and ref.col >= r.tl_col and ref.col <= r.br_col;
             },
             else => {},
@@ -6475,14 +6478,19 @@ pub const Workbook = struct {
         }
 
         /// A rectangle after the edit: null when the edit deletes it
-        /// whole (a one-row range on the deleted row).
-        fn mapRect(self: HostRowMap, r: pivots_mod.edit.Rect) ?pivots_mod.edit.Rect {
+        /// whole (a one-row range on the deleted row). An insert that
+        /// would push it past the grid is a shift the transform will
+        /// not make (it keeps the spelling) — refused here rather than
+        /// modelled off the grid (Codex #206 r16 REL-1602).
+        fn mapRect(self: HostRowMap, r: pivots_mod.edit.Rect) Error!?pivots_mod.edit.Rect {
             if (!self.active) return r;
             var out = r;
             const lo: *u32 = if (self.axis == .row) &out.tl_row else &out.tl_col;
             const hi: *u32 = if (self.axis == .row) &out.br_row else &out.br_col;
+            const limit: u32 = if (self.axis == .row) zlsx.max_row else zlsx.max_col_1based;
             switch (self.kind) {
                 .insert => {
+                    if (hi.* >= self.idx and hi.* >= limit) return error.PivotEditUnsafe;
                     if (lo.* >= self.idx) lo.* += 1;
                     if (hi.* >= self.idx) hi.* += 1;
                 },
@@ -6495,13 +6503,16 @@ pub const Workbook = struct {
             return out;
         }
 
-        /// Null for the deleted row / column.
-        fn map(self: HostRowMap, ref: CellRef) ?CellRef {
+        /// Null for the deleted row / column; past the grid on an
+        /// insert refuses (r16 REL-1602).
+        fn map(self: HostRowMap, ref: CellRef) Error!?CellRef {
             if (!self.active) return ref;
             var out = ref;
             const v: *u32 = if (self.axis == .row) &out.row else &out.col;
+            const limit: u32 = if (self.axis == .row) zlsx.max_row else zlsx.max_col_1based;
             switch (self.kind) {
                 .insert => if (v.* >= self.idx) {
+                    if (v.* >= limit) return error.PivotEditUnsafe;
                     v.* += 1;
                 },
                 .delete => {
@@ -6537,7 +6548,7 @@ pub const Workbook = struct {
             const decoded = try store_mod.decodeXmlEntities(arena, m.ref);
             // A merge the reader cannot place is one in the way.
             const r = pivots_mod.edit.parseRect(decoded) orelse return error.PivotEditUnsafe;
-            if (map.mapRect(r)) |mapped| try out.append(arena, mapped);
+            if (try map.mapRect(r)) |mapped| try out.append(arena, mapped);
         }
         return out.items;
     }
@@ -6556,7 +6567,7 @@ pub const Workbook = struct {
                 const parsed = coords.parseCell(cell.ref, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
                 const pre: CellRef = .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
                 if (pre.row != row.row_idx) return error.MalformedSheetXml;
-                const post = map.map(pre) orelse continue;
+                const post = (try map.map(pre)) orelse continue;
                 var hc: HostCell = .{ .occupied = cell.raw_value != null or cell.formula != null, .text = null, .style = cell.style_idx };
                 if (cell.cell_type_invalid or cell.style_invalid) {
                     hc.occupied = true;
@@ -6606,12 +6617,11 @@ pub const Workbook = struct {
                 const ref = entry.key_ptr.*;
                 const prior = grid.get(ref);
                 const style: ?u32 = if (prior) |h| h.style else null;
+                // A cell staged for deletion is unoccupied and holds no
+                // text; the style it wore stays a donor for the row
+                // kind (Codex #206 r16 REL-1604).
                 const hc: HostCell = switch (entry.value_ptr.*) {
-                    .deleted => {
-                        _ = grid.remove(ref);
-                        continue;
-                    },
-                    .blank => .{ .occupied = false, .text = null, .style = style },
+                    .deleted, .blank => .{ .occupied = false, .text = null, .style = style },
                     .string, .shared_string => |txt| .{ .occupied = true, .text = txt, .style = style },
                     else => .{ .occupied = true, .text = null, .style = style },
                 };
@@ -7013,8 +7023,10 @@ pub const Workbook = struct {
                     .open => {},
                 }
                 const t = sheet_edit.matchTagAt(src, m.lt, "row") orelse {
-                    try out.appendSlice(a, src[pos..m.after]);
-                    pos = m.after;
+                    if (sheet_edit.matchTagAt(src, m.lt, "c") != null or sheet_edit.matchTagAt(src, m.lt, "sheetData") != null) return error.MalformedSheetXml;
+                    const skip_to: usize = if (src[m.after - 2] == '/') m.after else try elementEnd(src, m);
+                    try out.appendSlice(a, src[pos..skip_to]);
+                    pos = skip_to;
                     continue;
                 };
                 try out.appendSlice(a, src[pos..m.lt]);
@@ -7073,8 +7085,13 @@ pub const Workbook = struct {
                         .open => {},
                     }
                     const ct = sheet_edit.matchTagAt(src, cm.lt, "c") orelse {
-                        try out.appendSlice(a, src[cpos..cm.after]);
-                        cpos = cm.after;
+                        // Not a cell: a row or `sheetData` here is
+                        // not a grid; anything else is stepped over
+                        // whole, its subtree verbatim (r16 SEC-1601).
+                        if (sheet_edit.matchTagAt(src, cm.lt, "row") != null or sheet_edit.matchTagAt(src, cm.lt, "sheetData") != null) return error.MalformedSheetXml;
+                        const skip_to: usize = if (src[cm.after - 2] == '/') cm.after else try elementEnd(src, cm);
+                        try out.appendSlice(a, src[cpos..skip_to]);
+                        cpos = skip_to;
                         continue;
                     };
                     try out.appendSlice(a, src[cpos..cm.lt]);
@@ -7135,13 +7152,52 @@ pub const Workbook = struct {
     }
 
     /// One past a `<c>` element: its `/>`, or its close tag found by
-    /// the walk (a `</c>` inside a comment is not one).
+    /// the walk (a `</c>` inside a comment is not one). A cell, a row
+    /// or a `sheetData` opened inside a cell is not a grid (Codex
+    /// #206 r16 SEC-1601); any other element inside it — a formula,
+    /// a value, an inline string, an extension — is stepped over
+    /// whole, so its close is never taken for the cell's.
     fn cellEnd(src: []const u8, ct: zlsx.TagOpen) Error!usize {
         if (src[ct.after_open - 2] == '/') return ct.after_open;
         var pos = ct.after_open;
         while (try nextMarkup(src, pos, src.len)) |m| {
             pos = m.after;
-            if (m.kind == .close and closeTagIs(src, m, "c")) return m.after;
+            switch (m.kind) {
+                .non_element => {},
+                .close => {
+                    if (closeTagIs(src, m, "c")) return m.after;
+                    return error.MalformedSheetXml;
+                },
+                .open => {
+                    if (sheet_edit.matchTagAt(src, m.lt, "c") != null or sheet_edit.matchTagAt(src, m.lt, "row") != null or sheet_edit.matchTagAt(src, m.lt, "sheetData") != null) return error.MalformedSheetXml;
+                    if (src[m.after - 2] != '/') pos = try elementEnd(src, m);
+                },
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    /// One past the element opened at `m`, by depth over its own
+    /// name — its subtree unread.
+    fn elementEnd(src: []const u8, m: Markup) Error!usize {
+        var j = m.lt + 1;
+        while (j < src.len and src[j] != ' ' and src[j] != '\t' and src[j] != '\n' and src[j] != '\r' and src[j] != '/' and src[j] != '>') j += 1;
+        const name = src[m.lt + 1 .. j];
+        if (name.len == 0) return error.MalformedSheetXml;
+        var depth: usize = 1;
+        var pos = m.after;
+        while (try nextMarkup(src, pos, src.len)) |x| {
+            pos = x.after;
+            switch (x.kind) {
+                .non_element => {},
+                .open => if (sheet_edit.matchTagAt(src, x.lt, name) != null and src[x.after - 2] != '/') {
+                    depth += 1;
+                },
+                .close => if (closeTagIs(src, x, name)) {
+                    depth -= 1;
+                    if (depth == 0) return pos;
+                },
+            }
         }
         return error.MalformedSheetXml;
     }
