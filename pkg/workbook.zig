@@ -6557,9 +6557,21 @@ pub const Workbook = struct {
             if (m.kind != .open) continue;
             var j = m.lt + 1;
             while (j < xml.len and xml[j] != ' ' and xml[j] != '\t' and xml[j] != '\n' and xml[j] != '\r' and xml[j] != '/' and xml[j] != '>') j += 1;
-            const attrs = xml[j .. m.after - 1];
+            const attrs = std.mem.trimEnd(u8, xml[j .. m.after - 1], "/");
             var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+            var seen: usize = 0;
             while (it.next()) |a| {
+                // Every binding is read, or none is trusted: a region
+                // the walk cannot finish hides the bindings after
+                // its first bad token, and a name spelt twice is
+                // not one binding (Codex #206 r29 SEC-2901).
+                var prior: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+                var k: usize = 0;
+                while (k < seen) : (k += 1) {
+                    const p = prior.next() orelse break;
+                    if (std.mem.eql(u8, p.name, a.name)) return error.PivotEditUnsafe;
+                }
+                seen += 1;
                 const is_default = std.mem.eql(u8, a.name, "xmlns");
                 const is_prefixed = std.mem.startsWith(u8, a.name, "xmlns:");
                 if (!is_default and !is_prefixed) continue;
@@ -6582,6 +6594,7 @@ pub const Workbook = struct {
                 if (is_default and !main) return error.PivotEditUnsafe;
                 if (is_default and main) root_bound = true;
             }
+            if (it.malformed) return error.PivotEditUnsafe;
             // A root with no default binding at all spells its cells
             // in no namespace — not SpreadsheetML's (Codex #206 r27
             // SEC-2701).
@@ -7137,6 +7150,7 @@ pub const Workbook = struct {
                 const t = sheet_edit.matchTagAt(src, m.lt, "row") orelse {
                     if (sheet_edit.matchTagAt(src, m.lt, "c") != null or sheet_edit.matchTagAt(src, m.lt, "sheetData") != null) return error.MalformedSheetXml;
                     const skip_to: usize = if (src[m.after - 2] == '/') m.after else try elementEnd(src, m);
+                    try refuseGridMarkupWithin(src, m.after, skip_to);
                     try out.appendSlice(a, src[pos..skip_to]);
                     pos = skip_to;
                     continue;
@@ -7212,6 +7226,7 @@ pub const Workbook = struct {
                         }
                         cells_closed = true;
                         const skip_to: usize = if (src[cm.after - 2] == '/') cm.after else try elementEnd(src, cm);
+                        try refuseGridMarkupWithin(src, cm.after, skip_to);
                         try out.appendSlice(a, src[cm.lt..skip_to]);
                         cpos = skip_to;
                         continue;
@@ -7377,6 +7392,19 @@ pub const Workbook = struct {
 
     /// One past the element opened at `m`, by depth over its own
     /// name — its subtree unread.
+    /// A subtree the splicer steps over whole holds no grid element:
+    /// the typed reader finds a `<row>` or `<c>` at any depth, so one
+    /// under an unknown child would be read as a cell and then spelt
+    /// again beside it (Codex #206 r29 SEC-2902).
+    fn refuseGridMarkupWithin(src: []const u8, from: usize, to: usize) Error!void {
+        var pos = from;
+        while (try nextMarkup(src, pos, to)) |x| {
+            pos = x.after;
+            if (x.kind != .open) continue;
+            if (sheet_edit.matchTagAt(src, x.lt, "row") != null or sheet_edit.matchTagAt(src, x.lt, "c") != null or sheet_edit.matchTagAt(src, x.lt, "sheetData") != null) return error.MalformedSheetXml;
+        }
+    }
+
     fn elementEnd(src: []const u8, m: Markup) Error!usize {
         var j = m.lt + 1;
         while (j < src.len and src[j] != ' ' and src[j] != '\t' and src[j] != '\n' and src[j] != '\r' and src[j] != '/' and src[j] != '>') j += 1;
@@ -10472,7 +10500,9 @@ fn writePatchedSstAttrs(
         }
         i = value_end + 1;
     }
-    if (!saw_count) try writeCountAttr(allocator, out, " count", new_count);
+    // `count` is occurrences, optional: absent stays absent — a pivot
+    // render dropped it on purpose the same save (Codex #206 r29
+    // REL-2901); `uniqueCount` is the entries and is kept true.
     if (!saw_unique) try writeCountAttr(allocator, out, " uniqueCount", new_count);
 }
 

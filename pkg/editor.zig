@@ -9997,3 +9997,75 @@ test "S7b-5: a shared-string table under the host's namespace hygiene; CDATA in 
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: a malformed token or a duplicate name in a root's attributes refuses before the bindings after it; a grid element under an opaque child refuses; the SST `count` a render dropped stays dropped (Codex #206 r29 SEC-2901, SEC-2902, REL-2901)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r29_dst.xlsx");
+    defer a.free(dst);
+    const main_ns = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "host_junk_then_alias", .part = "xl/worksheets/sheet2.xml", .old = main_ns, .new = main_ns ++ " junk xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"" },
+        .{ .name = "host_dup_name", .part = "xl/worksheets/sheet2.xml", .old = main_ns, .new = main_ns ++ " xmlns:q=\"urn:q\" xmlns:q=\"urn:q\"" },
+        .{ .name = "host_unterminated", .part = "xl/worksheets/sheet2.xml", .old = main_ns, .new = main_ns ++ " xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main" },
+        .{ .name = "sst_junk_then_alias", .part = "xl/sharedStrings.xml", .old = main_ns, .new = main_ns ++ " junk xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"" },
+        .{ .name = "cell_under_opaque", .part = "xl/worksheets/sheet2.xml", .old = "</row></sheetData>", .new = "</row><row r=\"4\"><foo><c r=\"A4\"><v>1</v></c></foo></row></sheetData>" },
+        .{ .name = "row_under_opaque", .part = "xl/worksheets/sheet2.xml", .old = "</row></sheetData>", .new = "</row><bar><row r=\"9\"><c r=\"A9\"><v>1</v></c></row></bar></sheetData>" },
+    };
+    const parts = [_][]const u8{ "xl/worksheets/sheet2.xml", "xl/sharedStrings.xml", "xl/pivotTables/pivotTable1.xml", "xl/pivotCache/pivotCacheRecords1.xml" };
+    for (cases) |case| {
+        const src = try tt.path(a, io, case.name);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, case.part, case.old, case.new);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var before: [parts.len][]u8 = undefined;
+        for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+        defer for (before) |b| a.free(b);
+        if (wb.insertRow(0, 2)) |_| return error.TestUnexpectedResult else |err| switch (err) {
+            error.PivotEditUnsafe, error.MalformedSheetXml => {},
+            else => return err,
+        }
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        // A source write re-lays the host (its strings drop the SST's
+        // `count`); a novel shared string elsewhere extends the same
+        // table later in the save — `count` stays absent, `uniqueCount`
+        // is the entries.
+        const src = try tt.path(a, io, "s7b5_r29_count.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const data = try wb.sheet(0);
+        try data.setCell("A3", .{ .shared_string = "Central" });
+        try data.setCell("E1", .{ .shared_string = "Novel" });
+        try wb.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const sst = (try store.part("xl/sharedStrings.xml")).?.bytes;
+        try std.testing.expect(std.mem.indexOf(u8, sst, "Novel</t>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sst, " count=") == null);
+        const uc_at = std.mem.indexOf(u8, sst, "uniqueCount=\"").? + "uniqueCount=\"".len;
+        const uc_end = std.mem.indexOfScalarPos(u8, sst, uc_at, '"').?;
+        const unique = try std.fmt.parseInt(usize, sst[uc_at..uc_end], 10);
+        try std.testing.expectEqual(std.mem.count(u8, sst, "<si>"), unique);
+        var out = try Workbook.open(a, io, dst);
+        defer out.deinit();
+        try expectHostCell(&out, 1, "A5", .{ .text = "Central" });
+        try expectHostCell(&out, 1, "B5", .{ .number = 4 });
+        try expectHostCell(&out, 1, "B6", .{ .number = 12 });
+    }
+}

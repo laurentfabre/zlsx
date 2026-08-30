@@ -1686,10 +1686,15 @@ fn narrow(err: wbxml.Error) Error {
     };
 }
 
-/// Walks `name="value"` pairs of a preflighted attributes region.
+/// Walks `name="value"` pairs of an attributes region. A region that
+/// is not pairs to its end stops the walk with `malformed` set — a
+/// reader that must see EVERY binding (the namespace hygiene) tells
+/// that from exhaustion (Codex #206 r29 SEC-2901); a preflighted
+/// region never sets it.
 pub const AttrIter = struct {
     attrs: []const u8,
     i: usize = 0,
+    malformed: bool = false,
 
     pub const Pair = struct { name: []const u8, value: []const u8 };
 
@@ -1701,17 +1706,28 @@ pub const AttrIter = struct {
         const name_start = i;
         while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
         const name = attrs[name_start..i];
-        while (i < attrs.len and (attrs[i] == '=' or std.ascii.isWhitespace(attrs[i]))) i += 1;
-        if (i >= attrs.len) return null;
-        if (attrs[i] != '"' and attrs[i] != '\'') return null;
+        if (name.len == 0) return self.stop();
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        if (i >= attrs.len or attrs[i] != '=') return self.stop();
+        i += 1;
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        if (i >= attrs.len) return self.stop();
+        if (attrs[i] != '"' and attrs[i] != '\'') return self.stop();
         const quote = attrs[i];
         i += 1;
         const val_start = i;
         while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return self.stop();
         const value = attrs[val_start..i];
-        if (i < attrs.len) i += 1;
+        i += 1;
         self.i = i;
         return .{ .name = name, .value = value };
+    }
+
+    fn stop(self: *AttrIter) ?Pair {
+        self.malformed = true;
+        self.i = self.attrs.len;
+        return null;
     }
 };
 

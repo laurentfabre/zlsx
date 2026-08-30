@@ -3506,6 +3506,7 @@ pub const engine = struct {
             if (must_hold and !is_true) return error.PivotShapeUnsupported;
             if (must_not and !is_false) return error.PivotShapeUnsupported;
         }
+        if (it.malformed) return error.PivotShapeUnsupported;
     }
 
     /// Attributes of the row field that would change what the layout
@@ -3530,6 +3531,7 @@ pub const engine = struct {
             if (flagged and !is_false) return error.PivotShapeUnsupported;
             if (must_hold and !is_true) return error.PivotShapeUnsupported;
         }
+        if (it.malformed) return error.PivotShapeUnsupported;
     }
 
     /// `ascending`: numbers by value, then text under the workbook's
