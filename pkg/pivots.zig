@@ -3316,7 +3316,8 @@ pub const engine = struct {
     /// one inventory item per row, of a kind the slice lays out; an
     /// inline field's rows are numbers or blanks.
     fn validateRebuild(arena: Allocator, rb: *const Rebuild) RebuildError!void {
-        if (rb.rows.len != rb.record_count) return error.MalformedPivotXml;
+        // `rebuild` never makes an empty one (Codex #206 r14 REL-1401).
+        if (rb.rows.len == 0 or rb.rows.len != rb.record_count) return error.MalformedPivotXml;
         for (rb.rows) |r| if (r.len != rb.fields.len) return error.MalformedPivotXml;
         for (rb.fields, 0..) |f, k| {
             if (f.index_of_row.len != rb.rows.len) return error.MalformedPivotXml;
@@ -7254,6 +7255,16 @@ test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed,
         row[1] = .{ .number = "0x1p0" };
         rows[0] = row;
         rb.rows = rows;
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // No records at all (Codex #206 r14 REL-1401).
+    {
+        var rb = good;
+        rb.rows = &.{};
+        rb.record_count = 0;
+        const fields = try arena.dupe(engine.Field, good.fields);
+        for (fields) |*f| f.index_of_row = &.{};
+        rb.fields = fields;
         try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
     }
     // A cache whose decoded names are not parallel to its fields, and

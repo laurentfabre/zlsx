@@ -9265,3 +9265,51 @@ test "S7b-5: a pivot whose rectangle overlaps its own source — the edit refuse
         try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
     }
 }
+
+test "S7b-5: a phonetic run is not caption text; the shared-string table drops its occurrence count once host cells change it (Codex #206 r14 REL-1402, REL-1403)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r14_src.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r14_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>漢字</t><rPh sb=\"0\" eb=\"2\"><t>かんじ</t></rPh><phoneticPr fontId=\"1\"/></is></c></row></sheetData>");
+    {
+        var store = try store_mod.PartStore.open(a, io, src);
+        defer store.deinit();
+        const sst = (try store.part("xl/sharedStrings.xml")).?.bytes;
+        try std.testing.expect(std.mem.indexOf(u8, sst, " count=\"") != null);
+    }
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    const sst = (try store.part("xl/sharedStrings.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, sst, " count=\"") == null);
+    const unique = std.mem.count(u8, sst, "<si>");
+    const want = try std.fmt.allocPrint(a, "uniqueCount=\"{d}\"", .{unique});
+    defer a.free(want);
+    try std.testing.expect(std.mem.indexOf(u8, sst, want) != null);
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "A3", .{ .text = "漢字" });
+    // A shrink writes only strings the table has: the count still goes.
+    const src2 = try tt.path(a, io, "s7b5_r14_shrink.xlsx");
+    defer a.free(src2);
+    try pivots_mod.fixture.write(a, io, src2, .sheet_ref);
+    var ed2 = try Editor.open(a, io, src2);
+    defer ed2.deinit();
+    try ed2.deleteRow(0, 3);
+    try ed2.save(io, dst);
+    var store2 = try store_mod.PartStore.open(a, io, dst);
+    defer store2.deinit();
+    const sst2 = (try store2.part("xl/sharedStrings.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, sst2, " count=\"") == null);
+}

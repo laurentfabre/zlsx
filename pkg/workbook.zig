@@ -6632,6 +6632,23 @@ pub const Workbook = struct {
         while (try nextMarkup(body, pos, body.len)) |m| {
             pos = m.after;
             if (m.kind != .open) continue;
+            // A phonetic run is a hint over the text, not the text
+            // (Codex #206 r14 REL-1402): skipped whole.
+            if (sheet_edit.matchTagAt(body, m.lt, "rPh")) |ph| {
+                if (body[ph.after_open - 2] == '/') continue;
+                var ppos = ph.after_open;
+                var closed = false;
+                while (try nextMarkup(body, ppos, body.len)) |pm| {
+                    ppos = pm.after;
+                    if (pm.kind == .close and closeTagIs(body, pm, "rPh")) {
+                        closed = true;
+                        break;
+                    }
+                }
+                if (!closed) return error.MalformedSheetXml;
+                pos = ppos;
+                continue;
+            }
             const t = zlsx.TagOpen{ .start = m.lt, .after_open = m.after };
             if (sheet_edit.matchTagAt(body, m.lt, "t") == null) continue;
             if (body[t.after_open - 2] == '/') continue;
@@ -6823,9 +6840,27 @@ pub const Workbook = struct {
         // one batch below, so it refuses instead (Codex #206 r4
         // SEC-404).
         if (out.plan.has_new_strings and !out.plan.sst_part_exists) return error.PivotEditUnsafe;
-        if (out.plan.has_new_strings) {
+        // Host cells written or cleared change how many cells name a
+        // shared string; the table's `count` (occurrences, optional)
+        // is dropped rather than left stale or written as
+        // `uniqueCount` (Codex #206 r14 REL-1403).
+        var touches_strings = strings.items.len > 0;
+        for (host_writes) |hw| for (hw.cells) |c| {
+            if (c.value == .deleted) touches_strings = true;
+        };
+        if (touches_strings and out.plan.sst_part_exists) {
             const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
-            out.sst_bytes = try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items);
+            const extended: []u8 = if (out.plan.has_new_strings)
+                try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items)
+            else
+                try a.dupe(u8, existing.bytes);
+            defer a.free(extended);
+            const stripped = try dropSstCountAttr(a, extended);
+            if (std.mem.eql(u8, stripped, existing.bytes)) {
+                a.free(stripped);
+            } else {
+                out.sst_bytes = stripped;
+            }
         }
         for (host_writes) |hw| {
             var slot: ?*HostSheetWrites = null;
@@ -7194,6 +7229,33 @@ pub const Workbook = struct {
         const v = wbxml_typed.decodeScalarAttr(&buf, raw) orelse return error.MalformedSheetXml;
         const parsed = coords.parseCell(v, .{ .case = .upper_only }) catch return error.MalformedSheetXml;
         return .{ .row = parsed.row.oneBased(), .col = parsed.col.oneBased() };
+    }
+
+    /// `<sst …>` without its `count` attribute; everything else as
+    /// written. A part without the attribute, or one whose root the
+    /// walk cannot find, is copied whole.
+    fn dropSstCountAttr(a: Allocator, xml: []const u8) Error![]u8 {
+        var pos: usize = 0;
+        while (try nextMarkup(xml, pos, xml.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            const t = sheet_edit.matchTagAt(xml, m.lt, "sst") orelse continue;
+            const attrs_start = t.start + "<sst".len;
+            const attrs = xml[attrs_start .. t.after_open - 1];
+            var it: typed_parts.pivot_xml.AttrIter = .{ .attrs = attrs };
+            var prev_end: usize = 0;
+            while (it.next()) |pair| {
+                const value_end = @intFromPtr(pair.value.ptr) - @intFromPtr(attrs.ptr) + pair.value.len + 1;
+                if (std.mem.eql(u8, pair.name, "count")) {
+                    // From the end of the previous attribute (its
+                    // whitespace included) to the closing quote.
+                    return std.mem.concat(a, u8, &.{ xml[0 .. attrs_start + prev_end], xml[attrs_start + value_end .. xml.len] });
+                }
+                prev_end = value_end;
+            }
+            break;
+        }
+        return a.dupe(u8, xml);
     }
 
     /// The rendered host writes installed with `extra` (a caller's
