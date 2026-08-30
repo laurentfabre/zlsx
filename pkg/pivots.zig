@@ -3384,6 +3384,10 @@ pub const engine = struct {
         // REL-801).
         if (!def.row_grand_totals or !def.col_grand_totals) return error.PivotShapeUnsupported;
         if (def.fields.len != cache.definition.fields.len or rb.fields.len != def.fields.len) return error.MalformedPivotXml;
+        // A cache is public too: its decoded spines are parallel to
+        // its definition's fields by construction, and checked here
+        // before anything indexes by them (Codex #206 r12 REL-1203).
+        if (cache.field_names.len != def.fields.len or cache.field_formulas.len != def.fields.len) return error.MalformedPivotXml;
         if (def.row_fields.len != 1 or def.row_fields[0] != .field) return error.PivotShapeUnsupported;
         const rf = def.row_fields[0].field;
         if (rf >= def.fields.len) return error.MalformedPivotXml;
@@ -7251,6 +7255,16 @@ test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed,
         rows[0] = row;
         rb.rows = rows;
         try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
+    }
+    // A cache whose decoded names are not parallel to its fields, and
+    // a data field with no caption to fall back on (Codex #206 r12
+    // REL-1203).
+    {
+        var short = cache.*;
+        short.field_names = cache.field_names[0..1];
+        const nameless = try std.mem.replaceOwned(u8, arena, t.raw_xml, "<dataField name=\"Sum of Qty\" ", "<dataField ");
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, nameless, &short, &good, .{}));
+        try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, &short, &good, .{}));
     }
     // A row whose index names another item than its value, an inline
     // field with an inventory (Codex #206 r10 REL-1003).

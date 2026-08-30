@@ -816,6 +816,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.fields)) return error.MalformedXml;
             seen.insert(.fields);
             def.fields = try parsePivotFields(allocator, xml, k, p, &def.has_other_children);
+            try noteWrapper(xml, k, "pivotField", def.fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "rowFields")) {
             if (seen.contains(.rows)) return error.MalformedXml;
             seen.insert(.rows);

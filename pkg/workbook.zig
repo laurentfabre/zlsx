@@ -8021,31 +8021,40 @@ pub const Workbook = struct {
         }
         // A pivot whose source is another pivot's rectangle reads the
         // cells written here (Codex #206 r9 REL-901): such a cache is
-        // marked in the same install — and a rebuild it had staged is
-        // dropped, since it read those cells before they were written
-        // — to a fixed point, since dropping one withdraws its writes.
-        const downstream = try arena.alloc(bool, p.caches.len);
-        @memset(downstream, false);
+        // marked in the same install, and a rebuild it had staged is
+        // dropped, since it read those cells before they were written.
+        // Which stagings stand is decided over the writer → reader
+        // graph among them (r12 REL-1202): a staging nobody standing
+        // writes into is kept, its readers are dropped — which
+        // withdraws their writes — until nothing moves; what remains
+        // is a cycle, all of it dropped.
+        const n = p.caches.len;
         const identity = HostRowMap.forEdit(false, .row, 1, .insert);
-        var settled = false;
-        while (!settled) {
-            settled = true;
-            for (p.caches, 0..) |*c, ci| {
-                if (downstream[ci]) continue;
+        const edges = try arena.alloc(bool, n * n);
+        @memset(edges, false);
+        for (stagings, 0..) |st_opt, i| {
+            const st = st_opt orelse continue;
+            for (p.caches, 0..) |*c, j| {
                 var hit = false;
-                for (stagings) |st_opt| {
-                    const st = st_opt orelse continue;
-                    for (st.host_writes) |hw| for (hw.cells) |cell| {
-                        if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, identity)) hit = true;
-                    };
-                }
-                if (!hit) continue;
-                downstream[ci] = true;
-                if (stagings[ci] != null) {
-                    stagings[ci] = null;
-                    settled = false;
-                }
+                for (st.host_writes) |hw| for (hw.cells) |cell| {
+                    if (hostCellHitsCache(c, hw.sheet_idx, cell.ref, identity)) hit = true;
+                };
+                edges[i * n + j] = hit;
             }
+        }
+        const candidate = try arena.alloc(bool, n);
+        for (stagings, candidate) |st, *cand| cand.* = st != null;
+        const kept = try peelStagings(arena, edges, candidate, n);
+        const downstream = try arena.alloc(bool, n);
+        @memset(downstream, false);
+        for (0..n) |i| {
+            if (!kept[i]) stagings[i] = null;
+        }
+        for (0..n) |i| {
+            if (!kept[i]) continue;
+            for (0..n) |j| if (edges[i * n + j]) {
+                downstream[j] = true;
+            };
         }
         for (p.caches, 0..) |*c, ci| {
             if (!affected[ci] and !downstream[ci]) continue;
@@ -8096,6 +8105,56 @@ pub const Workbook = struct {
         } else if (patches.items.len > 0) {
             try self.store.replaceParts(patches.items);
         }
+    }
+
+    /// Which of the candidate stagings stand, over the writer → reader
+    /// edges among caches (`edges[i * n + j]`: `i`'s host cells land
+    /// in `j`'s source). Rounds: a candidate no undecided or kept
+    /// candidate writes into is kept; then every undecided candidate
+    /// a kept one writes into is dropped; a round that moves nothing
+    /// leaves cycles, all dropped. Pure, so a test can pin it.
+    fn peelStagings(arena: Allocator, edges: []const bool, candidate: []const bool, n: usize) Error![]bool {
+        const State = enum { undecided, kept, dropped };
+        const state = try arena.alloc(State, n);
+        for (candidate, state) |c, *st| st.* = if (c) .undecided else .dropped;
+        while (true) {
+            var moved = false;
+            var undecided = false;
+            for (0..n) |j| {
+                if (state[j] != .undecided) continue;
+                undecided = true;
+                var incoming = false;
+                for (0..n) |i| {
+                    if (i == j or !edges[i * n + j]) continue;
+                    if (state[i] != .dropped) incoming = true;
+                }
+                if (!incoming) {
+                    state[j] = .kept;
+                    moved = true;
+                }
+            }
+            for (0..n) |j| {
+                if (state[j] != .undecided) continue;
+                var from_kept = false;
+                for (0..n) |i| {
+                    if (i != j and edges[i * n + j] and state[i] == .kept) from_kept = true;
+                }
+                if (from_kept) {
+                    state[j] = .dropped;
+                    moved = true;
+                }
+            }
+            if (!undecided) break;
+            if (!moved) {
+                for (state) |*st| if (st.* == .undecided) {
+                    st.* = .dropped;
+                };
+                break;
+            }
+        }
+        const kept = try arena.alloc(bool, n);
+        for (state, kept) |st, *k| k.* = st == .kept;
+        return kept;
     }
 
     const StagedRefresh = struct {
@@ -24878,4 +24937,33 @@ test "Workbook.countRefErrorsOutsideQuotes: a #REF! inside a string literal or a
     try std.testing.expectEqual(@as(usize, 1), count("'It''s #REF!'!#REF!"));
     try std.testing.expectEqual(@as(usize, 2), count("#REF!:#REF!"));
     try std.testing.expectEqual(@as(usize, 0), count("\"a\"\"#REF!\"\"b\""));
+}
+
+test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a lone reader (Codex #206 r12 REL-1202)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A(0) → B(2) → C(1): C is visited before B; A and C stand, B falls.
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 2] = true;
+        edges[2 * 3 + 1] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ true, true, false }, kept);
+    }
+    // A ↔ B: a cycle, both fall; C beside it stands.
+    {
+        var edges = [_]bool{false} ** 9;
+        edges[0 * 3 + 1] = true;
+        edges[1 * 3 + 0] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
+        try std.testing.expectEqualSlices(bool, &.{ false, false, true }, kept);
+    }
+    // A → B where B is no candidate: A stands (B is marked by the caller).
+    {
+        var edges = [_]bool{false} ** 4;
+        edges[0 * 2 + 1] = true;
+        const kept = try Workbook.peelStagings(arena, &edges, &.{ true, false }, 2);
+        try std.testing.expectEqualSlices(bool, &.{ true, false }, kept);
+    }
 }

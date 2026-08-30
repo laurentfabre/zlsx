@@ -8485,6 +8485,10 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r12 REL-1201: the field wrapper's own count and
+        // attributes.
+        .{ .name = "pivot_fields_count", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"9\">", .direct = error.MalformedPivotXml },
+        .{ .name = "pivot_fields_attr", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"3\" foo=\"1\">" },
         // Codex #206 r10 REL-1002: the axis and data wrappers.
         .{ .name = "row_fields_count", .old = "<rowFields count=\"1\">", .new = "<rowFields count=\"2\">", .direct = error.MalformedPivotXml },
         .{ .name = "data_fields_stray", .old = "<dataFields count=\"1\">", .new = "<dataFields count=\"1\"><foo/>" },
