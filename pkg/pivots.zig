@@ -3173,7 +3173,7 @@ pub const engine = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.MalformedXml => return error.MalformedPivotXml,
         };
-        try validateRebuild(rb);
+        try validateRebuild(arena, rb);
         try checkTableShape(arena, &def, cache, rb);
 
         const rf: u32 = def.row_fields[0].field;
@@ -3315,7 +3315,7 @@ pub const engine = struct {
     /// records and are one value per field; an indexed field names
     /// one inventory item per row, of a kind the slice lays out; an
     /// inline field's rows are numbers or blanks.
-    fn validateRebuild(rb: *const Rebuild) RebuildError!void {
+    fn validateRebuild(arena: Allocator, rb: *const Rebuild) RebuildError!void {
         if (rb.rows.len != rb.record_count) return error.MalformedPivotXml;
         for (rb.rows) |r| if (r.len != rb.fields.len) return error.MalformedPivotXml;
         for (rb.fields, 0..) |f, k| {
@@ -3344,12 +3344,11 @@ pub const engine = struct {
                         },
                         .string => |txt| {
                             if (it.kind != .s) return error.MalformedPivotXml;
-                            const fa = fold(std.heap.page_allocator, txt) catch return error.MalformedPivotXml;
-                            defer if (fa) |v| std.heap.page_allocator.free(v);
-                            const fb = fold(std.heap.page_allocator, it.text) catch return error.MalformedPivotXml;
-                            defer if (fb) |v| std.heap.page_allocator.free(v);
-                            const ka = fa orelse return error.MalformedPivotXml;
-                            const kb = fb orelse return error.MalformedPivotXml;
+                            // An allocation failure is its own error,
+                            // never "malformed" (Codex #206 r11
+                            // REL-1101).
+                            const ka = try foldForValidation(arena, txt);
+                            const kb = try foldForValidation(arena, it.text);
                             if (!std.mem.eql(u8, ka, kb)) return error.MalformedPivotXml;
                         },
                     }
@@ -3363,6 +3362,14 @@ pub const engine = struct {
                 };
             }
         }
+    }
+
+    fn foldForValidation(arena: Allocator, s: []const u8) RebuildError![]const u8 {
+        const folded = fold(arena, s) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MalformedPivotXml,
+        };
+        return folded orelse error.MalformedPivotXml;
     }
 
     /// The consumer forms this slice lays out; everything else refuses
@@ -7279,4 +7286,31 @@ test "S7b-5: a caller-assembled Rebuild that disagrees with itself is malformed,
             try testing.expectError(error.MalformedPivotXml, engine.layout(arena, t.raw_xml, cache, &rb, .{}));
         }
     }
+}
+
+fn layoutForFailures(allocator: Allocator, table_xml: []const u8, cache: *const PivotCache, rb: *const engine.Rebuild) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    _ = try engine.layout(arena_state.allocator(), table_xml, cache, rb, .{});
+}
+
+test "S7b-5: an allocation failure anywhere in a layout is OutOfMemory, never a refusal (Codex #206 r11 REL-1101)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7b5_r11_oom.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const t = o.pivots.tables[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rb = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
+    try testing.checkAllAllocationFailures(testing.allocator, layoutForFailures, .{ t.raw_xml, cache, &rb });
 }
