@@ -9916,3 +9916,84 @@ test "S7b-5: a host root with no default binding refuses; a planned cell goes be
         try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
     }
 }
+
+test "S7b-5: a shared-string table under the host's namespace hygiene; CDATA in an inline caption is its payload, between the runs it is malformed (Codex #206 r28 SEC-2801, REL-2801)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r28_dst.xlsx");
+    defer a.free(dst);
+    const main_ns = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool };
+    const cases = [_]Case{
+        .{ .name = "sst_foreign_root", .old = main_ns, .new = "xmlns=\"urn:vendor\"", .admitted = false },
+        .{ .name = "sst_rebound_si", .old = "<si><t xml:space=\"preserve\">", .new = "<si xmlns=\"urn:vendor\"><t xml:space=\"preserve\">", .admitted = false },
+        .{ .name = "sst_aliased", .old = main_ns, .new = "xmlns:m=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " ++ main_ns, .admitted = false },
+        .{ .name = "sst_strict", .old = main_ns, .new = "xmlns=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"", .admitted = true },
+        .{ .name = "sst_entity", .old = main_ns, .new = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/mai&#x6e;\"", .admitted = true },
+    };
+    for (cases) |case| {
+        const src = try tt.path(a, io, case.name);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/sharedStrings.xml", case.old, case.new);
+        if (case.admitted) {
+            var ed = try Editor.open(a, io, src);
+            defer ed.deinit();
+            try ed.insertRow(0, 2);
+            try ed.save(io, dst);
+            var wb = try Workbook.open(a, io, dst);
+            defer wb.deinit();
+            try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+            try expectHostCell(&wb, 1, "A3", .{ .text = "Row Labels" });
+            continue;
+        }
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        // Captions with CDATA: the payload, verbatim, joined with the
+        // decoded text around it.
+        const src = try tt.path(a, io, "s7b5_r28_cdata.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>pre<![CDATA[x&<]]>post &amp; more</t></is></c></row><row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><r><t><![CDATA[Grand Total]]></t></r></is></c></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "prex&<post & more" });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Grand Total" });
+    }
+    {
+        // A CDATA section between an inline string's elements is
+        // character data where none may be.
+        const src = try tt.path(a, io, "s7b5_r28_cdata_between.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><![CDATA[x]]><t>Grand Total</t></is></c></row></sheetData>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}

@@ -6717,7 +6717,8 @@ pub const Workbook = struct {
             if (!typed_parts.pivot_xml.isBlank(body[pos..m.lt])) return error.MalformedSheetXml;
             pos = m.after;
             switch (m.kind) {
-                .non_element => continue,
+                // A CDATA section is character data wherever it is.
+                .non_element => if (isCdataAt(body, m.lt)) return error.MalformedSheetXml else continue,
                 .close => {
                     if (in_run and closeTagIs(body, m, "r")) {
                         in_run = false;
@@ -6751,14 +6752,18 @@ pub const Workbook = struct {
     }
 
     /// The text of a `<t>` opened just before `from`, appended decoded;
-    /// a comment inside is not text, any element is not a run.
+    /// a comment inside is not text, a CDATA section is its payload
+    /// as written (Codex #206 r28 REL-2801), any element is not a run.
     fn readInlineRun(arena: Allocator, out: *std.ArrayListUnmanaged(u8), body: []const u8, from: usize) Error!usize {
         var tpos = from;
         while (try nextMarkup(body, tpos, body.len)) |tm| {
             try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[tpos..tm.lt]));
             tpos = tm.after;
             switch (tm.kind) {
-                .non_element => continue,
+                .non_element => {
+                    if (isCdataAt(body, tm.lt)) try out.appendSlice(arena, body[tm.lt + 9 .. tm.after - 3]);
+                    continue;
+                },
                 .close => {
                     if (closeTagIs(body, tm, "t")) return tpos;
                     return error.MalformedSheetXml;
@@ -6767,6 +6772,10 @@ pub const Workbook = struct {
             }
         }
         return error.MalformedSheetXml;
+    }
+
+    fn isCdataAt(src: []const u8, lt: usize) bool {
+        return std.mem.startsWith(u8, src[lt..], "<![CDATA[");
     }
 
     /// Past the close of `name`, opened just before `from`; the
@@ -7021,6 +7030,10 @@ pub const Workbook = struct {
         };
         if (touches_strings and out.plan.sst_part_exists) {
             const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
+            // The entries the host cells name, matched or appended, are
+            // `<si>` in the main namespace only when the table binds
+            // it as the host must (Codex #206 r28 SEC-2801).
+            try hostNamespaceHygiene(existing.bytes);
             const extended: []u8 = if (out.plan.has_new_strings)
                 try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items, out.plan.base_index)
             else
