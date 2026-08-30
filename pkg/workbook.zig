@@ -162,6 +162,9 @@ pub const Error = error{
     /// `</Relationships>` tag — refused rather than producing an
     /// unparseable relationships file when extending the SST.
     MalformedWorkbookRels,
+    /// `xl/workbook.xml` lacks the element a splice needs (`</sheets>`)
+    /// — a workbook the open parser admits but an edit cannot patch.
+    MalformedWorkbookXml,
     InvalidCellRef,
     NoSheetData,
     UnsupportedCellValue,
@@ -5627,6 +5630,17 @@ pub const Workbook = struct {
         // match in decoded space.
         const doomed_name_owned = try store_mod.decodeXmlEntities(self.allocator, doomed_name_src);
         defer self.allocator.free(doomed_name_owned);
+        // The slot table that survives is allocated BEFORE the first
+        // mutation (S3a, Codex #207 r4 REL-402): the sweeps below and
+        // the three part patches follow the documented post-validation
+        // contract (a failure among them: discard, reopen), but the
+        // commit that swaps the view and drops the doomed slot must not
+        // be able to fail half-way — a handle whose slot table
+        // disagrees with itself is one that cannot even be closed.
+        const old_slots = self.worksheets;
+        const old_len = old_slots.len;
+        const new_slots = try self.allocator.alloc(Worksheet, old_len - 1);
+        errdefer self.allocator.free(new_slots);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
         try self.preflightExtensionFormulas();
         _ = try self.rewriteAllFormulas(edit, null, null);
@@ -5661,20 +5675,13 @@ pub const Workbook = struct {
             self.workbook = fresh;
         }
 
-        // Shrink the slot table. Order matters:
-        //   1. deinit the doomed Worksheet BEFORE copying slots —
-        //      copying first then freeing would deinit the wrong slot.
-        //   2. allocate the new (n-1)-sized slot array.
-        //   3. copy [0..idx] and [idx+1..] across.
-        //   4. free the old array.
-        const old_slots = self.worksheets;
-        const old_len = old_slots.len;
+        // Shrink the slot table — nothing from here on can fail. Order
+        // matters: deinit the doomed Worksheet BEFORE copying slots
+        // (copying first then freeing would deinit the wrong slot),
+        // then copy [0..idx] and [idx+1..] into the table allocated
+        // above, then free the old array.
         assert(sheet_idx < old_len);
-
         old_slots[sheet_idx].deinit(self.allocator);
-
-        const new_slots = try self.allocator.alloc(Worksheet, old_len - 1);
-        errdefer self.allocator.free(new_slots);
 
         var i: u32 = 0;
         var j: u32 = 0;
@@ -9365,7 +9372,7 @@ fn patchWorkbookXmlAddSheet(
     sheet_id: u32,
     rid: []const u8,
 ) Error![]u8 {
-    const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedXml;
+    const close = std.mem.indexOf(u8, xml, "</sheets>") orelse return error.MalformedWorkbookXml;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, xml.len + 256);
@@ -10925,11 +10932,16 @@ pub const Worksheet = struct {
 
         const part_name = try self.resolvePartName();
         const wb = self.workbook;
-        const part = try wb.store.part(part_name) orelse return Error.MissingSheetPart;
-        // A worksheet part the typed parser cannot read is, to every
-        // caller, the sheet transform's own verdict — one name for
-        // "this sheet's XML is not readable" on every surface (S3a,
-        // Codex #207 r3 REL-302), not the parser's two.
+        // A worksheet part the store cannot materialise (a CRC that no
+        // longer matches, a broken stream) or the typed parser cannot
+        // read is, to every caller, the sheet transform's own verdict —
+        // one name for "this sheet is not readable" on every surface
+        // (S3a, Codex #207 r3 REL-302, r4 REL-401), not the store's or
+        // the parser's. Memory and the archive-wide budget keep theirs.
+        const part = (wb.store.part(part_name) catch |e| switch (e) {
+            error.OutOfMemory, error.ZipBombSuspected => return e,
+            else => return Error.MalformedSheetXml,
+        }) orelse return Error.MissingSheetPart;
         self.parsed = sheet_xml_mod.parse(wb.allocator, part.bytes) catch |e| switch (e) {
             error.MalformedXml, error.UnexpectedEof => return Error.MalformedSheetXml,
             else => |x| return x,
@@ -25594,4 +25606,45 @@ test "S3a: an addSheet that fails on any allocation leaves the workbook and its 
         try w.save(io, src);
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, addSheetForFailures, .{ io, src });
+}
+
+// ─── S3a (Codex #207 r4 REL-402): a deleteSheet that fails leaves a handle that closes ──
+
+fn deleteSheetForFailures(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var wb = try Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    const before = wb.sheetCount();
+    wb.deleteSheet(1) catch |e| {
+        // Whatever the sweeps managed before the failure (the documented
+        // post-validation contract: discard, reopen), the handle stays
+        // consistent with itself — the view and the slot table agree,
+        // so `deinit` (the defer above) frees every slot exactly once.
+        try std.testing.expectEqual(wb.workbook.sheets.len, wb.worksheets.len);
+        try std.testing.expectEqual(before, wb.sheetCount());
+        return e;
+    };
+    try std.testing.expectEqual(before - 1, wb.sheetCount());
+    try std.testing.expectEqual(wb.workbook.sheets.len, wb.worksheets.len);
+}
+
+test "S3a: a deleteSheet that fails on any allocation leaves a handle whose view and slots agree" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const src = try std.fs.path.join(std.testing.allocator, &.{ dir, "s3a_deletesheet_oom.xlsx" });
+    defer std.testing.allocator.free(src);
+    {
+        var w = zlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var a = try w.addSheet("Data");
+        try a.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        var b = try w.addSheet("Gone");
+        try b.writeRow(&.{.{ .string = "x" }});
+        try w.save(io, src);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, deleteSheetForFailures, .{ io, src });
 }

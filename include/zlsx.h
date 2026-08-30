@@ -1750,7 +1750,7 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     ASCII case-insensitively), TableColumnNameInUse,
  *     MalformedPivotXml (the pivot graph cannot be read whole), the
  *     workbook's own structure found broken (InternalSheetNameTooLong,
- *     MissingRelationship, SheetCountMismatch, …);
+ *     MalformedWorkbookXml, MissingRelationship, SheetCountMismatch, …);
  *   with their precise names, the worksheet transform's own verdicts
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot

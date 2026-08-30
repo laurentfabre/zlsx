@@ -4824,9 +4824,11 @@ fn runDeleteSheetCommand(
 
 /// S3a: `zlsx rename-table-column <file> --table T --old-name A
 /// --new-name B --out P`. Routes through `Editor.renameTableColumn`;
-/// its refusals (`TableNotFound`, `TableColumnNotFound`,
-/// `TableColumnNameInUse`, `InvalidTableColumnName`) exit 3 like every
-/// other refused structural edit.
+/// every error it raises — a selector that names nothing
+/// (`TableNotFound`, `TableColumnNotFound`), a name in use
+/// (`TableColumnNameInUse`), a name Excel would not take
+/// (`InvalidTableColumnName`) — exits 3 like every other failed
+/// structural edit.
 fn runRenameTableColumnCommand(
     alloc: std.mem.Allocator,
     io: std.Io,

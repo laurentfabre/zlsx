@@ -365,7 +365,7 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 | The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
 | `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing, the table-shaped `SheetIndexOutOfRange` (decision S3a-9) |
-| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
+| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
 | | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
 
@@ -481,3 +481,16 @@ without either macro.
    sheet index — not refusals; `TableColumnNameInUse` stays `-2`.
 10. The `worksheetSource@sheet` hole under sheet rename / delete is
     inherited and documented, not lifted here.
+11. `Worksheet.ensureParsed` spells a part the store cannot materialise
+    (a CRC mismatch, a broken stream) as `MalformedSheetXml` too;
+    `xl/workbook.xml` without `</sheets>` is `MalformedWorkbookXml`. The
+    rewriters' own consistency guards ("the view no longer describes
+    these bytes", `MalformedXml`) keep the generic name and `-1`.
+12. `deleteSheet` allocates its surviving slot table (and the editor
+    its mirror) before the first mutation; the commit after the fresh
+    view parses cannot fail, so a handle that met an allocation failure
+    still agrees with itself and closes (pinned by an allocation-failure
+    sweep in `pkg/workbook.zig`). The sweeps' partial work under a
+    failure stays the documented discard-and-reopen contract.
+13. `zlsx_editor_close` tears down the handle's `std.Io.Threaded`, as
+    `zlsx_book_close` always did.

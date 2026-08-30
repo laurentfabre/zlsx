@@ -3062,14 +3062,15 @@ class ZlsxRefusal(ZlsxError):
     """A typed refusal (C status ``ZLSX_REFUSED``, -2): a statement
     about the workbook, not about the call. zlsx refused rather than
     guess — an edit that would land inside a pivot's footprint, a sheet
-    name the workbook already has, the last sheet, a table column that
-    is not there, a pivot graph it cannot read whole. ``error_name`` is
+    name the workbook already has, a table-column name another column
+    holds, the last sheet, a part it cannot read, a pivot graph it
+    cannot read whole. ``error_name`` is
     the Zig error name (``"RowEditUnsafeForSheet"``,
     ``"DuplicateSheetName"``, ``"CannotDeleteLastSheet"``, …); the
     structural vocabulary is listed on :meth:`Editor.insert_row`.
-    Statements about the call (an index off the grid, a sheet that does
-    not exist, an edit on a sheet with unsaved cell writes) raise a
-    plain :class:`ZlsxError`."""
+    Statements about the call (an index off the grid, a sheet, table or
+    column that does not exist, an edit on a sheet with unsaved cell
+    writes) raise a plain :class:`ZlsxError`."""
 
     def __init__(self, error_name: str, message: Optional[str] = None):
         super().__init__(message or error_name)

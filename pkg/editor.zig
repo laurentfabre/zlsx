@@ -837,12 +837,16 @@ pub const Editor = struct {
         // on Workbook.deleteSheet) — Excel and openpyxl tolerate
         // unreferenced parts via the OPC reader's
         // Content_Types-driven part discovery.
+        // The mirror's new table is allocated BEFORE the workbook
+        // mutates (S3a, Codex #207 r4 REL-402): nothing after the delete
+        // can fail, so the mirror and the view never disagree.
+        const new_paths = try self.allocator.alloc([]const u8, self.sheet_paths.len - 1);
+        errdefer self.allocator.free(new_paths);
         try self.workbook.deleteSheet(sheet_idx);
 
         // Rebuild sheet_paths without the deleted entry. Free the
         // deleted entry's path bytes; other entries are still
         // referenced by new_paths so they live on.
-        const new_paths = try self.allocator.alloc([]const u8, self.sheet_paths.len - 1);
         var dst: usize = 0;
         for (self.sheet_paths, 0..) |p, i| {
             if (i == sheet_idx) continue;
