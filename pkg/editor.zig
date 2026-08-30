@@ -10163,3 +10163,82 @@ test "S7b-5: entity-spelled item, axis-item and showDataAs enums are their decod
         }
     }
 }
+
+test "S7b-5: an entity-spelled grand item keeps the host's caption; a host cell of unknown type keeps its style as the donor; an unreadable style refuses (Codex #206 r32 REL-3201, REL-3202)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r32_dst.xlsx");
+    defer a.free(dst);
+    const host = "xl/worksheets/sheet2.xml";
+    {
+        const src = try tt.path(a, io, "s7b5_r32_grand.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/pivotTables/pivotTable1.xml", "t=\"grand\"", "t=\"gr&#x61;nd\"");
+        try pivots_mod.fixture.patchPart(a, io, src, host, "</row></sheetData>", "</row><row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><t>Total général</t></is></c></row></sheetData>");
+        {
+            var ed = try Editor.open(a, io, src);
+            defer ed.deinit();
+            try ed.insertRow(0, 2);
+            try ed.save(io, dst);
+            var wb = try Workbook.open(a, io, dst);
+            defer wb.deinit();
+            try expectHostCell(&wb, 1, "A7", .{ .text = "Total général" });
+            try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+        }
+        {
+            var ed = try Editor.open(a, io, src);
+            defer ed.deinit();
+            try ed.setCell(0, 3, 0, .{ .string = "Central" });
+            try ed.save(io, dst);
+            var wb = try Workbook.open(a, io, dst);
+            defer wb.deinit();
+            try expectHostCell(&wb, 1, "A5", .{ .text = "Central" });
+            try expectHostCell(&wb, 1, "A6", .{ .text = "Total général" });
+        }
+    }
+    {
+        // `A5`, the item row the items' style is read from, of a type
+        // the reader does not know but styled: the items laid out
+        // over the row kind take style 7.
+        const src = try tt.path(a, io, "s7b5_r32_type.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, host, "</row></sheetData>", "</row><row r=\"5\"><c r=\"A5\" s=\"7\" t=\"bogus\"><v>0</v></c></row></sheetData>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
+        try expectHostStyle(&wb, 1, "A4", 7);
+        try expectHostStyle(&wb, 1, "A5", 7);
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r32_style.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, host, "</row></sheetData>", "</row><row r=\"4\"><c r=\"A4\" s=\"bogus\"><v>0</v></c></row></sheetData>");
+        const parts = [_][]const u8{ host, "xl/pivotTables/pivotTable1.xml", "xl/pivotCache/pivotCacheRecords1.xml" };
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var before: [parts.len][]u8 = undefined;
+        for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+        defer for (before) |b| a.free(b);
+        if (wb.insertRow(0, 2)) |_| return error.TestUnexpectedResult else |err| switch (err) {
+            error.PivotEditUnsafe, error.MalformedSheetXml => {},
+            else => return err,
+        }
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 3, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}

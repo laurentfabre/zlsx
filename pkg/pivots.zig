@@ -3488,7 +3488,7 @@ pub const engine = struct {
     /// An enum-valued attribute kept as written says `want` by its
     /// decoded value — `def&#x61;ult` is `default` (Codex #206 r31
     /// REL-3101); one that does not decode says nothing.
-    fn attrIs(raw: []const u8, want: []const u8) bool {
+    pub fn attrIs(raw: []const u8, want: []const u8) bool {
         var buf: [32]u8 = undefined;
         const v = wbxml.decodeScalarAttr(&buf, raw) orelse return false;
         return std.mem.eql(u8, v, want);

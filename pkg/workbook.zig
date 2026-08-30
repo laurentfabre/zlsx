@@ -6644,9 +6644,14 @@ pub const Workbook = struct {
                 // An inline string with nothing in it (`<is/>`) is a
                 // value all the same (Codex #206 r21 REL-2102).
                 var hc: HostCell = .{ .occupied = cell.raw_value != null or cell.formula != null or cell.inline_body != null, .text = null, .style = cell.style_idx };
-                if (cell.cell_type_invalid or cell.style_invalid) {
+                // A style written but unreadable is not "unstyled":
+                // carried by row kind, it would be dropped from the
+                // cells laid out over it (Codex #206 r32 REL-3202).
+                // A `t` this reader does not know is a cell all the
+                // same, its style as written.
+                if (cell.style_invalid) return error.MalformedSheetXml;
+                if (cell.cell_type_invalid) {
                     hc.occupied = true;
-                    hc.style = null;
                 } else switch (cell.cell_type) {
                     .shared_string => if (cell.raw_value) |raw| {
                         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -6845,7 +6850,9 @@ pub const Workbook = struct {
             if (row > zlsx.max_row) break;
             const at: CellRef = .{ .row = @intCast(row), .col = tl.tl_col };
             if (it.t) |t| {
-                if (std.mem.eql(u8, t, "grand")) if (grid.get(at)) |c| {
+                // By its decoded value, as the shape check reads it
+                // (Codex #206 r32 REL-3201).
+                if (pivots_mod.engine.attrIs(t, "grand")) if (grid.get(at)) |c| {
                     captions.grand_total = c.text;
                 };
                 continue;
