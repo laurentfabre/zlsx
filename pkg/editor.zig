@@ -8468,6 +8468,11 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         .{ .name = "x_and_t", .old = "<item x=\"0\"/>", .new = "<item x=\"0\" t=\"default\"/>" },
         .{ .name = "items_attr", .old = "<items count=\"3\">", .new = "<items count=\"3\" foo=\"1\">" },
         .{ .name = "row_items_attr", .old = "<rowItems count=\"3\">", .new = "<rowItems count=\"3\" foo=\"1\">" },
+        // Codex #206 r2 REL-202: a `<rowItems>` position outside the
+        // item list, twice, or a grand total not at position 0.
+        .{ .name = "position_out_of_range", .old = "<i><x v=\"1\"/></i>", .new = "<i><x v=\"99\"/></i>" },
+        .{ .name = "position_twice", .old = "<i><x v=\"1\"/></i>", .new = "<i><x/></i>" },
+        .{ .name = "grand_at_one", .old = "<i t=\"grand\"><x/></i>", .new = "<i t=\"grand\"><x v=\"1\"/></i>" },
         .{ .name = "col_field", .old = "<dataFields count=\"1\">", .new = "<colFields count=\"1\"><field x=\"2\"/></colFields><dataFields count=\"1\">" },
         .{ .name = "show_all", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"1\">" },
         .{ .name = "hidden_item", .old = "<item x=\"1\"/>", .new = "<item x=\"1\" h=\"1\"/>" },
@@ -8636,5 +8641,59 @@ test "S7b-5: a host part the cells cannot be rendered into, or a blank merge in 
         defer store.deinit();
         try expectPartHas(&store, pt_part, "<location ref=\"A3:B5\"");
         try expectPartHas(&store, "xl/worksheets/sheet2.xml", "<mergeCell ref=\"A7:B7\"/>");
+    }
+}
+
+test "S7b-5: a table's row counts are checked before any arithmetic on a delete; a host the cells cannot be rendered into refuses the edit before anything moves (Codex #206 r2 SEC-201, REL-203)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const parts = [_][]const u8{ "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml", "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", "xl/pivotTables/pivotTable1.xml", "xl/sharedStrings.xml" };
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8 };
+    const counts = [_]Case{
+        .{ .name = "header_max", .old = "ref=\"A1:C4\" totalsRowShown=\"0\"", .new = "ref=\"A1:C4\" headerRowCount=\"4294967295\" totalsRowShown=\"0\"" },
+        .{ .name = "totals_max", .old = "ref=\"A1:C4\" totalsRowShown=\"0\"", .new = "ref=\"A1:C4\" totalsRowCount=\"4294967295\" totalsRowShown=\"0\"" },
+    };
+    for (counts) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r2_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/tables/table1.xml", case.old, case.new);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var before: [parts.len][]u8 = undefined;
+        for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+        defer for (before) |b| a.free(b);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.deleteRow(0, 3));
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(0, 3));
+    }
+    {
+        // No `<sheetData>` on the host, a content edit on the source:
+        // refused at the pre-flight, every part as it was.
+        const src = try tt.path(a, io, "s7b5_r2_nosd.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", "<sd>");
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</sheetData>", "</sd>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        var before: [parts.len][]u8 = undefined;
+        for (parts, 0..) |name, i| before[i] = try a.dupe(u8, (try wb.store.part(name)).?.bytes);
+        defer for (before) |b| a.free(b);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        for (parts, 0..) |name, i| try std.testing.expectEqualStrings(before[i], (try wb.store.part(name)).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        // A shift alone writes no cell and needs no host render.
+        try ed.insertRow(0, 1);
     }
 }

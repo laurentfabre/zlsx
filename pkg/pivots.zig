@@ -3173,7 +3173,7 @@ pub const engine = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.MalformedXml => return error.MalformedPivotXml,
         };
-        try checkTableShape(&def, cache, rb);
+        try checkTableShape(arena, &def, cache, rb);
 
         const rf: u32 = def.row_fields[0].field;
         const pf = def.fields[rf];
@@ -3310,7 +3310,7 @@ pub const engine = struct {
     /// The consumer forms this slice lays out; everything else refuses
     /// before a cell is computed. Malformed where the part disagrees
     /// with itself or with the cache it reads.
-    fn checkTableShape(def: *const pivot_xml.TableDefinition, cache: *const PivotCache, rb: *const Rebuild) RebuildError!void {
+    fn checkTableShape(arena: Allocator, def: *const pivot_xml.TableDefinition, cache: *const PivotCache, rb: *const Rebuild) RebuildError!void {
         if (def.has_other_children or def.chart_formats == .other) return error.PivotShapeUnsupported;
         if (def.page_fields.len != 0 or def.data_on_rows or !def.compact) return error.PivotShapeUnsupported;
         if (def.fields.len != cache.definition.fields.len or rb.fields.len != def.fields.len) return error.MalformedPivotXml;
@@ -3367,6 +3367,20 @@ pub const engine = struct {
         try checkRowFieldAttrs(pf.attrs);
         for (pf.items) |it| if (it.other_attrs) return error.PivotShapeUnsupported;
         if (!rb.fields[rf].indexed) return error.PivotShapeUnsupported;
+        // Each `<rowItems>` data item names one position of the row
+        // field's list — a cache item, once; the grand total names
+        // position 0 (Codex #206 r2 REL-202).
+        const named = try arena.alloc(bool, pf.items.len);
+        @memset(named, false);
+        for (ri.items) |it| {
+            const pos = it.xs[0];
+            if (it.t != null) {
+                if (pos != 0) return error.PivotShapeUnsupported;
+                continue;
+            }
+            if (pos >= pf.items.len or pf.items[pos].t != null or named[pos]) return error.PivotShapeUnsupported;
+            named[pos] = true;
+        }
         // Every other field: unplaced, or a data field.
         for (def.fields, 0..) |f, k| {
             if (k == rf) continue;

@@ -6361,6 +6361,21 @@ pub const Workbook = struct {
             errdefer self.allocator.free(dup);
             try patches.append(self.allocator, .{ .name = t.part_name, .bytes = dup });
         }
+        // The host writes are rendered LAST in the sweep, over the
+        // hosts as the transform leaves them; that render must not be
+        // the first to find a host it cannot emit into (no
+        // `<sheetData>`, a part that does not parse) after every other
+        // part has moved — so it is rehearsed here, before anything
+        // is installed, and discarded (Codex #206 r2 REL-203). A host
+        // the transform will shift renders here over its pre-edit
+        // bytes: the same element boundaries, the same parse.
+        if (prepared.host_writes.items.len > 0) {
+            var rehearsal = self.renderPivotHostWrites(prepared.host_writes.items) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.PivotEditUnsafe,
+            };
+            rehearsal.deinit(self.allocator);
+        }
         try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
     }
 
@@ -7014,16 +7029,65 @@ pub const Workbook = struct {
         // A column edit inside a rectangle refuses before this; only a
         // row edit changes a rectangle's content.
         if (axis != .row) return error.PivotEditUnsafe;
+        // The counts are the part's own: checked before any
+        // arithmetic on them (Codex #206 r2 SEC-201).
+        const geo = try sourceGeometry(c, src);
         // The header row is the field names: its delete is the table
         // rewriter's refusal, reached first here on the Editor's path.
-        if (kind == .delete and idx_1based < src.rect.tl_row + src.header_rows) return error.PivotEditUnsafe;
+        if (kind == .delete and idx_1based < geo.first_data_row) return error.PivotEditUnsafe;
         // A delete on a table's totals row is not a data edit.
-        if (kind == .delete and idx_1based > src.rect.br_row - src.totals_rows) return error.PivotEditUnsafe;
+        if (kind == .delete and idx_1based > geo.read_rect.br_row) return error.PivotEditUnsafe;
         const eng = pivots_mod.engine;
         const data = try self.sourceDataRows(arena, c, src, sheet_idx, false);
-        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
-        const after = eng.rowsAfterEdit(arena, data, width, src.rect.tl_row + src.header_rows, idx_1based, kind) catch |e| return mapEngineError(e);
+        const after = eng.rowsAfterEdit(arena, data, geo.width, geo.first_data_row, idx_1based, kind) catch |e| return mapEngineError(e);
         return self.rebuildFromRows(arena, c, after);
+    }
+
+    /// A source rectangle's checked geometry: its width is the field
+    /// schema, its header and totals rows (the part's own counts,
+    /// added with a check) leave a data row, its area is within the
+    /// read budget, a headerless table's column names are the field
+    /// names. Every later expression on the counts uses these.
+    const SourceGeometry = struct {
+        width: usize,
+        /// The rectangle read: `rect` less its totals rows.
+        read_rect: pivots_mod.edit.Rect,
+        /// The sheet row of the first data row.
+        first_data_row: u32,
+    };
+
+    fn sourceGeometry(c: *const pivots_mod.PivotCache, src: pivots_mod.edit.RebuildSource) Error!SourceGeometry {
+        if (src.header_rows > 1) return error.PivotEditUnsafe;
+        const eng = pivots_mod.engine;
+        // Before any read: the rectangle's width is the field schema
+        // (a disagreement is S7c's column edit), and its area is
+        // bounded — `engine.max_rebuild_cells` (Codex #205 r3
+        // PERF-301).
+        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
+        if (c.field_names.len != width) return error.PivotEditUnsafe;
+        // A table's totals rows span the bottom of its `ref` and are
+        // not records (Codex #205 r4 REL-401): a delete on one is not
+        // a data edit, an insert at one appends a data row above it,
+        // and they are not read at all (r5 REL-502) — a label or an
+        // uncached SUBTOTAL there is nobody's source cell. The counts
+        // are the part's own, added with a check (r5 SEC-501).
+        const skip = std.math.add(u32, src.header_rows, src.totals_rows) catch return error.PivotEditUnsafe;
+        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
+        if (skip >= height) return error.PivotEditUnsafe;
+        const area = std.math.mul(usize, width, height - src.totals_rows) catch return error.PivotEditUnsafe;
+        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
+        // A headerless table's field names are its `<tableColumn>`
+        // names (Codex #205 r4 REL-402); a headered one's are checked
+        // on the header row once read.
+        if (src.header_rows == 0) {
+            if (src.columns.len != c.field_names.len) return error.PivotEditUnsafe;
+            for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
+        }
+        return .{
+            .width = width,
+            .read_rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows },
+            .first_data_row = src.rect.tl_row + src.header_rows,
+        };
     }
 
     /// S7b-5 (§7 Q3): the same rebuild for a save with staged cell
@@ -7057,35 +7121,9 @@ pub const Workbook = struct {
         sheet_idx: u32,
         with_writes: bool,
     ) Error![]const pivots_mod.engine.Row {
-        if (src.header_rows > 1) return error.PivotEditUnsafe;
-        const eng = pivots_mod.engine;
-        // Before any read: the rectangle's width is the field schema
-        // (a disagreement is S7c's column edit), and its area is
-        // bounded — `engine.max_rebuild_cells` (Codex #205 r3
-        // PERF-301).
-        const width: usize = src.rect.br_col - src.rect.tl_col + 1;
-        if (c.field_names.len != width) return error.PivotEditUnsafe;
-        // A table's totals rows span the bottom of its `ref` and are
-        // not records (Codex #205 r4 REL-401): a delete on one is not
-        // a data edit, an insert at one appends a data row above it,
-        // and they are not read at all (r5 REL-502) — a label or an
-        // uncached SUBTOTAL there is nobody's source cell. The counts
-        // are the part's own, added with a check (r5 SEC-501).
-        const skip = std.math.add(u32, src.header_rows, src.totals_rows) catch return error.PivotEditUnsafe;
-        const height: usize = src.rect.br_row - src.rect.tl_row + 1;
-        if (skip >= height) return error.PivotEditUnsafe;
-        const read_rect: pivots_mod.edit.Rect = .{ .tl_col = src.rect.tl_col, .tl_row = src.rect.tl_row, .br_col = src.rect.br_col, .br_row = src.rect.br_row - src.totals_rows };
-        const area = std.math.mul(usize, width, height - src.totals_rows) catch return error.PivotEditUnsafe;
-        if (area > eng.max_rebuild_cells) return error.PivotEditUnsafe;
-        // A headerless table's field names are its `<tableColumn>`
-        // names (Codex #205 r4 REL-402); a headered one's are checked
-        // on the header row once read.
-        if (src.header_rows == 0) {
-            if (src.columns.len != c.field_names.len) return error.PivotEditUnsafe;
-            for (src.columns, c.field_names) |col, name| if (!std.mem.eql(u8, col, name)) return error.PivotEditUnsafe;
-        }
+        const geo = try sourceGeometry(c, src);
         self.pivot_rebuilds +|= 1;
-        const all = try self.readPivotSourceRows(arena, sheet_idx, read_rect, with_writes);
+        const all = try self.readPivotSourceRows(arena, sheet_idx, geo.read_rect, with_writes);
         if (src.header_rows == 1) {
             for (all[0], c.field_names) |v, name| switch (v) {
                 .string => |str| if (!std.mem.eql(u8, str, name)) return error.PivotEditUnsafe,
