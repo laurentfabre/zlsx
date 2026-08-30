@@ -6701,6 +6701,9 @@ pub const Workbook = struct {
         var pos: usize = 0;
         var in_run = false;
         while (try nextMarkup(body, pos, body.len)) |m| {
+            // Character data lives in `<t>` alone; between the
+            // elements only whitespace (Codex #206 r24 REL-2403).
+            if (!typed_parts.pivot_xml.isBlank(body[pos..m.lt])) return error.MalformedSheetXml;
             pos = m.after;
             switch (m.kind) {
                 .non_element => continue,
@@ -6732,7 +6735,7 @@ pub const Workbook = struct {
                 return error.MalformedSheetXml;
             }
         }
-        if (in_run) return error.MalformedSheetXml;
+        if (in_run or !typed_parts.pivot_xml.isBlank(body[pos..])) return error.MalformedSheetXml;
         return out.items;
     }
 
@@ -8490,12 +8493,12 @@ pub const Workbook = struct {
                 // (Codex #206 r23 REL-2303).
                 // Judged all before any falls: a node dropped mid-pass
                 // would hide the cycle from the next one.
-                var cyclic: [256]bool = [_]bool{false} ** 256;
-                if (n > cyclic.len) return error.OutOfMemory;
+                const cyclic = try arena.alloc(bool, n);
+                @memset(cyclic, false);
                 var any_cyclic = false;
                 for (0..n) |j| {
                     if (state[j] != .undecided) continue;
-                    cyclic[j] = reachesItself(edges, state, n, j);
+                    cyclic[j] = try reachesItself(arena, edges, state, n, j);
                     if (cyclic[j]) any_cyclic = true;
                 }
                 for (0..n) |j| if (cyclic[j]) {
@@ -8514,12 +8517,13 @@ pub const Workbook = struct {
         return kept;
     }
 
-    /// Does `j` reach itself through undecided nodes? A bounded walk
-    /// over the edge matrix — `n` is the cache count.
-    fn reachesItself(edges: []const bool, state: anytype, n: usize, j: usize) bool {
-        var visited: [256]bool = [_]bool{false} ** 256;
-        if (n > visited.len) return true; // too many to walk: conservative
-        var stack: [256]usize = undefined;
+    /// Does `j` reach itself through undecided nodes? A walk over the
+    /// edge matrix — `n` is the cache count — on arena scratch, so a
+    /// list of any length walks (Codex #206 r24 REL-2402).
+    fn reachesItself(arena: Allocator, edges: []const bool, state: anytype, n: usize, j: usize) Error!bool {
+        const visited = try arena.alloc(bool, n);
+        @memset(visited, false);
+        const stack = try arena.alloc(usize, n);
         var top: usize = 0;
         for (0..n) |k| {
             if (k != j and edges[j * n + k] and state[k] == .undecided and !visited[k]) {
@@ -10164,7 +10168,7 @@ fn emitSstXmlForExtension(
     // The one document element, `<sst>`, its close the one that
     // closes it (Codex #206 r21 SEC-2104): a table wrapped in another
     // element, or one beside a decoy, refuses.
-    const doc = Workbook.scanDocument(src_xml, "sst", null) catch |e| switch (e) {
+    const doc = Workbook.scanDocument(src_xml, "sst", "extLst") catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedXml,
     };
@@ -10232,7 +10236,10 @@ fn emitSstXmlForExtension(
         bpos = m.after;
         if (m.kind == .open and sheet_edit.matchTagAt(src_xml, m.lt, "sst") != null) return error.MalformedXml;
     }
-    const close = doc.root_close_lt;
+    // New entries go before a trailing `<extLst>` — `CT_Sst` orders
+    // its entries before the extension list (Codex #206 r24
+    // REL-2401) — else before the root's close.
+    const close = if (doc.child) |ext| ext.start else doc.root_close_lt;
     try out.appendSlice(allocator, src_xml[body_start..close]);
     try appendNewSiEntries(allocator, &out, new_strings);
     try appendNewRichSiEntries(allocator, &out, new_rich);
@@ -25349,6 +25356,20 @@ test "S7b-5: the stagings that stand over a writer → reader chain, a cycle, a 
         edges[2 * 3 + 1] = true;
         const kept = try Workbook.peelStagings(arena, &edges, &.{ true, true, true }, 3);
         try std.testing.expectEqualSlices(bool, &.{ true, true, false }, kept);
+    }
+    // Three hundred candidates, a cycle among the first two: the
+    // scratch is the arena's, not a fixed array's (r24 REL-2402).
+    {
+        const n: usize = 300;
+        const edges = try arena.alloc(bool, n * n);
+        @memset(edges, false);
+        edges[0 * n + 1] = true;
+        edges[1 * n + 0] = true;
+        const cand = try arena.alloc(bool, n);
+        @memset(cand, true);
+        const kept = try Workbook.peelStagings(arena, edges, cand, n);
+        try std.testing.expect(!kept[0] and !kept[1]);
+        for (kept[2..]) |k| try std.testing.expect(k);
     }
     // A ↔ B with A → C: the cycle falls, its reader stands once the
     // cycle's writes are withdrawn (Codex #206 r23 REL-2303).

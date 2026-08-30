@@ -9749,3 +9749,55 @@ test "S7b-5: a consumer host with staged appends refuses the edit; an <is> neste
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: a new shared string goes before the table's extension list; character data between an inline string's elements refuses (Codex #206 r24 REL-2401, REL-2403)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r24_dst.xlsx");
+    defer a.free(dst);
+    {
+        const src = try tt.path(a, io, "s7b5_r24_ext.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/sharedStrings.xml", "</sst>", "<extLst><ext uri=\"{x}\"/></extLst></sst>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const sst = (try store.part("xl/sharedStrings.xml")).?.bytes;
+        const ext = std.mem.indexOf(u8, sst, "<extLst>").?;
+        const last_si = std.mem.lastIndexOf(u8, sst, "<si>").?;
+        try std.testing.expect(last_si < ext);
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, sst, " \n"), "<extLst><ext uri=\"{x}\"/></extLst></sst>"));
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A6", .{ .text = "(blank)" });
+    }
+    const Case = struct { name: []const u8, rows: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "leading_text", .rows = "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is>junk<t>Row Labels</t></is></c></row></sheetData>" },
+        .{ .name = "trailing_text", .rows = "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>Row Labels</t>tail</is></c></row></sheetData>" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(a, "s7b5_r24_{s}.xlsx", .{case.name});
+        defer a.free(file);
+        const src = try tt.path(a, io, file);
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", case.rows);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+}
