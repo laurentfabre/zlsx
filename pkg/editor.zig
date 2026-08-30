@@ -8541,6 +8541,11 @@ fn addUnsupportedConsumer(io: std.Io, path: []const u8) !void {
 /// Every pivot part and the host byte-identical to `original`, save
 /// for the marker on the definition.
 fn expectMarkerOnly(io: std.Io, original: []const u8, saved: []const u8) !void {
+    return expectMarkerOnlyWith(io, original, saved, true);
+}
+
+/// `same_sst` false when the save's own write adds a string.
+fn expectMarkerOnlyWith(io: std.Io, original: []const u8, saved: []const u8, same_sst: bool) !void {
     const a = std.testing.allocator;
     var before = try store_mod.PartStore.open(a, io, original);
     defer before.deinit();
@@ -8548,6 +8553,7 @@ fn expectMarkerOnly(io: std.Io, original: []const u8, saved: []const u8) !void {
     defer after.deinit();
     const same = [_][]const u8{ "xl/pivotCache/pivotCacheRecords1.xml", "xl/pivotTables/pivotTable1.xml", "xl/worksheets/sheet2.xml", "xl/sharedStrings.xml" };
     for (same) |name| {
+        if (!same_sst and std.mem.eql(u8, name, "xl/sharedStrings.xml")) continue;
         const b = (try before.part(name)) orelse return error.PartNotFound;
         const c = (try after.part(name)) orelse return error.PartNotFound;
         try std.testing.expectEqualStrings(b.bytes, c.bytes);
@@ -8845,4 +8851,127 @@ test "S7b-5: the host is spliced, not regenerated — a row's attributes, a shar
     try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
     try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
     try expectHostCell(&wb, 1, "E2", .{ .text = "keep" });
+}
+
+test "S7b-5: a comment, CDATA section or processing instruction spelling sheet markup is copied through, never spliced into; an explicitly closed dimension keeps its close (Codex #206 r4 SEC-401, REL-405)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r4_decoy_src.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r4_decoy_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    const decoy_head = "<!--<sheetData><row r=\"3\"><c r=\"A3\"/></row></sheetData>--><?zlsx <sheetData/>?><dimension ref=\"A1\"></dimension>";
+    const decoy_row = "<row r=\"4\"><!--<c r=\"A4\"/></row>--><c r=\"C4\"><![CDATA[</c></row>]]><v>1</v></c></row>";
+    const rows = try std.mem.concat(a, u8, &.{ "</row>", decoy_row, "</sheetData><!--<row r=\"9\"/>-->" });
+    defer a.free(rows);
+    // The rows first: the decoy head spells `</row></sheetData>` too.
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", rows);
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "<sheetData>", decoy_head ++ "<sheetData>");
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    const host = (try store.part("xl/worksheets/sheet2.xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, host, "<!--<sheetData><row r=\"3\"><c r=\"A3\"/></row></sheetData>--><?zlsx <sheetData/>?><dimension ref=\"A1:B7\"></dimension><sheetData>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host, "<row r=\"4\"><!--<c r=\"A4\"/></row>--><c r=\"A4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host, "<c r=\"C4\"><![CDATA[</c></row>]]><v>1</v></c></row>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host, "</sheetData><!--<row r=\"9\"/>-->") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host, "<dimension"));
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "A3", .{ .text = "Row Labels" });
+    try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
+    try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+    try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+}
+
+test "S7b-5: a merge the old rectangle held is still in the way; an appended integer under a date style 0 leaves the save at the marker (Codex #206 r4 REL-402, REL-403)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r4_dst.xlsx");
+    defer a.free(dst);
+    {
+        // `A6:B6` merged inside `A3:B6`.
+        const src = try tt.path(a, io, "s7b5_r4_merge_inside.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</sheetData>", "</sheetData><mergeCells count=\"1\"><mergeCell ref=\"A6:B6\"/></mergeCells>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        // Style 0 is a date; the source's own numbers wear style 1
+        // (General); the source rectangle runs to row 9, and a row
+        // appended inside it carries an integer with no style — style
+        // 0, a date: refused, the marker alone.
+        const src = try tt.path(a, io, "s7b5_r4_append_int.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        {
+            var store = try store_mod.PartStore.open(a, io, src);
+            defer store.deinit();
+            try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"2\"><xf numFmtId=\"14\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>");
+            try store.save(io, src);
+        }
+        const numeric = [_][]const u8{ "<c r=\"B2\">", "<c r=\"C2\">", "<c r=\"B3\">", "<c r=\"C3\">", "<c r=\"B4\">", "<c r=\"C4\">" };
+        for (numeric) |old| {
+            const new = try std.mem.concat(a, u8, &.{ old[0 .. old.len - 1], " s=\"1\">" });
+            defer a.free(new);
+            try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet1.xml", old, new);
+        }
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/pivotCache/pivotCacheDefinition1.xml", "ref=\"A1:C4\"", "ref=\"A1:C9\"");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        const row = [_]Cell{ .{ .string = "North" }, .{ .integer = 6 }, .empty };
+        const rows = [_][]const Cell{&row};
+        try ed.appendRows(0, &rows);
+        try ed.save(io, dst);
+        try expectMarkerOnlyWith(io, src, dst, false);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 0, "B5", .{ .number = 6 });
+    }
+}
+
+test "S7b-5: a product grand total folds the subtotals as a sum does (Codex #206 r4 REL-406)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7b5_r4_product_src.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7b5_r4_product_dst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "fld=\"1\" baseField", "fld=\"1\" subtotal=\"product\" baseField");
+    // East 0.1, West 3, East 0.7: in record order (0.1·3)·0.7 =
+    // 0.21000000000000002; folded, (0.1·0.7)·3 = 0.20999999999999996.
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try ed.setCell(0, 2, 1, .{ .number = 0.1 });
+    try ed.setCell(0, 3, 1, .{ .number = 3 });
+    try ed.setCell(0, 4, 1, .{ .number = 0.7 });
+    try ed.save(io, dst);
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "B4", .{ .number = 0.06999999999999999 });
+    try expectHostCell(&wb, 1, "B5", .{ .number = 3 });
+    try expectHostCell(&wb, 1, "B6", .{ .number = 0.20999999999999996 });
 }

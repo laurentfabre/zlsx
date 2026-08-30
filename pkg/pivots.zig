@@ -3288,6 +3288,7 @@ pub const engine = struct {
             for (def.data_fields, 0..) |df, j| {
                 var total = aggregateGroup(rb, df.fld, all.items);
                 if (df.subtotal == .sum) total.sum = folded[j].sum;
+                if (df.subtotal == .product) total.prod = folded[j].prod;
                 try cells.append(arena, .{ .row = r, .col = rect.tl_col + 1 + @as(u32, @intCast(j)), .value = try renderAgg(arena, df, total), .kind = .grand });
             }
         }
@@ -3489,8 +3490,8 @@ pub const engine = struct {
     /// sums added, not fifty records), while an AVERAGE is one running
     /// sum over every record in record order, divided (mtcars:
     /// `20.210344827586205`, which no fold of the three subtotals
-    /// gives). Count, min and max are order-blind; product follows
-    /// the running pass.
+    /// gives). Count, min and max are order-blind; a product folds
+    /// like a sum (unverified either way: the corpus carries none).
     const Agg = struct {
         sum: f64 = 0,
         prod: f64 = 1,

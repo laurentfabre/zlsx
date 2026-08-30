@@ -6604,19 +6604,16 @@ pub const Workbook = struct {
         return a.tl_row <= b.br_row and b.tl_row <= a.br_row and a.tl_col <= b.br_col and b.tl_col <= a.br_col;
     }
 
-    fn rectContains(outer: pivots_mod.edit.Rect, inner: pivots_mod.edit.Rect) bool {
-        return inner.tl_row >= outer.tl_row and inner.br_row <= outer.br_row and inner.tl_col >= outer.tl_col and inner.br_col <= outer.br_col;
-    }
-
     fn planHostWriteCells(a: Allocator, t: pivots_mod.PivotTable, lay: pivots_mod.engine.Layout, grid: *const HostGrid, merges: []const pivots_mod.edit.Rect) Error!PivotHostWrite {
         const old = lay.old_rect;
         const new = lay.rect;
         var cells: std.ArrayListUnmanaged(PivotHostCell) = .empty;
-        // A merged range the new rectangle reaches, unless the old one
-        // held it whole (a pivot's own merged labels), is in the way
-        // as an occupied cell is.
+        // A merged range the new rectangle reaches is in the way as an
+        // occupied cell is — one the old rectangle held too (merged
+        // labels, `mergeItem`): the slice writes one value per cell
+        // and does not maintain the merge (Codex #206 r4 REL-402).
         for (merges) |m| {
-            if (rectsIntersect(m, new) and !rectContains(old, m)) return error.PivotEditUnsafe;
+            if (rectsIntersect(m, new)) return error.PivotEditUnsafe;
         }
 
         // Style sources: the old rectangle's rows by kind.
@@ -6714,7 +6711,13 @@ pub const Workbook = struct {
         };
         var out: RenderedHostWrites = .{ .plan = try self.sstPlanForStrings(strings.items) };
         errdefer out.deinit(a);
-        if (out.plan.has_new_strings and out.plan.sst_part_exists) {
+        // A workbook with strings on a pivot host and no shared-string
+        // table is not one Excel wrote; adding the part, its
+        // relationship and its content type is a mutation outside the
+        // one batch below, so it refuses instead (Codex #206 r4
+        // SEC-404).
+        if (out.plan.has_new_strings and !out.plan.sst_part_exists) return error.PivotEditUnsafe;
+        if (out.plan.has_new_strings) {
             const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
             out.sst_bytes = try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items);
         }
@@ -6777,93 +6780,141 @@ pub const Workbook = struct {
         }
         std.mem.sort(PlannedCell, cells.items, {}, PlannedCell.before);
 
-        const sd = sheet_edit.matchTagAt(src, std.mem.indexOf(u8, src, "<sheetData") orelse return error.NoSheetData, "sheetData") orelse return error.NoSheetData;
-        const sd_self_closing = src[sd.after_open - 2] == '/';
+        // `<sheetData>` by the walk, not by the first spelling of its
+        // name: a comment, CDATA section or processing instruction
+        // may spell any of it (Codex #206 r4 SEC-401).
+        var sd: ?zlsx.TagOpen = null;
+        var pos: usize = 0;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            if (sheet_edit.matchTagAt(src, m.lt, "sheetData")) |t| {
+                sd = t;
+                break;
+            }
+        }
+        const sd_tag = sd orelse return error.NoSheetData;
+        const sd_self_closing = src[sd_tag.after_open - 2] == '/';
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(a);
         try out.ensureTotalCapacity(a, src.len + 64 * cells.items.len);
 
         // Everything before the rows, the dimension widened on the way.
-        var head_end = sd.after_open;
-        if (sd_self_closing) head_end = sd.start;
+        const head_end: usize = if (sd_self_closing) sd_tag.start else sd_tag.after_open;
         try appendWithDimension(a, &out, src[0..head_end], cells.items);
         if (sd_self_closing) try out.appendSlice(a, "<sheetData>");
 
-        const body_end: usize = if (sd_self_closing) sd.after_open else (std.mem.indexOfPos(u8, src, sd.after_open, "</sheetData>") orelse return error.NoSheetData);
-        var pos: usize = if (sd_self_closing) sd.after_open else sd.after_open;
         var next: usize = 0; // into `cells`
         var last_row: u32 = 0;
-        while (pos < body_end) {
-            const lt = std.mem.indexOfScalarPos(u8, src, pos, '<') orelse break;
-            if (lt >= body_end) break;
-            const t = sheet_edit.matchTagAt(src, lt, "row") orelse {
-                // Not a row: whatever it is passes through to the next `<`.
-                try out.appendSlice(a, src[pos .. lt + 1]);
-                pos = lt + 1;
-                continue;
-            };
-            try out.appendSlice(a, src[pos..lt]);
-            const attrs = src[t.start + "<row".len .. t.after_open - 1];
-            const trimmed = std.mem.trimEnd(u8, attrs, " \t\r\n/");
-            const r = try rowNumberOf(wbxml_typed.getAttr(trimmed, "r") orelse return error.MalformedSheetXml);
-            if (r <= last_row) return error.MalformedSheetXml;
-            last_row = r;
-            // Planned rows the part does not have, before this one.
-            while (next < cells.items.len and cells.items[next].ref.row < r) {
-                next = try emitPlannedRow(a, &out, cells.items, next, plan);
-            }
-            const self_closing = src[t.after_open - 2] == '/';
-            const row_end: usize = if (self_closing) t.after_open else ((std.mem.indexOfPos(u8, src, t.after_open, "</row>") orelse return error.MalformedSheetXml) + "</row>".len);
-            if (next >= cells.items.len or cells.items[next].ref.row != r) {
-                try out.appendSlice(a, src[t.start..row_end]);
-                pos = row_end;
-                continue;
-            }
-            // This row gains, replaces or loses cells: its open tag as
-            // written (turned into an open/close pair if self-closing),
-            // its cells walked in column order.
-            if (self_closing) {
-                try out.appendSlice(a, src[t.start .. t.after_open - 2]);
-                try out.append(a, '>');
-            } else {
-                try out.appendSlice(a, src[t.start..t.after_open]);
-            }
-            var cpos = t.after_open;
-            const cells_end: usize = if (self_closing) t.after_open else row_end - "</row>".len;
-            var last_col: u32 = 0;
-            while (cpos < cells_end) {
-                const clt = std.mem.indexOfScalarPos(u8, src, cpos, '<') orelse break;
-                if (clt >= cells_end) break;
-                const ct = sheet_edit.matchTagAt(src, clt, "c") orelse {
-                    try out.appendSlice(a, src[cpos .. clt + 1]);
-                    cpos = clt + 1;
+        var body_end: usize = sd_tag.after_open;
+        pos = sd_tag.after_open;
+        if (!sd_self_closing) {
+            var closed = false;
+            while (try nextMarkup(src, pos, src.len)) |m| {
+                switch (m.kind) {
+                    .non_element => {
+                        try out.appendSlice(a, src[pos..m.after]);
+                        pos = m.after;
+                        continue;
+                    },
+                    .close => {
+                        if (closeTagIs(src, m, "sheetData")) {
+                            body_end = m.lt;
+                            closed = true;
+                            break;
+                        }
+                        try out.appendSlice(a, src[pos..m.after]);
+                        pos = m.after;
+                        continue;
+                    },
+                    .open => {},
+                }
+                const t = sheet_edit.matchTagAt(src, m.lt, "row") orelse {
+                    try out.appendSlice(a, src[pos..m.after]);
+                    pos = m.after;
                     continue;
                 };
-                try out.appendSlice(a, src[cpos..clt]);
-                const cattrs = std.mem.trimEnd(u8, src[ct.start + "<c".len .. ct.after_open - 1], " \t\r\n/");
-                const cref = try cellRefOf(wbxml_typed.getAttr(cattrs, "r") orelse return error.MalformedSheetXml);
-                if (cref.row != r or cref.col <= last_col) return error.MalformedSheetXml;
-                last_col = cref.col;
-                const c_self = src[ct.after_open - 2] == '/';
-                const c_end: usize = if (c_self) ct.after_open else ((std.mem.indexOfPos(u8, src, ct.after_open, "</c>") orelse return error.MalformedSheetXml) + "</c>".len);
-                // Planned cells left of this one.
-                while (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col < cref.col) : (next += 1) {
-                    try emitPlannedCell(a, &out, cells.items[next], plan);
+                try out.appendSlice(a, src[pos..m.lt]);
+                const attrs = std.mem.trimEnd(u8, src[t.start + "<row".len .. t.after_open - 1], " \t\r\n/");
+                const r = try rowNumberOf(wbxml_typed.getAttr(attrs, "r") orelse return error.MalformedSheetXml);
+                if (r <= last_row) return error.MalformedSheetXml;
+                last_row = r;
+                // Planned rows the part does not have, before this one.
+                while (next < cells.items.len and cells.items[next].ref.row < r) {
+                    next = try emitPlannedRow(a, &out, cells.items, next, plan);
                 }
-                if (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col == cref.col) {
-                    try emitPlannedCell(a, &out, cells.items[next], plan);
-                    next += 1;
-                } else {
-                    try out.appendSlice(a, src[ct.start..c_end]);
+                const self_closing = src[t.after_open - 2] == '/';
+                const planned = next < cells.items.len and cells.items[next].ref.row == r;
+                if (self_closing) {
+                    if (!planned) {
+                        try out.appendSlice(a, src[t.start..t.after_open]);
+                    } else {
+                        try out.appendSlice(a, src[t.start .. t.after_open - 2]);
+                        try out.append(a, '>');
+                        while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                            try emitPlannedCell(a, &out, cells.items[next], plan);
+                        }
+                        try out.appendSlice(a, "</row>");
+                    }
+                    pos = t.after_open;
+                    continue;
                 }
-                cpos = c_end;
+                // The row's open tag as written, then its cells in
+                // column order, everything between them verbatim.
+                try out.appendSlice(a, src[t.start..t.after_open]);
+                var cpos = t.after_open;
+                var last_col: u32 = 0;
+                var row_closed = false;
+                while (try nextMarkup(src, cpos, src.len)) |cm| {
+                    switch (cm.kind) {
+                        .non_element => {
+                            try out.appendSlice(a, src[cpos..cm.after]);
+                            cpos = cm.after;
+                            continue;
+                        },
+                        .close => {
+                            if (closeTagIs(src, cm, "row")) {
+                                try out.appendSlice(a, src[cpos..cm.lt]);
+                                while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
+                                    try emitPlannedCell(a, &out, cells.items[next], plan);
+                                }
+                                try out.appendSlice(a, src[cm.lt..cm.after]);
+                                cpos = cm.after;
+                                row_closed = true;
+                                break;
+                            }
+                            try out.appendSlice(a, src[cpos..cm.after]);
+                            cpos = cm.after;
+                            continue;
+                        },
+                        .open => {},
+                    }
+                    const ct = sheet_edit.matchTagAt(src, cm.lt, "c") orelse {
+                        try out.appendSlice(a, src[cpos..cm.after]);
+                        cpos = cm.after;
+                        continue;
+                    };
+                    try out.appendSlice(a, src[cpos..cm.lt]);
+                    const cattrs = std.mem.trimEnd(u8, src[ct.start + "<c".len .. ct.after_open - 1], " \t\r\n/");
+                    const cref = try cellRefOf(wbxml_typed.getAttr(cattrs, "r") orelse return error.MalformedSheetXml);
+                    if (cref.row != r or cref.col <= last_col) return error.MalformedSheetXml;
+                    last_col = cref.col;
+                    const c_end = try cellEnd(src, ct);
+                    while (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col < cref.col) : (next += 1) {
+                        try emitPlannedCell(a, &out, cells.items[next], plan);
+                    }
+                    if (next < cells.items.len and cells.items[next].ref.row == r and cells.items[next].ref.col == cref.col) {
+                        try emitPlannedCell(a, &out, cells.items[next], plan);
+                        next += 1;
+                    } else {
+                        try out.appendSlice(a, src[ct.start..c_end]);
+                    }
+                    cpos = c_end;
+                }
+                if (!row_closed) return error.MalformedSheetXml;
+                pos = cpos;
             }
-            try out.appendSlice(a, src[cpos..cells_end]);
-            while (next < cells.items.len and cells.items[next].ref.row == r) : (next += 1) {
-                try emitPlannedCell(a, &out, cells.items[next], plan);
-            }
-            try out.appendSlice(a, "</row>");
-            pos = row_end;
+            if (!closed) return error.NoSheetData;
         }
         try out.appendSlice(a, src[pos..body_end]);
         while (next < cells.items.len) {
@@ -6872,6 +6923,44 @@ pub const Workbook = struct {
         if (sd_self_closing) try out.appendSlice(a, "</sheetData>");
         try out.appendSlice(a, src[body_end..]);
         return try out.toOwnedSlice(a);
+    }
+
+    /// The next markup at or after `pos` and before `end`: a comment,
+    /// CDATA section or processing instruction (copied through whole
+    /// by every caller), a close tag, or an element's open tag.
+    const Markup = struct {
+        lt: usize,
+        after: usize,
+        kind: enum { non_element, close, open },
+    };
+
+    fn nextMarkup(src: []const u8, pos: usize, end: usize) Error!?Markup {
+        const lt = std.mem.indexOfScalarPos(u8, src, pos, '<') orelse return null;
+        if (lt >= end or lt + 1 >= src.len) return error.MalformedSheetXml;
+        const c = src[lt + 1];
+        if (c == '!' or c == '?') {
+            const after = wbxml_typed.skipNonElement(src, lt) catch return error.MalformedSheetXml;
+            return .{ .lt = lt, .after = after, .kind = .non_element };
+        }
+        const gt = std.mem.indexOfScalarPos(u8, src, lt, '>') orelse return error.MalformedSheetXml;
+        return .{ .lt = lt, .after = gt + 1, .kind = if (c == '/') .close else .open };
+    }
+
+    fn closeTagIs(src: []const u8, m: Markup, name: []const u8) bool {
+        const inner = std.mem.trim(u8, src[m.lt + 2 .. m.after - 1], " \t\r\n");
+        return std.mem.eql(u8, inner, name);
+    }
+
+    /// One past a `<c>` element: its `/>`, or its close tag found by
+    /// the walk (a `</c>` inside a comment is not one).
+    fn cellEnd(src: []const u8, ct: zlsx.TagOpen) Error!usize {
+        if (src[ct.after_open - 2] == '/') return ct.after_open;
+        var pos = ct.after_open;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            pos = m.after;
+            if (m.kind == .close and closeTagIs(src, m, "c")) return m.after;
+        }
+        return error.MalformedSheetXml;
     }
 
     /// A row the part lacks: `<row r="N">` and its planned cells (a
@@ -6946,11 +7035,18 @@ pub const Workbook = struct {
             try out.appendSlice(a, src);
             return;
         };
-        const at = std.mem.indexOf(u8, src, "<dimension") orelse {
-            try out.appendSlice(a, src);
-            return;
-        };
-        const t = sheet_edit.matchTagAt(src, at, "dimension") orelse {
+        // The element by the walk (a comment may spell one).
+        var dim: ?zlsx.TagOpen = null;
+        var pos: usize = 0;
+        while (try nextMarkup(src, pos, src.len)) |m| {
+            pos = m.after;
+            if (m.kind != .open) continue;
+            if (sheet_edit.matchTagAt(src, m.lt, "dimension")) |t| {
+                dim = t;
+                break;
+            }
+        }
+        const t = dim orelse {
             try out.appendSlice(a, src);
             return;
         };
@@ -6968,10 +7064,10 @@ pub const Workbook = struct {
         r.br_col = @max(r.br_col, want.br_col);
         var ref_buf: [pivots_mod.Bounds.format_buf_len]u8 = undefined;
         const new_ref = pivots_mod.edit.formatRect(&ref_buf, r) catch return error.MalformedSheetXml;
+        // The attribute's value alone — the element's spelling, open
+        // and close, stays (Codex #206 r4 REL-405).
         try out.appendSlice(a, src[0..t.start]);
-        try out.appendSlice(a, "<dimension ref=\"");
-        try out.appendSlice(a, new_ref);
-        try out.appendSlice(a, "\"/>");
+        try sheet_edit.writeWithReplacedAttr(a, out, src, t, "<dimension".len, "ref", new_ref);
         try out.appendSlice(a, src[t.after_open..]);
     }
 
@@ -6995,15 +7091,13 @@ pub const Workbook = struct {
     }
 
     /// The rendered host writes installed with `extra` (a caller's
-    /// pivot parts) in one `replaceParts`; a shared-string table the
-    /// workbook lacked is added first (the one step outside the
-    /// batch). Then the views the bytes replaced are dropped, and a
+    /// pivot parts) in one `replaceParts`. Then the views the bytes
+    /// replaced are dropped, and a
     /// staged write inside a re-laid rectangle with them: the pivot's
     /// cells are its own — the refresh overwrites a typed-over cell,
     /// as Excel's does.
     fn installPivotHostWrites(self: *Workbook, r: *RenderedHostWrites, extra: []const store_mod.PartStore.Replacement) Error!void {
         const a = self.allocator;
-        if (r.plan.has_new_strings and !r.plan.sst_part_exists) try applySstExtensionPlan(self, &r.plan);
         var all: std.ArrayListUnmanaged(store_mod.PartStore.Replacement) = .empty;
         defer all.deinit(a);
         try all.appendSlice(a, extra);
@@ -7530,13 +7624,17 @@ pub const Workbook = struct {
                 if (col > zlsx.max_col_1based) break;
                 if (col < rect.tl_col or col > rect.br_col) continue;
                 const slot = try Put.slot(arena, grid, blank_row, width, row - rect.tl_row, @as(u32, @intCast(col)) - rect.tl_col);
+                // An appended number wears style 0 — an integer as
+                // much as a float (Codex #206 r4 REL-403).
+                if (cell == .integer or cell == .number) {
+                    if (style0) |st| if (try self.styleDescribesDate(arena, st, date_styles)) return error.PivotEditUnsafe;
+                }
                 slot.* = switch (cell) {
                     .empty => .blank,
                     .string => |txt| .{ .string = txt },
                     .integer => |n| .{ .number = try std.fmt.allocPrint(arena, "{d}", .{n}) },
                     .number => |x| blk: {
                         if (!std.math.isFinite(x)) return error.PivotEditUnsafe;
-                        if (style0) |st| if (try self.styleDescribesDate(arena, st, date_styles)) return error.PivotEditUnsafe;
                         break :blk .{ .number = try std.fmt.allocPrint(arena, "{d}", .{x}) };
                     },
                     .boolean => return error.PivotEditUnsafe,
@@ -9802,7 +9900,9 @@ fn injectSstRelationship(allocator: Allocator, xml: []const u8) Error![]u8 {
         }
         i = num_end + 1;
     }
-    const new_id: u32 = max_id + 1;
+    // A part may spell `rId4294967295`; the next id is not a trap
+    // (Codex #206 r4 SEC-404).
+    const new_id = std.math.add(u32, max_id, 1) catch return error.MalformedXml;
 
     const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse
         return error.MalformedWorkbookRels;
