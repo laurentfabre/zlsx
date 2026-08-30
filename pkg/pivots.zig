@@ -3431,8 +3431,14 @@ pub const engine = struct {
         }
         if (seen_grand != def.row_grand_totals) return error.PivotShapeUnsupported;
         // The location's counts, as the form has them.
+        // The schema requires all three offsets; the form has its
+        // data at (1, 1) and its header row at 0 or 1 — the two the
+        // corpus and the fixture spell (Codex #206 r15 REL-1505).
         const loc = def.location;
-        if ((loc.first_data_row orelse 1) != 1 or (loc.first_data_col orelse 1) != 1) return error.PivotShapeUnsupported;
+        const fhr = loc.first_header_row orelse return error.MalformedPivotXml;
+        const fdr = loc.first_data_row orelse return error.MalformedPivotXml;
+        const fdc = loc.first_data_col orelse return error.MalformedPivotXml;
+        if (fdr != 1 or fdc != 1 or fhr > 1) return error.PivotShapeUnsupported;
         if (loc.row_page_count != null or loc.col_page_count != null) return error.PivotShapeUnsupported;
         // The row field.
         const pf = def.fields[rf];

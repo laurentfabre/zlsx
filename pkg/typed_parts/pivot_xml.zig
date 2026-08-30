@@ -1023,18 +1023,30 @@ fn parseAxisItems(allocator: Allocator, xml: []const u8, el: Child, p: []const u
 /// walk cannot read whole — a stepped-over child, a `field` that is
 /// not a number — reads as `.other`, the reading that refuses.
 fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFormats {
-    var any_field = false;
+    const values_axis: u32 = 4294967294;
+    var any_area = false;
     var formats = Children.init(xml, el.hit, el.end, p, el.env);
     while (try formats.next()) |cf| {
         if (!std.mem.eql(u8, cf.local, "chartFormat")) return .other;
         var areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
         while (try areas.next()) |pa| {
             if (!std.mem.eql(u8, pa.local, "pivotArea")) return .other;
-            // The area's own `field` names a field as a reference does
-            // (Codex #206 r6 REL-602).
-            if (try u32Attr(pa.attrs(xml), "field")) |field| {
-                if (field != 4294967294) return .other;
-                any_field = true;
+            // Every area must be proven to select the values axis and
+            // nothing else — by its own `field`, its `axis`, or a
+            // reference — with no selector naming a field, a row,
+            // column or page axis (Codex #206 r6 REL-602, r15
+            // REL-1504). An area proving nothing refuses.
+            var proven = false;
+            const pattrs = pa.attrs(xml);
+            if (try u32Attr(pattrs, "field")) |field| {
+                if (field != values_axis) return .other;
+                proven = true;
+            }
+            if (wbxml.getAttr(pattrs, "axis")) |ax| {
+                var buf: [32]u8 = undefined;
+                const v = wbxml.decodeScalarAttr(&buf, ax) orelse return .other;
+                if (!std.mem.eql(u8, v, "axisValues")) return .other;
+                proven = true;
             }
             var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
             while (try refs_blocks.next()) |rb| {
@@ -1043,17 +1055,19 @@ fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFo
                 while (try refs.next()) |r| {
                     if (!std.mem.eql(u8, r.local, "reference")) return .other;
                     const field = (try u32Attr(r.attrs(xml), "field")) orelse return .other;
-                    if (field != 4294967294) return .other;
-                    any_field = true;
+                    if (field != values_axis) return .other;
+                    proven = true;
                 }
                 if (refs.skipped > 0 or refs.other) return .other;
             }
             if (refs_blocks.skipped > 0 or refs_blocks.other) return .other;
+            if (!proven) return .other;
+            any_area = true;
         }
         if (areas.skipped > 0 or areas.other) return .other;
     }
     if (formats.skipped > 0 or formats.other) return .other;
-    return if (any_field) .values_only else .none;
+    return if (any_area) .values_only else .none;
 }
 
 fn axisFromXml(s: []const u8) ?Axis {

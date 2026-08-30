@@ -6627,46 +6627,88 @@ pub const Workbook = struct {
     /// the body is not a run and not text (Codex #206 r7 REL-702); a
     /// `<t>` without its close is `MalformedSheetXml`.
     fn inlineStringText(arena: Allocator, body: []const u8) Error![]const u8 {
+        // CT_Rst by structure (Codex #206 r15 REL-1503): under `<is>`,
+        // a `<t>`, an `<r>` (holding `<rPr>` and a `<t>`), an `<rPh>`
+        // (a phonetic hint, skipped whole), a childless `<phoneticPr>`;
+        // anything else, or a close that is not the open's, is a
+        // string this reader does not carry.
         var out: std.ArrayListUnmanaged(u8) = .empty;
         var pos: usize = 0;
+        var in_run = false;
         while (try nextMarkup(body, pos, body.len)) |m| {
             pos = m.after;
-            if (m.kind != .open) continue;
-            // A phonetic run is a hint over the text, not the text
-            // (Codex #206 r14 REL-1402): skipped whole.
-            if (sheet_edit.matchTagAt(body, m.lt, "rPh")) |ph| {
-                if (body[ph.after_open - 2] == '/') continue;
-                var ppos = ph.after_open;
-                var closed = false;
-                while (try nextMarkup(body, ppos, body.len)) |pm| {
-                    ppos = pm.after;
-                    if (pm.kind == .close and closeTagIs(body, pm, "rPh")) {
-                        closed = true;
-                        break;
+            switch (m.kind) {
+                .non_element => continue,
+                .close => {
+                    if (in_run and closeTagIs(body, m, "r")) {
+                        in_run = false;
+                        continue;
                     }
-                }
-                if (!closed) return error.MalformedSheetXml;
-                pos = ppos;
-                continue;
+                    return error.MalformedSheetXml;
+                },
+                .open => {},
             }
-            const t = zlsx.TagOpen{ .start = m.lt, .after_open = m.after };
-            if (sheet_edit.matchTagAt(body, m.lt, "t") == null) continue;
-            if (body[t.after_open - 2] == '/') continue;
-            // The text: everything up to `</t>` that is not markup.
-            var tpos = t.after_open;
-            var closed = false;
-            while (try nextMarkup(body, tpos, body.len)) |tm| {
-                try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[tpos..tm.lt]));
-                tpos = tm.after;
-                if (tm.kind == .close and closeTagIs(body, tm, "t")) {
-                    closed = true;
-                    break;
-                }
+            const self_closing = body[m.after - 2] == '/';
+            if (sheet_edit.matchTagAt(body, m.lt, "t") != null) {
+                if (self_closing) continue;
+                pos = try readInlineRun(arena, &out, body, m.after);
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "r") != null) {
+                if (self_closing) continue;
+                in_run = true;
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "rPh") != null) {
+                if (self_closing) continue;
+                pos = try skipSubtree(body, m.after, "rPh");
+            } else if (in_run and sheet_edit.matchTagAt(body, m.lt, "rPr") != null) {
+                if (self_closing) continue;
+                pos = try skipSubtree(body, m.after, "rPr");
+            } else if (!in_run and sheet_edit.matchTagAt(body, m.lt, "phoneticPr") != null) {
+                if (!self_closing) return error.MalformedSheetXml;
+            } else {
+                return error.MalformedSheetXml;
             }
-            if (!closed) return error.MalformedSheetXml;
-            pos = tpos;
         }
+        if (in_run) return error.MalformedSheetXml;
         return out.items;
+    }
+
+    /// The text of a `<t>` opened just before `from`, appended decoded;
+    /// a comment inside is not text, any element is not a run.
+    fn readInlineRun(arena: Allocator, out: *std.ArrayListUnmanaged(u8), body: []const u8, from: usize) Error!usize {
+        var tpos = from;
+        while (try nextMarkup(body, tpos, body.len)) |tm| {
+            try out.appendSlice(arena, try sst_xml_mod.decodeText(arena, body[tpos..tm.lt]));
+            tpos = tm.after;
+            switch (tm.kind) {
+                .non_element => continue,
+                .close => {
+                    if (closeTagIs(body, tm, "t")) return tpos;
+                    return error.MalformedSheetXml;
+                },
+                .open => return error.MalformedSheetXml,
+            }
+        }
+        return error.MalformedSheetXml;
+    }
+
+    /// Past the close of `name`, opened just before `from`; the
+    /// subtree's own markup is not read.
+    fn skipSubtree(body: []const u8, from: usize, name: []const u8) Error!usize {
+        var ppos = from;
+        var depth: usize = 1;
+        while (try nextMarkup(body, ppos, body.len)) |pm| {
+            ppos = pm.after;
+            switch (pm.kind) {
+                .non_element => {},
+                .open => if (sheet_edit.matchTagAt(body, pm.lt, name) != null and body[pm.after - 2] != '/') {
+                    depth += 1;
+                },
+                .close => if (closeTagIs(body, pm, name)) {
+                    depth -= 1;
+                    if (depth == 0) return ppos;
+                },
+            }
+        }
+        return error.MalformedSheetXml;
     }
 
     /// The captions the host spells today, read where the part as it
@@ -6851,7 +6893,7 @@ pub const Workbook = struct {
         if (touches_strings and out.plan.sst_part_exists) {
             const existing = (try self.store.part("xl/sharedStrings.xml")) orelse return error.MissingWorkbookPart;
             const extended: []u8 = if (out.plan.has_new_strings)
-                try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items)
+                try emitSstXmlForExtension(a, existing.bytes, out.plan.new_strings.items, out.plan.new_rich_strings.items, out.plan.base_index)
             else
                 try a.dupe(u8, existing.bytes);
             defer a.free(extended);
@@ -7272,7 +7314,9 @@ pub const Workbook = struct {
         if (r.sst_bytes) |b| try all.append(a, .{ .name = "xl/sharedStrings.xml", .bytes = b });
         try all.appendSlice(a, r.patches.items);
         if (all.items.len > 0) try self.store.replaceParts(all.items);
-        if (r.plan.has_new_strings) {
+        // The table's bytes changed — with new entries or only without
+        // its count (Codex #206 r15 REL-1501): the view goes with them.
+        if (r.sst_bytes != null) {
             if (self.sst_view) |*v| {
                 var view = v.*;
                 view.deinit(a);
@@ -8092,7 +8136,10 @@ pub const Workbook = struct {
         // is a cycle, all of it dropped.
         const n = p.caches.len;
         const identity = HostRowMap.forEdit(false, .row, 1, .insert);
-        const edges = try arena.alloc(bool, n * n);
+        // The list is the part's own; its square is checked (Codex
+        // #206 r15 SEC-1502).
+        const edge_count = std.math.mul(usize, n, n) catch return error.OutOfMemory;
+        const edges = try arena.alloc(bool, edge_count);
         @memset(edges, false);
         for (stagings, 0..) |st_opt, i| {
             const st = st_opt orelse continue;
@@ -9794,6 +9841,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
             existing_part.bytes,
             plan.new_strings.items,
             plan.new_rich_strings.items,
+            plan.base_index,
         );
         defer wb.allocator.free(new_xml);
         try wb.store.replacePart("xl/sharedStrings.xml", new_xml);
@@ -9834,29 +9882,32 @@ fn emitSstXmlForExtension(
     src_xml: []const u8,
     new_strings: []const []const u8,
     new_rich: []const RichEntry,
+    existing_si_count: u32,
 ) Error![]u8 {
     assert(src_xml.len > 0);
     assert(new_strings.len > 0 or new_rich.len > 0);
 
-    // Locate `<sst …>` opening tag.
-    const sst_open = std.mem.indexOf(u8, src_xml, "<sst") orelse
-        return error.MalformedXml;
-    const sst_open_gt = std.mem.indexOfScalarPos(u8, src_xml, sst_open, '>') orelse
-        return error.MalformedXml;
-    const is_self_closing = sst_open_gt > 0 and src_xml[sst_open_gt - 1] == '/';
-
-    // Existing si count: parse uniqueCount attribute when present;
-    // otherwise count `<si` opens in the body.
-    const existing_si_count: u32 = blk: {
-        const attrs = src_xml[sst_open .. sst_open_gt + 1];
-        if (extractAttrValue(attrs, "uniqueCount")) |raw| {
-            if (std.fmt.parseInt(u32, raw, 10)) |n| break :blk n else |_| {}
+    // The root by the markup walk — a comment, CDATA section or
+    // processing instruction may spell one, and a `>` inside a quoted
+    // attribute is not the tag's end (Codex #206 r15 SEC-1506).
+    var root: ?zlsx.TagOpen = null;
+    var pos: usize = 0;
+    while (try Workbook.nextMarkup(src_xml, pos, src_xml.len)) |m| {
+        pos = m.after;
+        if (m.kind != .open) continue;
+        if (sheet_edit.matchTagAt(src_xml, m.lt, "sst")) |t| {
+            root = t;
+            break;
         }
-        break :blk countSiOpens(src_xml);
-    };
-    // The counts are the part's own (`uniqueCount` is taken on
-    // trust above): added with a check, not trapped on (Codex #206
-    // r3 SEC-301).
+    }
+    const sst_tag = root orelse return error.MalformedXml;
+    const sst_open = sst_tag.start;
+    const sst_open_gt = sst_tag.after_open - 1;
+    const is_self_closing = src_xml[sst_open_gt - 1] == '/';
+
+    // `existing_si_count` is the parsed table's entry count — what
+    // the new indices continue from — never the part's own
+    // `uniqueCount`, which may lie. Added with a check (r3 SEC-301).
     const new_total = std.math.add(usize, new_strings.len, new_rich.len) catch return error.MalformedXml;
     const new_si_count = std.math.cast(u32, new_total) orelse return error.MalformedXml;
     const total_si = std.math.add(u32, existing_si_count, new_si_count) catch return error.MalformedXml;
@@ -9902,11 +9953,20 @@ fn emitSstXmlForExtension(
         return try out.toOwnedSlice(allocator);
     }
 
-    // Normal form: copy body verbatim up to `</sst>`, then append
+    // Normal form: copy body verbatim up to the root's close — found
+    // by the walk, past any spelling of it in a comment — then append
     // new entries (plain then rich), then `</sst>` + trailing.
     const body_start = sst_open_gt + 1;
-    const close = std.mem.indexOfPos(u8, src_xml, body_start, "</sst>") orelse
-        return error.MalformedXml;
+    var close_at: ?usize = null;
+    var bpos = body_start;
+    while (try Workbook.nextMarkup(src_xml, bpos, src_xml.len)) |m| {
+        bpos = m.after;
+        if (m.kind == .close and Workbook.closeTagIs(src_xml, m, "sst")) {
+            close_at = m.lt;
+            break;
+        }
+    }
+    const close = close_at orelse return error.MalformedXml;
     try out.appendSlice(allocator, src_xml[body_start..close]);
     try appendNewSiEntries(allocator, &out, new_strings);
     try appendNewRichSiEntries(allocator, &out, new_rich);

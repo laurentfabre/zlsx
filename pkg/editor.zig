@@ -8485,6 +8485,17 @@ test "S7b-5: a consumer form the slice does not lay out refuses the edit whole â
         .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
         .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
         .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        // Codex #206 r15 REL-1504: an area selecting by axis, or proving
+        // nothing.
+        .{ .name = "chart_area_axis_row", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" axis=\"axisRow\"/></chartFormat></chartFormats><pivotTableStyleInfo" },
+        .{ .name = "chart_area_empty", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea/></chartFormat></chartFormats><pivotTableStyleInfo" },
+        .{ .name = "chart_area_axis_values", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\" axis=\"axisValues\"/></chartFormat></chartFormats><pivotTableStyleInfo", .admitted = true },
+        // Codex #206 r15 REL-1505: the location's required offsets.
+        .{ .name = "no_first_data_row", .old = " firstDataRow=\"1\"", .new = "", .direct = error.MalformedPivotXml },
+        .{ .name = "no_first_header_row", .old = " firstHeaderRow=\"1\"", .new = "", .direct = error.MalformedPivotXml },
+        .{ .name = "no_first_data_col", .old = " firstDataCol=\"1\"", .new = "", .direct = error.MalformedPivotXml },
+        .{ .name = "first_data_col_2", .old = "firstDataCol=\"1\"", .new = "firstDataCol=\"2\"" },
+        .{ .name = "first_header_row_2", .old = "firstHeaderRow=\"1\"", .new = "firstHeaderRow=\"2\"" },
         // Codex #206 r12 REL-1201: the field wrapper's own count and
         // attributes.
         .{ .name = "pivot_fields_count", .old = "<pivotFields count=\"3\">", .new = "<pivotFields count=\"9\">", .direct = error.MalformedPivotXml },
@@ -8776,22 +8787,23 @@ test "S7b-5: a shared-string table lying about its count refuses the edit and le
     const dst = try tt.path(a, io, "s7b5_r3_dst.xlsx");
     defer a.free(dst);
     {
+        // A `uniqueCount` at the u32 maximum: the parsed table's entry
+        // count is what the new indices continue from (r15 SEC-1506
+        // superseded r3's refusal), so the edit is admitted and the
+        // table respelt exactly.
         const src = try tt.path(a, io, "s7b5_r3_sst.xlsx");
         defer a.free(src);
         try pivots_mod.fixture.write(a, io, src, .sheet_ref);
         try patchSstUniqueCount(io, src, "4294967295");
         var wb = try Workbook.open(a, io, src);
         defer wb.deinit();
-        const before = try a.dupe(u8, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
-        defer a.free(before);
-        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
-        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/sharedStrings.xml")).?.bytes);
-        var ed = try Editor.open(a, io, src);
-        defer ed.deinit();
-        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
-        try ed.setCell(0, 2, 0, .{ .string = "Central" });
-        try ed.save(io, dst);
-        try expectMarkerOnly(io, src, dst);
+        try wb.insertRow(0, 2);
+        const sst = (try wb.store.part("xl/sharedStrings.xml")).?.bytes;
+        const unique = std.mem.count(u8, sst, "<si>");
+        const want = try std.fmt.allocPrint(a, "uniqueCount=\"{d}\"", .{unique});
+        defer a.free(want);
+        try std.testing.expect(std.mem.indexOf(u8, sst, want) != null);
+        try expectHostCell(&wb, 1, "A6", .{ .text = "(blank)" });
     }
     {
         // `A4` twice on the host.
@@ -9312,4 +9324,66 @@ test "S7b-5: a phonetic run is not caption text; the shared-string table drops i
     defer store2.deinit();
     const sst2 = (try store2.part("xl/sharedStrings.xml")).?.bytes;
     try std.testing.expect(std.mem.indexOf(u8, sst2, " count=\"") == null);
+}
+
+test "S7b-5: a decoy shared-string root, a quoted `>` on it and a lying uniqueCount do not misplace a new entry; an unknown element in an inline caption refuses; a count-only table rewrite drops the cached view (Codex #206 r15 SEC-1506, REL-1503, REL-1501)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r15_dst.xlsx");
+    defer a.free(dst);
+    {
+        const src = try tt.path(a, io, "s7b5_r15_sst.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try patchSstUniqueCount(io, src, "99");
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/sharedStrings.xml", "<sst ", "<!--<sst/>--><?pi <sst>?><sst xml:lang=\"a>b\" ");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(a, io, dst);
+        defer store.deinit();
+        const sst = (try store.part("xl/sharedStrings.xml")).?.bytes;
+        // The decoys as written, the root's own attribute kept (the
+        // attribute writer respaces the blob), the count gone.
+        try std.testing.expect(std.mem.indexOf(u8, sst, "<!--<sst/>--><?pi <sst>?><sst") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sst, "xml:lang=\"a>b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sst, " count=\"") == null);
+        const unique = std.mem.count(u8, sst, "<si>");
+        const want = try std.fmt.allocPrint(a, "uniqueCount=\"{d}\"", .{unique});
+        defer a.free(want);
+        try std.testing.expect(std.mem.indexOf(u8, sst, want) != null);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A6", .{ .text = "(blank)" });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Grand Total" });
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r15_foo.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</row></sheetData>", "</row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><foo><t>fake</t></foo><t>Row Labels</t></is></c></row></sheetData>");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, wb.insertRow(0, 2));
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r15_view.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expect((try wb.sst()).?.total_count != null);
+        try wb.deleteRow(0, 3);
+        try std.testing.expect((try wb.sst()).?.total_count == null);
+    }
 }
