@@ -496,11 +496,14 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
   package layer (see [`docs/cli.md`](docs/cli.md)).
 - **Automatic date decoding** — dates surface as Excel serials; opt in via
   `Rows.parseDate` / `xlsx.fromExcelSerial`.
-- **Pivot-aware edits** — pivots round-trip byte-preserved, and row/col edits
-  on sheets that *host* a pivot are refused rather than silently breaking it.
-  The guard walks the edited sheet's relationships, so a sheet a pivot only
-  *reads from* is admitted — pinned by S6's audit, closed by S7b
-  (`goal_sigmoid.md`). The typed read, `Workbook.pivotTables` / `zlsx pivots`,
+- **Pivot-aware edits** — pivots round-trip byte-preserved; a row/col edit on a
+  sheet that *hosts* one moves its rectangle, and a row edit (or a cell write)
+  that changes a source's *content* refreshes the pivot the way Excel would —
+  the cache rebuilt from the cells, its consumers re-laid, their output cells
+  rewritten (S7b, `goal_sigmoid.md`) — for the report forms the engine lays
+  out (one row field, the values axis, plain aggregates); every other form
+  refuses the edit rather than corrupt it, and the cache is still marked to
+  refresh at open. The typed read, `Workbook.pivotTables` / `zlsx pivots`,
   names every host and source sheet.
 - **Chart authoring** — extraction is in; typed chart emission is not. Image
   authoring exists on the `Workbook` editing layer only (writer matrix

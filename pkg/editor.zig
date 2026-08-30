@@ -5599,7 +5599,12 @@ test "S7b: the corpus fixture — the host-and-source sheet moves its pivot and 
     var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
     defer store.deinit();
     const pt1 = (try store.part("xl/pivotTables/pivotTable1.xml")).?;
-    try std.testing.expect(std.mem.indexOf(u8, pt1.bytes, "<location ref=\"G3:K7\"") != null);
+    // Moved by the insert (S7a), then grown by the blank record's
+    // `(blank)` row (S7b-5).
+    try std.testing.expect(std.mem.indexOf(u8, pt1.bytes, "<location ref=\"G3:K8\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pt1.bytes, "<rowItems count=\"5\">") != null);
+    const pt2 = (try store.part("xl/pivotTables/pivotTable2.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<location ref=\"A1:D6\"") != null);
     const tbl1 = (try store.part("xl/tables/table1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, tbl1.bytes, "ref=\"A1:E52\"") != null);
     const cd1 = (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?;
@@ -6527,7 +6532,8 @@ test "S7b-4: a prepared collection is this edit's or nothing — another index, 
 
     var prepared = try wb.preflightPivotEditsForSheet("xl/worksheets/sheet1.xml", .row, 2, .insert);
     defer prepared.deinit(std.testing.allocator);
-    try std.testing.expect(prepared.patches.items.len == 2);
+    try std.testing.expect(prepared.patches.items.len == 3);
+    try std.testing.expect(prepared.host_writes.items.len == 1);
     try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 3, .kind = .insert }, &prepared));
     try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .row = 2, .kind = .delete }, &prepared));
     try std.testing.expectError(error.PivotEditUnsafe, wb.applySheetEdit(0, .{ .col = 2, .kind = .insert }, &prepared));
@@ -6790,21 +6796,23 @@ test "S7b-3: a setCell inside a source rectangle marks the cache at save; outsid
         try std.testing.expectEqualStrings(original, after);
     }
     {
-        // `Data!B3` is a record's `Qty`: marked, and the marker is the
-        // only byte that changed.
+        // `Data!B3` is a record's `Qty`: marked — and, since S7b-5,
+        // rebuilt from the sheet as written, the consumer re-laid.
         var ed = try Editor.open(std.testing.allocator, io, src);
         defer ed.deinit();
         try ed.setCell(0, 3, 1, .{ .number = 9.5 });
         try ed.save(io, dst);
-        const after = try cacheDefinitionBytes(std.testing.allocator, io, dst);
-        defer std.testing.allocator.free(after);
-        try std.testing.expectEqualStrings(marked, after);
         var wb = try Workbook.open(std.testing.allocator, io, dst);
         defer wb.deinit();
         var p = try wb.pivotTables();
         defer p.deinit();
         try std.testing.expect(p.caches[0].definition.refresh_on_load);
         try std.testing.expectEqualStrings("A1:C4", p.caches[0].source.ref.?);
+        try expectRebuilt(&wb.store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        const rec = (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"1\"/><n v=\"9.5\"/><n v=\"2.5\"/></r>") != null);
+        try expectHostCell(&wb, 1, "B5", .{ .number = 9.5 });
+        try expectHostCell(&wb, 1, "B6", .{ .number = 17.5 });
     }
     {
         // The buffer save takes the same path; the header cell `A1` is
@@ -6821,14 +6829,18 @@ test "S7b-3: a setCell inside a source rectangle marks the cache at save; outsid
         try std.testing.expect(p.caches[0].definition.refresh_on_load);
     }
     {
-        // A blank write at the bottom-right corner `C4` is a write.
+        // A blank write at the bottom-right corner `C4` is a write:
+        // marked and rebuilt, the record's `Price` now a blank.
         var ed = try Editor.open(std.testing.allocator, io, src);
         defer ed.deinit();
         try ed.setCell(0, 4, 2, .empty);
         try ed.save(io, dst);
-        const after = try cacheDefinitionBytes(std.testing.allocator, io, dst);
-        defer std.testing.allocator.free(after);
-        try std.testing.expectEqualStrings(marked, after);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        const rec = (try store.part("xl/pivotCache/pivotCacheRecords1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, rec.bytes, "<r><x v=\"0\"/><n v=\"5\"/><m/></r>") != null);
     }
 }
 
@@ -6941,7 +6953,7 @@ test "S7b-3: appended rows mark only where the emitter lands them — inside a s
     try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", false);
 }
 
-test "S7b-3: an already-marked definition is byte-identical under a write inside; a graph that cannot be read marks nothing and still saves" {
+test "S7b-3: an already-marked definition keeps its one marker under a write inside (S7b-5 rebuilds it); a graph that cannot be read marks nothing and still saves" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -6954,16 +6966,16 @@ test "S7b-3: an already-marked definition is byte-identical under a write inside
     defer std.testing.allocator.free(set);
     try pivots_mod.fixture.write(std.testing.allocator, io, set, .sheet_ref);
     try pivots_mod.fixture.patchPart(std.testing.allocator, io, set, "xl/pivotCache/pivotCacheDefinition1.xml", " recordCount=\"3\">", " recordCount=\"3\" refreshOnLoad=\"1\">");
-    const already = try cacheDefinitionBytes(std.testing.allocator, io, set);
-    defer std.testing.allocator.free(already);
     {
         var ed = try Editor.open(std.testing.allocator, io, set);
         defer ed.deinit();
         try ed.setCell(0, 3, 1, .{ .number = 9.5 });
         try ed.save(io, dst);
-        const after = try cacheDefinitionBytes(std.testing.allocator, io, dst);
-        defer std.testing.allocator.free(after);
-        try std.testing.expectEqualStrings(already, after);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        try std.testing.expect(std.mem.indexOf(u8, (try store.part("xl/pivotCache/pivotCacheDefinition1.xml")).?.bytes, "maxValue=\"9.5\"") != null);
     }
 
     // The cache's workbook relationship mistyped: the graph refuses
@@ -8058,4 +8070,427 @@ test "Editor: an extLst with only xm:sqref still edits, and shifts" {
     defer store.deinit();
     const sheet = (try store.part("xl/worksheets/sheet1.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, "<xm:sqref>A6:A10</xm:sqref>") != null);
+}
+
+// ─── S7b-5: the engine's second slice — the consumers ────────────────
+//
+// A rebuilt cache's consumers are laid out again in the same edit:
+// the row field's `<items>`, `<rowItems>`, `location@ref`, and the
+// cells of the host rectangle — the header, one row per item with a
+// record, the grand total — written last in the sweep, in post-edit
+// coordinates. A save with a staged write inside a source takes the
+// same path (§7 Q3), with the marker kept as the safety net.
+
+/// What a host cell holds after a save.
+const HostValue = union(enum) { text: []const u8, number: f64, blank, none };
+
+fn expectHostCell(wb: *Workbook, sheet_idx: u32, ref: []const u8, want: HostValue) !void {
+    const ws = try wb.sheet(sheet_idx);
+    const cell = try ws.cellByRef(ref);
+    switch (want) {
+        .none => try std.testing.expect(cell == null),
+        .blank => {
+            const c = cell orelse return error.TestExpectedCell;
+            try std.testing.expect(c.raw_value == null and c.formula == null);
+        },
+        .number => |x| {
+            const c = cell orelse return error.TestExpectedCell;
+            try std.testing.expect(c.cell_type == .number);
+            try std.testing.expectEqual(x, try std.fmt.parseFloat(f64, c.raw_value orelse return error.TestExpectedValue));
+        },
+        .text => |t| {
+            const c = cell orelse return error.TestExpectedCell;
+            const raw: []const u8 = switch (c.cell_type) {
+                .shared_string => blk: {
+                    const idx = try std.fmt.parseInt(usize, c.raw_value orelse return error.TestExpectedValue, 10);
+                    const sst = (try wb.sst()) orelse return error.TestExpectedSst;
+                    break :blk sst.entries[idx].plain;
+                },
+                // A pure shift leaves an inline string as written.
+                .inline_string => c.raw_value orelse return error.TestExpectedValue,
+                else => return error.TestExpectedText,
+            };
+            const decoded = try store_mod.decodeXmlEntities(std.testing.allocator, raw);
+            defer std.testing.allocator.free(decoded);
+            try std.testing.expectEqualStrings(t, decoded);
+        },
+    }
+}
+
+fn expectHostStyle(wb: *Workbook, sheet_idx: u32, ref: []const u8, want: ?u32) !void {
+    const ws = try wb.sheet(sheet_idx);
+    const c = (try ws.cellByRef(ref)) orelse return error.TestExpectedCell;
+    try std.testing.expectEqual(want, c.style_idx);
+}
+
+fn expectPartHas(store: *store_mod.PartStore, part: []const u8, needle: []const u8) !void {
+    const p = (try store.part(part)) orelse return error.PartNotFound;
+    if (std.mem.indexOf(u8, p.bytes, needle) == null) {
+        std.debug.print("\nexpected in {s}:\n  {s}\ngot:\n  {s}\n", .{ part, needle, p.bytes });
+        return error.TestExpectedSubstring;
+    }
+}
+
+const pt_part = "xl/pivotTables/pivotTable1.xml";
+const fixture_pivot_field = "<pivotField axis=\"axisRow\" showAll=\"0\"><items count=\"3\"><item x=\"0\"/><item x=\"1\"/><item t=\"default\"/></items></pivotField>";
+const fixture_data_field = "<dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/>";
+
+test "S7b-5: an insert inside the source re-lays the consumer — items, rowItems, location and the host cells; a delete shrinks it and clears the row it no longer covers" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b5_grow_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const grown = try tt.path(std.testing.allocator, io, "s7b5_grow_dst.xlsx");
+    defer std.testing.allocator.free(grown);
+    const shrunk = try tt.path(std.testing.allocator, io, "s7b5_shrink_dst.xlsx");
+    defer std.testing.allocator.free(shrunk);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    {
+        // Row 2 of `Data` is inside `A1:C4`: a blank record, so a
+        // `(blank)` item after the written ones (`sortType` manual),
+        // shown with an empty sum; the grand total moves down one.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, grown);
+    }
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, grown);
+        defer store.deinit();
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 4);
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "<sharedItems containsBlank=\"1\" count=\"3\"><s v=\"East\"/><s v=\"West\"/><m/></sharedItems>");
+        try expectPartHas(&store, pt_part, "<location ref=\"A3:B7\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>");
+        try expectPartHas(&store, pt_part, "<pivotField axis=\"axisRow\" showAll=\"0\"><items count=\"4\"><item x=\"0\"/><item x=\"1\"/><item x=\"2\"/><item t=\"default\"/></items></pivotField>");
+        try expectPartHas(&store, pt_part, "<rowItems count=\"4\"><i><x/></i><i><x v=\"1\"/></i><i><x v=\"2\"/></i><i t=\"grand\"><x/></i></rowItems>");
+        try expectPartHas(&store, pt_part, "<colItems count=\"1\"><i/></colItems>");
+        var wb = try Workbook.open(std.testing.allocator, io, grown);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A1", .{ .text = "pivot host" });
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 1, "B3", .{ .text = "Sum of Qty" });
+        try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
+        try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+        try expectHostCell(&wb, 1, "A5", .{ .text = "West" });
+        try expectHostCell(&wb, 1, "B5", .{ .number = 4 });
+        try expectHostCell(&wb, 1, "A6", .{ .text = "(blank)" });
+        try expectHostCell(&wb, 1, "B6", .blank);
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+        try expectHostCell(&wb, 1, "A8", .none);
+        // The marker stays: the safety net under B (§8 Q2).
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+    }
+    {
+        // From there, delete `West` (row 4 of the grown sheet): its
+        // item stays in the inventory and the field's list, marked
+        // missing, and is not a row; the old grand-total cells at row
+        // 7 are cleared.
+        var ed = try Editor.open(std.testing.allocator, io, grown);
+        defer ed.deinit();
+        try ed.deleteRow(0, 4);
+        try ed.save(io, shrunk);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, shrunk);
+        defer store.deinit();
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        try expectPartHas(&store, pt_part, "<location ref=\"A3:B6\"");
+        try expectPartHas(&store, pt_part, "<items count=\"4\"><item x=\"0\"/><item x=\"1\" m=\"1\"/><item x=\"2\"/><item t=\"default\"/></items>");
+        try expectPartHas(&store, pt_part, "<rowItems count=\"3\"><i><x/></i><i><x v=\"2\"/></i><i t=\"grand\"><x/></i></rowItems>");
+        var wb = try Workbook.open(std.testing.allocator, io, shrunk);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A4", .{ .text = "East" });
+        try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+        try expectHostCell(&wb, 1, "A5", .{ .text = "(blank)" });
+        try expectHostCell(&wb, 1, "B5", .blank);
+        try expectHostCell(&wb, 1, "A6", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 1, "B6", .{ .number = 8 });
+        try expectHostCell(&wb, 1, "A7", .none);
+        try expectHostCell(&wb, 1, "B7", .none);
+    }
+}
+
+/// The fixture with its pivot hosted on `Data` at `A7:B10`, below the
+/// source, laid out as Excel (in French) would have left it — the
+/// captions it wrote, a style per cell.
+fn writeHostOnSourceFixture(io: std.Io, path: []const u8, bottom_note: bool) !void {
+    const a = std.testing.allocator;
+    try pivots_mod.fixture.write(a, io, path, .sheet_ref);
+    {
+        var store = try store_mod.PartStore.open(a, io, path);
+        defer store.deinit();
+        try store.addPart(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdPT1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>
+            ,
+        );
+        try store.save(io, path);
+    }
+    try pivots_mod.fixture.patchPart(a, io, path, "xl/worksheets/_rels/sheet2.xml.rels", "<Relationship Id=\"rIdPT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable1.xml\"/>", "");
+    try pivots_mod.fixture.patchPart(a, io, path, pt_part, "ref=\"A3:B6\"", "ref=\"A7:B10\"");
+    const note: []const u8 = if (bottom_note) "<row r=\"11\"><c r=\"A11\" t=\"inlineStr\"><is><t>note</t></is></c></row>" else "";
+    const rows = try std.mem.concat(a, u8, &.{
+        "<row r=\"7\"><c r=\"A7\" s=\"3\" t=\"inlineStr\"><is><t>Étiquettes de lignes</t></is></c><c r=\"B7\" s=\"4\" t=\"inlineStr\"><is><t>Somme de Qty</t></is></c></row>",
+        "<row r=\"8\"><c r=\"A8\" s=\"5\" t=\"inlineStr\"><is><t>East</t></is></c><c r=\"B8\" s=\"6\"><v>8</v></c></row>",
+        "<row r=\"9\"><c r=\"A9\" s=\"5\" t=\"inlineStr\"><is><t>West</t></is></c><c r=\"B9\" s=\"6\"><v>4</v></c></row>",
+        "<row r=\"10\"><c r=\"A10\" s=\"7\" t=\"inlineStr\"><is><t>Total général</t></is></c><c r=\"B10\" s=\"8\"><v>12</v></c></row>",
+        note,
+        "</sheetData>",
+    });
+    defer a.free(rows);
+    try pivots_mod.fixture.patchPart(a, io, path, "xl/worksheets/sheet1.xml", "</sheetData>", rows);
+}
+
+test "S7b-5: a host on the edited sheet — the rectangle moves with the edit, then grows, in post-edit coordinates; the captions and styles carry; growth over a cell refuses whole" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b5_host_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b5_host_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try writeHostOnSourceFixture(io, src, false);
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+    }
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    // `A7:B10` shifted to `A8:B11` by the insert, then grown to
+    // `A8:B12` by the `(blank)` row.
+    try expectPartHas(&store, pt_part, "<location ref=\"A8:B12\"");
+    var wb = try Workbook.open(std.testing.allocator, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 0, "A8", .{ .text = "Étiquettes de lignes" });
+    try expectHostCell(&wb, 0, "B8", .{ .text = "Sum of Qty" });
+    try expectHostCell(&wb, 0, "A9", .{ .text = "East" });
+    try expectHostCell(&wb, 0, "B9", .{ .number = 8 });
+    try expectHostCell(&wb, 0, "A10", .{ .text = "West" });
+    try expectHostCell(&wb, 0, "B10", .{ .number = 4 });
+    try expectHostCell(&wb, 0, "A11", .{ .text = "(blank)" });
+    try expectHostCell(&wb, 0, "B11", .blank);
+    try expectHostCell(&wb, 0, "A12", .{ .text = "Total général" });
+    try expectHostCell(&wb, 0, "B12", .{ .number = 12 });
+    try expectHostCell(&wb, 0, "A7", .none);
+    try expectHostCell(&wb, 0, "A13", .none);
+    // Styles by row kind: the header's, the last item row's for every
+    // item row (the new one included), the grand total's.
+    try expectHostStyle(&wb, 0, "A8", 3);
+    try expectHostStyle(&wb, 0, "B8", 4);
+    try expectHostStyle(&wb, 0, "A9", 5);
+    try expectHostStyle(&wb, 0, "B11", 6);
+    try expectHostStyle(&wb, 0, "A12", 7);
+    try expectHostStyle(&wb, 0, "B12", 8);
+    // The source rows moved too: the blank record's row is 2.
+    try expectHostCell(&wb, 0, "A3", .{ .text = "East" });
+
+    // A note at `A11` sits at `A12` after the insert — where the grown
+    // rectangle would land. Refused whole, on both paths.
+    const noted = try tt.path(std.testing.allocator, io, "s7b5_host_noted.xlsx");
+    defer std.testing.allocator.free(noted);
+    try writeHostOnSourceFixture(io, noted, true);
+    var ed = try Editor.open(std.testing.allocator, io, noted);
+    defer ed.deinit();
+    try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+    var direct = try Workbook.open(std.testing.allocator, io, noted);
+    defer direct.deinit();
+    const before = try std.testing.allocator.dupe(u8, (try direct.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(error.PivotEditUnsafe, direct.insertRow(0, 2));
+    try std.testing.expectEqualStrings(before, (try direct.store.part("xl/worksheets/sheet1.xml")).?.bytes);
+    try expectPartHas(&direct.store, pt_part, "<location ref=\"A7:B10\"");
+    // A shift alone (row 1, above the source's header — no content
+    // changes) moves the rectangle and writes no cell.
+    try direct.insertRow(0, 1);
+    try expectPartHas(&direct.store, pt_part, "<location ref=\"A8:B11\"");
+    try expectHostCell(&direct, 0, "A11", .{ .text = "Total général" });
+    try expectHostCell(&direct, 0, "A12", .{ .text = "note" });
+}
+
+test "S7b-5: a save with a write inside the source rebuilds the cache and re-lays the consumer (§7 Q3); `ascending` sorts a new item by value, `manual` appends it; a write the rebuild refuses still marks" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const dst = try tt.path(std.testing.allocator, io, "s7b5_save_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    const Case = struct { name: []const u8, ascending: bool, rows: [3][]const u8, nums: [3]f64 };
+    const cases = [_]Case{
+        .{ .name = "ascending", .ascending = true, .rows = .{ "Central", "East", "West" }, .nums = .{ 3, 5, 4 } },
+        .{ .name = "manual", .ascending = false, .rows = .{ "East", "West", "Central" }, .nums = .{ 5, 4, 3 } },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b5_save_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        if (case.ascending) try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<pivotField axis=\"axisRow\" showAll=\"0\">", "<pivotField axis=\"axisRow\" showAll=\"0\" sortType=\"ascending\">");
+        {
+            // `Data!A2`: the first record's `Region`, `East` → `Central`.
+            var ed = try Editor.open(std.testing.allocator, io, src);
+            defer ed.deinit();
+            try ed.setCell(0, 2, 0, .{ .string = "Central" });
+            try ed.save(io, dst);
+        }
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectRebuilt(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", 3);
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "<sharedItems count=\"3\"><s v=\"East\"/><s v=\"West\"/><s v=\"Central\"/></sharedItems>");
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheRecords1.xml", "<r><x v=\"2\"/><n v=\"3\"/><n v=\"1.5\"/></r>");
+        if (case.ascending) {
+            try expectPartHas(&store, pt_part, "<items count=\"4\"><item x=\"2\"/><item x=\"0\"/><item x=\"1\"/><item t=\"default\"/></items>");
+        } else {
+            try expectPartHas(&store, pt_part, "<items count=\"4\"><item x=\"0\"/><item x=\"1\"/><item x=\"2\"/><item t=\"default\"/></items>");
+        }
+        try expectPartHas(&store, pt_part, "<rowItems count=\"4\"><i><x/></i><i><x v=\"1\"/></i><i><x v=\"2\"/></i><i t=\"grand\"><x/></i></rowItems>");
+        try expectPartHas(&store, pt_part, "<location ref=\"A3:B7\"");
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 0, "A2", .{ .text = "Central" });
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 1, "A4", .{ .text = case.rows[0] });
+        try expectHostCell(&wb, 1, "B4", .{ .number = case.nums[0] });
+        try expectHostCell(&wb, 1, "A5", .{ .text = case.rows[1] });
+        try expectHostCell(&wb, 1, "B5", .{ .number = case.nums[1] });
+        try expectHostCell(&wb, 1, "A6", .{ .text = case.rows[2] });
+        try expectHostCell(&wb, 1, "B6", .{ .number = case.nums[2] });
+        try expectHostCell(&wb, 1, "A7", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    }
+    {
+        // A write the rebuild refuses — a boolean in a record — marks
+        // and leaves the snapshot: the save is not where an admitted
+        // write is refused.
+        const src = try tt.path(std.testing.allocator, io, "s7b5_save_refused.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        const original = try cacheDefinitionBytes(std.testing.allocator, io, src);
+        defer std.testing.allocator.free(original);
+        const marked = try markedDefinition(std.testing.allocator, original);
+        defer std.testing.allocator.free(marked);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 2, 1, .{ .boolean = true });
+        try ed.save(io, dst);
+        const after = try cacheDefinitionBytes(std.testing.allocator, io, dst);
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualStrings(marked, after);
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .none);
+    }
+    {
+        // A write inside the pivot's own rectangle is the pivot's to
+        // overwrite: the refresh wins, as Excel's does.
+        const src = try tt.path(std.testing.allocator, io, "s7b5_save_typed_over.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.setCell(0, 3, 1, .{ .integer = 10 });
+        try ed.setCell(1, 4, 1, .{ .string = "typed over" });
+        try ed.setCell(1, 9, 0, .{ .string = "kept" });
+        try ed.save(io, dst);
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+        try expectHostCell(&wb, 1, "B5", .{ .number = 10 });
+        try expectHostCell(&wb, 1, "B6", .{ .number = 18 });
+        try expectHostCell(&wb, 1, "A9", .{ .text = "kept" });
+    }
+}
+
+test "S7b-5: the values axis across — two data fields, an average beside a sum, the grand total folded from the subtotals" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7b5_two_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7b5_two_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    const a = std.testing.allocator;
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<pivotField dataField=\"1\" showAll=\"0\"/><pivotField showAll=\"0\"/>", "<pivotField dataField=\"1\" showAll=\"0\"/><pivotField dataField=\"1\" showAll=\"0\"/>");
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<colItems count=\"1\"><i/></colItems><dataFields count=\"1\">" ++ fixture_data_field ++ "</dataFields>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems><dataFields count=\"2\">" ++ fixture_data_field ++ "<dataField name=\"Average of Price\" fld=\"2\" subtotal=\"average\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "ref=\"A3:B6\" firstHeaderRow=\"1\"", "ref=\"A3:C6\" firstHeaderRow=\"0\"");
+    var ed = try Editor.open(a, io, src);
+    defer ed.deinit();
+    try ed.insertRow(0, 2);
+    try ed.save(io, dst);
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    try expectPartHas(&store, pt_part, "<location ref=\"A3:C7\" firstHeaderRow=\"0\"");
+    try expectPartHas(&store, pt_part, "<colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "C3", .{ .text = "Average of Price" });
+    try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+    try expectHostCell(&wb, 1, "C4", .{ .number = 2.5 });
+    try expectHostCell(&wb, 1, "B5", .{ .number = 4 });
+    try expectHostCell(&wb, 1, "C5", .{ .number = 2.5 });
+    try expectHostCell(&wb, 1, "B6", .blank);
+    try expectHostCell(&wb, 1, "C6", .blank);
+    try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    try expectHostCell(&wb, 1, "C7", .{ .number = 2.5 });
+}
+
+test "S7b-5: a consumer form the slice does not lay out refuses the edit whole — page, column and hidden items, a dispersion, a percentage, tabular form, a chart on a field" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8, admitted: bool = false };
+    const cases = [_]Case{
+        .{ .name = "page", .old = "<dataFields count=\"1\">", .new = "<pageFields count=\"1\"><pageField fld=\"2\" hier=\"-1\"/></pageFields><dataFields count=\"1\">" },
+        .{ .name = "col_field", .old = "<dataFields count=\"1\">", .new = "<colFields count=\"1\"><field x=\"2\"/></colFields><dataFields count=\"1\">" },
+        .{ .name = "show_all", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"1\">" },
+        .{ .name = "hidden_item", .old = "<item x=\"1\"/>", .new = "<item x=\"1\" h=\"1\"/>" },
+        .{ .name = "std_dev", .old = "fld=\"1\" baseField", .new = "fld=\"1\" subtotal=\"stdDev\" baseField" },
+        .{ .name = "percent", .old = "fld=\"1\" baseField", .new = "fld=\"1\" showDataAs=\"percentOfTotal\" baseField" },
+        .{ .name = "tabular", .old = "outline=\"1\"", .new = "outline=\"1\" compact=\"0\"" },
+        .{ .name = "descending", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" sortType=\"descending\">" },
+        .{ .name = "top_n", .old = "<pivotField axis=\"axisRow\" showAll=\"0\">", .new = "<pivotField axis=\"axisRow\" showAll=\"0\" autoShow=\"1\" topAutoShow=\"1\" itemPageCount=\"2\" rankBy=\"0\">" },
+        .{ .name = "filters", .old = "<pivotTableStyleInfo", .new = "<filters count=\"1\"><filter fld=\"1\" type=\"count\" evalOrder=\"-1\" id=\"1\" iMeasureFld=\"0\"><autoFilter ref=\"A1\"/></filter></filters><pivotTableStyleInfo" },
+        .{ .name = "chart_on_field", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"0\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo" },
+        .{ .name = "chart_on_values", .old = "<pivotTableStyleInfo", .new = "<chartFormats count=\"1\"><chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"0\"/></reference></references></pivotArea></chartFormat></chartFormats><pivotTableStyleInfo", .admitted = true },
+        .{ .name = "no_row_items", .old = "<rowItems count=\"3\"><i><x/></i><i><x v=\"1\"/></i><i t=\"grand\"><x/></i></rowItems>", .new = "" },
+    };
+    for (cases) |case| {
+        const file = try std.fmt.allocPrint(std.testing.allocator, "s7b5_refuse_{s}.xlsx", .{case.name});
+        defer std.testing.allocator.free(file);
+        const src = try tt.path(std.testing.allocator, io, file);
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, case.old, case.new);
+        var wb = try Workbook.open(std.testing.allocator, io, src);
+        defer wb.deinit();
+        const before = try std.testing.allocator.dupe(u8, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        defer std.testing.allocator.free(before);
+        if (case.admitted) {
+            try wb.insertRow(0, 2);
+            try expectPartHas(&wb.store, pt_part, "<location ref=\"A3:B7\"");
+            continue;
+        }
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/pivotCache/pivotCacheRecords1.xml")).?.bytes);
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        // A shift stays a shift: row 1 is above the source, and no
+        // cache is rebuilt, so the form is not asked.
+        try ed.insertRow(0, 1);
+    }
 }
