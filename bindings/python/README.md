@@ -225,11 +225,20 @@ with zlsx.edit("report.xlsx") as ed:
     ed.save("report.xlsx")
 
 for p in zlsx.pivots("report.xlsx"):       # the `zlsx pivots` records, as dicts
-    if p["kind"] == "pivot":               # a table; its cache may be null
-        src = p["cache"]["source"]["resolved"] if p["cache"] else None
-        print(p["name"], p["location"]["ref"], src)
-    else:                                  # "pivot_cache": a cache no table reads
+    if p["kind"] != "pivot":               # "pivot_cache": a cache no table reads
         print("orphan cache", p["cache"]["id"])
+        continue
+    cache = p["cache"]                     # null when the part reaches no cache
+    src = cache["source"] if cache else None
+    if src is None:
+        where = "no cache"
+    elif src["type"] == "worksheet":       # sheet / table / defined-name spellings
+        where = src["resolved"]            # {"sheet":…,"sheet_idx":…,"via":…,"bounds":…}, {"external":…} or None
+    elif src["type"] == "consolidation":
+        where = [rs["resolved"] for rs in src["range_sets"]]
+    else:                                  # "external", "scenario", "unknown"
+        where = src["type"]
+    print(p["name"], p["location"]["ref"], where)
 ```
 
 A structural edit carries the rewriters the CLI's `insert-row` family
@@ -252,7 +261,7 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
-| `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit` / `Malformed*` / `*CoordinateOverflow` | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read |
+| `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit`, the carrier verdicts `MalformedSheetXml` / `MalformedDrawingXml` / `MalformedVmlDrawing` / `MalformedCommentsXml` / `MalformedTableXml` / `*CoordinateOverflow`, the workbook's own `MalformedWorkbookXml` / `IdSpaceExhausted` / … | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read or materialise. The list is §10 of `docs/plans/c-abi-status-v1.md`; a generic `MalformedXml` from a rewriter's consistency guard stays a plain `ZlsxError` |
 
 `ZlsxRefusal` is a `ZlsxError`; `ZlsxFormulaRefusal` (the engine's
 Plane-2 refusals) now derives from it. Statements about the *call* stay

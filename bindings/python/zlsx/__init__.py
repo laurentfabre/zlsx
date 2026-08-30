@@ -3600,9 +3600,15 @@ class Editor:
 
         * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
           1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
-          — a split pane the rewriter does not shift; ``Malformed*`` /
-          ``*CoordinateOverflow`` — a sheet, drawing, VML, comments or
-          table part the walkers cannot read or move.
+          — a split pane the rewriter does not shift; the carrier
+          verdicts ``MalformedSheetXml``, ``MalformedDrawingXml``,
+          ``MalformedVmlDrawing``, ``MalformedCommentsXml``,
+          ``MalformedTableXml``, ``DrawingCoordinateOverflow``,
+          ``VmlCoordinateOverflow``, ``TableCoordinateOverflow`` — a part
+          the walkers cannot read (or materialise) or move. The full
+          list is §10 of ``docs/plans/c-abi-status-v1.md``; a generic
+          ``MalformedXml`` from a rewriter's consistency guard stays a
+          plain :class:`ZlsxError`.
 
         Errors (:class:`ZlsxError`): ``SheetIndexOutOfRange``,
         ``RowIndexOutOfRange`` (0 or past 1048576), and

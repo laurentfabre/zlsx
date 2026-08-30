@@ -1750,12 +1750,16 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     ASCII case-insensitively), TableColumnNameInUse,
  *     MalformedPivotXml (the pivot graph cannot be read whole), the
  *     workbook's own structure found broken (InternalSheetNameTooLong,
- *     MalformedWorkbookXml, MissingRelationship, SheetCountMismatch, …);
+ *     MalformedWorkbookXml, IdSpaceExhausted, MissingRelationship,
+ *     SheetCountMismatch, …);
  *   with their precise names, the worksheet transform's own verdicts
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
- *     read or move (every Malformed* / *CoordinateOverflow part,
- *     PivotEditUnsafe, MissingSheetPart, NoSheetData) — the full list is
+ *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
+ *     MalformedCommentsXml, MalformedTableXml, the *CoordinateOverflow
+ *     trio, PivotEditUnsafe, MissingSheetPart, NoSheetData; a generic
+ *     MalformedXml from a rewriter's consistency guard stays -1) — the
+ *     full list is
  *     docs/plans/c-abi-status-v1.md §10; the typed worksheet parser's
  *     MalformedXml / UnexpectedEof cross as MalformedSheetXml, and a
  *     pivot part the archive cannot materialise as MalformedPivotXml.

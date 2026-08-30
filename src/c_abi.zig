@@ -5946,6 +5946,7 @@ const structural_refusals = [_]anyerror{
     error.RelationshipElementNotFound,
     error.SheetCountMismatch,
     error.MalformedWorkbookXml,
+    error.IdSpaceExhausted,
     error.MissingWorkbookPart,
     error.MissingWorkbookRels,
     error.MissingContentTypes,
@@ -7630,6 +7631,45 @@ test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the 
         try std.testing.expectEqual(no_sheet_idx, idx);
         try std.testing.expectEqual(plane_none, diag.plane);
     }
+    // A sheetId the workbook has already pushed to the top of u32: the
+    // next identifier does not exist, and that is the workbook's verdict
+    // (Codex #207 r5 REL-501), not a trap.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3a_sheetid_exhausted.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "sheetId=\"2\"", "sheetId=\"4294967295\"");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var idx: u32 = 3;
+        const nm = "Fresh";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_add_sheet(ed, nm.ptr, nm.len, &idx, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("IdSpaceExhausted", diagName(&diag));
+        try std.testing.expectEqual(no_sheet_idx, idx);
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    // A table part whose payload the store cannot materialise: the
+    // carrier's own verdict (Codex #207 r5 REL-502) — unfolded from the
+    // rename, folded into the sheet-level name by a row edit's
+    // pre-flight, a refusal either way.
+    {
+        const path = try tt.path(alloc, io, "s3a_lazy_table.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.write(alloc, io, path, .table_name);
+        try corruptPartPayload(alloc, io, path, "xl/tables/table1.xml");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        const tbl = "SalesTbl";
+        const old = "Qty";
+        const new = "Quantity";
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_table_column(ed, tbl.ptr, tbl.len, old.ptr, old.len, new.ptr, new.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedTableXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 0, 6, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("RowEditUnsafeForSheet", diagName(&diag));
+    }
     // A pivot part whose payload the store cannot materialise: the
     // archive opens (the central directory is intact), the read refuses
     // as `MalformedPivotXml` with nothing handed out.
@@ -7675,6 +7715,7 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.InternalSheetNameTooLong));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedWorkbookXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.IdSpaceExhausted));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableColumnNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidTableColumnName));

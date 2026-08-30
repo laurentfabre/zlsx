@@ -2272,10 +2272,14 @@ def test_editor_evaluate_value_shapes(tmp_path):
     assert m.cells == [[1.0, 2.0], [3.0, 4.0]]
     assert ed.evaluate("=D7", **ctx).value == 0.0
 
-    # Typed refusal raises ZlsxFormulaRefusal (a ZlsxError subclass).
+    # Typed refusal raises ZlsxFormulaRefusal — a ZlsxRefusal (S3a's base
+    # for every typed refusal), hence a ZlsxError.
     with pytest.raises(zlsx.ZlsxFormulaRefusal) as exc_info:
         ed.evaluate("=1+", **ctx)
     assert exc_info.value.error_name == "FormulaMalformedInput"
+    assert isinstance(exc_info.value, zlsx.ZlsxRefusal)
+    assert isinstance(exc_info.value, zlsx.ZlsxError)
+    assert issubclass(zlsx.ZlsxFormulaRefusal, zlsx.ZlsxRefusal)
     ed.close()
 
 
@@ -2368,6 +2372,7 @@ def test_editor_recalc_refusal_carries_census(tmp_path):
     with pytest.raises(zlsx.ZlsxFormulaRefusal) as exc_info:
         ed.recalculate(now=1_700_000_000_000, seed=1)
     refusal = exc_info.value
+    assert isinstance(refusal, zlsx.ZlsxRefusal)
     assert refusal.error_name == "FormulaUnsupportedFunction"
     # The refusing cell survives to Python: sheet 0, row 1 (1-based),
     # col 1 (0-based) — the M9a2 seam through recalc_run.prepare.

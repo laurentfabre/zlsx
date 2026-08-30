@@ -4908,13 +4908,16 @@ pub const Workbook = struct {
         outer: while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
             const sheet_part_name = try ws.resolvePartName();
-            const sheet_part = (try self.store.part(sheet_part_name)) orelse continue;
+            const sheet_part = (try self.carrierPart(sheet_part_name, error.MalformedSheetXml)) orelse continue;
             const rels = self.store.rels(sheet_part_name);
             var rid_iter = TablePartRidIterator.init(sheet_part.bytes);
             while (rid_iter.next()) |rid| {
                 const target = relTargetForId(rels, rid) orelse continue;
                 const part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
-                const part = (try self.store.part(part_name)) orelse continue;
+                // The table lookup materialises every table part on
+                // the way to the one named: a payload the store cannot
+                // read is that carrier's verdict here too.
+                const part = (try self.carrierPart(part_name, error.MalformedTableXml)) orelse continue;
                 const display_raw = table_edit.tableDisplayNameRaw(part.bytes) orelse continue;
                 // STRING-carrier decode (entities + ST_Xstring) —
                 // resolution parity with the engine, which reads
@@ -4940,7 +4943,7 @@ pub const Workbook = struct {
 
         // Step 2: rewrite the table part (validations included —
         // nothing below runs unless the rename is fully legal).
-        const table_part = (try self.store.part(table_part_name)) orelse return error.TableNotFound;
+        const table_part = (try self.carrierPart(table_part_name, error.MalformedTableXml)) orelse return error.TableNotFound;
         var renamed = try table_edit.renameTableColumn(a, table_part.bytes, old_name, new_name);
         defer renamed.deinit(a);
 
@@ -5036,8 +5039,23 @@ pub const Workbook = struct {
     /// editor mirroring the part names can compute it BEFORE the mutation
     /// and allocate nothing after (S3a, Codex #207 r3 REL-305).
     pub fn nextSheetPartName(self: *const Workbook, buf: *[64]u8) Error![]const u8 {
-        const next_path_num = (try nextMaxSheetPathNumFromStore(&self.store)) + 1;
+        // Checked: a workbook carrying `sheet4294967295.xml` is a
+        // workbook, not a crash (Codex #207 r5 REL-501).
+        const next_path_num = std.math.add(u32, try nextMaxSheetPathNumFromStore(&self.store), 1) catch
+            return error.IdSpaceExhausted;
         return std.fmt.bufPrint(buf, "xl/worksheets/sheet{d}.xml", .{next_path_num}) catch unreachable;
+    }
+
+    /// A carrier part on a structural path, read lazily: a payload the
+    /// store cannot materialise (a CRC that no longer matches, a broken
+    /// stream) is the carrier's own "cannot read" verdict, not the
+    /// store's `BadZip` (S3a, Codex #207 r5 REL-502). Memory and the
+    /// archive-wide budget keep their names.
+    fn carrierPart(self: *const Workbook, name: []const u8, comptime malformed: Error) Error!?store_mod.Part {
+        return self.store.part(name) catch |e| switch (e) {
+            error.OutOfMemory, error.ZipBombSuspected => return e,
+            else => return malformed,
+        };
     }
 
     pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
@@ -5062,8 +5080,12 @@ pub const Workbook = struct {
         // Each addSheet rescans because previous calls extend the
         // workbook view in-place — nothing else tracks the running
         // high-water marks.
-        const next_sheet_id = nextMaxNumericAttr(wb_part.bytes, "sheetId=\"") + 1;
-        const next_rid_num = nextMaxNumericAttr(rels_part.bytes, "Id=\"rId") + 1;
+        // Checked, like the part number: an identifier space a hostile
+        // workbook has exhausted is its verdict, not a trap.
+        const next_sheet_id = std.math.add(u32, nextMaxNumericAttr(wb_part.bytes, "sheetId=\""), 1) catch
+            return error.IdSpaceExhausted;
+        const next_rid_num = std.math.add(u32, nextMaxNumericAttr(rels_part.bytes, "Id=\"rId"), 1) catch
+            return error.IdSpaceExhausted;
         var path_buf: [64]u8 = undefined;
         const new_path = try self.nextSheetPartName(&path_buf);
         var rid_buf: [32]u8 = undefined;
@@ -6032,7 +6054,7 @@ pub const Workbook = struct {
         const rels = self.store.rels(sheet_part_name);
         const target = relTargetForId(rels, rid) orelse return;
         const drawing_part_name = (try self.store.resolve(sheet_part_name, target)) orelse return;
-        const drawing_part = (try self.store.part(drawing_part_name)) orelse return;
+        const drawing_part = (try self.carrierPart(drawing_part_name, error.MalformedDrawingXml)) orelse return;
 
         const idx_1based = spec.row orelse spec.col.?;
         if (idx_1based == 0) return;
@@ -6080,7 +6102,7 @@ pub const Workbook = struct {
         if (findWorksheetLegacyDrawingRid(sheet_xml)) |rid| {
             if (relTargetForId(rels, rid)) |target| {
                 if (try self.store.resolve(sheet_part_name, target)) |drawing_part_name| {
-                    if (try self.store.part(drawing_part_name)) |drawing_part| {
+                    if (try self.carrierPart(drawing_part_name, error.MalformedVmlDrawing)) |drawing_part| {
                         const new_bytes = try vml_edit.applyEditToVmlDrawing(
                             self.allocator,
                             drawing_part.bytes,
@@ -6106,7 +6128,7 @@ pub const Workbook = struct {
         for (rels) |rel| {
             if (!std.mem.endsWith(u8, rel.type, "/relationships/comments")) continue;
             const comments_part_name = (try self.store.resolve(sheet_part_name, rel.target)) orelse continue;
-            const comments_part = (try self.store.part(comments_part_name)) orelse continue;
+            const comments_part = (try self.carrierPart(comments_part_name, error.MalformedCommentsXml)) orelse continue;
             const new_bytes = try vml_edit.applyEditToCommentsXml(
                 self.allocator,
                 comments_part.bytes,
@@ -6142,7 +6164,7 @@ pub const Workbook = struct {
         while (rid_iter.next()) |rid| {
             const target = relTargetForId(rels, rid) orelse continue;
             const table_part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
-            const table_part = (try self.store.part(table_part_name)) orelse continue;
+            const table_part = (try self.carrierPart(table_part_name, error.MalformedTableXml)) orelse continue;
             const out = try table_edit.applyEditToTable(
                 self.allocator,
                 table_part.bytes,
@@ -6261,7 +6283,15 @@ pub const Workbook = struct {
             }
         }
         if (!hosts and !(try self.carriesPivotCache())) return null;
-        return try self.pivotTables();
+        // A graph that cannot be read whole — a part the store cannot
+        // materialise included (a table a source names, a records part)
+        // — is `MalformedPivotXml`, which the editor folds into the
+        // sheet-level refusal (Codex #207 r5 REL-502). Memory and the
+        // archive-wide budget keep theirs.
+        return self.pivotTables() catch |e| switch (e) {
+            error.OutOfMemory, error.ZipBombSuspected => return e,
+            else => return error.MalformedPivotXml,
+        };
     }
 
     fn carriesPivotCache(self: *Workbook) Error!bool {
@@ -8763,7 +8793,7 @@ pub const Workbook = struct {
         while (rid_iter.next()) |rid| {
             const target = relTargetForId(rels, rid) orelse continue;
             const table_part_name = (try self.store.resolve(sheet_part_name, target)) orelse continue;
-            const table_part = (try self.store.part(table_part_name)) orelse continue;
+            const table_part = (try self.carrierPart(table_part_name, error.MalformedTableXml)) orelse continue;
             const new_bytes = try table_edit.applyEditToTable(
                 self.allocator,
                 table_part.bytes,
