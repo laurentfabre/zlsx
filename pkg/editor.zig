@@ -9801,3 +9801,47 @@ test "S7b-5: a new shared string goes before the table's extension list; charact
         try expectMarkerOnly(io, src, dst);
     }
 }
+
+test "S7b-5: a host root bound to a foreign default namespace refuses; the Strict namespace is a main one (Codex #206 r26 SEC-2601)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const dst = try tt.path(a, io, "s7b5_r26_dst.xlsx");
+    defer a.free(dst);
+    const main_ns = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+    {
+        const src = try tt.path(a, io, "s7b5_r26_foreign.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", main_ns, "xmlns=\"urn:vendor\"");
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const before = try a.dupe(u8, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        defer a.free(before);
+        try std.testing.expectError(error.PivotEditUnsafe, wb.insertRow(0, 2));
+        try std.testing.expectEqualStrings(before, (try wb.store.part("xl/worksheets/sheet2.xml")).?.bytes);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 2));
+        try ed.setCell(0, 2, 0, .{ .string = "Central" });
+        try ed.save(io, dst);
+        try expectMarkerOnly(io, src, dst);
+    }
+    {
+        const src = try tt.path(a, io, "s7b5_r26_strict.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", main_ns, "xmlns=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.insertRow(0, 2);
+        try ed.save(io, dst);
+        var wb = try Workbook.open(a, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A6", .{ .text = "(blank)" });
+        try expectHostCell(&wb, 1, "B7", .{ .number = 12 });
+    }
+}

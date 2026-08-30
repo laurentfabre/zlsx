@@ -6574,6 +6574,11 @@ pub const Workbook = struct {
                 };
                 if (is_prefixed and main) return error.PivotEditUnsafe;
                 if (is_default and root_seen) return error.PivotEditUnsafe;
+                // The root's own default binding, when spelt, is the
+                // main namespace — Transitional or Strict — or the
+                // cells the splicer writes are not cells (Codex #206
+                // r26 SEC-2601), as the pivot parts' root check has it.
+                if (is_default and !main) return error.PivotEditUnsafe;
             }
             root_seen = true;
         }
