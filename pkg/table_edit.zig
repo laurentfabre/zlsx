@@ -598,24 +598,42 @@ fn emitSyntheticTableColumn(
     body_end: usize,
     new_id: u32,
 ) !void {
-    // REL-A502: pick a `name` attribute that doesn't collide with
-    // any existing `<tableColumn name>` in the same table (ECMA-376
-    // §18.5.1.78 requires names unique within the parent table).
-    // Try `Column<id>`, then `Column<id>_2`, `Column<id>_3`, ...
     var name_buf: [40]u8 = undefined;
-    var suffix: u32 = 1;
-    const name = while (true) {
-        const candidate = if (suffix == 1)
-            try std.fmt.bufPrint(&name_buf, "Column{d}", .{new_id})
-        else
-            try std.fmt.bufPrint(&name_buf, "Column{d}_{d}", .{ new_id, suffix });
-        if (!tableColumnNameTaken(src, body_start, body_end, candidate)) break candidate;
-        suffix += 1;
-        if (suffix > 1000) return error.MalformedTableXml; // pathological
-    };
+    const name = try probeSyntheticColumnName(&name_buf, src, body_start, body_end, new_id);
     var buf: [80]u8 = undefined;
     const written = try std.fmt.bufPrint(&buf, "<tableColumn id=\"{d}\" name=\"{s}\"/>", .{ new_id, name });
     try out.appendSlice(allocator, written);
+}
+
+/// REL-A502: pick a `name` attribute that doesn't collide with any
+/// existing `<tableColumn name>` in the same table (ECMA-376
+/// §18.5.1.78 requires names unique within the parent table). Try
+/// `Column<id>`, then `Column<id>_2`, `Column<id>_3`, ...
+fn probeSyntheticColumnName(name_buf: *[40]u8, src: []const u8, body_start: usize, body_end: usize, new_id: u32) ![]const u8 {
+    var suffix: u32 = 1;
+    while (true) {
+        const candidate = if (suffix == 1)
+            try std.fmt.bufPrint(name_buf, "Column{d}", .{new_id})
+        else
+            try std.fmt.bufPrint(name_buf, "Column{d}_{d}", .{ new_id, suffix });
+        if (!tableColumnNameTaken(src, body_start, body_end, candidate)) return candidate;
+        suffix += 1;
+        if (suffix > 1000) return error.MalformedTableXml; // pathological
+    }
+}
+
+/// The `name` a column insert strictly inside this table's range will
+/// synthesize — `Column<max id + 1>`, suffixed past any collision —
+/// computed from the part as written, mutating nothing. S7c's pivot
+/// planner names the new cache field with it before the table's own
+/// rewrite runs; both walk the same bytes, so they agree by
+/// construction. Caller owns the returned name.
+pub fn syntheticInsertColumnName(allocator: Allocator, src: []const u8) Error![]u8 {
+    const tc = findTableColumns(src) orelse return error.MalformedTableXml;
+    const new_id = scanMaxTableColumnId(src, tc.body_start, tc.close_pos) +| 1;
+    var name_buf: [40]u8 = undefined;
+    const name = probeSyntheticColumnName(&name_buf, src, tc.body_start, tc.close_pos, new_id) catch return error.MalformedTableXml;
+    return try allocator.dupe(u8, name);
 }
 
 /// Walk `<tableColumn>` siblings looking for one whose `name`

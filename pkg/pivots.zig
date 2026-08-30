@@ -226,6 +226,10 @@ pub const SourceResolution = union(enum) {
         /// headerless table's field names (Codex #205 r4 REL-402);
         /// empty for every other carrier.
         columns: []const []const u8 = &.{},
+        /// The table part behind a `.table` carrier — where S7c reads
+        /// the column name a table's own column insert will synthesize;
+        /// null for every other carrier.
+        table_part_name: ?[]const u8 = null,
     };
 };
 
@@ -817,6 +821,66 @@ pub fn relLeafIs(rel_type: []const u8, leaf: []const u8) bool {
     return std.ascii.eqlIgnoreCase(l, leaf);
 }
 
+/// The extension namespaces a slicer / timeline cache definition
+/// lives in — x14 and x15. The attachment reader admits exactly
+/// these; a part in any other spelling refuses the read, and the
+/// caller refuses with it.
+const slicer_ns_uris = [_][]const u8{"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"};
+const timeline_ns_uris = [_][]const u8{"http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"};
+
+pub const AttachmentKind = enum { slicer, timeline };
+
+/// The decoded pivot-table names a slicer or timeline cache is
+/// attached to — `<pivotTables><pivotTable name="…"/></pivotTables>`
+/// under the part's own extension namespace, read with the shared
+/// one-prefix scanner (S7c's gate: a schema edit refuses when one of
+/// them names a consumer of the edited cache — its `sourceName` is a
+/// field this reader does not type, and a removed field would leave a
+/// slicer no refresh repairs). Everything else in the part is
+/// tolerated unread; a `pivotTable` without a `name`, or a part the
+/// scanner refuses, is the caller's refusal.
+pub fn attachedPivotNames(arena: Allocator, xml: []const u8, kind: AttachmentKind) Error![]const []const u8 {
+    const local: []const u8 = switch (kind) {
+        .slicer => "slicerCacheDefinition",
+        .timeline => "timelineCacheDefinition",
+    };
+    const uris: []const []const u8 = switch (kind) {
+        .slicer => &slicer_ns_uris,
+        .timeline => &timeline_ns_uris,
+    };
+    const root = pivot_xml.scanRootIn(xml, local, uris) catch return error.MalformedPivotXml;
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
+    while (kids.next() catch return error.MalformedPivotXml) |k| {
+        if (!std.mem.eql(u8, k.local, "pivotTables")) continue;
+        var inner = pivot_xml.Children.init(xml, k.hit, k.end, root.prefix, k.env);
+        while (inner.next() catch return error.MalformedPivotXml) |pt| {
+            if (!std.mem.eql(u8, pt.local, "pivotTable")) continue;
+            const raw = wbxml.getAttr(pt.attrs(xml), "name") orelse return error.MalformedPivotXml;
+            try out.append(arena, try decode(arena, .pivot_table_name, raw));
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Do two decoded pivot-table names name one pivot? Excel keeps them
+/// unique case-insensitively, so the collation fold compares them; a
+/// name the fold refuses matches everything — the caller's refusal is
+/// the safe answer.
+pub fn pivotNamesMatch(a: Allocator, x: []const u8, y: []const u8) error{OutOfMemory}!bool {
+    const fx = (fold(a, x) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    }) orelse return true;
+    defer a.free(fx);
+    const fy = (fold(a, y) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    }) orelse return true;
+    defer a.free(fy);
+    return std.mem.eql(u8, fx, fy);
+}
+
 fn spell(a: Allocator, ws: pivot_xml.WorksheetSource) Error!SourceSpelling {
     return .{
         .sheet = if (ws.sheet) |raw| try decode(a, .pivot_source_sheet_name, raw) else null,
@@ -890,9 +954,12 @@ const Resolver = struct {
         totals_rows: u32,
         /// The table's `<tableColumn>` names, decoded, in order.
         columns: []const []const u8,
+        /// The table part's name — S7c reads the part again to plan a
+        /// schema edit beside the table's own rewrite.
+        part_name: []const u8,
 
         fn shape(self: TableEntry) TableShape {
-            return .{ .header_rows = self.header_rows, .totals_rows = self.totals_rows, .columns = self.columns };
+            return .{ .header_rows = self.header_rows, .totals_rows = self.totals_rows, .columns = self.columns, .table_part_name = self.part_name };
         }
     };
 
@@ -972,6 +1039,7 @@ const Resolver = struct {
         header_rows: u32 = 1,
         totals_rows: u32 = 0,
         columns: []const []const u8 = &.{},
+        table_part_name: ?[]const u8 = null,
     };
 
     fn local(self: *Resolver, sheet_idx: u32, via: ResolvedVia, bounds: ?Bounds, carrier: SourceCarrier, names: []const NameKey, shape: TableShape) Error!SourceResolution {
@@ -987,6 +1055,7 @@ const Resolver = struct {
             .header_rows = shape.header_rows,
             .totals_rows = shape.totals_rows,
             .columns = shape.columns,
+            .table_part_name = shape.table_part_name,
         } };
     }
 
@@ -1112,7 +1181,7 @@ const Resolver = struct {
                 // Only a headerless table's names are its schema; a
                 // headered one's are read off its header row.
                 const columns: []const []const u8 = if (header_rows == 0) try self.tableColumnNames(table_part.bytes) else &.{};
-                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows, .totals_rows = totals_rows, .columns = columns });
+                try entries.append(self.arena, .{ .folded = folded, .sheet_idx = @intCast(i), .bounds = bounds, .header_rows = header_rows, .totals_rows = totals_rows, .columns = columns, .part_name = try self.arena.dupe(u8, table_part_name) });
             }
         }
         self.tables = try entries.toOwnedSlice(self.arena);
@@ -2168,6 +2237,29 @@ pub const edit = struct {
         /// an unknown `type` — which the rebuild refuses
         /// (`docs/plans/s7b-cache-policy.md` §9, S7b-4).
         rebuild: ?RebuildSource = null,
+        /// S7c: the edit is a column edit strictly inside the source
+        /// rectangle — the field schema changes, and the rebuild adds
+        /// or removes a cache field with it.
+        schema: ?SchemaEdit = null,
+    };
+
+    /// S7c's schema change, in 0-based field ordinals: a source-column
+    /// delete removes the field at `remove` (K3 — admitted only when
+    /// no consumer references it); a source-column insert adds one at
+    /// `insert.at` (K2 — admitted only for a headerless table, whose
+    /// own rewrite names the column).
+    pub const SchemaEdit = union(enum) {
+        remove: u32,
+        insert: Insert,
+
+        pub const Insert = struct {
+            at: u32,
+            /// The new field's decoded name — the column the table's
+            /// own rewrite will synthesize. Empty until the sweep
+            /// resolves it from the table part; the engine refuses an
+            /// empty one.
+            name: []const u8 = "",
+        };
     };
 
     /// Where a rebuild reads: the source rectangle as the sheet is
@@ -2223,7 +2315,8 @@ pub const edit = struct {
         var plan: Plan = .{};
         const def = &cache.definition;
         if (def.source.worksheet) |ws| {
-            const r = try sourceSplice(arena, &plan.splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind);
+            const r = try sourceSplice(arena, &plan.splices, ws, cache.resolution, sheet_idx, axis, idx_1based, kind, def.source.type == .worksheet);
+            plan.schema = r.schema;
             if (r.changed) {
                 plan.changed = true;
                 // Only a worksheet-type source is a rectangle the
@@ -2242,7 +2335,7 @@ pub const edit = struct {
         // disagrees with its own resolutions is not one this row read.
         if (def.source.range_sets.len != cache.range_set_resolutions.len) return error.MalformedPivotXml;
         for (def.source.range_sets, cache.range_set_resolutions) |rs, res| {
-            const r = try sourceSplice(arena, &plan.splices, rs, res, sheet_idx, axis, idx_1based, kind);
+            const r = try sourceSplice(arena, &plan.splices, rs, res, sheet_idx, axis, idx_1based, kind, false);
             plan.changed = plan.changed or r.changed;
         }
         if (plan.changed) {
@@ -2273,7 +2366,90 @@ pub const edit = struct {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const plan = try planCacheEdit(arena_state.allocator(), cache, sheet_idx, axis, idx_1based, kind);
+        // A schema edit needs the engine (S7c): this seam moves the
+        // coordinate and the marker alone, and refuses what it cannot
+        // install whole.
+        if (plan.schema != null) return error.PivotSourceEditUnsafe;
         return try applyPlan(allocator, cache, &plan);
+    }
+
+    /// One consumer part under a schema edit (S7c): the removed
+    /// ordinal's `<pivotField>` taken out whole (K3) or a bare
+    /// `<pivotField showAll="0"/>` inserted at the new ordinal (K2),
+    /// `<pivotFields count>` adjusted, and every ordinal carrier the
+    /// admitted form holds moved — `<field x>` on the row axis,
+    /// `dataField@fld` and `@baseField`. A consumer that references
+    /// the removed field — its pivotField spells an axis or
+    /// `dataField="1"`, an axis names the ordinal, a data field reads
+    /// it, a `baseField` names it — refuses: dropping a rendered
+    /// values column is K4a, ruled a follow-up slice
+    /// (`docs/plans/s7c-column-edits.md` §4). A form with carriers
+    /// this rewrite has no spans for — a page field, a real field on
+    /// the columns axis, a chart format not proven values-only —
+    /// refuses here, as the layout refuses it after.
+    pub fn applyConsumerSchemaEdit(arena: Allocator, table_xml: []const u8, schema: SchemaEdit) EditError![]u8 {
+        const def = pivot_xml.parseTableDefinition(arena, table_xml) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedXml => return error.MalformedPivotXml,
+        };
+        if (def.page_fields.len != 0 or def.chart_formats == .other) return error.PivotShapeUnsupported;
+        for (def.col_fields) |cf| if (cf == .field) return error.PivotShapeUnsupported;
+        if (def.row_fields.len != def.row_field_x_spans.len) return error.MalformedPivotXml;
+
+        var splices: std.ArrayListUnmanaged(Splice) = .empty;
+        switch (schema) {
+            .remove => |k| {
+                if (k >= def.fields.len) return error.MalformedPivotXml;
+                const pf = def.fields[k];
+                if (pf.axis != null or pf.axis_raw != null or pf.data_field) return error.PivotSourceEditUnsafe;
+                if (pf.span.start == 0 and pf.span.end == 0) return error.MalformedPivotXml;
+                try splices.append(arena, .{ .span = pf.span, .text = "" });
+                for (def.row_fields, def.row_field_x_spans) |rf, span| {
+                    if (rf != .field) continue;
+                    if (rf.field == k) return error.PivotSourceEditUnsafe;
+                    if (rf.field > k) try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{rf.field - 1}) });
+                }
+                for (def.data_fields) |df| {
+                    if (df.fld == k) return error.PivotSourceEditUnsafe;
+                    if (df.fld > k) try splices.append(arena, .{ .span = df.fld_span, .text = try std.fmt.allocPrint(arena, "{d}", .{df.fld - 1}) });
+                    if (df.base_field) |bf| {
+                        if (bf >= 0) {
+                            const b: u32 = @intCast(bf);
+                            if (b == k) return error.PivotSourceEditUnsafe;
+                            if (b > k) try splices.append(arena, .{ .span = df.base_field_span.?, .text = try std.fmt.allocPrint(arena, "{d}", .{b - 1}) });
+                        }
+                    }
+                }
+                if (def.pivot_fields_count_span) |span| {
+                    try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{def.fields.len - 1}) });
+                }
+            },
+            .insert => |ins| {
+                const j = ins.at;
+                if (j == 0 or j >= def.fields.len) return error.MalformedPivotXml;
+                const anchor = def.fields[j].span.start;
+                if (anchor == 0) return error.MalformedPivotXml;
+                const p = if (def.prefix.len == 0) "" else try std.mem.concat(arena, u8, &.{ def.prefix, ":" });
+                const fresh = try std.mem.concat(arena, u8, &.{ "<", p, "pivotField showAll=\"0\"/>" });
+                try splices.append(arena, .{ .span = .{ .start = anchor, .end = anchor }, .text = fresh });
+                for (def.row_fields, def.row_field_x_spans) |rf, span| {
+                    if (rf != .field or rf.field < j) continue;
+                    try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{rf.field + 1}) });
+                }
+                for (def.data_fields) |df| {
+                    if (df.fld >= j) try splices.append(arena, .{ .span = df.fld_span, .text = try std.fmt.allocPrint(arena, "{d}", .{df.fld + 1}) });
+                    if (df.base_field) |bf| {
+                        if (bf >= 0 and @as(u32, @intCast(bf)) >= j) {
+                            try splices.append(arena, .{ .span = df.base_field_span.?, .text = try std.fmt.allocPrint(arena, "{d}", .{@as(u32, @intCast(bf)) + 1}) });
+                        }
+                    }
+                }
+                if (def.pivot_fields_count_span) |span| {
+                    try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{def.fields.len + 1}) });
+                }
+            },
+        }
+        return try spliceAll(arena, table_xml, splices.items);
     }
 
     /// `src` rebuilt from its own bytes with each splice swapped in
@@ -2316,11 +2492,41 @@ pub const edit = struct {
         /// The local resolution the outcome was judged on, when it was
         /// one on the edited sheet.
         local: ?SourceResolution.LocalSheet = null,
+        /// S7c: the edit changes the field schema (a column edit
+        /// strictly inside the source rectangle).
+        schema: ?SchemaEdit = null,
     };
+
+    /// A column edit strictly inside a finite source rectangle is the
+    /// field schema (S7c). A delete removes the field at that column —
+    /// unless it would collapse the rectangle (K5, the row-collapse
+    /// twin). An insert adds a field there — admitted only where the
+    /// new field has a name the engine can prove, a headerless table's
+    /// synthesized column (K2); every other insert refuses (K1: the
+    /// new header cell is blank, and Excel's own refresh fails on it
+    /// with *"The PivotTable field name is not valid"*). Outside the
+    /// rectangle is a shift or a no-op, not this function's.
+    fn schemaEditFor(s: SourceResolution.LocalSheet, r: Rect, idx_1based: u32, kind: Kind) EditError!?SchemaEdit {
+        switch (kind) {
+            .insert => {
+                if (idx_1based <= r.tl_col or idx_1based > r.br_col) return null;
+                if (s.header_rows != 0) return error.PivotSourceEditUnsafe;
+                return .{ .insert = .{ .at = idx_1based - r.tl_col } };
+            },
+            .delete => {
+                if (idx_1based < r.tl_col or idx_1based > r.br_col) return null;
+                if (r.tl_col == r.br_col) return error.PivotSourceEditUnsafe;
+                return .{ .remove = idx_1based - r.tl_col };
+            },
+        }
+    }
 
     /// One source under the edit: its `ref` splice appended when it has
     /// one, its refusal raised, and whether the edit changed what it
-    /// holds — the marker's input.
+    /// holds — the marker's input. `allow_schema` opens the S7c arm —
+    /// the worksheet source of a `worksheet`-type cache; a consolidation
+    /// `rangeSet` or an unknown-`type` locator keeps the refusal (the
+    /// engine rebuilds neither).
     fn sourceSplice(
         arena: Allocator,
         splices: *std.ArrayListUnmanaged(Splice),
@@ -2330,6 +2536,7 @@ pub const edit = struct {
         axis: Axis,
         idx_1based: u32,
         kind: Kind,
+        allow_schema: bool,
     ) EditError!SourceOutcome {
         switch (res) {
             .external, .none => return .{ .changed = false },
@@ -2356,6 +2563,29 @@ pub const edit = struct {
                 // `ref` the bounds parser rejects, a name the reader
                 // could not place on that sheet (Q4 iv).
                 const bounds = s.bounds orelse return error.PivotSourceEditUnsafe;
+                // S7c first: a column edit strictly inside the finite
+                // rectangle changes the field schema. The coordinate:
+                // a direct `ref` respells the shrunk / grown rectangle;
+                // a table or a name body moves with its own carrier.
+                if (allow_schema and axis == .col and bounds == .rect) {
+                    if (try schemaEditFor(s, bounds.rect, idx_1based, kind)) |se| {
+                        if (s.carrier == .ref) {
+                            const span = ws.ref_span orelse return error.MalformedPivotXml;
+                            var moved = bounds.rect;
+                            switch (kind) {
+                                .insert => {
+                                    if (moved.br_col >= zlsx.max_col_1based) return error.PivotCoordinateOverflow;
+                                    moved.br_col += 1;
+                                },
+                                .delete => moved.br_col -= 1,
+                            }
+                            var buf: [Bounds.format_buf_len]u8 = undefined;
+                            const text = formatRect(&buf, moved) catch return error.PivotCoordinateOverflow;
+                            try splices.append(arena, .{ .span = span, .text = try arena.dupe(u8, text) });
+                        }
+                        return .{ .changed = true, .local = s, .schema = se };
+                    }
+                }
                 switch (s.carrier) {
                     .none => unreachable, // bounds and carrier are set together
                     // A table carries its own row rules — `table_edit`
@@ -2532,6 +2762,39 @@ pub const engine = struct {
         }
     }
 
+    /// The data rows after a column edit inside the rectangle (S7c),
+    /// each at the effective width: a delete drops every row's value
+    /// at the removed 0-based ordinal, an insert puts a blank there.
+    /// `width` is the pre-edit field count.
+    pub fn rowsAfterColEdit(arena: Allocator, rows: []const Row, width: usize, ordinal: u32, kind: edit.Kind) RebuildError![]const Row {
+        const k: usize = ordinal;
+        const out = try arena.alloc(Row, rows.len);
+        switch (kind) {
+            .insert => {
+                if (k == 0 or k > width) return error.MalformedPivotXml;
+                for (rows, 0..) |r, i| {
+                    if (r.len != width) return error.MalformedPivotXml;
+                    const nr = try arena.alloc(Value, width + 1);
+                    @memcpy(nr[0..k], r[0..k]);
+                    nr[k] = .blank;
+                    @memcpy(nr[k + 1 ..], r[k..]);
+                    out[i] = nr;
+                }
+            },
+            .delete => {
+                if (k >= width) return error.MalformedPivotXml;
+                for (rows, 0..) |r, i| {
+                    if (r.len != width) return error.MalformedPivotXml;
+                    const nr = try arena.alloc(Value, width - 1);
+                    @memcpy(nr[0..k], r[0..k]);
+                    @memcpy(nr[k..], r[k + 1 ..]);
+                    out[i] = nr;
+                }
+            },
+        }
+        return out;
+    }
+
     /// The refresh instant: an Excel serial under the workbook's date
     /// system for `refreshedDate`, and the same instant as ISO 8601
     /// for a part that also spells `refreshedDateIso` (Codex #205 r9
@@ -2559,6 +2822,32 @@ pub const engine = struct {
         rows: []const Row,
     };
 
+    /// The definition's fields under a schema edit: the old list less
+    /// the removed one, or with the new field spliced in at its
+    /// ordinal — the view every consumer-side check indexes after the
+    /// edit. The inserted view entry carries the new field's decoded
+    /// name and no inventory; null schema hands the old list back.
+    pub fn effectiveCacheFields(arena: Allocator, old: []const pivot_xml.CacheField, schema: ?edit.SchemaEdit) RebuildError![]const pivot_xml.CacheField {
+        const se = schema orelse return old;
+        switch (se) {
+            .remove => |k| {
+                if (k >= old.len) return error.MalformedPivotXml;
+                const out = try arena.alloc(pivot_xml.CacheField, old.len - 1);
+                @memcpy(out[0..k], old[0..k]);
+                @memcpy(out[k..], old[k + 1 ..]);
+                return out;
+            },
+            .insert => |ins| {
+                if (ins.at == 0 or ins.at > old.len or ins.name.len == 0) return error.MalformedPivotXml;
+                const out = try arena.alloc(pivot_xml.CacheField, old.len + 1);
+                @memcpy(out[0..ins.at], old[0..ins.at]);
+                out[ins.at] = .{ .name = ins.name };
+                @memcpy(out[ins.at + 1 ..], old[ins.at..]);
+                return out;
+            },
+        }
+    }
+
     /// Rebuild `cache` from `rows`, the data rows of its source
     /// rectangle after the edit (`rowsAfterEdit`), each one value per
     /// field. `records_xml` is the cache's records part as stored,
@@ -2567,27 +2856,50 @@ pub const engine = struct {
     /// `refreshedDateIso` beside it) is then removed rather than left
     /// describing a refresh that did not happen.
     pub fn rebuild(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed: ?Refreshed) RebuildError!Rebuild {
+        return rebuildWith(arena, cache, rows, records_xml, refreshed, null);
+    }
+
+    /// `rebuild` with S7c's schema edit, when the edit is one: `rows`
+    /// are then already the effective width, and the definition gains
+    /// the field splice — the removed `<cacheField>` taken out whole,
+    /// the inserted one rendered fresh — beside `<cacheFields count>`.
+    pub fn rebuildWith(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed: ?Refreshed, schema: ?edit.SchemaEdit) RebuildError!Rebuild {
         const def = &cache.definition;
         try checkShape(def);
+        const eff = try effectiveCacheFields(arena, def.fields, schema);
         if (rows.len == 0 or rows.len > std.math.maxInt(u32)) return error.PivotShapeUnsupported;
         // The rectangle's width is the field schema: a disagreement
-        // is S7c's column edit, not a rebuild.
-        if (rows[0].len != def.fields.len) return error.PivotShapeUnsupported;
-        for (rows) |r| if (r.len != def.fields.len) return error.MalformedPivotXml;
+        // is a shape the engine does not read.
+        if (rows[0].len != eff.len) return error.PivotShapeUnsupported;
+        for (rows) |r| if (r.len != eff.len) return error.MalformedPivotXml;
 
         const p = try qualified(arena, def.prefix);
         // The records as written say how each field spelt its values —
         // `<x>` into the inventory, or inline — which is what "stays
-        // inline" is measured against (Codex #205 r10 REL-1001).
-        const spelt = if (records_xml) |xml| try inspectRecords(arena, xml, def.fields.len) else try arena.alloc(?bool, def.fields.len);
-        if (records_xml == null) @memset(spelt, null);
-        const fields = try arena.alloc(Field, def.fields.len);
-        for (def.fields, 0..) |f, k| fields[k] = try Field.build(arena, f.shared_items.?, rows, k, p, spelt[k]);
+        // inline" is measured against (Codex #205 r10 REL-1001). Read
+        // at the written arity, then mapped to the effective schema —
+        // a removed field's spelling leaves with it, an inserted one
+        // has none to read.
+        const spelt_old = if (records_xml) |xml| try inspectRecords(arena, xml, def.fields.len) else try arena.alloc(?bool, def.fields.len);
+        if (records_xml == null) @memset(spelt_old, null);
+        const spelt = try effectiveSpelt(arena, spelt_old, schema);
+        const fields = try arena.alloc(Field, eff.len);
+        for (eff, 0..) |f, k| {
+            const si = f.shared_items orelse blk: {
+                // Only the inserted field has no inventory element;
+                // `checkShape` required one of every written field.
+                if (!insertedAt(schema, k)) return error.MalformedPivotXml;
+                break :blk pivot_xml.SharedItems{};
+            };
+            fields[k] = try Field.build(arena, si, rows, k, p, spelt[k]);
+        }
 
         var splices: std.ArrayListUnmanaged(edit.Splice) = .empty;
-        for (def.fields, fields) |f, built| {
+        for (eff, fields, 0..) |f, built, k| {
+            if (insertedAt(schema, k)) continue;
             try splices.append(arena, .{ .span = f.shared_items.?.span, .text = built.xml });
         }
+        if (schema) |se| try appendSchemaSplices(arena, &splices, def, se, fields, p);
 
         // Root attributes: replaced where present, inserted before the
         // root's `>` where absent — one insertion for both, so their
@@ -2626,6 +2938,84 @@ pub const engine = struct {
 
         const records = if (records_xml) |xml| try renderRecords(arena, xml, fields, rows) else null;
         return .{ .splices = try splices.toOwnedSlice(arena), .records = records, .record_count = @intCast(rows.len), .fields = fields, .rows = rows };
+    }
+
+    /// Is effective ordinal `k` the field a schema insert adds?
+    fn insertedAt(schema: ?edit.SchemaEdit, k: usize) bool {
+        const se = schema orelse return false;
+        return switch (se) {
+            .remove => false,
+            .insert => |ins| ins.at == k,
+        };
+    }
+
+    /// The written per-field record spelling mapped to the effective
+    /// schema: a removed field's spelling leaves with it; an inserted
+    /// field had no records to spell it.
+    fn effectiveSpelt(arena: Allocator, old: []const ?bool, schema: ?edit.SchemaEdit) RebuildError![]const ?bool {
+        const se = schema orelse return old;
+        switch (se) {
+            .remove => |k| {
+                if (k >= old.len) return error.MalformedPivotXml;
+                const out = try arena.alloc(?bool, old.len - 1);
+                @memcpy(out[0..k], old[0..k]);
+                @memcpy(out[k..], old[k + 1 ..]);
+                return out;
+            },
+            .insert => |ins| {
+                if (ins.at > old.len) return error.MalformedPivotXml;
+                const out = try arena.alloc(?bool, old.len + 1);
+                @memcpy(out[0..ins.at], old[0..ins.at]);
+                out[ins.at] = null;
+                @memcpy(out[ins.at + 1 ..], old[ins.at..]);
+                return out;
+            },
+        }
+    }
+
+    /// The definition's field-list splices for a schema edit: the
+    /// removed `<cacheField>` taken out whole, or the new one rendered
+    /// before the field at its ordinal — `name` encoded, `numFmtId="0"`
+    /// as Excel spells a fresh field, the built inventory inside — and
+    /// `<cacheFields count>` set to the effective count where the
+    /// wrapper spells one.
+    fn appendSchemaSplices(
+        arena: Allocator,
+        splices: *std.ArrayListUnmanaged(edit.Splice),
+        def: *const pivot_xml.CacheDefinition,
+        se: edit.SchemaEdit,
+        fields: []const Field,
+        p: []const u8,
+    ) RebuildError!void {
+        switch (se) {
+            .remove => |k| {
+                const f = def.fields[k];
+                if (f.span.start == 0 and f.span.end == 0) return error.MalformedPivotXml;
+                try splices.append(arena, .{ .span = f.span, .text = "" });
+            },
+            .insert => |ins| {
+                if (ins.at >= def.fields.len) return error.MalformedPivotXml;
+                const anchor = def.fields[ins.at].span.start;
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                try out.append(arena, '<');
+                try out.appendSlice(arena, p);
+                try out.appendSlice(arena, "cacheField name=\"");
+                try out.appendSlice(arena, try formula.decode.encodeAuthoredString(arena, ins.name));
+                try out.appendSlice(arena, "\" numFmtId=\"0\">");
+                try out.appendSlice(arena, fields[ins.at].xml);
+                try out.appendSlice(arena, "</");
+                try out.appendSlice(arena, p);
+                try out.appendSlice(arena, "cacheField>");
+                try splices.append(arena, .{ .span = .{ .start = anchor, .end = anchor }, .text = out.items });
+            },
+        }
+        if (def.fields_count_span) |span| {
+            const n: usize = switch (se) {
+                .remove => def.fields.len - 1,
+                .insert => def.fields.len + 1,
+            };
+            try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{n}) });
+        }
     }
 
     /// The definition shapes this slice rebuilds — everything else
@@ -7391,4 +7781,191 @@ test "S7b-5: an allocation failure anywhere in a layout is OutOfMemory, never a 
     const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
     const rb = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
     try testing.checkAllAllocationFailures(testing.allocator, layoutForFailures, .{ t.raw_xml, cache, &rb });
+}
+
+// ─── S7c: column edits inside a source — the schema edits ────────────
+
+test "S7c edit: a column edit strictly inside a finite source is the plan's schema edit — the ref respells, K1/K5 refuse, outside still shifts" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_plan.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const cache = &o.pivots.caches[0];
+        // Delete inside: the plan carries the ordinal, the shrunk ref
+        // and the rebuild rectangle.
+        var plan = try edit.planCacheEdit(arena, cache, 0, .col, 3, .delete);
+        try testing.expect(plan.changed);
+        try testing.expect(plan.rebuild != null);
+        try testing.expectEqual(@as(u32, 2), plan.schema.?.remove);
+        var found_ref = false;
+        for (plan.splices.items) |sp| {
+            if (std.mem.eql(u8, sp.text, "A1:B4")) found_ref = true;
+        }
+        try testing.expect(found_ref);
+        // The first column is ordinal 0.
+        plan = try edit.planCacheEdit(arena, cache, 0, .col, 1, .delete);
+        try testing.expectEqual(@as(u32, 0), plan.schema.?.remove);
+        // K1: an insert inside a headered source refuses — the new
+        // header cell is blank, and Excel's own refresh fails on it.
+        try testing.expectError(error.PivotSourceEditUnsafe, edit.planCacheEdit(arena, cache, 0, .col, 2, .insert));
+        try testing.expectError(error.PivotSourceEditUnsafe, edit.planCacheEdit(arena, cache, 0, .col, 3, .insert));
+        // Outside: right of the rectangle is a no-op; at the left edge
+        // an insert is a pure shift, as before.
+        try testing.expect((try cacheEdit(testing.allocator, &o, 0, .col, 4, .delete)) == null);
+        const shifted = (try cacheEdit(testing.allocator, &o, 0, .col, 1, .insert)).?;
+        defer testing.allocator.free(shifted);
+        try testing.expect(std.mem.indexOf(u8, shifted, "ref=\"B1:D4\"") != null);
+        // The marker-only seam cannot rebuild a schema: it refuses.
+        try testing.expectError(error.PivotSourceEditUnsafe, cacheEdit(testing.allocator, &o, 0, .col, 3, .delete));
+    }
+    // K5: a delete that would collapse the rectangle refuses.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "sheet=\"Data\" ref=\"A1:C4\"", "sheet=\"Data\" ref=\"C1:C4\"");
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.planCacheEdit(arena, &o.pivots.caches[0], 0, .col, 3, .delete));
+}
+
+test "S7c engine: a remove rebuild takes the cacheField out whole — the count follows, the records narrow, every other inventory holds" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_remove.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    var plan = try edit.planCacheEdit(arena, cache, 0, .col, 3, .delete);
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "East" }, .{ .number = "3" } },
+        &.{ .{ .string = "West" }, .{ .number = "4" } },
+        &.{ .{ .string = "East" }, .{ .number = "5" } },
+    };
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rb = try engine.rebuildWith(arena, cache, &rows, rec, .{ .serial = 46001, .iso = "2025-12-14T00:00:00" }, plan.schema);
+    try plan.splices.appendSlice(arena, rb.splices);
+    const def = (try edit.applyPlan(testing.allocator, cache, &plan)).?;
+    defer testing.allocator.free(def);
+    try testing.expect(std.mem.indexOf(u8, def, "Price") == null);
+    try testing.expect(std.mem.indexOf(u8, def, "<cacheFields count=\"2\">") != null);
+    try testing.expect(std.mem.indexOf(u8, def, "ref=\"A1:B4\"") != null);
+    try testing.expect(std.mem.indexOf(u8, def, "refreshOnLoad=\"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, def, "<cacheField name=\"Region\" numFmtId=\"0\">") != null);
+    try expectRecords(testing.allocator, rb.records.?, "3", "<r><x v=\"0\"/><n v=\"3\"/></r><r><x v=\"1\"/><n v=\"4\"/></r><r><x v=\"0\"/><n v=\"5\"/></r>");
+    // The effective width is the contract: pre-edit rows refuse.
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuildWith(arena, cache, &fixture_rows, rec, null, plan.schema));
+}
+
+test "S7c engine: an insert rebuild lands the new field named and blank-inventoried; an empty or misplaced name refuses" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_insert.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cache = &o.pivots.caches[0];
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "East" }, .blank, .{ .number = "3" }, .{ .number = "1.5" } },
+        &.{ .{ .string = "West" }, .blank, .{ .number = "4" }, .{ .number = "2.5" } },
+        &.{ .{ .string = "East" }, .blank, .{ .number = "5" }, .{ .number = "3.5" } },
+    };
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rb = try engine.rebuildWith(arena, cache, &rows, rec, null, .{ .insert = .{ .at = 1, .name = "Column4" } });
+    const def = try edit.spliceAll(arena, cache.raw_xml, rb.splices);
+    try testing.expect(std.mem.indexOf(u8, def, "<cacheFields count=\"4\">") != null);
+    try testing.expect(std.mem.indexOf(u8, def, "<cacheField name=\"Column4\" numFmtId=\"0\"><sharedItems containsNonDate=\"0\" containsString=\"0\" containsBlank=\"1\" count=\"1\"><m/></sharedItems></cacheField><cacheField name=\"Qty\"") != null);
+    try expectRecords(testing.allocator, rb.records.?, "3", "<r><x v=\"0\"/><x v=\"0\"/><n v=\"3\"/><n v=\"1.5\"/></r><r><x v=\"1\"/><x v=\"0\"/><n v=\"4\"/><n v=\"2.5\"/></r><r><x v=\"0\"/><x v=\"0\"/><n v=\"5\"/><n v=\"3.5\"/></r>");
+    // The name is the table's to give: empty refuses, as does an
+    // ordinal outside the written list.
+    try testing.expectError(error.MalformedPivotXml, engine.rebuildWith(arena, cache, &rows, rec, null, .{ .insert = .{ .at = 1 } }));
+    try testing.expectError(error.MalformedPivotXml, engine.rebuildWith(arena, cache, &rows, rec, null, .{ .insert = .{ .at = 9, .name = "X" } }));
+}
+
+test "S7c edit: applyConsumerSchemaEdit — an unreferenced field leaves whole, every referenced form refuses, the inserted one lands bare" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_consumer.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t_xml = o.pivots.tables[0].raw_xml;
+    // Remove the unreferenced Price (ordinal 2): its pivotField leaves,
+    // the count follows, the row and data ordinals hold still.
+    const out = try edit.applyConsumerSchemaEdit(arena, t_xml, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, out, "<pivotFields count=\"2\">") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<pivotField "));
+    try testing.expect(std.mem.indexOf(u8, out, "<field x=\"0\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fld=\"1\"") != null);
+    // Referenced (K4a, the follow-up slice): the data field, the row
+    // field, and a baseField all refuse.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, t_xml, .{ .remove = 1 }));
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, t_xml, .{ .remove = 0 }));
+    const based = try replacedOnce(arena, t_xml, "baseField=\"0\"", "baseField=\"2\"");
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, based, .{ .remove = 2 }));
+    // Insert at 1: a bare pivotField between the row field and the
+    // data field; `fld` moves up, `x` and `baseField` hold.
+    const ins = try edit.applyConsumerSchemaEdit(arena, t_xml, .{ .insert = .{ .at = 1, .name = "Column4" } });
+    try testing.expect(std.mem.indexOf(u8, ins, "<pivotFields count=\"4\">") != null);
+    try testing.expect(std.mem.indexOf(u8, ins, "</pivotField><pivotField showAll=\"0\"/><pivotField dataField=\"1\" showAll=\"0\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, ins, "fld=\"2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ins, "baseField=\"0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ins, "<field x=\"0\"/>") != null);
+    // A baseField right of the insertion moves with it.
+    const based_up = try replacedOnce(arena, t_xml, "baseField=\"0\"", "baseField=\"2\"");
+    const ins2 = try edit.applyConsumerSchemaEdit(arena, based_up, .{ .insert = .{ .at = 1, .name = "Column4" } });
+    try testing.expect(std.mem.indexOf(u8, ins2, "baseField=\"3\"") != null);
+}
+
+test "S7c engine: rowsAfterColEdit and effectiveCacheFields hold their bounds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dropped = try engine.rowsAfterColEdit(arena, &fixture_rows, 3, 1, .delete);
+    try testing.expectEqual(@as(usize, 3), dropped.len);
+    try testing.expectEqual(@as(usize, 2), dropped[0].len);
+    try testing.expectEqualStrings("1.5", dropped[0][1].number);
+    const grown = try engine.rowsAfterColEdit(arena, &fixture_rows, 3, 2, .insert);
+    try testing.expectEqual(@as(usize, 4), grown[1].len);
+    try testing.expect(grown[1][2] == .blank);
+    try testing.expectEqualStrings("2.5", grown[1][3].number);
+    try testing.expectError(error.MalformedPivotXml, engine.rowsAfterColEdit(arena, &fixture_rows, 3, 3, .delete));
+    try testing.expectError(error.MalformedPivotXml, engine.rowsAfterColEdit(arena, &fixture_rows, 3, 0, .insert));
+    const two = [_]pivot_xml.CacheField{ .{ .name = "A" }, .{ .name = "B" } };
+    const one = try engine.effectiveCacheFields(arena, &two, .{ .remove = 1 });
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqualStrings("A", one[0].name);
+    try testing.expectError(error.MalformedPivotXml, engine.effectiveCacheFields(arena, &two, .{ .remove = 2 }));
+    try testing.expectError(error.MalformedPivotXml, engine.effectiveCacheFields(arena, &two, .{ .insert = .{ .at = 0, .name = "X" } }));
+    const three = try engine.effectiveCacheFields(arena, &two, .{ .insert = .{ .at = 1, .name = "X" } });
+    try testing.expectEqualStrings("X", three[1].name);
+    try testing.expectEqualStrings("B", three[2].name);
 }

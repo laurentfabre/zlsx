@@ -209,6 +209,10 @@ pub const CacheField = struct {
     /// — `fieldGroup` (grouping), `mpMap` — a shape the S7b-4 rebuild
     /// refuses rather than rewrite around.
     has_other_children: bool = false,
+    /// The whole `<cacheField>` element, `<` to one past its close —
+    /// S7c's splice target when a schema edit removes the field, and
+    /// the insertion anchor when one adds a field before it.
+    span: Span = .{ .start = 0, .end = 0 },
 };
 
 pub const CacheDefinition = struct {
@@ -237,6 +241,9 @@ pub const CacheDefinition = struct {
     /// `<cacheFields count>` as written, for a consistency check
     /// against `fields.len`.
     fields_count_attr: ?u32,
+    /// The `<cacheFields count>` value bytes, when the wrapper spells
+    /// one — S7c's splice target when a schema edit changes the count.
+    fields_count_span: ?Span = null,
     /// The root element's attribute region — from just past the tag
     /// name to the `>` (or the `/` of a self-close). S7b-3's upsert
     /// target: a root attribute the part lacks is inserted at `end`.
@@ -321,6 +328,7 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
             if (have_fields) return error.MalformedXml;
             have_fields = true;
             def.fields_count_attr = try u32Attr(k.attrs(xml), "count");
+            if (wbxml.getAttr(k.attrs(xml), "count")) |v| def.fields_count_span = spanOf(xml, v);
             def.fields = try parseCacheFields(allocator, xml, k, root.prefix);
         } else if (!std.mem.eql(u8, k.local, "extLst")) {
             def.has_other_children = true;
@@ -420,6 +428,7 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             }
         }
         if (inner.skipped > 0) field.has_other_children = true;
+        field.span = .{ .start = k.hit.open_lt, .end = k.after };
         try out.append(allocator, field);
     }
     return out.toOwnedSlice(allocator);
@@ -677,6 +686,10 @@ pub const DataField = struct {
     base_field: ?i32 = null,
     base_item: ?u32 = null,
     num_fmt_id: ?u32 = null,
+    /// The `fld` / `baseField` value bytes — S7c's splice targets
+    /// when a schema edit moves the ordinals.
+    fld_span: Span = .{ .start = 0, .end = 0 },
+    base_field_span: ?Span = null,
 };
 
 pub const StyleInfo = struct {
@@ -721,7 +734,14 @@ pub const TableDefinition = struct {
     location: Location,
     /// `<pivotFields>` children, parallel to the cache's fields.
     fields: []PivotField,
+    /// The `<pivotFields count>` value bytes, when the wrapper spells
+    /// one — S7c's splice target when a schema edit changes the field
+    /// count.
+    pivot_fields_count_span: ?Span = null,
     row_fields: []AxisField,
+    /// Per row field, the `<field x>` value bytes — S7c's splice
+    /// target when a schema edit moves the ordinals.
+    row_field_x_spans: []Span = &.{},
     col_fields: []AxisField,
     page_fields: []PageField,
     data_fields: []DataField,
@@ -751,6 +771,7 @@ pub const TableDefinition = struct {
         for (self.fields) |f| allocator.free(f.items);
         allocator.free(self.fields);
         allocator.free(self.row_fields);
+        allocator.free(self.row_field_x_spans);
         allocator.free(self.col_fields);
         allocator.free(self.page_fields);
         allocator.free(self.data_fields);
@@ -824,11 +845,13 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.fields)) return error.MalformedXml;
             seen.insert(.fields);
             def.fields = try parsePivotFields(allocator, xml, k, p, &def.has_other_children);
+            if (wbxml.getAttr(k.attrs(xml), "count")) |v| def.pivot_fields_count_span = spanOf(xml, v);
             try noteWrapper(xml, k, "pivotField", def.fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "rowFields")) {
             if (seen.contains(.rows)) return error.MalformedXml;
             seen.insert(.rows);
             def.row_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            def.row_field_x_spans = try axisFieldXSpans(allocator, xml, k, p);
             try noteWrapper(xml, k, "field", def.row_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "colFields")) {
             if (seen.contains(.cols)) return error.MalformedXml;
@@ -1103,6 +1126,21 @@ fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
     return out.toOwnedSlice(allocator);
 }
 
+/// The `<field x>` value spans of one axis wrapper, in child order —
+/// a second walk over the same scanner, so the spans are parallel to
+/// `parseAxisFields`' list by construction.
+fn axisFieldXSpans(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]Span {
+    var out: std.ArrayListUnmanaged(Span) = .empty;
+    errdefer out.deinit(allocator);
+    var kids = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try kids.next()) |k| {
+        if (!std.mem.eql(u8, k.local, "field")) continue;
+        const v = wbxml.getAttr(k.attrs(xml), "x") orelse return error.MalformedXml;
+        try out.append(allocator, spanOf(xml, v));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// What a wrapper says of itself against what it holds: an attribute
 /// besides `count`, a `count` that is not its children.
 fn noteWrapper(xml: []const u8, el: Child, child: []const u8, n: usize, def: *TableDefinition) Error!void {
@@ -1175,6 +1213,8 @@ fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
             .base_item = try u32Attr(attrs, "baseItem"),
             .num_fmt_id = try u32Attr(attrs, "numFmtId"),
         };
+        df.fld_span = spanOf(xml, wbxml.getAttr(attrs, "fld").?);
+        if (wbxml.getAttr(attrs, "baseField")) |v| df.base_field_span = spanOf(xml, v);
         if (wbxml.getAttr(attrs, "subtotal")) |s| {
             var buf: [32]u8 = undefined;
             df.subtotal = if (wbxml.decodeScalarAttr(&buf, s)) |d| ConsolidateFunction.fromXml(d) else .unknown;
@@ -1288,6 +1328,14 @@ pub const Root = struct {
 /// check its local name, and learn its prefixes. Anything before the
 /// root (XML declaration, comments) is skipped.
 pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
+    return scanRootIn(xml, local, &main_ns_uris);
+}
+
+/// `scanRoot` against another namespace family — the x14 / x15
+/// extension parts S7c reads an attachment list from. The same
+/// hygiene, the family swapped: one binding of it per part, and the
+/// root's own binding must be it.
+pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) Error!Root {
     try preflight(xml);
     var i: usize = 0;
     while (i < xml.len) {
@@ -1310,21 +1358,21 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
         const hit = (wbxml.findTagOpen(xml, lt, qname) catch |e| return narrow(e)) orelse
             return error.MalformedXml;
         const attrs = xml[hit.attrs_start..hit.attrs_end];
-        // One binding of the main namespace per part. Two (a prefix and
-        // the default, or two prefixes) would let children hide under
-        // the one this parser is not matching.
-        if (countBindings(attrs, &main_ns_uris) > 1) return error.MalformedXml;
+        // One binding of the family per part. Two (a prefix and the
+        // default, or two prefixes) would let children hide under the
+        // one this parser is not matching.
+        if (countBindings(attrs, uris) > 1) return error.MalformedXml;
         // And the root's own binding must be it: a `<v:pivotCacheDefinition
         // xmlns:v="urn:vendor">` is a vendor's element, whatever else the
         // root declares. Undeclared is tolerated (a hand-rolled part).
         if (declaredBinding(attrs, prefix)) |uri| {
-            if (!isOneOf(uri, &main_ns_uris)) return error.MalformedXml;
+            if (!isOneOf(uri, uris)) return error.MalformedXml;
         }
-        // And the one main binding there is must be the root's own: a
+        // And the one binding there is must be the root's own: a
         // `<pivotCacheDefinition xmlns:y="…/main">` puts every `y:`
         // child under a prefix this parser does not match (Codex #205
         // r1 REL-102).
-        if (countBindings(attrs, &main_ns_uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
+        if (countBindings(attrs, uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
         const env = try (NsEnv{}).forChild(attrs);
         for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const extent = try extentOfQ(xml, hit, qname);
