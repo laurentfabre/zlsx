@@ -470,13 +470,15 @@ fn processTableColumnsForCol(
         i.* = t.after_open;
         return;
     };
-    // The lexical close and the decoy-aware one must be the same
-    // byte: a commented `</tableColumns>` between them would bound
-    // this walk short of the real body — and short of the bytes the
-    // S7c name planner walks (in-house review S7C-R3). Refused, as
-    // the count disagreements below are.
+    // The lexical open and close and the decoy-aware ones must be the
+    // same bytes: a commented `<tableColumns …>` before the real block
+    // hands this walk a fake wrapper whose count it would rewrite
+    // while the children move inside the real one (Codex #208 r2
+    // REL-202), and a commented `</tableColumns>` bounds it short of
+    // the body the S7c name planner walks (in-house review S7C-R3).
+    // Refused, as the count disagreements below are.
     if (findTableColumns(src)) |tc| {
-        if (tc.close_pos != close_pos) return error.MalformedTableXml;
+        if (tc.open_pos != t.start or tc.close_pos != close_pos) return error.MalformedTableXml;
     } else return error.MalformedTableXml;
     const after_close = close_pos + close_tag.len;
 
@@ -965,6 +967,8 @@ pub fn tableDisplayNameRaw(src: []const u8) ?[]const u8 {
 /// The `<tableColumns>` block: body span and close position. Aware
 /// scan on both ends — a decoy inside a comment is not a block.
 const TableColumnsSpan = struct {
+    /// The `<` of the real (decoy-aware) open tag.
+    open_pos: usize,
     body_start: usize,
     close_pos: usize,
 };
@@ -973,7 +977,7 @@ fn findTableColumns(src: []const u8) ?TableColumnsSpan {
     const hit = (wbxml.findTagOpen(src, 0, "tableColumns") catch return null) orelse return null;
     if (hit.self_closing) return null;
     const close = (wbxml.findClosingTag(src, hit.after_tag_close, "</tableColumns>") catch return null) orelse return null;
-    return .{ .body_start = hit.after_tag_close, .close_pos = close };
+    return .{ .open_pos = hit.open_lt, .body_start = hit.after_tag_close, .close_pos = close };
 }
 
 /// Direct `<tableColumn>` children of a `<tableColumns>` body, in
@@ -2091,4 +2095,11 @@ test "S7c: a commented </tableColumns> between the lexical close and the real on
     defer a.free(decoy);
     try testing.expectError(error.MalformedTableXml, applyEditToTable(a, decoy, .col, 4, .insert));
     try testing.expectError(error.MalformedTableXml, applyEditToTable(a, decoy, .col, 4, .delete));
+    // A commented OPENER before the real block hands the lexical walk
+    // a fake wrapper (Codex #208 r2 REL-202) — the open positions
+    // disagree and the edit refuses.
+    const opener = try std.mem.replaceOwned(u8, a, sample_table, "<tableColumns count=\"3\">", "<!-- <tableColumns count=\"3\"> --><tableColumns count=\"3\">");
+    defer a.free(opener);
+    try testing.expectError(error.MalformedTableXml, applyEditToTable(a, opener, .col, 4, .insert));
+    try testing.expectError(error.MalformedTableXml, applyEditToTable(a, opener, .col, 4, .delete));
 }

@@ -415,14 +415,23 @@ pub const Editor = struct {
             };
             defer b.deinit();
             const out_paths = try allocator.alloc([]const u8, b.sheets.len);
-            errdefer {
-                for (out_paths) |p_owned| allocator.free(p_owned);
+            // Free only the slots a failed fill reached — the rest are
+            // undefined — and nothing at all once ownership moved to
+            // `sheet_paths_alloc`, whose fn-level errdefer would free
+            // the same array again (Codex #208, surfaced by the
+            // full-edit allocation sweep).
+            var filled: usize = 0;
+            var committed = false;
+            errdefer if (!committed) {
+                for (out_paths[0..filled]) |p_owned| allocator.free(p_owned);
                 allocator.free(out_paths);
-            }
+            };
             for (b.sheets, 0..) |s, i| {
                 out_paths[i] = try allocator.dupe(u8, s.path);
+                filled = i + 1;
             }
             sheet_paths_alloc = out_paths;
+            committed = true;
 
             // Workbook.fromBook re-opens the file and sanity-checks
             // sheet_count == book.sheets.len (errors SheetCountMismatch
@@ -10432,8 +10441,20 @@ test "S7c: the v1 presence gates — a slicer or timeline cache in the package, 
         try ed.deleteRow(0, 3);
         // Attached to some OTHER pivot: not this edit's business —
         // the corpus carries exactly this shape (a slicer on the iris
-        // pivot beside a mtcars edit).
+        // pivot beside a mtcars edit). A `_rels` companion under the
+        // prefix is a relationship part, not a cache definition, and
+        // must not gate anything (Codex #208 r2 REL-204).
         try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/slicerCaches/slicerCache1.xml", "name=\"PivotTable1\"", "name=\"SomeOtherPivot\"");
+        {
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart(
+                "xl/slicerCaches/_rels/slicerCache1.xml.rels",
+                "application/vnd.openxmlformats-package.relationships+xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+            );
+            try store.save(io, src);
+        }
         {
             var ed2 = try Editor.open(std.testing.allocator, io, src);
             defer ed2.deinit();
@@ -10475,6 +10496,43 @@ test "S7c: the v1 presence gates — a slicer or timeline cache in the package, 
         defer ed.deinit();
         try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
     }
+}
+
+fn fullColEditForFailures(allocator: std.mem.Allocator, io: std.Io, path: []const u8, baseline: []const u8) !void {
+    var ed = try Editor.open(allocator, io, path);
+    defer ed.deinit();
+    ed.deleteColumn(0, 3) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        // After a failed edit: either nothing installed and a save
+        // reproduces the input byte for byte, or the model is torn
+        // and the save refuses — a tear never ships (Codex #208 r2
+        // REL-201; the whole-edit staging is the follow-up).
+        const out = ed.saveToOwnedBuffer(allocator) catch |se| switch (se) {
+            error.OutOfMemory, error.StructuralEditIncomplete => return error.OutOfMemory,
+            else => return se,
+        };
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(baseline, out);
+        return error.OutOfMemory;
+    };
+}
+
+test "S7c: a K3 edit under injected allocation failure never ships a tear — untouched bytes, or a save that refuses (Codex #208 r2 REL-201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7c_oom_full.xlsx");
+    defer std.testing.allocator.free(src);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    const baseline = blk: {
+        var ed0 = try Editor.open(std.testing.allocator, io, src);
+        defer ed0.deinit();
+        break :blk try ed0.saveToOwnedBuffer(std.testing.allocator);
+    };
+    defer std.testing.allocator.free(baseline);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, fullColEditForFailures, .{ io, src, baseline });
 }
 
 test "S7c: a nameless data field's caption reads the effective schema — the reduced spines align (in-house S7C-T2)" {

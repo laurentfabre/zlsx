@@ -993,9 +993,16 @@ pub const Book = struct {
                 // demand by `ensureCommentsLoaded`. `Book.open`'s
                 // facade walks every sheet through `loadEagerParts`,
                 // which pulls these in via the rels resolver.
+                // Ownership transfers to `book.strings` at the append:
+                // the errdefer must NOT outlive it, or a later failure
+                // frees the key here and again in `deinit`'s sweep
+                // (Codex #208 — the S3a-flagged bad free under an
+                // injected allocation failure).
                 const key = try allocator.dupe(u8, filename);
-                errdefer allocator.free(key);
-                try book.strings.append(allocator, key);
+                {
+                    errdefer allocator.free(key);
+                    try book.strings.append(allocator, key);
+                }
                 try archive.comments_offsets.put(allocator, key, cached);
             } else if (std.mem.eql(u8, filename, "xl/workbook.xml")) {
                 workbook_xml = try extractEntryToBuffer(allocator, entry, file_reader);
@@ -1013,9 +1020,12 @@ pub const Book = struct {
                 const rels_suffix = ".rels".len;
                 const bare = filename[rels_prefix .. filename.len - rels_suffix];
                 const sheet_key = try std.fmt.allocPrint(allocator, "xl/worksheets/{s}", .{bare});
-                errdefer allocator.free(sheet_key);
-                try book.strings.append(allocator, sheet_key);
+                {
+                    errdefer allocator.free(sheet_key);
+                    try book.strings.append(allocator, sheet_key);
+                }
                 const data = try extractEntryToBuffer(allocator, entry, file_reader);
+                errdefer allocator.free(data);
                 try book.sheet_rels_data.put(allocator, sheet_key, data);
             } else if (std.mem.startsWith(u8, filename, "xl/worksheets/") and
                 std.mem.endsWith(u8, filename, ".xml"))
@@ -1026,8 +1036,10 @@ pub const Book = struct {
                 // on the `Book.open` facade). Own the key outright so
                 // the HashMap entry stays valid for the Book's lifetime.
                 const key = try allocator.dupe(u8, filename);
-                errdefer allocator.free(key);
-                try book.strings.append(allocator, key);
+                {
+                    errdefer allocator.free(key);
+                    try book.strings.append(allocator, key);
+                }
                 try archive.sheet_offsets.put(allocator, key, cached);
             } else if (std.mem.startsWith(u8, filename, "xl/drawings/vmlDrawing") and
                 std.mem.endsWith(u8, filename, ".vml"))
@@ -1036,8 +1048,10 @@ pub const Book = struct {
                 // path. Today we don't load vml drawings eagerly, so
                 // just stash the offset (key owned by book.strings).
                 const key = try allocator.dupe(u8, filename);
-                errdefer allocator.free(key);
-                try book.strings.append(allocator, key);
+                {
+                    errdefer allocator.free(key);
+                    try book.strings.append(allocator, key);
+                }
                 try archive.vml_offsets.put(allocator, key, cached);
             }
         }

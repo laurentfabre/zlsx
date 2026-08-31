@@ -209,6 +209,9 @@ pub const CacheField = struct {
     /// — `fieldGroup` (grouping), `mpMap` — a shape the S7b-4 rebuild
     /// refuses rather than rewrite around.
     has_other_children: bool = false,
+    /// The field carries its own `<extLst>` — content a schema edit
+    /// must not move ordinals past unread (Codex #208 r2 REL-203).
+    has_ext_lst: bool = false,
     /// The whole `<cacheField>` element, `<` to one past its close —
     /// S7c's splice target when a schema edit removes the field, and
     /// the insertion anchor when one adds a field before it.
@@ -244,6 +247,9 @@ pub const CacheDefinition = struct {
     /// The `<cacheFields count>` value bytes, when the wrapper spells
     /// one — S7c's splice target when a schema edit changes the count.
     fields_count_span: ?Span = null,
+    /// The first root `<extLst>`'s `<` position — where S7c's cache-
+    /// side ordinal-token probe starts (Codex #208 r2 REL-203).
+    ext_lst_start: ?usize = null,
     /// The root element's attribute region — from just past the tag
     /// name to the `>` (or the `/` of a self-close). S7b-3's upsert
     /// target: a root attribute the part lacks is inserted at `end`.
@@ -330,7 +336,9 @@ pub fn parseCacheDefinition(allocator: Allocator, xml: []const u8) Error!CacheDe
             def.fields_count_attr = try u32Attr(k.attrs(xml), "count");
             if (wbxml.getAttr(k.attrs(xml), "count")) |v| def.fields_count_span = spanOf(xml, v);
             def.fields = try parseCacheFields(allocator, xml, k, root.prefix);
-        } else if (!std.mem.eql(u8, k.local, "extLst")) {
+        } else if (std.mem.eql(u8, k.local, "extLst")) {
+            if (def.ext_lst_start == null) def.ext_lst_start = k.hit.open_lt;
+        } else {
             def.has_other_children = true;
         }
     }
@@ -423,7 +431,9 @@ fn parseCacheFields(allocator: Allocator, xml: []const u8, el: Child, p: []const
             if (std.mem.eql(u8, c.local, "sharedItems")) {
                 if (field.shared_items != null) return error.MalformedXml;
                 field.shared_items = try parseSharedItems(allocator, xml, c, p);
-            } else if (!std.mem.eql(u8, c.local, "extLst")) {
+            } else if (std.mem.eql(u8, c.local, "extLst")) {
+                field.has_ext_lst = true;
+            } else {
                 field.has_other_children = true;
             }
         }
@@ -1367,18 +1377,18 @@ pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) 
         // One binding of the family per part. Two (a prefix and the
         // default, or two prefixes) would let children hide under the
         // one this parser is not matching.
-        if (countBindings(attrs, uris) > 1) return error.MalformedXml;
+        if ((try countBindings(attrs, uris)) > 1) return error.MalformedXml;
         // And the root's own binding must be it: a `<v:pivotCacheDefinition
         // xmlns:v="urn:vendor">` is a vendor's element, whatever else the
         // root declares. Undeclared is tolerated (a hand-rolled part).
         if (declaredBinding(attrs, prefix)) |uri| {
-            if (!isOneOf(uri, uris)) return error.MalformedXml;
+            if (!(try bindsFamilyDecoded(uri, uris))) return error.MalformedXml;
         }
         // And the one binding there is must be the root's own: a
         // `<pivotCacheDefinition xmlns:y="…/main">` puts every `y:`
         // child under a prefix this parser does not match (Codex #205
         // r1 REL-102).
-        if (countBindings(attrs, uris) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
+        if ((try countBindings(attrs, uris)) == 1 and declaredBinding(attrs, prefix) == null) return error.MalformedXml;
         const env = try (NsEnv{}).forChild(attrs);
         for (env.inScope()) |rp| if (rp.len > max_prefix_len) return error.MalformedXml;
         const extent = try extentOfQ(xml, hit, qname);
@@ -1513,7 +1523,7 @@ fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_boun
             a.name["xmlns:".len..]
         else
             continue;
-        const binds_main = isOneOf(a.value, uris);
+        const binds_main = try bindsFamilyDecoded(a.value, uris);
         const is_root_prefix = std.mem.eql(u8, declared, root_prefix);
         if (binds_main != is_root_prefix) return error.MalformedXml;
         if (binds_main and !root_bound) return error.MalformedXml;
@@ -1796,14 +1806,27 @@ pub const AttrIter = struct {
 
 /// How many distinct `xmlns` bindings on this element name one of
 /// `uris` — the default namespace counts as one.
-fn countBindings(attrs: []const u8, uris: []const []const u8) usize {
+fn countBindings(attrs: []const u8, uris: []const []const u8) Error!usize {
     var n: usize = 0;
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
         if (!isXmlnsDecl(a.name)) continue;
-        if (isOneOf(a.value, uris)) n += 1;
+        if (try bindsFamilyDecoded(a.value, uris)) n += 1;
     }
     return n;
+}
+
+/// Does a namespace declaration's RAW value name one of `uris`,
+/// decoded first — `…/mai&#x6e;` binds the same namespace as its
+/// plain spelling (Codex #208 r2 SEC-201; the rule the host hygiene
+/// already applies, #206 r19). A value the decoder cannot spell
+/// refuses the part: a binding this check cannot read could be hiding
+/// the family.
+fn bindsFamilyDecoded(raw: []const u8, uris: []const []const u8) Error!bool {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return isOneOf(raw, uris);
+    var buf: [512]u8 = undefined;
+    const decoded = wbxml.decodeScalarAttr(&buf, raw) orelse return error.MalformedXml;
+    return isOneOf(decoded, uris);
 }
 
 fn isXmlnsDecl(name: []const u8) bool {

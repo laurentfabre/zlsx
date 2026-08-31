@@ -2933,6 +2933,26 @@ pub const engine = struct {
     pub fn rebuildWith(arena: Allocator, cache: *const PivotCache, rows: []const Row, records_xml: ?[]const u8, refreshed: ?Refreshed, schema: ?edit.SchemaEdit) RebuildError!Rebuild {
         const def = &cache.definition;
         try checkShape(def);
+        if (schema) |se| {
+            // S7c moves cache-field ordinals, so extension content
+            // this reader tolerates unread must be proven not to
+            // carry any — the cache-side twin of the consumer probe
+            // (Codex #208 r2 REL-203). A SURVIVING field's own
+            // `extLst` refuses; the removed field's leaves whole with
+            // it. The root extension region is probed for the
+            // ordinal-carrier attribute names — the corpus'
+            // `pivotCacheId` extension carries none.
+            for (def.fields, 0..) |f, k| {
+                switch (se) {
+                    .remove => |r| if (r == k) continue,
+                    .insert => {},
+                }
+                if (f.has_ext_lst) return error.PivotShapeUnsupported;
+            }
+            if (def.ext_lst_start) |at| {
+                if (edit.extRegionNamesOrdinal(cache.raw_xml[at..])) return error.PivotShapeUnsupported;
+            }
+        }
         const eff = try effectiveCacheFields(arena, def.fields, schema);
         if (rows.len == 0 or rows.len > std.math.maxInt(u32)) return error.PivotShapeUnsupported;
         // The rectangle's width is the field schema: a disagreement
@@ -8113,6 +8133,71 @@ test "S7c: an attachment list the reader cannot see refuses; the plain list deco
         \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><data xmlns:y="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><y:pivotTables><y:pivotTable tabId="2" name="P"/></y:pivotTables></data></slicerCacheDefinition>
     ;
     try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, aliased, .slicer));
+    // An entity-spelled alias binds the same namespace as its plain
+    // spelling (Codex #208 r2 SEC-201): decoded before the family
+    // comparison, it refuses the same way.
+    const ent_alias =
+        \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><data xmlns:y="http://schemas.microsoft.com/office/spreadsheetml/2009/9/mai&#x6e;"><y:pivotTables><y:pivotTable tabId="2" name="P"/></y:pivotTables></data></slicerCacheDefinition>
+    ;
+    try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, ent_alias, .slicer));
+}
+
+test "S7c engine: cache-side tolerated-unread content refuses a schema edit — a surviving field's extLst, an ordinal token in the root extension (Codex #208 r2 REL-203)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_cache_ext.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    // The corpus shape: an attribute-only root extension with no
+    // ordinal name admits the rebuild.
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "</pivotCacheDefinition>", "<extLst><ext uri=\"{X}\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"><x14:pivotCacheDefinition pivotCacheId=\"2\"/></ext></extLst></pivotCacheDefinition>");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "East" }, .{ .number = "3" } },
+        &.{ .{ .string = "West" }, .{ .number = "4" } },
+        &.{ .{ .string = "East" }, .{ .number = "5" } },
+    };
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const cache = &o.pivots.caches[0];
+        const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+        _ = try engine.rebuildWith(arena, cache, &rows, rec, null, .{ .remove = 2 });
+    }
+    // An ordinal-carrier attribute anywhere in the extension region
+    // refuses the schema edit; the same cache still rebuilds under a
+    // ROW edit (no ordinal moves).
+    try fixture.patchPart(testing.allocator, io, path, "xl/pivotCache/pivotCacheDefinition1.xml", "pivotCacheId=\"2\"", "pivotCacheId=\"2\" fld=\"1\"");
+    {
+        var o = try Opened.open(testing.allocator, io, path);
+        defer o.deinit(testing.allocator);
+        const cache = &o.pivots.caches[0];
+        const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+        try testing.expectError(error.PivotShapeUnsupported, engine.rebuildWith(arena, cache, &rows, rec, null, .{ .remove = 2 }));
+        _ = try engine.rebuild(arena, cache, &fixture_rows, rec, null);
+    }
+    // A SURVIVING field's own extLst refuses; the removed field's
+    // leaves whole with it.
+    const path2 = try tt.path(testing.allocator, io, "s7c_field_ext.xlsx");
+    defer testing.allocator.free(path2);
+    try fixture.write(testing.allocator, io, path2, .sheet_ref);
+    try fixture.patchPart(testing.allocator, io, path2, "xl/pivotCache/pivotCacheDefinition1.xml", "maxValue=\"5\"/></cacheField>", "maxValue=\"5\"/><extLst/></cacheField>");
+    var o = try Opened.open(testing.allocator, io, path2);
+    defer o.deinit(testing.allocator);
+    const cache = &o.pivots.caches[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    try testing.expectError(error.PivotShapeUnsupported, engine.rebuildWith(arena, cache, &rows, rec, null, .{ .remove = 2 }));
+    const keep = [_]engine.Row{
+        &.{ .{ .string = "East" }, .{ .number = "1.5" } },
+        &.{ .{ .string = "West" }, .{ .number = "2.5" } },
+        &.{ .{ .string = "East" }, .{ .number = "3.5" } },
+    };
+    _ = try engine.rebuildWith(arena, cache, &keep, rec, null, .{ .remove = 1 });
 }
 
 fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8) !void {

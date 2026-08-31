@@ -142,6 +142,12 @@ pub const WorkbookDefinedName = workbook_xml_plan_mod.DefinedName;
 pub const DefinedNameOptions = workbook_xml_plan_mod.DefinedNameOptions;
 
 pub const Error = error{
+    /// A structural edit failed AFTER its first install — a resource
+    /// failure between the sweep's phases left the in-memory model
+    /// torn, and saving or editing it would ship the tear. Reopen the
+    /// workbook. (Codex #208 r2 REL-201; the disk file is untouched —
+    /// only this instance is poisoned.)
+    StructuralEditIncomplete,
     /// Style validation failed — empty font name, non-positive font
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
@@ -988,6 +994,12 @@ pub const Workbook = struct {
     /// write staged after it ages the collection as a store mutation
     /// does (Codex #206 r6 REL-601).
     staged_writes: u64 = 0,
+    /// A structural edit failed after its first install: the model is
+    /// between phases, and every save and further structural edit
+    /// refuses with `StructuralEditIncomplete` (Codex #208 r2
+    /// REL-201). The whole-edit staging that would make the five
+    /// phases one transaction is the documented follow-up.
+    torn_edit: bool = false,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -3546,6 +3558,8 @@ pub const Workbook = struct {
     /// deltas / appended rows into `store.replacePart`, and invalidate
     /// the typed views those bytes made stale.
     fn applySavePlans(self: *Workbook) Error!void {
+        // A torn model must not ship (Codex #208 r2 REL-201).
+        if (self.torn_edit) return error.StructuralEditIncomplete;
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
         // plan. Today the only axis is staged defined names — splice
         // them into `xl/workbook.xml` BEFORE the SST + per-sheet
@@ -5876,6 +5890,16 @@ pub const Workbook = struct {
     }
 
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
+        if (self.torn_edit) return error.StructuralEditIncomplete;
+        // A failure once anything has installed leaves the model
+        // between phases: poisoned, so no save or further edit ships
+        // the tear (Codex #208 r2 REL-201). A failure before the
+        // first install poisons nothing — the mutation counter tells
+        // the two apart.
+        const mutations_before = self.store.mutations;
+        errdefer if (self.store.mutations != mutations_before) {
+            self.torn_edit = true;
+        };
         // One axis, exactly: a spec naming neither would unwrap
         // nothing below, one naming both is not one edit (Codex #205
         // r12 REL-1201).
@@ -6381,6 +6405,7 @@ pub const Workbook = struct {
         @memset(rebuilt, null);
         const schemas = try arena.alloc(?pivots_mod.edit.SchemaEdit, p.caches.len);
         @memset(schemas, null);
+        var gate_cands: ?std.ArrayListUnmanaged(AttachmentCand) = null;
         for (p.caches, 0..) |*c, ci| {
             var plan = pivots_mod.edit.planCacheEdit(arena, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
             if (plan.schema) |se| {
@@ -6401,7 +6426,7 @@ pub const Workbook = struct {
                         else => return error.PivotEditUnsafe,
                     };
                 }
-                try self.refuseSchemaEditGates(arena, &p, ci);
+                try self.refuseSchemaEditGates(arena, &p, ci, &gate_cands);
                 schemas[ci] = plan.schema.?;
             }
             if (plan.changed) {
@@ -6511,9 +6536,19 @@ pub const Workbook = struct {
     /// can name field ordinals; read as presence) all refuse:
     /// over-matching costs a refusal, under-matching a corrupted
     /// workbook.
-    fn refuseSchemaEditGates(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize) Error!void {
-        const Cand = struct { part: []const u8, kind: pivots_mod.AttachmentKind };
-        var cand: std.ArrayListUnmanaged(Cand) = .empty;
+    const AttachmentCand = struct { part: []const u8, kind: pivots_mod.AttachmentKind };
+
+    /// The slicer / timeline cache parts an edit's gates read — the
+    /// workbook's relationships plus a filtered part-name fallback —
+    /// collected ONCE per edit into the caller's arena and reused for
+    /// every schema-edited cache (Codex #208 r2 PERF-201). The
+    /// fallback skips `_rels` companions and non-XML payloads under
+    /// the prefixes (Codex #208 r2 REL-204: a relationship part is
+    /// not a cache definition, and refusing on one would gate an edit
+    /// no slicer touches) and drops names the relationships already
+    /// named.
+    fn attachmentCandidates(self: *Workbook, arena: Allocator) Error!std.ArrayListUnmanaged(AttachmentCand) {
+        var cand: std.ArrayListUnmanaged(AttachmentCand) = .empty;
         for (self.store.rels("xl/workbook.xml")) |rel| {
             const kind: pivots_mod.AttachmentKind = if (pivots_mod.relLeafIs(rel.type, "slicerCache"))
                 .slicer
@@ -6527,11 +6562,26 @@ pub const Workbook = struct {
         // Belt and braces: a cache part the workbook does not list is
         // dead to Excel, but reading it costs nothing and an attached
         // one that only the name reveals still refuses.
-        for (try self.store.partNames()) |name| {
-            if (std.mem.startsWith(u8, name, "xl/slicerCaches/")) try cand.append(arena, .{ .part = name, .kind = .slicer });
-            if (std.mem.startsWith(u8, name, "xl/timelineCaches/")) try cand.append(arena, .{ .part = name, .kind = .timeline });
+        var i: usize = 0;
+        outer: while (i < self.store.partCount()) : (i += 1) {
+            const name = self.store.partNameAt(i);
+            if (std.mem.indexOf(u8, name, "/_rels/") != null) continue;
+            if (!std.mem.endsWith(u8, name, ".xml")) continue;
+            const kind: pivots_mod.AttachmentKind = if (std.mem.startsWith(u8, name, "xl/slicerCaches/"))
+                .slicer
+            else if (std.mem.startsWith(u8, name, "xl/timelineCaches/"))
+                .timeline
+            else
+                continue;
+            for (cand.items) |c| if (std.mem.eql(u8, c.part, name)) continue :outer;
+            try cand.append(arena, .{ .part = name, .kind = kind });
         }
-        for (cand.items) |c| {
+        return cand;
+    }
+
+    fn refuseSchemaEditGates(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize, cands: *?std.ArrayListUnmanaged(AttachmentCand)) Error!void {
+        if (cands.* == null) cands.* = try self.attachmentCandidates(arena);
+        for (cands.*.?.items) |c| {
             const part = (try self.store.part(c.part)) orelse return error.PivotEditUnsafe;
             const names = pivots_mod.attachedPivotNames(arena, part.bytes, c.kind) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,

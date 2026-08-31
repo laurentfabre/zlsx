@@ -1468,6 +1468,17 @@ pub const PartStore = struct {
         return out;
     }
 
+    /// Borrowed access to the stored part names — no allocation, for
+    /// a caller that only scans them (Codex #208 r2 PERF-201; the
+    /// arena-allocating `partNames` retains its view per call).
+    pub fn partCount(self: *const PartStore) usize {
+        return self.parts.len;
+    }
+
+    pub fn partNameAt(self: *const PartStore, i: usize) []const u8 {
+        return self.parts[i].name;
+    }
+
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
         return self.partControlled(name, .none);
     }
