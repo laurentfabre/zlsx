@@ -73,6 +73,7 @@ __all__ = [
     "ZlsxFormulaRefusal",
     "ZlsxRefusal",
     "pivots",
+    "defined_names",
     "FormulaSpec",
     "RecalcOptions",
     "RecalcReport",
@@ -3770,6 +3771,54 @@ class Editor:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
 
+    # ── Defined names (S3b, the typed read) ───────────────────────
+
+    def defined_names(self) -> list[dict]:
+        """The workbook's defined names as ``zlsx defined-names``
+        reports them: one ``{"kind": "defined_name", …}`` record per
+        ``<definedName>`` of ``xl/workbook.xml`` in document order
+        (``name``, ``scope``, ``sheet``, ``sheet_idx``, ``body``,
+        ``hidden``), parsed from the same NDJSON bytes the CLI prints
+        (docs/cli.md, "defined-names"). ``body`` is the formula text
+        as authored — nothing resolved or rewritten; hidden names are
+        streamed, not suppressed. Read over the editor's current
+        workbook state: structural edits and the name sweeps they
+        carry (a sheet rename rewriting the bodies) are visible
+        immediately. ``[]`` for a workbook without defined names. An
+        inventory that cannot be served faithfully — a carrier that
+        does not decode, malformed UTF-8, a body with embedded markup
+        — raises :class:`ZlsxRefusal` (``MalformedWorkbookXml``)
+        rather than return a record that lies."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_DEFINED_NAMES:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_defined_names_ndjson "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        import json
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = _ffi.lib.zlsx_editor_defined_names_ndjson(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"zlsx_editor_defined_names_ndjson: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
+
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
 
@@ -4156,6 +4205,14 @@ def pivots(path: Union[str, Path]) -> list[dict]:
     over a fresh editor, closed before returning."""
     with Editor(path) as ed:
         return ed.pivots()
+
+
+def defined_names(path: Union[str, Path]) -> list[dict]:
+    """The defined names of the workbook at ``path`` —
+    :meth:`Editor.defined_names` over a fresh editor, closed before
+    returning."""
+    with Editor(path) as ed:
+        return ed.defined_names()
 
 
 # ─── Embeddings (E5) ─────────────────────────────────────────────────

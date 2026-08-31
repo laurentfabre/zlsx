@@ -2,10 +2,11 @@
 //! (`docs/cli.md`, "defined-names"), written once for every surface.
 //!
 //! `zlsx defined-names` emits these through its own selection and
-//! pagination; the C and Python legs of row S3b hand over the same
-//! bytes when they land. One writer, so the record a Python caller
-//! will see is byte-for-byte the one the CLI prints — the
-//! `pivot_ndjson.zig` precedent.
+//! pagination; the C and Python legs of row S3b
+//! (`zlsx_editor_defined_names_ndjson`, `Editor.defined_names`) hand
+//! over the same bytes. One writer, so the record a Python caller sees
+//! is byte-for-byte the one the CLI prints — the `pivot_ndjson.zig`
+//! precedent.
 //!
 //! The read is a decode of what `xl/workbook.xml` already parsed:
 //! `name` by its string carrier (entities + ST_Xstring — the codec
@@ -112,7 +113,7 @@ pub fn writeName(out: *std.Io.Writer, d: DecodedName) !void {
 }
 
 /// The unselected stream — every name, document order. The C leg's
-/// entry point when it lands.
+/// entry point (`c_abi.zig::definedNamesNdjsonOwned`).
 pub fn writeAll(out: *std.Io.Writer, view: *const DefinedNames) !void {
     for (view.names) |d| try writeName(out, d);
 }

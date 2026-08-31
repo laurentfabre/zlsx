@@ -2738,6 +2738,95 @@ def test_pivots_frozen_shape_on_corpus_and_empty_on_plain_workbook(tmp_path):
     assert all(r["kind"] == "pivot" for r in records)
 
 
+# ── S3b slice 2: the defined-names read through the C ABI ─────────────
+
+
+def _require_defined_names():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_DEFINED_NAMES:
+        pytest.skip("defined-names read not exposed in loaded libzlsx (requires 0.9.0+)")
+
+
+def _named_workbook(path):
+    with zlsx.write(path) as w:
+        w.add_sheet("Data").write_row([1, 2, 3])
+        w.add_sheet("Second").write_row(["two"])
+        w.add_defined_name("Prices", "Data!$A$1:$C$4")
+        w.add_defined_name("_xlnm.Print_Area", "Second!$A$1:$B$9", local_sheet_id=1)
+        w.add_defined_name("Secret", "Data!$Z$1", hidden=True)
+
+
+def test_defined_names_frozen_shape_and_empty_on_plain_workbook(tmp_path):
+    """`Editor.defined_names()` / `zlsx.defined_names(path)` return the
+    `zlsx defined-names` records as dicts — document order, hidden
+    names streamed, `body` as authored; `[]` without names."""
+    _require_defined_names()
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    assert zlsx.defined_names(plain) == []
+    with zlsx.edit(plain) as ed:
+        assert ed.defined_names() == []
+
+    src = tmp_path / "named.xlsx"
+    _named_workbook(src)
+    assert zlsx.defined_names(src) == [
+        {"kind": "defined_name", "name": "Prices", "scope": "workbook",
+         "sheet": None, "sheet_idx": None, "body": "Data!$A$1:$C$4", "hidden": False},
+        {"kind": "defined_name", "name": "_xlnm.Print_Area", "scope": "sheet",
+         "sheet": "Second", "sheet_idx": 1, "body": "Second!$A$1:$B$9", "hidden": False},
+        {"kind": "defined_name", "name": "Secret", "scope": "workbook",
+         "sheet": None, "sheet_idx": None, "body": "Data!$Z$1", "hidden": True},
+    ]
+
+
+def test_defined_names_read_the_editors_current_state(tmp_path):
+    """A sheet rename is visible immediately: the name sweep rewrites
+    the bodies and the view refreshes, no save in between."""
+    _require_defined_names()
+    _require_structural()
+    src = tmp_path / "named.xlsx"
+    _named_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "Facts")
+        records = ed.defined_names()
+    bodies = [r["body"] for r in records]
+    assert bodies == ["Facts!$A$1:$C$4", "Second!$A$1:$B$9", "Facts!$Z$1"]
+    assert records[1]["sheet"] == "Second"
+
+
+def test_defined_names_refusal_is_typed(tmp_path):
+    """An inventory the read cannot serve faithfully raises
+    `ZlsxRefusal(MalformedWorkbookXml)` — never a partial list."""
+    _require_defined_names()
+    import zipfile
+
+    src = tmp_path / "named.xlsx"
+    _named_workbook(src)
+
+    # A bad entity in one body: the editor opens (the open parser keeps
+    # raw spans); the decode at read time refuses the whole view.
+    broken = tmp_path / "broken.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(broken, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/workbook.xml":
+                data = data.replace(b"Data!$Z$1", b"Data!$Z$1&bogus;")
+            zout.writestr(item, data)
+
+    with zlsx.edit(broken) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.defined_names()
+        assert info.value.error_name == "MalformedWorkbookXml"
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+
+    ed = zlsx.edit(src)
+    ed.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.defined_names()
+
+
 def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path):
     """c_uint32 wraps modulo 2**32: without a guard, rename_sheet(2**32, …)
     would rename sheet 0. Every integer-bearing structural method rejects

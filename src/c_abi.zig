@@ -6249,6 +6249,72 @@ fn pivotsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// The S3b `defined-names` records — one `{"kind":"defined_name",…}`
+/// line per `<definedName>` of `xl/workbook.xml`, in document order —
+/// as a library-allocated UTF-8 buffer, byte-for-byte what
+/// `zlsx defined-names <file>` prints with no selector (`docs/cli.md`,
+/// "defined-names"). `body` is the formula text as authored — nothing
+/// resolved or rewritten. Read over the editor's current workbook
+/// state: structural edits and the name sweeps they carry (a sheet
+/// rename rewriting the bodies) are visible immediately; nothing about
+/// a defined name waits for save. A workbook without defined names is
+/// ZLSX_OK with `(NULL, 0)`. An inventory that cannot be served
+/// faithfully — a carrier that does not decode, malformed UTF-8, a
+/// body with embedded markup — refuses whole (`MalformedWorkbookXml`,
+/// -2) rather than hand over a record that lies. Release with
+/// `zlsx_buffer_release`.
+export fn zlsx_editor_defined_names_ndjson(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail: a rejected sibling
+    // leaves the accepted ones releasable.
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    const bytes = definedNamesNdjsonOwned(gpa, &state.inner.workbook) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The defined-name records as one owned buffer in `alloc` — the
+/// shared writer (`pkg/defined_name_ndjson.zig`) over the workbook's
+/// parsed `xl/workbook.xml` view, so the bytes are the CLI's. The
+/// allocating writer reports a failed growth as `WriteFailed`; at this
+/// boundary that is an allocation failure and crosses as `-3`, the
+/// pivots builder's rule.
+fn definedNamesNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
+    var view = try zlsx_pkg.defined_names_ndjson.collect(alloc, &wb.workbook);
+    defer view.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.defined_names_ndjson.writeAll(&out.writer, &view) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
 // ─── M9a1 tests ──────────────────────────────────────────────────────
 
 /// A1 = 1 (plain), B1 = formula "A1+2" with cached <v>0</v> — one
@@ -7572,6 +7638,150 @@ test "S3a pivots_ndjson: every allocation failure while writing is OutOfMemory, 
     defer wb.deinit();
     try std.testing.checkAllAllocationFailures(alloc, pivotsNdjsonForFailures, .{&wb});
     try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
+
+/// Two sheets and three defined names — workbook scope, sheet scope,
+/// hidden — written through the C surface so the read-back crosses the
+/// same boundary a binding does.
+fn writeS3bDefinedNamesFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    const s1 = "Data";
+    const sw1 = zlsx_writer_add_sheet(w, s1.ptr, s1.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells1 = [_]CCell{ toCCell(.{ .integer = 1 }), toCCell(.{ .integer = 2 }) };
+    if (zlsx_sheet_writer_write_row(sw1, &cells1, cells1.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const s2 = "Second";
+    const sw2 = zlsx_writer_add_sheet(w, s2.ptr, s2.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells2 = [_]CCell{toCCell(.{ .integer = 3 })};
+    if (zlsx_sheet_writer_write_row(sw2, &cells2, cells2.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const n1 = "Prices";
+    const b1 = "Data!$A$1:$C$4";
+    if (zlsx_writer_add_defined_name(w, n1.ptr, n1.len, b1.ptr, b1.len, -1, 0, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const n2 = "_xlnm.Print_Area";
+    const b2 = "Second!$A$1:$B$9";
+    if (zlsx_writer_add_defined_name(w, n2.ptr, n2.len, b2.ptr, b2.len, 1, 0, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const n3 = "Secret";
+    const b3 = "Data!$Z$1";
+    if (zlsx_writer_add_defined_name(w, n3.ptr, n3.len, b3.ptr, b3.len, -1, 1, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    if (zlsx_writer_save(w, path.ptr, path.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    return path;
+}
+
+test "S3b defined_names_ndjson: the shared writer's bytes, current after a rename, empty without names" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    {
+        const path = try writeS3bDefinedNamesFixture(io, &tt, "s3b_defined_names.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        // The frozen record — the literal the CLI test and the package
+        // test both pin (docs/cli.md, "defined-names").
+        const expected =
+            "{\"kind\":\"defined_name\",\"name\":\"Prices\",\"scope\":\"workbook\",\"sheet\":null,\"sheet_idx\":null,\"body\":\"Data!$A$1:$C$4\",\"hidden\":false}\n" ++
+            "{\"kind\":\"defined_name\",\"name\":\"_xlnm.Print_Area\",\"scope\":\"sheet\",\"sheet\":\"Second\",\"sheet_idx\":1,\"body\":\"Second!$A$1:$B$9\",\"hidden\":false}\n" ++
+            "{\"kind\":\"defined_name\",\"name\":\"Secret\",\"scope\":\"workbook\",\"sheet\":null,\"sheet_idx\":null,\"body\":\"Data!$Z$1\",\"hidden\":true}\n";
+        try std.testing.expectEqualStrings(expected, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // A structural edit is what the read sees: renaming the sheet
+        // the bodies reference shows the name sweep's rewrite and the
+        // refreshed view, no save in between.
+        const nm = "Facts";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const got = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"body\":\"Facts!$A$1:$C$4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"body\":\"Facts!$Z$1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Second\",\"sheet_idx\":1,\"body\":\"Second!$A$1:$B$9\"") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // NULL out pointers are about the call.
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+    }
+    // No defined names: success, nothing to release, the poison reset.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3b_no_names.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3b defined_names_ndjson: an inventory the read cannot serve refuses whole, nothing handed out" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bDefinedNamesFixture(io, &tt, "s3b_names_broken.xlsx");
+    defer alloc.free(path);
+    // A bad entity in one body: the open parser keeps raw spans, so the
+    // editor opens; the decode at read time refuses the whole view.
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "Data!$Z$1", "Data!$Z$1&bogus;");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+    try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+fn definedNamesNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try definedNamesNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+test "S3b defined_names_ndjson: every allocation failure is OutOfMemory, never WriteFailed" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bDefinedNamesFixture(io, &tt, "s3b_names_oom.xlsx");
+    defer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, definedNamesNdjsonForFailures, .{&wb});
 }
 
 /// Flip one byte deep inside the stored payload of `part`, found by

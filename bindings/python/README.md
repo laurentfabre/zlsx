@@ -261,6 +261,7 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
+| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies |
 | `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit`, the carrier verdicts `MalformedSheetXml` / `MalformedDrawingXml` / `MalformedVmlDrawing` / `MalformedCommentsXml` / `MalformedTableXml` / `*CoordinateOverflow`, the workbook's own `MalformedWorkbookXml` / `IdSpaceExhausted` / … | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read or materialise. The list is §10 of `docs/plans/c-abi-status-v1.md`; a generic `MalformedXml` from a rewriter's consistency guard stays a plain `ZlsxError` |
 
 `ZlsxRefusal` is a `ZlsxError`; `ZlsxFormulaRefusal` (the engine's
@@ -285,6 +286,18 @@ structural edits are visible immediately — rename the host sheet and
 the record names it — while staged `set_cell` / `append_rows` writes
 reach the pivot graph at `save`, where a cache whose source they change
 is rebuilt or marked; save, then read, to see them.
+
+`Editor.defined_names()` / `zlsx.defined_names(path)` are the same
+pattern over the `zlsx defined-names` records
+([docs/cli.md](../../docs/cli.md), "defined-names"): one
+`{"kind": "defined_name", …}` dict per `<definedName>` of
+`xl/workbook.xml` in document order — `name`, `scope`
+(`"workbook"` / `"sheet"` with `sheet` / `sheet_idx`), `body` (the
+formula text as authored — nothing resolved or rewritten), `hidden`
+(hidden names are streamed, not suppressed). Defined names live in
+`xl/workbook.xml` only, so the read never waits for `save`: structural
+edits and the name sweeps they carry — a sheet rename rewriting the
+bodies — are visible immediately.
 
 ## Spark (PySpark Data Source)
 
@@ -449,6 +462,8 @@ with zlsx.write("out.xlsx") as w:
   `ZlsxRefusal` — see *Structural edits & pivots*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts
+- Defined names, typed read (0.9.0+): `Editor.defined_names()` /
+  `zlsx.defined_names(path)` — the `zlsx defined-names` records as dicts
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
