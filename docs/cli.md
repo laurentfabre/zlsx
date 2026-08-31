@@ -165,7 +165,14 @@ one record per `<mergeCell>`, every sheet by default, `--sheet` /
 range declares it; `start_row` / `start_col` / `end_row` / `end_col`
 are its inclusive corners, 1-based on both axes (column A = 1, like the
 `cells` envelope), so `jq` consumers can intersect without re-parsing
-A1 text.
+A1 text. Sheet names — in the `sheet` field and against `--name` /
+`--sheet-glob` — carry the reader's spelling, exactly as on every
+Book-route command (`rows`, `cells`, `comments`, `validations`,
+`hyperlinks`): XML entities decoded, ST_Xstring `_xHHHH_` escapes as
+written. The package-route commands (`pivots`, `defined-names`) decode
+ST_Xstring too, so the rare sheet name spelled with such an escape
+reads differently across the two families — a reader-level lift on a
+later S3b slice, not a per-command patch (one family, one spelling).
 
 ### Edit (load-modify-save)
 
@@ -552,7 +559,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

@@ -849,7 +849,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  recalc            recalculate every formula cell into --out
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0; on
-        \\                    pivots, every host sheet)
+        \\                    pivots every host sheet, on merges every
+        \\                    sheet, on defined-names every name)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
