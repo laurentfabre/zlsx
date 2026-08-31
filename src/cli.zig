@@ -4161,7 +4161,15 @@ fn runMergesCommand(
             if (signals.shouldStop()) return;
             switch (pg.consume()) {
                 .drop => continue,
-                .stop => return,
+                // Flush before the early return: runMain's deferred
+                // flush swallows errors, so a --take'd stream that
+                // relied on it would report exit 0 on a failed final
+                // write instead of the documented exit 5 (Codex #211
+                // r1).
+                .stop => {
+                    try out.flush();
+                    return;
+                },
                 .emit => {},
             }
             if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {

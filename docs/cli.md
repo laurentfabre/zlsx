@@ -97,7 +97,18 @@ suppresses them. Nothing is modified; this is the read half of
 Sheet selection follows the read family — `--sheet` / `--name` narrow to one
 host sheet, `--all-sheets` / `--sheet-glob` widen, the default streams every
 sheet — and `--skip` / `--take` page the record stream. A workbook without
-pivots is an empty, successful stream.
+pivots is an empty, successful stream. The graph is read whole or not at all
+(`MalformedPivotXml`, exit 2): a part a pivot, cache or sheet relationship
+names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
+without its `cacheId` or `r:id`, a cache whose identity disagrees between
+`xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
+with two cache edges, a records part that is named but absent, a defined-name
+inventory the engine refuses or a `<tablePart>` that attaches nothing (checked,
+in that order, when a source is spelled by name and no defined name has it) all fail the command rather than listing the pivots
+that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
+chart formats, hierarchies and every OLAP-only element are not exposed; the
+parts stay byte-preserved for callers that need them raw
+(`zlsx_pkg.PartStore`).
 
 #### `defined-names` — the workbook name inventory
 
@@ -129,10 +140,22 @@ location, so there is no prologue to hoist them into). The command
 routes through the package layer like `pivots`, so an archive the
 lenient reader tolerates but the package layer refuses (ZIP data
 descriptors, for one) is exit 2; a workbook without defined names is an
-empty, successful stream. A name or body whose carrier does not decode
-(a bad entity, an ill-formed `_xHHHH_` escape) refuses the whole
-command (exit 2) — a partial name inventory is the shape of a guard
-hole.
+empty, successful stream. A name or body the read cannot serve
+faithfully refuses the whole command (exit 2) rather than emit a
+record that lies: a carrier that does not decode (a bad entity, an
+ill-formed `_xHHHH_` escape), a decoded name, body or sheet name that
+is not UTF-8 (NDJSON must stay parseable), or a body carrying embedded
+markup (a CDATA section, a comment — element text no consumer of the
+name reads through; the rewriters refuse such a body too) — a partial
+or wrong name inventory is the shape of a guard hole. Two shapes are
+not part of the workbook.xml view at all and emit no record, on any
+surface that reads it: a bodiless self-closing `<definedName/>` and an
+entry with no `name` attribute — spellings Excel never writes, and
+names the engine's symbol table (which `pivots` resolution and the
+edit-time name sweep read through) equally does not hold, so the CLI
+cannot show a name the rest of the toolchain would not honour.
+
+#### `merges` — merged ranges
 
 `merges` (S3b) is the same read family as `validations` / `hyperlinks`:
 one record per `<mergeCell>`, every sheet by default, `--sheet` /
@@ -142,18 +165,7 @@ one record per `<mergeCell>`, every sheet by default, `--sheet` /
 range declares it; `start_row` / `start_col` / `end_row` / `end_col`
 are its inclusive corners, 1-based on both axes (column A = 1, like the
 `cells` envelope), so `jq` consumers can intersect without re-parsing
-A1 text. The graph is read whole or not at all
-(`MalformedPivotXml`, exit 2): a part a pivot, cache or sheet relationship
-names but that is missing, mistyped or unreadable, a `<pivotCache>` entry
-without its `cacheId` or `r:id`, a cache whose identity disagrees between
-`xl/workbook.xml` and the pivot that reads it, two caches under one id, a pivot
-with two cache edges, a records part that is named but absent, a defined-name
-inventory the engine refuses or a `<tablePart>` that attaches nothing (checked,
-in that order, when a source is spelled by name and no defined name has it) all fail the command rather than listing the pivots
-that did parse — a partial inventory is the shape of a guard hole. Formats, conditional formats,
-chart formats, hierarchies and every OLAP-only element are not exposed; the
-parts stay byte-preserved for callers that need them raw
-(`zlsx_pkg.PartStore`).
+A1 text.
 
 ### Edit (load-modify-save)
 

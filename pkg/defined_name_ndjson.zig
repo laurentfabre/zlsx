@@ -53,10 +53,17 @@ pub const DefinedNames = struct {
     }
 };
 
-/// Decode every defined name of `wb`. A carrier that does not decode
-/// (a bad entity, an ill-formed ST_Xstring escape) refuses the whole
-/// read — a partial name inventory is the shape of a guard hole, as
-/// the pivot read established.
+/// Decode every defined name of `wb`. A read this module cannot serve
+/// faithfully refuses whole — a partial or wrong name inventory is the
+/// shape of a guard hole, as the pivot read established. Refused: a
+/// carrier that does not decode (a bad entity, an ill-formed
+/// ST_Xstring escape); a decoded name, body or sheet name that is not
+/// UTF-8 — the JSON writer passes bytes through verbatim, so admitting
+/// one would emit invalid NDJSON under an exit 0 (Codex #211 r1); a
+/// raw body carrying embedded markup — a `<` in element text can only
+/// open a CDATA section, a comment or a PI, content `dn.formula`
+/// records as written, so the "formula" would be markup, not the
+/// element's text. The edit-time name sweep refuses such bodies too.
 pub fn collect(gpa: Allocator, wb: *const workbook_xml.WorkbookXml) Error!DefinedNames {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -67,6 +74,9 @@ pub fn collect(gpa: Allocator, wb: *const workbook_xml.WorkbookXml) Error!Define
 
     const names = try a.alloc(DecodedName, wb.defined_names.len);
     for (wb.defined_names, 0..) |dn, i| {
+        if (std.mem.indexOfScalar(u8, dn.formula, '<') != null) {
+            return error.MalformedWorkbookXml;
+        }
         names[i] = .{
             .name = try decode(a, .defined_name_identifier, dn.name),
             .body = try decode(a, .defined_name_body, dn.formula),
@@ -108,10 +118,16 @@ pub fn writeAll(out: *std.Io.Writer, view: *const DefinedNames) !void {
 }
 
 fn decode(a: Allocator, site: formula.decode.Site, raw: []const u8) Error![]u8 {
-    return formula.decode.decodeAt(a, site, raw) catch |e| switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.MalformedWorkbookXml,
+    const decoded = formula.decode.decodeAt(a, site, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedWorkbookXml,
     };
+    // The decoders resolve entities and ST_Xstring escapes but pass
+    // raw bytes through, so a malformed-UTF-8 part would flow into the
+    // NDJSON verbatim. Refuse it here — every retained string is what
+    // the JSON writer emits.
+    if (!std.unicode.utf8ValidateSlice(decoded)) return error.MalformedWorkbookXml;
+    return decoded;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -193,6 +209,86 @@ test "collect: a name body with a bad entity refuses the whole read" {
     defer wb.deinit(testing.allocator);
 
     try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+}
+
+test "collect: a CDATA or comment body refuses — markup is not the formula" {
+    inline for (.{
+        "<definedName name=\"Cd\"><![CDATA[Data!$A$1]]></definedName>",
+        "<definedName name=\"Cm\">Data!<!-- x -->$A$1</definedName>",
+    }) |entry| {
+        const xml =
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheets>" ++
+            "<sheet name=\"Data\" sheetId=\"1\" r:id=\"rId1\"/>" ++
+            "</sheets>" ++
+            "<definedNames>" ++ entry ++ "</definedNames>" ++
+            "</workbook>";
+        var wb = try parseWb(xml);
+        defer wb.deinit(testing.allocator);
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    }
+}
+
+test "collect: an entity-spelt '<' in a body is text, not markup — admitted" {
+    const xml =
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheets>" ++
+        "<sheet name=\"Data\" sheetId=\"1\" r:id=\"rId1\"/>" ++
+        "</sheets>" ++
+        "<definedNames>" ++
+        "<definedName name=\"Cmp\">IF(A1&#60;2,1,0)</definedName>" ++
+        "</definedNames>" ++
+        "</workbook>";
+    var wb = try parseWb(xml);
+    defer wb.deinit(testing.allocator);
+
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqualStrings("IF(A1<2,1,0)", view.names[0].body);
+}
+
+test "collect: malformed UTF-8 in a name or body refuses — the NDJSON must stay parseable" {
+    inline for (.{
+        "<definedName name=\"A\xff\">Data!$A$1</definedName>",
+        "<definedName name=\"B\">Data!$A$1\xff</definedName>",
+    }) |entry| {
+        const xml =
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+            "<sheets>" ++
+            "<sheet name=\"Data\" sheetId=\"1\" r:id=\"rId1\"/>" ++
+            "</sheets>" ++
+            "<definedNames>" ++ entry ++ "</definedNames>" ++
+            "</workbook>";
+        var wb = try parseWb(xml);
+        defer wb.deinit(testing.allocator);
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    }
+}
+
+test "collect: a bodiless self-closing definedName is not part of the view (docs ruling)" {
+    // The shared parser deliberately skips `<definedName name="x"/>` —
+    // a spelling Excel never writes, and a name the engine's symbol
+    // table equally does not hold. One inventory across every
+    // consumer; docs/cli.md documents the exclusion. This pin keeps
+    // the ruling deliberate: if the parser's inventory ever widens,
+    // the contract paragraph must move with it.
+    const xml =
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<sheets>" ++
+        "<sheet name=\"Data\" sheetId=\"1\" r:id=\"rId1\"/>" ++
+        "</sheets>" ++
+        "<definedNames>" ++
+        "<definedName name=\"Empty\"/>" ++
+        "<definedName name=\"Real\">Data!$A$1</definedName>" ++
+        "</definedNames>" ++
+        "</workbook>";
+    var wb = try parseWb(xml);
+    defer wb.deinit(testing.allocator);
+
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 1), view.names.len);
+    try testing.expectEqualStrings("Real", view.names[0].name);
 }
 
 test "collect: a workbook without defined names is an empty view" {
