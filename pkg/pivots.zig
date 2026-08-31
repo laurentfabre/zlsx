@@ -8563,6 +8563,15 @@ test "S7c-2 edit: the colItems canonical gates each refuse — and three survivo
     const axisless = try replacedOnce(arena, s7c_multi_data, "<colFields count=\"1\"><field x=\"-2\"/></colFields>", "");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, axisless, .{ .remove = 0 }));
     _ = try edit.applyConsumerSchemaEdit(arena, axisless, .{ .remove = 3 });
+    // A count-less wrapper is admitted, as the layout admits it
+    // (Codex #210 r5 MNT-501): both arms narrow.
+    const countless_cf = try replacedOnce(arena, s7c_multi_data, "<colFields count=\"1\">", "<colFields>");
+    const ncf = try edit.applyConsumerSchemaEdit(arena, countless_cf, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, ncf, "<colFields><field x=\"-2\"/></colFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, ncf, "<location ref=\"B2:D7\"") != null);
+    const ncf1 = try edit.applyConsumerSchemaEdit(arena, countless_cf, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, ncf1, "<colFields") == null);
+    try testing.expect(std.mem.indexOf(u8, ncf1, "<location ref=\"B2:C7\"") != null);
     // Four data fields: three survive, the re-enumeration is not a
     // hardcoded pair.
     var four = try replacedOnce(arena, s7c_multi_data, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");

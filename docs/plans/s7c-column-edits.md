@@ -270,7 +270,8 @@ consumer narrow, all inside `edit.applyConsumerSchemaEdit`:
   wrapper would erase the evidence the layout's own checks refuse on (the
   S7C-MUT-1 rule), the canonical form is required FIRST: a lying `count`, a
   stray attribute, a non-identity entry, a values axis that is not exactly
-  `<colFields count="1"><field x="-2"/></colFields>`, or a `location` width
+  one `<field x="-2"/>` (its `count`, when spelled, agreeing — an absent
+  one is admitted, as the layout admits it), or a `location` width
   that is not one label column plus the data fields, refuses — and none of
   those gates run on the K3 path, which narrows no axis;
 - a drop to a **single survivor** takes `<colFields>` out whole and leaves
