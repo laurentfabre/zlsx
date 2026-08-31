@@ -11101,3 +11101,64 @@ test "S7c-2: a host on the source sheet — the S7a move composes with the K4a n
     try expectHostCell(&wb, 0, "F10", .none);
     try expectHostCell(&wb, 0, "G7", .{ .text = "keep" });
 }
+
+test "S7c-2: the widened clear region keeps the guards — a merge or another pivot's footprint in the vacated column refuses whole (Codex #210 r2 REL-201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    {
+        // A merged range wholly inside the vacated values column: the
+        // clear would empty its cells under a standing <mergeCell>.
+        const src = try tt.path(a, io, "s7c2_merge.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<location ref=\"A3:B6\"", "<location ref=\"A3:C6\"");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<colItems count=\"1\"><i/></colItems>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>", "<dataFields count=\"2\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Sum of Price\" fld=\"2\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet2.xml", "</worksheet>", "<mergeCells count=\"1\"><mergeCell ref=\"C5:C6\"/></mergeCells></worksheet>");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
+    }
+    {
+        // Another pivot — its own cache reading an untouched sheet —
+        // whose declared footprint sits in the vacated column.
+        const src = try tt.path(a, io, "s7c2_overlap.xlsx");
+        defer a.free(src);
+        try pivots_mod.fixture.writeWithOrphanCache(a, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<location ref=\"A3:B6\"", "<location ref=\"A3:C6\"");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<colItems count=\"1\"><i/></colItems>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+        try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>", "<dataFields count=\"2\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Sum of Price\" fld=\"2\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+        {
+            var store = try store_mod.PartStore.open(a, io, src);
+            defer store.deinit();
+            const first = (try store.part(pt_part)).?;
+            const second_a = try std.mem.replaceOwned(u8, a, first.bytes, "name=\"PivotTable1\"", "name=\"PivotTable2\"");
+            defer a.free(second_a);
+            const second_b = try std.mem.replaceOwned(u8, a, second_a, "cacheId=\"7\"", "cacheId=\"8\"");
+            defer a.free(second_b);
+            const second = try std.mem.replaceOwned(u8, a, second_b, "<location ref=\"A3:C6\"", "<location ref=\"C5:D8\"");
+            defer a.free(second);
+            try store.addPart(
+                "xl/pivotTables/pivotTable2.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+                second,
+            );
+            try store.addPart(
+                "xl/pivotTables/_rels/pivotTable2.xml.rels",
+                "application/vnd.openxmlformats-package.relationships+xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition\" Target=\"../pivotCache/pivotCacheDefinition2.xml\"/></Relationships>",
+            );
+            try store.save(io, src);
+        }
+        try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/_rels/sheet2.xml.rels", "<Relationship Id=\"rIdPT1\"", "<Relationship Id=\"rIdPT2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable2.xml\"/><Relationship Id=\"rIdPT1\"");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
+    }
+}

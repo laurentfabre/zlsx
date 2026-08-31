@@ -945,9 +945,16 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (def.col_items != null) return error.MalformedXml;
             def.col_items = try parseAxisItems(allocator, xml, k, p);
         } else if (std.mem.eql(u8, k.local, "chartFormats")) {
-            // Two blocks are not one; the stricter reading wins.
+            // Two blocks are not one; the stricter reading wins —
+            // monotonically, so a trailing empty element cannot erase
+            // a values-only one (Codex #210 r2 REL-202).
             const cf = try classifyChartFormats(xml, k, p);
-            def.chart_formats = if (def.chart_formats == .other or cf == .other) .other else cf;
+            def.chart_formats = if (def.chart_formats == .other or cf == .other)
+                .other
+            else if (def.chart_formats == .values_only or cf == .values_only)
+                .values_only
+            else
+                .none;
             if (def.chart_formats_span == null) {
                 def.chart_formats_span = .{ .start = k.hit.open_lt, .end = k.after };
                 if (wbxml.getAttr(k.attrs(xml), "count")) |v| {
@@ -1184,6 +1191,7 @@ fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []
     while (try formats.next()) |cf| {
         var ref: ChartFormatRef = .{ .span = .{ .start = cf.hit.open_lt, .end = cf.after } };
         var areas: u32 = 0;
+        var wrappers: u32 = 0;
         var references: u32 = 0;
         var xs: u32 = 0;
         var walk_areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
@@ -1191,6 +1199,7 @@ fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []
             areas += 1;
             var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
             while (try refs_blocks.next()) |rb| {
+                wrappers += 1;
                 var n_here: u32 = 0;
                 var refs = Children.init(xml, rb.hit, rb.end, p, rb.env);
                 while (try refs.next()) |r| {
@@ -1224,7 +1233,7 @@ fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []
                 }
             }
         }
-        if (areas != 1 or references != 1 or xs != 1) ref.canonical = false;
+        if (areas != 1 or wrappers != 1 or references != 1 or xs != 1) ref.canonical = false;
         try out.append(allocator, ref);
     }
     return out.toOwnedSlice(allocator);

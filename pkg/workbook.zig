@@ -6509,6 +6509,11 @@ pub const Workbook = struct {
             if (schemas[ci] != null) {
                 const pre = pivots_mod.edit.footprintOfBytes(arena, b0) catch |e| return mapPivotEditError(e);
                 if (pre.rect.br_col > lay.old_rect.br_col) lay.old_rect.br_col = pre.rect.br_col;
+                // The widened clear region reaches cells the narrowed
+                // rectangle's own guards never see — another pivot's
+                // footprint there refuses like a growth into it would
+                // (Codex #210 r2 REL-201).
+                try self.refuseOverOtherPivots(arena, &p, i, lay.old_rect, table_bytes);
             }
             try self.refuseOverOtherPivots(arena, &p, i, lay.rect, table_bytes);
             table_bytes[i] = lay.table_xml;
@@ -7163,8 +7168,12 @@ pub const Workbook = struct {
         // occupied cell is — one the old rectangle held too (merged
         // labels, `mergeItem`): the slice writes one value per cell
         // and does not maintain the merge (Codex #206 r4 REL-402).
+        // The OLD rectangle's cells are written too — cleared where
+        // the new one no longer covers them — so a merge there is the
+        // same corruption: cells emptied under a standing
+        // `<mergeCell>` (Codex #210 r2 REL-201).
         for (merges) |m| {
-            if (rectsIntersect(m, new)) return error.PivotEditUnsafe;
+            if (rectsIntersect(m, new) or rectsIntersect(m, old)) return error.PivotEditUnsafe;
         }
 
         // Style sources: the old rectangle's rows by kind.

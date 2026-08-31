@@ -2676,8 +2676,11 @@ pub const edit = struct {
         def: *const pivot_xml.TableDefinition,
         k: u32,
     ) EditError!void {
-        if (def.chart_formats != .values_only) return;
+        // Multiplicity first: a trailing element could have folded the
+        // classification down while the first element's blocks are the
+        // ones going stale (Codex #210 r2 REL-202).
         if (def.chart_formats_multi) return error.PivotShapeUnsupported;
+        if (def.chart_formats != .values_only) return;
         const refs = def.chart_format_values_refs;
         if (def.chart_formats_count) |n| {
             if (n != refs.len) return error.MalformedPivotXml;
@@ -8475,11 +8478,31 @@ test "S7c-2 edit: values-only chartFormats move with the data-field drop — rem
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, dangling, .{ .remove = 0 }));
     const lying = try replacedOnce(arena, s7c_multi_data_charts, "<chartFormats count=\"3\">", "<chartFormats count=\"4\">");
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, lying, .{ .remove = 0 }));
+    // A second `<chartFormats>` refuses — even an empty trailing one,
+    // which must not fold the classification down while the first
+    // element's blocks go stale (Codex #210 r2 REL-202).
+    const trailing = try replacedOnce(arena, s7c_multi_data_charts, "</chartFormats>", "</chartFormats><chartFormats/>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, trailing, .{ .remove = 0 }));
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, trailing, .{ .remove = 2 }));
+    // An extra `<references>` wrapper — even an empty one — is not the
+    // one-block-one-index shape (Codex #210 r2 REL-203).
+    const two_wrappers = try replacedOnce(arena, s7c_multi_data_charts, "fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>", "fieldPosition=\"0\"><references count=\"0\"/><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_wrappers, .{ .remove = 0 }));
     // The K3 path reads none of it — the same shapes lift untouched.
-    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying }) |src| {
+    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying, trailing, two_wrappers }) |src| {
         const k3 = try edit.applyConsumerSchemaEdit(arena, src, .{ .remove = 3 });
         try testing.expect(std.mem.indexOf(u8, k3, "<x v=\"2\"/>") != null or std.mem.indexOf(u8, k3, "<x v=\"9\"/>") != null);
     }
+    // A wrapper count that lies about its children is evidence, kept:
+    // `colFields` and `dataFields` set the same flag the layout
+    // refuses on, before any splice could heal it (Codex #210 r2
+    // MNT-201) — on EVERY schema edit, the S7c-1 rule.
+    const cf_lying = try replacedOnce(arena, s7c_multi_data, "<colFields count=\"1\">", "<colFields count=\"2\">");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, cf_lying, .{ .remove = 0 }));
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, cf_lying, .{ .remove = 3 }));
+    const df_lying = try replacedOnce(arena, s7c_multi_data, "<dataFields count=\"3\">", "<dataFields count=\"4\">");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, df_lying, .{ .remove = 0 }));
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, df_lying, .{ .remove = 3 }));
 }
 
 test "S7c-2 edit: the colItems canonical gates each refuse — and three survivors re-enumerate; a data-field-less consumer still lifts K3 (in-house S7C2-B1..B6)" {
