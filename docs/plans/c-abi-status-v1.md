@@ -491,6 +491,33 @@ without either macro.
    sheet index — not refusals; `TableColumnNameInUse` stays `-2`.
 10. The `worksheetSource@sheet` hole under sheet rename / delete is
     inherited and documented, not lifted here.
+11. `Worksheet.ensureParsed` spells a part the store cannot materialise
+    (a CRC mismatch, a broken stream) as `MalformedSheetXml` too;
+    `xl/workbook.xml` without `</sheets>` is `MalformedWorkbookXml`. The
+    rewriters' own consistency guards ("the view no longer describes
+    these bytes", `MalformedXml`) keep the generic name and `-1`.
+12. `deleteSheet` allocates its surviving slot table (and the editor
+    its mirror) before the first mutation; the commit after the fresh
+    view parses cannot fail, so a handle that met an allocation failure
+    still agrees with itself and closes (pinned by an allocation-failure
+    sweep in `pkg/workbook.zig`). The sweeps' partial work under a
+    failure stays the documented discard-and-reopen contract.
+13. `zlsx_editor_close` tears down the handle's `std.Io.Threaded`, as
+    `zlsx_book_close` always did.
+14. A carrier part a structural path reads lazily — the `<xm:f>`
+    pre-flight's whole-workbook sheet scan included (r6 REL-603) — drawing, VML,
+    comments, table — that the store cannot materialise is that
+    carrier's own verdict (`Workbook.carrierPart`: `MalformedDrawingXml`
+    / `MalformedVmlDrawing` / `MalformedCommentsXml` /
+    `MalformedTableXml`), as the worksheet and pivot parts already were;
+    `OutOfMemory` / `ZipBombSuspected` keep theirs. The three
+    identifier increments of `addSheet` are checked
+    (`IdSpaceExhausted`).
+15. A `Worksheet.setCell` overwrite installs the replacement before it
+    frees the displaced owned value (`getOrPut`, the one fallible
+    step first): an allocation failure leaves the previous delta live
+    and the handle closable (r6 REL-602; allocation-failure sweep in
+    `pkg/workbook.zig`).
 
 ## 12. S3b slice 2 — the `defined-names` read (2026-09-01)
 
@@ -531,36 +558,10 @@ writes never touch the part, so nothing about this read waits for save.
 writer's frozen record over a fixture built through the C writer surface
 (workbook scope, sheet scope, hidden); the rename-sweep rewrite visible
 with no save; `(NULL, 0)` on a workbook without names with the poison
-reset; `NullOutPointer` / `InvalidInput` as call errors; `-2`
-`MalformedWorkbookXml` on a bad entity with nothing handed out and the
-name in diag + errbuf; an allocation-failure sweep over
-`definedNamesNdjsonOwned`. The smoke gate takes the address and
-`#error`s without the macro; the Python leg pins the parsed records,
-the refusal type and the closed-editor error.
-11. `Worksheet.ensureParsed` spells a part the store cannot materialise
-    (a CRC mismatch, a broken stream) as `MalformedSheetXml` too;
-    `xl/workbook.xml` without `</sheets>` is `MalformedWorkbookXml`. The
-    rewriters' own consistency guards ("the view no longer describes
-    these bytes", `MalformedXml`) keep the generic name and `-1`.
-12. `deleteSheet` allocates its surviving slot table (and the editor
-    its mirror) before the first mutation; the commit after the fresh
-    view parses cannot fail, so a handle that met an allocation failure
-    still agrees with itself and closes (pinned by an allocation-failure
-    sweep in `pkg/workbook.zig`). The sweeps' partial work under a
-    failure stays the documented discard-and-reopen contract.
-13. `zlsx_editor_close` tears down the handle's `std.Io.Threaded`, as
-    `zlsx_book_close` always did.
-14. A carrier part a structural path reads lazily — the `<xm:f>`
-    pre-flight's whole-workbook sheet scan included (r6 REL-603) — drawing, VML,
-    comments, table — that the store cannot materialise is that
-    carrier's own verdict (`Workbook.carrierPart`: `MalformedDrawingXml`
-    / `MalformedVmlDrawing` / `MalformedCommentsXml` /
-    `MalformedTableXml`), as the worksheet and pivot parts already were;
-    `OutOfMemory` / `ZipBombSuspected` keep theirs. The three
-    identifier increments of `addSheet` are checked
-    (`IdSpaceExhausted`).
-15. A `Worksheet.setCell` overwrite installs the replacement before it
-    frees the displaced owned value (`getOrPut`, the one fallible
-    step first): an allocation failure leaves the previous delta live
-    and the handle closable (r6 REL-602; allocation-failure sweep in
-    `pkg/workbook.zig`).
+reset; `NullOutPointer` / `InvalidInput` as call errors; poisoned
+outputs reset on the refusal and undersized-diag paths, the rejected
+diag byte-for-byte untouched; `-2` `MalformedWorkbookXml` on a bad
+entity with nothing handed out and the name in diag + errbuf; an
+allocation-failure sweep over `definedNamesNdjsonOwned`. The smoke gate
+takes the address and `#error`s without the macro; the Python leg pins
+the parsed records, the refusal type and the closed-editor error.

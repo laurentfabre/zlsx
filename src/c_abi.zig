@@ -7716,13 +7716,33 @@ test "S3b defined_names_ndjson: the shared writer's bytes, current after a renam
         try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Second\",\"sheet_idx\":1,\"body\":\"Second!$A$1:$B$9\"") != null);
         zlsx_buffer_release(out_ptr, out_len);
 
-        // NULL out pointers are about the call.
+        // NULL out pointers are about the call — either one, with the
+        // present one reset from its poison.
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqual(@as(usize, 0), out_len);
+        out_ptr = @ptrFromInt(0x1000);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expect(out_ptr == null);
+
+        // struct_size below v1: the outputs reset first, then the diag
+        // is rejected before a byte of it is written.
+        var small = std.mem.zeroes(CDiag);
+        small.struct_size = @sizeOf(CDiag) - 1;
+        small.plane = 7;
+        small.error_name[0] = 'x';
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        try std.testing.expectEqual(@as(u32, 7), small.plane);
+        try std.testing.expectEqual(@as(u8, 'x'), small.error_name[0]);
     }
     // No defined names: success, nothing to release, the poison reset.
     {
@@ -7755,8 +7775,9 @@ test "S3b defined_names_ndjson: an inventory the read cannot serve refuses whole
     const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
     defer zlsx_editor_close(ed);
     var diag = freshDiag();
-    var out_ptr: ?[*]u8 = null;
-    var out_len: usize = 0;
+    // Poisoned on entry: the refusal path itself must reset the pair.
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
     try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
     try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
