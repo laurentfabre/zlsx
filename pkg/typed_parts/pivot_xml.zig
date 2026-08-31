@@ -1257,6 +1257,13 @@ fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
             continue;
         }
         if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
+        // CT_Field spells `x` alone — any other attribute is content
+        // this reader does not classify, and S7c-2's collapse removes
+        // the values axis WHOLE (Codex #210 r3 REL-301).
+        var ai: AttrIter = .{ .attrs = k.attrs(xml) };
+        while (ai.next()) |a| {
+            if (!std.mem.eql(u8, a.name, "x")) def.axes_other = true;
+        }
         const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
         try out.append(allocator, try ordinalOrValues(x));
     }

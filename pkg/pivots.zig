@@ -8416,6 +8416,13 @@ test "S7c-2 edit: K4a — a data-field delete drops the dataField, re-enumerates
     const cf_child = try replacedOnce(arena, s7c_multi_data, "<field x=\"-2\"/></colFields>", "<field x=\"-2\"/><!-- c --></colFields>");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_child, .{ .remove = 2 }));
     _ = try edit.applyConsumerSchemaEdit(arena, cf_child, .{ .remove = 3 });
+    // CT_Field spells `x` alone: an extra attribute on the values
+    // axis's own `<field>` is content the collapse would erase
+    // (Codex #210 r3 REL-301).
+    const field_attr = try replacedOnce(arena, s7c_multi_data, "<field x=\"-2\"/></colFields>", "<field x=\"-2\" foo=\"x\"/></colFields>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, field_attr, .{ .remove = 2 }));
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, field_attr, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, field_attr, .{ .remove = 3 });
     // A `dataFields` wrapper spelling no `count` narrows without one.
     const countless = try replacedOnce(arena, s7c_multi_data, "<dataFields count=\"3\">", "<dataFields>");
     const nc = try edit.applyConsumerSchemaEdit(arena, countless, .{ .remove = 0 });
@@ -8488,8 +8495,16 @@ test "S7c-2 edit: values-only chartFormats move with the data-field drop — rem
     // one-block-one-index shape (Codex #210 r2 REL-203).
     const two_wrappers = try replacedOnce(arena, s7c_multi_data_charts, "fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>", "fieldPosition=\"0\"><references count=\"0\"/><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_wrappers, .{ .remove = 0 }));
+    // Two pivotArea children, or two reference children in one
+    // wrapper, are not one-block-one-index either (Codex #210 r3
+    // MNT-301).
+    const one_area = "<pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/></reference></references></pivotArea>";
+    const two_areas = try replacedOnce(arena, s7c_multi_data_charts, one_area, one_area ++ one_area);
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_areas, .{ .remove = 0 }));
+    const two_refs = try replacedOnce(arena, s7c_multi_data_charts, "<references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/></reference>", "<references count=\"2\"><reference field=\"4294967294\" count=\"0\" selected=\"0\"/><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/></reference>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_refs, .{ .remove = 0 }));
     // The K3 path reads none of it — the same shapes lift untouched.
-    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying, trailing, two_wrappers }) |src| {
+    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying, trailing, two_wrappers, two_areas, two_refs }) |src| {
         const k3 = try edit.applyConsumerSchemaEdit(arena, src, .{ .remove = 3 });
         try testing.expect(std.mem.indexOf(u8, k3, "<x v=\"2\"/>") != null or std.mem.indexOf(u8, k3, "<x v=\"9\"/>") != null);
     }
@@ -8537,6 +8552,11 @@ test "S7c-2 edit: the colItems canonical gates each refuse — and three survivo
     try testing.expect(std.mem.indexOf(u8, three, "<colItems count=\"3\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i><i i=\"2\"><x v=\"2\"/></i></colItems>") != null);
     try testing.expect(std.mem.indexOf(u8, three, "<dataFields count=\"3\">") != null);
     try testing.expect(std.mem.indexOf(u8, three, "<location ref=\"B2:E7\"") != null);
+    // The only data ORDINAL spelled by several dataField entries is
+    // still K4b: all of them go, or none (Codex #210 r3 MNT-301).
+    var sole = try replacedOnce(arena, s7c_multi_data, "<pivotField dataField=\"1\" showAll=\"0\"/><pivotField axis=\"axisRow\"", "<pivotField showAll=\"0\"/><pivotField axis=\"axisRow\"");
+    sole = try replacedOnce(arena, sole, "<dataField name=\"Sum of A\" fld=\"0\" baseField=\"1\" baseItem=\"0\"/>", "<dataField name=\"Sum of A\" fld=\"2\" baseField=\"1\" baseItem=\"0\"/>");
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, sole, .{ .remove = 2 }));
     // A consumer with no data fields at all is not K4b — its
     // unreferenced columns keep lifting (the `dropped > 0` clause).
     var bare = try replacedOnce(arena, s7c_row_axis_high, "<pivotField dataField=\"1\" showAll=\"0\"/>", "<pivotField showAll=\"0\"/>");
