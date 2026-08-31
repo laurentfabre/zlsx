@@ -2110,8 +2110,7 @@ fn runMain(init: std.process.Init) !u8 {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runMergesCommand(out, &book, filter, args, args.skip, args.take);
-            return 0;
+            return try runMergesCommand(out, err, &book, filter, args, args.skip, args.take);
         },
         .styles => {
             try runStylesCommand(out, &book, args.skip, args.take);
@@ -4142,24 +4141,49 @@ fn runPivotsCommand(
 /// follows the same iter59c rules as runCommentsCommand — see there.
 fn runMergesCommand(
     out: *std.Io.Writer,
+    err: *std.Io.Writer,
     book: *const xlsx.Book,
     filter: ?usize,
     args: Args,
     skip: ?usize,
     take: ?usize,
-) !void {
+) !u8 {
+    // A merge record's only user-text channel is the sheet name (the
+    // range and corners are ASCII by construction), so one that is
+    // not UTF-8 would make the whole stream unparseable NDJSON under
+    // exit 0 (Codex #211 r4). Refuse up front — before any record —
+    // when a sheet the selection includes would emit records under a
+    // name the stream cannot carry; a bad-named sheet with no merges
+    // emits nothing and does not lie.
+    for (book.sheets, 0..) |s, sheet_idx| {
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
+        }
+        if (book.mergedRanges(s).len == 0) continue;
+        if (!std.unicode.utf8ValidateSlice(s.name)) {
+            try err.print(
+                "zlsx: cannot read merges in '{s}': sheet {d} has a non-UTF-8 name\n",
+                .{ args.file, sheet_idx },
+            );
+            try err.flush();
+            return 2;
+        }
+    }
+
     var pg = Pagination.init(skip, take);
     const compact = args.output == .compact_ndjson;
     var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
-        if (signals.shouldStop()) return;
+        if (signals.shouldStop()) return 0;
         if (filter) |f| {
             if (sheet_idx != f) continue;
         } else if (args.sheet_glob != null or args.all_sheets) {
             if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
         }
         for (book.mergedRanges(s)) |m| {
-            if (signals.shouldStop()) return;
+            if (signals.shouldStop()) return 0;
             switch (pg.consume()) {
                 .drop => continue,
                 // Flush before the early return: runMain's deferred
@@ -4169,7 +4193,7 @@ fn runMergesCommand(
                 // r1).
                 .stop => {
                     try out.flush();
-                    return;
+                    return 0;
                 },
                 .emit => {},
             }
@@ -4198,6 +4222,7 @@ fn runMergesCommand(
         }
     }
     try out.flush();
+    return 0;
 }
 
 /// S3b: `zlsx defined-names` — one `{"kind":"defined_name",…}` record
@@ -9042,7 +9067,9 @@ test "runMergesCommand: every sheet by default, exact wire shape" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges }, null, null);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        try std.testing.expectEqual(@as(u8, 0), try runMergesCommand(&w, &err_w, &book, null, .{ .file = path, .subcommand = .merges }, null, null));
         try std.testing.expectEqualStrings(
             "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"A1:B3\",\"start_row\":1,\"start_col\":1,\"end_row\":3,\"end_col\":2}\n" ++
                 "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"D5:D6\",\"start_row\":5,\"start_col\":4,\"end_row\":6,\"end_col\":4}\n" ++
@@ -9054,7 +9081,9 @@ test "runMergesCommand: every sheet by default, exact wire shape" {
     {
         var scratch: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runMergesCommand(&w, &book, 1, .{ .file = path, .subcommand = .merges }, null, null);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        try std.testing.expectEqual(@as(u8, 0), try runMergesCommand(&w, &err_w, &book, 1, .{ .file = path, .subcommand = .merges }, null, null));
         try std.testing.expectEqualStrings(
             "{\"kind\":\"merge\",\"sheet\":\"Report\",\"sheet_idx\":1,\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
             w.buffered(),
@@ -9064,7 +9093,9 @@ test "runMergesCommand: every sheet by default, exact wire shape" {
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges, .output = .compact_ndjson }, null, null);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        try std.testing.expectEqual(@as(u8, 0), try runMergesCommand(&w, &err_w, &book, null, .{ .file = path, .subcommand = .merges, .output = .compact_ndjson }, null, null));
         try std.testing.expectEqualStrings(
             "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n" ++
                 "{\"kind\":\"merge\",\"range\":\"A1:B3\",\"start_row\":1,\"start_col\":1,\"end_row\":3,\"end_col\":2}\n" ++
@@ -9078,7 +9109,9 @@ test "runMergesCommand: every sheet by default, exact wire shape" {
     {
         var scratch: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges }, 1, 1);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        try std.testing.expectEqual(@as(u8, 0), try runMergesCommand(&w, &err_w, &book, null, .{ .file = path, .subcommand = .merges }, 1, 1));
         try std.testing.expectEqualStrings(
             "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"D5:D6\",\"start_row\":5,\"start_col\":4,\"end_row\":6,\"end_col\":4}\n",
             w.buffered(),
@@ -9088,9 +9121,66 @@ test "runMergesCommand: every sheet by default, exact wire shape" {
     {
         var scratch: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
-        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges, .sheet_glob = "Rep*" }, null, null);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        try std.testing.expectEqual(@as(u8, 0), try runMergesCommand(&w, &err_w, &book, null, .{ .file = path, .subcommand = .merges, .sheet_glob = "Rep*" }, null, null));
         try std.testing.expectEqualStrings(
             "{\"kind\":\"merge\",\"sheet\":\"Report\",\"sheet_idx\":1,\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
+            w.buffered(),
+        );
+    }
+}
+
+test "runMergesCommand: a non-UTF-8 sheet name refuses before any record (Codex #211 r4)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_merges_bad_name.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Bad");
+        try s0.writeRow(&.{.{ .string = "a" }});
+        try s0.addMergedCell("A1:B2");
+        var s1 = try w.addSheet("Fine");
+        try s1.writeRow(&.{.{ .string = "b" }});
+        try s1.addMergedCell("C3:D4");
+        try w.save(io, path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, io, path);
+    defer book.deinit();
+    // Post-injection: the writer refuses invalid names, so poison the
+    // parsed inventory directly — the merge map is keyed by part path,
+    // not by name, so the lookup still resolves.
+    book.sheets[0].name = "B\xffd";
+
+    // Both output modes refuse with exit 2 and an empty stream.
+    inline for (.{ OutputMode.ndjson, OutputMode.compact_ndjson }) |mode| {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runMergesCommand(&w, &err_w, &book, null, .{ .file = path, .subcommand = .merges, .output = mode }, null, null);
+        try std.testing.expectEqual(@as(u8, 2), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "non-UTF-8") != null);
+    }
+    // Narrowed away from the bad sheet, the stream is clean and the
+    // bad name is never emitted — no reason to refuse.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runMergesCommand(&w, &err_w, &book, 1, .{ .file = path, .subcommand = .merges }, null, null);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"merge\",\"sheet\":\"Fine\",\"sheet_idx\":1,\"range\":\"C3:D4\",\"start_row\":3,\"start_col\":3,\"end_row\":4,\"end_col\":4}\n",
             w.buffered(),
         );
     }
