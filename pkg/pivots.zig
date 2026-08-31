@@ -1905,8 +1905,13 @@ pub const edit = struct {
 
     /// The footprint a part's bytes declare — a parse plus
     /// `footprintOf`, for a caller holding only the bytes (the
-    /// sweep's pre-schema host clear, S7c-2).
-    pub fn footprintOfBytes(arena: Allocator, table_xml: []const u8) EditError!Footprint {
+    /// sweep's pre-schema host clear, S7c-2). The parse lives in a
+    /// local arena and the result is all values, so any allocator
+    /// serves (in-house review S7C2-A5).
+    pub fn footprintOfBytes(allocator: Allocator, table_xml: []const u8) EditError!Footprint {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         const def = pivot_xml.parseTableDefinition(arena, table_xml) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.MalformedXml => return error.MalformedPivotXml,
@@ -2507,7 +2512,10 @@ pub const edit = struct {
                         }
                     }
                 }
-                if (dropped > 0) try narrowValuesAxis(arena, &splices, &def, dropped);
+                if (dropped > 0) {
+                    try narrowValuesAxis(arena, &splices, &def, dropped);
+                    try rewriteValuesChartFormats(arena, &splices, &def, k);
+                }
                 if (def.pivot_fields_count_span) |span| {
                     try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{def.fields.len - 1}) });
                 }
@@ -2537,6 +2545,18 @@ pub const edit = struct {
                 }
             },
         }
+        // Every span this plan emits is disjoint: a nested one (a
+        // `fld` inside a removed `<dataField>`) is a bug HERE, not a
+        // malformed part — assert the producer's invariant where it
+        // is produced, so it cannot present as an input refusal
+        // (in-house review S7C2-A3).
+        if (std.debug.runtime_safety) {
+            std.mem.sort(Splice, splices.items, {}, Splice.before);
+            var i: usize = 1;
+            while (i < splices.items.len) : (i += 1) {
+                assert(splices.items[i - 1].span.end <= splices.items[i].span.start);
+            }
+        }
         return try spliceAll(arena, table_xml, splices.items);
     }
 
@@ -2548,14 +2568,19 @@ pub const edit = struct {
     /// fixture attests. The wrappers are regenerated, so the canonical
     /// form the layout admits is required FIRST and anything else
     /// refuses: a regenerated wrapper would erase the evidence the
-    /// layout's own checks refuse on (the S7C-MUT-1 rule).
+    /// layout's own checks refuse on (the S7C-MUT-1 rule). Host-cell
+    /// styles carry by POSITION (S7b-5's rule), so a survivor shifted
+    /// left wears the vanished column's format until Excel's
+    /// open-refresh re-lays it — the marker covers it, and the corpus
+    /// cannot tell (every mtCars data cell shares one style).
     fn narrowValuesAxis(
         arena: Allocator,
         splices: *std.ArrayListUnmanaged(Splice),
         def: *const pivot_xml.TableDefinition,
         dropped: u32,
     ) EditError!void {
-        assert(dropped > 0 and dropped < def.data_fields.len);
+        assert(dropped > 0);
+        assert(dropped < def.data_fields.len);
         const survivors: usize = def.data_fields.len - dropped;
         // An axis wrapper carrying content the parser did not classify
         // — a stray attribute, a child that is not its field, markup
@@ -2627,6 +2652,75 @@ pub const edit = struct {
         var ref_buf: [Bounds.format_buf_len]u8 = undefined;
         const new_ref = formatRect(&ref_buf, narrowed) catch return error.PivotCoordinateOverflow;
         try splices.append(arena, .{ .span = def.location.ref_span, .text = try arena.dupe(u8, new_ref) });
+    }
+
+    /// K4a's chart-format move (S7c-2): a values-only `<chartFormat>`
+    /// selects a data field BY INDEX (`<x v>` under its
+    /// `field="4294967294"` reference) — the one admitted carrier of
+    /// data-field indices S7b-5 left as written, sound only while no
+    /// edit moved them (the corpus' mtCars pivot chart rides three
+    /// such blocks; in-house review S7C2-B8). A block naming a
+    /// dropped index leaves whole; a survivor's index decrements in
+    /// place; `<chartFormats count>` follows; a rewrite that empties
+    /// the list takes the element out whole (the chart part itself
+    /// stays as written — Excel's open-refresh re-lays a pivot
+    /// chart's series from the pivot, the S7b-5 safety-net rule).
+    /// A shape the collector could not read as one-block-one-index —
+    /// a second `<chartFormats>`, a non-canonical block, an index
+    /// past the data fields, a lying `count` — refuses rather than
+    /// heals (the S7C-MUT-1 rule); the K3 path never reads any of
+    /// this.
+    fn rewriteValuesChartFormats(
+        arena: Allocator,
+        splices: *std.ArrayListUnmanaged(Splice),
+        def: *const pivot_xml.TableDefinition,
+        k: u32,
+    ) EditError!void {
+        if (def.chart_formats != .values_only) return;
+        if (def.chart_formats_multi) return error.PivotShapeUnsupported;
+        const refs = def.chart_format_values_refs;
+        if (def.chart_formats_count) |n| {
+            if (n != refs.len) return error.MalformedPivotXml;
+        }
+        // The survivor map: data-field position -> its index after the
+        // drop, null for a dropped position.
+        const map = try arena.alloc(?u32, def.data_fields.len);
+        var next: u32 = 0;
+        for (def.data_fields, map) |df, *m| {
+            m.* = if (df.fld == k) null else blk: {
+                const v = next;
+                next += 1;
+                break :blk v;
+            };
+        }
+        var kept: usize = 0;
+        for (refs) |r| {
+            if (!r.canonical) return error.PivotShapeUnsupported;
+            if (r.index >= def.data_fields.len) return error.MalformedPivotXml;
+            if (map[r.index] != null) kept += 1;
+        }
+        if (kept == 0 and refs.len > 0) {
+            const span = def.chart_formats_span orelse return error.MalformedPivotXml;
+            try splices.append(arena, .{ .span = span, .text = "" });
+            return;
+        }
+        for (refs) |r| {
+            const new = map[r.index] orelse {
+                try splices.append(arena, .{ .span = r.span, .text = "" });
+                continue;
+            };
+            if (new != r.index) {
+                // An absent `v` is index 0, which no drop moves; a
+                // moved index was spelled.
+                const span = r.v_span orelse return error.MalformedPivotXml;
+                try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{new}) });
+            }
+        }
+        if (kept != refs.len) {
+            if (def.chart_formats_count_span) |span| {
+                try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{kept}) });
+            }
+        }
     }
 
     /// Does the extension region spell an attribute named `field` or
@@ -8343,6 +8437,90 @@ test "S7c-2 edit: a strict-prefixed part regenerates its values axis under its o
     try testing.expect(std.mem.indexOf(u8, one, "ref=\"B2:C7\"") != null);
 }
 
+const s7c_charts_tail =
+    \\<chartFormats count="3"><chartFormat chart="0" format="0" series="1"><pivotArea type="data" outline="0" fieldPosition="0"><references count="1"><reference field="4294967294" count="1" selected="0"><x/></reference></references></pivotArea></chartFormat><chartFormat chart="0" format="2" series="1"><pivotArea type="data" outline="0" fieldPosition="0"><references count="1"><reference field="4294967294" count="1" selected="0"><x v="1"/></reference></references></pivotArea></chartFormat><chartFormat chart="0" format="3" series="1"><pivotArea type="data" outline="0" fieldPosition="0"><references count="1"><reference field="4294967294" count="1" selected="0"><x v="2"/></reference></references></pivotArea></chartFormat></chartFormats>
+;
+const s7c_multi_data_charts = s7c_multi_data[0 .. s7c_multi_data.len - "</pivotTableDefinition>".len] ++ s7c_charts_tail ++ "</pivotTableDefinition>";
+
+test "S7c-2 edit: values-only chartFormats move with the data-field drop — removed, renumbered, emptied whole; non-canonical shapes refuse; K3 leaves them (in-house S7C2-B8)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Remove ordinal 0: the block selecting data field 0 leaves whole,
+    // the survivors renumber 1 -> 0 and 2 -> 1, the count follows.
+    const two = try edit.applyConsumerSchemaEdit(arena, s7c_multi_data_charts, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, two, "<chartFormats count=\"2\">") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, two, "<chartFormat "));
+    try testing.expect(std.mem.indexOf(u8, two, "format=\"0\"") == null);
+    try testing.expect(std.mem.indexOf(u8, two, "selected=\"0\"><x v=\"0\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<x v=\"1\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<x v=\"2\"/>") == null);
+    // Remove ordinal 2 (two data fields at once): both their blocks
+    // leave, the bare-`<x/>` block (index 0) stands as written.
+    const one = try edit.applyConsumerSchemaEdit(arena, s7c_multi_data_charts, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, one, "<chartFormats count=\"1\">") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "<chartFormat "));
+    try testing.expect(std.mem.indexOf(u8, one, "format=\"0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "selected=\"0\"><x/>") != null);
+    // Every block naming a dropped index empties the element whole.
+    const only_dropped = try replacedOnce(arena, s7c_multi_data_charts, "<chartFormat chart=\"0\" format=\"0\" series=\"1\"><pivotArea type=\"data\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x/></reference></references></pivotArea></chartFormat>", "");
+    const emptied_src = try replacedOnce(arena, only_dropped, "<chartFormats count=\"3\">", "<chartFormats count=\"2\">");
+    const emptied = try edit.applyConsumerSchemaEdit(arena, emptied_src, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, emptied, "<chartFormats") == null);
+    // Non-canonical shapes refuse rather than heal: a second `<x>`,
+    // an index past the data fields, a lying count.
+    const two_x = try replacedOnce(arena, s7c_multi_data_charts, "<x v=\"1\"/></reference>", "<x v=\"1\"/><x v=\"1\"/></reference>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_x, .{ .remove = 0 }));
+    const dangling = try replacedOnce(arena, s7c_multi_data_charts, "<x v=\"2\"/></reference>", "<x v=\"9\"/></reference>");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, dangling, .{ .remove = 0 }));
+    const lying = try replacedOnce(arena, s7c_multi_data_charts, "<chartFormats count=\"3\">", "<chartFormats count=\"4\">");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, lying, .{ .remove = 0 }));
+    // The K3 path reads none of it — the same shapes lift untouched.
+    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying }) |src| {
+        const k3 = try edit.applyConsumerSchemaEdit(arena, src, .{ .remove = 3 });
+        try testing.expect(std.mem.indexOf(u8, k3, "<x v=\"2\"/>") != null or std.mem.indexOf(u8, k3, "<x v=\"9\"/>") != null);
+    }
+}
+
+test "S7c-2 edit: the colItems canonical gates each refuse — and three survivors re-enumerate; a data-field-less consumer still lifts K3 (in-house S7C2-B1..B6)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A typed `<i>`, a second `<x>`, an `i` disagreeing with its
+    // position, an item list shorter than the data fields, a missing
+    // values axis: each refuses the drop and leaves K3 alone.
+    const typed = try replacedOnce(arena, s7c_multi_data, "<i i=\"2\"><x v=\"2\"/></i>", "<i i=\"2\" t=\"grand\"><x v=\"2\"/></i>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, typed, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, typed, .{ .remove = 3 });
+    const double_x = try replacedOnce(arena, s7c_multi_data, "<i i=\"1\"><x v=\"1\"/></i>", "<i i=\"1\"><x v=\"1\"/><x v=\"1\"/></i>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, double_x, .{ .remove = 0 }));
+    const misnumbered = try replacedOnce(arena, s7c_multi_data, "<i i=\"1\"><x v=\"1\"/></i>", "<i i=\"2\"><x v=\"1\"/></i>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, misnumbered, .{ .remove = 0 }));
+    const short = try replacedOnce(arena, s7c_multi_data, "<colItems count=\"3\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i><i i=\"2\"><x v=\"2\"/></i></colItems>", "<colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, short, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, short, .{ .remove = 3 });
+    const axisless = try replacedOnce(arena, s7c_multi_data, "<colFields count=\"1\"><field x=\"-2\"/></colFields>", "");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, axisless, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, axisless, .{ .remove = 3 });
+    // Four data fields: three survive, the re-enumeration is not a
+    // hardcoded pair.
+    var four = try replacedOnce(arena, s7c_multi_data, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+    four = try replacedOnce(arena, four, "<dataFields count=\"3\">", "<dataFields count=\"4\">");
+    four = try replacedOnce(arena, four, "</dataFields>", "<dataField name=\"Sum of D\" fld=\"3\" baseField=\"1\" baseItem=\"0\"/></dataFields>");
+    four = try replacedOnce(arena, four, "<i i=\"2\"><x v=\"2\"/></i></colItems>", "<i i=\"2\"><x v=\"2\"/></i><i i=\"3\"><x v=\"3\"/></i></colItems>");
+    four = try replacedOnce(arena, four, "<colItems count=\"3\">", "<colItems count=\"4\">");
+    four = try replacedOnce(arena, four, "ref=\"B2:E7\"", "ref=\"B2:F7\"");
+    const three = try edit.applyConsumerSchemaEdit(arena, four, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, three, "<colItems count=\"3\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i><i i=\"2\"><x v=\"2\"/></i></colItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, three, "<dataFields count=\"3\">") != null);
+    try testing.expect(std.mem.indexOf(u8, three, "<location ref=\"B2:E7\"") != null);
+    // A consumer with no data fields at all is not K4b — its
+    // unreferenced columns keep lifting (the `dropped > 0` clause).
+    var bare = try replacedOnce(arena, s7c_row_axis_high, "<pivotField dataField=\"1\" showAll=\"0\"/>", "<pivotField showAll=\"0\"/>");
+    bare = try replacedOnce(arena, bare, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"2\" baseItem=\"0\"/></dataFields>", "");
+    _ = try edit.applyConsumerSchemaEdit(arena, bare, .{ .remove = 0 });
+}
+
 test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -8491,7 +8669,9 @@ test "S7c: an allocation failure anywhere in a schema rebuild or the consumer re
     try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &grown, rec, .{ .insert = .{ .at = 1, .name = "Column4" } } });
     try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ o.pivots.tables[0].raw_xml, .{ .insert = .{ .at = 1, .name = "Column4" } } });
     // The K4a drop allocates down its own paths — the re-enumerated
-    // values axis, the narrowed location, the collapse (S7c-2).
+    // values axis, the narrowed location, the collapse, the
+    // chart-format move (S7c-2).
     try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ s7c_multi_data, .{ .remove = 0 } });
     try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ s7c_multi_data, .{ .remove = 2 } });
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ s7c_multi_data_charts, .{ .remove = 0 } });
 }

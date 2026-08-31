@@ -281,7 +281,29 @@ consumer narrow, all inside `edit.applyConsumerSchemaEdit`:
   reads a self-consistent part. The sweep re-reads the pre-schema part's
   footprint (`edit.footprintOfBytes` on the post-S7a-move bytes) and widens
   the layout's `old_rect` back over the vacated columns, so the host clear
-  reaches the cells Excel wrote there.
+  reaches the cells Excel wrote there;
+- a values-only `<chartFormat>` (carrier #12) selects a data field **by
+  index** (`<x v>` under its `field="4294967294"` reference) — the one
+  admitted carrier of data-field indices, sound while no edit moved them.
+  The drop moves them, so the rewrite moves the blocks (the review loop's
+  first catch — the corpus' own pivot chart rides three): a block naming a
+  dropped index leaves whole, a survivor's index decrements in place,
+  `chartFormats@count` follows, and a rewrite that empties the list takes
+  the element out whole. The chart part itself stays as written — carrier
+  #17's rule: Excel's open-refresh re-lays a pivot chart's series from the
+  pivot, the S7b-5 safety-net standard. A shape the collector cannot read
+  as one-block-one-index — a second `<chartFormats>`, extra areas /
+  references / `<x>` children, a lying `count`, an index past the data
+  fields — refuses.
+
+Two spellings ride as written, on the same parked-oracle terms:
+`location@firstHeaderRow` keeps the part's own value across the collapse
+(the corpus' multi-data-field pivot spells `0` where every single-data-field
+fixture spells `1` — unpinned either way), and host-cell **styles** carry by
+position (S7b-5's rule), so a survivor shifted left wears the vanished
+column's number format until Excel's open-refresh re-lays it — the marker
+covers both, and the corpus cannot tell (every mtCars data cell shares one
+style).
 
 Still K4b (refused): the row axis's column, the only data field (all of an
 ordinal's data fields count as one here), an ordinal a **surviving**

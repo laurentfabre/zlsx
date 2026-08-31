@@ -615,6 +615,25 @@ pub const AxisItem = struct {
 /// would leave pointing elsewhere.
 pub const ChartFormats = enum { none, values_only, other };
 
+/// One values-only `<chartFormat>` block as the S7c-2 rewrite moves
+/// it: the block selects a data field BY INDEX (`<x v>` under its
+/// `field="4294967294"` reference), and a data-field drop renumbers
+/// those indices.
+pub const ChartFormatRef = struct {
+    /// The whole `<chartFormat>` element, `<` to one past its close.
+    span: Span,
+    /// The data-field index the block selects (`<x v>`, 0 when the
+    /// attribute is absent).
+    index: u32 = 0,
+    /// The `v` value bytes, when spelled.
+    v_span: ?Span = null,
+    /// The one shape the rewrite can move: exactly one pivotArea, one
+    /// references, one reference, one `<x>` carrying at most `v`,
+    /// every declared `count` agreeing. Anything else refuses a
+    /// data-field drop.
+    canonical: bool = true,
+};
+
 /// A pivot-field ordinal, or the values axis — spelled `x="-2"` on
 /// `<field>` and `fld="-2"` on `<pageField>`. Any other negative
 /// ordinal names no field and is refused by the parser.
@@ -771,6 +790,16 @@ pub const TableDefinition = struct {
     row_items: ?AxisItems = null,
     col_items: ?AxisItems = null,
     chart_formats: ChartFormats = .none,
+    /// The first `<chartFormats>` element whole, its `count` (value
+    /// and value bytes), and its per-block values refs when it read
+    /// as `.values_only` — S7c-2's splice targets when a data-field
+    /// drop renumbers the indices. A second `<chartFormats>` element
+    /// sets `chart_formats_multi`, which the rewrite refuses.
+    chart_formats_span: ?Span = null,
+    chart_formats_count: ?u32 = null,
+    chart_formats_count_span: ?Span = null,
+    chart_formats_multi: bool = false,
+    chart_format_values_refs: []ChartFormatRef = &.{},
     has_ext_lst: bool = false,
     /// The first root `<extLst>`'s `<` position — where S7c's
     /// ordinal-token probe starts: extension content is tolerated
@@ -803,6 +832,7 @@ pub const TableDefinition = struct {
         allocator.free(self.data_fields);
         if (self.row_items) |ri| freeAxisItems(allocator, ri);
         if (self.col_items) |ci| freeAxisItems(allocator, ci);
+        allocator.free(self.chart_format_values_refs);
         self.* = undefined;
     }
 };
@@ -918,6 +948,16 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             // Two blocks are not one; the stricter reading wins.
             const cf = try classifyChartFormats(xml, k, p);
             def.chart_formats = if (def.chart_formats == .other or cf == .other) .other else cf;
+            if (def.chart_formats_span == null) {
+                def.chart_formats_span = .{ .start = k.hit.open_lt, .end = k.after };
+                if (wbxml.getAttr(k.attrs(xml), "count")) |v| {
+                    def.chart_formats_count = try u32Attr(k.attrs(xml), "count");
+                    def.chart_formats_count_span = spanOf(xml, v);
+                }
+                if (cf == .values_only) def.chart_format_values_refs = try chartFormatValuesRefs(allocator, xml, k, p);
+            } else {
+                def.chart_formats_multi = true;
+            }
         } else if (std.mem.eql(u8, k.local, "extLst")) {
             def.has_ext_lst = true;
             if (def.ext_lst_start == null) def.ext_lst_start = k.hit.open_lt;
@@ -1128,6 +1168,66 @@ fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFo
     }
     if (formats.skipped > 0 or formats.other) return .other;
     return if (any_area) .values_only else .none;
+}
+
+/// The per-block spans and indices of a `.values_only`
+/// `<chartFormats>` — a second walk over the same scanner, so the
+/// blocks are parallel to the classifier's reading by construction.
+/// Shape questions beyond the classifier's (how many areas /
+/// references / `<x>` children, whether every declared `count`
+/// agrees) fold into `canonical`, which the S7c-2 rewrite requires
+/// rather than heals.
+fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]ChartFormatRef {
+    var out: std.ArrayListUnmanaged(ChartFormatRef) = .empty;
+    errdefer out.deinit(allocator);
+    var formats = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try formats.next()) |cf| {
+        var ref: ChartFormatRef = .{ .span = .{ .start = cf.hit.open_lt, .end = cf.after } };
+        var areas: u32 = 0;
+        var references: u32 = 0;
+        var xs: u32 = 0;
+        var walk_areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
+        while (try walk_areas.next()) |pa| {
+            areas += 1;
+            var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
+            while (try refs_blocks.next()) |rb| {
+                var n_here: u32 = 0;
+                var refs = Children.init(xml, rb.hit, rb.end, p, rb.env);
+                while (try refs.next()) |r| {
+                    references += 1;
+                    n_here += 1;
+                    var x_here: u32 = 0;
+                    var inner = Children.init(xml, r.hit, r.end, p, r.env);
+                    while (try inner.next()) |x| {
+                        if (!std.mem.eql(u8, x.local, "x")) {
+                            ref.canonical = false;
+                            continue;
+                        }
+                        xs += 1;
+                        x_here += 1;
+                        const xa = x.attrs(xml);
+                        var xi: AttrIter = .{ .attrs = xa };
+                        while (xi.next()) |a| {
+                            if (!std.mem.eql(u8, a.name, "v")) ref.canonical = false;
+                        }
+                        if (!x.hit.self_closing and !isBlank(xml[x.hit.after_tag_close..x.end])) ref.canonical = false;
+                        ref.index = (try u32Attr(xa, "v")) orelse 0;
+                        if (wbxml.getAttr(xa, "v")) |v| ref.v_span = spanOf(xml, v);
+                    }
+                    if (inner.skipped > 0 or inner.other) ref.canonical = false;
+                    if (try u32Attr(r.attrs(xml), "count")) |c| {
+                        if (c != x_here) ref.canonical = false;
+                    }
+                }
+                if (try u32Attr(rb.attrs(xml), "count")) |c| {
+                    if (c != n_here) ref.canonical = false;
+                }
+            }
+        }
+        if (areas != 1 or references != 1 or xs != 1) ref.canonical = false;
+        try out.append(allocator, ref);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn axisFromXml(s: []const u8) ?Axis {

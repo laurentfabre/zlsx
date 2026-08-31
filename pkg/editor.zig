@@ -10654,6 +10654,25 @@ test "S7c: K3 and K2 edits under injected allocation failure never ship a tear �
         defer std.testing.allocator.free(baseline);
         try std.testing.checkAllAllocationFailures(std.testing.allocator, fullK2EditForFailures, .{ io, src, baseline });
     }
+    {
+        // S7c-2 (K4a): the data-field drop, the values-axis narrow
+        // and the sweep's pre-schema footprint all allocate
+        // (in-house review S7C2-A2).
+        const src = try tt.path(std.testing.allocator, io, "s7c_oom_k4a.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<location ref=\"A3:B6\"", "<location ref=\"A3:C6\"");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<colItems count=\"1\"><i/></colItems>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>", "<dataFields count=\"2\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Sum of Price\" fld=\"2\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+        const baseline = blk: {
+            var ed0 = try Editor.open(std.testing.allocator, io, src);
+            defer ed0.deinit();
+            break :blk try ed0.saveToOwnedBuffer(std.testing.allocator);
+        };
+        defer std.testing.allocator.free(baseline);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, fullColEditForFailures, .{ io, src, baseline });
+    }
 }
 
 test "S7c: a nameless data field's caption reads the effective schema — the reduced spines align (in-house S7C-T2)" {
@@ -10935,6 +10954,13 @@ test "S7c-2: corpus — deleting a referenced mtcars column drops its values col
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colFields count=\"1\"><field x=\"-2\"/></colFields>") != null);
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>") != null);
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<location ref=\"A1:C5\"") != null);
+        // The pivot chart's per-series links (`chartFormats`) name
+        // data fields BY INDEX: the dropped field's block leaves, the
+        // survivors renumber (in-house S7C2-B8).
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<chartFormats count=\"2\">") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pt2.bytes, "<chartFormat "));
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "format=\"0\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<x v=\"2\"/></reference>") == null);
         // The surviving 15 cells are the corpus' own `wt` columns,
         // shifted one left; the vacated `D` column clears.
         var wb = try Workbook.open(std.testing.allocator, io, dst);
@@ -10979,6 +11005,11 @@ test "S7c-2: corpus — deleting a referenced mtcars column drops its values col
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colItems count=\"1\"><i/></colItems>") != null);
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<location ref=\"A1:B5\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<rowFields count=\"1\"><field x=\"1\"/></rowFields>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<chartFormats count=\"1\">") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, pt2.bytes, "<chartFormat "));
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "format=\"0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<x v=\"1\"/></reference>") == null);
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition2.xml", true);
         var wb = try Workbook.open(std.testing.allocator, io, dst2);
         defer wb.deinit();
         try expectHostCell(&wb, 3, "A1", .{ .text = "Row Labels" });
@@ -10992,8 +11023,81 @@ test "S7c-2: corpus — deleting a referenced mtcars column drops its values col
         try expectHostCell(&wb, 3, "A5", .{ .text = "Grand Total" });
         try expectHostCell(&wb, 3, "B5", .{ .number = 20.210344827586205 });
         try expectHostCell(&wb, 3, "C1", .none);
+        try expectHostCell(&wb, 3, "C2", .none);
+        try expectHostCell(&wb, 3, "C3", .none);
+        try expectHostCell(&wb, 3, "C4", .none);
         try expectHostCell(&wb, 3, "C5", .none);
         try expectHostCell(&wb, 3, "D1", .none);
+        try expectHostCell(&wb, 3, "D2", .none);
+        try expectHostCell(&wb, 3, "D3", .none);
+        try expectHostCell(&wb, 3, "D4", .none);
         try expectHostCell(&wb, 3, "D5", .none);
     }
+}
+
+test "S7c-2: a host on the source sheet — the S7a move composes with the K4a narrow, and the clear lands in post-move coordinates (in-house S7C2-B7)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const a = std.testing.allocator;
+    const src = try tt.path(a, io, "s7c2_hostsrc.xlsx");
+    defer a.free(src);
+    const dst = try tt.path(a, io, "s7c2_hostdst.xlsx");
+    defer a.free(dst);
+    try pivots_mod.fixture.write(a, io, src, .sheet_ref);
+    {
+        var store = try store_mod.PartStore.open(a, io, src);
+        defer store.deinit();
+        try store.addPart(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdPT1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>
+            ,
+        );
+        try store.save(io, src);
+    }
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/_rels/sheet2.xml.rels", "<Relationship Id=\"rIdPT1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable1.xml\"/>", "");
+    // Two data fields, hosted at E7:G10 on the SOURCE sheet — right of
+    // the source, so a source-column delete shifts the part (S7a)
+    // before the schema narrows it.
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<location ref=\"A3:B6\"", "<location ref=\"E7:G10\"");
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<colItems count=\"1\"><i/></colItems>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+    try pivots_mod.fixture.patchPart(a, io, src, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>", "<dataFields count=\"2\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Sum of Price\" fld=\"2\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+    const rows =
+        "<row r=\"7\"><c r=\"E7\" t=\"inlineStr\"><is><t>Étiquettes de lignes</t></is></c><c r=\"F7\" t=\"inlineStr\"><is><t>Sum of Qty</t></is></c><c r=\"G7\" t=\"inlineStr\"><is><t>Sum of Price</t></is></c><c r=\"H7\" t=\"inlineStr\"><is><t>keep</t></is></c></row>" ++
+        "<row r=\"8\"><c r=\"E8\" t=\"inlineStr\"><is><t>East</t></is></c><c r=\"F8\"><v>8</v></c><c r=\"G8\"><v>5</v></c></row>" ++
+        "<row r=\"9\"><c r=\"E9\" t=\"inlineStr\"><is><t>West</t></is></c><c r=\"F9\"><v>4</v></c><c r=\"G9\"><v>2.5</v></c></row>" ++
+        "<row r=\"10\"><c r=\"E10\" t=\"inlineStr\"><is><t>Total général</t></is></c><c r=\"F10\"><v>12</v></c><c r=\"G10\"><v>7.5</v></c></row>" ++
+        "</sheetData>";
+    try pivots_mod.fixture.patchPart(a, io, src, "xl/worksheets/sheet1.xml", "</sheetData>", rows);
+    {
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 2);
+        try ed.save(io, dst);
+    }
+    var store = try store_mod.PartStore.open(a, io, dst);
+    defer store.deinit();
+    try expectPartHas(&store, pt_part, "<location ref=\"D7:E10\"");
+    try expectPartHas(&store, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Price\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+    var wb = try Workbook.open(a, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 0, "D7", .{ .text = "Étiquettes de lignes" });
+    try expectHostCell(&wb, 0, "E7", .{ .text = "Sum of Price" });
+    try expectHostCell(&wb, 0, "E8", .{ .number = 5 });
+    try expectHostCell(&wb, 0, "E9", .{ .number = 2.5 });
+    try expectHostCell(&wb, 0, "D10", .{ .text = "Total général" });
+    try expectHostCell(&wb, 0, "E10", .{ .number = 7.5 });
+    // The vacated values column clears at POST-MOVE coordinates —
+    // and the cell one right of the pre-move footprint survives (a
+    // widen from the pre-move bytes would clear it).
+    try expectHostCell(&wb, 0, "F7", .none);
+    try expectHostCell(&wb, 0, "F8", .none);
+    try expectHostCell(&wb, 0, "F9", .none);
+    try expectHostCell(&wb, 0, "F10", .none);
+    try expectHostCell(&wb, 0, "G7", .{ .text = "keep" });
 }

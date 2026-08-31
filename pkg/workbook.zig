@@ -6479,8 +6479,9 @@ pub const Workbook = struct {
             // marker (Codex #206 r23 REL-2301).
             if ((try self.sheet(t.sheet_idx)).appended_rows.items.len > 0) return error.PivotEditUnsafe;
             // S7c: a schema edit moves the consumer's ordinals first —
-            // the removed field's `<pivotField>` out (a consumer that
-            // references it refuses, K4a), the inserted one in — and
+            // the removed field's `<pivotField>` out (with its data
+            // fields, K4a; a consumer reading it on the row axis or as
+            // its only data field refuses, K4b), the inserted one in — and
             // the layout then reads the rewritten bytes against the
             // effective schema, as any consumer is read.
             const b0 = table_bytes[i] orelse t.raw_xml;
