@@ -62,11 +62,11 @@ The four surfaces:
 | Error cells distinguished from text | ✓ `Rows.errorStrings` | ~ `zlsx_rows_next` ³ | ~ `Rows.__next__` ³ | ✓ `cells` ² | S3b |
 | Cell style index + resolved font / fill / border / alignment / number format | ✓ `Rows.styleIndices`, `Book.cellFont`, `Book.cellFill`, `Book.cellBorder`, `Book.cellAlignment`, `Book.numberFormat` | ✓ `zlsx_rows_style_at`, `zlsx_cell_font`, `zlsx_cell_fill`, `zlsx_cell_border`, `zlsx_cell_alignment`, `zlsx_number_format` | ✓ `Rows.style_indices`, `Book.cell_font`, `Book.cell_fill`, `Book.cell_border`, `Book.cell_alignment`, `Book.number_format` | ✓ `cells`, `styles` | |
 | Indexed palette (`indexed="N"`) + `tint` resolution | — S4 ⁴ | — S4 | — S4 | — S4 | S4 |
-| Merged ranges | ✓ `Book.mergedRanges` | ✓ `zlsx_merged_range_at`, `zlsx_merged_range_count` | ✓ `Book.merged_ranges` | — S3b | S3b |
+| Merged ranges | ✓ `Book.mergedRanges` | ✓ `zlsx_merged_range_at`, `zlsx_merged_range_count` | ✓ `Book.merged_ranges` | ✓ `merges` | |
 | Hyperlinks (external + internal) | ✓ `Book.hyperlinks` | ✓ `zlsx_hyperlink_at`, `zlsx_hyperlink_count`, `zlsx_hyperlink_location_at` | ✓ `Book.hyperlinks` | ✓ `hyperlinks` | |
 | Data validations | ✓ `Book.dataValidations` | ✓ `zlsx_data_validation_at`, `zlsx_data_validation_count` | ✓ `Book.data_validations` | ✓ `validations` | |
 | Comments (+ rich runs) | ✓ `Book.comments` | ✓ `zlsx_comment_at`, `zlsx_comment_count`, `zlsx_comment_run_at` | ✓ `Book.comments` | ✓ `comments` | |
-| Defined names | ✓ `Workbook.definedNames`, `Workbook.definedNamesForSheet` | — S3b | — S3b | — S3b | S3b |
+| Defined names | ✓ `Workbook.definedNames`, `Workbook.definedNamesForSheet` | — S3b | — S3b | ✓ `defined-names` | S3b |
 | Conditional formats | ✓ `Worksheet.conditionalFormats` | — S3b | — S3b | — S3b | S3b |
 | Freeze panes, `<dimension>`, calc properties | ✓ `Worksheet.freezePane`, `Worksheet.dimension`, `Workbook.calcProperties` | — S3b | — S3b | — S3b | S3b |
 | Image / chart anchors | ✓ `zlsx_pkg.imageAnchors`, `zlsx_pkg.chartAnchors` | — S3b | — S3b | — S3b | S3b |
@@ -208,7 +208,7 @@ gate (2026-08-26).
 |---|---|
 | S2 | **Done 2026-08-26** — §3 `<xm:f>` row: the refusal became `Workbook.rewriteAllExtensionFormulas` + `Workbook.preflightExtensionFormulas` in the shared code (footnote ¹⁵); C and Py *observe* the lift only once S3a gives them structural edits — the row's four-way `done` is transitive through S3a. |
 | S3a | **Done 2026-08-30** — §3 sheet-level edits, row / col edits, table-column rename and the rewriters → C + Py (footnote ¹⁹); table-column rename → CLI (`rename-table-column`); S6's C + Py legs rode along (§1 pivot row). |
-| S3b | The ladder text says merged ranges, defined names, conditional formats, anchors → **CLI**; §1 adds document properties to that CLI list. §1 also shows defined names, conditional formats, anchors, panes / dimension / calc properties, sheet visibility, formula text and error tags missing on **C and Py** (merged ranges and document properties are already there). Widened at the gate: one typed-read parity row covering all four surfaces. |
+| S3b | **First slice shipped 2026-08-31** — merged ranges (`merges`) and defined names (`defined-names`) → CLI as NDJSON; the defined-name record writer lives in `pkg/defined_name_ndjson.zig` so the C and Py legs hand over the same bytes (the `pivot_ndjson` precedent). Remaining: conditional formats, drawing anchors, document properties → **CLI**; defined names, conditional formats, anchors, panes / dimension / calc properties, sheet visibility, formula text and error tags → **C and Py** (merged ranges and document properties are already there). Widened at the gate: one typed-read parity row covering all four surfaces. |
 | S3c | §4 embeddable rows, write, prune, strip → C + Py; `recovery_in_cells` → C + Py + CLI; the vector / state dump → CLI; §6 control-byte check on embedding metadata (all surfaces, shared code). |
 | S3d | §3 existing-workbook authoring (styles, layout, merges, hyperlinks, comments, DV / CF, defined names, `deleteCell`) and a standalone mark-recalc → C + Py + CLI. Zig-only today; no row names it. |
 | S3e | §1 opening strategies — lazy per-sheet loading and the lazy SST backend → C + Py (+ CLI for per-sheet). |

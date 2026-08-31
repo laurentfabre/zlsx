@@ -40,6 +40,8 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx validations <file>` | `"validation"` | `sheet, sheet_idx, range, rule_type, op?, formula1, formula2?, values?` |
 | `zlsx hyperlinks <file>` | `"hyperlink"` | `sheet, sheet_idx, range, url?, location?` |
 | `zlsx pivots <file>` | `"pivot"`, then `"pivot_cache"` | `sheet, sheet_idx, name, part, location{}, rows[], cols[], pages[], values[], data_caption, grand_totals{}, style, cache{}` — [contract](#pivots--the-typed-pivot-read) |
+| `zlsx merges <file>` | `"merge"` | `sheet, sheet_idx, range, start_row, start_col, end_row, end_col` — 1-based, corners inclusive |
+| `zlsx defined-names <file>` | `"defined_name"` | `name, scope, sheet, sheet_idx, body, hidden` — [contract](#defined-names--the-workbook-name-inventory) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
@@ -107,6 +109,76 @@ that did parse — a partial inventory is the shape of a guard hole. Formats, co
 chart formats, hierarchies and every OLAP-only element are not exposed; the
 parts stay byte-preserved for callers that need them raw
 (`zlsx_pkg.PartStore`).
+
+#### `defined-names` — the workbook name inventory
+
+`zlsx defined-names <file>` (S3b) emits one record per `<definedName>` of
+`xl/workbook.xml`, in document order — the order Excel's name manager
+shows. Nothing is resolved or rewritten: `body` is the formula text as
+authored (entity-decoded), whether it is a static area, a 3D span, a
+dynamic `OFFSET`, or a constant.
+
+```jsonl
+{"kind":"defined_name","name":"Prices","scope":"workbook","sheet":null,"sheet_idx":null,"body":"Data!$A$1:$C$4","hidden":false}
+{"kind":"defined_name","name":"_xlnm.Print_Area","scope":"sheet","sheet":"Report","sheet_idx":1,"body":"Report!$A$1:$B$9","hidden":false}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The `name` attribute, decoded by its string carrier (entities + ST_Xstring). Excel's built-ins keep their `_xlnm.` prefix. |
+| `scope`, `sheet`, `sheet_idx` | `"workbook"` for a name with no `localSheetId` (`sheet` / `sheet_idx` are `null`); `"sheet"` for a sheet-scoped name, with the scope sheet's decoded name and its zero-based index (`localSheetId` indexes the `<sheets>` order). A `localSheetId` past the sheet list keeps `scope:"sheet"` and the index as written, with `sheet:null` — the attribute is what the producer wrote. |
+| `body` | The element's inner text — the formula the name refers to — entity-decoded, verbatim otherwise. |
+| `hidden` | The `hidden` attribute (schema default `false`). Hidden names (filter databases, slicer caches) are streamed, not suppressed — filter with `jq 'select(.hidden|not)'`. |
+
+Selection mirrors the `pivots` orphan-cache rule: a concrete selector —
+`--sheet`, `--name`, `--sheet-glob` — narrows to the names **scoped** to
+matching sheets and suppresses workbook-scope names; the default and
+`--all-sheets` stream every name, workbook scope included. `--skip` /
+`--take` page the stream; `--output compact-ndjson` is accepted as a
+no-op (a defined name's sheet fields are its scope, not a host
+location, so there is no prologue to hoist them into). The command
+routes through the package layer like `pivots`, so an archive the
+lenient reader tolerates but the package layer refuses (ZIP data
+descriptors, for one) is exit 2; a workbook without defined names is an
+empty, successful stream. A name or body the read cannot serve
+faithfully refuses the whole command (exit 2) rather than emit a
+record that lies: a carrier that does not decode (a bad entity, an
+ill-formed `_xHHHH_` escape), a decoded name, body or sheet name that
+is not UTF-8 (NDJSON must stay parseable), or a body carrying embedded
+markup (a CDATA section, a comment — element text no consumer of the
+name reads through; the rewriters refuse such a body too) — a partial
+or wrong name inventory is the shape of a guard hole. Two shapes are
+not part of the workbook.xml view at all and emit no record, on any
+surface that reads it: a bodiless self-closing `<definedName/>` and an
+entry with no `name` attribute — spellings Excel never writes, and
+names the engine's symbol table (which `pivots` resolution and the
+edit-time name sweep read through) equally does not hold, so the CLI
+cannot show a name the rest of the toolchain would not honour.
+
+#### `merges` — merged ranges
+
+`merges` (S3b) is the same read family as `validations` / `hyperlinks`:
+one record per `<mergeCell>`, every sheet by default, `--sheet` /
+`--name` / `--all-sheets` / `--sheet-glob` narrowing and widening,
+`--skip` / `--take` paging, a sheet prologue under
+`--output compact-ndjson`. `range` is the A1 rectangle as one merged
+range declares it; `start_row` / `start_col` / `end_row` / `end_col`
+are its inclusive corners, 1-based on both axes (column A = 1, like the
+`cells` envelope), so `jq` consumers can intersect without re-parsing
+A1 text. Sheet names — in the `sheet` field and against `--name` /
+`--sheet-glob` — carry the reader's spelling, exactly as on every
+Book-route command (`rows`, `cells`, `comments`, `validations`,
+`hyperlinks`): XML entities decoded, ST_Xstring `_xHHHH_` escapes as
+written. The package-route commands (`pivots`, `defined-names`) decode
+ST_Xstring too, so the rare sheet name spelled with such an escape
+reads differently across the two families — a reader-level lift on a
+later S3b slice, not a per-command patch (one family, one spelling).
+One validity floor is this command's own: the sheet name is a merge
+record's only user-text channel, so a selected sheet that has merges
+under a non-UTF-8 name refuses the whole command (exit 2) before any
+record — the stream is valid NDJSON or it is nothing. A bad-named
+sheet with no merges, or one the selection excludes, emits nothing
+and does not refuse.
 
 ### Edit (load-modify-save)
 
@@ -351,8 +423,10 @@ is set.
 ## Flags
 
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
-unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots`
-stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
+unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots` /
+`merges` stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are
+workbook-wide, and so is `defined-names` (a sheet selector there narrows by
+a name's *scope* — see its contract above).
 
 **Sheet selection** — mutually exclusive:
 
@@ -394,8 +468,8 @@ stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide.
 --output ndjson               # default: invariant-envelope stream
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
-                              # validations / hyperlinks / pivots — a no-op on
-                              # workbook-scoped sub-commands
+                              # validations / hyperlinks / pivots / merges — a no-op
+                              # on workbook-scoped sub-commands (defined-names included)
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -430,6 +504,12 @@ zlsx validations data.xlsx | jq 'select(.rule_type=="list") | {sheet, range, val
 
 # Grep SST for emails.
 zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
+
+# Merged header bands: every merge that touches row 1.
+zlsx merges data.xlsx --all-sheets | jq 'select(.start_row==1)'
+
+# Visible workbook-scope names with their bodies, as TSV.
+zlsx defined-names data.xlsx | jq -r 'select(.scope=="workbook" and (.hidden|not)) | [.name, .body] | @tsv'
 
 # Push a report to a UC Volume, then ask Genie about it.
 zlsx dbx push report.xlsx /Volumes/main/default/landing/report.xlsx
@@ -485,7 +565,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

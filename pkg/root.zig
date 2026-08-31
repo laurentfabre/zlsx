@@ -121,6 +121,10 @@ pub const Worksheet = workbook_mod.Worksheet;
 /// The JSON text scalars the NDJSON contracts share (S3a).
 pub const json_text = @import("json_text.zig");
 pub const pivots = @import("pivots.zig");
+/// S3b: the `defined-names` NDJSON records — decoded from the
+/// `WorkbookXml` view, written once for every surface (the
+/// `pivot_ndjson` precedent; the C and Python legs reuse it).
+pub const defined_names_ndjson = @import("defined_name_ndjson.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;
