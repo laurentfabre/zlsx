@@ -96,7 +96,7 @@ fixtures too when it runs).
 | **K1** | insert strictly inside; header from the sheet (direct `ref`, static name, table with `headerRowCount="1"`) | the range grows; the new header cell is **blank**; refresh **fails** — *"The PivotTable field name is not valid"* — and at open, a marked cache raises that dialog | training data; consistent with the header check the engine already enforces | **refuse** (align the reason: the new field has no name the engine can prove). No lift is coherent: grow-and-mark ships a workbook that errors at open |
 | **K2** | insert strictly inside a **headerless table** source (`headerRowCount="0"`) — `table_edit` synthesizes `Column<id>` in `<tableColumns>`, so the new field *is* named | refresh succeeds; a new unused field appears at the inserted ordinal; later ordinals shift **up** | training data | mechanical (same carriers as K3, `+1` instead of `−1`, one new bare `pivotField` + one blank-inventory `cacheField`) — but the shape is rare and each lift needs its own overflow/namespace/provenance pass. **Recommend refuse** in this PR |
 | **K3** | delete strictly inside; the deleted ordinal **unreferenced**; the source had ≥ 2 columns (it keeps ≥ 1) | the range shrinks; refresh drops the `cacheField`, each record loses its value, later ordinals shift **down**, the rendered cells **do not change** | ordinal shift is ECMA-376 positional by definition; unchanged cells are **corpus-provable** (§3) | **lift** (recommended) or refuse |
-| **K4a** | delete of a **referenced** ordinal that is one of ≥ 2 data fields (the form stays inside the slice: one row field, ≥ 1 data field left) | refresh drops the `dataField`; the values column vanishes; `location` narrows | training data; the surviving columns are corpus-pinned, the narrowing is not | lift later or refuse. **Recommend refuse** in this PR: silently dropping a rendered values column as a side effect of a sheet edit is the surprising outcome a refusal exists for; a follow-up slice can lift it if wanted |
+| **K4a** | delete of a **referenced** ordinal that is one of ≥ 2 data fields (the form stays inside the slice: one row field, ≥ 1 data field left) | refresh drops the `dataField`; the values column vanishes; `location` narrows | training data; the surviving columns are corpus-pinned, the narrowing is not | lift later or refuse. **Recommend refuse** in this PR: silently dropping a rendered values column as a side effect of a sheet edit is the surprising outcome a refusal exists for; a follow-up slice can lift it if wanted. **Lifted in S7c-2** (below) |
 | **K4b** | delete of the row field, the only data field, or an ordinal named by `baseField` | refresh re-lays into a **form the slice does not lay out** (no row axis / no values), `baseField` has no defined successor | training data | **refuse** |
 | **K5** | delete that collapses the source to zero width | no meaningful result | — | **refuse** (the row-collapse twin) |
 | **K6** | any column edit inside a source with **no finite rectangle** — whole columns, whole rows, an unbounded name body, a consolidation set, an unknown-`type` locator | — | — | **stays refused** — decided by policy B at the S7b gate, not re-opened here |
@@ -230,8 +230,9 @@ is a no-op on it. Identical standard to S7b-4/5, which shipped on the same
 terms. Beyond that the corpus pins nothing — K2's synthetic-name insert was
 this section's "not lifted" until the owner ruled it in (§4 Q3: the name is
 mechanical, the same probe the table rewrite runs, so the ruling authorized
-it on that proof despite the missing corpus oracle); K4a's narrowing stays
-un-lifted, deferred to S7c-2 (§4 Q2).
+it on that proof despite the missing corpus oracle); K4a's narrowing shipped
+in S7c-2 (§4 Q2, §5) — its parked line is the same one: Excel opens the K4a
+result without repair and *Refresh* is a no-op on it.
 
 ## 4. Recommendation and the owner's questions
 
@@ -254,3 +255,63 @@ mangles; K2/K4a are deferred, not ruled out.
 per-case refusals for K1 / K4a / K4b / K5; S7c-2 lifts K4a. The Codex
 pressure-test of this framing could not run before the ruling (usage limit
 until 2026-09-05) — it folds into the PR's review loop instead.
+
+## 5. S7c-2 — the K4a lift (shipped 2026-08-31)
+
+K4a rides the K3 machinery whole — the cache side is *identical* (field `k`
+out, records at the reduced arity, the same gates and admissions) — plus the
+consumer narrow, all inside `edit.applyConsumerSchemaEdit`:
+
+- each `<dataField>` with `fld == k` leaves whole (its own `baseField` /
+  `baseItem` with it; `wt` twice is two elements and one ordinal — all go),
+  `<dataFields count>` following; the surviving carriers decrement as K3's do;
+- `<colItems>` is regenerated for the survivors in the canonical identity
+  form (`<i><x/></i><i i="1"><x v="1"/></i>…`) — and because a regenerated
+  wrapper would erase the evidence the layout's own checks refuse on (the
+  S7C-MUT-1 rule), the canonical form is required FIRST: a lying `count`, a
+  stray attribute, a non-identity entry, a values axis that is not exactly
+  one `<field x="-2"/>` (its `count`, when spelled, agreeing — an absent
+  one is admitted, as the layout admits it), or a `location` width
+  that is not one label column plus the data fields, refuses — and none of
+  those gates run on the K3 path, which narrows no axis;
+- a drop to a **single survivor** takes `<colFields>` out whole and leaves
+  `<colItems count="1"><i/></colItems>` — Excel's own one-data-field
+  spelling, the form every single-data-field fixture and both corpus pivots'
+  siblings attest (K4b keeps 1 → 0 refused, so this arm is always 2+ → 1);
+- `location@ref` narrows by the vanished values column(s); the layout then
+  reads a self-consistent part. The sweep re-reads the pre-schema part's
+  footprint (`edit.footprintOfBytes` on the post-S7a-move bytes) and widens
+  the layout's `old_rect` back over the vacated columns, so the host clear
+  reaches the cells Excel wrote there;
+- a values-only `<chartFormat>` (carrier #12) selects a data field **by
+  index** (`<x v>` under its `field="4294967294"` reference) — the one
+  admitted carrier of data-field indices, sound while no edit moved them.
+  The drop moves them, so the rewrite moves the blocks (the review loop's
+  first catch — the corpus' own pivot chart rides three): a block naming a
+  dropped index leaves whole, a survivor's index decrements in place,
+  `chartFormats@count` follows, and a rewrite that empties the list takes
+  the element out whole. The chart part itself stays as written — carrier
+  #17's rule: Excel's open-refresh re-lays a pivot chart's series from the
+  pivot, the S7b-5 safety-net standard. A shape the collector cannot read
+  as one-block-one-index — a second `<chartFormats>`, extra areas /
+  references / `<x>` children, a lying `count`, an index past the data
+  fields — refuses.
+
+Two spellings ride as written, on the same parked-oracle terms:
+`location@firstHeaderRow` keeps the part's own value across the collapse
+(the corpus' multi-data-field pivot spells `0` where every single-data-field
+fixture spells `1` — unpinned either way), and host-cell **styles** carry by
+position (S7b-5's rule), so a survivor shifted left wears the vanished
+column's number format until Excel's open-refresh re-lays it — the marker
+covers both, and the corpus cannot tell (every mtCars data cell shares one
+style).
+
+Still K4b (refused): the row axis's column, the only data field (all of an
+ordinal's data fields count as one here), an ordinal a **surviving**
+`baseField` names. The corpus is the oracle both ways on `mtCars Pivot`:
+deleting `mpg`'s column leaves the two `wt` columns as Excel wrote them
+(value-exact, the §3 lexical note applying) with `D1:D5` cleared; deleting
+`wt`'s column drops both its data fields at once, collapses the values axis
+and leaves the `Average of mpg` column bit-exact with `C1:D5` cleared. The
+iris pivot's K4a candidates stay refused by the attachment-level slicer gate
+(`Slicer_Species`), exactly as in S7c-1.

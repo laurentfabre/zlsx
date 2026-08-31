@@ -504,14 +504,17 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
   or left of it; inside it refuses), and a row edit
   (or a cell write) that changes a finite-rectangle source's *content* —
   or a column edit that changes its *schema*: deleting a source column no
-  consumer references, inserting one into a headerless table (S7c) —
+  consumer references, deleting one that backs some of a report's data fields
+  (the values column drops and the layout narrows, as Excel's refresh would),
+  inserting a column into a headerless table (S7c) —
   refreshes the pivot the way Excel would —
   the cache rebuilt from the cells, its consumers re-laid, their output cells
   rewritten (S7b, `goal_sigmoid.md`) — for the report forms the engine lays
   out (one row field, the values axis, plain aggregates). Every rebuilt
   cache stays marked to refresh at open; a form the engine does not lay out —
-  or a schema edit it cannot prove: a blank new header, a referenced field's
-  column, a slicer attached to the pivot —
+  or a schema edit it cannot prove: a blank new header, the row axis's
+  column, the last data field's, a `baseField`'s, a slicer attached to the
+  pivot —
   refuses a structural edit rather than corrupt it, and leaves a cell-write
   save at that marker alone. The typed read, `Workbook.pivotTables` /
   `zlsx pivots`, names every host and source sheet.

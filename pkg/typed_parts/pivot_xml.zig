@@ -615,6 +615,25 @@ pub const AxisItem = struct {
 /// would leave pointing elsewhere.
 pub const ChartFormats = enum { none, values_only, other };
 
+/// One values-only `<chartFormat>` block as the S7c-2 rewrite moves
+/// it: the block selects a data field BY INDEX (`<x v>` under its
+/// `field="4294967294"` reference), and a data-field drop renumbers
+/// those indices.
+pub const ChartFormatRef = struct {
+    /// The whole `<chartFormat>` element, `<` to one past its close.
+    span: Span,
+    /// The data-field index the block selects (`<x v>`, 0 when the
+    /// attribute is absent).
+    index: u32 = 0,
+    /// The `v` value bytes, when spelled.
+    v_span: ?Span = null,
+    /// The one shape the rewrite can move: exactly one pivotArea, one
+    /// references, one reference, one `<x>` carrying at most `v`,
+    /// every declared `count` agreeing. Anything else refuses a
+    /// data-field drop.
+    canonical: bool = true,
+};
+
 /// A pivot-field ordinal, or the values axis — spelled `x="-2"` on
 /// `<field>` and `fld="-2"` on `<pageField>`. Any other negative
 /// ordinal names no field and is refused by the parser.
@@ -700,6 +719,9 @@ pub const DataField = struct {
     /// when a schema edit moves the ordinals.
     fld_span: Span = .{ .start = 0, .end = 0 },
     base_field_span: ?Span = null,
+    /// The whole element, `<` to one past its close — S7c-2's splice
+    /// target when a data-field delete (K4a) takes it out whole.
+    span: Span = .{ .start = 0, .end = 0 },
 };
 
 pub const StyleInfo = struct {
@@ -753,13 +775,37 @@ pub const TableDefinition = struct {
     /// target when a schema edit moves the ordinals.
     row_field_x_spans: []Span = &.{},
     col_fields: []AxisField,
+    /// The whole `<colFields>` element, when the part has one —
+    /// S7c-2's splice target when a data-field delete leaves a single
+    /// data field and the values axis collapses off the columns.
+    col_fields_span: ?Span = null,
     page_fields: []PageField,
     data_fields: []DataField,
+    /// The `<dataFields count>` value bytes, when the wrapper spells
+    /// one — S7c-2's splice target when a data-field delete (K4a)
+    /// changes the count.
+    data_fields_count_span: ?Span = null,
     style: ?StyleInfo,
     /// `<rowItems>` / `<colItems>` as written, when present.
     row_items: ?AxisItems = null,
     col_items: ?AxisItems = null,
     chart_formats: ChartFormats = .none,
+    /// The first `<chartFormats>` element whole, its `count` (value
+    /// and value bytes), and its per-block values refs when it read
+    /// as `.values_only` — S7c-2's splice targets when a data-field
+    /// drop renumbers the indices. A second `<chartFormats>` element
+    /// sets `chart_formats_multi`, which the rewrite refuses.
+    chart_formats_span: ?Span = null,
+    chart_formats_count: ?u32 = null,
+    chart_formats_count_span: ?Span = null,
+    chart_formats_multi: bool = false,
+    /// The wrapper carries what this reader cannot classify — an
+    /// attribute besides `count`, a `count` that does not read as a
+    /// number. The S7c-2 rewrite refuses it (an emptied wrapper is
+    /// deleted WHOLE — Codex #210 r4 REL-402); every other reader
+    /// tolerates it as before.
+    chart_formats_other: bool = false,
+    chart_format_values_refs: []ChartFormatRef = &.{},
     has_ext_lst: bool = false,
     /// The first root `<extLst>`'s `<` position — where S7c's
     /// ordinal-token probe starts: extension content is tolerated
@@ -792,6 +838,7 @@ pub const TableDefinition = struct {
         allocator.free(self.data_fields);
         if (self.row_items) |ri| freeAxisItems(allocator, ri);
         if (self.col_items) |ci| freeAxisItems(allocator, ci);
+        allocator.free(self.chart_format_values_refs);
         self.* = undefined;
     }
 };
@@ -872,6 +919,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.cols)) return error.MalformedXml;
             seen.insert(.cols);
             def.col_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            def.col_fields_span = .{ .start = k.hit.open_lt, .end = k.after };
             try noteWrapper(xml, k, "field", def.col_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pageFields")) {
             if (seen.contains(.pages)) return error.MalformedXml;
@@ -882,6 +930,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.data)) return error.MalformedXml;
             seen.insert(.data);
             def.data_fields = try parseDataFields(allocator, xml, k, p, &def);
+            if (wbxml.getAttr(k.attrs(xml), "count")) |v| def.data_fields_count_span = spanOf(xml, v);
             try noteWrapper(xml, k, "dataField", def.data_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pivotTableStyleInfo")) {
             if (seen.contains(.style)) return error.MalformedXml;
@@ -902,9 +951,36 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (def.col_items != null) return error.MalformedXml;
             def.col_items = try parseAxisItems(allocator, xml, k, p);
         } else if (std.mem.eql(u8, k.local, "chartFormats")) {
-            // Two blocks are not one; the stricter reading wins.
+            // Two blocks are not one; the stricter reading wins —
+            // monotonically, so a trailing empty element cannot erase
+            // a values-only one (Codex #210 r2 REL-202).
             const cf = try classifyChartFormats(xml, k, p);
-            def.chart_formats = if (def.chart_formats == .other or cf == .other) .other else cf;
+            def.chart_formats = if (def.chart_formats == .other or cf == .other)
+                .other
+            else if (def.chart_formats == .values_only or cf == .values_only)
+                .values_only
+            else
+                .none;
+            if (def.chart_formats_span == null) {
+                def.chart_formats_span = .{ .start = k.hit.open_lt, .end = k.after };
+                var cfa: AttrIter = .{ .attrs = k.attrs(xml) };
+                while (cfa.next()) |a| {
+                    if (!std.mem.eql(u8, a.name, "count")) def.chart_formats_other = true;
+                }
+                if (wbxml.getAttr(k.attrs(xml), "count")) |v| {
+                    // A count that does not read is K4a's problem
+                    // alone — the shared view stays tolerant of it
+                    // (Codex #210 r4 REL-401).
+                    def.chart_formats_count = u32Attr(k.attrs(xml), "count") catch blk: {
+                        def.chart_formats_other = true;
+                        break :blk null;
+                    };
+                    def.chart_formats_count_span = spanOf(xml, v);
+                }
+                if (cf == .values_only) def.chart_format_values_refs = try chartFormatValuesRefs(allocator, xml, k, p);
+            } else {
+                def.chart_formats_multi = true;
+            }
         } else if (std.mem.eql(u8, k.local, "extLst")) {
             def.has_ext_lst = true;
             if (def.ext_lst_start == null) def.ext_lst_start = k.hit.open_lt;
@@ -1117,6 +1193,80 @@ fn classifyChartFormats(xml: []const u8, el: Child, p: []const u8) Error!ChartFo
     return if (any_area) .values_only else .none;
 }
 
+/// The per-block spans and indices of a `.values_only`
+/// `<chartFormats>` — a second walk over the same scanner, so the
+/// blocks are parallel to the classifier's reading by construction.
+/// Shape questions beyond the classifier's (how many areas /
+/// references / `<x>` children, whether every declared `count`
+/// agrees) fold into `canonical`, which the S7c-2 rewrite requires
+/// rather than heals.
+fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []const u8) Error![]ChartFormatRef {
+    var out: std.ArrayListUnmanaged(ChartFormatRef) = .empty;
+    errdefer out.deinit(allocator);
+    var formats = Children.init(xml, el.hit, el.end, p, el.env);
+    while (try formats.next()) |cf| {
+        var ref: ChartFormatRef = .{ .span = .{ .start = cf.hit.open_lt, .end = cf.after } };
+        var areas: u32 = 0;
+        var wrappers: u32 = 0;
+        var references: u32 = 0;
+        var xs: u32 = 0;
+        var walk_areas = Children.init(xml, cf.hit, cf.end, p, cf.env);
+        while (try walk_areas.next()) |pa| {
+            areas += 1;
+            var refs_blocks = Children.init(xml, pa.hit, pa.end, p, pa.env);
+            while (try refs_blocks.next()) |rb| {
+                wrappers += 1;
+                var n_here: u32 = 0;
+                var refs = Children.init(xml, rb.hit, rb.end, p, rb.env);
+                while (try refs.next()) |r| {
+                    references += 1;
+                    n_here += 1;
+                    var x_here: u32 = 0;
+                    var inner = Children.init(xml, r.hit, r.end, p, r.env);
+                    while (try inner.next()) |x| {
+                        if (!std.mem.eql(u8, x.local, "x")) {
+                            ref.canonical = false;
+                            continue;
+                        }
+                        xs += 1;
+                        x_here += 1;
+                        const xa = x.attrs(xml);
+                        var xi: AttrIter = .{ .attrs = xa };
+                        while (xi.next()) |a| {
+                            if (!std.mem.eql(u8, a.name, "v")) ref.canonical = false;
+                        }
+                        if (!x.hit.self_closing and !isBlank(xml[x.hit.after_tag_close..x.end])) ref.canonical = false;
+                        // A scalar that does not read is K4a's problem
+                        // alone — the shared view stays tolerant of it
+                        // (Codex #210 r4 REL-401).
+                        ref.index = (u32Attr(xa, "v") catch blk: {
+                            ref.canonical = false;
+                            break :blk null;
+                        }) orelse 0;
+                        if (wbxml.getAttr(xa, "v")) |v| ref.v_span = spanOf(xml, v);
+                    }
+                    if (inner.skipped > 0 or inner.other) ref.canonical = false;
+                    if (u32Attr(r.attrs(xml), "count") catch blk: {
+                        ref.canonical = false;
+                        break :blk null;
+                    }) |c| {
+                        if (c != x_here) ref.canonical = false;
+                    }
+                }
+                if (u32Attr(rb.attrs(xml), "count") catch blk: {
+                    ref.canonical = false;
+                    break :blk null;
+                }) |c| {
+                    if (c != n_here) ref.canonical = false;
+                }
+            }
+        }
+        if (areas != 1 or wrappers != 1 or references != 1 or xs != 1) ref.canonical = false;
+        try out.append(allocator, ref);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn axisFromXml(s: []const u8) ?Axis {
     if (std.mem.eql(u8, s, "axisRow")) return .row;
     if (std.mem.eql(u8, s, "axisCol")) return .col;
@@ -1135,6 +1285,13 @@ fn parseAxisFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
             continue;
         }
         if (!k.hit.self_closing and !isBlank(xml[k.hit.after_tag_close..k.end])) def.axes_other = true;
+        // CT_Field spells `x` alone — any other attribute is content
+        // this reader does not classify, and S7c-2's collapse removes
+        // the values axis WHOLE (Codex #210 r3 REL-301).
+        var ai: AttrIter = .{ .attrs = k.attrs(xml) };
+        while (ai.next()) |a| {
+            if (!std.mem.eql(u8, a.name, "x")) def.axes_other = true;
+        }
         const x = (try i32Attr(k.attrs(xml), "x")) orelse return error.MalformedXml;
         try out.append(allocator, try ordinalOrValues(x));
     }
@@ -1230,6 +1387,7 @@ fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
             .num_fmt_id = try u32Attr(attrs, "numFmtId"),
         };
         df.fld_span = spanOf(xml, wbxml.getAttr(attrs, "fld").?);
+        df.span = .{ .start = k.hit.open_lt, .end = k.after };
         if (wbxml.getAttr(attrs, "baseField")) |v| df.base_field_span = spanOf(xml, v);
         if (wbxml.getAttr(attrs, "subtotal")) |s| {
             var buf: [32]u8 = undefined;
@@ -2292,6 +2450,23 @@ test "parseTableDefinition: name, cache, location, roles, axes, data fields, sty
     try testing.expectEqual(ConsolidateFunction.average, def.data_fields[0].subtotal);
     try testing.expectEqual(ConsolidateFunction.sum, def.data_fields[1].subtotal);
     try testing.expectEqual(@as(u32, 3), def.data_fields[1].fld);
+    // S7c-2's splice targets: each data field's whole element, the
+    // wrapper's count value, the colFields element.
+    try testing.expectEqualStrings(
+        "<dataField name=\"Average of mpg\" fld=\"0\" subtotal=\"average\" baseField=\"1\" baseItem=\"0\"/>",
+        table_def_xml[def.data_fields[0].span.start..def.data_fields[0].span.end],
+    );
+    try testing.expectEqualStrings(
+        "<dataField name=\"Sum of wt\" fld=\"3\" baseField=\"1\" baseItem=\"0\"/>",
+        table_def_xml[def.data_fields[1].span.start..def.data_fields[1].span.end],
+    );
+    const dfc = def.data_fields_count_span.?;
+    try testing.expectEqualStrings("2", table_def_xml[dfc.start..dfc.end]);
+    const cfs = def.col_fields_span.?;
+    try testing.expectEqualStrings(
+        "<colFields count=\"1\"><field x=\"-2\"/></colFields>",
+        table_def_xml[cfs.start..cfs.end],
+    );
 
     const style = def.style.?;
     try testing.expectEqualStrings("PivotStyleLight16", style.name.?);
