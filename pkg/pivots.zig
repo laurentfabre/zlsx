@@ -848,7 +848,7 @@ pub fn attachedPivotNames(arena: Allocator, xml: []const u8, kind: AttachmentKin
         .slicer => &slicer_ns_uris,
         .timeline => &timeline_ns_uris,
     };
-    const root = pivot_xml.scanRootIn(xml, local, uris) catch return error.MalformedPivotXml;
+    const root = pivot_xml.scanRootIn(xml, local, uris, .require_family) catch return error.MalformedPivotXml;
     // A second attachment list can ride the part's `extLst`
     // (`x15:slicerCachePivotTables`, the data-model spelling) — an
     // attachment this reader would not see. Its token anywhere in the
@@ -2951,15 +2951,19 @@ pub const engine = struct {
             // it. The root extension region is probed for the
             // ordinal-carrier attribute names — the corpus'
             // `pivotCacheId` extension carries none.
+            if (def.ext_lst_start) |at| {
+                // A caller-assembled offset answers, it does not trap
+                // — the parser always points at a `<` inside the part
+                // (Codex #208 r5 REL-503).
+                if (at >= cache.raw_xml.len or cache.raw_xml[at] != '<') return error.MalformedPivotXml;
+                if (edit.extRegionNamesOrdinal(cache.raw_xml[at..])) return error.PivotShapeUnsupported;
+            }
             for (def.fields, 0..) |f, k| {
                 switch (se) {
                     .remove => |r| if (r == k) continue,
                     .insert => {},
                 }
                 if (f.has_ext_lst) return error.PivotShapeUnsupported;
-            }
-            if (def.ext_lst_start) |at| {
-                if (edit.extRegionNamesOrdinal(cache.raw_xml[at..])) return error.PivotShapeUnsupported;
             }
         }
         const eff = try effectiveCacheFields(arena, def.fields, schema);
@@ -8157,6 +8161,18 @@ test "S7c: an attachment list the reader cannot see refuses; the plain list deco
         \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><data xmlns:y="http://schemas.microsoft.com/office/spreadsheetml/2009/9/mai&#x6e;"><y:pivotTables><y:pivotTable tabId="2" name="P"/></y:pivotTables></data></slicerCacheDefinition>
     ;
     try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, ent_alias, .slicer));
+    // A root NOT bound to the family is not a slicer cache this reader
+    // can walk — undeclared or vendor-namespaced roots refuse rather
+    // than skip a foreign-prefixed attachment list (Codex #208 r5
+    // REL-502).
+    const unbound =
+        \\<slicerCacheDefinition name="S" sourceName="F"><pivotTables><pivotTable tabId="2" name="P"/></pivotTables></slicerCacheDefinition>
+    ;
+    try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, unbound, .slicer));
+    const vendor =
+        \\<v:slicerCacheDefinition xmlns:v="urn:vendor" name="S"><v:pivotTables><v:pivotTable tabId="2" name="P"/></v:pivotTables></v:slicerCacheDefinition>
+    ;
+    try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, vendor, .slicer));
 }
 
 test "S7c engine: cache-side tolerated-unread content refuses a schema edit — a surviving field's extLst, an ordinal token in the root extension (Codex #208 r2 REL-203)" {
@@ -8215,6 +8231,11 @@ test "S7c engine: cache-side tolerated-unread content refuses a schema edit — 
         &.{ .{ .string = "East" }, .{ .number = "3.5" } },
     };
     _ = try engine.rebuildWith(arena, cache, &keep, rec, null, .{ .remove = 1 });
+    // A caller-assembled extension offset answers, it does not trap
+    // (Codex #208 r5 REL-503).
+    var forged = cache.*;
+    forged.definition.ext_lst_start = forged.raw_xml.len + 1;
+    try testing.expectError(error.MalformedPivotXml, engine.rebuildWith(arena, &forged, &rows, rec, null, .{ .remove = 2 }));
 }
 
 fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8, schema: edit.SchemaEdit) !void {

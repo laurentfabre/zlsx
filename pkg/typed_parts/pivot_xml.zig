@@ -1344,14 +1344,22 @@ pub const Root = struct {
 /// check its local name, and learn its prefixes. Anything before the
 /// root (XML declaration, comments) is skipped.
 pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
-    return scanRootIn(xml, local, &main_ns_uris);
+    return scanRootIn(xml, local, &main_ns_uris, .tolerate_undeclared);
 }
+
+/// How `scanRootIn` treats a root whose own prefix has no namespace
+/// declaration. The main-part parsers tolerate it (a hand-rolled
+/// part); the S7c attachment reader REQUIRES the family binding — a
+/// vendor-namespaced or unbound "slicer cache" is not one, and
+/// admitting it would skip a foreign-prefixed attachment list (Codex
+/// #208 r5 REL-502).
+pub const RootBinding = enum { tolerate_undeclared, require_family };
 
 /// `scanRoot` against another namespace family — the x14 / x15
 /// extension parts S7c reads an attachment list from. The same
 /// hygiene, the family swapped: one binding of it per part, and the
 /// root's own binding must be it.
-pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) Error!Root {
+pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8, binding: RootBinding) Error!Root {
     try preflightIn(xml, uris);
     var i: usize = 0;
     while (i < xml.len) {
@@ -1383,7 +1391,7 @@ pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) 
         // root declares. Undeclared is tolerated (a hand-rolled part).
         if (declaredBinding(attrs, prefix)) |uri| {
             if (!(try bindsFamilyDecoded(uri, uris))) return error.MalformedXml;
-        }
+        } else if (binding == .require_family) return error.MalformedXml;
         // And the one binding there is must be the root's own: a
         // `<pivotCacheDefinition xmlns:y="…/main">` puts every `y:`
         // child under a prefix this parser does not match (Codex #205

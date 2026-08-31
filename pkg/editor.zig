@@ -10535,6 +10535,94 @@ fn fullK2EditForFailures(allocator: std.mem.Allocator, io: std.Io, path: []const
     ed.insertColumn(0, 2) catch |err| return tearContractAfterFailedEdit(&ed, allocator, baseline, err);
 }
 
+test "S7c: a torn workbook refuses EVERY save path — the plans, both recalc entries, the fresh emit (Codex #208 r5 REL-501)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7c_torn_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7c_torn_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    var wb = try Workbook.open(std.testing.allocator, io, src);
+    defer wb.deinit();
+    wb.torn_edit = true;
+    try std.testing.expectError(error.StructuralEditIncomplete, wb.saveToOwnedBuffer(std.testing.allocator));
+    try std.testing.expectError(error.StructuralEditIncomplete, wb.saveWithRecalc(std.testing.allocator, io, dst, .{
+        .now_utc_ms = 1_700_000_000_000,
+        .rng_seed = 0x5EED_5D3,
+        .limits = .{},
+    }, .{}));
+    const recalc_run = @import("recalc_run.zig");
+    try std.testing.expectError(error.StructuralEditIncomplete, recalc_run.saveWithRecalc(&wb, std.testing.allocator, io, dst, .{
+        .now_utc_ms = 1_700_000_000_000,
+        .rng_seed = 0x5EED_5D3,
+        .limits = .{},
+    }, .{}));
+    try std.testing.expectError(error.StructuralEditIncomplete, wb.saveFreshEmit(io, dst));
+    // And the structural mutators, as r3 pinned.
+    try std.testing.expectError(error.StructuralEditIncomplete, wb.addSheet("Nope"));
+    std.Io.Dir.cwd().access(io, dst, .{}) catch |e| {
+        try std.testing.expectEqual(error.FileNotFound, e);
+        return;
+    };
+    return error.TestUnexpectedResult;
+}
+
+test "S7c: two consumers of one cache both narrow and re-lay under an admitted K3 (Codex #208 r5 quick win)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7c_two_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7c_two_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+        defer store.deinit();
+        const first = (try store.part(pt_part)).?;
+        const second_a = try std.mem.replaceOwned(u8, std.testing.allocator, first.bytes, "name=\"PivotTable1\"", "name=\"PivotTable2\"");
+        defer std.testing.allocator.free(second_a);
+        const second = try std.mem.replaceOwned(u8, std.testing.allocator, second_a, "<location ref=\"A3:B6\"", "<location ref=\"D3:E6\"");
+        defer std.testing.allocator.free(second);
+        try store.addPart(
+            "xl/pivotTables/pivotTable2.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+            second,
+        );
+        try store.addPart(
+            "xl/pivotTables/_rels/pivotTable2.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition\" Target=\"../pivotCache/pivotCacheDefinition1.xml\"/></Relationships>",
+        );
+        try store.save(io, src);
+    }
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/worksheets/_rels/sheet2.xml.rels", "<Relationship Id=\"rIdPT1\"", "<Relationship Id=\"rIdPT2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable2.xml\"/><Relationship Id=\"rIdPT1\"");
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(io, dst);
+    }
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    try expectPartHas(&store, pt_part, "<pivotFields count=\"2\">");
+    try expectPartHas(&store, "xl/pivotTables/pivotTable2.xml", "<pivotFields count=\"2\">");
+    try expectPartHas(&store, "xl/pivotTables/pivotTable2.xml", "<location ref=\"D3:E6\"");
+    try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "<cacheFields count=\"2\">");
+    var wb = try Workbook.open(std.testing.allocator, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+    try expectHostCell(&wb, 1, "B6", .{ .number = 12 });
+    try expectHostCell(&wb, 1, "E4", .{ .number = 8 });
+    try expectHostCell(&wb, 1, "E6", .{ .number = 12 });
+}
+
 test "S7c: K3 and K2 edits under injected allocation failure never ship a tear — untouched bytes, or a save that refuses (Codex #208 r2 REL-201, r3 MNT-302)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

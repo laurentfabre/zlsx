@@ -1391,6 +1391,9 @@ pub const Workbook = struct {
         run: recalc_run.RunInputs,
         opts: recalc_run.Options,
     ) Error!recalc_run.Report {
+        // Defense in depth beside the guard inside
+        // `recalc_run.saveWithRecalc` itself (Codex #208 r5 REL-501).
+        try self.requireCompleteStructuralState();
         return recalc_run.saveWithRecalc(self, allocator, io, path, run, opts);
     }
 
@@ -3666,6 +3669,7 @@ pub const Workbook = struct {
     /// when no worksheets are registered; allocation/zip-sentinel
     /// errors on archive build.
     pub fn saveFreshEmit(self: *Workbook, io: std.Io, path: []const u8) !void {
+        try self.requireCompleteStructuralState();
         if (self.worksheets.len == 0) return error.NoSheets;
 
         const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.worksheets.len);
@@ -5894,8 +5898,10 @@ pub const Workbook = struct {
     }
 
     /// The torn-edit gate every structural mutation, pivot preflight
-    /// and save passes first (Codex #208 r2 REL-201, r3 REL-303).
-    fn requireCompleteStructuralState(self: *const Workbook) Error!void {
+    /// and save passes first — the recalculating save included, whose
+    /// no-formula arm writes the store directly (Codex #208 r2
+    /// REL-201, r3 REL-303, r5 REL-501).
+    pub fn requireCompleteStructuralState(self: *const Workbook) Error!void {
         if (self.torn_edit) return error.StructuralEditIncomplete;
     }
 
