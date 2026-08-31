@@ -7725,24 +7725,30 @@ test "S3b defined_names_ndjson: the shared writer's bytes, current after a renam
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expect(out_ptr == null);
+        // Re-poisoned: the NULL-editor path's own reset is what this pins.
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
 
         // struct_size below v1: the outputs reset first, then the diag
-        // is rejected before a byte of it is written.
+        // is rejected before a byte of it is written — the whole struct
+        // compared, not a field or two.
         var small = std.mem.zeroes(CDiag);
         small.struct_size = @sizeOf(CDiag) - 1;
         small.plane = 7;
         small.error_name[0] = 'x';
+        const small_before = std.mem.toBytes(small);
         out_ptr = @ptrFromInt(0x1000);
         out_len = 99;
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_defined_names_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expect(out_ptr == null);
         try std.testing.expectEqual(@as(usize, 0), out_len);
-        try std.testing.expectEqual(@as(u32, 7), small.plane);
-        try std.testing.expectEqual(@as(u8, 'x'), small.error_name[0]);
+        const small_after = std.mem.toBytes(small);
+        try std.testing.expectEqualSlices(u8, &small_before, &small_after);
     }
     // No defined names: success, nothing to release, the poison reset.
     {
