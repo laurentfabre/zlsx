@@ -700,6 +700,9 @@ pub const DataField = struct {
     /// when a schema edit moves the ordinals.
     fld_span: Span = .{ .start = 0, .end = 0 },
     base_field_span: ?Span = null,
+    /// The whole element, `<` to one past its close — S7c-2's splice
+    /// target when a data-field delete (K4a) takes it out whole.
+    span: Span = .{ .start = 0, .end = 0 },
 };
 
 pub const StyleInfo = struct {
@@ -753,8 +756,16 @@ pub const TableDefinition = struct {
     /// target when a schema edit moves the ordinals.
     row_field_x_spans: []Span = &.{},
     col_fields: []AxisField,
+    /// The whole `<colFields>` element, when the part has one —
+    /// S7c-2's splice target when a data-field delete leaves a single
+    /// data field and the values axis collapses off the columns.
+    col_fields_span: ?Span = null,
     page_fields: []PageField,
     data_fields: []DataField,
+    /// The `<dataFields count>` value bytes, when the wrapper spells
+    /// one — S7c-2's splice target when a data-field delete (K4a)
+    /// changes the count.
+    data_fields_count_span: ?Span = null,
     style: ?StyleInfo,
     /// `<rowItems>` / `<colItems>` as written, when present.
     row_items: ?AxisItems = null,
@@ -872,6 +883,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.cols)) return error.MalformedXml;
             seen.insert(.cols);
             def.col_fields = try parseAxisFields(allocator, xml, k, p, &def);
+            def.col_fields_span = .{ .start = k.hit.open_lt, .end = k.after };
             try noteWrapper(xml, k, "field", def.col_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pageFields")) {
             if (seen.contains(.pages)) return error.MalformedXml;
@@ -882,6 +894,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             if (seen.contains(.data)) return error.MalformedXml;
             seen.insert(.data);
             def.data_fields = try parseDataFields(allocator, xml, k, p, &def);
+            if (wbxml.getAttr(k.attrs(xml), "count")) |v| def.data_fields_count_span = spanOf(xml, v);
             try noteWrapper(xml, k, "dataField", def.data_fields.len, &def);
         } else if (std.mem.eql(u8, k.local, "pivotTableStyleInfo")) {
             if (seen.contains(.style)) return error.MalformedXml;
@@ -1230,6 +1243,7 @@ fn parseDataFields(allocator: Allocator, xml: []const u8, el: Child, p: []const 
             .num_fmt_id = try u32Attr(attrs, "numFmtId"),
         };
         df.fld_span = spanOf(xml, wbxml.getAttr(attrs, "fld").?);
+        df.span = .{ .start = k.hit.open_lt, .end = k.after };
         if (wbxml.getAttr(attrs, "baseField")) |v| df.base_field_span = spanOf(xml, v);
         if (wbxml.getAttr(attrs, "subtotal")) |s| {
             var buf: [32]u8 = undefined;
@@ -2292,6 +2306,23 @@ test "parseTableDefinition: name, cache, location, roles, axes, data fields, sty
     try testing.expectEqual(ConsolidateFunction.average, def.data_fields[0].subtotal);
     try testing.expectEqual(ConsolidateFunction.sum, def.data_fields[1].subtotal);
     try testing.expectEqual(@as(u32, 3), def.data_fields[1].fld);
+    // S7c-2's splice targets: each data field's whole element, the
+    // wrapper's count value, the colFields element.
+    try testing.expectEqualStrings(
+        "<dataField name=\"Average of mpg\" fld=\"0\" subtotal=\"average\" baseField=\"1\" baseItem=\"0\"/>",
+        table_def_xml[def.data_fields[0].span.start..def.data_fields[0].span.end],
+    );
+    try testing.expectEqualStrings(
+        "<dataField name=\"Sum of wt\" fld=\"3\" baseField=\"1\" baseItem=\"0\"/>",
+        table_def_xml[def.data_fields[1].span.start..def.data_fields[1].span.end],
+    );
+    const dfc = def.data_fields_count_span.?;
+    try testing.expectEqualStrings("2", table_def_xml[dfc.start..dfc.end]);
+    const cfs = def.col_fields_span.?;
+    try testing.expectEqualStrings(
+        "<colFields count=\"1\"><field x=\"-2\"/></colFields>",
+        table_def_xml[cfs.start..cfs.end],
+    );
 
     const style = def.style.?;
     try testing.expectEqualStrings("PivotStyleLight16", style.name.?);

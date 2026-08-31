@@ -1903,6 +1903,17 @@ pub const edit = struct {
         return std.mem.concat(allocator, u8, &.{ src[0..span.start], new_ref, src[span.end..] });
     }
 
+    /// The footprint a part's bytes declare — a parse plus
+    /// `footprintOf`, for a caller holding only the bytes (the
+    /// sweep's pre-schema host clear, S7c-2).
+    pub fn footprintOfBytes(arena: Allocator, table_xml: []const u8) EditError!Footprint {
+        const def = pivot_xml.parseTableDefinition(arena, table_xml) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedXml => return error.MalformedPivotXml,
+        };
+        return footprintOf(arena, def);
+    }
+
     /// The footprint of a parsed definition. Refuses (as malformed) a
     /// `ref` that is not an A1 rectangle — ST_Ref has no `$`, no sheet
     /// qualifier, no whitespace.
@@ -2380,12 +2391,16 @@ pub const edit = struct {
     /// `<pivotField showAll="0"/>` inserted at the new ordinal (K2),
     /// `<pivotFields count>` adjusted, and every ordinal carrier the
     /// admitted form holds moved — `<field x>` on the row axis,
-    /// `dataField@fld` and `@baseField`. A consumer that references
-    /// the removed field — its pivotField spells an axis or
-    /// `dataField="1"`, an axis names the ordinal, a data field reads
-    /// it, a `baseField` names it — refuses: dropping a rendered
-    /// values column is K4a, ruled a follow-up slice
-    /// (`docs/plans/s7c-column-edits.md` §4). A form with carriers
+    /// `dataField@fld` and `@baseField`. A removed field one of ≥ 2
+    /// data fields read is K4a, lifted in S7c-2
+    /// (`docs/plans/s7c-column-edits.md` §4 Q2): each `<dataField>`
+    /// reading it leaves whole, `<colItems>` re-enumerates the
+    /// survivors, `location@ref` narrows by the vanished values
+    /// column(s), and a drop to a single survivor collapses the
+    /// values axis off the columns — Excel's own one-data-field
+    /// spelling, the form every single-data-field fixture attests.
+    /// Still refused (K4b): the row axis, the only data field, an
+    /// ordinal a surviving `baseField` names. A form with carriers
     /// this rewrite has no spans for — a page field, a real field on
     /// the columns axis, a chart format not proven values-only —
     /// refuses here, as the layout refuses it after.
@@ -2452,7 +2467,11 @@ pub const edit = struct {
             .remove => |k| {
                 if (k >= def.fields.len) return error.MalformedPivotXml;
                 const pf = def.fields[k];
-                if (pf.axis != null or pf.axis_raw != null or pf.data_field) return error.PivotSourceEditUnsafe;
+                // K4b: an axis field. A data field is K4a — the
+                // cross-check above already ties `pf.data_field` to
+                // the `dataField@fld` set, so the drop count below is
+                // its one source of truth.
+                if (pf.axis != null or pf.axis_raw != null) return error.PivotSourceEditUnsafe;
                 if (pf.span.start == 0 and pf.span.end == 0) return error.MalformedPivotXml;
                 try splices.append(arena, .{ .span = pf.span, .text = "" });
                 for (def.row_fields, def.row_field_x_spans) |rf, span| {
@@ -2460,17 +2479,35 @@ pub const edit = struct {
                     if (rf.field == k) return error.PivotSourceEditUnsafe;
                     if (rf.field > k) try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{rf.field - 1}) });
                 }
+                var dropped: u32 = 0;
                 for (def.data_fields) |df| {
-                    if (df.fld == k) return error.PivotSourceEditUnsafe;
+                    if (df.fld == k) dropped += 1;
+                }
+                // K4b: the only data field (`wt` twice is two entries
+                // and one ordinal — all of them go, or none). The
+                // layout has no form without a values column.
+                if (dropped > 0 and dropped == def.data_fields.len) return error.PivotSourceEditUnsafe;
+                for (def.data_fields) |df| {
+                    if (df.fld == k) {
+                        // K4a: the data field leaves whole, its own
+                        // `baseField` and `baseItem` with it.
+                        if (df.span.start == 0 and df.span.end == 0) return error.MalformedPivotXml;
+                        try splices.append(arena, .{ .span = df.span, .text = "" });
+                        continue;
+                    }
                     if (df.fld > k) try splices.append(arena, .{ .span = df.fld_span, .text = try std.fmt.allocPrint(arena, "{d}", .{df.fld - 1}) });
                     if (df.base_field) |bf| {
                         if (bf >= 0) {
                             const b: u32 = @intCast(bf);
+                            // K4b: a surviving data field baselined on
+                            // the removed ordinal has no defined
+                            // successor.
                             if (b == k) return error.PivotSourceEditUnsafe;
                             if (b > k) try splices.append(arena, .{ .span = df.base_field_span.?, .text = try std.fmt.allocPrint(arena, "{d}", .{b - 1}) });
                         }
                     }
                 }
+                if (dropped > 0) try narrowValuesAxis(arena, &splices, &def, dropped);
                 if (def.pivot_fields_count_span) |span| {
                     try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{def.fields.len - 1}) });
                 }
@@ -2501,6 +2538,88 @@ pub const edit = struct {
             },
         }
         return try spliceAll(arena, table_xml, splices.items);
+    }
+
+    /// K4a's values-axis narrow (S7c-2): with `dropped` of the part's
+    /// data fields gone, `<colItems>`, the `<dataFields count>` and
+    /// `location@ref` must follow, and a drop to one survivor takes
+    /// `<colFields>` (the `x="-2"` values axis) out whole — Excel's
+    /// own one-data-field spelling, the form every single-data-field
+    /// fixture attests. The wrappers are regenerated, so the canonical
+    /// form the layout admits is required FIRST and anything else
+    /// refuses: a regenerated wrapper would erase the evidence the
+    /// layout's own checks refuse on (the S7C-MUT-1 rule).
+    fn narrowValuesAxis(
+        arena: Allocator,
+        splices: *std.ArrayListUnmanaged(Splice),
+        def: *const pivot_xml.TableDefinition,
+        dropped: u32,
+    ) EditError!void {
+        assert(dropped > 0 and dropped < def.data_fields.len);
+        const survivors: usize = def.data_fields.len - dropped;
+        // ≥ 2 data fields spell the values axis across; the single-
+        // data-field form (no colFields) has no second entry for a
+        // drop to leave behind.
+        if (def.col_fields.len != 1 or def.col_fields[0] != .values) return error.PivotShapeUnsupported;
+        const ci = def.col_items orelse return error.PivotShapeUnsupported;
+        if (ci.other_attrs) return error.PivotShapeUnsupported;
+        if (ci.count) |n| if (n != ci.items.len) return error.MalformedPivotXml;
+        if (ci.items.len != def.data_fields.len) return error.PivotShapeUnsupported;
+        for (ci.items, 0..) |it, j| {
+            if (it.t != null or it.r != null or it.other_attrs or it.has_other_children) return error.PivotShapeUnsupported;
+            if (it.xs.len != 1 or it.xs[0] != j or (it.i orelse 0) != j) return error.PivotShapeUnsupported;
+        }
+        const p = if (def.prefix.len == 0) "" else try std.mem.concat(arena, u8, &.{ def.prefix, ":" });
+        if (survivors == 1) {
+            const cf_span = def.col_fields_span orelse return error.MalformedPivotXml;
+            try splices.append(arena, .{ .span = cf_span, .text = "" });
+            try splices.append(arena, .{ .span = ci.span, .text = try std.mem.concat(arena, u8, &.{ "<", p, "colItems count=\"1\"><", p, "i/></", p, "colItems>" }) });
+        } else {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            try out.append(arena, '<');
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "colItems count=\"");
+            try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{survivors}));
+            try out.appendSlice(arena, "\">");
+            for (0..survivors) |j| {
+                try out.append(arena, '<');
+                try out.appendSlice(arena, p);
+                if (j == 0) {
+                    try out.appendSlice(arena, "i><");
+                    try out.appendSlice(arena, p);
+                    try out.appendSlice(arena, "x/></");
+                } else {
+                    try out.appendSlice(arena, "i i=\"");
+                    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{j}));
+                    try out.appendSlice(arena, "\"><");
+                    try out.appendSlice(arena, p);
+                    try out.appendSlice(arena, "x v=\"");
+                    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{j}));
+                    try out.appendSlice(arena, "\"/></");
+                }
+                try out.appendSlice(arena, p);
+                try out.appendSlice(arena, "i>");
+            }
+            try out.appendSlice(arena, "</");
+            try out.appendSlice(arena, p);
+            try out.appendSlice(arena, "colItems>");
+            try splices.append(arena, .{ .span = ci.span, .text = out.items });
+        }
+        if (def.data_fields_count_span) |span| {
+            try splices.append(arena, .{ .span = span, .text = try std.fmt.allocPrint(arena, "{d}", .{survivors}) });
+        }
+        // The location narrows with the vanished values column(s). The
+        // width invariant is the layout's own — a part whose rectangle
+        // is not one label column plus its data fields is not one this
+        // rewrite narrows.
+        const fp = try footprintOf(arena, def.*);
+        const r = fp.rect;
+        if (@as(u64, r.br_col) - r.tl_col + 1 != @as(u64, def.data_fields.len) + 1) return error.MalformedPivotXml;
+        var narrowed = r;
+        narrowed.br_col -= dropped;
+        var ref_buf: [Bounds.format_buf_len]u8 = undefined;
+        const new_ref = formatRect(&ref_buf, narrowed) catch return error.PivotCoordinateOverflow;
+        try splices.append(arena, .{ .span = def.location.ref_span, .text = try arena.dupe(u8, new_ref) });
     }
 
     /// Does the extension region spell an attribute named `field` or
@@ -8030,8 +8149,9 @@ test "S7c edit: applyConsumerSchemaEdit — an unreferenced field leaves whole, 
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<pivotField "));
     try testing.expect(std.mem.indexOf(u8, out, "<field x=\"0\"/>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "fld=\"1\"") != null);
-    // Referenced (K4a, the follow-up slice): the data field, the row
-    // field, and a baseField all refuse.
+    // K4b: the fixture's one data field (dropping it would leave no
+    // values column), the row field, and a surviving baseField all
+    // refuse; K4a (one of >= 2 data fields) lifts in its own test.
     try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, t_xml, .{ .remove = 1 }));
     try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, t_xml, .{ .remove = 0 }));
     const based = try replacedOnce(arena, t_xml, "baseField=\"0\"", "baseField=\"2\"");
@@ -8131,6 +8251,56 @@ test "S7c edit: every ordinal carrier above the edit moves — the row axis and 
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, flagless, .{ .remove = 0 }));
     const readless = try replacedOnce(arena, s7c_row_axis_high, "<pivotField showAll=\"0\"/>", "<pivotField dataField=\"1\" showAll=\"0\"/>");
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, readless, .{ .insert = .{ .at = 1, .name = "N" } }));
+}
+
+const s7c_multi_data =
+    \\<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="7"><location ref="B2:E7" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="4"><pivotField dataField="1" showAll="0"/><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField dataField="1" showAll="0"/><pivotField showAll="0"/></pivotFields><rowFields count="1"><field x="1"/></rowFields><rowItems count="3"><i><x/></i><i><x v="1"/></i><i t="grand"><x/></i></rowItems><colFields count="1"><field x="-2"/></colFields><colItems count="3"><i><x/></i><i i="1"><x v="1"/></i><i i="2"><x v="2"/></i></colItems><dataFields count="3"><dataField name="Sum of A" fld="0" baseField="1" baseItem="0"/><dataField name="Min of C" fld="2" subtotal="min" baseField="1" baseItem="0"/><dataField name="Max of C" fld="2" subtotal="max" baseField="1" baseItem="0"/></dataFields></pivotTableDefinition>
+;
+
+test "S7c-2 edit: K4a — a data-field delete drops the dataField, re-enumerates the values axis and narrows the location; one survivor collapses the axis; K4b keeps refusing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Remove ordinal 0 (`Sum of A`): two data fields survive — the
+    // values axis stays across, `<colItems>` re-enumerates, the
+    // location loses one column, every carrier above 0 decrements.
+    const two = try edit.applyConsumerSchemaEdit(arena, s7c_multi_data, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, two, "<pivotFields count=\"3\">") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "Sum of A") == null);
+    try testing.expect(std.mem.indexOf(u8, two, "<rowFields count=\"1\"><field x=\"0\"/></rowFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<dataFields count=\"2\"><dataField name=\"Min of C\" fld=\"1\" subtotal=\"min\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Max of C\" fld=\"1\" subtotal=\"max\" baseField=\"0\" baseItem=\"0\"/></dataFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<colFields count=\"1\"><field x=\"-2\"/></colFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<location ref=\"B2:D7\"") != null);
+    // Remove ordinal 2 (`C`, two data fields at once): one survivor —
+    // the values axis leaves the columns whole (Excel's own
+    // one-data-field spelling), the single bare item stands, the
+    // location loses two.
+    const one = try edit.applyConsumerSchemaEdit(arena, s7c_multi_data, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, one, "<pivotFields count=\"3\">") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "<colFields") == null);
+    try testing.expect(std.mem.indexOf(u8, one, "<colItems count=\"1\"><i/></colItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "<dataFields count=\"1\"><dataField name=\"Sum of A\" fld=\"0\" baseField=\"1\" baseItem=\"0\"/></dataFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "<location ref=\"B2:C7\"") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "<rowFields count=\"1\"><field x=\"1\"/></rowFields>") != null);
+    // K4b: the row axis; a surviving baseField naming the ordinal.
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, s7c_multi_data, .{ .remove = 1 }));
+    const based = try replacedOnce(arena, s7c_multi_data, "fld=\"0\" baseField=\"1\"", "fld=\"0\" baseField=\"2\"");
+    try testing.expectError(error.PivotSourceEditUnsafe, edit.applyConsumerSchemaEdit(arena, based, .{ .remove = 2 }));
+    // The K4a gates refuse rather than heal what the layout's own
+    // checks would refuse on (the S7C-MUT-1 rule) — and only the K4a
+    // path reads them: the unreferenced ordinal 3 narrows no axis and
+    // still lifts, the layout refusing the part later on its own.
+    const lying_count = try replacedOnce(arena, s7c_multi_data, "<colItems count=\"3\">", "<colItems count=\"4\">");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, lying_count, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, lying_count, .{ .remove = 3 });
+    const attributed = try replacedOnce(arena, s7c_multi_data, "<colItems count=\"3\">", "<colItems count=\"3\" grandTotalCaption=\"x\">");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, attributed, .{ .remove = 0 }));
+    const shuffled = try replacedOnce(arena, s7c_multi_data, "<i i=\"1\"><x v=\"1\"/></i>", "<i i=\"1\"><x v=\"2\"/></i>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, shuffled, .{ .remove = 0 }));
+    const wide = try replacedOnce(arena, s7c_multi_data, "ref=\"B2:E7\"", "ref=\"B2:F7\"");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wide, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, wide, .{ .remove = 3 });
 }
 
 test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
@@ -8280,4 +8450,8 @@ test "S7c: an allocation failure anywhere in a schema rebuild or the consumer re
     };
     try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &grown, rec, .{ .insert = .{ .at = 1, .name = "Column4" } } });
     try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ o.pivots.tables[0].raw_xml, .{ .insert = .{ .at = 1, .name = "Column4" } } });
+    // The K4a drop allocates down its own paths — the re-enumerated
+    // values axis, the narrowed location, the collapse (S7c-2).
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ s7c_multi_data, .{ .remove = 0 } });
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ s7c_multi_data, .{ .remove = 2 } });
 }

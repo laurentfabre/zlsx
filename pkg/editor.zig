@@ -10828,3 +10828,172 @@ test "S7c: corpus — deleting an unreferenced mtcars column leaves every render
         try expectHostCell(&wb, 3, "D5", .{ .number = 5.4240000000000004 });
     }
 }
+
+test "S7c-2: K4a on the fixture — deleting a data-field column drops its dataField, collapses the values axis to the survivor and narrows the location" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7c2_fix_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7c2_fix_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    // Grow the fixture's consumer to two data fields: `Price`
+    // (ordinal 2) joins `Qty` on the values axis, which moves onto
+    // the columns as Excel spells >= 2 data fields.
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<pivotField showAll=\"0\"/></pivotFields>", "<pivotField dataField=\"1\" showAll=\"0\"/></pivotFields>");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<location ref=\"A3:B6\"", "<location ref=\"A3:C6\"");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<colItems count=\"1\"><i/></colItems>", "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>");
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>", "<dataFields count=\"2\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Sum of Price\" fld=\"2\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+    {
+        // Delete `Price`'s column: its data field drops, `Sum of Qty`
+        // survives alone, the values axis leaves the columns.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(io, dst);
+    }
+    {
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "sheet=\"Data\" ref=\"A1:B4\"");
+        try expectPartHas(&store, "xl/pivotCache/pivotCacheDefinition1.xml", "<cacheFields count=\"2\">");
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition1.xml", true);
+        try expectPartHas(&store, pt_part, "<pivotFields count=\"2\">");
+        try expectPartHas(&store, pt_part, "<colItems count=\"1\"><i/></colItems>");
+        try expectPartHas(&store, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Qty\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+        try expectPartHas(&store, pt_part, "<location ref=\"A3:B6\"");
+        const pt = (try store.part(pt_part)).?;
+        try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "<colFields") == null);
+        try std.testing.expect(std.mem.indexOf(u8, pt.bytes, "Price") == null);
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 1, "A3", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 1, "B3", .{ .text = "Sum of Qty" });
+        try expectHostCell(&wb, 1, "B4", .{ .number = 8 });
+        try expectHostCell(&wb, 1, "B5", .{ .number = 4 });
+        try expectHostCell(&wb, 1, "A6", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 1, "B6", .{ .number = 12 });
+        try expectHostCell(&wb, 1, "C3", .none);
+        try expectHostCell(&wb, 1, "C6", .none);
+    }
+    {
+        // The other ordering: delete `Qty`'s column — the SECOND data
+        // field survives, its `fld` decrementing into the vacancy.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 2);
+        try ed.save(io, dst);
+    }
+    var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+    defer store.deinit();
+    try expectPartHas(&store, pt_part, "<dataFields count=\"1\"><dataField name=\"Sum of Price\" fld=\"1\" baseField=\"0\" baseItem=\"0\"/></dataFields>");
+    try expectPartHas(&store, pt_part, "<location ref=\"A3:B6\"");
+    var wb = try Workbook.open(std.testing.allocator, io, dst);
+    defer wb.deinit();
+    try expectHostCell(&wb, 1, "B3", .{ .text = "Sum of Price" });
+    try expectHostCell(&wb, 1, "B4", .{ .number = 5 });
+    try expectHostCell(&wb, 1, "B5", .{ .number = 2.5 });
+    try expectHostCell(&wb, 1, "B6", .{ .number = 7.5 });
+    try expectHostCell(&wb, 1, "C3", .none);
+}
+
+test "S7c-2: corpus — deleting a referenced mtcars column drops its values column; the vacated host cells clear, the survivors are Excel's to the bit" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, src, .{}) catch return error.SkipZigTest;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const dst = try tt.path(std.testing.allocator, io, "s7c2_corpus_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    const dst2 = try tt.path(std.testing.allocator, io, "s7c2_corpus_dst2.xlsx");
+    defer std.testing.allocator.free(dst2);
+    {
+        // `mpg` (ordinal 0, sheet column A) backs `Average of mpg`:
+        // the drop leaves `Min of wt` / `Max of wt`, every ordinal
+        // decrementing — the row axis 1 -> 0, `wt` 5 -> 4, every
+        // `baseField` 1 -> 0 — and the location narrows A1:D5 -> A1:C5.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(2, 1);
+        try ed.save(io, dst);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst);
+        defer store.deinit();
+        const cd = (try store.part("xl/pivotCache/pivotCacheDefinition2.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<cacheFields count=\"10\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "name=\"mpg\"") == null);
+        try expectMarked(&store, "xl/pivotCache/pivotCacheDefinition2.xml", true);
+        const pt2 = (try store.part("xl/pivotTables/pivotTable2.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<pivotFields count=\"10\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "Average of mpg") == null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<dataFields count=\"2\"><dataField name=\"Min of wt\" fld=\"4\" subtotal=\"min\" baseField=\"0\" baseItem=\"0\"/><dataField name=\"Max of wt\" fld=\"4\" subtotal=\"max\" baseField=\"0\" baseItem=\"0\"/></dataFields>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<rowFields count=\"1\"><field x=\"0\"/></rowFields>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colFields count=\"1\"><field x=\"-2\"/></colFields>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colItems count=\"2\"><i><x/></i><i i=\"1\"><x v=\"1\"/></i></colItems>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<location ref=\"A1:C5\"") != null);
+        // The surviving 15 cells are the corpus' own `wt` columns,
+        // shifted one left; the vacated `D` column clears.
+        var wb = try Workbook.open(std.testing.allocator, io, dst);
+        defer wb.deinit();
+        try expectHostCell(&wb, 3, "A1", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 3, "B1", .{ .text = "Min of wt" });
+        try expectHostCell(&wb, 3, "C1", .{ .text = "Max of wt" });
+        try expectHostCell(&wb, 3, "A2", .{ .number = 4 });
+        try expectHostCell(&wb, 3, "B2", .{ .number = 1.5129999999999999 });
+        try expectHostCell(&wb, 3, "C2", .{ .number = 3.15 });
+        try expectHostCell(&wb, 3, "A3", .{ .number = 6 });
+        try expectHostCell(&wb, 3, "B3", .{ .number = 2.62 });
+        try expectHostCell(&wb, 3, "C3", .{ .number = 3.44 });
+        try expectHostCell(&wb, 3, "A4", .{ .number = 8 });
+        try expectHostCell(&wb, 3, "B4", .{ .number = 3.17 });
+        try expectHostCell(&wb, 3, "C4", .{ .number = 5.4240000000000004 });
+        try expectHostCell(&wb, 3, "A5", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 3, "B5", .{ .number = 1.5129999999999999 });
+        try expectHostCell(&wb, 3, "C5", .{ .number = 5.4240000000000004 });
+        try expectHostCell(&wb, 3, "D1", .none);
+        try expectHostCell(&wb, 3, "D2", .none);
+        try expectHostCell(&wb, 3, "D3", .none);
+        try expectHostCell(&wb, 3, "D4", .none);
+        try expectHostCell(&wb, 3, "D5", .none);
+    }
+    {
+        // `wt` (ordinal 5, sheet column F) backs TWO data fields: both
+        // drop at once, `Average of mpg` survives alone, the values
+        // axis leaves the columns and the location narrows by two.
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(2, 6);
+        try ed.save(io, dst2);
+        var store = try store_mod.PartStore.open(std.testing.allocator, io, dst2);
+        defer store.deinit();
+        const cd = (try store.part("xl/pivotCache/pivotCacheDefinition2.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "<cacheFields count=\"10\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "name=\"wt\"") == null);
+        const pt2 = (try store.part("xl/pivotTables/pivotTable2.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<dataFields count=\"1\"><dataField name=\"Average of mpg\" fld=\"0\" subtotal=\"average\" baseField=\"1\" baseItem=\"0\"/></dataFields>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colFields") == null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<colItems count=\"1\"><i/></colItems>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<location ref=\"A1:B5\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "<rowFields count=\"1\"><field x=\"1\"/></rowFields>") != null);
+        var wb = try Workbook.open(std.testing.allocator, io, dst2);
+        defer wb.deinit();
+        try expectHostCell(&wb, 3, "A1", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 3, "B1", .{ .text = "Average of mpg" });
+        try expectHostCell(&wb, 3, "A2", .{ .number = 4 });
+        try expectHostCell(&wb, 3, "B2", .{ .number = 26.890000000000004 });
+        try expectHostCell(&wb, 3, "A3", .{ .number = 6 });
+        try expectHostCell(&wb, 3, "B3", .{ .number = 20.016666666666666 });
+        try expectHostCell(&wb, 3, "A4", .{ .number = 8 });
+        try expectHostCell(&wb, 3, "B4", .{ .number = 15.161538461538463 });
+        try expectHostCell(&wb, 3, "A5", .{ .text = "Grand Total" });
+        try expectHostCell(&wb, 3, "B5", .{ .number = 20.210344827586205 });
+        try expectHostCell(&wb, 3, "C1", .none);
+        try expectHostCell(&wb, 3, "C5", .none);
+        try expectHostCell(&wb, 3, "D1", .none);
+        try expectHostCell(&wb, 3, "D5", .none);
+    }
+}

@@ -6483,8 +6483,8 @@ pub const Workbook = struct {
             // references it refuses, K4a), the inserted one in — and
             // the layout then reads the rewritten bytes against the
             // effective schema, as any consumer is read.
+            const b0 = table_bytes[i] orelse t.raw_xml;
             const base = blk: {
-                const b0 = table_bytes[i] orelse t.raw_xml;
                 const se = schemas[ci] orelse break :blk b0;
                 break :blk pivots_mod.edit.applyConsumerSchemaEdit(arena, b0, se) catch |e| return mapPivotEditError(e);
             };
@@ -6497,7 +6497,18 @@ pub const Workbook = struct {
             const merges = try self.hostMerges(arena, t.sheet_idx, map);
             const cache_view = try schemaCacheView(arena, &p.caches[ci], schemas[ci]);
             const captions = try self.hostCaptions(arena, base, cache_view, &grid);
-            const lay = pivots_mod.engine.layout(arena, base, cache_view, rb, captions) catch |e| return mapEngineError(e);
+            var lay = pivots_mod.engine.layout(arena, base, cache_view, rb, captions) catch |e| return mapEngineError(e);
+            // S7c-2 (K4a): a data-field drop narrows `location@ref`
+            // before the layout reads it, so `lay.old_rect` no longer
+            // covers the vanished values column(s) — but their host
+            // cells still hold Excel's, and the clear must reach them.
+            // The pre-schema part (b0 — post-S7a-move, so post-edit
+            // sheet coordinates) declares the rectangle the cells
+            // still fill.
+            if (schemas[ci] != null) {
+                const pre = pivots_mod.edit.footprintOfBytes(arena, b0) catch |e| return mapPivotEditError(e);
+                if (pre.rect.br_col > lay.old_rect.br_col) lay.old_rect.br_col = pre.rect.br_col;
+            }
             try self.refuseOverOtherPivots(arena, &p, i, lay.rect, table_bytes);
             table_bytes[i] = lay.table_xml;
             try self.planPivotHostWrite(prepared, t, lay, &grid, merges);
