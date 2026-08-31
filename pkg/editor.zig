@@ -10393,6 +10393,10 @@ test "S7c: a defined-name source narrows through its body on an interior column;
     {
         var ed = try Editor.open(std.testing.allocator, io, src);
         defer ed.deinit();
+        // The LAST column refuses on the repointed fixture too — both
+        // the endpoint dry-run (`$C` would spell `#REF!`) and the K4
+        // reference (fld=2) pin it (Codex #208 r3 MNT-302).
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
         try ed.deleteColumn(0, 2);
         try ed.save(io, dst);
     }
@@ -10498,41 +10502,70 @@ test "S7c: the v1 presence gates — a slicer or timeline cache in the package, 
     }
 }
 
+/// After a failed edit: either nothing installed and a save
+/// reproduces the input byte for byte, or the model is torn and the
+/// save refuses — a tear never ships (Codex #208 r2 REL-201; the
+/// whole-edit staging is the follow-up).
+fn tearContractAfterFailedEdit(ed: *Editor, allocator: std.mem.Allocator, baseline: []const u8, err: anyerror) anyerror {
+    if (err != error.OutOfMemory) return err;
+    const out = ed.saveToOwnedBuffer(allocator) catch |se| switch (se) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StructuralEditIncomplete => {
+            // Torn: every OTHER structural mutation refuses too
+            // (Codex #208 r3 REL-303).
+            std.testing.expectError(error.StructuralEditIncomplete, ed.renameSheet(0, "Torn")) catch |e| return e;
+            return error.OutOfMemory;
+        },
+        else => return se,
+    };
+    defer allocator.free(out);
+    std.testing.expectEqualStrings(baseline, out) catch |e| return e;
+    return error.OutOfMemory;
+}
+
 fn fullColEditForFailures(allocator: std.mem.Allocator, io: std.Io, path: []const u8, baseline: []const u8) !void {
     var ed = try Editor.open(allocator, io, path);
     defer ed.deinit();
-    ed.deleteColumn(0, 3) catch |err| {
-        if (err != error.OutOfMemory) return err;
-        // After a failed edit: either nothing installed and a save
-        // reproduces the input byte for byte, or the model is torn
-        // and the save refuses — a tear never ships (Codex #208 r2
-        // REL-201; the whole-edit staging is the follow-up).
-        const out = ed.saveToOwnedBuffer(allocator) catch |se| switch (se) {
-            error.OutOfMemory, error.StructuralEditIncomplete => return error.OutOfMemory,
-            else => return se,
-        };
-        defer allocator.free(out);
-        try std.testing.expectEqualStrings(baseline, out);
-        return error.OutOfMemory;
-    };
+    ed.deleteColumn(0, 3) catch |err| return tearContractAfterFailedEdit(&ed, allocator, baseline, err);
 }
 
-test "S7c: a K3 edit under injected allocation failure never ships a tear — untouched bytes, or a save that refuses (Codex #208 r2 REL-201)" {
+fn fullK2EditForFailures(allocator: std.mem.Allocator, io: std.Io, path: []const u8, baseline: []const u8) !void {
+    var ed = try Editor.open(allocator, io, path);
+    defer ed.deinit();
+    ed.insertColumn(0, 2) catch |err| return tearContractAfterFailedEdit(&ed, allocator, baseline, err);
+}
+
+test "S7c: K3 and K2 edits under injected allocation failure never ship a tear — untouched bytes, or a save that refuses (Codex #208 r2 REL-201, r3 MNT-302)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const src = try tt.path(std.testing.allocator, io, "s7c_oom_full.xlsx");
-    defer std.testing.allocator.free(src);
-    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
-    const baseline = blk: {
-        var ed0 = try Editor.open(std.testing.allocator, io, src);
-        defer ed0.deinit();
-        break :blk try ed0.saveToOwnedBuffer(std.testing.allocator);
-    };
-    defer std.testing.allocator.free(baseline);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, fullColEditForFailures, .{ io, src, baseline });
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7c_oom_full.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        const baseline = blk: {
+            var ed0 = try Editor.open(std.testing.allocator, io, src);
+            defer ed0.deinit();
+            break :blk try ed0.saveToOwnedBuffer(std.testing.allocator);
+        };
+        defer std.testing.allocator.free(baseline);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, fullColEditForFailures, .{ io, src, baseline });
+    }
+    {
+        const src = try tt.path(std.testing.allocator, io, "s7c_oom_k2.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .table_name);
+        try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, "xl/tables/table1.xml", "ref=\"A1:C4\" totalsRowShown=\"0\"", "ref=\"A2:C4\" headerRowCount=\"0\" totalsRowShown=\"0\"");
+        const baseline = blk: {
+            var ed0 = try Editor.open(std.testing.allocator, io, src);
+            defer ed0.deinit();
+            break :blk try ed0.saveToOwnedBuffer(std.testing.allocator);
+        };
+        defer std.testing.allocator.free(baseline);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, fullK2EditForFailures, .{ io, src, baseline });
+    }
 }
 
 test "S7c: a nameless data field's caption reads the effective schema — the reduced spines align (in-house S7C-T2)" {
@@ -10681,9 +10714,27 @@ test "S7c: corpus — deleting an unreferenced mtcars column leaves every render
         try std.testing.expect(std.mem.indexOf(u8, cd.bytes, "name=\"qsec\"") == null);
         const pt2 = (try store.part("xl/pivotTables/pivotTable2.xml")).?;
         try std.testing.expect(std.mem.indexOf(u8, pt2.bytes, "name=\"Min of wt\" fld=\"4\"") != null);
+        // The full 20-cell oracle again on the twice-narrowed result
+        // (Codex #208 r3 MNT-302).
         var wb = try Workbook.open(std.testing.allocator, io, dst2);
         defer wb.deinit();
+        try expectHostCell(&wb, 3, "A1", .{ .text = "Row Labels" });
+        try expectHostCell(&wb, 3, "B1", .{ .text = "Average of mpg" });
+        try expectHostCell(&wb, 3, "C1", .{ .text = "Min of wt" });
+        try expectHostCell(&wb, 3, "D1", .{ .text = "Max of wt" });
+        try expectHostCell(&wb, 3, "A2", .{ .number = 4 });
         try expectHostCell(&wb, 3, "B2", .{ .number = 26.890000000000004 });
+        try expectHostCell(&wb, 3, "C2", .{ .number = 1.5129999999999999 });
+        try expectHostCell(&wb, 3, "D2", .{ .number = 3.15 });
+        try expectHostCell(&wb, 3, "A3", .{ .number = 6 });
+        try expectHostCell(&wb, 3, "B3", .{ .number = 20.016666666666666 });
+        try expectHostCell(&wb, 3, "C3", .{ .number = 2.62 });
+        try expectHostCell(&wb, 3, "D3", .{ .number = 3.44 });
+        try expectHostCell(&wb, 3, "A4", .{ .number = 8 });
+        try expectHostCell(&wb, 3, "B4", .{ .number = 15.161538461538463 });
+        try expectHostCell(&wb, 3, "C4", .{ .number = 3.17 });
+        try expectHostCell(&wb, 3, "D4", .{ .number = 5.4240000000000004 });
+        try expectHostCell(&wb, 3, "A5", .{ .text = "Grand Total" });
         try expectHostCell(&wb, 3, "B5", .{ .number = 20.210344827586205 });
         try expectHostCell(&wb, 3, "C5", .{ .number = 1.5129999999999999 });
         try expectHostCell(&wb, 3, "D5", .{ .number = 5.4240000000000004 });

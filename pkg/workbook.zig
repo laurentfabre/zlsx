@@ -3559,7 +3559,7 @@ pub const Workbook = struct {
     /// the typed views those bytes made stale.
     fn applySavePlans(self: *Workbook) Error!void {
         // A torn model must not ship (Codex #208 r2 REL-201).
-        if (self.torn_edit) return error.StructuralEditIncomplete;
+        try self.requireCompleteStructuralState();
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
         // plan. Today the only axis is staged defined names — splice
         // them into `xl/workbook.xml` BEFORE the SST + per-sheet
@@ -4814,6 +4814,7 @@ pub const Workbook = struct {
     /// pointing at the renamed sheet are likewise unaltered. A future
     /// iter (`m3-defnames-hyperlinks`) covers both.
     pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
+        try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         try validateSheetName(new_name);
         try self.assertSheetNameAvailable(sheet_idx, new_name);
@@ -4915,6 +4916,7 @@ pub const Workbook = struct {
         old_name: []const u8,
         new_name: []const u8,
     ) Error!u32 {
+        try self.requireCompleteStructuralState();
         if (table_name.len == 0) return error.TableNotFound;
 
         // Step 1: locate the table part and its host sheet.
@@ -5080,6 +5082,7 @@ pub const Workbook = struct {
     }
 
     pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
+        try self.requireCompleteStructuralState();
         try validateSheetName(name);
         if (self.worksheets.len >= std.math.maxInt(u32)) return error.TooManySheets;
         // Workbook view stores sheet names as raw attribute bytes —
@@ -5630,6 +5633,7 @@ pub const Workbook = struct {
     ///     the on-wire bytes don't match the parsed view (file
     ///     mutated under us between parse and patch).
     pub fn deleteSheet(self: *Workbook, sheet_idx: u32) Error!void {
+        try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         if (self.sheetCount() == 1) return error.LastSheetUndeletable;
         // Pre-condition: the slot table and the parsed view agree on
@@ -5889,15 +5893,23 @@ pub const Workbook = struct {
         try self.applySheetEditTransform(sheet_idx, spec, prepared);
     }
 
-    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
+    /// The torn-edit gate every structural mutation, pivot preflight
+    /// and save passes first (Codex #208 r2 REL-201, r3 REL-303).
+    fn requireCompleteStructuralState(self: *const Workbook) Error!void {
         if (self.torn_edit) return error.StructuralEditIncomplete;
+    }
+
+    fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
+        try self.requireCompleteStructuralState();
         // A failure once anything has installed leaves the model
         // between phases: poisoned, so no save or further edit ships
         // the tear (Codex #208 r2 REL-201). A failure before the
-        // first install poisons nothing — the mutation counter tells
-        // the two apart.
-        const mutations_before = self.store.mutations;
-        errdefer if (self.store.mutations != mutations_before) {
+        // first COMMITTED install poisons nothing — `store.installs`
+        // counts commit points, where `mutations` counts attempts
+        // (Codex #208 r3 REL-301: an attempt that failed in its own
+        // staging left the store unchanged).
+        const installs_before = self.store.installs;
+        errdefer if (self.store.installs != installs_before) {
             self.torn_edit = true;
         };
         // One axis, exactly: a spec naming neither would unwrap
@@ -6279,6 +6291,7 @@ pub const Workbook = struct {
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
     ) Error!PreparedPivotEdits {
+        try self.requireCompleteStructuralState();
         var prepared: PreparedPivotEdits = .{
             .owner = self,
             .mutations = self.store.mutations,
@@ -6581,6 +6594,14 @@ pub const Workbook = struct {
 
     fn refuseSchemaEditGates(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize, cands: *?std.ArrayListUnmanaged(AttachmentCand)) Error!void {
         if (cands.* == null) cands.* = try self.attachmentCandidates(arena);
+        // The edited cache's consumer names, folded ONCE; an
+        // unfoldable name matches everything — the refusing direction
+        // (Codex #208 r3 PERF-301).
+        var consumer_folds: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        for (p.tables) |t| {
+            if ((t.cache orelse continue) != ci) continue;
+            try consumer_folds.append(arena, try pivots_mod.foldedPivotName(arena, t.name));
+        }
         for (cands.*.?.items) |c| {
             const part = (try self.store.part(c.part)) orelse return error.PivotEditUnsafe;
             const names = pivots_mod.attachedPivotNames(arena, part.bytes, c.kind) catch |e| switch (e) {
@@ -6588,9 +6609,11 @@ pub const Workbook = struct {
                 else => return error.PivotEditUnsafe,
             };
             for (names) |n| {
-                for (p.tables) |t| {
-                    if ((t.cache orelse continue) != ci) continue;
-                    if (try pivots_mod.pivotNamesMatch(arena, n, t.name)) return error.PivotEditUnsafe;
+                const fn_ = try pivots_mod.foldedPivotName(arena, n);
+                for (consumer_folds.items) |cf| {
+                    const a_fold = fn_ orelse return error.PivotEditUnsafe;
+                    const b_fold = cf orelse return error.PivotEditUnsafe;
+                    if (std.mem.eql(u8, a_fold, b_fold)) return error.PivotEditUnsafe;
                 }
             }
         }

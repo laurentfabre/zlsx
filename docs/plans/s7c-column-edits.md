@@ -159,7 +159,13 @@ Everything else inside → the per-case refusal, each with its own test.
 
 ### What the K3 lift writes
 
-One transaction, the S7b sweep's existing all-or-nothing `replaceParts`:
+The pivot parts — cache definition, records, every consumer — install in one
+all-or-nothing `replaceParts` batch, the S7b sweep's; the table, defined-name,
+sheet and host-write phases install separately after it, as they always have.
+A failure between phases poisons the in-memory workbook (`torn_edit` →
+`StructuralEditIncomplete` on every save and further structural edit — Codex
+#208 r2/r3), so a tear cannot ship; the whole-edit staging that would make
+the phases one transaction is the documented follow-up. The pivot batch:
 
 - **the source coordinate**: `worksheetSource@ref` shrinks by the shipped
   range semantics (the refusal arm in `shiftSourceRect` becomes a caller

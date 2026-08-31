@@ -870,22 +870,17 @@ pub fn attachedPivotNames(arena: Allocator, xml: []const u8, kind: AttachmentKin
     return out.toOwnedSlice(arena);
 }
 
-/// Do two decoded pivot-table names name one pivot? Excel keeps them
-/// unique case-insensitively, so the collation fold compares them; a
-/// name the fold refuses matches everything — the caller's refusal is
-/// the safe answer.
-pub fn pivotNamesMatch(a: Allocator, x: []const u8, y: []const u8) error{OutOfMemory}!bool {
-    const fx = (fold(a, x) catch |e| switch (e) {
+/// A decoded pivot-table name under the collation fold Excel compares
+/// them with (unique case-insensitively) — folded ONCE by the caller
+/// and matched with `std.mem.eql`, so a gate over N attachment names
+/// and M consumers folds N + M times, not N × M (Codex #208 r3
+/// PERF-301). Null when the fold cannot spell the name: the caller
+/// treats it as matching everything, the refusing direction.
+pub fn foldedPivotName(a: Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {
+    return fold(a, name) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return true,
-    }) orelse return true;
-    defer a.free(fx);
-    const fy = (fold(a, y) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return true,
-    }) orelse return true;
-    defer a.free(fy);
-    return std.mem.eql(u8, fx, fy);
+        else => return null,
+    };
 }
 
 fn spell(a: Allocator, ws: pivot_xml.WorksheetSource) Error!SourceSpelling {
@@ -8200,16 +8195,16 @@ test "S7c engine: cache-side tolerated-unread content refuses a schema edit — 
     _ = try engine.rebuildWith(arena, cache, &keep, rec, null, .{ .remove = 1 });
 }
 
-fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8) !void {
+fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8, schema: edit.SchemaEdit) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    _ = try engine.rebuildWith(arena_state.allocator(), cache, rows, rec, null, .{ .remove = 2 });
+    _ = try engine.rebuildWith(arena_state.allocator(), cache, rows, rec, null, schema);
 }
 
-fn consumerSchemaForFailures(allocator: Allocator, table_xml: []const u8) !void {
+fn consumerSchemaForFailures(allocator: Allocator, table_xml: []const u8, schema: edit.SchemaEdit) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    _ = try edit.applyConsumerSchemaEdit(arena_state.allocator(), table_xml, .{ .remove = 2 });
+    _ = try edit.applyConsumerSchemaEdit(arena_state.allocator(), table_xml, schema);
 }
 
 test "S7c: an allocation failure anywhere in a schema rebuild or the consumer rewrite is OutOfMemory, never a refusal (in-house S7C-MUT-4)" {
@@ -8230,6 +8225,16 @@ test "S7c: an allocation failure anywhere in a schema rebuild or the consumer re
         &.{ .{ .string = "West" }, .{ .number = "4" } },
         &.{ .{ .string = "East" }, .{ .number = "5" } },
     };
-    try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &rows, rec });
-    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{o.pivots.tables[0].raw_xml});
+    try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &rows, rec, .{ .remove = 2 } });
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ o.pivots.tables[0].raw_xml, .{ .remove = 2 } });
+    // The K2 insert allocates down its own paths — the fresh cache
+    // field, the blank inventory, the bare pivotField, the inserted
+    // spines (Codex #208 r3 MNT-302).
+    const grown = [_]engine.Row{
+        &.{ .{ .string = "East" }, .blank, .{ .number = "3" }, .{ .number = "1.5" } },
+        &.{ .{ .string = "West" }, .blank, .{ .number = "4" }, .{ .number = "2.5" } },
+        &.{ .{ .string = "East" }, .blank, .{ .number = "5" }, .{ .number = "3.5" } },
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &grown, rec, .{ .insert = .{ .at = 1, .name = "Column4" } } });
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{ o.pivots.tables[0].raw_xml, .{ .insert = .{ .at = 1, .name = "Column4" } } });
 }
