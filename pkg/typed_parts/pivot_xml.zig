@@ -799,6 +799,12 @@ pub const TableDefinition = struct {
     chart_formats_count: ?u32 = null,
     chart_formats_count_span: ?Span = null,
     chart_formats_multi: bool = false,
+    /// The wrapper carries what this reader cannot classify — an
+    /// attribute besides `count`, a `count` that does not read as a
+    /// number. The S7c-2 rewrite refuses it (an emptied wrapper is
+    /// deleted WHOLE — Codex #210 r4 REL-402); every other reader
+    /// tolerates it as before.
+    chart_formats_other: bool = false,
     chart_format_values_refs: []ChartFormatRef = &.{},
     has_ext_lst: bool = false,
     /// The first root `<extLst>`'s `<` position — where S7c's
@@ -957,8 +963,18 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
                 .none;
             if (def.chart_formats_span == null) {
                 def.chart_formats_span = .{ .start = k.hit.open_lt, .end = k.after };
+                var cfa: AttrIter = .{ .attrs = k.attrs(xml) };
+                while (cfa.next()) |a| {
+                    if (!std.mem.eql(u8, a.name, "count")) def.chart_formats_other = true;
+                }
                 if (wbxml.getAttr(k.attrs(xml), "count")) |v| {
-                    def.chart_formats_count = try u32Attr(k.attrs(xml), "count");
+                    // A count that does not read is K4a's problem
+                    // alone — the shared view stays tolerant of it
+                    // (Codex #210 r4 REL-401).
+                    def.chart_formats_count = u32Attr(k.attrs(xml), "count") catch blk: {
+                        def.chart_formats_other = true;
+                        break :blk null;
+                    };
                     def.chart_formats_count_span = spanOf(xml, v);
                 }
                 if (cf == .values_only) def.chart_format_values_refs = try chartFormatValuesRefs(allocator, xml, k, p);
@@ -1220,15 +1236,27 @@ fn chartFormatValuesRefs(allocator: Allocator, xml: []const u8, el: Child, p: []
                             if (!std.mem.eql(u8, a.name, "v")) ref.canonical = false;
                         }
                         if (!x.hit.self_closing and !isBlank(xml[x.hit.after_tag_close..x.end])) ref.canonical = false;
-                        ref.index = (try u32Attr(xa, "v")) orelse 0;
+                        // A scalar that does not read is K4a's problem
+                        // alone — the shared view stays tolerant of it
+                        // (Codex #210 r4 REL-401).
+                        ref.index = (u32Attr(xa, "v") catch blk: {
+                            ref.canonical = false;
+                            break :blk null;
+                        }) orelse 0;
                         if (wbxml.getAttr(xa, "v")) |v| ref.v_span = spanOf(xml, v);
                     }
                     if (inner.skipped > 0 or inner.other) ref.canonical = false;
-                    if (try u32Attr(r.attrs(xml), "count")) |c| {
+                    if (u32Attr(r.attrs(xml), "count") catch blk: {
+                        ref.canonical = false;
+                        break :blk null;
+                    }) |c| {
                         if (c != x_here) ref.canonical = false;
                     }
                 }
-                if (try u32Attr(rb.attrs(xml), "count")) |c| {
+                if (u32Attr(rb.attrs(xml), "count") catch blk: {
+                    ref.canonical = false;
+                    break :blk null;
+                }) |c| {
                     if (c != n_here) ref.canonical = false;
                 }
             }

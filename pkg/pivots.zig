@@ -2678,8 +2678,12 @@ pub const edit = struct {
     ) EditError!void {
         // Multiplicity first: a trailing element could have folded the
         // classification down while the first element's blocks are the
-        // ones going stale (Codex #210 r2 REL-202).
+        // ones going stale (Codex #210 r2 REL-202). A wrapper carrying
+        // what the reader cannot classify — a stray attribute, a count
+        // that does not read — refuses too: the emptied arm below
+        // deletes it whole (Codex #210 r4 REL-402/401).
         if (def.chart_formats_multi) return error.PivotShapeUnsupported;
+        if (def.chart_formats_other) return error.PivotShapeUnsupported;
         if (def.chart_formats != .values_only) return;
         const refs = def.chart_format_values_refs;
         if (def.chart_formats_count) |n| {
@@ -8495,6 +8499,22 @@ test "S7c-2 edit: values-only chartFormats move with the data-field drop — rem
     // one-block-one-index shape (Codex #210 r2 REL-203).
     const two_wrappers = try replacedOnce(arena, s7c_multi_data_charts, "fieldPosition=\"0\"><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>", "fieldPosition=\"0\"><references count=\"0\"/><references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_wrappers, .{ .remove = 0 }));
+    // A wrapper attribute the reader does not classify would be
+    // erased by the emptied arm's whole-element delete; a scalar that
+    // does not read as a number is K4a's problem alone — the shared
+    // typed view must stay tolerant of both (Codex #210 r4
+    // REL-402/401).
+    const cf_attr2 = try replacedOnce(arena, s7c_multi_data_charts, "<chartFormats count=\"3\">", "<chartFormats count=\"3\" foo=\"x\">");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_attr2, .{ .remove = 0 }));
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_attr2, .{ .remove = 2 }));
+    const cnt_bad = try replacedOnce(arena, s7c_multi_data_charts, "<chartFormats count=\"3\">", "<chartFormats count=\"bad\">");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cnt_bad, .{ .remove = 0 }));
+    const refs_bad = try replacedOnce(arena, s7c_multi_data_charts, "<references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>", "<references count=\"bad\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, refs_bad, .{ .remove = 0 }));
+    const ref_bad = try replacedOnce(arena, s7c_multi_data_charts, "<reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/>", "<reference field=\"4294967294\" count=\"bad\" selected=\"0\"><x v=\"1\"/>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, ref_bad, .{ .remove = 0 }));
+    const x_bad = try replacedOnce(arena, s7c_multi_data_charts, "<x v=\"1\"/></reference>", "<x v=\"bad\"/></reference>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, x_bad, .{ .remove = 0 }));
     // Two pivotArea children, or two reference children in one
     // wrapper, are not one-block-one-index either (Codex #210 r3
     // MNT-301).
@@ -8503,11 +8523,14 @@ test "S7c-2 edit: values-only chartFormats move with the data-field drop — rem
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_areas, .{ .remove = 0 }));
     const two_refs = try replacedOnce(arena, s7c_multi_data_charts, "<references count=\"1\"><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/></reference>", "<references count=\"2\"><reference field=\"4294967294\" count=\"0\" selected=\"0\"/><reference field=\"4294967294\" count=\"1\" selected=\"0\"><x v=\"1\"/></reference>");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, two_refs, .{ .remove = 0 }));
-    // The K3 path reads none of it — the same shapes lift untouched.
-    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying, trailing, two_wrappers, two_areas, two_refs }) |src| {
+    // The K3 path reads none of it — the same shapes lift untouched,
+    // the tolerated bytes preserved.
+    for ([_][]const u8{ s7c_multi_data_charts, two_x, dangling, lying, trailing, two_wrappers, two_areas, two_refs, cf_attr2, cnt_bad, refs_bad, ref_bad, x_bad }) |src| {
         const k3 = try edit.applyConsumerSchemaEdit(arena, src, .{ .remove = 3 });
         try testing.expect(std.mem.indexOf(u8, k3, "<x v=\"2\"/>") != null or std.mem.indexOf(u8, k3, "<x v=\"9\"/>") != null);
     }
+    const k3_attr = try edit.applyConsumerSchemaEdit(arena, cf_attr2, .{ .remove = 3 });
+    try testing.expect(std.mem.indexOf(u8, k3_attr, "foo=\"x\"") != null);
     // A wrapper count that lies about its children is evidence, kept:
     // `colFields` and `dataFields` set the same flag the layout
     // refuses on, before any splice could heal it (Codex #210 r2
