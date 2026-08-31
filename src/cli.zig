@@ -50,6 +50,16 @@ const Subcommand = enum {
     pivots,
     styles,
     sst,
+    /// S3b: merged ranges — one record per `<mergeCell>` across the
+    /// selected sheets. Book route; the validations / hyperlinks
+    /// family (range-keyed, every sheet by default).
+    merges,
+    /// S3b: defined names — one record per `<definedName>` of
+    /// `xl/workbook.xml`, document order. Package-layer route like
+    /// `pivots` (the reader-only Book has no workbook.xml view);
+    /// a concrete sheet selector narrows to the names SCOPED to that
+    /// sheet and suppresses workbook-scope names.
+    defined_names,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
@@ -313,6 +323,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "pivots")) return .pivots;
         if (std.mem.eql(u8, a, "styles")) return .styles;
         if (std.mem.eql(u8, a, "sst")) return .sst;
+        if (std.mem.eql(u8, a, "merges")) return .merges;
+        if (std.mem.eql(u8, a, "defined-names")) return .defined_names;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -423,7 +435,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .styles,
         .sst,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -659,6 +671,8 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "pivots") or
                     std.mem.eql(u8, a, "styles") or
                     std.mem.eql(u8, a, "sst") or
+                    std.mem.eql(u8, a, "merges") or
+                    std.mem.eql(u8, a, "defined-names") or
                     std.mem.eql(u8, a, "append-rows") or
                     std.mem.eql(u8, a, "set-cell") or
                     std.mem.eql(u8, a, "insert-row") or
@@ -687,7 +701,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -699,7 +713,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -731,7 +745,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -740,7 +754,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -863,8 +877,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  --skip N          drop the first N emitted records (iter59a).
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
-        \\                    hyperlinks / pivots / styles / sst. Ignored by meta
-        \\                    and list-sheets.
+        \\                    hyperlinks / pivots / merges / defined-names /
+        \\                    styles / sst. Ignored by meta and list-sheets.
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
         \\  --start-row R     (iter59b) 1-based OOXML row; drop records
@@ -872,7 +886,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    sheet's own rows, unlike --skip which is
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
-        \\                    / pivots / meta / list-sheets / styles / sst.
+        \\                    / pivots / merges / defined-names / meta /
+        \\                    list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -926,14 +941,18 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     sheet; subsequent records OMIT
         \\                                     `sheet`/`sheet_idx`. Applies to
         \\                                     cells / rows / comments /
-        \\                                     validations / hyperlinks / pivots.
+        \\                                     validations / hyperlinks / pivots
+        \\                                     / merges.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
         \\                                     per-sheet records drop
         \\                                     `sheet`/`sheet_idx`; on
         \\                                     `list-sheets` / `styles` / `sst`
-        \\                                     it's effectively a no-op.
+        \\                                     / `defined-names` it's
+        \\                                     effectively a no-op (a defined
+        \\                                     name's sheet fields are its
+        \\                                     SCOPE, not a host location).
         \\                    pretty-json      meta-only. Collapses workbook
         \\                                     + sheets into one 2-space-
         \\                                     indented JSON object. The
@@ -1006,6 +1025,23 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  sst                one NDJSON record per shared-string entry
         \\                     (workbook-wide, iter58):
         \\                     {"kind":"sst","idx":0,"text":"…","runs":null}
+        \\  merges             one NDJSON record per merged range across every
+        \\                     sheet (S3b):
+        \\                     {"kind":"merge","sheet":"S","sheet_idx":0,
+        \\                      "range":"A1:B3","start_row":1,"start_col":1,
+        \\                      "end_row":3,"end_col":2}
+        \\                     Rows and cols are 1-based, corners inclusive.
+        \\  defined-names      one NDJSON record per <definedName> of
+        \\                     xl/workbook.xml, document order (S3b):
+        \\                     {"kind":"defined_name","name":"Prices",
+        \\                      "scope":"workbook","sheet":null,"sheet_idx":null,
+        \\                      "body":"Data!$A$1:$C$4","hidden":false}
+        \\                     scope ∈ {"workbook","sheet"}; a sheet-scoped
+        \\                     name carries its sheet + 0-based sheet_idx
+        \\                     (localSheetId). --sheet / --name / --sheet-glob
+        \\                     narrow to names SCOPED to matching sheets and
+        \\                     suppress workbook-scope names; the default and
+        \\                     --all-sheets stream every name.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
         \\                     row arrays from stdin (one JSON array per
@@ -1981,6 +2017,9 @@ fn runMain(init: std.process.Init) !u8 {
         // The legacy --list-sheets flag overrides every read
         // sub-command, this one included: it takes the Book path below.
         .pivots => if (!args.list_sheets) return try runPivotsCommand(alloc, proc_io, args, out, err),
+        // S3b: defined names live in xl/workbook.xml, which only the
+        // package layer parses — same pre-Book dispatch as `pivots`.
+        .defined_names => if (!args.list_sheets) return try runDefinedNamesCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2065,6 +2104,14 @@ fn runMain(init: std.process.Init) !u8 {
             try runHyperlinksCommand(out, &book, filter, args, args.skip, args.take);
             return 0;
         },
+        .merges => {
+            const filter = resolveSheetFilter(&book, args) catch {
+                try err.writeAll("zlsx: sheet not found\n");
+                return 3;
+            };
+            try runMergesCommand(out, &book, filter, args, args.skip, args.take);
+            return 0;
+        },
         .styles => {
             try runStylesCommand(out, &book, args.skip, args.take);
             return 0;
@@ -2087,6 +2134,7 @@ fn runMain(init: std.process.Init) !u8 {
         .scrub_metadata,
         .embed,
         .pivots,
+        .defined_names,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2143,6 +2191,8 @@ fn runMain(init: std.process.Init) !u8 {
         .scrub_metadata,
         .embed,
         .pivots,
+        .merges,
+        .defined_names,
         => unreachable,
     }
     return 0;
@@ -4087,6 +4137,137 @@ fn runPivotsCommand(
     return 0;
 }
 
+/// S3b: emit one NDJSON record per merged range. Sheet selection
+/// follows the same iter59c rules as runCommentsCommand — see there.
+fn runMergesCommand(
+    out: *std.Io.Writer,
+    book: *const xlsx.Book,
+    filter: ?usize,
+    args: Args,
+    skip: ?usize,
+    take: ?usize,
+) !void {
+    var pg = Pagination.init(skip, take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
+    for (book.sheets, 0..) |s, sheet_idx| {
+        if (signals.shouldStop()) return;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
+        }
+        for (book.mergedRanges(s)) |m| {
+            if (signals.shouldStop()) return;
+            switch (pg.consume()) {
+                .drop => continue,
+                .stop => return,
+                .emit => {},
+            }
+            if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+                try writeCompactSheetPrologue(out, s.name, sheet_idx);
+                last_prologue = sheet_idx;
+            }
+            var range_buf: [32]u8 = undefined;
+            const range = rangeFromBounds(&range_buf, m.top_left, m.bottom_right);
+
+            if (compact) {
+                try out.writeAll("{\"kind\":\"merge\",\"range\":");
+                try writeJsonString(out, range);
+            } else {
+                try out.writeAll("{\"kind\":\"merge\",\"sheet\":");
+                try writeJsonString(out, s.name);
+                try out.print(",\"sheet_idx\":{d},\"range\":", .{sheet_idx});
+                try writeJsonString(out, range);
+            }
+            // Reader cols are 0-based (A=0); the wire is 1-based like
+            // the `cells` / `comments` envelopes.
+            try out.print(
+                ",\"start_row\":{d},\"start_col\":{d},\"end_row\":{d},\"end_col\":{d}}}\n",
+                .{ m.top_left.row, m.top_left.col + 1, m.bottom_right.row, m.bottom_right.col + 1 },
+            );
+        }
+    }
+    try out.flush();
+}
+
+/// S3b: `zlsx defined-names` — one `{"kind":"defined_name",…}` record
+/// per `<definedName>` of `xl/workbook.xml`, in document order. Routes
+/// through the package layer: the reader-only Book has no workbook.xml
+/// view. A concrete selector (`--sheet` / `--name`) narrows to the
+/// names SCOPED to that sheet (`localSheetId`) and suppresses
+/// workbook-scope names, the way a selector suppresses orphan caches
+/// on `pivots`; `--sheet-glob` matches the scope sheet's name; the
+/// default and `--all-sheets` stream every name. Contract in
+/// docs/cli.md, "defined-names".
+fn runDefinedNamesCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    var view = zlsx_pkg.defined_names_ndjson.collect(alloc, &wb.workbook) catch |e| {
+        try err.print("zlsx: cannot read defined names in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer view.deinit();
+
+    const filter: ?usize = blk: {
+        if (args.all_sheets or args.sheet_glob != null) break :blk null;
+        if (args.sheet_index) |idx| {
+            if (idx >= view.sheet_names.len) {
+                try err.writeAll("zlsx: sheet not found\n");
+                try err.flush();
+                return 3;
+            }
+            break :blk idx;
+        }
+        if (args.sheet_name) |name| {
+            for (view.sheet_names, 0..) |s, i| {
+                if (std.mem.eql(u8, s, name)) break :blk i;
+            }
+            try err.writeAll("zlsx: sheet not found\n");
+            try err.flush();
+            return 3;
+        }
+        break :blk null;
+    };
+
+    var pg = Pagination.init(args.skip, args.take);
+    for (view.names) |d| {
+        if (signals.shouldStop()) return 0;
+        if (filter) |f| {
+            const sid = d.scope_sheet_idx orelse continue;
+            if (sid != f) continue;
+        } else if (args.sheet_glob) |pat| {
+            // A name whose localSheetId is past the sheet list has no
+            // scope sheet to match — skipped, like every non-matching
+            // scope. Workbook-scope names are suppressed here too.
+            const scope = d.scope_sheet orelse continue;
+            if (!globMatch(pat, scope)) continue;
+        }
+        switch (pg.consume()) {
+            .drop => continue,
+            .stop => {
+                try out.flush();
+                return 0;
+            },
+            .emit => {},
+        }
+        try zlsx_pkg.defined_names_ndjson.writeName(out, d);
+    }
+    try out.flush();
+    return 0;
+}
+
 /// Emit `{…}` for a BorderSide or `null` when the side has no style.
 fn writeBorderSideOrNull(w: *std.Io.Writer, side: xlsx.BorderSide) !void {
     if (side.style.len == 0) {
@@ -5777,7 +5958,7 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
         try std.testing.expectEqual(@as(?u32, 7), a.end_row);
     }
     // Sub-commands without a row key reject --start-row / --end-row.
-    inline for (.{ "validations", "hyperlinks", "pivots", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+    inline for (.{ "validations", "hyperlinks", "pivots", "merges", "defined-names", "meta", "list-sheets", "styles", "sst" }) |cmd| {
         {
             const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2" };
             try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
@@ -5905,7 +6086,7 @@ test "parseArgs --range round-trip and rejections" {
         try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
     }
     // Sub-commands without row+col keys reject --range.
-    inline for (.{ "comments", "validations", "hyperlinks", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+    inline for (.{ "comments", "validations", "hyperlinks", "merges", "defined-names", "meta", "list-sheets", "styles", "sst" }) |cmd| {
         const argv = [_][]const u8{ cmd, "f.xlsx", "--range", "A1:B2" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
@@ -8779,4 +8960,262 @@ test "parseArgs routes 'pivots' and rejects row-keyed flags on it" {
         const argv = [_][]const u8{ "pivots", "f.xlsx", "--range", "A1:B2" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
+}
+
+// ─── S3b: `merges` + `defined-names` ─────────────────────────────────
+
+test "parseArgs: merges / defined-names tokens and flag rejections" {
+    {
+        const argv = [_][]const u8{ "merges", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.merges, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    {
+        const argv = [_][]const u8{ "defined-names", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.defined_names, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // Range-keyed / workbook-keyed records: no row or rectangle key.
+    inline for (.{ "merges", "defined-names" }) |cmd| {
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--range", "A1:B2" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--end-row", "5" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+        {
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--output", "pretty-json" };
+            try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+        }
+        {
+            // `--format` shapes only `rows` output; non-workbook-scoped
+            // sub-commands reject anything but the implicit default.
+            const argv = [_][]const u8{ cmd, "f.xlsx", "--format", "csv" };
+            try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+        }
+    }
+}
+
+test "runMergesCommand: every sheet by default, exact wire shape" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_merges.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .string = "a" }});
+        try s0.addMergedCell("A1:B3");
+        try s0.addMergedCell("D5:D6");
+        var s1 = try w.addSheet("Report");
+        try s1.writeRow(&.{.{ .string = "b" }});
+        try s1.addMergedCell("C2:E2");
+        try w.save(io, path);
+    }
+
+    var book = try xlsx.Book.open(std.testing.allocator, io, path);
+    defer book.deinit();
+
+    // Default: every sheet, full envelope, corners 1-based.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges }, null, null);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"A1:B3\",\"start_row\":1,\"start_col\":1,\"end_row\":3,\"end_col\":2}\n" ++
+                "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"D5:D6\",\"start_row\":5,\"start_col\":4,\"end_row\":6,\"end_col\":4}\n" ++
+                "{\"kind\":\"merge\",\"sheet\":\"Report\",\"sheet_idx\":1,\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
+            w.buffered(),
+        );
+    }
+    // --sheet 1 narrows to the Report sheet.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runMergesCommand(&w, &book, 1, .{ .file = path, .subcommand = .merges }, null, null);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"merge\",\"sheet\":\"Report\",\"sheet_idx\":1,\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
+            w.buffered(),
+        );
+    }
+    // compact-ndjson: one prologue per sheet, records drop the envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges, .output = .compact_ndjson }, null, null);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n" ++
+                "{\"kind\":\"merge\",\"range\":\"A1:B3\",\"start_row\":1,\"start_col\":1,\"end_row\":3,\"end_col\":2}\n" ++
+                "{\"kind\":\"merge\",\"range\":\"D5:D6\",\"start_row\":5,\"start_col\":4,\"end_row\":6,\"end_col\":4}\n" ++
+                "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n" ++
+                "{\"kind\":\"merge\",\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
+            w.buffered(),
+        );
+    }
+    // --skip / --take page the concatenated cross-sheet stream.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges }, 1, 1);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"merge\",\"sheet\":\"Data\",\"sheet_idx\":0,\"range\":\"D5:D6\",\"start_row\":5,\"start_col\":4,\"end_row\":6,\"end_col\":4}\n",
+            w.buffered(),
+        );
+    }
+    // --sheet-glob narrows by sheet name.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try runMergesCommand(&w, &book, null, .{ .file = path, .subcommand = .merges, .sheet_glob = "Rep*" }, null, null);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"merge\",\"sheet\":\"Report\",\"sheet_idx\":1,\"range\":\"C2:E2\",\"start_row\":2,\"start_col\":3,\"end_row\":2,\"end_col\":5}\n",
+            w.buffered(),
+        );
+    }
+}
+
+test "runDefinedNamesCommand: document order, scope narrowing, exit codes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_defined_names.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        var s1 = try w.addSheet("Report");
+        try s1.writeRow(&.{.{ .integer = 2 }});
+        try w.addDefinedName("Prices", "Data!$A$1:$C$4", .{});
+        try w.addDefinedName("_xlnm.Print_Area", "Report!$A$1:$B$9", .{ .local_sheet_id = 1 });
+        try w.addDefinedName("Secret", "Data!$Z$1", .{ .hidden = true });
+        try w.save(io, path);
+    }
+
+    // Default: every name, document order, exact wire shape.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"defined_name\",\"name\":\"Prices\",\"scope\":\"workbook\",\"sheet\":null,\"sheet_idx\":null,\"body\":\"Data!$A$1:$C$4\",\"hidden\":false}\n" ++
+                "{\"kind\":\"defined_name\",\"name\":\"_xlnm.Print_Area\",\"scope\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1,\"body\":\"Report!$A$1:$B$9\",\"hidden\":false}\n" ++
+                "{\"kind\":\"defined_name\",\"name\":\"Secret\",\"scope\":\"workbook\",\"sheet\":null,\"sheet_idx\":null,\"body\":\"Data!$Z$1\",\"hidden\":true}\n",
+            w.buffered(),
+        );
+    }
+    // --sheet 1: only the names SCOPED to that sheet; workbook-scope
+    // names are suppressed like orphan caches under a pivots selector.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_index = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"defined_name\",\"name\":\"_xlnm.Print_Area\",\"scope\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1,\"body\":\"Report!$A$1:$B$9\",\"hidden\":false}\n",
+            w.buffered(),
+        );
+    }
+    // --sheet 0: a sheet with no scoped names is an empty, successful
+    // stream.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_index = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // --name resolves by decoded sheet name.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_name = "Report" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"name\":\"_xlnm.Print_Area\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"name\":\"Prices\"") == null);
+    }
+    // --sheet-glob matches scope sheets; workbook-scope suppressed.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_glob = "Rep*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"name\":\"_xlnm.Print_Area\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"scope\":\"workbook\"") == null);
+    }
+    // --skip / --take page the stream.
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .skip = 1, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"kind\":\"defined_name\",\"name\":\"_xlnm.Print_Area\""));
+        try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, w.buffered(), "\"name\":\"Secret\""));
+    }
+    // A sheet selector that names no sheet is exit 3.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_name = "Nope" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc);
+        const rc2 = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names, .sheet_index = 9 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc2);
+    }
+}
+
+test "runDefinedNamesCommand: a workbook without names is an empty stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_defined_names_none.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
 }

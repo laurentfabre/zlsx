@@ -14649,6 +14649,14 @@ fn writeMinimalSstLessXlsx(allocator: Allocator, io: std.Io, path: []const u8) !
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
+test {
+    // S3b: the defined-names NDJSON writer has no test root of its own
+    // — a file no test root analyses is a file whose tests never run
+    // (the pkg/control.zig lesson, S1). This target is where its
+    // decode round-trips and wire-shape pins run.
+    _ = @import("defined_name_ndjson.zig");
+}
+
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {
     // §9.1 M10o: the model holds one `Cell` per coordinate per layer —
     // 100 010 of them on the named workload since M10r stopped the drive
