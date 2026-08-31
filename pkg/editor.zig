@@ -10447,6 +10447,26 @@ test "S7c: the v1 presence gates — a slicer or timeline cache in the package, 
         try std.testing.expectError(error.ColEditUnsafeForSheet, ed3.deleteColumn(0, 3));
     }
     {
+        // A timeline cache attached to the consumer refuses the same
+        // way, through the x15 root.
+        const src = try tt.path(std.testing.allocator, io, "s7c_timeline_src.xlsx");
+        defer std.testing.allocator.free(src);
+        try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+        {
+            var store = try store_mod.PartStore.open(std.testing.allocator, io, src);
+            defer store.deinit();
+            try store.addPart(
+                "xl/timelineCaches/timelineCache1.xml",
+                "application/vnd.ms-excel.timelineCacheDefinition+xml",
+                "<timelineCacheDefinition xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2010/11/main\" name=\"T\" sourceName=\"Region\"><pivotTables><pivotTable tabId=\"2\" name=\"PivotTable1\"/></pivotTables></timelineCacheDefinition>",
+            );
+            try store.save(io, src);
+        }
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
+    }
+    {
         const src = try tt.path(std.testing.allocator, io, "s7c_psel_src.xlsx");
         defer std.testing.allocator.free(src);
         try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);

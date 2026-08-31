@@ -2408,6 +2408,19 @@ pub const edit = struct {
         // refused here, where the evidence still exists (in-house
         // review S7C-MUT-1).
         if (def.axes_count_mismatch) return error.MalformedPivotXml;
+        // Every ordinal carrier must name a field the part enumerates,
+        // checked before any arithmetic on it: a `fld="4294967295"`
+        // would otherwise trap in the increment instead of folding
+        // into the typed refusal (Codex #208 r1 SEC-104).
+        for (def.row_fields) |rf| {
+            if (rf == .field and rf.field >= def.fields.len) return error.MalformedPivotXml;
+        }
+        for (def.data_fields) |df| {
+            if (df.fld >= def.fields.len) return error.MalformedPivotXml;
+            if (df.base_field) |bf| {
+                if (bf >= 0 and @as(u64, @intCast(bf)) >= def.fields.len) return error.MalformedPivotXml;
+            }
+        }
         // S7c is the first slice that MOVES ordinals, so content this
         // reader tolerates unread must be proven not to carry any. A
         // surviving pivotField's body beyond its `<items>` (an
@@ -2422,8 +2435,7 @@ pub const edit = struct {
             if (f.has_other_children) return error.PivotShapeUnsupported;
         }
         if (def.ext_lst_start) |at| {
-            const tail = table_xml[at..];
-            if (std.mem.indexOf(u8, tail, "field=") != null or std.mem.indexOf(u8, tail, "fld=") != null) return error.PivotShapeUnsupported;
+            if (extRegionNamesOrdinal(table_xml[at..])) return error.PivotShapeUnsupported;
         }
 
         var splices: std.ArrayListUnmanaged(Splice) = .empty;
@@ -2480,6 +2492,31 @@ pub const edit = struct {
             },
         }
         return try spliceAll(arena, table_xml, splices.items);
+    }
+
+    /// Does the extension region spell an attribute named `field` or
+    /// `fld` — an ordinal carrier this reader tolerates unread? The
+    /// probe matches the attribute NAME at a name boundary with XML
+    /// whitespace admitted around the `=` (Codex #208 r1 SEC-101:
+    /// `field = '2'` is the same attribute as `field='2'`; attribute
+    /// names are never entity-spelled), so `fieldPosition=` and
+    /// `sourceField=` stay outside it. Presence anywhere in the
+    /// region — a comment included — refuses: over-matching costs a
+    /// refusal.
+    fn extRegionNamesOrdinal(tail: []const u8) bool {
+        for ([_][]const u8{ "field", "fld" }) |name| {
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, tail, from, name)) |hit| {
+                from = hit + 1;
+                if (hit == 0) continue;
+                const before = tail[hit - 1];
+                if (before != ' ' and before != '\t' and before != '\n' and before != '\r' and before != ':') continue;
+                var j = hit + name.len;
+                while (j < tail.len and (tail[j] == ' ' or tail[j] == '\t' or tail[j] == '\n' or tail[j] == '\r')) j += 1;
+                if (j < tail.len and tail[j] == '=') return true;
+            }
+        }
+        return false;
     }
 
     /// `src` rebuilt from its own bytes with each splice swapped in
@@ -8041,6 +8078,18 @@ test "S7c edit: every ordinal carrier above the edit moves — the row axis and 
     _ = try edit.applyConsumerSchemaEdit(arena, ext_ok, .{ .remove = 0 });
     const ext_bad = try replacedOnce(arena, ext_ok, "hideValuesRow=\"1\"", "hideValuesRow=\"1\" field=\"2\"");
     try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, ext_bad, .{ .remove = 0 }));
+    // The probe matches the attribute NAME, whitespace around `=`
+    // included; `fieldPosition=` is another name (Codex #208 r1
+    // SEC-101).
+    const ext_ws = try replacedOnce(arena, ext_ok, "hideValuesRow=\"1\"", "hideValuesRow=\"1\" field = '2'");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, ext_ws, .{ .remove = 0 }));
+    const ext_pos = try replacedOnce(arena, ext_ok, "hideValuesRow=\"1\"", "hideValuesRow=\"1\" fieldPosition=\"0\"");
+    _ = try edit.applyConsumerSchemaEdit(arena, ext_pos, .{ .remove = 0 });
+    // An ordinal past the field list refuses before any arithmetic on
+    // it (Codex #208 r1 SEC-104).
+    const wild = try replacedOnce(arena, s7c_row_axis_high, "fld=\"1\"", "fld=\"4294967295\"");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wild, .{ .insert = .{ .at = 1, .name = "N" } }));
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wild, .{ .remove = 0 }));
 }
 
 test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
@@ -8057,6 +8106,13 @@ test "S7c: an attachment list the reader cannot see refuses; the plain list deco
     const names = try attachedPivotNames(arena, plain, .slicer);
     try testing.expectEqual(@as(usize, 1), names.len);
     try testing.expectEqualStrings("P&L", names[0]);
+    // A descendant alias of the part's own family would hide the list
+    // under a prefix the walk steps over — the family-parameterized
+    // preflight refuses it (Codex #208 r1 SEC-102).
+    const aliased =
+        \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><data xmlns:y="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><y:pivotTables><y:pivotTable tabId="2" name="P"/></y:pivotTables></data></slicerCacheDefinition>
+    ;
+    try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, aliased, .slicer));
 }
 
 fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8) !void {

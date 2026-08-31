@@ -611,7 +611,7 @@ fn emitSyntheticTableColumn(
     new_id: u32,
 ) !void {
     var name_buf: [40]u8 = undefined;
-    const name = try probeSyntheticColumnName(&name_buf, src, body_start, body_end, new_id);
+    const name = try probeSyntheticColumnName(allocator, &name_buf, src, body_start, body_end, new_id);
     var buf: [80]u8 = undefined;
     const written = try std.fmt.bufPrint(&buf, "<tableColumn id=\"{d}\" name=\"{s}\"/>", .{ new_id, name });
     try out.appendSlice(allocator, written);
@@ -621,14 +621,14 @@ fn emitSyntheticTableColumn(
 /// existing `<tableColumn name>` in the same table (ECMA-376
 /// §18.5.1.78 requires names unique within the parent table). Try
 /// `Column<id>`, then `Column<id>_2`, `Column<id>_3`, ...
-fn probeSyntheticColumnName(name_buf: *[40]u8, src: []const u8, body_start: usize, body_end: usize, new_id: u32) ![]const u8 {
+fn probeSyntheticColumnName(allocator: Allocator, name_buf: *[40]u8, src: []const u8, body_start: usize, body_end: usize, new_id: u32) ![]const u8 {
     var suffix: u32 = 1;
     while (true) {
         const candidate = if (suffix == 1)
             try std.fmt.bufPrint(name_buf, "Column{d}", .{new_id})
         else
             try std.fmt.bufPrint(name_buf, "Column{d}_{d}", .{ new_id, suffix });
-        if (!tableColumnNameTaken(src, body_start, body_end, candidate)) return candidate;
+        if (!try tableColumnNameTaken(allocator, src, body_start, body_end, candidate)) return candidate;
         suffix += 1;
         if (suffix > 1000) return error.MalformedTableXml; // pathological
     }
@@ -649,14 +649,21 @@ pub fn syntheticInsertColumnName(allocator: Allocator, src: []const u8) Error![]
     if (max_id == std.math.maxInt(u32)) return error.MalformedTableXml;
     const new_id = max_id + 1;
     var name_buf: [40]u8 = undefined;
-    const name = probeSyntheticColumnName(&name_buf, src, tc.body_start, tc.close_pos, new_id) catch return error.MalformedTableXml;
+    const name = probeSyntheticColumnName(allocator, &name_buf, src, tc.body_start, tc.close_pos, new_id) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedTableXml,
+    };
     return try allocator.dupe(u8, name);
 }
 
 /// Walk `<tableColumn>` siblings looking for one whose `name`
 /// attribute equals `candidate`. Used by `emitSyntheticTableColumn`
-/// to dodge name collisions on insert (REL-A502).
-fn tableColumnNameTaken(src: []const u8, body_start: usize, body_end: usize, candidate: []const u8) bool {
+/// to dodge name collisions on insert (REL-A502). The existing name is
+/// compared by what it IS — decoded and under the fold rule the
+/// resolver matches names with — so `name="Column&#52;"` and
+/// `name="column4"` both block a synthesized `Column4` (Codex #208 r1
+/// REL-103); a name that does not decode blocks conservatively.
+fn tableColumnNameTaken(allocator: Allocator, src: []const u8, body_start: usize, body_end: usize, candidate: []const u8) !bool {
     var k = body_start;
     while (k < body_end) {
         const lt = std.mem.indexOfScalarPos(u8, src, k, '<') orelse return false;
@@ -665,7 +672,12 @@ fn tableColumnNameTaken(src: []const u8, body_start: usize, body_end: usize, can
             if (ct.after_open > body_end) return false;
             const attrs = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
             if (getAttr(attrs, "name")) |existing| {
-                if (std.mem.eql(u8, existing, candidate)) return true;
+                const decoded = decodeNameAttr(allocator, .table_column_name, existing) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return true,
+                };
+                defer allocator.free(decoded);
+                if (try foldedEql(allocator, decoded, candidate)) return true;
             }
             k = ct.after_open;
         } else {
@@ -722,7 +734,12 @@ fn scanMaxTableColumnId(src: []const u8, body_start: usize, body_end: usize) u32
             if (ct.after_open > body_end) return max_id;
             const attrs = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
             if (getAttr(attrs, "id")) |idv| {
-                if (std.fmt.parseInt(u32, idv, 10) catch null) |n| {
+                // The id is read by what it is: `id="&#52;"` is 4, and
+                // skipping it would hand the synthesized column a
+                // duplicate (Codex #208 r1 REL-103).
+                var buf: [16]u8 = undefined;
+                const decoded = wbxml.decodeScalarAttr(&buf, idv) orelse idv;
+                if (std.fmt.parseInt(u32, decoded, 10) catch null) |n| {
                     if (n > max_id) max_id = n;
                 }
             }
@@ -2036,6 +2053,36 @@ test "S7c: a col insert refuses at the id ceiling on both the rewrite and the na
     const out = try applyEditToTable(a, ceiling, .col, 5, .delete);
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "id=\"4294967295\"") == null);
+}
+
+test "S7c: the synthesized name and id read existing ones by what they ARE — entities decoded, names folded (Codex #208 r1 REL-103)" {
+    const a = testing.allocator;
+    // `name="Column&#52;"` IS Column4: the probe suffixes past it, on
+    // both the planner and the rewrite.
+    const ent_name = try std.mem.replaceOwned(u8, a, sample_table, "<tableColumn id=\"3\" name=\"C\"/>", "<tableColumn id=\"3\" name=\"Column&#52;\"/>");
+    defer a.free(ent_name);
+    const n1 = try syntheticInsertColumnName(a, ent_name);
+    defer a.free(n1);
+    try testing.expectEqualStrings("Column4_2", n1);
+    const out1 = try applyEditToTable(a, ent_name, .col, 4, .insert);
+    defer a.free(out1);
+    try testing.expect(std.mem.indexOf(u8, out1, "<tableColumn id=\"4\" name=\"Column4_2\"/>") != null);
+    // A case-equivalent name blocks too (§18.5.1.78 compares them
+    // case-insensitively).
+    const cased = try std.mem.replaceOwned(u8, a, sample_table, "name=\"C\"", "name=\"column4\"");
+    defer a.free(cased);
+    const n2 = try syntheticInsertColumnName(a, cased);
+    defer a.free(n2);
+    try testing.expectEqualStrings("Column4_2", n2);
+    // `id="&#52;"` IS 4: the next id is 5 on both sides.
+    const ent_id = try std.mem.replaceOwned(u8, a, sample_table, "<tableColumn id=\"3\" name=\"C\"/>", "<tableColumn id=\"&#52;\" name=\"C\"/>");
+    defer a.free(ent_id);
+    const n3 = try syntheticInsertColumnName(a, ent_id);
+    defer a.free(n3);
+    try testing.expectEqualStrings("Column5", n3);
+    const out3 = try applyEditToTable(a, ent_id, .col, 4, .insert);
+    defer a.free(out3);
+    try testing.expect(std.mem.indexOf(u8, out3, "<tableColumn id=\"5\" name=\"Column5\"/>") != null);
 }
 
 test "S7c: a commented </tableColumns> between the lexical close and the real one refuses the col edit (in-house S7C-R3)" {

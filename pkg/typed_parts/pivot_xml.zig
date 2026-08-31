@@ -1342,7 +1342,7 @@ pub fn scanRoot(xml: []const u8, local: []const u8) Error!Root {
 /// hygiene, the family swapped: one binding of it per part, and the
 /// root's own binding must be it.
 pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) Error!Root {
-    try preflight(xml);
+    try preflightIn(xml, uris);
     var i: usize = 0;
     while (i < xml.len) {
         const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return error.MalformedXml;
@@ -1399,6 +1399,15 @@ pub fn scanRootIn(xml: []const u8, local: []const u8, uris: []const []const u8) 
 /// And the namespace hygiene the one-prefix walk rests on, below the
 /// root (`checkDescendantBindings`).
 fn preflight(xml: []const u8) Error!void {
+    return preflightIn(xml, &main_ns_uris);
+}
+
+/// `preflight` against another namespace family — the descendant
+/// binding hygiene must guard the family the ROOT was admitted under,
+/// or an x14 part could rebind its own namespace to a prefix below the
+/// root and hide the attachment list from the one-prefix walk (Codex
+/// #208 r1 SEC-102).
+fn preflightIn(xml: []const u8, uris: []const []const u8) Error!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedXml;
     var stack: [max_depth][]const u8 = undefined;
     var depth: usize = 0;
@@ -1441,7 +1450,7 @@ fn preflight(xml: []const u8) Error!void {
             root_prefix = if (std.mem.indexOfScalar(u8, qname, ':')) |c| qname[0..c] else "";
             root_bound = declaredBinding(xml[j..attrs_end], root_prefix) != null;
         } else {
-            try checkDescendantBindings(xml[j..attrs_end], root_prefix, root_bound);
+            try checkDescendantBindings(xml[j..attrs_end], root_prefix, root_bound, uris);
         }
         if (!tag_end.self_closing) {
             if (depth >= max_depth) return error.MalformedXml;
@@ -1494,7 +1503,7 @@ pub fn isBlank(s: []const u8) bool {
 /// — redundant, that is, only when the root made it: a binding first
 /// introduced below the root lives on an element a rebuild may
 /// regenerate without it (Codex #205 r3 REL-302).
-fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_bound: bool) Error!void {
+fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_bound: bool, uris: []const []const u8) Error!void {
     if (std.mem.indexOf(u8, attrs, "xmlns") == null) return;
     var it: AttrIter = .{ .attrs = attrs };
     while (it.next()) |a| {
@@ -1504,7 +1513,7 @@ fn checkDescendantBindings(attrs: []const u8, root_prefix: []const u8, root_boun
             a.name["xmlns:".len..]
         else
             continue;
-        const binds_main = isOneOf(a.value, &main_ns_uris);
+        const binds_main = isOneOf(a.value, uris);
         const is_root_prefix = std.mem.eql(u8, declared, root_prefix);
         if (binds_main != is_root_prefix) return error.MalformedXml;
         if (binds_main and !root_bound) return error.MalformedXml;

@@ -221,9 +221,11 @@ tables), pinning the direct-`ref` shrink and the name-body rewrite.
 What stays on the **parked Excel oracle** (one new line in S7b-4's parked
 entry, nothing else): Excel opens the K3 result without repair and *Refresh*
 is a no-op on it. Identical standard to S7b-4/5, which shipped on the same
-terms. Everything the corpus cannot pin beyond that — K2's synthetic-name
-insert, K4a's narrowing — is *not lifted*, which is what "lift only what the
-oracle proves" buys.
+terms. Beyond that the corpus pins nothing — K2's synthetic-name insert was
+this section's "not lifted" until the owner ruled it in (§4 Q3: the name is
+mechanical, the same probe the table rewrite runs, so the ruling authorized
+it on that proof despite the missing corpus oracle); K4a's narrowing stays
+un-lifted, deferred to S7c-2 (§4 Q2).
 
 ## 4. Recommendation and the owner's questions
 

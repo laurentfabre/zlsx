@@ -8090,6 +8090,14 @@ pub const Workbook = struct {
             };
             if (ord != idx_1based - src.rect.tl_col) return error.PivotEditUnsafe;
             const geo = try sourceGeometry(c, src);
+            // The budget must hold at the EFFECTIVE width: a source at
+            // the ceiling before a K2 insert would read and grow past
+            // it (Codex #208 r1 PERF-105).
+            if (kind == .insert) {
+                const rows_n: usize = geo.read_rect.br_row - geo.first_data_row + 1;
+                const eff = std.math.mul(usize, geo.width + 1, rows_n) catch return error.PivotEditUnsafe;
+                if (eff > eng.max_rebuild_cells) return error.PivotEditUnsafe;
+            }
             const data = try self.sourceDataRows(arena, c, src, sheet_idx, false);
             const after = eng.rowsAfterColEdit(arena, data, geo.width, ord, kind) catch |e| return mapEngineError(e);
             return self.rebuildFromRows(arena, c, after, schema);
