@@ -738,19 +738,19 @@ fn scanMaxTableColumnId(src: []const u8, body_start: usize, body_end: usize) Err
         if (sheet_edit.matchTagAt(src, lt, "tableColumn")) |ct| {
             if (ct.after_open > body_end) return max_id;
             const attrs = src[ct.start + "<tableColumn".len .. ct.after_open - 1];
-            if (getAttr(attrs, "id")) |idv| {
-                // The id is read by what it is: `id="&#52;"` is 4 and
-                // `id="&#32;4"` is 4 under XML Schema's whitespace
-                // collapse — and one the scan cannot read REFUSES,
-                // because a skipped id could be the collision the
-                // synthesized `max + 1` must dodge (Codex #208 r1
-                // REL-103, r3 REL-302).
-                var buf: [16]u8 = undefined;
-                const decoded = wbxml.decodeScalarAttr(&buf, idv) orelse return error.MalformedTableXml;
-                const trimmed = std.mem.trim(u8, decoded, " \t\n\r");
-                const n = std.fmt.parseInt(u32, trimmed, 10) catch return error.MalformedTableXml;
-                if (n > max_id) max_id = n;
-            }
+            // The id is REQUIRED (§18.5.1.78) and read by what it is:
+            // `id="&#52;"` is 4 and `id="&#32;4"` is 4 under XML
+            // Schema's whitespace collapse — and one absent or
+            // unreadable REFUSES, because a skipped id could be the
+            // collision the synthesized `max + 1` must dodge (Codex
+            // #208 r1 REL-103, r3 REL-302, r4 REL-402; deletes never
+            // reach this scan and keep their shipped tolerance).
+            const idv = getAttr(attrs, "id") orelse return error.MalformedTableXml;
+            var buf: [16]u8 = undefined;
+            const decoded = wbxml.decodeScalarAttr(&buf, idv) orelse return error.MalformedTableXml;
+            const trimmed = std.mem.trim(u8, decoded, " \t\n\r");
+            const n = std.fmt.parseInt(u32, trimmed, 10) catch return error.MalformedTableXml;
+            if (n > max_id) max_id = n;
             k = ct.after_open;
         } else {
             k = lt + 1;
@@ -2117,6 +2117,17 @@ test "S7c: the synthesized name and id read existing ones by what they ARE — e
     const out5 = try applyEditToTable(a, bad_id, .col, 3, .delete);
     defer a.free(out5);
     try testing.expect(std.mem.indexOf(u8, out5, "name=\"A\"") == null);
+    // A tableColumn without its REQUIRED id refuses the insert on
+    // both sides — the synthesis has no id space to reason about —
+    // while the delete keeps its shipped tolerance (Codex #208 r4
+    // REL-402).
+    const no_id = try std.mem.replaceOwned(u8, a, sample_table, "<tableColumn id=\"2\" name=\"B\"/>", "<tableColumn name=\"B\"/>");
+    defer a.free(no_id);
+    try testing.expectError(error.MalformedTableXml, syntheticInsertColumnName(a, no_id));
+    try testing.expectError(error.MalformedTableXml, applyEditToTable(a, no_id, .col, 4, .insert));
+    const out6 = try applyEditToTable(a, no_id, .col, 3, .delete);
+    defer a.free(out6);
+    try testing.expect(std.mem.indexOf(u8, out6, "name=\"A\"") == null);
 }
 
 test "S7c: a commented </tableColumns> between the lexical close and the real one refuses the col edit (in-house S7C-R3)" {

@@ -2416,6 +2416,20 @@ pub const edit = struct {
                 if (bf >= 0 and @as(u64, @intCast(bf)) >= def.fields.len) return error.MalformedPivotXml;
             }
         }
+        // The two directions must AGREE for EVERY field, not only the
+        // edited one: the positional `pivotField@dataField` and the
+        // `dataField@fld` set name the same ordinals (several data
+        // fields on one ordinal are one entry) — a part that
+        // disagrees with itself is not one this rewrite re-lays
+        // (Codex #208 r4 REL-401; the ruled predicate's own sentence).
+        {
+            const referenced = try arena.alloc(bool, def.fields.len);
+            @memset(referenced, false);
+            for (def.data_fields) |df| referenced[df.fld] = true;
+            for (def.fields, referenced) |f, r| {
+                if (f.data_field != r) return error.MalformedPivotXml;
+            }
+        }
         // S7c is the first slice that MOVES ordinals, so content this
         // reader tolerates unread must be proven not to carry any. A
         // surviving pivotField's body beyond its `<items>` (an
@@ -8105,6 +8119,14 @@ test "S7c edit: every ordinal carrier above the edit moves — the row axis and 
     const wild = try replacedOnce(arena, s7c_row_axis_high, "fld=\"1\"", "fld=\"4294967295\"");
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wild, .{ .insert = .{ .at = 1, .name = "N" } }));
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wild, .{ .remove = 0 }));
+    // The two directions must agree on every SURVIVING field too
+    // (Codex #208 r4 REL-401): a data field whose pivotField lacks the
+    // flag, and a flagged pivotField no data field reads, both refuse
+    // whichever ordinal the edit touches.
+    const flagless = try replacedOnce(arena, s7c_row_axis_high, "<pivotField dataField=\"1\" showAll=\"0\"/>", "<pivotField showAll=\"0\"/>");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, flagless, .{ .remove = 0 }));
+    const readless = try replacedOnce(arena, s7c_row_axis_high, "<pivotField showAll=\"0\"/>", "<pivotField dataField=\"1\" showAll=\"0\"/>");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, readless, .{ .insert = .{ .at = 1, .name = "N" } }));
 }
 
 test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
