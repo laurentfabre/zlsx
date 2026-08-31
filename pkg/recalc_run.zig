@@ -210,6 +210,10 @@ pub fn saveWithRecalc(
     run: RunInputs,
     opts: Options,
 ) Error!Report {
+    // A torn model must not ship through ANY save — the `.none` arm
+    // below writes the store directly, past `applySavePlans`' own
+    // guard (Codex #208 r5 REL-501).
+    try wb.requireCompleteStructuralState();
     var prepared = try prepare(wb, gpa, io, run, opts);
     switch (prepared) {
         .refused => |r| return takeRefusal(wb, opts, r),

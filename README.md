@@ -87,10 +87,11 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   cell refs, formulas, merged ranges, panes, tables, drawings, comments and
   sparkline / extension formulas together; anything the rewriter cannot shift
   safely is **refused with a typed error instead of corrupting the file**
-  ([refusal audit](docs/plans/refusal-audit.md)). One guard remains: sheets
-  that *host* a pivot. A sheet a pivot only *reads from* is not detected — the
-  S6 audit pinned that with tests, and `zlsx pivots` / `Workbook.pivotTables`
-  now name every source sheet; row S7b of `goal_sigmoid.md` closes it.
+  ([refusal audit](docs/plans/refusal-audit.md)). Sheets a pivot *hosts on*
+  or *reads from* are both detected through the typed pivot graph
+  (`zlsx pivots` / `Workbook.pivotTables`); rows S7a–S7c of
+  `goal_sigmoid.md` lifted the hosted rectangle, source rows and the
+  provable source-column edits, the rest refusing per case.
 - **In-workbook embeddings** — store embedding vectors *inside* the workbook
   as OPC parts invisible to Excel; extract / write / prune / strip via
   [`zlsx embed`](docs/cli.md#embeddings-embed). A spreadsheet that carries its
@@ -501,12 +502,16 @@ casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 - **Pivot-aware edits** — pivots round-trip byte-preserved; an admitted row/col
   edit maintains a hosted pivot's rectangle (moving it when the edit is above
   or left of it; inside it refuses), and a row edit
-  (or a cell write) that changes a finite-rectangle source's *content*
+  (or a cell write) that changes a finite-rectangle source's *content* —
+  or a column edit that changes its *schema*: deleting a source column no
+  consumer references, inserting one into a headerless table (S7c) —
   refreshes the pivot the way Excel would —
   the cache rebuilt from the cells, its consumers re-laid, their output cells
   rewritten (S7b, `goal_sigmoid.md`) — for the report forms the engine lays
   out (one row field, the values axis, plain aggregates). Every rebuilt
-  cache stays marked to refresh at open; a form the engine does not lay out
+  cache stays marked to refresh at open; a form the engine does not lay out —
+  or a schema edit it cannot prove: a blank new header, a referenced field's
+  column, a slicer attached to the pivot —
   refuses a structural edit rather than corrupt it, and leaves a cell-write
   save at that marker alone. The typed read, `Workbook.pivotTables` /
   `zlsx pivots`, names every host and source sheet.

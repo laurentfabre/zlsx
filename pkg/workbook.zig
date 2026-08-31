@@ -142,6 +142,12 @@ pub const WorkbookDefinedName = workbook_xml_plan_mod.DefinedName;
 pub const DefinedNameOptions = workbook_xml_plan_mod.DefinedNameOptions;
 
 pub const Error = error{
+    /// A structural edit failed AFTER its first install — a resource
+    /// failure between the sweep's phases left the in-memory model
+    /// torn, and saving or editing it would ship the tear. Reopen the
+    /// workbook. (Codex #208 r2 REL-201; the disk file is untouched —
+    /// only this instance is poisoned.)
+    StructuralEditIncomplete,
     /// Style validation failed — empty font name, non-positive font
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
@@ -988,6 +994,12 @@ pub const Workbook = struct {
     /// write staged after it ages the collection as a store mutation
     /// does (Codex #206 r6 REL-601).
     staged_writes: u64 = 0,
+    /// A structural edit failed after its first install: the model is
+    /// between phases, and every save and further structural edit
+    /// refuses with `StructuralEditIncomplete` (Codex #208 r2
+    /// REL-201). The whole-edit staging that would make the five
+    /// phases one transaction is the documented follow-up.
+    torn_edit: bool = false,
 
     /// Parsed `xl/workbook.xml`. Borrows from the PartStore arena
     /// for leaf strings; owns its own arena for spine slices.
@@ -1379,6 +1391,9 @@ pub const Workbook = struct {
         run: recalc_run.RunInputs,
         opts: recalc_run.Options,
     ) Error!recalc_run.Report {
+        // Defense in depth beside the guard inside
+        // `recalc_run.saveWithRecalc` itself (Codex #208 r5 REL-501).
+        try self.requireCompleteStructuralState();
         return recalc_run.saveWithRecalc(self, allocator, io, path, run, opts);
     }
 
@@ -3546,6 +3561,8 @@ pub const Workbook = struct {
     /// deltas / appended rows into `store.replacePart`, and invalidate
     /// the typed views those bytes made stale.
     fn applySavePlans(self: *Workbook) Error!void {
+        // A torn model must not ship (Codex #208 r2 REL-201).
+        try self.requireCompleteStructuralState();
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
         // plan. Today the only axis is staged defined names — splice
         // them into `xl/workbook.xml` BEFORE the SST + per-sheet
@@ -3652,6 +3669,7 @@ pub const Workbook = struct {
     /// when no worksheets are registered; allocation/zip-sentinel
     /// errors on archive build.
     pub fn saveFreshEmit(self: *Workbook, io: std.Io, path: []const u8) !void {
+        try self.requireCompleteStructuralState();
         if (self.worksheets.len == 0) return error.NoSheets;
 
         const inputs = try self.allocator.alloc(fresh_emit.SheetInput, self.worksheets.len);
@@ -4800,6 +4818,7 @@ pub const Workbook = struct {
     /// pointing at the renamed sheet are likewise unaltered. A future
     /// iter (`m3-defnames-hyperlinks`) covers both.
     pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
+        try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         try validateSheetName(new_name);
         try self.assertSheetNameAvailable(sheet_idx, new_name);
@@ -4901,6 +4920,7 @@ pub const Workbook = struct {
         old_name: []const u8,
         new_name: []const u8,
     ) Error!u32 {
+        try self.requireCompleteStructuralState();
         if (table_name.len == 0) return error.TableNotFound;
 
         // Step 1: locate the table part and its host sheet.
@@ -5066,6 +5086,7 @@ pub const Workbook = struct {
     }
 
     pub fn addSheet(self: *Workbook, name: []const u8) Error!*Worksheet {
+        try self.requireCompleteStructuralState();
         try validateSheetName(name);
         if (self.worksheets.len >= std.math.maxInt(u32)) return error.TooManySheets;
         // Workbook view stores sheet names as raw attribute bytes —
@@ -5616,6 +5637,7 @@ pub const Workbook = struct {
     ///     the on-wire bytes don't match the parsed view (file
     ///     mutated under us between parse and patch).
     pub fn deleteSheet(self: *Workbook, sheet_idx: u32) Error!void {
+        try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         if (self.sheetCount() == 1) return error.LastSheetUndeletable;
         // Pre-condition: the slot table and the parsed view agree on
@@ -5875,7 +5897,27 @@ pub const Workbook = struct {
         try self.applySheetEditTransform(sheet_idx, spec, prepared);
     }
 
+    /// The torn-edit gate every structural mutation, pivot preflight
+    /// and save passes first — the recalculating save included, whose
+    /// no-formula arm writes the store directly (Codex #208 r2
+    /// REL-201, r3 REL-303, r5 REL-501).
+    pub fn requireCompleteStructuralState(self: *const Workbook) Error!void {
+        if (self.torn_edit) return error.StructuralEditIncomplete;
+    }
+
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
+        try self.requireCompleteStructuralState();
+        // A failure once anything has installed leaves the model
+        // between phases: poisoned, so no save or further edit ships
+        // the tear (Codex #208 r2 REL-201). A failure before the
+        // first COMMITTED install poisons nothing — `store.installs`
+        // counts commit points, where `mutations` counts attempts
+        // (Codex #208 r3 REL-301: an attempt that failed in its own
+        // staging left the store unchanged).
+        const installs_before = self.store.installs;
+        errdefer if (self.store.installs != installs_before) {
+            self.torn_edit = true;
+        };
         // One axis, exactly: a spec naming neither would unwrap
         // nothing below, one naming both is not one edit (Codex #205
         // r12 REL-1201).
@@ -6255,6 +6297,7 @@ pub const Workbook = struct {
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
     ) Error!PreparedPivotEdits {
+        try self.requireCompleteStructuralState();
         var prepared: PreparedPivotEdits = .{
             .owner = self,
             .mutations = self.store.mutations,
@@ -6379,13 +6422,37 @@ pub const Workbook = struct {
         const sheet_idx = p.sheetIndexOfPart(sheet_part_name) orelse return error.MalformedPivotXml;
         const rebuilt = try arena.alloc(?pivots_mod.engine.Rebuild, p.caches.len);
         @memset(rebuilt, null);
+        const schemas = try arena.alloc(?pivots_mod.edit.SchemaEdit, p.caches.len);
+        @memset(schemas, null);
+        var gate_cands: ?std.ArrayListUnmanaged(AttachmentCand) = null;
         for (p.caches, 0..) |*c, ci| {
             var plan = pivots_mod.edit.planCacheEdit(arena, c, sheet_idx, axis, idx_1based, kind) catch |e| return mapPivotEditError(e);
+            if (plan.schema) |se| {
+                // S7c: the field schema changes with the edit. The K2
+                // name is the column the table's own rewrite will
+                // synthesize, read from the part as written — the same
+                // walk `table_edit` performs, so the two agree by
+                // construction.
+                if (se == .insert) {
+                    const local = switch (c.resolution) {
+                        .sheet => |s| s,
+                        else => return error.PivotEditUnsafe,
+                    };
+                    const tp_name = local.table_part_name orelse return error.PivotEditUnsafe;
+                    const tp = (try self.store.part(tp_name)) orelse return error.MalformedPivotXml;
+                    plan.schema.?.insert.name = table_edit.syntheticInsertColumnName(arena, tp.bytes) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.PivotEditUnsafe,
+                    };
+                }
+                try self.refuseSchemaEditGates(arena, &p, ci, &gate_cands);
+                schemas[ci] = plan.schema.?;
+            }
             if (plan.changed) {
                 // S7b-4: the snapshot is no longer the source. Rebuild
                 // it from the cells — records, inventories, counts,
                 // date — in the same install, or refuse the edit.
-                const rb = try self.rebuildPivotCache(arena, c, plan.rebuild, sheet_idx, axis, idx_1based, kind);
+                const rb = try self.rebuildPivotCache(arena, c, plan.rebuild, sheet_idx, axis, idx_1based, kind, schemas[ci]);
                 rebuilt[ci] = rb;
                 try plan.splices.appendSlice(arena, rb.splices);
                 if (rb.records) |bytes| {
@@ -6411,7 +6478,16 @@ pub const Workbook = struct {
             // moves — refused, as the save leaves such a host to the
             // marker (Codex #206 r23 REL-2301).
             if ((try self.sheet(t.sheet_idx)).appended_rows.items.len > 0) return error.PivotEditUnsafe;
-            const base = table_bytes[i] orelse t.raw_xml;
+            // S7c: a schema edit moves the consumer's ordinals first —
+            // the removed field's `<pivotField>` out (a consumer that
+            // references it refuses, K4a), the inserted one in — and
+            // the layout then reads the rewritten bytes against the
+            // effective schema, as any consumer is read.
+            const base = blk: {
+                const b0 = table_bytes[i] orelse t.raw_xml;
+                const se = schemas[ci] orelse break :blk b0;
+                break :blk pivots_mod.edit.applyConsumerSchemaEdit(arena, b0, se) catch |e| return mapPivotEditError(e);
+            };
             const map = HostRowMap.forEdit(t.sheet_idx == sheet_idx, axis, idx_1based, kind);
             // With the host's staged writes laid over it: they are
             // what the sheet will hold, so a write in the way of a
@@ -6419,8 +6495,9 @@ pub const Workbook = struct {
             var grid = try self.readHostGrid(arena, t.sheet_idx, map, true);
             defer grid.deinit(arena);
             const merges = try self.hostMerges(arena, t.sheet_idx, map);
-            const captions = try self.hostCaptions(arena, base, &p.caches[ci], &grid);
-            const lay = pivots_mod.engine.layout(arena, base, &p.caches[ci], rb, captions) catch |e| return mapEngineError(e);
+            const cache_view = try schemaCacheView(arena, &p.caches[ci], schemas[ci]);
+            const captions = try self.hostCaptions(arena, base, cache_view, &grid);
+            const lay = pivots_mod.engine.layout(arena, base, cache_view, rb, captions) catch |e| return mapEngineError(e);
             try self.refuseOverOtherPivots(arena, &p, i, lay.rect, table_bytes);
             table_bytes[i] = lay.table_xml;
             try self.planPivotHostWrite(prepared, t, lay, &grid, merges);
@@ -6460,6 +6537,139 @@ pub const Workbook = struct {
             rehearsal.deinit(self.allocator);
         }
         try self.refuseNameSourcesTheSweepBreaks(&p, sheet_idx, axis, idx_1based, kind);
+    }
+
+    /// S7c's v1 gates (`docs/plans/s7c-column-edits.md` §2, Q4,
+    /// owner-accepted): a slicer or timeline cache ATTACHED to a
+    /// consumer of the edited cache refuses the schema edit — the
+    /// parts are otherwise untyped here and name fields by
+    /// `sourceName`, and a removed field would leave a dangling
+    /// slicer no refresh repairs. Only the attachment list is read
+    /// (`pivots.attachedPivotNames`, the shared scanner under the
+    /// part's own x14 / x15 namespace): the corpus itself carries a
+    /// slicer on the iris pivot, and a mtcars column edit is not its
+    /// business — a package-level presence gate would refuse the
+    /// row's own corpus proof. A cache part that cannot be read, a
+    /// rel target that resolves nowhere, and a `<pivotSelection>`
+    /// anywhere on a consumer's host sheet (its required `pivotArea`
+    /// can name field ordinals; read as presence) all refuse:
+    /// over-matching costs a refusal, under-matching a corrupted
+    /// workbook.
+    const AttachmentCand = struct { part: []const u8, kind: pivots_mod.AttachmentKind };
+
+    /// The slicer / timeline cache parts an edit's gates read — the
+    /// workbook's relationships plus a filtered part-name fallback —
+    /// collected ONCE per edit into the caller's arena and reused for
+    /// every schema-edited cache (Codex #208 r2 PERF-201). The
+    /// fallback skips `_rels` companions and non-XML payloads under
+    /// the prefixes (Codex #208 r2 REL-204: a relationship part is
+    /// not a cache definition, and refusing on one would gate an edit
+    /// no slicer touches) and drops names the relationships already
+    /// named.
+    fn attachmentCandidates(self: *Workbook, arena: Allocator) Error!std.ArrayListUnmanaged(AttachmentCand) {
+        var cand: std.ArrayListUnmanaged(AttachmentCand) = .empty;
+        for (self.store.rels("xl/workbook.xml")) |rel| {
+            const kind: pivots_mod.AttachmentKind = if (pivots_mod.relLeafIs(rel.type, "slicerCache"))
+                .slicer
+            else if (pivots_mod.relLeafIs(rel.type, "timelineCache") or pivots_mod.relLeafIs(rel.type, "timelineCacheDefinition"))
+                .timeline
+            else
+                continue;
+            const target = (try self.store.resolve("xl/workbook.xml", rel.target)) orelse return error.PivotEditUnsafe;
+            try cand.append(arena, .{ .part = target, .kind = kind });
+        }
+        // Belt and braces: a cache part the workbook does not list is
+        // dead to Excel, but reading it costs nothing and an attached
+        // one that only the name reveals still refuses.
+        var i: usize = 0;
+        outer: while (i < self.store.partCount()) : (i += 1) {
+            const name = self.store.partNameAt(i);
+            if (std.mem.indexOf(u8, name, "/_rels/") != null) continue;
+            if (!std.mem.endsWith(u8, name, ".xml")) continue;
+            const kind: pivots_mod.AttachmentKind = if (std.mem.startsWith(u8, name, "xl/slicerCaches/"))
+                .slicer
+            else if (std.mem.startsWith(u8, name, "xl/timelineCaches/"))
+                .timeline
+            else
+                continue;
+            for (cand.items) |c| if (std.mem.eql(u8, c.part, name)) continue :outer;
+            try cand.append(arena, .{ .part = name, .kind = kind });
+        }
+        return cand;
+    }
+
+    fn refuseSchemaEditGates(self: *Workbook, arena: Allocator, p: *const pivots_mod.Pivots, ci: usize, cands: *?std.ArrayListUnmanaged(AttachmentCand)) Error!void {
+        if (cands.* == null) cands.* = try self.attachmentCandidates(arena);
+        // The edited cache's consumer names, folded ONCE; an
+        // unfoldable name matches everything — the refusing direction
+        // (Codex #208 r3 PERF-301).
+        var consumer_folds: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        for (p.tables) |t| {
+            if ((t.cache orelse continue) != ci) continue;
+            try consumer_folds.append(arena, try pivots_mod.foldedPivotName(arena, t.name));
+        }
+        for (cands.*.?.items) |c| {
+            const part = (try self.store.part(c.part)) orelse return error.PivotEditUnsafe;
+            const names = pivots_mod.attachedPivotNames(arena, part.bytes, c.kind) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.PivotEditUnsafe,
+            };
+            for (names) |n| {
+                const fn_ = try pivots_mod.foldedPivotName(arena, n);
+                for (consumer_folds.items) |cf| {
+                    const a_fold = fn_ orelse return error.PivotEditUnsafe;
+                    const b_fold = cf orelse return error.PivotEditUnsafe;
+                    if (std.mem.eql(u8, a_fold, b_fold)) return error.PivotEditUnsafe;
+                }
+            }
+        }
+        for (p.tables) |t| {
+            if ((t.cache orelse continue) != ci) continue;
+            const host = (try self.store.part(t.sheet_part_name)) orelse return error.MalformedPivotXml;
+            if (std.mem.indexOf(u8, host.bytes, "<pivotSelection") != null) return error.PivotEditUnsafe;
+        }
+    }
+
+    /// The cache as its consumers see it after a schema edit: the
+    /// definition's field list and the decoded spines at the effective
+    /// arity, every other byte shared with the original — a read-only
+    /// view for the layout. The original cache, untouched, keeps
+    /// serving the resolution-side checks.
+    fn schemaCacheView(arena: Allocator, c: *const pivots_mod.PivotCache, schema: ?pivots_mod.edit.SchemaEdit) Error!*const pivots_mod.PivotCache {
+        const se = schema orelse return c;
+        const view = try arena.create(pivots_mod.PivotCache);
+        view.* = c.*;
+        // Freshly arena-allocated for a non-null schema — never the
+        // borrowed original.
+        view.definition.fields = @constCast(pivots_mod.engine.effectiveCacheFields(arena, c.definition.fields, se) catch |e| return mapEngineError(e));
+        switch (se) {
+            .remove => |k| {
+                if (k >= c.field_names.len or c.field_names.len != c.field_formulas.len) return error.MalformedPivotXml;
+                view.field_names = try removedAt([]const u8, arena, c.field_names, k);
+                view.field_formulas = try removedAt(?[]const u8, arena, c.field_formulas, k);
+            },
+            .insert => |ins| {
+                if (ins.at > c.field_names.len or c.field_names.len != c.field_formulas.len) return error.MalformedPivotXml;
+                view.field_names = try insertedAt([]const u8, arena, c.field_names, ins.at, ins.name);
+                view.field_formulas = try insertedAt(?[]const u8, arena, c.field_formulas, ins.at, null);
+            },
+        }
+        return view;
+    }
+
+    fn removedAt(comptime T: type, arena: Allocator, old: []const T, k: usize) Error![]const T {
+        const out = try arena.alloc(T, old.len - 1);
+        @memcpy(out[0..k], old[0..k]);
+        @memcpy(out[k..], old[k + 1 ..]);
+        return out;
+    }
+
+    fn insertedAt(comptime T: type, arena: Allocator, old: []const T, at: usize, value: T) Error![]const T {
+        const out = try arena.alloc(T, old.len + 1);
+        @memcpy(out[0..at], old[0..at]);
+        out[at] = value;
+        @memcpy(out[at + 1 ..], old[at..]);
+        return out;
     }
 
     /// A re-laid rectangle may not reach another pivot's declared
@@ -7942,11 +8152,36 @@ pub const Workbook = struct {
         axis: pivots_mod.edit.Axis,
         idx_1based: u32,
         kind: pivots_mod.edit.Kind,
+        schema: ?pivots_mod.edit.SchemaEdit,
     ) Error!pivots_mod.engine.Rebuild {
         const src = rebuild orelse return error.PivotEditUnsafe;
-        // A column edit inside a rectangle refuses before this; only a
-        // row edit changes a rectangle's content.
-        if (axis != .row) return error.PivotEditUnsafe;
+        const eng = pivots_mod.engine;
+        if (axis == .col) {
+            // S7c: on the column axis only a schema edit changes a
+            // rectangle's content, and the plan carries it — checked
+            // against this edit before anything is read.
+            const se = schema orelse return error.PivotEditUnsafe;
+            if ((se == .remove) != (kind == .delete)) return error.PivotEditUnsafe;
+            if (idx_1based < src.rect.tl_col) return error.PivotEditUnsafe;
+            const ord: u32 = switch (se) {
+                .remove => |k| k,
+                .insert => |ins| ins.at,
+            };
+            if (ord != idx_1based - src.rect.tl_col) return error.PivotEditUnsafe;
+            const geo = try sourceGeometry(c, src);
+            // The budget must hold at the EFFECTIVE width: a source at
+            // the ceiling before a K2 insert would read and grow past
+            // it (Codex #208 r1 PERF-105).
+            if (kind == .insert) {
+                const rows_n: usize = geo.read_rect.br_row - geo.first_data_row + 1;
+                const eff = std.math.mul(usize, geo.width + 1, rows_n) catch return error.PivotEditUnsafe;
+                if (eff > eng.max_rebuild_cells) return error.PivotEditUnsafe;
+            }
+            const data = try self.sourceDataRows(arena, c, src, sheet_idx, false);
+            const after = eng.rowsAfterColEdit(arena, data, geo.width, ord, kind) catch |e| return mapEngineError(e);
+            return self.rebuildFromRows(arena, c, after, schema);
+        }
+        if (schema != null) return error.PivotEditUnsafe;
         // The counts are the part's own: checked before any
         // arithmetic on them (Codex #206 r2 SEC-201).
         const geo = try sourceGeometry(c, src);
@@ -7955,10 +8190,9 @@ pub const Workbook = struct {
         if (kind == .delete and idx_1based < geo.first_data_row) return error.PivotEditUnsafe;
         // A delete on a table's totals row is not a data edit.
         if (kind == .delete and idx_1based > geo.read_rect.br_row) return error.PivotEditUnsafe;
-        const eng = pivots_mod.engine;
         const data = try self.sourceDataRows(arena, c, src, sheet_idx, false);
         const after = eng.rowsAfterEdit(arena, data, geo.width, geo.first_data_row, idx_1based, kind) catch |e| return mapEngineError(e);
-        return self.rebuildFromRows(arena, c, after);
+        return self.rebuildFromRows(arena, c, after, null);
     }
 
     /// A source rectangle's checked geometry: its width is the field
@@ -8016,15 +8250,15 @@ pub const Workbook = struct {
         const src = pivots_mod.edit.rebuildSourceOf(c) orelse return null;
         const local = c.resolution.sheet;
         const data = try self.sourceDataRows(arena, c, src, local.sheet_idx, true);
-        return try self.rebuildFromRows(arena, c, data);
+        return try self.rebuildFromRows(arena, c, data, null);
     }
 
-    fn rebuildFromRows(self: *Workbook, arena: Allocator, c: *const pivots_mod.PivotCache, rows: []const pivots_mod.engine.Row) Error!pivots_mod.engine.Rebuild {
+    fn rebuildFromRows(self: *Workbook, arena: Allocator, c: *const pivots_mod.PivotCache, rows: []const pivots_mod.engine.Row, schema: ?pivots_mod.edit.SchemaEdit) Error!pivots_mod.engine.Rebuild {
         const records_xml: ?[]const u8 = if (c.records_part_name) |n|
             ((try self.store.part(n)) orelse return error.MalformedPivotXml).bytes
         else
             null;
-        return pivots_mod.engine.rebuild(arena, c, rows, records_xml, try self.nowInstant(arena)) catch |e| return mapEngineError(e);
+        return pivots_mod.engine.rebuildWith(arena, c, rows, records_xml, try self.nowInstant(arena), schema) catch |e| return mapEngineError(e);
     }
 
     /// The source rectangle's data rows — the rectangle checked against

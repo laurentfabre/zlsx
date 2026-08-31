@@ -325,6 +325,11 @@ pub const PartStore = struct {
     /// (`Workbook.PreparedPivotEdits`) checks before it is installed
     /// (Codex #205 r6 REL-605).
     mutations: u64 = 0,
+    /// Bumped at each COMMIT point — the first infallible install of a
+    /// mutator — where `mutations` counts attempts from their entry.
+    /// The torn-edit guard reads this one: a failure whose attempt
+    /// never reached a commit poisons nothing (Codex #208 r3 REL-301).
+    installs: u64 = 0,
     /// The `Io` this store was opened with. `save()` needs one for the
     /// atomic-file output long after `open()` returned, so the store
     /// carries its own. Source *reads* go through `backing.io`, which
@@ -788,6 +793,7 @@ pub const PartStore = struct {
         @memcpy(grown_overrides[0..self.overrides.len], self.overrides);
 
         // ─── Commit point: every step from here on is infallible ──
+        self.installs += 1;
         grown_entries[grown_entries.len - 1] = new_entry;
         grown_parts[grown_parts.len - 1] = new_part;
         grown_overrides[grown_overrides.len - 1] = new_override;
@@ -959,6 +965,7 @@ pub const PartStore = struct {
         }
         std.debug.assert(w == n - 1);
 
+        self.installs += 1;
         self.entries = new_entries;
         self.parts = new_parts;
         self.overrides = new_overrides;
@@ -1037,6 +1044,7 @@ pub const PartStore = struct {
         try self.rels_by_owner.ensureUnusedCapacity(ar_alloc, n_rels);
 
         // Nothing below can fail.
+        self.installs += 1;
         for (staged) |st| {
             self.overrides[st.idx] = .pending;
             self.parts[st.idx].bytes = st.bytes;
@@ -1120,6 +1128,7 @@ pub const PartStore = struct {
         // partial-mutation observable to a caller that recovers from
         // the error).
         const dupe_bytes = try self.dupePayload(ar_alloc, bytes);
+        self.installs += 1;
         self.overrides[idx] = .pending;
         // Mirror into parts[idx].bytes so subsequent part() lookups see
         // the updated content. NOTE: derived content_type entries
@@ -1466,6 +1475,17 @@ pub const PartStore = struct {
         const out = try ar_alloc.alloc([]const u8, self.parts.len);
         for (self.parts, 0..) |p, i| out[i] = p.name;
         return out;
+    }
+
+    /// Borrowed access to the stored part names — no allocation, for
+    /// a caller that only scans them (Codex #208 r2 PERF-201; the
+    /// arena-allocating `partNames` retains its view per call).
+    pub fn partCount(self: *const PartStore) usize {
+        return self.parts.len;
+    }
+
+    pub fn partNameAt(self: *const PartStore, i: usize) []const u8 {
+        return self.parts[i].name;
     }
 
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
