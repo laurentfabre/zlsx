@@ -2557,6 +2557,13 @@ pub const edit = struct {
     ) EditError!void {
         assert(dropped > 0 and dropped < def.data_fields.len);
         const survivors: usize = def.data_fields.len - dropped;
+        // An axis wrapper carrying content the parser did not classify
+        // — a stray attribute, a child that is not its field, markup
+        // between children — is evidence the layout refuses on, and
+        // the collapse arm below removes `<colFields>` whole: healed
+        // evidence, the S7C-MUT-1 rule (Codex #210 r1 REL-101). Refuse
+        // while it still exists; the K3 path never reads this gate.
+        if (def.axes_other) return error.PivotShapeUnsupported;
         // ≥ 2 data fields spell the values axis across; the single-
         // data-field form (no colFields) has no second entry for a
         // drop to leave behind.
@@ -8301,6 +8308,39 @@ test "S7c-2 edit: K4a — a data-field delete drops the dataField, re-enumerates
     const wide = try replacedOnce(arena, s7c_multi_data, "ref=\"B2:E7\"", "ref=\"B2:F7\"");
     try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, wide, .{ .remove = 0 }));
     _ = try edit.applyConsumerSchemaEdit(arena, wide, .{ .remove = 3 });
+    // A stray attribute or child on an axis wrapper is evidence the
+    // layout refuses on — the collapse would remove `<colFields>`
+    // whole and heal it (Codex #210 r1 REL-101): refused on the K4a
+    // path, unread on the K3 path.
+    const cf_attr = try replacedOnce(arena, s7c_multi_data, "<colFields count=\"1\">", "<colFields count=\"1\" foo=\"x\">");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_attr, .{ .remove = 2 }));
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_attr, .{ .remove = 0 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, cf_attr, .{ .remove = 3 });
+    const cf_child = try replacedOnce(arena, s7c_multi_data, "<field x=\"-2\"/></colFields>", "<field x=\"-2\"/><!-- c --></colFields>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, cf_child, .{ .remove = 2 }));
+    _ = try edit.applyConsumerSchemaEdit(arena, cf_child, .{ .remove = 3 });
+    // A `dataFields` wrapper spelling no `count` narrows without one.
+    const countless = try replacedOnce(arena, s7c_multi_data, "<dataFields count=\"3\">", "<dataFields>");
+    const nc = try edit.applyConsumerSchemaEdit(arena, countless, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, nc, "<dataFields><dataField name=\"Min of C\"") != null);
+    try testing.expect(std.mem.indexOf(u8, nc, "<location ref=\"B2:D7\"") != null);
+}
+
+test "S7c-2 edit: a strict-prefixed part regenerates its values axis under its own prefix" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prefixed = try std.mem.concat(arena, u8, &.{
+        "<x:pivotTableDefinition xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" name=\"P\" cacheId=\"7\"><x:location ref=\"B2:E7\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><x:pivotFields count=\"4\"><x:pivotField dataField=\"1\" showAll=\"0\"/><x:pivotField axis=\"axisRow\" showAll=\"0\"><x:items count=\"3\"><x:item x=\"0\"/><x:item x=\"1\"/><x:item t=\"default\"/></x:items></x:pivotField><x:pivotField dataField=\"1\" showAll=\"0\"/><x:pivotField showAll=\"0\"/></x:pivotFields><x:rowFields count=\"1\"><x:field x=\"1\"/></x:rowFields><x:rowItems count=\"3\"><x:i><x:x/></x:i><x:i><x:x v=\"1\"/></x:i><x:i t=\"grand\"><x:x/></x:i></x:rowItems><x:colFields count=\"1\"><x:field x=\"-2\"/></x:colFields><x:colItems count=\"3\"><x:i><x:x/></x:i><x:i i=\"1\"><x:x v=\"1\"/></x:i><x:i i=\"2\"><x:x v=\"2\"/></x:i></x:colItems><x:dataFields count=\"3\"><x:dataField name=\"Sum of A\" fld=\"0\" baseField=\"1\" baseItem=\"0\"/><x:dataField name=\"Min of C\" fld=\"2\" subtotal=\"min\" baseField=\"1\" baseItem=\"0\"/><x:dataField name=\"Max of C\" fld=\"2\" subtotal=\"max\" baseField=\"1\" baseItem=\"0\"/></x:dataFields></x:pivotTableDefinition>",
+    });
+    const two = try edit.applyConsumerSchemaEdit(arena, prefixed, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, two, "<x:colItems count=\"2\"><x:i><x:x/></x:i><x:i i=\"1\"><x:x v=\"1\"/></x:i></x:colItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "<x:colFields count=\"1\"><x:field x=\"-2\"/></x:colFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, two, "ref=\"B2:D7\"") != null);
+    const one = try edit.applyConsumerSchemaEdit(arena, prefixed, .{ .remove = 2 });
+    try testing.expect(std.mem.indexOf(u8, one, "<x:colFields") == null);
+    try testing.expect(std.mem.indexOf(u8, one, "<x:colItems count=\"1\"><x:i/></x:colItems>") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "ref=\"B2:C7\"") != null);
 }
 
 test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
