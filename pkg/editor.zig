@@ -10457,6 +10457,32 @@ test "S7c: the v1 presence gates — a slicer or timeline cache in the package, 
     }
 }
 
+test "S7c: a nameless data field's caption reads the effective schema — the reduced spines align (in-house S7C-T2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(std.testing.allocator, io, "s7c_caption_src.xlsx");
+    defer std.testing.allocator.free(src);
+    const dst = try tt.path(std.testing.allocator, io, "s7c_caption_dst.xlsx");
+    defer std.testing.allocator.free(dst);
+    try pivots_mod.fixture.write(std.testing.allocator, io, src, .sheet_ref);
+    try pivots_mod.fixture.patchPart(std.testing.allocator, io, src, pt_part, "<dataField name=\"Sum of Qty\" fld=", "<dataField fld=");
+    {
+        var ed = try Editor.open(std.testing.allocator, io, src);
+        defer ed.deinit();
+        try ed.deleteColumn(0, 3);
+        try ed.save(io, dst);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, dst);
+    defer wb.deinit();
+    // `defaultCaption(sum, field_names[1])` over the REDUCED spine:
+    // a misaligned view would spell "Sum of Price".
+    try expectHostCell(&wb, 1, "B3", .{ .text = "Sum of Qty" });
+    try expectHostCell(&wb, 1, "B6", .{ .number = 12 });
+}
+
 test "S7c: a consumer hosted on the edited sheet — the source narrows in place, the host captions and cells carry" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

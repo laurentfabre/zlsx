@@ -117,10 +117,20 @@ cache C with source rectangle `[tl_col … br_col]`, iff **all** of:
    carries no `axis` and no `dataField="1"` **and** no `<field x="k">` on any
    axis, no `dataField@fld == k`, no `@baseField == k`, no admitted
    `reference@field == k` — a disagreement between the two directions
-   refuses (`MalformedPivotXml`, as the slice's other cross-checks do);
+   refuses (`MalformedPivotXml`, as the slice's other cross-checks do), and
+   so does a `pivotFields@count` that disagrees with its children: the
+   rewrite's count splice would heal the evidence layout's own check would
+   have refused on (in-house review S7C-MUT-1);
 5. `pivotField k` is removable whole: its children (an off-axis `<items>`
-   list, its own `extLst`) leave with the element; no *other* pivotField's
-   content indexes it (none can — item indexes are per-field);
+   list, its own `extLst`) leave with the element; item indexes are
+   per-field, so no *other* field's `<items>` indexes it — but a
+   **surviving** field's body beyond its items (an `autoSortScope`, its own
+   `extLst`) and the root `<extLst>` can name field ordinals this reader
+   tolerates unread, and S7c is the first slice that *moves* ordinals: a
+   surviving `has_other_children` field refuses, and the root extension
+   region is probed for the ordinal-carrier tokens (`field=` / `fld=`),
+   presence refusing — the corpus' attribute-only `x14:pivotTableDefinition`
+   carries none (in-house review S7C-R1);
 6. for a table-named source, `table_edit.checkEditSafe` admits the same
    delete (it does: the matching `<tableColumn>` is dropped whole, its own
    formulas with it; only collapse refuses). A *sibling* column's
@@ -132,11 +142,13 @@ cache C with source rectangle `[tl_col … br_col]`, iff **all** of:
    (`pivots.attachedPivotNames`: `<pivotTables><pivotTable name=…>` under
    the part's own x14 / x15 namespace, through the shared scanner); a part
    that cannot be read refuses, and `sourceName`-level matching stays
-   untyped. *(Amended from the package-level presence gate during
-   implementation: the corpus itself carries a slicer — on the iris pivot —
-   so presence alone would refuse the row's own corpus proof for a mtcars
-   edit. Attachment is the narrowest read that keeps the conservative
-   direction.)*;
+   untyped; a part whose bytes spell `slicerCachePivotTables` — the x15
+   data-model attachment list, one this reader would not see — refuses
+   as unreadable (in-house review S7C-R3b). *(Amended from the
+   package-level presence gate during implementation: the corpus itself
+   carries a slicer — on the iris pivot — so presence alone would refuse
+   the row's own corpus proof for a mtcars edit. Attachment is the
+   narrowest read that keeps the conservative direction.)*;
 8. no consumer's host sheet carries a `<pivotSelection>` at all (v1
    presence gate — the schema makes `<pivotArea>` a required child, so
    element presence is the check; `sheet_edit` keeps rewriting the four

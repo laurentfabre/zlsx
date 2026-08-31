@@ -849,6 +849,13 @@ pub fn attachedPivotNames(arena: Allocator, xml: []const u8, kind: AttachmentKin
         .timeline => &timeline_ns_uris,
     };
     const root = pivot_xml.scanRootIn(xml, local, uris) catch return error.MalformedPivotXml;
+    // A second attachment list can ride the part's `extLst`
+    // (`x15:slicerCachePivotTables`, the data-model spelling) — an
+    // attachment this reader would not see. Its token anywhere in the
+    // part is an attachment list it cannot read, and the caller's
+    // refusal is the safe answer (in-house review S7C-R3; a decoy
+    // spelling only costs a refusal).
+    if (std.mem.indexOf(u8, xml, "slicerCachePivotTables") != null) return error.MalformedPivotXml;
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var kids = pivot_xml.Children.init(xml, root.hit, root.body_end, root.prefix, root.env);
     while (kids.next() catch return error.MalformedPivotXml) |k| {
@@ -2395,6 +2402,29 @@ pub const edit = struct {
         if (def.page_fields.len != 0 or def.chart_formats == .other) return error.PivotShapeUnsupported;
         for (def.col_fields) |cf| if (cf == .field) return error.PivotShapeUnsupported;
         if (def.row_fields.len != def.row_field_x_spans.len) return error.MalformedPivotXml;
+        // A wrapper whose `count` disagrees with its children refuses
+        // every row edit at the layout; the count splice below would
+        // heal the disagreement before the layout re-parses, so it is
+        // refused here, where the evidence still exists (in-house
+        // review S7C-MUT-1).
+        if (def.axes_count_mismatch) return error.MalformedPivotXml;
+        // S7c is the first slice that MOVES ordinals, so content this
+        // reader tolerates unread must be proven not to carry any. A
+        // surviving pivotField's body beyond its `<items>` (an
+        // `autoSortScope`, its own `extLst`) can name a field by
+        // ordinal — refused; the removed field's body leaves whole
+        // with it. The root `<extLst>` is probed for the ordinal-
+        // carrier tokens — presence refuses, and the corpus'
+        // attribute-only `x14:pivotTableDefinition` carries none
+        // (in-house review S7C-R1).
+        for (def.fields, 0..) |f, m| {
+            if (schema == .remove and schema.remove == m) continue;
+            if (f.has_other_children) return error.PivotShapeUnsupported;
+        }
+        if (def.ext_lst_start) |at| {
+            const tail = table_xml[at..];
+            if (std.mem.indexOf(u8, tail, "field=") != null or std.mem.indexOf(u8, tail, "fld=") != null) return error.PivotShapeUnsupported;
+        }
 
         var splices: std.ArrayListUnmanaged(Splice) = .empty;
         switch (schema) {
@@ -2996,6 +3026,11 @@ pub const engine = struct {
             .insert => |ins| {
                 if (ins.at >= def.fields.len) return error.MalformedPivotXml;
                 const anchor = def.fields[ins.at].span.start;
+                // A caller-assembled field without a span would turn
+                // the insertion into a prepend before the declaration
+                // — answered, as the remove arm answers (in-house
+                // review S7C-MUT-2).
+                if (anchor == 0) return error.MalformedPivotXml;
                 var out: std.ArrayListUnmanaged(u8) = .empty;
                 try out.append(arena, '<');
                 try out.appendSlice(arena, p);
@@ -7968,4 +8003,92 @@ test "S7c engine: rowsAfterColEdit and effectiveCacheFields hold their bounds" {
     const three = try engine.effectiveCacheFields(arena, &two, .{ .insert = .{ .at = 1, .name = "X" } });
     try testing.expectEqualStrings("X", three[1].name);
     try testing.expectEqualStrings("B", three[2].name);
+}
+
+const s7c_row_axis_high =
+    \\<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="7"><location ref="A3:B6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField></pivotFields><rowFields count="1"><field x="2"/></rowFields><rowItems count="3"><i><x/></i><i><x v="1"/></i><i t="grand"><x/></i></rowItems><colItems count="1"><i/></colItems><dataFields count="1"><dataField name="Sum of Qty" fld="1" baseField="2" baseItem="0"/></dataFields></pivotTableDefinition>
+;
+
+test "S7c edit: every ordinal carrier above the edit moves — the row axis and baseField included; tolerated-unread content refuses (in-house S7C-R1, S7C-MUT-1)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Remove the unreferenced ordinal 0: the row axis, the data field
+    // and its baseField all sit above and decrement.
+    const removed = try edit.applyConsumerSchemaEdit(arena, s7c_row_axis_high, .{ .remove = 0 });
+    try testing.expect(std.mem.indexOf(u8, removed, "<rowFields count=\"1\"><field x=\"1\"/></rowFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, removed, "fld=\"0\" baseField=\"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, removed, "<pivotFields count=\"2\">") != null);
+    // Insert at 1: the same carriers increment.
+    const grown = try edit.applyConsumerSchemaEdit(arena, s7c_row_axis_high, .{ .insert = .{ .at = 1, .name = "N" } });
+    try testing.expect(std.mem.indexOf(u8, grown, "<rowFields count=\"1\"><field x=\"3\"/></rowFields>") != null);
+    try testing.expect(std.mem.indexOf(u8, grown, "fld=\"2\" baseField=\"3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, grown, "<pivotFields count=\"4\">") != null);
+    // A wrapper count that disagrees with its children refuses where
+    // the splice would have healed the evidence.
+    const lying = try replacedOnce(arena, s7c_row_axis_high, "<pivotFields count=\"3\">", "<pivotFields count=\"9\">");
+    try testing.expectError(error.MalformedPivotXml, edit.applyConsumerSchemaEdit(arena, lying, .{ .remove = 0 }));
+    // A SURVIVING field's body beyond its items may name ordinals this
+    // rewrite cannot see — refused; the removed field's body leaves
+    // whole with it.
+    const bodied = try replacedOnce(arena, s7c_row_axis_high, "<pivotField showAll=\"0\"/>", "<pivotField showAll=\"0\"><autoSortScope><pivotArea type=\"normal\"/></autoSortScope></pivotField>");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, bodied, .{ .insert = .{ .at = 1, .name = "N" } }));
+    _ = try edit.applyConsumerSchemaEdit(arena, bodied, .{ .remove = 0 });
+    // The root extLst: attribute-only extension content admits (the
+    // corpus' x14:pivotTableDefinition), an ordinal-carrier token
+    // refuses.
+    const ext_ok = try replacedOnce(arena, s7c_row_axis_high, "</pivotTableDefinition>", "<extLst><ext uri=\"{X}\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"><x14:pivotTableDefinition hideValuesRow=\"1\"/></ext></extLst></pivotTableDefinition>");
+    _ = try edit.applyConsumerSchemaEdit(arena, ext_ok, .{ .remove = 0 });
+    const ext_bad = try replacedOnce(arena, ext_ok, "hideValuesRow=\"1\"", "hideValuesRow=\"1\" field=\"2\"");
+    try testing.expectError(error.PivotShapeUnsupported, edit.applyConsumerSchemaEdit(arena, ext_bad, .{ .remove = 0 }));
+}
+
+test "S7c: an attachment list the reader cannot see refuses; the plain list decodes (in-house S7C-R3b)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const x15 =
+        \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><extLst><ext uri="{Y}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"><x15:slicerCachePivotTables><x15:pivotTable tabId="2" name="P"/></x15:slicerCachePivotTables></ext></extLst></slicerCacheDefinition>
+    ;
+    try testing.expectError(error.MalformedPivotXml, attachedPivotNames(arena, x15, .slicer));
+    const plain =
+        \\<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="S" sourceName="F"><pivotTables><pivotTable tabId="2" name="P&amp;L"/></pivotTables><data><tabular pivotCacheId="2"/></data></slicerCacheDefinition>
+    ;
+    const names = try attachedPivotNames(arena, plain, .slicer);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("P&L", names[0]);
+}
+
+fn rebuildWithForFailures(allocator: Allocator, cache: *const PivotCache, rows: []const engine.Row, rec: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    _ = try engine.rebuildWith(arena_state.allocator(), cache, rows, rec, null, .{ .remove = 2 });
+}
+
+fn consumerSchemaForFailures(allocator: Allocator, table_xml: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    _ = try edit.applyConsumerSchemaEdit(arena_state.allocator(), table_xml, .{ .remove = 2 });
+}
+
+test "S7c: an allocation failure anywhere in a schema rebuild or the consumer rewrite is OutOfMemory, never a refusal (in-house S7C-MUT-4)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "s7c_oom.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .sheet_ref);
+    var o = try Opened.open(testing.allocator, io, path);
+    defer o.deinit(testing.allocator);
+    const cache = &o.pivots.caches[0];
+    const rec = (try o.store.part(cache.records_part_name.?)).?.bytes;
+    const rows = [_]engine.Row{
+        &.{ .{ .string = "East" }, .{ .number = "3" } },
+        &.{ .{ .string = "West" }, .{ .number = "4" } },
+        &.{ .{ .string = "East" }, .{ .number = "5" } },
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, rebuildWithForFailures, .{ cache, &rows, rec });
+    try testing.checkAllAllocationFailures(testing.allocator, consumerSchemaForFailures, .{o.pivots.tables[0].raw_xml});
 }

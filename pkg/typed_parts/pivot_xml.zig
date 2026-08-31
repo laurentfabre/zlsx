@@ -751,6 +751,11 @@ pub const TableDefinition = struct {
     col_items: ?AxisItems = null,
     chart_formats: ChartFormats = .none,
     has_ext_lst: bool = false,
+    /// The first root `<extLst>`'s `<` position — where S7c's
+    /// ordinal-token probe starts: extension content is tolerated
+    /// unread, and a schema edit must not move ordinals past one that
+    /// might carry them.
+    ext_lst_start: ?usize = null,
     /// The axis and data wrappers (`rowFields`, `colFields`,
     /// `pageFields`, `dataFields`) carried content their reader does
     /// not classify — a child that is not their field, one under
@@ -892,6 +897,7 @@ pub fn parseTableDefinition(allocator: Allocator, xml: []const u8) Error!TableDe
             def.chart_formats = if (def.chart_formats == .other or cf == .other) .other else cf;
         } else if (std.mem.eql(u8, k.local, "extLst")) {
             def.has_ext_lst = true;
+            if (def.ext_lst_start == null) def.ext_lst_start = k.hit.open_lt;
         } else {
             def.has_other_children = true;
         }
