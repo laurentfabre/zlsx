@@ -126,9 +126,13 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
             else => return error.MalformedSheetXml,
         }) orelse return error.MissingSheetPart;
 
+        // Scratch (the walker's frame stack, the raw-rule list) lives
+        // on the caller's gpa and is reclaimed per sheet; only decoded
+        // records land on the view arena, whose allocations are never
+        // individually freed (Codex #215 r2 PERF-201).
         var raw_rules: std.ArrayListUnmanaged(RawRule) = .empty;
-        defer raw_rules.deinit(a);
-        try scanSheetRules(a, part.bytes, &raw_rules);
+        defer raw_rules.deinit(gpa);
+        try scanSheetRules(gpa, part.bytes, &raw_rules);
 
         for (raw_rules.items) |raw| {
             const formulas = try a.alloc([]const u8, raw.formula_count);
@@ -222,8 +226,14 @@ fn isMainNs(uri: []const u8) bool {
 /// the schema puts formula text (a CDATA section included — markup is
 /// not the formula, the defined-names ruling), and a rule spelling
 /// more than the schema's three formulas.
+/// The walker's nesting ceiling. Excel writes sheet parts a handful
+/// of levels deep; 1024 is two orders of magnitude of headroom, and a
+/// bound keeps a crafted part from growing the frame stack without
+/// limit (Codex #215 r2 PERF-201).
+const max_depth = 1024;
+
 fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(RawRule)) Error!void {
-    const Kind = enum { root, cf_block, cf_rule, other };
+    const Kind = enum { root, barren_root, cf_block, cf_rule, other };
     const Frame = struct {
         name: []const u8,
         kind: Kind,
@@ -259,7 +269,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             if (!std.mem.eql(u8, top.name, name)) return error.MalformedSheetXml;
             switch (top.kind) {
                 .cf_rule => try out.append(a, top.rule),
-                .root => root_closed = true,
+                .root, .barren_root => root_closed = true,
                 else => {},
             }
             i = j + 1;
@@ -309,14 +319,22 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
         if (frames.items.len == 0) {
             if (!is_main) return error.MalformedSheetXml;
             root_seen = true;
-            if (std.mem.eql(u8, qname, "chartsheet") or std.mem.eql(u8, qname, "dialogsheet")) {
-                return; // no grid — the part cannot carry rules
-            }
-            if (!std.mem.eql(u8, qname, "worksheet") and !std.mem.eql(u8, qname, "macrosheet")) {
+            // A chartsheet or dialogsheet cannot carry conditional
+            // formatting, so it contributes an empty inventory — but
+            // it is still WALKED whole: an early return here would
+            // bypass the second-root and unterminated-nesting checks,
+            // so a truncated chartsheet or a `<worksheet/>` followed
+            // by a rule-bearing second root would read as an empty
+            // success (Codex #215 r2 REL-201).
+            const barren = std.mem.eql(u8, qname, "chartsheet") or
+                std.mem.eql(u8, qname, "dialogsheet");
+            if (!barren and
+                !std.mem.eql(u8, qname, "worksheet") and
+                !std.mem.eql(u8, qname, "macrosheet"))
+            {
                 return error.MalformedSheetXml;
             }
-            if (te.self_closing) return; // an empty sheet holds no rules
-            frame.kind = .root;
+            frame.kind = if (barren) .barren_root else .root;
         } else {
             const parent = &frames.items[frames.items.len - 1];
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "conditionalFormatting")) {
@@ -333,21 +351,32 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                     .priority = digitU32(try uniqueAttr(attrs, "priority")),
                 };
             } else if (parent.kind == .cf_rule and is_main and std.mem.eql(u8, qname, "formula")) {
-                // Text-only, consumed atomically: a body holding any
-                // markup — an element, a comment, a CDATA section —
-                // refuses, and so does a fourth formula (the schema's
-                // maxOccurs is 3) or one that never closes.
+                // Text-only, consumed atomically: the FIRST markup
+                // construct after the open tag must be the closing
+                // `</formula>` — XML whitespace before its `>` allowed
+                // (`</formula >` is valid; Codex #215 r2 REL-202).
+                // Anything else — an element, a comment, a CDATA
+                // section, a foreign close tag — is markup where the
+                // schema puts formula text, or a formula that never
+                // closes; both refuse, as does a fourth formula (the
+                // schema's maxOccurs is 3).
                 _ = try uniqueAttr(attrs, "");
                 if (parent.rule.formula_count >= 3) return error.MalformedSheetXml;
                 var body: []const u8 = "";
                 if (te.self_closing) {
                     i = te.after_gt;
                 } else {
-                    const close = (workbook_xml.findClosingTag(xml, te.after_gt, "</formula>") catch
-                        return error.MalformedSheetXml) orelse return error.MalformedSheetXml;
-                    body = xml[te.after_gt..close];
-                    if (std.mem.indexOfScalar(u8, body, '<') != null) return error.MalformedSheetXml;
-                    i = close + "</formula>".len;
+                    const lt2 = std.mem.indexOfScalarPos(u8, xml, te.after_gt, '<') orelse
+                        return error.MalformedSheetXml;
+                    if (lt2 + 1 >= xml.len or xml[lt2 + 1] != '/') return error.MalformedSheetXml;
+                    var j2 = lt2 + 2;
+                    const ns2 = j2;
+                    while (j2 < xml.len and xml[j2] != '>' and !isXmlWs(xml[j2])) j2 += 1;
+                    if (!std.mem.eql(u8, xml[ns2..j2], "formula")) return error.MalformedSheetXml;
+                    while (j2 < xml.len and isXmlWs(xml[j2])) j2 += 1;
+                    if (j2 >= xml.len or xml[j2] != '>') return error.MalformedSheetXml;
+                    body = xml[te.after_gt..lt2];
+                    i = j2 + 1;
                 }
                 parent.rule.formulas[parent.rule.formula_count] = body;
                 parent.rule.formula_count += 1;
@@ -356,10 +385,15 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
         }
 
         if (te.self_closing) {
-            if (frame.kind == .cf_rule) try out.append(a, frame.rule);
-            // A self-closing block or opaque element contributes
-            // nothing and opens no frame.
+            switch (frame.kind) {
+                .cf_rule => try out.append(a, frame.rule),
+                .root, .barren_root => root_closed = true,
+                // A self-closing block or opaque element contributes
+                // nothing and opens no frame.
+                else => {},
+            }
         } else {
+            if (frames.items.len >= max_depth) return error.MalformedSheetXml;
             try frames.append(a, frame);
         }
         i = te.after_gt;
@@ -714,6 +748,73 @@ test "scanSheetRules: sheet-family roots — chartsheet empty, macrosheet walked
         "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
         "</worksheet>");
     try testing.expectEqual(@as(usize, 1), strict.len);
+}
+
+test "scanSheetRules: early-root shapes cannot bypass whole-part validation (REL-201)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A self-closing root followed by a second, rule-bearing root
+    // must refuse — an early return at root classification read this
+    // as an empty success and the second root's rules vanished.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>" ++
+        ws_open ++ "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting></worksheet>"));
+
+    // An unterminated chartsheet is mismatched nesting, not an empty
+    // inventory.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews/>"));
+
+    // A lone self-closing worksheet root is well-formed: an empty
+    // sheet holds no rules.
+    const empty = try scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>");
+    try testing.expectEqual(@as(usize, 0), empty.len);
+
+    // A chartsheet is walked whole; a rule-shaped subtree inside it
+    // is opaque (the part cannot carry rules by schema), and its
+    // nesting still has to prove.
+    const chart = try scanRules(a, "<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</chartsheet>");
+    try testing.expectEqual(@as(usize, 0), chart.len);
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><a></chartsheet>"));
+}
+
+test "scanSheetRules: XML whitespace before a formula close's '>' reads (REL-202)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rules = try scanRules(a, ws_open ++
+        "<conditionalFormatting sqref=\"A1\">" ++
+        "<cfRule type=\"cellIs\" priority=\"1\" operator=\"between\"><formula>1</formula ><formula>2</formula\n></cfRule>" ++
+        "</conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+    try testing.expectEqual(@as(u8, 2), rules[0].formula_count);
+    try testing.expectEqualStrings("1", rules[0].formulas[0]);
+    try testing.expectEqualStrings("2", rules[0].formulas[1]);
+}
+
+test "scanSheetRules: nesting past the ceiling refuses; deep-but-bounded walks (PERF-201)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try buf.appendSlice(testing.allocator, ws_open);
+    for (0..max_depth) |_| try buf.appendSlice(testing.allocator, "<a>");
+    // The ceiling trips at the push past max_depth — before EOF.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, buf.items));
+
+    buf.clearRetainingCapacity();
+    try buf.appendSlice(testing.allocator, ws_open);
+    for (0..1000) |_| try buf.appendSlice(testing.allocator, "<a>");
+    for (0..1000) |_| try buf.appendSlice(testing.allocator, "</a>");
+    try buf.appendSlice(testing.allocator, "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting></worksheet>");
+    const rules = try scanRules(a, buf.items);
+    try testing.expectEqual(@as(usize, 1), rules.len);
 }
 
 test "scanSheetRules: an attribute value may contain '>' — quote-aware tag ends (REL-103's shape)" {

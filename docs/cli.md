@@ -341,15 +341,18 @@ refuses, the host-predicate rule), a `cfRule` only as a direct child
 of a block, a `formula` only as a text-only direct child of a rule —
 so an extension tree spelling the same names (an `x14` subtree
 rebinding the default namespace, a decoy under `<extLst>`) can never
-ghost a record. Attributes follow XML, not a byte pattern: whitespace
-around `=` and either quote read as authored. Refused whole (exit 2),
-nothing written: mismatched or unterminated nesting anywhere in the
-part; a `<formula>` that never closes (a refusal, not an absence) or
-carries markup; a fourth formula (the schema's `maxOccurs` is 3); a
-duplicate attribute on a block or rule tag; a `sqref`, rule type or
-formula whose carrier does not decode (a bad entity) or decodes to
-non-UTF-8 (NDJSON must stay parseable); a sheet-name carrier that
-does not decode. A partial or wrong rule inventory is the shape of a
+ghost a record. The grammar is XML's, not a byte pattern: whitespace
+around `=` and either quote read as authored, and a closing tag may
+space before its `>` (`</formula >`). Refused whole (exit 2), nothing
+written: mismatched or unterminated nesting anywhere in the part —
+a truncated part, a second root, and nesting past the walker's
+1024-level ceiling included; a `<formula>` that never closes (a
+refusal, not an absence) or carries markup; a fourth formula (the
+schema's `maxOccurs` is 3); a duplicate attribute on a block or rule
+tag; a `sqref`, rule type or formula whose carrier does not decode (a
+bad entity — the character-reference grammar is exact: `&#+65;` and
+`&#1_0;` are not references) or decodes to non-UTF-8 (NDJSON must
+stay parseable); a sheet-name carrier that does not decode. A partial or wrong rule inventory is the shape of a
 guard hole. Boundary conventions, pinned as the contract: an absent
 `sqref` or `type` and an empty one are one shape (the empty string);
 a `dxfId` or `priority` that is written but not a plain string of
@@ -358,8 +361,9 @@ convention `tableHeaderRowCount` set — `+1` and `1_0` are not
 numbers); a `<conditionalFormatting>` block with no `<cfRule>`
 children — the self-closing spelling included — emits nothing; a
 `chartsheet` or `dialogsheet` part holds no rules by schema and
-contributes an empty inventory, while a `macrosheet` (which can carry
-conditional formatting) is walked like a worksheet. Extension-list
+contributes an empty inventory (it is still walked whole — its
+nesting must prove like any other part's), while a `macrosheet`
+(which can carry conditional formatting) is walked like a worksheet. Extension-list
 conditional formatting (`x14` data bars, icon sets carried under
 `<extLst>`) is a different tree and not part of this read — the edit
 paths move its `<xm:sqref>` / `<xm:f>` carriers with the grid (S2),

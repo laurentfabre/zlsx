@@ -345,7 +345,11 @@ fn indexOfTag(hay: []const u8, from: usize, needle: []const u8) ?usize {
 
 /// Match `key="value"` or `key='value'` inside an attribute slice.
 /// Returns the value (no quote-stripping issues, no entity decode).
-fn attrAt(attrs: []const u8, key: []const u8) ?[]const u8 {
+/// Pub so the DV/CF rewriter's raw-source walk can mirror this exact
+/// needle when it reproduces `parseValidations`' skip-without-an-index
+/// behaviour for sqref-less entries — the two walks must assign one
+/// element count (Codex #215 r2 REL-204).
+pub fn attrAt(attrs: []const u8, key: []const u8) ?[]const u8 {
     return attrAtQuote(attrs, key, '"') orelse attrAtQuote(attrs, key, '\'');
 }
 
