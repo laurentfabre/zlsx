@@ -742,19 +742,20 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             } else if (elem_main and prefixed) {
                 const c = std.mem.indexOfScalar(u8, qname, ':').?;
                 if (std.mem.eql(u8, qname[c + 1 ..], "macrosheet")) {
-                    var decl_name_buf: [64]u8 = undefined;
+                    // Structural compare — a fixed name buffer put an
+                    // artificial ceiling on a valid prefix's length
+                    // (Codex #215 r21 REL-2101).
                     const p = qname[0..c];
-                    if (p.len + "xmlns:".len <= decl_name_buf.len) {
-                        const want = std.fmt.bufPrint(&decl_name_buf, "xmlns:{s}", .{p}) catch unreachable;
-                        var it3: AttrScan = .{ .rest = attrs };
-                        while (try it3.next()) |attr3| {
-                            if (std.mem.eql(u8, attr3.name, want)) {
-                                if (try bindsNs(a, attr3.value, isMsMacroNs)) {
-                                    accepted = true;
-                                    root_kind = .macrosheet;
-                                }
-                                break;
+                    var it3: AttrScan = .{ .rest = attrs };
+                    while (try it3.next()) |attr3| {
+                        if (std.mem.startsWith(u8, attr3.name, "xmlns:") and
+                            std.mem.eql(u8, attr3.name["xmlns:".len..], p))
+                        {
+                            if (try bindsNs(a, attr3.value, isMsMacroNs)) {
+                                accepted = true;
+                                root_kind = .macrosheet;
                             }
+                            break;
                         }
                     }
                 }
@@ -2185,6 +2186,18 @@ test "scanSheetRules: the canonical xm:macrosheet root reads; foreign bindings r
 
     // An arbitrary bound prefix is not the canonical shape.
     try testing.expectError(error.MalformedSheetXml, scanRules(a, "<xm:macrosheet xmlns:xm=\"urn:foreign\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></xm:macrosheet>"));
+}
+
+test "scanSheetRules: a long macro-sheet prefix is not a refusal (REL-2101)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const lp = "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
+    const rules = try scanRules(a, "<" ++ lp ++ ":macrosheet xmlns:" ++ lp ++ "=\"http://schemas.microsoft.com/office/excel/2006/main\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</" ++ lp ++ ":macrosheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
 }
 
 test "collect: a canonical macro sheet in a real package keeps its rules (REL-2001)" {
