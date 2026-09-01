@@ -396,9 +396,19 @@ fn enterElementScope(
 ) Error!void {
     var it: AttrScan = .{ .rest = attrs };
     while (try it.next()) |attr| {
-        if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
+        if (std.mem.eql(u8, attr.name, "xmlns")) {
+            // A DEFAULT binding may not name either reserved
+            // namespace — `xmlns="http://www.w3.org/2000/xmlns/"` on
+            // a nested rule block otherwise classified it foreign and
+            // thinned the inventory under exit 0 (Codex #215 r12
+            // SEC-1201).
+            if (try bindsNs(scratch, attr.value, isXmlNsUri)) return error.MalformedSheetXml;
+            if (try bindsNs(scratch, attr.value, isXmlnsNsUri)) return error.MalformedSheetXml;
+        } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
             const p = attr.name["xmlns:".len..];
             if (std.mem.eql(u8, p, "xmlns")) return error.MalformedSheetXml;
+            // Namespaces in XML 1.0 forbids undeclaring a prefix.
+            if (attr.value.len == 0) return error.MalformedSheetXml;
             const binds_xml = try bindsNs(scratch, attr.value, isXmlNsUri);
             if (std.mem.eql(u8, p, "xml")) {
                 if (!binds_xml) return error.MalformedSheetXml;
@@ -1868,6 +1878,37 @@ test "scanSheetRules: prefixes resolve in scope; reserved declarations refuse (S
         "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
         "</worksheet>");
     try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "scanSheetRules: reserved URIs as a DEFAULT binding refuse; empty prefixed bindings refuse (SEC-1201)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A rule block rebinding its default to a reserved namespace is
+    // namespace-invalid XML, not a foreign subtree to step over.
+    inline for (.{ "http://www.w3.org/2000/xmlns/", "http://www.w3.org/XML/1998/namespace" }) |uri| {
+        try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+            "<conditionalFormatting xmlns=\"" ++ uri ++ "\" sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+            "</worksheet>"));
+    }
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " ++
+        "xmlns:zz=\"\"><sheetData/></worksheet>"));
+}
+
+test "collect: a reserved default binding in a real workbook refuses (SEC-1201)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "resv.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<conditionalFormatting sqref=\"A1:A4\">", "<conditionalFormatting xmlns=\"http://www.w3.org/2000/xmlns/\" sqref=\"A1:A4\">");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
 }
 
 test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts (SEC-1101)" {
