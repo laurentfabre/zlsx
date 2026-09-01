@@ -126,8 +126,10 @@ pub const FreezePane = struct {
 /// at `san_start` were copied VERBATIM from the source part at
 /// `src_start`. Runs break wherever the sanitizer elides (comments,
 /// PIs) or re-encodes (CDATA contents) — those sanitized bytes belong
-/// to no run.
-pub const SrcRun = struct { san_start: u32, src_start: u32, len: u32 };
+/// to no run. Offsets are usize: CDATA re-encoding can grow the
+/// SANITIZED buffer past what a u32 addresses even though the source
+/// itself is bounded below 2 GiB (Codex #215 r14 REL-1402).
+pub const SrcRun = struct { san_start: usize, src_start: usize, len: usize };
 
 pub const SheetXml = struct {
     dimension: ?Dimension,
@@ -205,8 +207,8 @@ pub const SheetXml = struct {
         }
         if (lo == 0) return null;
         const run = self.src_runs[lo - 1];
-        if (off + slice.len > @as(usize, run.san_start) + run.len) return null;
-        const src_lo = @as(usize, run.src_start) + (off - run.san_start);
+        if (off + slice.len > run.san_start + run.len) return null;
+        const src_lo = run.src_start + (off - run.san_start);
         return .{ src_lo, src_lo + slice.len };
     }
 };
@@ -360,17 +362,17 @@ fn mapRun(
     const list = runs orelse return;
     if (list.items.len > 0) {
         const last = &list.items[list.items.len - 1];
-        if (@as(usize, last.san_start) + last.len == san and
-            @as(usize, last.src_start) + last.len == src)
+        if (last.san_start + last.len == san and
+            last.src_start + last.len == src)
         {
-            last.len += @intCast(len);
+            last.len += len;
             return;
         }
     }
     try list.append(allocator, .{
-        .san_start = @intCast(san),
-        .src_start = @intCast(src),
-        .len = @intCast(len),
+        .san_start = san,
+        .src_start = src,
+        .len = len,
     });
 }
 
@@ -1317,6 +1319,20 @@ test "parse: cfRule collects up to three formula bodies in document order" {
     try testing.expect(bodiless.formula == null);
     try testing.expect(bodiless.formula2 == null);
     try testing.expect(bodiless.formula3 == null);
+}
+
+test "mapRun: offsets past u32 map without truncation (REL-1402)" {
+    // CDATA re-encoding can grow the sanitized buffer past 4 GiB on
+    // a sub-2-GiB source, so run offsets are usize — exercised here
+    // synthetically, without a multi-gigabyte buffer.
+    var runs: std.ArrayListUnmanaged(SrcRun) = .empty;
+    defer runs.deinit(testing.allocator);
+    const big: usize = @as(usize, std.math.maxInt(u32)) + 10;
+    try mapRun(testing.allocator, &runs, big, 100, 5);
+    try mapRun(testing.allocator, &runs, big + 5, 105, 5); // contiguous — extends
+    try testing.expectEqual(@as(usize, 1), runs.items.len);
+    try testing.expectEqual(big, runs.items[0].san_start);
+    try testing.expectEqual(@as(usize, 10), runs.items[0].len);
 }
 
 test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has no home" {
