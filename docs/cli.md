@@ -268,7 +268,8 @@ out twice under two identities); a drawing structure the walkers
 recognise but cannot read whole — a sheet's drawing relationship, a
 pic's image relationship or a frame's chart relationship that dangles,
 is of the wrong relationship type, or names an absent part, a
-`<drawing>` element whose reference cannot be read, an anchor whose
+`<drawing>` element whose reference cannot be read, a second live
+`<drawing>` element on one sheet (the schema allows one), an anchor whose
 `from` / `to` / `pos` / `ext` does not parse (a `two_cell` anchor with
 an unreadable `<to>` must not ride out looking like `one_cell`, and a
 `one_cell` anchor's schema-required extent is validated even though it

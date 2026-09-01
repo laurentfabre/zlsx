@@ -752,6 +752,10 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
         // A foreign relationship-type URI merely ENDING in the
         // expected leaf is not that edge (Codex #214 r3 REL-303).
         .{ .name = "a13.xlsx", .part = "xl/worksheets/_rels/sheet2.xml.rels", .old = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing", .new = "https://example.invalid/relationships/drawing" },
+        // The worksheet schema allows ONE drawing element; a second
+        // live one refuses rather than thinning (Codex #214 r4
+        // REL-403).
+        .{ .name = "a14.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "<drawing r:id=\"rIdD1\"/>", .new = "<drawing r:id=\"rIdD1\"/><drawing r:id=\"rIdD1\"/>" },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);

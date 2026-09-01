@@ -266,6 +266,10 @@ fn collectFromSheet(
             if (mode == .strict) return error.MalformedDrawingXml;
             return;
         },
+        .multiple => |r| blk: {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            break :blk r;
+        },
         .rid => |r| r,
     };
 
@@ -438,6 +442,10 @@ fn collectChartsFromSheet(
         .malformed => {
             if (mode == .strict) return error.MalformedDrawingXml;
             return;
+        },
+        .multiple => |r| blk: {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            break :blk r;
         },
         .rid => |r| r,
     };
@@ -842,7 +850,7 @@ fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
 /// (one per sheet at most).
 fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
     return switch (findDrawingRef(sheet_xml)) {
-        .rid => |r| r,
+        .rid, .multiple => |r| r,
         .absent, .malformed => null,
     };
 }
@@ -855,6 +863,11 @@ fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
 const DrawingRef = union(enum) {
     absent,
     rid: []const u8,
+    /// Two or more live drawing elements — schema-invalid. Strict
+    /// refuses (the inventory cannot be walked whole); lenient
+    /// follows the first, whose rid this carries (Codex #214 r4
+    /// REL-403).
+    multiple: []const u8,
     malformed,
 };
 
@@ -874,61 +887,78 @@ const relationships_ns_uris = [_][]const u8{
 };
 
 fn findDrawingRef(sheet_xml: []const u8) DrawingRef {
-    const tag = findDrawingElement(sheet_xml) orelse return .absent;
+    const tag = findDrawingElementFrom(sheet_xml, 0) orelse return .absent;
     const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, tag, '>') orelse return .malformed;
     const attrs = sheet_xml[tag .. tag_end + 1];
-    // Canonical spelling first; then any-prefix `*:id` whose prefix is
-    // bound to the relationships namespace — conventionally `r`, but
-    // OOXML producers may pick any prefix.
-    if (attrValue(attrs, "r:id")) |rid| return .{ .rid = rid };
-    if (prefixedIdAttrValue(sheet_xml, attrs)) |rid| return .{ .rid = rid };
-    return .malformed;
+    // Canonical spelling first — the literal `r:` prefix is honoured
+    // as spelled, the convention every relationship reference in this
+    // module reads (`r:embed`, the chart `r:id`); binding verification
+    // applies to the NON-canonical prefixes the r2 lift added. Then
+    // any-prefix `*:id` whose prefix is bound to the relationships
+    // namespace.
+    const rid = attrValue(attrs, "r:id") orelse
+        (prefixedIdAttrValue(sheet_xml, attrs) orelse return .malformed);
+    // The worksheet schema allows ONE drawing element; a second live
+    // one means the inventory cannot be walked whole — strict refuses,
+    // lenient follows the first (Codex #214 r4 REL-403).
+    if (findDrawingElementFrom(sheet_xml, tag_end + 1) != null) return .{ .multiple = rid };
+    return .{ .rid = rid };
 }
 
-/// The sheet's `<drawing>` element: the canonical unprefixed spelling,
-/// or `<{p}:drawing` for a prefix bound to the SpreadsheetML main
-/// namespace. Matches inside comments / CDATA / PIs are text, not the
+/// The first live `<drawing>` element at or after `start`, in either
+/// spelling — the canonical unprefixed one, or `<{p}:drawing` for a
+/// prefix bound to the SpreadsheetML main namespace — whichever comes
+/// FIRST in document order (one scan, not unprefixed-then-prefixed
+/// passes that could skip an earlier prefixed element; Codex #214 r4
+/// REL-403). Matches inside comments / CDATA / PIs are text, not the
 /// element — a commented `<drawing/>` must not turn into a strict
-/// refusal of a valid sheet (Codex #214 r3 REL-302).
-fn findDrawingElement(xml: []const u8) ?usize {
-    var i: usize = 0;
-    while (findOpeningTagFrom(xml, i, "drawing")) |at| {
-        if (isInsideCommentOrCdata(xml, at)) {
-            i = skipRegionContaining(xml, at) orelse at + 1;
-            continue;
-        }
-        return at;
-    }
-    i = 0;
-    while (std.mem.indexOfScalarPos(u8, xml, i, ':')) |colon| {
-        i = colon + 1;
-        const name = "drawing";
-        const after_name = colon + 1 + name.len;
-        if (after_name >= xml.len) return null;
-        if (!std.mem.eql(u8, xml[colon + 1 .. after_name], name)) continue;
-        const c = xml[after_name];
-        if (!(c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>')) continue;
-        // Walk back over the prefix to the `<`; every intervening
-        // byte must be a name char, so a `:drawing` inside an
-        // attribute value or text does not count.
-        var p = colon;
-        var ok = true;
-        while (p > 0) {
-            p -= 1;
-            const pc = xml[p];
-            if (pc == '<') break;
-            if (!(std.ascii.isAlphanumeric(pc) or pc == '_' or pc == '-' or pc == '.')) {
-                ok = false;
-                break;
+/// refusal of a valid sheet (r3 REL-302).
+fn findDrawingElementFrom(xml: []const u8, start: usize) ?usize {
+    const unprefixed: ?usize = blk: {
+        var i = start;
+        while (findOpeningTagFrom(xml, i, "drawing")) |at| {
+            if (isInsideCommentOrCdata(xml, at)) {
+                i = skipRegionContaining(xml, at) orelse at + 1;
+                continue;
             }
+            break :blk at;
         }
-        if (!ok or xml[p] != '<') continue;
-        if (p + 1 == colon) continue; // `<:name` — an empty prefix is not one.
-        if (isInsideCommentOrCdata(xml, p)) continue;
-        if (!prefixBoundTo(xml, xml[p + 1 .. colon], &spreadsheetml_main_uris)) continue;
-        return p;
-    }
-    return null;
+        break :blk null;
+    };
+    const prefixed: ?usize = blk: {
+        var i = start;
+        while (std.mem.indexOfScalarPos(u8, xml, i, ':')) |colon| {
+            i = colon + 1;
+            const name = "drawing";
+            const after_name = colon + 1 + name.len;
+            if (after_name >= xml.len) break :blk null;
+            if (!std.mem.eql(u8, xml[colon + 1 .. after_name], name)) continue;
+            const c = xml[after_name];
+            if (!(c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>')) continue;
+            // Walk back over the prefix to the `<`; every intervening
+            // byte must be a name char, so a `:drawing` inside an
+            // attribute value or text does not count.
+            var p = colon;
+            var ok = true;
+            while (p > start) {
+                p -= 1;
+                const pc = xml[p];
+                if (pc == '<') break;
+                if (!(std.ascii.isAlphanumeric(pc) or pc == '_' or pc == '-' or pc == '.')) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok or xml[p] != '<') continue;
+            if (p + 1 == colon) continue; // `<:name` — an empty prefix is not one.
+            if (isInsideCommentOrCdata(xml, p)) continue;
+            if (!prefixBoundTo(xml, xml[p + 1 .. colon], &spreadsheetml_main_uris)) continue;
+            break :blk p;
+        }
+        break :blk null;
+    };
+    if (unprefixed != null and prefixed != null) return @min(unprefixed.?, prefixed.?);
+    return unprefixed orelse prefixed;
 }
 
 /// Find the start of an opening tag named `name` at or after `start`,
@@ -995,7 +1025,11 @@ fn prefixedIdAttrValue(sheet_xml: []const u8, attrs: []const u8) ?[]const u8 {
 /// document-wide search, not a scope-accurate resolution — the sheet
 /// part is not namespace-parsed here, and a binding declared anywhere
 /// is evidence enough to honour the spelling (the drawings-part
-/// resolver does the scope-accurate version for its own URIs).
+/// resolver does the scope-accurate version for its own URIs). The
+/// candidate must be a real attribute NAME in a live opening tag —
+/// preceded by XML whitespace, outside quoted values, comments,
+/// CDATA and PIs — so declaration-shaped text inside an attribute
+/// value or a comment is not a binding (Codex #214 r4 REL-401).
 /// Tolerates XML `Eq` whitespace on both sides of `=`.
 fn prefixBoundTo(xml: []const u8, prefix: []const u8, uris: []const []const u8) bool {
     var buf: [140]u8 = undefined;
@@ -1003,7 +1037,11 @@ fn prefixBoundTo(xml: []const u8, prefix: []const u8, uris: []const []const u8) 
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, decl)) |at| {
         i = at + decl.len;
-        var j = i;
+        if (at == 0) continue;
+        const before = xml[at - 1];
+        if (!(before == ' ' or before == '\t' or before == '\n' or before == '\r')) continue;
+        if (!isInsideOpeningTag(xml, at)) continue;
+        var j = at + decl.len;
         while (j < xml.len and (xml[j] == ' ' or xml[j] == '\t' or xml[j] == '\n' or xml[j] == '\r')) j += 1;
         if (j >= xml.len or xml[j] != '=') continue;
         j += 1;
@@ -2080,14 +2118,16 @@ const rel_type_roots = [_][]const u8{
     "http://schemas.microsoft.com/office/2006/relationships/",
 };
 
-/// Is `rel_type` exactly `{known root}{leaf}`? The strict walk's type
-/// gate; also the anchors NDJSON view's sheet-family gate — pub for
-/// that one consumer.
+/// Is `rel_type` exactly `{known root}{leaf}`? Byte-exact — URIs are
+/// case-sensitive, so `…/relationships/DRAWING` is a different (and
+/// unknown) type, not a drawing edge (Codex #214 r4 REL-402). The
+/// strict walk's type gate; also the anchors NDJSON view's
+/// sheet-family gate — pub for that one consumer.
 pub fn relTypeIs(rel_type: []const u8, leaf: []const u8) bool {
     for (rel_type_roots) |root| {
         if (rel_type.len == root.len + leaf.len and
             std.mem.startsWith(u8, rel_type, root) and
-            std.ascii.eqlIgnoreCase(rel_type[root.len..], leaf)) return true;
+            std.mem.eql(u8, rel_type[root.len..], leaf)) return true;
     }
     return false;
 }
@@ -2450,6 +2490,38 @@ test "findDrawingRid: a prefixed drawing element and a non-r relationship prefix
     // Markup-shaped text inside a comment is not the element — a
     // commented `<drawing/>` must not refuse a valid sheet (REL-302).
     try std.testing.expect(findDrawingRef("<sheet><!-- <drawing/> --><sheetData/></sheet>") == .absent);
+    // A declaration-shaped string inside an attribute VALUE or a
+    // comment is not a binding (r4 REL-401).
+    const value_decoy =
+        "<sheet xmlns:foo=\"https://example.invalid/ns\"" ++
+        " note=\"xmlns:foo='http://schemas.openxmlformats.org/officeDocument/2006/relationships'\">" ++
+        "<drawing foo:id=\"rId1\"/></sheet>";
+    try std.testing.expect(findDrawingRef(value_decoy) == .malformed);
+    const comment_decoy =
+        "<sheet xmlns:foo=\"https://example.invalid/ns\">" ++
+        "<!-- xmlns:foo=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" -->" ++
+        "<drawing foo:id=\"rId1\"/></sheet>";
+    try std.testing.expect(findDrawingRef(comment_decoy) == .malformed);
+    // A real binding survives single quotes and Eq whitespace.
+    const eq_ws =
+        "<sheet xmlns:rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'>" ++
+        "<drawing rel:id=\"rId4\"/></sheet>";
+    try std.testing.expectEqualStrings("rId4", findDrawingRid(eq_ws).?);
+    // Two live drawing elements: `.multiple`, carrying the FIRST in
+    // document order — here the bound prefixed one (r4 REL-403).
+    const dup =
+        "<x:sheet xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"" ++
+        " xmlns:rel=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" ++
+        "<x:drawing rel:id=\"rIdA\"/><drawing r:id=\"rIdB\"/></x:sheet>";
+    switch (findDrawingRef(dup)) {
+        .multiple => |r| try std.testing.expectEqualStrings("rIdA", r),
+        else => return error.TestUnexpectedResult,
+    }
+    const dup2 = "<sheet><drawing r:id=\"rIdB\"/><drawing r:id=\"rIdC\"/></sheet>";
+    switch (findDrawingRef(dup2)) {
+        .multiple => |r| try std.testing.expectEqualStrings("rIdB", r),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "relTypeIs: exact known roots only; extractSeriesRefs stays linear under comment spam" {
@@ -2460,6 +2532,9 @@ test "relTypeIs: exact known roots only; extractSeriesRefs stays linear under co
     try std.testing.expect(relTypeIs("http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet", "xlMacrosheet"));
     try std.testing.expect(!relTypeIs("https://example.invalid/relationships/drawing", "drawing"));
     try std.testing.expect(!relTypeIs("http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawingx", "drawing"));
+    // URIs are case-sensitive: a case-mutated leaf is an unknown
+    // type, not the edge (r4 REL-402).
+    try std.testing.expect(!relTypeIs("http://schemas.openxmlformats.org/officeDocument/2006/relationships/DRAWING", "drawing"));
 
     // PERF-301: thousands of commented fakes around a few real
     // carriers — the forward-only scan must stay effectively linear
