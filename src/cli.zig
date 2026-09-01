@@ -60,6 +60,12 @@ const Subcommand = enum {
     /// a concrete sheet selector narrows to the names SCOPED to that
     /// sheet and suppresses workbook-scope names.
     defined_names,
+    /// S3b: document properties — one `{"kind":"doc_props",…}` record
+    /// carrying the `docProps/core.xml` + `app.xml` field set and the
+    /// `custom.xml` presence flag (the `Editor.doc_props` field set).
+    /// Package-layer route like `pivots`; no sheet dimension, so it
+    /// joins `meta`'s workbook-scoped flag tolerance.
+    doc_props,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
@@ -325,6 +331,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "sst")) return .sst;
         if (std.mem.eql(u8, a, "merges")) return .merges;
         if (std.mem.eql(u8, a, "defined-names")) return .defined_names;
+        if (std.mem.eql(u8, a, "doc-props")) return .doc_props;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -434,6 +441,10 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         .list_sheets,
         .styles,
         .sst,
+        // S3b: doc-props has no sheet dimension at all — sheet and
+        // format flags are tolerated and dropped, the meta family's
+        // wrapper-friendliness.
+        .doc_props,
         => true,
         .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
@@ -673,6 +684,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "sst") or
                     std.mem.eql(u8, a, "merges") or
                     std.mem.eql(u8, a, "defined-names") or
+                    std.mem.eql(u8, a, "doc-props") or
                     std.mem.eql(u8, a, "append-rows") or
                     std.mem.eql(u8, a, "set-cell") or
                     std.mem.eql(u8, a, "insert-row") or
@@ -701,7 +713,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -713,7 +725,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -745,7 +757,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -754,7 +766,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -879,7 +891,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
         \\                    hyperlinks / pivots / merges / defined-names /
-        \\                    styles / sst. Ignored by meta and list-sheets.
+        \\                    styles / sst. Ignored by meta, list-sheets and
+        \\                    doc-props (a single-record report).
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
         \\  --start-row R     (iter59b) 1-based OOXML row; drop records
@@ -887,8 +900,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    sheet's own rows, unlike --skip which is
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
-        \\                    / pivots / merges / defined-names / meta /
-        \\                    list-sheets / styles / sst.
+        \\                    / pivots / merges / defined-names / doc-props
+        \\                    / meta / list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -950,10 +963,11 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     per-sheet records drop
         \\                                     `sheet`/`sheet_idx`; on
         \\                                     `list-sheets` / `styles` / `sst`
-        \\                                     / `defined-names` it's
-        \\                                     effectively a no-op (a defined
-        \\                                     name's sheet fields are its
-        \\                                     SCOPE, not a host location).
+        \\                                     / `defined-names` / `doc-props`
+        \\                                     it's effectively a no-op (a
+        \\                                     defined name's sheet fields are
+        \\                                     its SCOPE, not a host location;
+        \\                                     doc-props has no sheet fields).
         \\                    pretty-json      meta-only. Collapses workbook
         \\                                     + sheets into one 2-space-
         \\                                     indented JSON object. The
@@ -1043,6 +1057,20 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     narrow to names SCOPED to matching sheets and
         \\                     suppress workbook-scope names; the default and
         \\                     --all-sheets stream every name.
+        \\  doc-props          the document-properties field set as ONE
+        \\                     NDJSON record (S3b):
+        \\                     {"kind":"doc_props","creator":…,
+        \\                      "last_modified_by":…,"title":…,"subject":…,
+        \\                      "description":…,"keywords":…,"category":…,
+        \\                      "created":…,"modified":…,"revision":…,
+        \\                      "company":…,"manager":…,"application":…,
+        \\                      "hyperlink_base":…,
+        \\                      "has_custom_properties":bool}
+        \\                     Absent fields are null; text is as stored
+        \\                     (the values meta and Editor.doc_props hand
+        \\                     over). A workbook with no docProps parts is
+        \\                     a record of nulls. Workbook-scoped: sheet
+        \\                     selectors are tolerated and ignored.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
         \\                     row arrays from stdin (one JSON array per
@@ -2021,6 +2049,9 @@ fn runMain(init: std.process.Init) !u8 {
         // S3b: defined names live in xl/workbook.xml, which only the
         // package layer parses — same pre-Book dispatch as `pivots`.
         .defined_names => if (!args.list_sheets) return try runDefinedNamesCommand(alloc, proc_io, args, out, err),
+        // S3b slice 3: document properties live in docProps/*.xml,
+        // which only the package layer holds — same pre-Book dispatch.
+        .doc_props => if (!args.list_sheets) return try runDocPropsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2135,6 +2166,7 @@ fn runMain(init: std.process.Init) !u8 {
         .embed,
         .pivots,
         .defined_names,
+        .doc_props,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2193,6 +2225,7 @@ fn runMain(init: std.process.Init) !u8 {
         .pivots,
         .merges,
         .defined_names,
+        .doc_props,
         => unreachable,
     }
     return 0;
@@ -3141,6 +3174,28 @@ fn runMetaCommand(
     try out.flush();
 }
 
+/// The doc-props wire fields, in the order `Editor.doc_props` and
+/// `meta`'s `doc_props` object list them. Every JSON key equals the
+/// `zlsx_pkg.DocProps` field it reads, so `@field` walks this one
+/// table for the `meta` object, the `doc-props` record and its UTF-8
+/// floor — three emissions that cannot disagree on order or spelling.
+const doc_prop_fields = [_][]const u8{
+    "creator",
+    "last_modified_by",
+    "title",
+    "subject",
+    "description",
+    "keywords",
+    "category",
+    "created",
+    "modified",
+    "revision",
+    "company",
+    "manager",
+    "application",
+    "hyperlink_base",
+};
+
 /// Emit the `doc_props` object for `meta --output pretty-json`.
 ///
 /// Absent parts render as `null` rather than being omitted, so a
@@ -3152,20 +3207,9 @@ fn writeDocPropsPretty(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
         return;
     };
     try out.writeAll("  \"doc_props\": {\n");
-    try writeDocPropField(out, "creator", dp.creator, "    ", true);
-    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "    ", true);
-    try writeDocPropField(out, "title", dp.title, "    ", true);
-    try writeDocPropField(out, "subject", dp.subject, "    ", true);
-    try writeDocPropField(out, "description", dp.description, "    ", true);
-    try writeDocPropField(out, "keywords", dp.keywords, "    ", true);
-    try writeDocPropField(out, "category", dp.category, "    ", true);
-    try writeDocPropField(out, "created", dp.created, "    ", true);
-    try writeDocPropField(out, "modified", dp.modified, "    ", true);
-    try writeDocPropField(out, "revision", dp.revision, "    ", true);
-    try writeDocPropField(out, "company", dp.company, "    ", true);
-    try writeDocPropField(out, "manager", dp.manager, "    ", true);
-    try writeDocPropField(out, "application", dp.application, "    ", true);
-    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "    ", true);
+    inline for (doc_prop_fields) |name| {
+        try writeDocPropField(out, name, @field(dp, name), "    ", true);
+    }
     try out.print(
         "    \"has_custom_properties\": {s}\n  }},\n",
         .{if (dp.has_custom_properties) "true" else "false"},
@@ -3179,24 +3223,67 @@ fn writeDocPropsCompact(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
         return;
     };
     try out.writeAll(",\"doc_props\":{");
-    try writeDocPropField(out, "creator", dp.creator, "", false);
-    try writeDocPropField(out, "last_modified_by", dp.last_modified_by, "", false);
-    try writeDocPropField(out, "title", dp.title, "", false);
-    try writeDocPropField(out, "subject", dp.subject, "", false);
-    try writeDocPropField(out, "description", dp.description, "", false);
-    try writeDocPropField(out, "keywords", dp.keywords, "", false);
-    try writeDocPropField(out, "category", dp.category, "", false);
-    try writeDocPropField(out, "created", dp.created, "", false);
-    try writeDocPropField(out, "modified", dp.modified, "", false);
-    try writeDocPropField(out, "revision", dp.revision, "", false);
-    try writeDocPropField(out, "company", dp.company, "", false);
-    try writeDocPropField(out, "manager", dp.manager, "", false);
-    try writeDocPropField(out, "application", dp.application, "", false);
-    try writeDocPropField(out, "hyperlink_base", dp.hyperlink_base, "", false);
+    inline for (doc_prop_fields) |name| {
+        try writeDocPropField(out, name, @field(dp, name), "", false);
+    }
     try out.print(
         "\"has_custom_properties\":{s}}}",
         .{if (dp.has_custom_properties) "true" else "false"},
     );
+}
+
+/// S3b: `zlsx doc-props` — the document-properties field set as one
+/// `{"kind":"doc_props",…}` record: every `docProps/core.xml` /
+/// `app.xml` field the typed view models (`null` when absent, text as
+/// stored — byte-for-byte the values `Editor.doc_props` and `meta`
+/// hand over) plus `has_custom_properties`. Routes through the package
+/// layer like `pivots`; a workbook with no docProps parts is a record
+/// of nulls — the absence itself is the one fact the line reports. A
+/// field value that is not UTF-8 refuses the whole command before the
+/// first byte (exit 2): the stream is valid NDJSON or nothing.
+/// Contract in docs/cli.md, "doc-props".
+fn runDocPropsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    const dp = wb.docProps() catch |e| {
+        try err.print("zlsx: cannot read document properties in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    // Emit-or-nothing: every present value is validated before the
+    // first byte of the record, so an invalid stream is never
+    // half-written. The values pass through writeJsonString verbatim,
+    // so malformed UTF-8 here would be invalid NDJSON under exit 0.
+    inline for (doc_prop_fields) |name| {
+        if (@field(dp, name)) |v| {
+            if (!std.unicode.utf8ValidateSlice(v)) {
+                try err.print("zlsx: cannot read document properties in '{s}': {s} is not UTF-8\n", .{ args.file, name });
+                try err.flush();
+                return 2;
+            }
+        }
+    }
+    try out.writeAll("{\"kind\":\"doc_props\"");
+    inline for (doc_prop_fields) |name| {
+        try out.writeAll(",\"" ++ name ++ "\":");
+        if (@field(dp, name)) |v| try writeJsonString(out, v) else try out.writeAll("null");
+    }
+    try out.print(
+        ",\"has_custom_properties\":{s}}}\n",
+        .{if (dp.has_custom_properties) "true" else "false"},
+    );
+    try out.flush();
+    return 0;
 }
 
 /// One `"key": value` pair. Null fields emit JSON `null` so the object
@@ -5992,7 +6079,7 @@ test "parseArgs --start-row / --end-row round-trip and rejections" {
         try std.testing.expectEqual(@as(?u32, 7), a.end_row);
     }
     // Sub-commands without a row key reject --start-row / --end-row.
-    inline for (.{ "validations", "hyperlinks", "pivots", "merges", "defined-names", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+    inline for (.{ "validations", "hyperlinks", "pivots", "merges", "defined-names", "doc-props", "meta", "list-sheets", "styles", "sst" }) |cmd| {
         {
             const argv = [_][]const u8{ cmd, "f.xlsx", "--start-row", "2" };
             try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
@@ -6120,7 +6207,7 @@ test "parseArgs --range round-trip and rejections" {
         try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
     }
     // Sub-commands without row+col keys reject --range.
-    inline for (.{ "comments", "validations", "hyperlinks", "merges", "defined-names", "meta", "list-sheets", "styles", "sst" }) |cmd| {
+    inline for (.{ "comments", "validations", "hyperlinks", "merges", "defined-names", "doc-props", "meta", "list-sheets", "styles", "sst" }) |cmd| {
         const argv = [_][]const u8{ cmd, "f.xlsx", "--range", "A1:B2" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
@@ -9317,4 +9404,143 @@ test "runDefinedNamesCommand: a workbook without names is an empty stream" {
     const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names }, &w, &err_w);
     try std.testing.expectEqual(@as(u8, 0), rc);
     try std.testing.expectEqualStrings("", w.buffered());
+}
+
+// ─── S3b slice 3: `doc-props` ────────────────────────────────────────
+
+/// A saved fresh-writer workbook with docProps parts spliced in through
+/// the package store — `core_xml` / `app_xml` / `custom` optional, so
+/// one helper serves the populated, absent and refused cases.
+fn writeDocPropsFixture(
+    io: std.Io,
+    tt: *TestTmp,
+    name: []const u8,
+    core_xml: ?[]const u8,
+    app_xml: ?[]const u8,
+    custom: bool,
+) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(alloc);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    if (core_xml == null and app_xml == null and !custom) return path;
+    // Splice the parts and save to a second file: the store's lazy
+    // part reads may still be backed by the source archive.
+    const out_path = try tt.path(alloc, io, "spliced.xlsx");
+    defer alloc.free(path);
+    errdefer alloc.free(out_path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    if (core_xml) |x| try wb.store.addPart("docProps/core.xml", "application/vnd.openxmlformats-package.core-properties+xml", x);
+    if (app_xml) |x| try wb.store.addPart("docProps/app.xml", "application/vnd.openxmlformats-officedocument.extended-properties+xml", x);
+    if (custom) try wb.store.addPart("docProps/custom.xml", "application/vnd.openxmlformats-officedocument.custom-properties+xml", "<Properties/>");
+    try wb.store.save(io, out_path);
+    return out_path;
+}
+
+test "runDocPropsCommand: the full field set, text as stored, one record" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    // `&amp;` stays as stored: the record carries the same bytes
+    // `Editor.doc_props` and `meta` hand over, not a re-decoding.
+    const core =
+        "<cp:coreProperties><dc:creator>A &amp; B</dc:creator>" ++
+        "<cp:lastModifiedBy>C</cp:lastModifiedBy><dc:title>T</dc:title>" ++
+        "<dcterms:created xsi:type=\"dcterms:W3CDTF\">2026-01-02T03:04:05Z</dcterms:created>" ++
+        "<cp:revision>7</cp:revision></cp:coreProperties>";
+    const app =
+        "<Properties><Company>Acme</Company><Manager>M</Manager>" ++
+        "<Application>zlsx-test</Application><HyperlinkBase>https://x</HyperlinkBase></Properties>";
+    const path = try writeDocPropsFixture(io, &tt, "cli_doc_props.xlsx", core, app, true);
+    defer std.testing.allocator.free(path);
+
+    var scratch: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runDocPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .doc_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"doc_props\",\"creator\":\"A &amp; B\",\"last_modified_by\":\"C\"," ++
+            "\"title\":\"T\",\"subject\":null,\"description\":null,\"keywords\":null," ++
+            "\"category\":null,\"created\":\"2026-01-02T03:04:05Z\",\"modified\":null," ++
+            "\"revision\":\"7\",\"company\":\"Acme\",\"manager\":\"M\"," ++
+            "\"application\":\"zlsx-test\",\"hyperlink_base\":\"https://x\"," ++
+            "\"has_custom_properties\":true}\n",
+        w.buffered(),
+    );
+}
+
+test "runDocPropsCommand: no docProps parts is a record of nulls" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeDocPropsFixture(io, &tt, "cli_doc_props_none.xlsx", null, null, false);
+    defer std.testing.allocator.free(path);
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runDocPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .doc_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"doc_props\",\"creator\":null,\"last_modified_by\":null," ++
+            "\"title\":null,\"subject\":null,\"description\":null,\"keywords\":null," ++
+            "\"category\":null,\"created\":null,\"modified\":null,\"revision\":null," ++
+            "\"company\":null,\"manager\":null,\"application\":null," ++
+            "\"hyperlink_base\":null,\"has_custom_properties\":false}\n",
+        w.buffered(),
+    );
+}
+
+test "runDocPropsCommand: a non-UTF-8 field refuses whole before any byte" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    // The last field the table walks carries the bad bytes, so a
+    // half-writing implementation would have emitted 13 fields first —
+    // the empty stdout is the test.
+    const app = "<Properties><HyperlinkBase>bad\xffbytes</HyperlinkBase></Properties>";
+    const path = try writeDocPropsFixture(io, &tt, "cli_doc_props_bad.xlsx", "<cp:coreProperties><dc:creator>Ok</dc:creator></cp:coreProperties>", app, false);
+    defer std.testing.allocator.free(path);
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runDocPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .doc_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "hyperlink_base is not UTF-8") != null);
+}
+
+test "parseArgs: doc-props token, workbook-scoped flag tolerance" {
+    {
+        const argv = [_][]const u8{ "doc-props", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.doc_props, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // The meta family's wrapper-friendliness: sheet and format flags
+    // parse without error and are ignored downstream.
+    {
+        const argv = [_][]const u8{ "doc-props", "f.xlsx", "--sheet", "2", "--format", "csv" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.doc_props, a.subcommand);
+    }
 }
