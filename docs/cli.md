@@ -42,6 +42,7 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx pivots <file>` | `"pivot"`, then `"pivot_cache"` | `sheet, sheet_idx, name, part, location{}, rows[], cols[], pages[], values[], data_caption, grand_totals{}, style, cache{}` — [contract](#pivots--the-typed-pivot-read) |
 | `zlsx merges <file>` | `"merge"` | `sheet, sheet_idx, range, start_row, start_col, end_row, end_col` — 1-based, corners inclusive |
 | `zlsx defined-names <file>` | `"defined_name"` | `name, scope, sheet, sheet_idx, body, hidden` — [contract](#defined-names--the-workbook-name-inventory) |
+| `zlsx doc-props <file>` | `"doc_props"` | one record: `creator, last_modified_by, title, subject, description, keywords, category, created, modified, revision, company, manager, application, hyperlink_base, has_custom_properties` — [contract](#doc-props--the-document-properties-report) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
@@ -179,6 +180,45 @@ under a non-UTF-8 name refuses the whole command (exit 2) before any
 record — the stream is valid NDJSON or it is nothing. A bad-named
 sheet with no merges, or one the selection excludes, emits nothing
 and does not refuse.
+
+#### `doc-props` — the document-properties report
+
+`zlsx doc-props <file>` (S3b) emits the document-properties field set as
+**one** NDJSON record: every `docProps/core.xml` / `docProps/app.xml`
+field the typed view models, plus a presence flag for
+`docProps/custom.xml` (whose arbitrary key/value pairs zlsx deliberately
+does not model). This is the read `meta` embeds as its `doc_props`
+object and `Editor.doc_props` returns over the C ABI, promoted to a
+typed report of its own — same field set, same order, same raw values,
+with two boundary-convention divergences: a present-but-empty element
+(`<dc:creator></dc:creator>`) is `""` here and in `meta`, while the C
+ABI's length-zero convention makes Python's `Editor.doc_props` report
+it as `None`; and a malformed-UTF-8 value refuses here (below) where
+Python decodes it with replacement characters.
+
+```jsonl
+{"kind":"doc_props","creator":"Alex","last_modified_by":"Alex","title":null,"subject":null,"description":null,"keywords":null,"category":null,"created":"2014-03-07T16:08:25Z","modified":"2017-08-27T03:03:25Z","revision":null,"company":null,"manager":null,"application":"Microsoft Excel","hyperlink_base":null,"has_custom_properties":false}
+```
+
+Absent fields are `null` — never omitted, so consumers can index without
+existence checks — and a workbook with no docProps parts at all is a
+record of nulls under exit 0: the absence itself is the one fact the
+line reports. Values are the element text **as stored** (XML entities as
+written, timestamps verbatim W3CDTF), not a re-decoding; a field value
+that is not UTF-8 refuses the whole command (exit 2) with nothing
+written, the family's validity floor — every read and validation
+failure lands before the first byte (only a stdout I/O failure mid-line,
+exit 5, can truncate the record, as on any streaming command). The
+command routes through the package layer like `pivots`, so an archive
+the lenient reader tolerates but the package layer refuses is exit 2
+(where `meta`, a Book-route command, degrades to `"doc_props": null`
+instead — its own contract). There is no sheet dimension: sheet
+selectors and `--format` are tolerated and ignored (the `meta` family's
+wrapper-friendliness), and `--skip` / `--take` do not apply to a
+single-record report. The identifying subset of this report is what
+`scrub-metadata` removes by default — `application`, `created`,
+`modified` and `revision` are deliberately preserved by its default
+mask (its contract, not this one).
 
 ### Edit (load-modify-save)
 
@@ -425,8 +465,9 @@ is set.
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
 unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots` /
 `merges` stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are
-workbook-wide, and so is `defined-names` (a sheet selector there narrows by
-a name's *scope* — see its contract above).
+workbook-wide, and so are `defined-names` (a sheet selector there narrows by
+a name's *scope* — see its contract above) and `doc-props` (no sheet
+dimension at all — selectors are tolerated and ignored).
 
 **Sheet selection** — mutually exclusive:
 
@@ -469,7 +510,8 @@ a name's *scope* — see its contract above).
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
                               # validations / hyperlinks / pivots / merges — a no-op
-                              # on workbook-scoped sub-commands (defined-names included)
+                              # on workbook-scoped sub-commands (defined-names and
+                              # doc-props included)
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -565,7 +607,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
