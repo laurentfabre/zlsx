@@ -586,3 +586,42 @@ test "collect: a workbook without drawings is an empty view" {
     try testing.expectEqual(@as(usize, 0), view.records.len);
     try testing.expectEqual(@as(usize, 1), view.sheet_names.len);
 }
+
+test "collect: an anchor on a worksheet part xl/workbook.xml does not list refuses whole" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_orphan.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    // Re-point the drawing at an orphan worksheet part: same bytes as
+    // sheet2 (drawing reference and rels ride along under the copied
+    // part name), but no <sheet> entry reaches it. The walkers still
+    // key anchors by the part, and the view cannot attribute them.
+    {
+        var store = try PartStore.open(testing.allocator, io, path);
+        defer store.deinit();
+        const sheet2 = (try store.part("xl/worksheets/sheet2.xml")) orelse return error.PartNotFound;
+        try store.addPart(
+            "xl/worksheets/sheet9.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            sheet2.bytes,
+        );
+        const rels = (try store.part("xl/worksheets/_rels/sheet2.xml.rels")) orelse return error.PartNotFound;
+        try store.addPart(
+            "xl/worksheets/_rels/sheet9.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            rels.bytes,
+        );
+        try store.save(io, path);
+    }
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(
+        error.DrawingOnUnlistedSheet,
+        collect(testing.allocator, &wb.store, &wb.workbook),
+    );
+}
