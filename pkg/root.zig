@@ -128,6 +128,10 @@ pub const defined_names_ndjson = @import("defined_name_ndjson.zig");
 /// S3b: the `anchors` NDJSON records — `imageAnchors` + `chartAnchors`
 /// attributed to workbook sheets, written once for every surface.
 pub const anchors_ndjson = @import("anchor_ndjson.zig");
+/// S3b: the `conditional-formats` NDJSON records —
+/// `Worksheet.conditionalFormats` attributed to workbook sheets,
+/// written once for every surface.
+pub const conditional_formats_ndjson = @import("conditional_format_ndjson.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;

@@ -72,6 +72,11 @@ const Subcommand = enum {
     /// Package-layer route like `pivots`: the walkers read drawing
     /// parts the reader-only Book has no view of.
     anchors,
+    /// S3b slice 5: conditional formats — one record per `<cfRule>`
+    /// across the selected sheets (`pkg/conditional_format_ndjson.zig`,
+    /// the strict walk over the inventory `Worksheet.conditionalFormats`
+    /// models). Package-layer route like `pivots`.
+    conditional_formats,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
@@ -339,6 +344,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "defined-names")) return .defined_names;
         if (std.mem.eql(u8, a, "doc-props")) return .doc_props;
         if (std.mem.eql(u8, a, "anchors")) return .anchors;
+        if (std.mem.eql(u8, a, "conditional-formats")) return .conditional_formats;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -453,7 +459,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         // wrapper-friendliness.
         .doc_props,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .anchors, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .anchors, .conditional_formats, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -693,6 +699,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "defined-names") or
                     std.mem.eql(u8, a, "doc-props") or
                     std.mem.eql(u8, a, "anchors") or
+                    std.mem.eql(u8, a, "conditional-formats") or
                     std.mem.eql(u8, a, "append-rows") or
                     std.mem.eql(u8, a, "set-cell") or
                     std.mem.eql(u8, a, "insert-row") or
@@ -721,7 +728,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -733,7 +740,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -765,7 +772,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -774,7 +781,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -869,9 +876,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  recalc            recalculate every formula cell into --out
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0; on
-        \\                    pivots every host sheet, on merges and
-        \\                    anchors every sheet, on defined-names
-        \\                    every name)
+        \\                    pivots every host sheet, on merges,
+        \\                    anchors and conditional-formats every
+        \\                    sheet, on defined-names every name)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
@@ -900,9 +907,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
         \\                    hyperlinks / pivots / merges / defined-names /
-        \\                    anchors / styles / sst. Ignored by meta,
-        \\                    list-sheets and doc-props (a single-record
-        \\                    report).
+        \\                    anchors / conditional-formats / styles / sst.
+        \\                    Ignored by meta, list-sheets and doc-props
+        \\                    (a single-record report).
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
         \\  --start-row R     (iter59b) 1-based OOXML row; drop records
@@ -911,7 +918,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
         \\                    / pivots / merges / defined-names / doc-props
-        \\                    / anchors / meta / list-sheets / styles / sst.
+        \\                    / anchors / conditional-formats / meta /
+        \\                    list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -966,7 +974,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     `sheet`/`sheet_idx`. Applies to
         \\                                     cells / rows / comments /
         \\                                     validations / hyperlinks / pivots
-        \\                                     / merges / anchors.
+        \\                                     / merges / anchors /
+        \\                                     conditional-formats.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
@@ -1098,6 +1107,20 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     absolute anchors carry {"x","y","cx","cy"}
         \\                     and null from/to. The payload stays in the
         \\                     archive — "bytes" is the image part's size.
+        \\  conditional-formats
+        \\                     one NDJSON record per <cfRule> across every
+        \\                     sheet (S3b), rules in document order:
+        \\                     {"kind":"conditional_format","sheet":"S",
+        \\                      "sheet_idx":0,"sqref":"A1:A4","rule_type":
+        \\                      "cellIs","formulas":["2","4"],"dxf_id":0,
+        \\                      "priority":1}
+        \\                     sqref is the parent block's target list as
+        \\                     authored (space-separated A1 areas);
+        \\                     formulas holds the rule's up-to-three
+        \\                     <formula> bodies in document order;
+        \\                     dxf_id/priority are null when absent. The
+        \\                     visual payload (colorScale / dataBar /
+        \\                     iconSet children) stays in the part.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
         \\                     row arrays from stdin (one JSON array per
@@ -2082,6 +2105,9 @@ fn runMain(init: std.process.Init) !u8 {
         // S3b slice 4: drawing anchors — the walkers read drawing parts
         // the reader-only Book has no view of; same pre-Book dispatch.
         .anchors => if (!args.list_sheets) return try runAnchorsCommand(alloc, proc_io, args, out, err),
+        // S3b slice 5: conditional formats — the typed sheet view lives
+        // on the package layer's Workbook; same pre-Book dispatch.
+        .conditional_formats => if (!args.list_sheets) return try runConditionalFormatsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2198,6 +2224,7 @@ fn runMain(init: std.process.Init) !u8 {
         .defined_names,
         .doc_props,
         .anchors,
+        .conditional_formats,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2258,6 +2285,7 @@ fn runMain(init: std.process.Init) !u8 {
         .defined_names,
         .doc_props,
         .anchors,
+        .conditional_formats,
         => unreachable,
     }
     return 0;
@@ -4501,6 +4529,90 @@ fn runAnchorsCommand(
             last_prologue = sheet_idx;
         }
         try zlsx_pkg.anchors_ndjson.writeRecord(out, r, if (compact) .compact else .full);
+    }
+    try out.flush();
+    return 0;
+}
+
+/// S3b slice 5: `zlsx conditional-formats` — one record per `<cfRule>`,
+/// sheets in workbook order, rules in sheet-document order. Routes
+/// through the package layer like `pivots`; the records come from the
+/// strict namespace- and depth-aware walk in
+/// `pkg/conditional_format_ndjson.zig` (the lenient Zig view
+/// `Worksheet.conditionalFormats` keeps its historical contract — the
+/// `anchors` split). Sheet selection follows the read family —
+/// `--sheet` / `--name` narrow to one sheet, `--all-sheets` /
+/// `--sheet-glob` widen, the default streams every sheet. Contract in
+/// docs/cli.md, "conditional-formats".
+fn runConditionalFormatsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    var view = zlsx_pkg.conditional_formats_ndjson.collect(alloc, &wb) catch |e| {
+        try err.print("zlsx: cannot read conditional formats in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer view.deinit();
+
+    const filter: ?usize = blk: {
+        if (args.all_sheets or args.sheet_glob != null) break :blk null;
+        if (args.sheet_index) |idx| {
+            if (idx >= view.sheet_names.len) {
+                try err.writeAll("zlsx: sheet not found\n");
+                try err.flush();
+                return 3;
+            }
+            break :blk idx;
+        }
+        if (args.sheet_name) |name| {
+            for (view.sheet_names, 0..) |s, i| {
+                if (std.mem.eql(u8, s, name)) break :blk i;
+            }
+            try err.writeAll("zlsx: sheet not found\n");
+            try err.flush();
+            return 3;
+        }
+        break :blk null;
+    };
+
+    var pg = Pagination.init(args.skip, args.take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
+    for (view.records) |r| {
+        if (signals.shouldStop()) return 0;
+        const sheet_idx: usize = r.sheet_idx;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, r.sheet, sheet_idx)) continue;
+        }
+        switch (pg.consume()) {
+            .drop => continue,
+            // Flush before the early return: runMain's deferred flush
+            // swallows errors, so a --take'd stream that relied on it
+            // would report exit 0 on a failed final write instead of
+            // the documented exit 5 (the Codex #211 r1 lesson).
+            .stop => {
+                try out.flush();
+                return 0;
+            },
+            .emit => {},
+        }
+        if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+            try writeCompactSheetPrologue(out, r.sheet, sheet_idx);
+            last_prologue = sheet_idx;
+        }
+        try zlsx_pkg.conditional_formats_ndjson.writeRecord(out, r, if (compact) .compact else .full);
     }
     try out.flush();
     return 0;
@@ -9740,6 +9852,276 @@ test "runAnchorsCommand: a series ref the stream cannot carry refuses whole (exi
     try std.testing.expectEqual(@as(u8, 2), rc);
     try std.testing.expectEqualStrings("", w.buffered());
     try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedDrawingXml") != null);
+}
+
+// ─── S3b slice 5: `conditional-formats` ──────────────────────────────
+
+test "parseArgs: conditional-formats token and flag rejections" {
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.conditional_formats, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // Rule records are sqref-keyed, not row-keyed, and stream.
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--end-row", "5" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--include-blanks" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--output", "pretty-json" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--format", "csv" };
+        try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+}
+
+test "runConditionalFormatsCommand: every sheet by default, exact wire shape" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"A1:A4\"," ++
+            "\"rule_type\":\"cellIs\",\"formulas\":[\"2\",\"4\"],\"dxf_id\":0,\"priority\":1}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"B1:B4\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"B1>3\"],\"dxf_id\":0,\"priority\":2}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"C1:C4\"," ++
+            "\"rule_type\":\"colorScale\",\"formulas\":[],\"dxf_id\":null,\"priority\":3}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"D1:D4\"," ++
+            "\"rule_type\":\"dataBar\",\"formulas\":[],\"dxf_id\":null,\"priority\":4}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"$A1=\\\"R&D\\\"\"],\"dxf_id\":0,\"priority\":1}\n",
+        w.buffered(),
+    );
+}
+
+test "runConditionalFormatsCommand: selection, pagination, compact prologue, exit codes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_sel.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+
+    // --sheet narrows to Report: just its rule, under the full envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .sheet_index = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"conditional_format\",\"sheet\":\"Report\",\"sheet_idx\":1,"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+    }
+    // compact-ndjson: one prologue per sheet, records drop the envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .output = .compact_ndjson }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "{\"kind\":\"sheet\","));
+        try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, got, "{\"kind\":\"conditional_format\",\"sqref\":"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"conditional_format\",\"sheet\":") == null);
+    }
+    // --skip 1 --take 2 pages the record stream.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .skip = 1, .take = 2 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"rule_type\":\"expression\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"rule_type\":\"colorScale\"") != null);
+    }
+    // compact + --skip 4 --take 1: prologues are not counted by the
+    // pager and a skipped sheet emits no prologue at all — Report's
+    // record is the fifth, so the stream is exactly its prologue and
+    // its record (Codex #215 r4 MNT-402).
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .output = .compact_ndjson, .skip = 4, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n" ++
+                "{\"kind\":\"conditional_format\",\"sqref\":\"A1:A2\",\"rule_type\":\"expression\"," ++
+                "\"formulas\":[\"$A1=\\\"R&D\\\"\"],\"dxf_id\":0,\"priority\":1}\n",
+            w.buffered(),
+        );
+    }
+    // --take 0 emits nothing — not even a prologue.
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .output = .compact_ndjson, .take = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // --sheet-glob widens by name.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .sheet_glob = "Rep*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+    }
+    // An unmatched glob is an empty success; a named miss is exit 3.
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [512]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .sheet_glob = "Zzz*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+        const rc2 = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .sheet_name = "Nope" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc2);
+        const rc3 = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .sheet_index = 9 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc3);
+    }
+}
+
+test "runConditionalFormatsCommand: a workbook without rules is an empty stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_none.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+}
+
+test "runConditionalFormatsCommand: a rule the stream cannot carry refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_bad_formula.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+    // A bad entity in one formula body: the whole command refuses —
+    // a partial rule inventory is the shape of a guard hole.
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "B1&gt;3", "B1&bogus;3");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
+test "runConditionalFormatsCommand: an unprocessed MCE branch refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_mce.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+    // An `mc:AlternateContent` at the rule slot needs an MCE
+    // processor to know what Excel would show — without one the whole
+    // command refuses rather than emit a projection-dependent subset.
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<conditionalFormatting", "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x14\"><conditionalFormatting");
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "</conditionalFormatting>", "</conditionalFormatting></mc:Choice></mc:AlternateContent>");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
+test "runConditionalFormatsCommand: an undecodable numeric carrier refuses whole (exit 2, MNT-2301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_bad_priority.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+    // Numeric carriers decode their entities FIRST; only a decoded
+    // non-numeric reads as null — an undecodable one refuses whole.
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "priority=\"1\"", "priority=\"&bogus;\"");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
 }
 
 // ─── S3b slice 3: `doc-props` ────────────────────────────────────────

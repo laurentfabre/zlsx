@@ -3780,20 +3780,32 @@ pub const Workbook = struct {
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
-            const view = try ws.ensureParsed();
             const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
             defer a.free(ws_name);
-            const part_name = ws.resolved_part_name.?;
+            const part_name = try ws.resolvePartName();
+            // The rewrite works on its own MAPPED view of the current
+            // part bytes: the source map is rewrite-only (ordinary
+            // typed reads never pay for it — Codex #215 r18
+            // PERF-1801), and a fresh parse can never be stale
+            // against the bytes phase B splices.
+            const src_part = (self.store.part(part_name) catch |e| switch (e) {
+                error.OutOfMemory, error.ZipBombSuspected => return e,
+                else => return Error.MalformedSheetXml,
+            }) orelse return Error.MissingSheetPart;
+            var mapped_view = sheet_xml_mod.parseMapped(self.allocator, src_part.bytes) catch |e| switch (e) {
+                error.MalformedXml, error.UnexpectedEof => return Error.MalformedSheetXml,
+                else => |x| return x,
+            };
+            defer mapped_view.deinit(self.allocator);
+            const view = &mapped_view;
 
             // Two phases. Phase A: rewrite each DV/CF formula body
             // against the typed view, building an indexed plan
             // (DV index, CF index) keyed by the *position in the
-            // view* — NOT source-byte offsets, since typed view
-            // slices borrow from the parser's sanitized buffer, not
-            // from `source`. Phase B walks the source XML and re-
-            // locates each `<formula1>` / `<formula2>` / `<formula>`
-            // body in lockstep with the view, splicing where the plan
-            // says so.
+            // view*. Phase B maps each rewritten view slice back to
+            // its source span through the sanitizer's contiguity runs
+            // (`SheetXml.sourceSpanOf`) and splices there — no raw
+            // re-scan, no lockstep (Codex #215 r5 REL-501).
             var dv_f1_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var dv_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var cf_f_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
@@ -3845,7 +3857,7 @@ pub const Workbook = struct {
 
             var patches: std.ArrayList(SourcePatch) = .empty;
             defer patches.deinit(a);
-            try collectDvCfPatches(a, source, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new);
+            try collectDvCfPatches(a, source, view, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new);
 
             // Sanity: every queued rewrite should have located a
             // splice site in the source (typed view and source share
@@ -3859,12 +3871,14 @@ pub const Workbook = struct {
             try self.store.replacePart(part_name, new_xml);
             count += @intCast(total);
 
-            // Invalidate the cached parsed view: its leaves borrowed
+            // Invalidate any cached parsed view: its leaves borrowed
             // from the old part bytes which `replacePart` swapped.
-            // Mirrors the invalidation pattern in `Workbook.save`.
-            var stale = ws.parsed.?;
-            stale.deinit(self.allocator);
-            ws.parsed = null;
+            // (The rewrite's own mapped view is local; the Worksheet
+            // cache only exists if some earlier reader parsed.)
+            if (ws.parsed) |*stale| {
+                stale.deinit(self.allocator);
+                ws.parsed = null;
+            }
         }
 
         return count;
@@ -12032,17 +12046,6 @@ fn owningTableFor(
 /// element inside the source sheet XML; `new` replaces those bytes.
 const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 
-/// Walk the source sheet XML in document order and locate each
-/// formula body whose typed-view counterpart was rewritten. Appends
-/// one `SourcePatch` per planned splice. Document order is the
-/// invariant linking typed-view indices to source occurrences:
-/// `parseValidations` and `parseConditionalFormats` iterate the
-/// source linearly without re-ordering, so the Nth `<formula1>`
-/// inside `<dataValidations>` corresponds to `view.validations[N]`'s
-/// `formula1`, etc.
-///
-/// Helper used only by
-/// `Workbook.rewriteAllValidationsAndConditionalFormats`.
 /// Find the next occurrence of a literal closing tag (`</c>`,
 /// `</sheetData>`, …) that is REAL markup — comments, CDATA
 /// sections, PIs and DOCTYPE blocks are skipped, so a decoy inside
@@ -12052,6 +12055,13 @@ const SourcePatch = struct { start: usize, end: usize, new: []const u8 };
 fn findClosingTagAware(source: []const u8, from: usize, close_tag: []const u8) ?usize {
     return workbook_xml_mod.findClosingTag(source, from, close_tag) catch null;
 }
+
+// (The r2–r4 raw-walk locators that lived here — prefix/exact tag
+// finders with hand-mirrored "view semantics" — are gone: the DV/CF
+// splice targets are now located by MAPPING the typed view's own
+// slices back to source offsets through the sanitizer's contiguity
+// runs (`SheetXml.sourceSpanOf`), so there is no raw re-scan left to
+// keep in lockstep. See `collectDvCfPatches`.)
 
 /// Collect source-byte patches for rewritten CELL formula bodies:
 /// locate each staged `<c r="REF">`'s `<f …>` inner text inside the
@@ -12131,171 +12141,78 @@ fn collectCellFormulaPatches(
     }
 }
 
+/// Queue one `SourcePatch` per rewritten DV/CF formula by MAPPING the
+/// typed view's own slice back to its source span
+/// (`SheetXml.sourceSpanOf`) — no raw re-scan, no element counting,
+/// no lockstep to lose. Four Codex #215 rounds (r1 REL-103, r2
+/// REL-204, r4 REL-401, r5 REL-501) each found another way a raw walk
+/// diverged from the sanitized view's lexical state — comment decoys,
+/// prefix-matched outer blocks, DTD bytes the sanitizer keeps, comment
+/// markers nested inside DTD literals — and the offset map ends the
+/// class: the splice target IS the view's formula, by construction. A
+/// slice that does not map to one verbatim source run (a body the
+/// sanitizer re-encoded from CDATA, or one crossing a stripped
+/// construct), or whose mapped source bytes no longer equal the
+/// view's (a part swapped under a stale view — the Codex #188 r8
+/// rule), refuses rather than splicing blind.
+///
+/// Helper used only by
+/// `Workbook.rewriteAllValidationsAndConditionalFormats`.
 fn collectDvCfPatches(
     a: Allocator,
     source: []const u8,
+    view: *const sheet_xml_mod.SheetXml,
     out: *std.ArrayList(SourcePatch),
     dv_f1_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     dv_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     cf_f_new: *const std.AutoHashMapUnmanaged(usize, []u8),
 ) Error!void {
     assert(source.len > 0);
-
-    // ─── DV walk ────────────────────────────────────────────────────
-    if (dv_f1_new.count() + dv_f2_new.count() > 0) {
-        if (std.mem.indexOf(u8, source, "<dataValidations")) |dv_open| {
-            const dv_open_gt = std.mem.indexOfScalarPos(u8, source, dv_open, '>') orelse
-                return error.NoSheetData;
-            const self_closing = dv_open_gt > 0 and source[dv_open_gt - 1] == '/';
-            if (!self_closing) {
-                const dv_close = std.mem.indexOfPos(u8, source, dv_open_gt, "</dataValidations>") orelse
-                    return error.NoSheetData;
-                const block_lo = dv_open_gt + 1;
-                const block_hi = dv_close;
-                var probe: usize = block_lo;
-                var dv_idx: usize = 0;
-                while (probe < block_hi) {
-                    const e_open = std.mem.indexOfPos(u8, source, probe, "<dataValidation") orelse break;
-                    if (e_open >= block_hi) break;
-                    const after = e_open + "<dataValidation".len;
-                    if (after >= source.len) break;
-                    const sep = source[after];
-                    if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
-                        probe = after;
-                        continue;
-                    }
-                    const e_open_gt = std.mem.indexOfScalarPos(u8, source, e_open, '>') orelse
-                        return error.NoSheetData;
-                    const e_self_closing = e_open_gt > 0 and source[e_open_gt - 1] == '/';
-                    var elem_hi: usize = undefined;
-                    if (e_self_closing) {
-                        elem_hi = e_open_gt + 1;
-                        probe = elem_hi;
-                    } else {
-                        const e_close = std.mem.indexOfPos(u8, source, e_open_gt, "</dataValidation>") orelse
-                            return error.NoSheetData;
-                        elem_hi = e_close;
-                        probe = e_close + "</dataValidation>".len;
-
-                        const body_lo = e_open_gt + 1;
-                        const body_hi = elem_hi;
-                        if (dv_f1_new.get(dv_idx)) |new1| {
-                            if (findInnerSpan(source, body_lo, body_hi, "<formula1", "</formula1>")) |span| {
-                                try out.append(a, .{ .start = span[0], .end = span[1], .new = new1 });
-                            }
-                        }
-                        if (dv_f2_new.get(dv_idx)) |new2| {
-                            if (findInnerSpan(source, body_lo, body_hi, "<formula2", "</formula2>")) |span| {
-                                try out.append(a, .{ .start = span[0], .end = span[1], .new = new2 });
-                            }
-                        }
-                    }
-                    dv_idx += 1;
-                }
-            }
-        }
+    // The view must have been parsed from THESE bytes — a part
+    // swapped underneath a cached view (`PartStore.replacePart`
+    // dupes, so pointer + length is a conservative identity) could
+    // otherwise pass the per-span equality check by coincidence of a
+    // short repeated body and splice an unrelated location (Codex
+    // #215 r10 REL-1002).
+    if (@intFromPtr(source.ptr) != view.src_ptr or source.len != view.src_len) {
+        return error.NoSheetData;
     }
 
-    // ─── CF walk ────────────────────────────────────────────────────
-    if (cf_f_new.count() > 0) {
-        var probe: usize = 0;
-        var cf_idx: usize = 0;
-        while (std.mem.indexOfPos(u8, source, probe, "<conditionalFormatting")) |cf_open| {
-            const after = cf_open + "<conditionalFormatting".len;
-            if (after >= source.len) break;
-            const sep = source[after];
-            if (sep != ' ' and sep != '\t' and sep != '\n' and sep != '\r' and sep != '/' and sep != '>') {
-                probe = after;
-                continue;
-            }
-            const cf_open_gt = std.mem.indexOfScalarPos(u8, source, cf_open, '>') orelse
-                return error.NoSheetData;
-            const cf_self_closing = cf_open_gt > 0 and source[cf_open_gt - 1] == '/';
-            if (cf_self_closing) {
-                probe = cf_open_gt + 1;
-                continue;
-            }
-            const cf_close = std.mem.indexOfPos(u8, source, cf_open_gt, "</conditionalFormatting>") orelse
-                return error.NoSheetData;
-            const cf_body_lo = cf_open_gt + 1;
-            const cf_body_hi = cf_close;
-            probe = cf_close + "</conditionalFormatting>".len;
-
-            // Walk each <cfRule> in this group. Each rule advances
-            // cf_idx by one, matching parseConditionalFormats's order.
-            var r_probe: usize = cf_body_lo;
-            while (r_probe < cf_body_hi) {
-                const r_open = std.mem.indexOfPos(u8, source, r_probe, "<cfRule") orelse break;
-                if (r_open >= cf_body_hi) break;
-                const r_after = r_open + "<cfRule".len;
-                if (r_after >= source.len) break;
-                const r_sep = source[r_after];
-                if (r_sep != ' ' and r_sep != '\t' and r_sep != '\n' and r_sep != '\r' and r_sep != '/' and r_sep != '>') {
-                    r_probe = r_after;
-                    continue;
-                }
-                const r_open_gt = std.mem.indexOfScalarPos(u8, source, r_open, '>') orelse
-                    return error.NoSheetData;
-                const r_self_closing = r_open_gt > 0 and source[r_open_gt - 1] == '/';
-                if (r_self_closing) {
-                    // No body — no formula to splice. Still advance idx.
-                    cf_idx += 1;
-                    r_probe = r_open_gt + 1;
-                    continue;
-                }
-                const r_close = std.mem.indexOfPos(u8, source, r_open_gt, "</cfRule>") orelse
-                    return error.NoSheetData;
-                const r_body_lo = r_open_gt + 1;
-                const r_body_hi = r_close;
-                r_probe = r_close + "</cfRule>".len;
-
-                if (cf_f_new.get(cf_idx)) |new_f| {
-                    if (findInnerSpan(source, r_body_lo, r_body_hi, "<formula", "</formula>")) |span| {
-                        try out.append(a, .{ .start = span[0], .end = span[1], .new = new_f });
-                    }
-                }
-                cf_idx += 1;
-            }
-        }
+    var it1 = dv_f1_new.iterator();
+    while (it1.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.validations[e.key_ptr.*].formula1.?, e.value_ptr.*);
+    }
+    var it2 = dv_f2_new.iterator();
+    while (it2.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.validations[e.key_ptr.*].formula2.?, e.value_ptr.*);
+    }
+    var it3 = cf_f_new.iterator();
+    while (it3.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula.?, e.value_ptr.*);
     }
 }
 
-/// Locate the inner-text span of `<tag …>BODY</close>` within
-/// `source[lo..hi]`. Returns `[body_lo, body_hi]` (the BODY span),
-/// or null if either tag is missing in that range. `open_prefix` is
-/// the opening-tag prefix without `>` (e.g. "<formula1") so we match
-/// both `<formula1>` and `<formula1 attr="…">`. The `<formula` /
-/// `<formula1` disambiguation is handled by the caller's choice of
-/// `open_prefix` (the search anchors on the literal prefix string).
-fn findInnerSpan(
+fn appendMappedPatch(
+    a: Allocator,
     source: []const u8,
-    lo: usize,
-    hi: usize,
-    open_prefix: []const u8,
-    close_tag: []const u8,
-) ?[2]usize {
-    if (lo >= hi or hi > source.len) return null;
-    const slice = source[lo..hi];
-    const o_rel = std.mem.indexOf(u8, slice, open_prefix) orelse return null;
-    const o_abs = lo + o_rel;
-    const o_after = o_abs + open_prefix.len;
-    if (o_after >= source.len) return null;
-    // `open_prefix` is "<formula" or "<formula1"/"<formula2". The
-    // boundary char must be `>`, whitespace, or `/` — otherwise we
-    // hit a longer-named element ("<formula1" matched on
-    // "<formula12" — guard against this).
-    const sep = source[o_after];
-    const is_boundary = switch (sep) {
-        ' ', '\t', '\r', '\n', '/', '>' => true,
-        else => false,
-    };
-    if (!is_boundary) return null;
-    const o_gt = std.mem.indexOfScalarPos(u8, source, o_after, '>') orelse return null;
-    if (o_gt >= hi) return null;
-    if (o_gt > 0 and source[o_gt - 1] == '/') return null; // self-closing — no body
-    const c_rel = std.mem.indexOfPos(u8, source, o_gt + 1, close_tag) orelse return null;
-    if (c_rel >= hi) return null;
-    return .{ o_gt + 1, c_rel };
+    view: *const sheet_xml_mod.SheetXml,
+    out: *std.ArrayList(SourcePatch),
+    slice: []const u8,
+    new: []u8,
+) Error!void {
+    if (view.sourceSpanOf(slice)) |span| {
+        if (span[1] > source.len) return error.NoSheetData;
+        if (!std.mem.eql(u8, source[span[0]..span[1]], slice)) return error.NoSheetData;
+        try out.append(a, .{ .start = span[0], .end = span[1], .new = new });
+        return;
+    }
+    // A body the sanitizer re-encoded (CDATA) or split (a stripped
+    // comment/PI) has no single verbatim run — its COVERING raw span,
+    // verified by re-sanitizing, is what the pre-map locator replaced
+    // whole, and valid XML must keep rewriting (Codex #215 r16
+    // REL-1601).
+    const span = (try view.sourceCoverOf(a, source, slice)) orelse return error.NoSheetData;
+    try out.append(a, .{ .start = span[0], .end = span[1], .new = new });
 }
 
 /// Linear splice of `source` against `patches`. Each patch's
@@ -14657,6 +14574,8 @@ test {
     _ = @import("defined_name_ndjson.zig");
     // S3b slice 4: same lesson, the anchors NDJSON writer.
     _ = @import("anchor_ndjson.zig");
+    // S3b slice 5: same lesson, the conditional-formats NDJSON writer.
+    _ = @import("conditional_format_ndjson.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {
@@ -16089,6 +16008,485 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     try std.testing.expectEqual(@as(?u32, 0), cfs[0].dxf_id);
     try std.testing.expectEqual(@as(?u32, 1), cfs[0].priority);
     try std.testing.expectEqual(@as(?u32, 2), cfs[1].priority);
+}
+
+test "rewrite CF: a commented-out cfRule decoy does not shift the splice lockstep (REL-103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-comment-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // The typed view counts rules over comment-stripped bytes, so
+        // the raw walk must not count the commented rule: with a raw
+        // `indexOfPos` walk, view index 0 (the live rule) landed on
+        // the COMMENT'S body and spliced inside it, leaving the live
+        // formula stale.
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><!-- <cfRule type="expression" priority="9"><formula>Z9</formula></cfRule> --><cfRule type="expression" dxfId="0" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-comment-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        try std.testing.expectEqual(@as(u32, 1), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+    // The comment's bytes were never a splice target.
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>Z9</formula>") != null);
+}
+
+test "rewrite DV: a dataValidationsX decoy keeps the raw walk in the view's index lockstep (REL-204)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-decoy-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // The typed view's OUTER block find is a prefix match, so the
+        // `<dataValidationsX>` decoy IS the view's block open and the
+        // view indexes the decoy's entry at 0 and the real block's at
+        // 1 (the first literal `</dataValidations>` — the real one —
+        // bounds its scan). The raw walk must count identically: an
+        // exact-name outer find started at the real block instead and
+        // spliced entry 0's replacement into entry 1's body.
+        const dv =
+            \\<dataValidationsX><dataValidation type="whole" operator="greaterThan" sqref="A1:A3"><formula1>B5</formula1></dataValidation></dataValidationsX><dataValidations count="1"><dataValidation type="whole" operator="lessThan" sqref="C1:C3"><formula1>B7</formula1></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-decoy-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_rows = .{ .at = 4, .count = 1 } },
+            null,
+        );
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqual(@as(usize, 2), dvs.len);
+    try std.testing.expectEqualStrings("B6", dvs[0].formula1.?);
+    try std.testing.expectEqualStrings("B8", dvs[1].formula1.?);
+}
+
+test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep (REL-401)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-dtd-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // Prepend a DOCTYPE whose entity literal spells a whole rule. The
+    // sanitizer KEEPS DTD bytes, so the typed view counts the phantom
+    // rule at index 0 and the live rule at index 1 — the raw walk
+    // must count identically: `skipNonElement`, which steps over the
+    // declaration, put the phantom's replacement into the live rule.
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        const dtd =
+            \\<!DOCTYPE worksheet [<!ENTITY e '<conditionalFormatting sqref="Z1:Z2"><cfRule type="expression" priority="9"><formula>Z9</formula></cfRule></conditionalFormatting>'>]>
+        ;
+        const at = std.mem.indexOf(u8, part.bytes, "<worksheet").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], dtd, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-dtd-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        // Phantom "Z9" → "AA9" (inside the DTD literal, as the view
+        // sees it) and live "D1" → "E1" — two rewrites, each landing
+        // in ITS OWN source occurrence.
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 2), cfs.len);
+    try std.testing.expectEqualStrings("AA9", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("E1", cfs[1].formula.?);
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+}
+
+test "rewrite DV/CF: LEADING and TRAILING edge markup joins the whole-body rewrite (REL-1701)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-edge-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A LEADING construct leaves the body slice starting exactly
+        // at a run boundary; a TRAILING one ends it there. The exact
+        // path used to accept both and splice only the text, leaving
+        // `<!--lead-->E1` behind — the boundary now defers to the
+        // verified covering span, which replaces the whole raw body.
+        const dv =
+            \\<dataValidations count="1"><dataValidation type="whole" operator="greaterThan" sqref="A1:A3"><formula1>D1<!--trail--></formula1></dataValidation></dataValidations>
+        ;
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula><?lead pi?>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-edge-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqualStrings("E1", dvs[0].formula1.?);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>E1</formula1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "trail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "lead") == null);
+}
+
+test "rewrite DV/CF: CDATA and comment-split formula bodies still rewrite (REL-1601)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-cover-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // Valid XML the map's exact path cannot place: a CDATA-encoded
+        // CF formula and a comment-split DV formula — the pre-map
+        // locator replaced their WHOLE raw bodies, and the covering
+        // span must keep doing so (the fixture keeps a second sheet, so
+        // a mid-sweep refusal would fail the whole edit visibly).
+        const dv =
+            \\<dataValidations count="1"><dataValidation type="whole" operator="greaterThan" sqref="A1:A3"><formula1>D<!--split-->1</formula1></dataValidation></dataValidations>
+        ;
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula><![CDATA[D1]]></formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-cover-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqualStrings("E1", dvs[0].formula1.?);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+    // The whole raw bodies were replaced — plain text now, exactly as
+    // the pre-map locator wrote them.
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>E1</formula1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+}
+
+test "rewrite DV/CF: the rewrite reads the CURRENT part bytes, cached views notwithstanding (REL-1002/r18)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-stale-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    // Prime a cached view, then swap the part underneath it. Since
+    // r18 the rewrite parses its OWN mapped view of the CURRENT part
+    // bytes (the map is rewrite-only), so no stale-cache offset can
+    // reach the splice: the swap simply becomes the truth the rewrite
+    // reads, and the identity gate in appendMappedPatch stays as an
+    // internal invariant.
+    _ = try ws.conditionalFormats();
+    const part_name = try ws.resolvePartName();
+    const part = (try wb.store.part(part_name)).?;
+    const copy = try std.testing.allocator.dupe(u8, part.bytes);
+    defer std.testing.allocator.free(copy);
+    try wb.store.replacePart(part_name, copy);
+
+    const ws_name_owned = try std.testing.allocator.dupe(u8, ws.name());
+    defer std.testing.allocator.free(ws_name_owned);
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(
+        .{ .insert_cols = .{ .at = 4, .count = 1 } },
+        ws_name_owned,
+    );
+    try std.testing.expectEqual(@as(u32, 1), count);
+    const cfs = try (try wb.sheet(0)).conditionalFormats();
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+}
+
+test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync the splice (REL-501)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-dtdc-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // The DTD's quoted literal holds a COMMENT-WRAPPED rule and a
+    // plain rule. The sanitizer copies the whole declaration verbatim
+    // (the markers sit inside quotes), so the typed view counts BOTH
+    // phantoms plus the live rule; a raw walk that skipped comment
+    // markers wherever they appeared counted one fewer and spliced a
+    // phantom's replacement into the live formula (Codex #215 r5
+    // REL-501 — the shape one level below r4's).
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        const dtd =
+            \\<!DOCTYPE worksheet [<!ENTITY e '<!-- <conditionalFormatting sqref="Y1"><cfRule type="expression" priority="8"><formula>Y9</formula></cfRule></conditionalFormatting> --><conditionalFormatting sqref="Z1:Z2"><cfRule type="expression" priority="9"><formula>Z9</formula></cfRule></conditionalFormatting>'>]>
+        ;
+        const at = std.mem.indexOf(u8, part.bytes, "<worksheet").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], dtd, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-dtdc-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        // Comment-phantom Y9→Z9, phantom Z9→AA9, live D1→E1 — three
+        // rewrites, each landing in ITS OWN source occurrence.
+        try std.testing.expectEqual(@as(u32, 3), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 3), cfs.len);
+    try std.testing.expectEqualStrings("Z9", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("AA9", cfs[1].formula.?);
+    try std.testing.expectEqualStrings("E1", cfs[2].formula.?);
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <conditionalFormatting sqref=\"Y1\"><cfRule type=\"expression\" priority=\"8\"><formula>Z9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "priority=\"9\"><formula>AA9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+}
+
+test "rewrite CF: a quoted '>' in an attribute does not corrupt the formula splice (REL-103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-quotegt-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A raw `>` inside a quoted attribute value is valid XML; the
+        // bare `indexOfScalarPos` scan took it as the tag end and the
+        // splice span started inside the attribute, emitting a part
+        // that no longer parsed.
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula cm=">">D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-quotegt-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        try std.testing.expectEqual(@as(u32, 1), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+    // The attribute — quote, `>` and all — survived the splice.
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "cm=\">\"") != null);
 }
 
 test "Workbook.rewriteAllValidationsAndConditionalFormats: no-op count == 0 on workbook without DV/CF" {
