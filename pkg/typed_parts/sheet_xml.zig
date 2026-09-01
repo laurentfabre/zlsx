@@ -844,9 +844,10 @@ fn extractInner(body: []const u8, open_prefix: []const u8, close_tag: []const u8
 /// caller can collect repeated children (`<cfRule>`'s up-to-three
 /// `<formula>` bodies). First-match semantics are `extractInner`'s
 /// exactly — the scan anchors on the literal prefix and bails (null)
-/// when the first hit is a longer-named element, the same shape the
-/// DV/CF rewriter's `findInnerSpan` bails on, so the two keep
-/// agreeing on which body is "the formula".
+/// when the first hit is a longer-named element. (The DV/CF rewriter
+/// no longer re-locates bodies at all: it maps the view's own slices
+/// back to source offsets via `sourceSpanOf`, so whichever body THIS
+/// scan records is, by construction, the one that gets spliced.)
 fn extractInnerAdvance(rest: *[]const u8, open_prefix: []const u8, close_tag: []const u8) ?[]const u8 {
     const body = rest.*;
     const o = std.mem.indexOf(u8, body, open_prefix) orelse return null;
@@ -1367,9 +1368,10 @@ test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has 
 test "parse: cfRule formula scan keeps extractInner's bail-on-decoy shape" {
     // A longer-named element at the first `<formula` hit bails the
     // whole scan (formula == null), exactly as `extractInner` did —
-    // the DV/CF rewriter's `findInnerSpan` bails on the same shape,
-    // and the two must agree on which body is "the formula". A decoy
-    // AFTER a real formula likewise ends the collection there.
+    // and since the rewriter splices by mapping THIS view's slice
+    // back to source (`sourceSpanOf`), a bailed rule simply has no
+    // formula to rewrite. A decoy AFTER a real formula likewise ends
+    // the collection there.
     const xml =
         \\<worksheet>
         \\  <sheetData/>

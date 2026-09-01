@@ -720,7 +720,8 @@ zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 # Merged header bands: every merge that touches row 1.
 zlsx merges data.xlsx --all-sheets | jq 'select(.start_row==1)'
 
-# Every between-rule with both bounds, as TSV.
+# Every cellIs rule with exactly two formula bodies (between / notBetween — the
+# operator itself is not on the wire), as TSV.
 zlsx conditional-formats data.xlsx | jq -r 'select(.rule_type=="cellIs" and (.formulas|length)==2) | [.sheet, .sqref, .formulas[0], .formulas[1]] | @tsv'
 
 # Visible workbook-scope names with their bodies, as TSV.

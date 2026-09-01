@@ -3788,12 +3788,10 @@ pub const Workbook = struct {
             // Two phases. Phase A: rewrite each DV/CF formula body
             // against the typed view, building an indexed plan
             // (DV index, CF index) keyed by the *position in the
-            // view* — NOT source-byte offsets, since typed view
-            // slices borrow from the parser's sanitized buffer, not
-            // from `source`. Phase B walks the source XML and re-
-            // locates each `<formula1>` / `<formula2>` / `<formula>`
-            // body in lockstep with the view, splicing where the plan
-            // says so.
+            // view*. Phase B maps each rewritten view slice back to
+            // its source span through the sanitizer's contiguity runs
+            // (`SheetXml.sourceSpanOf`) and splices there — no raw
+            // re-scan, no lockstep (Codex #215 r5 REL-501).
             var dv_f1_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var dv_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var cf_f_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};

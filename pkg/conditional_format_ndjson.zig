@@ -371,13 +371,48 @@ fn isXmlnsNsUri(uri: []const u8) bool {
     return std.mem.eql(u8, uri, xmlns_ns_uri);
 }
 
-fn prefixInScope(declared: []const []const u8, p: []const u8) bool {
-    if (std.mem.eql(u8, p, "xml")) return true; // implicitly declared
-    for (declared) |d| {
-        if (std.mem.eql(u8, d, p)) return true;
+/// In-scope prefix bindings: a declaration stack (per-frame
+/// watermarks pop exactly what a frame declared) beside a REFCOUNTED
+/// hash map, so the per-attribute lookup is O(1) — the linear scan
+/// was quadratic against a tag with many declarations and many
+/// prefixed attributes (Codex #215 r15 PERF-1501).
+const PrefixScope = struct {
+    stack: std.ArrayListUnmanaged([]const u8) = .empty,
+    counts: std.StringHashMapUnmanaged(u32) = .empty,
+
+    fn deinit(self: *PrefixScope, a: Allocator) void {
+        self.stack.deinit(a);
+        self.counts.deinit(a);
     }
-    return false;
-}
+
+    fn mark(self: *const PrefixScope) usize {
+        return self.stack.items.len;
+    }
+
+    fn declare(self: *PrefixScope, a: Allocator, p: []const u8) !void {
+        try self.stack.append(a, p);
+        const g = try self.counts.getOrPut(a, p);
+        if (g.found_existing) g.value_ptr.* += 1 else g.value_ptr.* = 1;
+    }
+
+    fn truncate(self: *PrefixScope, to: usize) void {
+        while (self.stack.items.len > to) {
+            const p = self.stack.items[self.stack.items.len - 1];
+            self.stack.items.len -= 1;
+            const v = self.counts.getPtr(p).?;
+            if (v.* == 1) {
+                _ = self.counts.remove(p);
+            } else {
+                v.* -= 1;
+            }
+        }
+    }
+
+    fn contains(self: *const PrefixScope, p: []const u8) bool {
+        if (std.mem.eql(u8, p, "xml")) return true; // implicitly declared
+        return self.counts.contains(p);
+    }
+};
 
 /// Process one element's namespace declarations into the in-scope
 /// prefix stack and validate the reserved rules, then require the
@@ -390,7 +425,7 @@ fn prefixInScope(declared: []const []const u8, p: []const u8) bool {
 /// for `<p>:id` matching — callers skip `xmlns`-family names.
 fn enterElementScope(
     scratch: Allocator,
-    declared: *std.ArrayListUnmanaged([]const u8),
+    scope: *PrefixScope,
     qname: []const u8,
     attrs: []const u8,
 ) Error!void {
@@ -417,18 +452,18 @@ fn enterElementScope(
                 return error.MalformedSheetXml;
             }
             if (try bindsNs(scratch, attr.value, isXmlnsNsUri)) return error.MalformedSheetXml;
-            try declared.append(scratch, p);
+            try scope.declare(scratch, p);
         }
     }
     if (std.mem.indexOfScalar(u8, qname, ':')) |c| {
-        if (!prefixInScope(declared.items, qname[0..c])) return error.MalformedSheetXml;
+        if (!scope.contains(qname[0..c])) return error.MalformedSheetXml;
     }
     var it2: AttrScan = .{ .rest = attrs };
     while (try it2.next()) |attr| {
         if (std.mem.eql(u8, attr.name, "xmlns")) continue;
         if (std.mem.startsWith(u8, attr.name, "xmlns:")) continue;
         if (std.mem.indexOfScalar(u8, attr.name, ':')) |c| {
-            if (!prefixInScope(declared.items, attr.name[0..c])) return error.MalformedSheetXml;
+            if (!scope.contains(attr.name[0..c])) return error.MalformedSheetXml;
         }
     }
 }
@@ -508,10 +543,10 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
     };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(a);
-    // The in-scope prefix stack (Codex #215 r11 SEC-1101): each frame
-    // records its watermark and pops its own declarations.
-    var declared: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer declared.deinit(a);
+    // The in-scope prefix bindings (Codex #215 r11 SEC-1101): each
+    // frame records its watermark and pops its own declarations.
+    var scope: PrefixScope = .{};
+    defer scope.deinit(a);
     var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer decl_seen.deinit(a);
 
@@ -543,6 +578,10 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             const is_comment = lt + 4 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 4], "<!--");
             const is_cdata = lt + 9 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 9], "<![CDATA[");
             if (!is_comment and !is_cdata) return error.MalformedSheetXml;
+            if (is_comment) {
+                i = skipStrictComment(xml, lt) orelse return error.MalformedSheetXml;
+                continue;
+            }
         }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedSheetXml;
         if (skip_to != lt) {
@@ -563,7 +602,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             const top = frames.items[frames.items.len - 1];
             frames.items.len -= 1;
             if (!std.mem.eql(u8, top.name, name)) return error.MalformedSheetXml;
-            declared.items.len = top.prefix_mark;
+            scope.truncate(top.prefix_mark);
             switch (top.kind) {
                 .cf_rule => try out.append(a, top.rule),
                 .root, .barren_root => root_closed = true,
@@ -587,8 +626,8 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
         // Namespace bookkeeping: the default declared here binds this
         // element too; the main namespace bound to a prefix is outside
         // the closed form and refuses (the host/SST predicate's rule).
-        const prefix_mark = declared.items.len;
-        try enterElementScope(a, &declared, qname, attrs);
+        const prefix_mark = scope.mark();
+        try enterElementScope(a, &scope, qname, attrs);
         var elem_main = if (frames.items.len == 0)
             false
         else
@@ -702,13 +741,13 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 }
                 parent.rule.formulas[parent.rule.formula_count] = body;
                 parent.rule.formula_count += 1;
-                declared.items.len = prefix_mark; // atomic element — its scope ends here
+                scope.truncate(prefix_mark); // atomic element — its scope ends here
                 continue;
             }
         }
 
         if (te.self_closing) {
-            declared.items.len = prefix_mark;
+            scope.truncate(prefix_mark);
             switch (frame.kind) {
                 .cf_rule => try out.append(a, frame.rule),
                 .root, .barren_root => root_closed = true,
@@ -730,6 +769,19 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
     if (!root_seen) return error.MalformedSheetXml;
     if (frames.items.len != 0) return error.MalformedSheetXml;
     return root_kind;
+}
+
+/// XML 1.0 comments forbid `--` inside the content and content
+/// ending in `-` — a delimiter-only skip let
+/// `<!-- bad -- <conditionalFormatting>…</conditionalFormatting> -->`
+/// swallow a rule block into a malformed comment under exit 0 (Codex
+/// #215 r15 REL-1501). Null = malformed or unterminated.
+fn skipStrictComment(xml: []const u8, lt: usize) ?usize {
+    const end = std.mem.indexOfPos(u8, xml, lt + 4, "-->") orelse return null;
+    const body = xml[lt + 4 .. end];
+    if (std.mem.indexOf(u8, body, "--") != null) return null;
+    if (body.len > 0 and body[body.len - 1] == '-') return null;
+    return end + 3;
 }
 
 fn isXmlWs(c: u8) bool {
@@ -923,8 +975,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(gpa);
-    var declared: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer declared.deinit(gpa);
+    var scope: PrefixScope = .{};
+    defer scope.deinit(gpa);
     var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer decl_seen.deinit(gpa);
 
@@ -955,6 +1007,10 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             const is_comment = lt + 4 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 4], "<!--");
             const is_cdata = lt + 9 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 9], "<![CDATA[");
             if (!is_comment and !is_cdata) return error.MalformedWorkbookXml;
+            if (is_comment) {
+                i = skipStrictComment(xml, lt) orelse return error.MalformedWorkbookXml;
+                continue;
+            }
         }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedWorkbookXml;
         if (skip_to != lt) {
@@ -974,7 +1030,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             const top = frames.items[frames.items.len - 1];
             frames.items.len -= 1;
             if (!std.mem.eql(u8, top.name, name)) return error.MalformedWorkbookXml;
-            declared.items.len = top.prefix_mark;
+            scope.truncate(top.prefix_mark);
             if (top.kind == .root) root_closed = true;
             i = j + 1;
             continue;
@@ -990,8 +1046,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
         const attrs = xml[j..te.attrs_end];
         if (root_closed) return error.MalformedWorkbookXml;
 
-        const prefix_mark = declared.items.len;
-        enterElementScope(gpa, &declared, qname, attrs) catch |e| switch (e) {
+        const prefix_mark = scope.mark();
+        enterElementScope(gpa, &scope, qname, attrs) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => return error.MalformedWorkbookXml,
         };
@@ -1089,7 +1145,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
         }
 
         if (te.self_closing) {
-            declared.items.len = prefix_mark;
+            scope.truncate(prefix_mark);
         } else {
             if (frames.items.len >= max_depth) return error.MalformedWorkbookXml;
             try frames.append(gpa, .{ .name = qname, .kind = kind, .main_default = elem_main, .prefix_mark = prefix_mark });
@@ -1132,8 +1188,8 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
     const Frame = struct { name: []const u8, kind: Kind, pkg_default: bool, prefix_mark: usize };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(gpa);
-    var declared: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer declared.deinit(gpa);
+    var scope: PrefixScope = .{};
+    defer scope.deinit(gpa);
     var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer decl_seen.deinit(gpa);
     // Hashed — the linear seen-scan was quadratic in the relationship
@@ -1163,6 +1219,10 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             const is_comment = lt + 4 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 4], "<!--");
             const is_cdata = lt + 9 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 9], "<![CDATA[");
             if (!is_comment and !is_cdata) return error.MalformedWorkbookXml;
+            if (is_comment) {
+                i = skipStrictComment(xml, lt) orelse return error.MalformedWorkbookXml;
+                continue;
+            }
         }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedWorkbookXml;
         if (skip_to != lt) {
@@ -1182,7 +1242,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             const top = frames.items[frames.items.len - 1];
             frames.items.len -= 1;
             if (!std.mem.eql(u8, top.name, name)) return error.MalformedWorkbookXml;
-            declared.items.len = top.prefix_mark;
+            scope.truncate(top.prefix_mark);
             if (top.kind == .root) root_closed = true;
             i = j + 1;
             continue;
@@ -1198,8 +1258,8 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
         const attrs = xml[j..te.attrs_end];
         if (root_closed) return error.MalformedWorkbookXml;
 
-        const prefix_mark = declared.items.len;
-        enterElementScope(gpa, &declared, qname, attrs) catch |e| switch (e) {
+        const prefix_mark = scope.mark();
+        enterElementScope(gpa, &scope, qname, attrs) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => return error.MalformedWorkbookXml,
         };
@@ -1295,7 +1355,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
         }
 
         if (te.self_closing) {
-            declared.items.len = prefix_mark;
+            scope.truncate(prefix_mark);
         } else {
             if (frames.items.len >= max_depth) return error.MalformedWorkbookXml;
             try frames.append(gpa, .{ .name = qname, .kind = kind, .pkg_default = elem_pkg, .prefix_mark = prefix_mark });
@@ -1922,6 +1982,55 @@ test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts 
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
         try std.testing.expectError(case.err, collect(testing.allocator, &wb));
+    }
+}
+
+test "scanSheetRules: malformed comments cannot swallow a rule block (REL-1501)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cf_doc = "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>";
+    // `--` inside comment content is malformed XML — a delimiter-only
+    // skip let this comment eat the rule block under exit 0.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<!-- bad -- " ++ cf_doc ++ " -->" ++
+        "</worksheet>"));
+    // Content ending in `-` is malformed too.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<!-- x --->" ++ cf_doc ++ "</worksheet>"));
+}
+
+test "collect: a malformed comment in a real workbook refuses (REL-1501); notBetween pin (MNT-1501)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    {
+        const path = try tt.path(testing.allocator, io, "cmt.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<conditionalFormatting sqref=\"A1:A4\">", "<!-- a -- b --><conditionalFormatting sqref=\"A1:A4\">");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+    }
+    // A notBetween rule wears the same `cellIs` type and two formula
+    // bodies — the wire does not carry the operator, which is why the
+    // docs' two-formula pipeline is operator-agnostic (MNT-1501).
+    {
+        const path = try tt.path(testing.allocator, io, "notbtw.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "operator=\"between\"", "operator=\"notBetween\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqualStrings("cellIs", view.records[0].rule_type);
+        try testing.expectEqual(@as(usize, 2), view.records[0].formulas.len);
     }
 }
 
