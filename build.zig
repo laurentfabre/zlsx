@@ -1882,10 +1882,54 @@ pub fn build(b: *std.Build) void {
             .fuzz = true,
         });
         if (w.needs_zlsx) mod.addImport("zlsx", zlsx_mod);
+        // The full package_mod mirror: table_edit's closure has grown
+        // to reach the engine and the store since the S7c
+        // column-schema work, and the fuzz step stopped COMPILING —
+        // silently, because nothing on macOS runs it (found re-wiring
+        // MNT-2303). Unused imports on the leaner walkers are inert.
+        mod.addImport("zlsx_control", control_mod);
+        mod.addImport("zlsx_sst_plan", sst_plan_mod);
+        mod.addImport("zlsx_styles_plan", styles_plan_mod);
+        mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+        mod.addImport("zlsx_zip", zip_mod);
+        mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+        mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+        mod.addImport("zlsx_nfc", nfc_mod);
         mod.addImport("zlsx_refs", refs_mod);
+        mod.addImport("zlsx_formula", formula_pkg_mod);
         const t = b.addTest(.{ .root_module = mod, .test_runner = fuzz_test_runner });
         fuzz_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // S3b slice 5: the strict conditional-format scanners
+    // (`scanSheetRules` / `scanWorkbookSheets` / `verifyWorkbookRels`)
+    // are three more depth- and namespace-aware walkers over
+    // attacker-controlled XML, and nothing already wired into `fuzz`
+    // reaches them (Codex #215 r23 MNT-2303). The module mirrors
+    // `package_mod`'s imports because the file sits in workbook.zig's
+    // closure.
+    const cf_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/conditional_format_ndjson.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    cf_fuzz_mod.addImport("zlsx_control", control_mod);
+    cf_fuzz_mod.addImport("zlsx", zlsx_mod);
+    cf_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    cf_fuzz_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    cf_fuzz_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    cf_fuzz_mod.addImport("zlsx_zip", zip_mod);
+    cf_fuzz_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    cf_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    cf_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
+    cf_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    cf_fuzz_mod.addImport("zlsx_formula", formula_pkg_mod);
+    const cf_fuzz_tests = b.addTest(.{
+        .root_module = cf_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(cf_fuzz_tests).step);
 
     // tests/package_corpus.zig — corpus-level integration test for
     // the package layer. Imports `zlsx_pkg` and walks every fixture

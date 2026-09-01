@@ -1595,9 +1595,17 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             }
             const cached_external = rels[entry_idx].target_mode == .external;
             if (try wbAttr(gpa, attrs, "TargetMode")) |mode| {
-                if (std.mem.eql(u8, mode, "External")) {
+                // Decoded like Id/Type/Target — `Inter&#110;al` is a
+                // valid spelling of the enum and a raw compare refused
+                // it (Codex #215 r23 REL-2301).
+                const mode_dec = decodeRelText(gpa, mode) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => return error.MalformedWorkbookXml,
+                };
+                defer gpa.free(mode_dec);
+                if (std.mem.eql(u8, mode_dec, "External")) {
                     if (!cached_external) return error.MalformedWorkbookXml;
-                } else if (std.mem.eql(u8, mode, "Internal")) {
+                } else if (std.mem.eql(u8, mode_dec, "Internal")) {
                     if (cached_external) return error.MalformedWorkbookXml;
                 } else {
                     return error.MalformedWorkbookXml;
@@ -2336,6 +2344,128 @@ test "collect: an MCE branch inside <sheets> refuses (SEC-2201)" {
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
     try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+}
+
+test "scanSheetRules: MCE binding state — entity spelling and shadow restore (MNT-2303)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An entity-spelled MCE binding IS the MCE binding — the decoded
+    // compare every other namespace already gets (SEC-301's rule).
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility&#47;2006\"><mc:Choice/></mc:AlternateContent></worksheet>"));
+    // A foreign shadow of `mc` ends with its element: the outer MCE
+    // binding restores on pop and the slot rule still fires.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:mc=\"" ++ mce_ns ++ "\">" ++
+        "<wrap xmlns:mc=\"urn:x\"><mc:thing/></wrap>" ++
+        "<mc:AlternateContent><mc:Choice/></mc:AlternateContent></worksheet>"));
+}
+
+fn fuzzScannersTarget(_: void, smith: *std.testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    // 4 KiB matches the sheet_edit harness's scratch bound.
+    var smith_buf: [4096]u8 = undefined;
+    const input = smith_buf[0..smith.slice(&smith_buf)];
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var rules: std.ArrayListUnmanaged(RawRule) = .empty;
+    _ = scanSheetRules(a, input, &rules) catch {};
+    var sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
+    scanWorkbookSheets(a, input, &sheets) catch {};
+    verifyWorkbookRels(a, input, &.{}) catch {};
+}
+
+/// The shapes the review rounds actually broke, plus the truncations
+/// a hand-written test would not think to write.
+const scanner_fuzz_corpus = [_][]const u8{
+    "",
+    "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>",
+    ws_open ++ "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting></worksheet>",
+    "<xm:macrosheet xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>",
+    ws_open ++ "<mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Choice/></mc:AlternateContent></worksheet>",
+    ws_open ++ "<conditionalFormatting sqref=\"A1\"><cfRule type=\"x\" priority=\"1\"><formula>",
+    ws_open ++ "<!--",
+    ws_open ++ "<?tgt",
+    "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"a\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"t\" Target=\"x\"/></Relationships>",
+    "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:mc=",
+    ws_open ++ "<a xmlns:b=\"c\" b:d=\"e\"",
+    "<<<<>>>>",
+};
+
+test "fuzz: the strict scanners never crash on adversarial XML (MNT-2303)" {
+    try std.testing.fuzz({}, fuzzScannersTarget, .{ .corpus = &scanner_fuzz_corpus });
+}
+
+test "collect: an entity-spelled TargetMode verifies by its decoded value (REL-2301)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "tmode.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    // `Inter&#110;al` DECODES to Internal — the store cached it that
+    // way, and the strict verifier must read the same spelling.
+    try fixture.patchPart(testing.allocator, io, path, "xl/_rels/workbook.xml.rels", "Target=\"worksheets/sheet2.xml\"", "Target=\"worksheets/sheet2.xml\" TargetMode=\"Inter&#110;al\"");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 5), view.records.len);
+}
+
+test "collect: a decoded External sheet target refuses by POLICY, not by spelling (REL-2301)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "tmode_ext.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(testing.allocator, io, path, "xl/_rels/workbook.xml.rels", "Target=\"worksheets/sheet2.xml\"", "Target=\"worksheets/sheet2.xml\" TargetMode=\"Exter&#110;al\"");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    // The spelling decodes and agrees with the cache; the refusal is
+    // the sheet-graph rule that a sheet relationship must be internal.
+    try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+}
+
+test "writeAll: the future C handoff writes the full stream byte-exactly (MNT-2302)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "writeall.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeAll(&out.writer, &view);
+    try testing.expectEqualStrings(
+        "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"A1:A4\"," ++
+            "\"rule_type\":\"cellIs\",\"formulas\":[\"2\",\"4\"],\"dxf_id\":0,\"priority\":1}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"B1:B4\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"B1>3\"],\"dxf_id\":0,\"priority\":2}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"C1:C4\"," ++
+            "\"rule_type\":\"colorScale\",\"formulas\":[],\"dxf_id\":null,\"priority\":3}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"D1:D4\"," ++
+            "\"rule_type\":\"dataBar\",\"formulas\":[],\"dxf_id\":null,\"priority\":4}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"$A1=\\\"R&D\\\"\"],\"dxf_id\":0,\"priority\":1}\n",
+        out.written(),
+    );
 }
 
 test "collect: a canonical macro sheet in a real package keeps its rules (REL-2001)" {

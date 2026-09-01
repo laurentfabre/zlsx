@@ -372,7 +372,10 @@ formula (the schema's `maxOccurs` is 3); a duplicate attribute on a
 block or rule tag; a `sqref`, rule type or formula whose carrier does not decode (a
 bad entity — the character-reference grammar is exact: `&#+65;` and
 `&#1_0;` are not references) or decodes to non-UTF-8 (NDJSON must
-stay parseable); a sheet-name carrier that does not decode; and — the
+stay parseable); a sheet-name carrier that does not decode; a numeric
+carrier (`dxfId`, `priority`) whose entities do not decode — decoding
+runs first, and only a carrier that decodes falls through to the
+written-but-invalid `null` convention below; and — the
 walk runs no markup-compatibility (MCE) processor — the MCE constructs
 whose projection could reach a rule-carrying slot: an MCE-bound
 element as a direct child of the sheet root, a block or a rule
@@ -386,10 +389,11 @@ carries them — and a deeper `mc:AlternateContent` (the real
 and stays walkable. A partial or wrong rule inventory is the shape of a
 guard hole. Boundary conventions, pinned as the contract: an absent
 `sqref` or `type` and an empty one are one shape (the empty string);
-a `dxfId` or `priority` that is written but not a plain string of
+a `dxfId` or `priority` that decodes but is not a plain string of
 decimal digits in `u32` range reads as `null` (the written-but-invalid
 convention `tableHeaderRowCount` set — `+1` and `1_0` are not
-numbers); a `<conditionalFormatting>` block with no `<cfRule>`
+numbers; entities resolve first, so `&#49;` is `1` and an undecodable
+carrier is exit 2, not `null`); a `<conditionalFormatting>` block with no `<cfRule>`
 children — the self-closing spelling included — emits nothing; a
 `chartsheet` or `dialogsheet` part holds no rules by schema and
 contributes an empty inventory (it is still walked whole — its

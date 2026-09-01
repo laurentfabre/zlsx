@@ -10102,6 +10102,28 @@ test "runConditionalFormatsCommand: an unprocessed MCE branch refuses whole (exi
     try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
 }
 
+test "runConditionalFormatsCommand: an undecodable numeric carrier refuses whole (exit 2, MNT-2301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_bad_priority.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+    // Numeric carriers decode their entities FIRST; only a decoded
+    // non-numeric reads as null — an undecodable one refuses whole.
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "priority=\"1\"", "priority=\"&bogus;\"");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
 // ─── S3b slice 3: `doc-props` ────────────────────────────────────────
 
 /// A saved fresh-writer workbook with docProps parts spliced in through
