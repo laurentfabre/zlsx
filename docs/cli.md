@@ -328,12 +328,13 @@ A workbook without conditional formatting is an empty, successful
 stream. The command routes through the package layer like `pivots`, so
 an archive the lenient reader tolerates but the package layer refuses
 is exit 2, and so is any workbook sheet the package layer cannot read
-whole — the workbook's `<sheets>` list is verified against a strict
-namespace- and depth-aware read (a ghost `<sheet>` under `<extLst>`
-cannot mint an identity, an entry missing a required carrier refuses
-instead of vanishing), the sheet graph resolves strictly (the
-relationship under the sheet's `r:id` — spelled under a root-declared
-relationships-namespace prefix and matched by its DECODED spelling —
+whole — sheet identities come from a strict namespace- and depth-aware
+read of the workbook's `<sheets>` list (a ghost `<sheet>` under
+`<extLst>` is not an identity, an entry missing a required carrier
+refuses instead of vanishing, and any root-declared
+relationships-namespace prefix spells the id reference — `q:id` under
+`xmlns:q` reads like `r:id`), the sheet graph resolves strictly (the
+relationship under the entry's id — matched by its DECODED spelling —
 must exist, be a sheet-family type, be internal, and reach a part the
 archive holds that no other sheet reaches — the `anchors` rule; the
 rels part itself verifies strictly too, so a nested `Relationship`

@@ -113,31 +113,36 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const sheet_names = try a.alloc([]const u8, wb.workbook.sheets.len);
-    for (wb.workbook.sheets, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
-
-    // The lenient workbook projection finds `<sheet>` tags lexically,
-    // document-wide, and silently drops entries missing a carrier —
-    // so a foreign unprefixed `<sheet>` under `<extLst>` could become
-    // a ghost identity and a real entry could vanish. Verify the
-    // projection against a strict, namespace- and depth-aware read of
-    // `<workbook>/<sheets>/<sheet>` before trusting it (Codex #215 r5
-    // SEC-502).
+    // The AUTHORITATIVE sheet inventory is the strict namespace- and
+    // depth-aware read of `xl/workbook.xml` (`scanWorkbookSheets`) —
+    // not the lenient lexical projection, which counts `<sheet>` tags
+    // document-wide, drops carrier-less entries silently, and only
+    // spells the literal `r:id` (Codex #215 r5 SEC-502, r8 REL-801:
+    // a ghost under `<extLst>` is excluded here, a real entry missing
+    // a carrier refuses, and a valid alternate relationships prefix
+    // is an identity).
+    var strict_sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
+    defer strict_sheets.deinit(gpa);
     {
         const wb_part = (wb.store.part("xl/workbook.xml") catch |e| switch (e) {
             error.OutOfMemory, error.ZipBombSuspected => return e,
             else => return error.MalformedWorkbookXml,
         }) orelse return error.MalformedWorkbookXml;
-        try verifyWorkbookSheets(gpa, wb_part.bytes, wb.workbook.sheets);
+        try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets);
     }
+    const sheet_count = strict_sheets.items.len;
 
-    // Resolve each workbook sheet to its part STRICTLY — the anchors
-    // collector's rule, not `Worksheet.resolvePartName`'s first-match
-    // fast path: the relationship must exist under the sheet's `r:id`,
-    // be a sheet-family type, be internal, and reach a part the
-    // archive holds, and no two `<sheet>` entries may reach one part
-    // (the same rule would ride out twice under two identities) —
-    // Codex #215 r4 REL-402.
+    const sheet_names = try a.alloc([]const u8, sheet_count);
+    for (strict_sheets.items, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
+
+    // Resolve each sheet to its part STRICTLY — the anchors
+    // collector's rule: the relationship under the entry's id must
+    // exist, be a sheet-family type, be internal, and reach a part
+    // the archive holds that no other sheet reaches (the same rule
+    // would ride out twice under two identities) — Codex #215 r4
+    // REL-402. Lookups are hashed: an id→relationship map and a
+    // seen-targets set replace the per-sheet linear scans a crafted
+    // graph amplified quadratically (r8 PERF-801).
     const wb_rels = wb.store.rels("xl/workbook.xml");
     // The store's relationship list is lexical too — verify it against
     // a strict read of the rels part before resolving through it, so a
@@ -154,9 +159,28 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
             return error.MalformedWorkbookXml;
         }
     }
-    const sheet_parts = try a.alloc([]const u8, wb.workbook.sheets.len);
-    for (wb.workbook.sheets, 0..) |s, i| {
-        const rel = (try relById(a, wb_rels, s.r_id)) orelse return error.MalformedWorkbookXml;
+    var rel_by_id: std.StringHashMapUnmanaged(store_mod.Relationship) = .empty;
+    defer rel_by_id.deinit(gpa);
+    try rel_by_id.ensureTotalCapacity(gpa, @intCast(wb_rels.len));
+    for (wb_rels) |rel| {
+        const g = rel_by_id.getOrPutAssumeCapacity(rel.id);
+        if (g.found_existing) return error.MalformedWorkbookXml;
+        g.value_ptr.* = rel;
+    }
+    var seen_targets: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_targets.deinit(gpa);
+    const sheet_parts = try a.alloc([]const u8, sheet_count);
+    for (strict_sheets.items, 0..) |s, i| {
+        const rel = blk: {
+            if (std.mem.indexOfScalar(u8, s.rid, '&') != null) {
+                // The XML-semantic id is the DECODED spelling (r5
+                // REL-503); one that does not decode refuses.
+                const decoded = try decodeRelText(gpa, s.rid);
+                defer gpa.free(decoded);
+                break :blk rel_by_id.get(decoded) orelse return error.MalformedWorkbookXml;
+            }
+            break :blk rel_by_id.get(s.rid) orelse return error.MalformedWorkbookXml;
+        };
         var typed = false;
         for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
         if (!typed) return error.MalformedWorkbookXml;
@@ -164,14 +188,13 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         const name = (try wb.store.resolve("xl/workbook.xml", rel.target)) orelse
             return error.MalformedWorkbookXml;
         if ((try wb.store.part(name)) == null) return error.MalformedWorkbookXml;
-        for (sheet_parts[0..i]) |prev| {
-            if (std.mem.eql(u8, prev, name)) return error.MalformedWorkbookXml;
-        }
+        const g = try seen_targets.getOrPut(gpa, name);
+        if (g.found_existing) return error.MalformedWorkbookXml;
         sheet_parts[i] = name;
     }
 
     var records: std.ArrayListUnmanaged(Record) = .empty;
-    for (0..wb.workbook.sheets.len) |idx| {
+    for (0..sheet_count) |idx| {
         // Store failures fold like `Worksheet.ensureParsed`: memory
         // and the archive-wide budget keep their names, everything
         // else is "this sheet is not readable".
@@ -454,6 +477,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
         while (j < xml.len and !isTagBoundary(xml[j])) j += 1;
         if (j == name_start or j >= xml.len) return error.MalformedSheetXml;
         const qname = xml[name_start..j];
+        if (!validQName(qname)) return error.MalformedSheetXml;
         const te = tagEnd(xml, j) orelse return error.MalformedSheetXml;
         const attrs = xml[j..te.attrs_end];
         if (root_closed) return error.MalformedSheetXml; // a second root
@@ -654,10 +678,7 @@ const AttrScan = struct {
         while (i < s.len and s[i] != '=' and !isXmlWs(s[i])) i += 1;
         if (i == name_start) return error.MalformedSheetXml;
         const name = s[name_start..i];
-        if (!isXmlNameStart(name[0])) return error.MalformedSheetXml;
-        for (name[1..]) |c| {
-            if (!isXmlNameChar(c)) return error.MalformedSheetXml;
-        }
+        if (!validQName(name)) return error.MalformedSheetXml;
         while (i < s.len and isXmlWs(s[i])) i += 1;
         if (i >= s.len or s[i] != '=') return error.MalformedSheetXml;
         i += 1;
@@ -677,11 +698,36 @@ const AttrScan = struct {
 };
 
 fn isXmlNameStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == ':' or c >= 0x80;
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c >= 0x80;
 }
 
 fn isXmlNameChar(c: u8) bool {
     return isXmlNameStart(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
+}
+
+/// A QName: an NCName, or NCName `:` NCName — at most one colon,
+/// neither side empty, each side starting with a NameStart character.
+/// `xmlns:=` (an empty prefix) and `:id` (an empty first half) are
+/// malformed namespace XML that slipped a colon-agnostic NameChar
+/// check and reopened the relationship-identity boundary (Codex #215
+/// r8 SEC-801).
+fn validQName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, name, ':')) |c| {
+        if (c == 0 or c == name.len - 1) return false;
+        if (std.mem.indexOfScalarPos(u8, name, c + 1, ':') != null) return false;
+        return validNcName(name[0..c]) and validNcName(name[c + 1 ..]);
+    }
+    return validNcName(name);
+}
+
+fn validNcName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isXmlNameStart(name[0])) return false;
+    for (name[1..]) |c| {
+        if (!isXmlNameChar(c)) return false;
+    }
+    return true;
 }
 
 /// Look up `key` on a rule-machinery tag while refusing a duplicate
@@ -723,45 +769,24 @@ fn digitU32(raw: ?[]const u8) ?u32 {
 /// relationship-type namespace root by `drawings.relTypeIs`.
 const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
 
-/// Find a relationship by its `r:id` attribute value. The store's
-/// `Relationship.id` is entity-decoded, so the XML-semantic id is the
-/// DECODED spelling — a rid that carries `&` is decoded FIRST and
-/// compared only in that form (a raw-first compare matched
-/// `r:id="r&amp;d"` against a relationship whose decoded id was
-/// literally `r&amp;d`, i.e. a different XML id — Codex #215 r5
-/// REL-503); the decode is the strict one, so a rid whose reference
-/// does not decode refuses rather than resolving to nothing quietly.
-fn relById(a: Allocator, rels: []const store_mod.Relationship, raw_rid: []const u8) Error!?store_mod.Relationship {
-    if (raw_rid.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, raw_rid, '&') != null) {
-        const decoded = formula_mod.decode.decodeEntities(a, raw_rid) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.MalformedWorkbookXml,
-        };
-        defer a.free(decoded);
-        if (decoded.len == 0) return null;
-        for (rels) |rel| {
-            if (std.mem.eql(u8, rel.id, decoded)) return rel;
-        }
-        return null;
-    }
-    for (rels) |rel| {
-        if (std.mem.eql(u8, rel.id, raw_rid)) return rel;
-    }
-    return null;
-}
+/// One sheet identity as the STRICT workbook read established it.
+/// Slices borrow the workbook part's bytes (stable — the store caches
+/// parts).
+const StrictSheet = struct { name: []const u8, rid: []const u8 };
 
-/// SEC-502 verifier: walk `xl/workbook.xml` with the sheet-part
-/// walker's discipline (DOCTYPE refusal, decoded namespace bindings,
-/// depth + namespace classification) and require the lenient
-/// projection (`WorkbookXml.sheets`) to match it entry for entry. A
+/// The AUTHORITATIVE sheet inventory: walk `xl/workbook.xml` with the
+/// sheet-part walker's discipline (DOCTYPE refusal, decoded namespace
+/// bindings, depth + namespace classification, QName grammar). A
 /// `<sheet>` is an entry only as a main-namespace direct child of the
 /// ONE main-namespace `<sheets>` child of the root; every entry must
-/// carry the schema's required `name`, `sheetId` and `r:id`; and the
-/// strict sequence's (name, r:id) pairs must equal the projection's.
-/// A ghost under `<extLst>` is not an entry, a real entry the lenient
-/// scan dropped is a count mismatch — both refuse.
-fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workbook_xml.Sheet) Error!void {
+/// carry the schema's required `name` and `sheetId` plus exactly one
+/// id reference under a ROOT-declared relationships prefix. A ghost
+/// under `<extLst>` is not an entry (SEC-502); a carrier-less real
+/// entry refuses; and a standards-valid alternate prefix (`q:id`
+/// under `xmlns:q="…relationships"`) IS an entry — sheet identities
+/// come from this read, not from the lenient projection that only
+/// spells `r:id` (Codex #215 r8 REL-801).
+fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet)) Error!void {
     const Kind = enum { root, sheets_wrap, other };
     const Frame = struct { name: []const u8, kind: Kind, main_default: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
@@ -779,7 +804,6 @@ fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workboo
     var root_seen = false;
     var root_closed = false;
     var wraps_seen: usize = 0;
-    var entry_idx: usize = 0;
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, xml, i, '<')) |lt| {
         if (lt + 1 < xml.len and xml[lt + 1] == '!') {
@@ -815,6 +839,7 @@ fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workboo
         while (j < xml.len and !isTagBoundary(xml[j])) j += 1;
         if (j == name_start or j >= xml.len) return error.MalformedWorkbookXml;
         const qname = xml[name_start..j];
+        if (!validQName(qname)) return error.MalformedWorkbookXml;
         const te = tagEnd(xml, j) orelse return error.MalformedWorkbookXml;
         const attrs = xml[j..te.attrs_end];
         if (root_closed) return error.MalformedWorkbookXml;
@@ -915,10 +940,7 @@ fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workboo
                     }
                 }
                 const rid = rid_attr orelse return error.MalformedWorkbookXml;
-                if (entry_idx >= sheets.len) return error.MalformedWorkbookXml;
-                if (!std.mem.eql(u8, name_attr, sheets[entry_idx].name)) return error.MalformedWorkbookXml;
-                if (!std.mem.eql(u8, rid, sheets[entry_idx].r_id)) return error.MalformedWorkbookXml;
-                entry_idx += 1;
+                try out.append(gpa, .{ .name = name_attr, .rid = rid });
             }
         }
 
@@ -930,11 +952,10 @@ fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workboo
     }
     if (!root_seen) return error.MalformedWorkbookXml;
     if (frames.items.len != 0) return error.MalformedWorkbookXml;
-    // Exactly one <sheets> wrapper — zero would let a sheetless
-    // workbook read as an empty success against the projection it
-    // never verified (Codex #215 r6 REL-602).
+    // Exactly one <sheets> wrapper — zero would make a sheetless
+    // workbook an empty success with no inventory ever established
+    // (Codex #215 r6 REL-602).
     if (wraps_seen != 1) return error.MalformedWorkbookXml;
-    if (entry_idx != sheets.len) return error.MalformedWorkbookXml;
 }
 
 /// `uniqueAttr` with the workbook part's error name. `wbAttr` also
@@ -956,9 +977,12 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
     const Frame = struct { name: []const u8, kind: Kind, pkg_default: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(gpa);
-    var ids: std.ArrayListUnmanaged([]u8) = .empty;
+    // Hashed — the linear seen-scan was quadratic in the relationship
+    // count (Codex #215 r8 PERF-801). Keys are owned decoded ids.
+    var ids: std.StringHashMapUnmanaged(void) = .empty;
     defer {
-        for (ids.items) |id| gpa.free(id);
+        var key_it = ids.keyIterator();
+        while (key_it.next()) |k| gpa.free(k.*);
         ids.deinit(gpa);
     }
 
@@ -1000,6 +1024,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
         while (j < xml.len and !isTagBoundary(xml[j])) j += 1;
         if (j == name_start or j >= xml.len) return error.MalformedWorkbookXml;
         const qname = xml[name_start..j];
+        if (!validQName(qname)) return error.MalformedWorkbookXml;
         const te = tagEnd(xml, j) orelse return error.MalformedWorkbookXml;
         const attrs = xml[j..te.attrs_end];
         if (root_closed) return error.MalformedWorkbookXml;
@@ -1094,12 +1119,10 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 else => return error.MalformedWorkbookXml,
             };
             errdefer gpa.free(id);
-            for (ids.items) |seen| {
-                if (std.mem.eql(u8, seen, id)) return error.MalformedWorkbookXml;
-            }
             if (!std.mem.eql(u8, id, rels[entry_idx].id)) return error.MalformedWorkbookXml;
+            const g = try ids.getOrPut(gpa, id);
+            if (g.found_existing) return error.MalformedWorkbookXml;
             entry_idx += 1;
-            try ids.append(gpa, id);
         }
 
         if (!te.self_closing) {
@@ -1591,27 +1614,84 @@ test "collect: the relationship graph verifies strictly (SEC-601, REL-602)" {
     }
 }
 
-test "collect: the workbook sheet list verifies against a strict read (SEC-502)" {
+test "collect: sheet identities come from the strict workbook read (SEC-502, REL-801)" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
 
-    const cases = [_]struct { name: []const u8, old: []const u8, new: []const u8 }{
-        // A foreign-slot <sheet> decoy under extLst must not mint an
-        // identity: the lenient projection counts it lexically, the
-        // strict read does not — mismatch refuses.
-        .{ .name = "w1.xlsx", .old = "</workbook>", .new = "<extLst><sheet name=\"Ghost\" sheetId=\"9\" r:id=\"rId1\"/></extLst></workbook>" },
-        // A real entry missing a required carrier refuses instead of
-        // silently vanishing from the projection.
-        .{ .name = "w2.xlsx", .old = " name=\"Report\"", .new = "" },
-    };
-    for (cases) |case| {
-        const path = try tt.path(testing.allocator, io, case.name);
+    // A foreign-slot <sheet> decoy under extLst is NOT an identity —
+    // the strict read excludes it, and the stream stays exactly the
+    // real sheets' records.
+    {
+        const path = try tt.path(testing.allocator, io, "w1.xlsx");
         defer testing.allocator.free(path);
         try fixture.write(testing.allocator, io, path);
-        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", case.old, case.new);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "</workbook>", "<extLst><sheet name=\"Ghost\" sheetId=\"9\" r:id=\"rId1\"/></extLst></workbook>");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqual(@as(usize, 2), view.sheet_names.len);
+        try testing.expectEqual(@as(usize, 5), view.records.len);
+        for (view.sheet_names) |n| try testing.expect(!std.mem.eql(u8, n, "Ghost"));
+    }
+    // A real entry missing a required carrier refuses instead of
+    // silently vanishing.
+    {
+        const path = try tt.path(testing.allocator, io, "w2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", " name=\"Report\"", "");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    }
+    // A standards-valid ALTERNATE relationships prefix is an identity
+    // (REL-801) — the strict read is authoritative, not the lenient
+    // projection's literal `r:id` spelling.
+    {
+        const path = try tt.path(testing.allocator, io, "w3.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"", "xmlns:q=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"");
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "r:id=\"rId1\"", "q:id=\"rId1\"");
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "r:id=\"rId2\"", "q:id=\"rId2\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqual(@as(usize, 5), view.records.len);
+        try testing.expectEqualStrings("Report", view.records[4].sheet);
+    }
+}
+
+test "collect: malformed namespace prefixes cannot slip the identity gate (SEC-801)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    // An EMPTY prefix (`xmlns:=` + `:id`) is malformed namespace XML,
+    // not a relationships binding.
+    {
+        const path = try tt.path(testing.allocator, io, "q1.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"", "xmlns:=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"");
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "r:id=\"rId1\"", ":id=\"rId1\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    }
+    // A multi-colon declaration name is not a QName.
+    {
+        const path = try tt.path(testing.allocator, io, "q2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "<workbook ", "<workbook xmlns:a:b=\"urn:x\" ");
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
         try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
