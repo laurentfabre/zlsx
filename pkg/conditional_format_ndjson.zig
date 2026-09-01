@@ -416,6 +416,10 @@ fn xmlCharsValid(s: []const u8) bool {
 const max_depth = 1024;
 
 fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(RawRule)) Error!RootKind {
+    // The whole part must be UTF-8 before any byte-level scan — a
+    // stray invalid byte inside a NAME otherwise turned an element
+    // opaque instead of refusing (Codex #215 r10 SEC-1001).
+    if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedSheetXml;
     const Kind = enum { root, barren_root, cf_block, cf_rule, other };
     const Frame = struct {
         name: []const u8,
@@ -705,20 +709,11 @@ const AttrScan = struct {
     }
 };
 
-fn isXmlNameStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c >= 0x80;
-}
-
-fn isXmlNameChar(c: u8) bool {
-    return isXmlNameStart(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
-}
-
 /// A QName: an NCName, or NCName `:` NCName — at most one colon,
-/// neither side empty, each side starting with a NameStart character.
-/// `xmlns:=` (an empty prefix) and `:id` (an empty first half) are
-/// malformed namespace XML that slipped a colon-agnostic NameChar
-/// check and reopened the relationship-identity boundary (Codex #215
-/// r8 SEC-801).
+/// neither side empty. `xmlns:=` (an empty prefix) and `:id` (an
+/// empty first half) are malformed namespace XML that slipped a
+/// colon-agnostic NameChar check and reopened the relationship-
+/// identity boundary (Codex #215 r8 SEC-801).
 fn validQName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (std.mem.indexOfScalar(u8, name, ':')) |c| {
@@ -729,13 +724,39 @@ fn validQName(name: []const u8) bool {
     return validNcName(name);
 }
 
+/// An NCName by XML 1.0's CODE-POINT ranges — a `>= 0x80` byte
+/// shortcut admitted `\xff` and U+00A0 in names, and a matched pair
+/// like `<conditionalFormatting\xff>` then classified as opaque and
+/// hid the rule subtree inside it (Codex #215 r10 SEC-1001).
 fn validNcName(name: []const u8) bool {
     if (name.len == 0) return false;
-    if (!isXmlNameStart(name[0])) return false;
-    for (name[1..]) |c| {
-        if (!isXmlNameChar(c)) return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    var it = std.unicode.Utf8View.initUnchecked(name).iterator();
+    var first = true;
+    while (it.nextCodepoint()) |cp| {
+        if (first) {
+            if (!ncNameStartCp(cp)) return false;
+            first = false;
+        } else if (!ncNameCharCp(cp)) {
+            return false;
+        }
     }
     return true;
+}
+
+fn ncNameStartCp(cp: u21) bool {
+    return (cp >= 'A' and cp <= 'Z') or cp == '_' or (cp >= 'a' and cp <= 'z') or
+        (cp >= 0xC0 and cp <= 0xD6) or (cp >= 0xD8 and cp <= 0xF6) or
+        (cp >= 0xF8 and cp <= 0x2FF) or (cp >= 0x370 and cp <= 0x37D) or
+        (cp >= 0x37F and cp <= 0x1FFF) or (cp >= 0x200C and cp <= 0x200D) or
+        (cp >= 0x2070 and cp <= 0x218F) or (cp >= 0x2C00 and cp <= 0x2FEF) or
+        (cp >= 0x3001 and cp <= 0xD7FF) or (cp >= 0xF900 and cp <= 0xFDCF) or
+        (cp >= 0xFDF0 and cp <= 0xFFFD) or (cp >= 0x10000 and cp <= 0xEFFFF);
+}
+
+fn ncNameCharCp(cp: u21) bool {
+    return ncNameStartCp(cp) or cp == '-' or cp == '.' or (cp >= '0' and cp <= '9') or
+        cp == 0xB7 or (cp >= 0x300 and cp <= 0x36F) or (cp >= 0x203F and cp <= 0x2040);
 }
 
 /// Look up `key` on a rule-machinery tag while refusing a duplicate
@@ -795,6 +816,7 @@ const StrictSheet = struct { name: []const u8, rid: []const u8 };
 /// come from this read, not from the lenient projection that only
 /// spells `r:id` (Codex #215 r8 REL-801).
 fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet)) Error!void {
+    if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, sheets_wrap, other };
     const Frame = struct { name: []const u8, kind: Kind, main_default: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
@@ -981,6 +1003,7 @@ fn wbAttr(attrs: []const u8, key: []const u8) ?[]const u8 {
 /// STRICTLY-DECODED ids, and the store's decoded id sequence equal to
 /// the strict one — so `relById`'s first match is THE match.
 fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.Relationship) Error!void {
+    if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, other };
     const Frame = struct { name: []const u8, kind: Kind, pkg_default: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
@@ -1673,6 +1696,29 @@ test "collect: sheet identities come from the strict workbook read (SEC-502, REL
         try testing.expectEqual(@as(usize, 5), view.records.len);
         try testing.expectEqualStrings("Report", view.records[4].sheet);
     }
+}
+
+test "scanSheetRules: names validate by XML's code points, parts by UTF-8 whole (SEC-1001)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A matched `\xff`-suffixed pair used to classify as opaque and
+    // hide the rule inside it; the whole-part UTF-8 gate refuses it.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<conditionalFormatting\xff sqref=\"Z1\"><cfRule type=\"expression\" priority=\"9\"><formula>1</formula></cfRule></conditionalFormatting\xff>" ++
+        "</worksheet>"));
+    // Valid UTF-8 but not an XML name character (U+00A0) refuses at
+    // the QName check rather than reading as an opaque element.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<conditionalFormatting\xc2\xa0 sqref=\"Z1\"><cfRule type=\"expression\" priority=\"9\"><formula>1</formula></cfRule></conditionalFormatting\xc2\xa0>" ++
+        "</worksheet>"));
+    // A valid non-ASCII NCName is an ordinary opaque element.
+    const rules = try scanRules(a, ws_open ++
+        "<donn\xc3\xa9es><x/></donn\xc3\xa9es>" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
 }
 
 test "scanSheetRules: attributes require their XML separator (SEC-901)" {

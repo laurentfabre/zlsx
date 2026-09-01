@@ -146,6 +146,15 @@ pub const SheetXml = struct {
     /// the sanitizer's lexical state; the map ends the class.
     sanitized: []const u8 = "",
     src_runs: []const SrcRun = &.{},
+    /// Identity of the source the view was parsed FROM — the pointer
+    /// and length of the bytes handed to `parse`. The DV/CF rewriter
+    /// refuses to map through a view whose source part has been
+    /// swapped underneath it (`PartStore.replacePart` dupes its
+    /// input, so pointer + length is a conservative identity gate —
+    /// Codex #215 r10 REL-1002; equality of a short formula body
+    /// alone cannot establish source identity).
+    src_ptr: usize = 0,
+    src_len: usize = 0,
     /// `<row>` elements without a usable `r` — not in `rows`, since the
     /// view has no coordinate for them (the Editor's own scanner numbers
     /// them implicitly). A reader that needs the grid whole refuses
@@ -265,6 +274,8 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
         .unaddressed_rows = unaddressed_rows,
         .sanitized = sanitized,
         .src_runs = src_runs.items,
+        .src_ptr = @intFromPtr(xml.ptr),
+        .src_len = xml.len,
         .arena = arena,
     };
 }

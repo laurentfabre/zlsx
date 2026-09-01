@@ -12154,6 +12154,15 @@ fn collectDvCfPatches(
     cf_f_new: *const std.AutoHashMapUnmanaged(usize, []u8),
 ) Error!void {
     assert(source.len > 0);
+    // The view must have been parsed from THESE bytes — a part
+    // swapped underneath a cached view (`PartStore.replacePart`
+    // dupes, so pointer + length is a conservative identity) could
+    // otherwise pass the per-span equality check by coincidence of a
+    // short repeated body and splice an unrelated location (Codex
+    // #215 r10 REL-1002).
+    if (@intFromPtr(source.ptr) != view.src_ptr or source.len != view.src_len) {
+        return error.NoSheetData;
+    }
 
     var it1 = dv_f1_new.iterator();
     while (it1.next()) |e| {
@@ -16156,6 +16165,50 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+}
+
+test "rewrite DV/CF: a part swapped under a cached view refuses the mapped splice (REL-1002)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-stale-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    // Prime the cached view, then swap the part underneath it — even
+    // with byte-identical content, the dupe is a DIFFERENT source and
+    // the mapped splice must refuse rather than trust old offsets
+    // (equality of a short formula body cannot establish identity).
+    _ = try ws.conditionalFormats();
+    const part_name = try ws.resolvePartName();
+    const part = (try wb.store.part(part_name)).?;
+    const copy = try std.testing.allocator.dupe(u8, part.bytes);
+    defer std.testing.allocator.free(copy);
+    try wb.store.replacePart(part_name, copy);
+
+    const ws_name_owned = try std.testing.allocator.dupe(u8, ws.name());
+    defer std.testing.allocator.free(ws_name_owned);
+    try std.testing.expectError(error.NoSheetData, wb.rewriteAllValidationsAndConditionalFormats(
+        .{ .insert_cols = .{ .at = 4, .count = 1 } },
+        ws_name_owned,
+    ));
 }
 
 test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync the splice (REL-501)" {
