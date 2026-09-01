@@ -150,7 +150,7 @@ pub fn collect(
     for (wb.sheets, 0..) |s, i| {
         const rel = (try relById(a, wb_rels, s.r_id)) orelse return error.MalformedWorkbookXml;
         var typed = false;
-        for (sheet_rel_leaves) |leaf| typed = typed or relLeafIs(rel.type, leaf);
+        for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
         if (!typed) return error.MalformedWorkbookXml;
         if (rel.target_mode == .external) return error.MalformedWorkbookXml;
         const name = (try store.resolve("xl/workbook.xml", rel.target)) orelse
@@ -373,14 +373,11 @@ fn relById(a: Allocator, rels: []const store_mod.Relationship, raw_rid: []const 
 }
 
 /// The sheet-family relationship types a `<sheet r:id>` may carry —
-/// the pivots walk's list (`pkg/pivots.zig`), duplicated here because
-/// this module keeps its imports to the walkers it fronts.
+/// the pivots walk's list (`pkg/pivots.zig`). Each is matched by
+/// `drawings.relTypeIs`, i.e. exactly under a known relationship-type
+/// namespace root — a foreign URI merely ENDING in `/worksheet` is
+/// not a sheet edge (Codex #214 r3 REL-303).
 const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
-
-fn relLeafIs(rel_type: []const u8, leaf: []const u8) bool {
-    const l = if (std.mem.lastIndexOfScalar(u8, rel_type, '/')) |i| rel_type[i + 1 ..] else rel_type;
-    return std.ascii.eqlIgnoreCase(l, leaf);
-}
 
 fn imageOffsetLess(images: []const drawings.ImageAnchor, lhs: usize, rhs: usize) bool {
     return images[lhs].doc_offset < images[rhs].doc_offset;
@@ -747,6 +744,14 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
         // A real, opened <c:f> that never closes silently thinned the
         // refs list (Codex #214 r2 REL-203).
         .{ .name = "a10.xlsx", .part = "xl/charts/chart1.xml", .old = "Data!$B$2:$B$4</c:f>", .new = "Data!$B$2:$B$4" },
+        // A `<xdr:extLst>` or a commented fake must not satisfy the
+        // one-cell extent validation the real element would fail
+        // (Codex #214 r3 REL-301).
+        .{ .name = "a11.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:ext cx=\"3048000\" cy=\"2286000\"/>", .new = "<xdr:extLst cx=\"1\" cy=\"1\"/>" },
+        .{ .name = "a12.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:ext cx=\"3048000\" cy=\"2286000\"/>", .new = "<!-- <xdr:ext cx=\"1\" cy=\"1\"/> -->" },
+        // A foreign relationship-type URI merely ENDING in the
+        // expected leaf is not that edge (Codex #214 r3 REL-303).
+        .{ .name = "a13.xlsx", .part = "xl/worksheets/_rels/sheet2.xml.rels", .old = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing", .new = "https://example.invalid/relationships/drawing" },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);
@@ -771,7 +776,27 @@ test "collect: an alternate relationship-namespace prefix on <drawing> still wal
     const path = try tt.path(testing.allocator, io, "anchors_rel_prefix.xlsx");
     defer testing.allocator.free(path);
     try fixture.write(testing.allocator, io, path, .image_and_chart);
-    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<drawing r:id=\"rIdD1\"/>", "<drawing rel:id=\"rIdD1\"/>");
+    // The alternate prefix is DECLARED — an unbound or foreign-bound
+    // prefix is not a relationship reference (r3 REL-302).
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<drawing r:id=\"rIdD1\"/>", "<drawing xmlns:rel=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" rel:id=\"rIdD1\"/>");
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 3), view.records.len);
+}
+
+test "collect: an extLst decoy before the real extent does not hide it (REL-301)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_ext_decoy.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<xdr:ext cx=\"3048000\" cy=\"2286000\"/>", "<xdr:extLst foo=\"1\"/><xdr:ext cx=\"3048000\" cy=\"2286000\"/>");
     const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
@@ -831,6 +856,9 @@ test "collect: a sheet list the anchors cannot be attributed against refuses who
         // Two <sheet> entries reaching one part: the same anchor would
         // ride out twice under two identities.
         .{ .name = "b2.xlsx", .old = "worksheets/sheet1.xml", .new = "worksheets/sheet2.xml" },
+        // A foreign URI ending in /worksheet is not a sheet edge
+        // (Codex #214 r3 REL-303).
+        .{ .name = "b3.xlsx", .old = "officeDocument/2006/relationships/worksheet", .new = "officeDocument/2006/relationshipsX/worksheet" },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);
