@@ -1060,8 +1060,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                 wraps_seen += 1;
                 if (wraps_seen > 1) return error.MalformedWorkbookXml;
             } else if (parent.kind == .sheets_wrap and is_main and std.mem.eql(u8, qname, "sheet")) {
-                const name_attr = (wbAttr(gpa, attrs, "name") orelse return error.MalformedWorkbookXml);
-                if (wbAttr(gpa, attrs, "sheetId") == null) return error.MalformedWorkbookXml;
+                const name_attr = ((try wbAttr(gpa, attrs, "name")) orelse return error.MalformedWorkbookXml);
+                if ((try wbAttr(gpa, attrs, "sheetId")) == null) return error.MalformedWorkbookXml;
                 // The relationship reference is an attr named
                 // `<p>:id` under a ROOT-declared relationships prefix
                 // — exactly one (SEC-601).
@@ -1107,10 +1107,15 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     if (wraps_seen != 1) return error.MalformedWorkbookXml;
 }
 
-/// `uniqueAttr` with the workbook part's error name. `wbAttr` also
-/// tolerates nothing the sheet-side tokenizer would not.
-fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) ?[]const u8 {
-    return uniqueAttr(a, attrs, key) catch null;
+/// `uniqueAttr` with the workbook part's error name: a duplicate or
+/// malformed region reads as "absent" for the caller's orelse-refusal
+/// — but OutOfMemory PROPAGATES (the allocation-failure sweep caught
+/// a `catch null` swallowing it into a spurious refusal).
+fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
+    return uniqueAttr(a, attrs, key) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 /// SEC-601 verifier, second half: the store's lexical relationship
@@ -1241,9 +1246,9 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             // counted — refuse rather than reconcile.
             const parent = frames.items[frames.items.len - 1];
             if (parent.kind != .root or !is_pkg) return error.MalformedWorkbookXml;
-            const id_raw = (wbAttr(gpa, attrs, "Id") orelse return error.MalformedWorkbookXml);
-            const type_raw = (wbAttr(gpa, attrs, "Type") orelse return error.MalformedWorkbookXml);
-            const target_raw = (wbAttr(gpa, attrs, "Target") orelse return error.MalformedWorkbookXml);
+            const id_raw = ((try wbAttr(gpa, attrs, "Id")) orelse return error.MalformedWorkbookXml);
+            const type_raw = ((try wbAttr(gpa, attrs, "Type")) orelse return error.MalformedWorkbookXml);
+            const target_raw = ((try wbAttr(gpa, attrs, "Target")) orelse return error.MalformedWorkbookXml);
             if (entry_idx >= rels.len) return error.MalformedWorkbookXml;
             // `Type` and `Target` verify by the STRICT decode too and
             // must equal what the lenient store cached — its wider
@@ -1267,7 +1272,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 if (!std.mem.eql(u8, target_dec, rels[entry_idx].target)) return error.MalformedWorkbookXml;
             }
             const cached_external = rels[entry_idx].target_mode == .external;
-            if (uniqueAttr(gpa, attrs, "TargetMode") catch null) |mode| {
+            if (try wbAttr(gpa, attrs, "TargetMode")) |mode| {
                 if (std.mem.eql(u8, mode, "External")) {
                     if (!cached_external) return error.MalformedWorkbookXml;
                 } else if (std.mem.eql(u8, mode, "Internal")) {
