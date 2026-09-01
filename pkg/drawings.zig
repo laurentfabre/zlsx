@@ -662,10 +662,16 @@ fn extractSeriesRefs(
     // must not add a ref (Codex #214 r2 REL-203, r5 REL-502). The
     // region-skipping inside the live search is forward-only, so a
     // document stuffed with fakes costs linear work (r3 PERF-301).
+    // Candidates are CACHED per prefix and refreshed only once the
+    // scan passes them: without this, an enabled-but-unused alternate
+    // prefix rescans its entire remaining suffix for every primary
+    // carrier — Θ(n²) on dense charts (Codex #214 r6 PERF-602).
     var i: usize = 0;
+    var p = nextCarrierOpen(xml, 0, primary_open);
+    var a = if (alt_open) |o| nextCarrierOpen(xml, 0, o) else null;
     while (true) {
-        const p = nextCarrierOpen(xml, i, primary_open);
-        const a = if (alt_open) |o| nextCarrierOpen(xml, i, o) else null;
+        if (p != null and p.?.at < i) p = nextCarrierOpen(xml, i, primary_open);
+        if (a != null and a.?.at < i) a = nextCarrierOpen(xml, i, alt_open.?);
         const use_primary = if (p != null and a != null)
             p.?.at <= a.?.at
         else
@@ -1127,9 +1133,11 @@ fn findBlipEmbedWithAlt(
 fn tryBlipEmbedAt(pic_xml: []const u8, buf: []u8, prefix: []const u8) ?[]const u8 {
     const blip_open = std.fmt.bufPrint(buf, "<{s}:blip", .{prefix}) catch return null;
     var search_at: usize = 0;
-    // Live matches only — a commented blip is text, not an image
-    // reference (Codex #214 r5 REL-501).
-    while (findLiveMarkup(pic_xml, search_at, blip_open)) |blip| {
+    // Live, QName-exact matches only — a commented blip is text (r5
+    // REL-501), and a `<a:blipExtension r:embed=…>` is not a blip
+    // (Codex #214 r6 REL-601). `<a:blipFill>` fails the terminator
+    // and the loop walks on to the real `<a:blip>` inside it.
+    while (findLiveExactTag(pic_xml, search_at, blip_open)) |blip| {
         const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
         if (attrValue(pic_xml[blip .. blip_end + 1], "r:embed")) |rid| return rid;
         search_at = blip_end + 1;
@@ -2603,6 +2611,27 @@ test "relTypeIs: exact known roots only; extractSeriesRefs stays linear under co
     try std.testing.expectEqual(@as(usize, 2), refs.len);
     try std.testing.expectEqualStrings("Real!A1", refs[0]);
     try std.testing.expectEqualStrings("Real!B1", refs[1]);
+
+    // PERF-602: dense primary carriers with an ENABLED but unused
+    // alternate prefix — the cached-candidate scan must not rescan
+    // the alternate's whole suffix per carrier (the shape that did
+    // would grind here in Debug long before failing).
+    var dense: std.ArrayListUnmanaged(u8) = .empty;
+    defer dense.deinit(std.testing.allocator);
+    try dense.appendSlice(std.testing.allocator, "<c:chartSpace>");
+    for (0..1500) |_| try dense.appendSlice(std.testing.allocator, "<c:f>R!A1</c:f>");
+    try dense.appendSlice(std.testing.allocator, "</c:chartSpace>");
+    const dense_refs = try extractSeriesRefs(std.testing.allocator, dense.items, "c", "c2", .strict);
+    defer std.testing.allocator.free(dense_refs);
+    try std.testing.expectEqual(@as(usize, 1500), dense_refs.len);
+    // The symmetric alternate-only case still flattens in order.
+    const alt_only = "<c:chartSpace><c2:f>Alt!A1</c2:f><c:f>Pri!A1</c:f><c2:f>Alt!B1</c2:f></c:chartSpace>";
+    const mixed = try extractSeriesRefs(std.testing.allocator, alt_only, "c", "c2", .strict);
+    defer std.testing.allocator.free(mixed);
+    try std.testing.expectEqual(@as(usize, 3), mixed.len);
+    try std.testing.expectEqualStrings("Alt!A1", mixed[0]);
+    try std.testing.expectEqualStrings("Pri!A1", mixed[1]);
+    try std.testing.expectEqualStrings("Alt!B1", mixed[2]);
 }
 
 test "parseCellAnchor unit test" {

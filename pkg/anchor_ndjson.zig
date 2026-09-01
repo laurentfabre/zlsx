@@ -756,6 +756,10 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
         // live one refuses rather than thinning (Codex #214 r4
         // REL-403).
         .{ .name = "a14.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "<drawing r:id=\"rIdD1\"/>", .new = "<drawing r:id=\"rIdD1\"/><drawing r:id=\"rIdD1\"/>" },
+        // A `<a:blipExtension r:embed=…>` is not a blip: the pic has
+        // no readable image reference, which strict refuses (Codex
+        // #214 r6 REL-601).
+        .{ .name = "a15.xlsx", .part = "xl/drawings/drawing2.xml", .old = "<a:blip r:embed=\"rIdI1\"/>", .new = "<a:blipExtension r:embed=\"rIdI1\"/>" },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);
@@ -896,6 +900,25 @@ test "walkers: duplicate drawing element — strict refuses, lenient follows the
         testing.allocator.free(charts);
     }
     try testing.expectEqual(@as(usize, 1), charts.len);
+}
+
+test "walkers: a blipExtension is not a blip — lenient emits no fabricated image (REL-601)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_blip_ext.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing2.xml", "<a:blip r:embed=\"rIdI1\"/>", "<a:blipExtension r:embed=\"rIdI1\"/>");
+    var store = try PartStore.open(testing.allocator, io, path);
+    defer store.deinit();
+    const images = try drawings.imageAnchorsIn(&store, testing.allocator, .lenient);
+    defer testing.allocator.free(images);
+    // Only Report's image survives — Data's pic has no real blip.
+    try testing.expectEqual(@as(usize, 1), images.len);
+    try testing.expectEqualStrings("xl/worksheets/sheet2.xml", images[0].sheet_part_name);
 }
 
 test "collect: comment-shaped plot types and carriers do not pollute chart metadata (REL-203)" {
