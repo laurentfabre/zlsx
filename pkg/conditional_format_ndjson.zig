@@ -334,11 +334,15 @@ fn isPkgRelsNs(uri: []const u8) bool {
 }
 
 fn bindsNs(scratch: Allocator, raw: []const u8, comptime pred: fn ([]const u8) bool) Error!bool {
-    // A binding that is not UTF-8 is not one the walk can rule out
-    // either — `xmlns="\xff"` read as bound-to-foreign and the block
-    // went opaque (Codex #215 r5 SEC-501).
+    // A binding that is not UTF-8, or that holds characters XML 1.0
+    // forbids outright (`&#0;`, a literal C0 control, U+FFFE), is not
+    // one the walk can rule out — each read as bound-to-foreign and
+    // the block went opaque (Codex #215 r5 SEC-501, r7 SEC-701). The
+    // XML-Char floor applies HERE, not to formula/record carriers,
+    // whose decoded controls the JSON writer escapes.
     if (std.mem.indexOfScalar(u8, raw, '&') == null) {
         if (!std.unicode.utf8ValidateSlice(raw)) return error.MalformedSheetXml;
+        if (!xmlCharsValid(raw)) return error.MalformedSheetXml;
         return pred(raw);
     }
     const decoded = formula_mod.decode.decodeEntities(scratch, raw) catch |e| switch (e) {
@@ -347,7 +351,22 @@ fn bindsNs(scratch: Allocator, raw: []const u8, comptime pred: fn ([]const u8) b
     };
     defer scratch.free(decoded);
     if (!std.unicode.utf8ValidateSlice(decoded)) return error.MalformedSheetXml;
+    if (!xmlCharsValid(decoded)) return error.MalformedSheetXml;
     return pred(decoded);
+}
+
+/// XML 1.0 `Char`: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD]
+/// | [#x10000-#x10FFFF]. The input must already be valid UTF-8.
+fn xmlCharsValid(s: []const u8) bool {
+    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const ok = cp == 0x9 or cp == 0xA or cp == 0xD or
+            (cp >= 0x20 and cp <= 0xD7FF) or
+            (cp >= 0xE000 and cp <= 0xFFFD) or
+            (cp >= 0x10000 and cp <= 0x10FFFF);
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// Walk one sheet part and collect its rules — the strict read the
@@ -448,11 +467,24 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             frames.items[frames.items.len - 1].main_default;
         {
             var it: AttrScan = .{ .rest = attrs };
-            var saw_default = false;
+            // A namespace declaration repeated on one start tag —
+            // default or prefixed, whichever value order — makes the
+            // binding ambiguous; refuse before reading either value
+            // (Codex #215 r7 SEC-703).
+            var decl_names: [16][]const u8 = undefined;
+            var decl_n: usize = 0;
             while (try it.next()) |attr| {
+                const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
+                    std.mem.startsWith(u8, attr.name, "xmlns:");
+                if (is_decl) {
+                    for (decl_names[0..decl_n]) |d| {
+                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedSheetXml;
+                    }
+                    if (decl_n >= decl_names.len) return error.MalformedSheetXml;
+                    decl_names[decl_n] = attr.name;
+                    decl_n += 1;
+                }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
-                    if (saw_default) return error.MalformedSheetXml;
-                    saw_default = true;
                     elem_main = try bindsMainNs(a, attr.value);
                 } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
                     if (try bindsMainNs(a, attr.value)) return error.MalformedSheetXml;
@@ -793,11 +825,24 @@ fn verifyWorkbookSheets(gpa: Allocator, xml: []const u8, sheets: []const workboo
             frames.items[frames.items.len - 1].main_default;
         {
             var it: AttrScan = .{ .rest = attrs };
-            var saw_default = false;
+            // Duplicate declarations refuse before either value is
+            // interpreted — a correct-then-foreign (or reverse)
+            // duplicate `xmlns:r` left the prefix collected under an
+            // ambiguous binding (Codex #215 r7 SEC-703).
+            var decl_names: [16][]const u8 = undefined;
+            var decl_n: usize = 0;
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
+                const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
+                    std.mem.startsWith(u8, attr.name, "xmlns:");
+                if (is_decl) {
+                    for (decl_names[0..decl_n]) |d| {
+                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedWorkbookXml;
+                    }
+                    if (decl_n >= decl_names.len) return error.MalformedWorkbookXml;
+                    decl_names[decl_n] = attr.name;
+                    decl_n += 1;
+                }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
-                    if (saw_default) return error.MalformedWorkbookXml;
-                    saw_default = true;
                     elem_main = bindsMainNs(gpa, attr.value) catch |e| switch (e) {
                         error.OutOfMemory => return e,
                         else => return error.MalformedWorkbookXml,
@@ -965,11 +1010,20 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             frames.items[frames.items.len - 1].pkg_default;
         {
             var it: AttrScan = .{ .rest = attrs };
-            var saw_default = false;
+            var decl_names: [16][]const u8 = undefined;
+            var decl_n: usize = 0;
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
+                const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
+                    std.mem.startsWith(u8, attr.name, "xmlns:");
+                if (is_decl) {
+                    for (decl_names[0..decl_n]) |d| {
+                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedWorkbookXml;
+                    }
+                    if (decl_n >= decl_names.len) return error.MalformedWorkbookXml;
+                    decl_names[decl_n] = attr.name;
+                    decl_n += 1;
+                }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
-                    if (saw_default) return error.MalformedWorkbookXml;
-                    saw_default = true;
                     elem_pkg = bindsNs(gpa, attr.value, isPkgRelsNs) catch |e| switch (e) {
                         error.OutOfMemory => return e,
                         else => return error.MalformedWorkbookXml,
@@ -999,12 +1053,41 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             const parent = frames.items[frames.items.len - 1];
             if (parent.kind != .root or !is_pkg) return error.MalformedWorkbookXml;
             const id_raw = (wbAttr(attrs, "Id") orelse return error.MalformedWorkbookXml);
-            if (wbAttr(attrs, "Type") == null) return error.MalformedWorkbookXml;
-            if (wbAttr(attrs, "Target") == null) return error.MalformedWorkbookXml;
+            const type_raw = (wbAttr(attrs, "Type") orelse return error.MalformedWorkbookXml);
+            const target_raw = (wbAttr(attrs, "Target") orelse return error.MalformedWorkbookXml);
+            if (entry_idx >= rels.len) return error.MalformedWorkbookXml;
+            // `Type` and `Target` verify by the STRICT decode too and
+            // must equal what the lenient store cached — its wider
+            // decoder (`&#X65;`) must not be the resolution's only
+            // reading of a carrier (Codex #215 r7 SEC-702) — and the
+            // `TargetMode` spelling must agree with the cached enum.
+            {
+                const type_dec = decodeRelText(gpa, type_raw) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => return error.MalformedWorkbookXml,
+                };
+                defer gpa.free(type_dec);
+                if (!std.mem.eql(u8, type_dec, rels[entry_idx].type)) return error.MalformedWorkbookXml;
+            }
+            {
+                const target_dec = decodeRelText(gpa, target_raw) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => return error.MalformedWorkbookXml,
+                };
+                defer gpa.free(target_dec);
+                if (!std.mem.eql(u8, target_dec, rels[entry_idx].target)) return error.MalformedWorkbookXml;
+            }
+            const cached_external = rels[entry_idx].target_mode == .external;
             if (uniqueAttr(attrs, "TargetMode") catch null) |mode| {
-                if (!std.mem.eql(u8, mode, "Internal") and !std.mem.eql(u8, mode, "External")) {
+                if (std.mem.eql(u8, mode, "External")) {
+                    if (!cached_external) return error.MalformedWorkbookXml;
+                } else if (std.mem.eql(u8, mode, "Internal")) {
+                    if (cached_external) return error.MalformedWorkbookXml;
+                } else {
                     return error.MalformedWorkbookXml;
                 }
+            } else if (cached_external) {
+                return error.MalformedWorkbookXml;
             }
             const id = decodeRelText(gpa, id_raw) catch |e| switch (e) {
                 error.OutOfMemory => return e,
@@ -1014,7 +1097,6 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             for (ids.items) |seen| {
                 if (std.mem.eql(u8, seen, id)) return error.MalformedWorkbookXml;
             }
-            if (entry_idx >= rels.len) return error.MalformedWorkbookXml;
             if (!std.mem.eql(u8, id, rels[entry_idx].id)) return error.MalformedWorkbookXml;
             entry_idx += 1;
             try ids.append(gpa, id);
@@ -1042,6 +1124,7 @@ fn decodeRelText(a: Allocator, raw: []const u8) Error![]u8 {
     };
     errdefer a.free(decoded);
     if (!std.unicode.utf8ValidateSlice(decoded)) return error.MalformedWorkbookXml;
+    if (!xmlCharsValid(decoded)) return error.MalformedWorkbookXml;
     return decoded;
 }
 
@@ -1375,6 +1458,60 @@ test "scanSheetRules: non-UTF-8 namespace bindings cannot hide rules (SEC-501)" 
     // The decoded value is held to the same floor.
     try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " ++
         "xmlns:zz=\"a&amp;\xff\"><sheetData/></worksheet>"));
+}
+
+test "scanSheetRules: XML-forbidden characters in a binding cannot ghost rules (SEC-701)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `&#0;` decodes, `&#7;` decodes, a literal C0 byte and U+FFFE
+    // are valid UTF-8 — but none is an XML 1.0 Char, so none is a
+    // binding the walk can rule out.
+    const bindings = [_][]const u8{ "&#0;", "&#7;", "\x01", "\xEF\xBF\xBE" };
+    inline for (bindings) |b| {
+        try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+            "<conditionalFormatting xmlns=\"" ++ b ++ "\" sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+            "</worksheet>"));
+    }
+}
+
+test "collect: lenient Type/Target decoding and duplicate declarations verify strictly (SEC-702/703)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const rels = "xl/_rels/workbook.xml.rels";
+    const rel_ns = "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"";
+    const cases = [_]struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 }{
+        // The store's wider decoder reads `&#X65;`; the strict one
+        // refuses — the resolution must not rest on the lenient
+        // reading of a Type or Target carrier (SEC-702).
+        .{ .name = "x1.xlsx", .part = rels, .old = "relationships/worksheet\" Target=\"worksheets/sheet2.xml\"", .new = "relationships/worksh&#X65;et\" Target=\"worksheets/sheet2.xml\"" },
+        .{ .name = "x2.xlsx", .part = rels, .old = "Target=\"worksheets/sheet2.xml\"", .new = "Target=\"worksheets/sheet&#X32;.xml\"" },
+        // A duplicate xmlns:r — either value order — is an ambiguous
+        // binding, not an authorization (SEC-703).
+        .{ .name = "x3.xlsx", .part = "xl/workbook.xml", .old = rel_ns, .new = rel_ns ++ " xmlns:r=\"urn:foreign\"" },
+        .{ .name = "x4.xlsx", .part = "xl/workbook.xml", .old = rel_ns, .new = "xmlns:r=\"urn:foreign\" " ++ rel_ns },
+        // An XML-forbidden character reference in a sheet-part binding
+        // refuses through a real workbook too (SEC-701).
+        .{ .name = "x5.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<conditionalFormatting sqref=\"A1:A4\">", .new = "<conditionalFormatting xmlns:q=\"&#0;\" sqref=\"A1:A4\">" },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, case.part, case.old, case.new);
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        const expected: anyerror = if (std.mem.eql(u8, case.part, "xl/worksheets/sheet1.xml"))
+            error.MalformedSheetXml
+        else
+            error.MalformedWorkbookXml;
+        try std.testing.expectError(expected, collect(testing.allocator, &wb));
+    }
 }
 
 test "scanSheetRules: attribute tokens follow XML's grammar (REL-502)" {
