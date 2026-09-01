@@ -1748,3 +1748,18 @@ if _HAS_PIVOTS:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_pivots_ndjson.restype = ctypes.c_int32
+
+# S3b slice 2: the defined-names read, the pivots buffer contract.
+# Plural, the read — `_HAS_DEFINED_NAME` (singular) probes the writer's
+# add_defined_name and predates this capability.
+_HAS_DEFINED_NAMES = hasattr(lib, "zlsx_editor_defined_names_ndjson") and _HAS_BUFFER_RELEASE and _HAS_DIAG_RELEASE
+if _HAS_DEFINED_NAMES:
+    lib.zlsx_editor_defined_names_ndjson.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_defined_names_ndjson.restype = ctypes.c_int32

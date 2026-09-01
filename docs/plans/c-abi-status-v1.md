@@ -518,3 +518,50 @@ without either macro.
     step first): an allocation failure leaves the previous delta live
     and the handle closable (r6 REL-602; allocation-failure sweep in
     `pkg/workbook.zig`).
+
+## 12. S3b slice 2 — the `defined-names` read (2026-09-01)
+
+One export, the S3a pivots pattern verbatim:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_defined_names_ndjson` (+ `zlsx_buffer_release`) | `_HAS_DEFINED_NAMES` | `ZLSX_HAS_DEFINED_NAMES` |
+
+(`_HAS_DEFINED_NAME`, singular, probes the writer's
+`zlsx_writer_add_defined_name` and predates this capability.)
+
+**The bytes are the CLI's** (decision S3a-2 carried over): the S3b gate
+froze the `defined-names` record in `docs/cli.md`, and the record is
+text. The export hands over the NDJSON bytes of
+`pkg/defined_name_ndjson.zig` — the shared writer `zlsx defined-names`
+prints through — built by `c_abi.zig::definedNamesNdjsonOwned(alloc, wb)`
+over the workbook's parsed `xl/workbook.xml` view: every name, document
+order, no selector (the CLI's default stream). A workbook without
+defined names is `ZLSX_OK` with `(NULL, 0)`; release with
+`zlsx_buffer_release`. The allocating writer's `WriteFailed` crosses as
+`-3`, the pivots builder's rule. Python parses one JSON object per line
+(`Editor.defined_names()` / `zlsx.defined_names(path)`).
+
+**One refusal, already in the vocabulary**: an inventory the read cannot
+serve faithfully — a carrier that does not decode, malformed UTF-8
+after decode, a body carrying embedded markup (the `docs/cli.md`
+contract) — is `MalformedWorkbookXml`, `-2`, a member of
+`structural_refusals` since S3a. No new name crosses.
+
+**Timing, simpler than pivots**: defined names live in `xl/workbook.xml`
+only, and the editor re-parses that view after every structural edit
+(`refreshWorkbookXmlView`), so edits *and* the name sweeps they carry (a
+sheet rename rewriting the bodies) are visible immediately; staged cell
+writes never touch the part, so nothing about this read waits for save.
+
+**Tests** (`src/c_abi.zig`, "S3b …"): the buffer equal to the shared
+writer's frozen record over a fixture built through the C writer surface
+(workbook scope, sheet scope, hidden); the rename-sweep rewrite visible
+with no save; `(NULL, 0)` on a workbook without names with the poison
+reset; `NullOutPointer` / `InvalidInput` as call errors; poisoned
+outputs reset on the refusal and undersized-diag paths, the rejected
+diag byte-for-byte untouched; `-2` `MalformedWorkbookXml` on a bad
+entity with nothing handed out and the name in diag + errbuf; an
+allocation-failure sweep over `definedNamesNdjsonOwned`. The smoke gate
+takes the address and `#error`s without the macro; the Python leg pins
+the parsed records, the refusal type and the closed-editor error.

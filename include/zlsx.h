@@ -1853,9 +1853,27 @@ int32_t zlsx_editor_pivots_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* The S3b `defined-names` records — one {"kind":"defined_name",…} line
+ * per <definedName> of xl/workbook.xml, in document order — as a
+ * library-allocated UTF-8 buffer, byte-for-byte what
+ * `zlsx defined-names <file>` prints with no selector (docs/cli.md,
+ * "defined-names"). `body` is the formula text as authored — nothing
+ * resolved or rewritten. Read over the editor's current workbook
+ * state: structural edits and the name sweeps they carry (a sheet
+ * rename rewriting the bodies) are visible immediately. A workbook
+ * without defined names is ZLSX_OK with (*out, *out_len) = (NULL, 0).
+ * An inventory that cannot be served faithfully — a carrier that does
+ * not decode, malformed UTF-8, a body with embedded markup — refuses
+ * whole (ZLSX_REFUSED, MalformedWorkbookXml) rather than hand over a
+ * record that lies. Release with zlsx_buffer_release. */
+int32_t zlsx_editor_defined_names_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
+#define ZLSX_HAS_DEFINED_NAMES    1   /* editor defined_names_ndjson (the read; the writer's add_defined_name predates the macros) */
 
 
 #ifdef __cplusplus

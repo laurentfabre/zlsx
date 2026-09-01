@@ -44,6 +44,9 @@
 #if !defined(ZLSX_HAS_PIVOTS)
 #error "ZLSX_HAS_PIVOTS missing"
 #endif
+#if !defined(ZLSX_HAS_DEFINED_NAMES)
+#error "ZLSX_HAS_DEFINED_NAMES missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -92,6 +95,8 @@ static const void *const s3a_exports[] = {
     (const void *)&zlsx_editor_delete_sheet,
     (const void *)&zlsx_editor_rename_table_column,
     (const void *)&zlsx_editor_pivots_ndjson,
+    /* S3b slice 2: the defined-names read rides the S3a gate. */
+    (const void *)&zlsx_editor_defined_names_ndjson,
 };
 
 const void *zlsx_c_abi_smoke_anchor_m9a2(void);
