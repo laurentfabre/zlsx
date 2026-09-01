@@ -66,6 +66,12 @@ const Subcommand = enum {
     /// Package-layer route like `pivots`; no sheet dimension, so it
     /// joins `meta`'s workbook-scoped flag tolerance.
     doc_props,
+    /// S3b slice 4: drawing anchors — one record per anchored image or
+    /// chart across the selected sheets (`pkg/anchor_ndjson.zig` over
+    /// `zlsx_pkg.imageAnchors` + `zlsx_pkg.chartAnchors`).
+    /// Package-layer route like `pivots`: the walkers read drawing
+    /// parts the reader-only Book has no view of.
+    anchors,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
@@ -332,6 +338,7 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "merges")) return .merges;
         if (std.mem.eql(u8, a, "defined-names")) return .defined_names;
         if (std.mem.eql(u8, a, "doc-props")) return .doc_props;
+        if (std.mem.eql(u8, a, "anchors")) return .anchors;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -446,7 +453,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         // wrapper-friendliness.
         .doc_props,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .anchors, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -685,6 +692,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "merges") or
                     std.mem.eql(u8, a, "defined-names") or
                     std.mem.eql(u8, a, "doc-props") or
+                    std.mem.eql(u8, a, "anchors") or
                     std.mem.eql(u8, a, "append-rows") or
                     std.mem.eql(u8, a, "set-cell") or
                     std.mem.eql(u8, a, "insert-row") or
@@ -713,7 +721,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -725,7 +733,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -757,7 +765,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -766,7 +774,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -861,8 +869,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\  recalc            recalculate every formula cell into --out
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0; on
-        \\                    pivots every host sheet, on merges every
-        \\                    sheet, on defined-names every name)
+        \\                    pivots every host sheet, on merges and
+        \\                    anchors every sheet, on defined-names
+        \\                    every name)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
@@ -891,8 +900,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
         \\                    hyperlinks / pivots / merges / defined-names /
-        \\                    styles / sst. Ignored by meta, list-sheets and
-        \\                    doc-props (a single-record report).
+        \\                    anchors / styles / sst. Ignored by meta,
+        \\                    list-sheets and doc-props (a single-record
+        \\                    report).
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
         \\  --start-row R     (iter59b) 1-based OOXML row; drop records
@@ -901,7 +911,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
         \\                    / pivots / merges / defined-names / doc-props
-        \\                    / meta / list-sheets / styles / sst.
+        \\                    / anchors / meta / list-sheets / styles / sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -956,7 +966,7 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     `sheet`/`sheet_idx`. Applies to
         \\                                     cells / rows / comments /
         \\                                     validations / hyperlinks / pivots
-        \\                                     / merges.
+        \\                                     / merges / anchors.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
@@ -1072,6 +1082,22 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     A workbook with no docProps parts is a
         \\                     record of nulls. Workbook-scoped: sheet
         \\                     selectors are tolerated and ignored.
+        \\  anchors            one NDJSON record per anchored image or
+        \\                     chart across every sheet (S3b) — images
+        \\                     before charts within a sheet:
+        \\                     {"kind":"image_anchor","sheet":"S","sheet_idx":0,
+        \\                      "part":"xl/media/image1.png","anchor":"two_cell",
+        \\                      "from":{"row":3,"col":2,"row_off":0,"col_off":9525},
+        \\                      "to":{…},"absolute":null,"bytes":4096}
+        \\                     {"kind":"chart_anchor",…,"part":"xl/charts/chart1.xml",
+        \\                      "anchor":"one_cell","from":{…},"to":null,
+        \\                      "absolute":null,"chart_type":"bar",
+        \\                      "series_refs":["Data!$B$2:$B$4"]}
+        \\                     anchor ∈ {"two_cell","one_cell","absolute"};
+        \\                     rows/cols 1-based, offsets in EMUs verbatim;
+        \\                     absolute anchors carry {"x","y","cx","cy"}
+        \\                     and null from/to. The payload stays in the
+        \\                     archive — "bytes" is the image part's size.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
         \\                     row arrays from stdin (one JSON array per
@@ -2053,6 +2079,9 @@ fn runMain(init: std.process.Init) !u8 {
         // S3b slice 3: document properties live in docProps/*.xml,
         // which only the package layer holds — same pre-Book dispatch.
         .doc_props => if (!args.list_sheets) return try runDocPropsCommand(alloc, proc_io, args, out, err),
+        // S3b slice 4: drawing anchors — the walkers read drawing parts
+        // the reader-only Book has no view of; same pre-Book dispatch.
+        .anchors => if (!args.list_sheets) return try runAnchorsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2168,6 +2197,7 @@ fn runMain(init: std.process.Init) !u8 {
         .pivots,
         .defined_names,
         .doc_props,
+        .anchors,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2227,6 +2257,7 @@ fn runMain(init: std.process.Init) !u8 {
         .merges,
         .defined_names,
         .doc_props,
+        .anchors,
         => unreachable,
     }
     return 0;
@@ -4389,6 +4420,87 @@ fn runDefinedNamesCommand(
             .emit => {},
         }
         try zlsx_pkg.defined_names_ndjson.writeName(out, d);
+    }
+    try out.flush();
+    return 0;
+}
+
+/// S3b slice 4: `zlsx anchors` — one record per anchored image or
+/// chart, images before charts within a sheet, sheets in workbook
+/// order. Routes through the package layer like `pivots`: the drawing
+/// walkers read parts the reader-only Book has no view of. Sheet
+/// selection follows the read family — `--sheet` / `--name` narrow to
+/// one host sheet, `--all-sheets` / `--sheet-glob` widen, the default
+/// streams every sheet. Contract in docs/cli.md, "anchors".
+fn runAnchorsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    var view = zlsx_pkg.anchors_ndjson.collect(alloc, &wb.store, &wb.workbook) catch |e| {
+        try err.print("zlsx: cannot read anchors in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer view.deinit();
+
+    const filter: ?usize = blk: {
+        if (args.all_sheets or args.sheet_glob != null) break :blk null;
+        if (args.sheet_index) |idx| {
+            if (idx >= view.sheet_names.len) {
+                try err.writeAll("zlsx: sheet not found\n");
+                try err.flush();
+                return 3;
+            }
+            break :blk idx;
+        }
+        if (args.sheet_name) |name| {
+            for (view.sheet_names, 0..) |s, i| {
+                if (std.mem.eql(u8, s, name)) break :blk i;
+            }
+            try err.writeAll("zlsx: sheet not found\n");
+            try err.flush();
+            return 3;
+        }
+        break :blk null;
+    };
+
+    var pg = Pagination.init(args.skip, args.take);
+    const compact = args.output == .compact_ndjson;
+    var last_prologue: ?usize = null;
+    for (view.records) |r| {
+        if (signals.shouldStop()) return 0;
+        const sheet_idx: usize = r.sheetIdx();
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, r.sheetName(), sheet_idx)) continue;
+        }
+        switch (pg.consume()) {
+            .drop => continue,
+            // Flush before the early return: runMain's deferred flush
+            // swallows errors, so a --take'd stream that relied on it
+            // would report exit 0 on a failed final write instead of
+            // the documented exit 5 (the Codex #211 r1 lesson).
+            .stop => {
+                try out.flush();
+                return 0;
+            },
+            .emit => {},
+        }
+        if (compact and (last_prologue == null or last_prologue.? != sheet_idx)) {
+            try writeCompactSheetPrologue(out, r.sheetName(), sheet_idx);
+            last_prologue = sheet_idx;
+        }
+        try zlsx_pkg.anchors_ndjson.writeRecord(out, r, if (compact) .compact else .full);
     }
     try out.flush();
     return 0;
@@ -9409,6 +9521,225 @@ test "runDefinedNamesCommand: a workbook without names is an empty stream" {
     const rc = try runDefinedNamesCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .defined_names }, &w, &err_w);
     try std.testing.expectEqual(@as(u8, 0), rc);
     try std.testing.expectEqualStrings("", w.buffered());
+}
+
+// ─── S3b slice 4: `anchors` ──────────────────────────────────────────
+
+test "parseArgs: anchors token and flag rejections" {
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.anchors, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // Anchor records are range-keyed, not row-keyed, and stream.
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx", "--output", "pretty-json" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx", "--format", "csv" };
+        try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "anchors", "f.xlsx", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+}
+
+test "runAnchorsCommand: every sheet by default, exact wire shape" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_anchors.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(std.testing.allocator, io, path, .with_absolute);
+
+    var scratch: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    const png_len = zlsx_pkg.anchors_ndjson.fixture.png_bytes.len;
+    var expected_buf: [4096]u8 = undefined;
+    // Report's chart is FIRST in its drawing's document order; the
+    // stream still puts the sheet's images first — the regrouping is
+    // the contract, not an echo of the fixture (Codex #214 r1 MNT-101).
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "{{\"kind\":\"image_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,\"part\":\"xl/media/image1.png\"," ++
+            "\"anchor\":\"two_cell\",\"from\":{{\"row\":1,\"col\":1,\"row_off\":0,\"col_off\":0}}," ++
+            "\"to\":{{\"row\":4,\"col\":3,\"row_off\":0,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
+            "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
+            "\"anchor\":\"two_cell\",\"from\":{{\"row\":3,\"col\":2,\"row_off\":0,\"col_off\":9525}}," ++
+            "\"to\":{{\"row\":8,\"col\":5,\"row_off\":19050,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
+            "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
+            "\"anchor\":\"absolute\",\"from\":null,\"to\":null," ++
+            "\"absolute\":{{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}},\"bytes\":{d}}}\n" ++
+            "{{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/charts/chart1.xml\"," ++
+            "\"anchor\":\"one_cell\",\"from\":{{\"row\":2,\"col\":6,\"row_off\":0,\"col_off\":0}},\"to\":null," ++
+            "\"absolute\":null,\"chart_type\":\"bar\"," ++
+            "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]}}\n",
+        .{ png_len, png_len, png_len },
+    );
+    try std.testing.expectEqualStrings(expected, w.buffered());
+}
+
+test "runAnchorsCommand: selection, pagination, compact prologue, exit codes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_anchors_sel.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(std.testing.allocator, io, path, .image_and_chart);
+
+    // --sheet narrows to Data: just its image, under the full envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_index = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+    }
+    // Compact across every sheet: one prologue per contributing sheet,
+    // envelope-less records after each.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .output = .compact_ndjson }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n{\"kind\":\"image_anchor\",\"part\":"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n{\"kind\":\"image_anchor\",\"part\":") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\"kind\":\"sheet\""));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet_idx\":1,\"part\"") == null);
+    }
+    // Compact + --skip past Data's record: only Report contributes, so
+    // only Report's prologue is emitted.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .output = .compact_ndjson, .skip = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\"kind\":\"sheet\""));
+    }
+    // --skip / --take page GLOBALLY across the sheet boundary: skip
+    // Data's image, take Report's image + chart.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .skip = 1, .take = 2 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Report\","));
+        try std.testing.expect(std.mem.indexOf(u8, got, "{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
+    }
+    // --sheet-glob widens by name; --skip / --take page the stream.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_glob = "Rep*", .skip = 1, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"chart_anchor\","));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+    }
+    // A glob matching zero sheets is an empty, successful stream.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_glob = "Zzz*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // Unknown sheet: exit 3, like every read sub-command.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_name = "Nope" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc);
+        const rc2 = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_index = 9 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc2);
+    }
+}
+
+test "runAnchorsCommand: a workbook without drawings is an empty stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_anchors_none.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Data");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    var scratch: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+}
+
+test "runAnchorsCommand: a series ref the stream cannot carry refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_anchors_bad_ref.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(std.testing.allocator, io, path, .image_and_chart);
+    // A bad entity in one `<c:f>` body: the whole command refuses —
+    // a partial anchor inventory is the shape of a guard hole.
+    try zlsx_pkg.pivots.fixture.patchPart(std.testing.allocator, io, path, "xl/charts/chart1.xml", "Data!$B$1", "Data!$B$1&bogus;");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedDrawingXml") != null);
 }
 
 // ─── S3b slice 3: `doc-props` ────────────────────────────────────────

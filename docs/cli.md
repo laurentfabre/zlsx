@@ -43,6 +43,7 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx merges <file>` | `"merge"` | `sheet, sheet_idx, range, start_row, start_col, end_row, end_col` — 1-based, corners inclusive |
 | `zlsx defined-names <file>` | `"defined_name"` | `name, scope, sheet, sheet_idx, body, hidden` — [contract](#defined-names--the-workbook-name-inventory) |
 | `zlsx doc-props <file>` | `"doc_props"` | one record: `creator, last_modified_by, title, subject, description, keywords, category, created, modified, revision, company, manager, application, hyperlink_base, has_custom_properties` — [contract](#doc-props--the-document-properties-report) |
+| `zlsx anchors <file>` | `"image_anchor"`, `"chart_anchor"` | `sheet, sheet_idx, part, anchor, from{}, to{}, absolute{}`, then `bytes` (images) or `chart_type, series_refs[]` (charts) — [contract](#anchors--anchored-images-and-charts) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
@@ -219,6 +220,73 @@ single-record report. The identifying subset of this report is what
 `scrub-metadata` removes by default — `application`, `created`,
 `modified` and `revision` are deliberately preserved by its default
 mask (its contract, not this one).
+
+#### `anchors` — anchored images and charts
+
+`zlsx anchors <file>` (S3b) emits one record per anchored image
+(`"image_anchor"`) and per anchored chart (`"chart_anchor"`): sheets in
+workbook order, a sheet's images before its charts, each class in
+drawing-document order. The view is `zlsx_pkg.imageAnchors` +
+`zlsx_pkg.chartAnchors` attributed to workbook sheets — the walkers key
+anchors by worksheet *part*, the command resolves each part back to the
+`<sheets>` entry that owns it so every record carries the read family's
+`sheet` / `sheet_idx` envelope. The payloads stay in the archive: an
+image record reports the part's decompressed size (`bytes`), a chart
+record its detected type and formula refs — `zlsx-extract-images` or
+`zlsx_pkg.PartStore` fetch the bytes by `part`.
+
+```jsonl
+{"kind":"image_anchor","sheet":"Report","sheet_idx":1,"part":"xl/media/image1.png","anchor":"two_cell","from":{"row":3,"col":2,"row_off":0,"col_off":9525},"to":{"row":8,"col":5,"row_off":19050,"col_off":0},"absolute":null,"bytes":4096}
+{"kind":"chart_anchor","sheet":"Report","sheet_idx":1,"part":"xl/charts/chart1.xml","anchor":"one_cell","from":{"row":2,"col":6,"row_off":0,"col_off":0},"to":null,"absolute":null,"chart_type":"bar","series_refs":["Data!$B$1","Data!$A$2:$A$4","Data!$B$2:$B$4"]}
+```
+
+| Field | Meaning |
+|---|---|
+| `sheet`, `sheet_idx` | The sheet whose drawing carries the anchor. Dropped under `--output compact-ndjson` in favour of the sheet prologue. |
+| `part` | The image or chart part's archive name — the key for fetching the payload. |
+| `anchor` | `"two_cell"` (`<xdr:twoCellAnchor>`), `"one_cell"` (`<xdr:oneCellAnchor>` — sized by `<xdr:ext>`, not modelled here) or `"absolute"` (`<xdr:absoluteAnchor>` — pixel-pinned, no cell anchor). |
+| `from`, `to` | Cell-grid corners: `row` / `col` 1-based on the wire (like the `cells` / `merges` envelopes; the drawing XML itself is 0-based), `row_off` / `col_off` the EMU offsets within that cell, verbatim (1 EMU = 1/914400 inch). `to` is `null` for `one_cell`; both are `null` for `absolute`. |
+| `absolute` | `{"x","y","cx","cy"}` in EMUs, verbatim, for `"absolute"` anchors; `null` otherwise. |
+| `bytes` | Image records only: the image part's decompressed size in bytes. The payload itself is never on the wire. |
+| `chart_type` | Chart records only: the detected chart-XML element — `bar`, `line`, `pie`, `scatter`, `area`, `bubble`, `radar`, or `other` for unrecognised / compound charts. |
+| `series_refs` | Chart records only: every `<c:f>` formula ref of the chart part, entity-decoded, flattened in document order (series names, categories, values). Empty for a chart of inline literal data. |
+
+Sheet selection follows the read family — `--sheet` / `--name` narrow to
+one sheet, `--all-sheets` / `--sheet-glob` widen, the default streams
+every sheet — and `--skip` / `--take` page the merged record stream. A
+workbook without drawings is an empty, successful stream, and so is a
+drawing of shapes only (shapes are not modelled). The command routes
+through the package layer like `pivots`, so an archive the lenient
+reader tolerates but the package layer refuses is exit 2. A read the
+command cannot serve faithfully refuses whole (exit 2) rather than emit
+a record that lies or thin the inventory: an anchor on a worksheet part
+`xl/workbook.xml` does not list (the record could not carry a truthful
+`sheet`); a listed sheet the read cannot place — its relationship
+dangling, mistyped or external, its part absent from the archive, or
+two `<sheet>` entries reaching one part (the same anchor would ride
+out twice under two identities); a drawing structure the walkers
+recognise but cannot read whole — a sheet's drawing relationship, a
+pic's image relationship or a frame's chart relationship that dangles,
+is of the wrong relationship type, or names an absent part, a
+`<drawing>` element whose reference cannot be read, a second live
+`<drawing>` element on one sheet (the schema allows one), an anchor whose
+`from` / `to` / `pos` / `ext` does not parse (a `two_cell` anchor with
+an unreadable `<to>` must not ride out looking like `one_cell`, and a
+`one_cell` anchor's schema-required extent is validated even though it
+stays off the wire), an anchor block or a `<c:f>` carrier that never
+closes; a sheet name or series ref whose carrier does not decode or is
+not UTF-8, a series ref with embedded markup, a part name that is not
+UTF-8 — a partial anchor inventory is the shape of a guard hole. (The
+Zig walkers `zlsx_pkg.imageAnchors` / `zlsx_pkg.chartAnchors` keep
+their historical lenient contract — skip what does not parse, no
+crash; the CLI reads their strict variant.) Scope notes
+from the underlying walkers: namespace prefixes are resolved from the
+drawing document itself (alternate bindings to the drawing URIs are
+followed — `pkg/drawings.zig` documents the exact scope); legacy VML
+drawings (`<legacyDrawing>`) are not walked; and the walkers cover
+**worksheet** drawings only, so a chartsheet's full-sheet chart emits
+no record (chartsheets stay in the `sheet_idx` numbering — they are
+`<sheets>` entries — they just host no walkable anchors).
 
 ### Edit (load-modify-save)
 
@@ -464,10 +532,10 @@ is set.
 
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
 unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots` /
-`merges` stream every sheet; `styles` / `sst` / `meta` / `list-sheets` are
-workbook-wide, and so are `defined-names` (a sheet selector there narrows by
-a name's *scope* — see its contract above) and `doc-props` (no sheet
-dimension at all — selectors are tolerated and ignored).
+`merges` / `anchors` stream every sheet; `styles` / `sst` / `meta` /
+`list-sheets` are workbook-wide, and so are `defined-names` (a sheet selector
+there narrows by a name's *scope* — see its contract above) and `doc-props`
+(no sheet dimension at all — selectors are tolerated and ignored).
 
 **Sheet selection** — mutually exclusive:
 
@@ -509,9 +577,9 @@ dimension at all — selectors are tolerated and ignored).
 --output ndjson               # default: invariant-envelope stream
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
-                              # validations / hyperlinks / pivots / merges — a no-op
-                              # on workbook-scoped sub-commands (defined-names and
-                              # doc-props included)
+                              # validations / hyperlinks / pivots / merges / anchors —
+                              # a no-op on workbook-scoped sub-commands (defined-names
+                              # and doc-props included)
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -607,7 +675,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
