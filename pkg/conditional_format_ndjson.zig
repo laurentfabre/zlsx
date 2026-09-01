@@ -512,6 +512,8 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
     // records its watermark and pops its own declarations.
     var declared: std.ArrayListUnmanaged([]const u8) = .empty;
     defer declared.deinit(a);
+    var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer decl_seen.deinit(a);
 
     var root_seen = false;
     var root_closed = false;
@@ -596,19 +598,15 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             // A namespace declaration repeated on one start tag —
             // default or prefixed, whichever value order — makes the
             // binding ambiguous; refuse before reading either value
-            // (Codex #215 r7 SEC-703).
-            var decl_names: [16][]const u8 = undefined;
-            var decl_n: usize = 0;
+            // (Codex #215 r7 SEC-703). Hashed and uncapped — a fixed
+            // table rejected valid XML past its size (r13 REL-1301).
+            decl_seen.clearRetainingCapacity();
             while (try it.next()) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
                 if (is_decl) {
-                    for (decl_names[0..decl_n]) |d| {
-                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedSheetXml;
-                    }
-                    if (decl_n >= decl_names.len) return error.MalformedSheetXml;
-                    decl_names[decl_n] = attr.name;
-                    decl_n += 1;
+                    const g = try decl_seen.getOrPut(a, attr.name);
+                    if (g.found_existing) return error.MalformedSheetXml;
                 }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     elem_main = try bindsMainNs(a, attr.value);
@@ -657,7 +655,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             const parent = &frames.items[frames.items.len - 1];
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "conditionalFormatting")) {
                 frame.kind = .cf_block;
-                frame.sqref = (try uniqueAttr(attrs, "sqref")) orelse "";
+                frame.sqref = (try uniqueAttr(a, attrs, "sqref")) orelse "";
                 // Validate the carrier at block open: a ruleless block
                 // — self-closing or paired-empty — emits no record, so
                 // a bad sqref there escaped the per-record decode and
@@ -668,11 +666,11 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 frame.kind = .cf_rule;
                 frame.rule = .{
                     .sqref = parent.sqref,
-                    .rule_type = (try uniqueAttr(attrs, "type")) orelse "",
+                    .rule_type = (try uniqueAttr(a, attrs, "type")) orelse "",
                     .formulas = .{ "", "", "" },
                     .formula_count = 0,
-                    .dxf_id = digitU32(try uniqueAttr(attrs, "dxfId")),
-                    .priority = digitU32(try uniqueAttr(attrs, "priority")),
+                    .dxf_id = digitU32(try uniqueAttr(a, attrs, "dxfId")),
+                    .priority = digitU32(try uniqueAttr(a, attrs, "priority")),
                 };
             } else if (parent.kind == .cf_rule and is_main and std.mem.eql(u8, qname, "formula")) {
                 // Text-only, consumed atomically: the FIRST markup
@@ -684,7 +682,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 // schema puts formula text, or a formula that never
                 // closes; both refuse, as does a fourth formula (the
                 // schema's maxOccurs is 3).
-                _ = try uniqueAttr(attrs, "");
+                _ = try uniqueAttr(a, attrs, "");
                 if (parent.rule.formula_count >= 3) return error.MalformedSheetXml;
                 var body: []const u8 = "";
                 if (te.self_closing) {
@@ -868,19 +866,17 @@ fn ncNameCharCp(cp: u21) bool {
 /// Look up `key` on a rule-machinery tag while refusing a duplicate
 /// of ANY attribute name there (the S7b-4 "a name twice on one start
 /// tag" rule, scoped to the elements this read depends on). Pass an
-/// empty `key` to run the duplicate check alone.
-fn uniqueAttr(attrs: []const u8, key: []const u8) Error!?[]const u8 {
-    var names: [64][]const u8 = undefined;
-    var n: usize = 0;
+/// empty `key` to run the duplicate check alone. Hashed and uncapped
+/// — a fixed table rejected valid XML past its size (Codex #215 r13
+/// REL-1301).
+fn uniqueAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
     var found: ?[]const u8 = null;
     var it: AttrScan = .{ .rest = attrs };
     while (try it.next()) |attr| {
-        for (names[0..n]) |seen| {
-            if (std.mem.eql(u8, seen, attr.name)) return error.MalformedSheetXml;
-        }
-        if (n >= names.len) return error.MalformedSheetXml;
-        names[n] = attr.name;
-        n += 1;
+        const g = try seen.getOrPut(a, attr.name);
+        if (g.found_existing) return error.MalformedSheetXml;
         if (key.len != 0 and std.mem.eql(u8, attr.name, key)) found = attr.value;
     }
     return found;
@@ -929,6 +925,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     defer frames.deinit(gpa);
     var declared: std.ArrayListUnmanaged([]const u8) = .empty;
     defer declared.deinit(gpa);
+    var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer decl_seen.deinit(gpa);
 
     // Prefixes the ROOT binds to a relationships namespace — the only
     // spellings an entry's `r:id` may use (a literal `r:id` under a
@@ -936,8 +934,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     // Codex #215 r6 SEC-601). A relationships binding below the root,
     // or a redeclaration of a collected prefix, is outside the closed
     // form and refuses, so the root's list stays authoritative.
-    var rel_prefixes_buf: [8][]const u8 = undefined;
-    var rel_prefix_count: usize = 0;
+    var rel_prefixes: std.StringHashMapUnmanaged(void) = .empty;
+    defer rel_prefixes.deinit(gpa);
 
     var root_seen = false;
     var root_closed = false;
@@ -1006,19 +1004,15 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             // Duplicate declarations refuse before either value is
             // interpreted — a correct-then-foreign (or reverse)
             // duplicate `xmlns:r` left the prefix collected under an
-            // ambiguous binding (Codex #215 r7 SEC-703).
-            var decl_names: [16][]const u8 = undefined;
-            var decl_n: usize = 0;
+            // ambiguous binding (Codex #215 r7 SEC-703). Hashed and
+            // uncapped (r13 REL-1301).
+            decl_seen.clearRetainingCapacity();
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
                 if (is_decl) {
-                    for (decl_names[0..decl_n]) |d| {
-                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedWorkbookXml;
-                    }
-                    if (decl_n >= decl_names.len) return error.MalformedWorkbookXml;
-                    decl_names[decl_n] = attr.name;
-                    decl_n += 1;
+                    const g = try decl_seen.getOrPut(gpa, attr.name);
+                    if (g.found_existing) return error.MalformedWorkbookXml;
                 }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     elem_main = bindsMainNs(gpa, attr.value) catch |e| switch (e) {
@@ -1038,18 +1032,12 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                     };
                     if (frames.items.len == 0) {
                         if (is_rel) {
-                            for (rel_prefixes_buf[0..rel_prefix_count]) |p| {
-                                if (std.mem.eql(u8, p, prefix)) return error.MalformedWorkbookXml;
-                            }
-                            if (rel_prefix_count >= rel_prefixes_buf.len) return error.MalformedWorkbookXml;
-                            rel_prefixes_buf[rel_prefix_count] = prefix;
-                            rel_prefix_count += 1;
+                            const g = try rel_prefixes.getOrPut(gpa, prefix);
+                            if (g.found_existing) return error.MalformedWorkbookXml;
                         }
                     } else {
                         if (is_rel) return error.MalformedWorkbookXml;
-                        for (rel_prefixes_buf[0..rel_prefix_count]) |p| {
-                            if (std.mem.eql(u8, p, prefix)) return error.MalformedWorkbookXml;
-                        }
+                        if (rel_prefixes.contains(prefix)) return error.MalformedWorkbookXml;
                     }
                 }
             }
@@ -1072,8 +1060,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                 wraps_seen += 1;
                 if (wraps_seen > 1) return error.MalformedWorkbookXml;
             } else if (parent.kind == .sheets_wrap and is_main and std.mem.eql(u8, qname, "sheet")) {
-                const name_attr = (wbAttr(attrs, "name") orelse return error.MalformedWorkbookXml);
-                if (wbAttr(attrs, "sheetId") == null) return error.MalformedWorkbookXml;
+                const name_attr = (wbAttr(gpa, attrs, "name") orelse return error.MalformedWorkbookXml);
+                if (wbAttr(gpa, attrs, "sheetId") == null) return error.MalformedWorkbookXml;
                 // The relationship reference is an attr named
                 // `<p>:id` under a ROOT-declared relationships prefix
                 // — exactly one (SEC-601).
@@ -1086,11 +1074,9 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                         // under any authorized prefix (SEC-1101).
                         if (std.mem.eql(u8, attr2.name, "xmlns") or
                             std.mem.startsWith(u8, attr2.name, "xmlns:")) continue;
-                        for (rel_prefixes_buf[0..rel_prefix_count]) |p| {
-                            if (attr2.name.len == p.len + 3 and
-                                std.mem.startsWith(u8, attr2.name, p) and
-                                std.mem.eql(u8, attr2.name[p.len..], ":id"))
-                            {
+                        if (attr2.name.len > 3 and std.mem.endsWith(u8, attr2.name, ":id")) {
+                            const p = attr2.name[0 .. attr2.name.len - 3];
+                            if (rel_prefixes.contains(p)) {
                                 if (rid_attr != null) return error.MalformedWorkbookXml;
                                 rid_attr = attr2.value;
                             }
@@ -1123,8 +1109,8 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
 
 /// `uniqueAttr` with the workbook part's error name. `wbAttr` also
 /// tolerates nothing the sheet-side tokenizer would not.
-fn wbAttr(attrs: []const u8, key: []const u8) ?[]const u8 {
-    return uniqueAttr(attrs, key) catch null;
+fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) ?[]const u8 {
+    return uniqueAttr(a, attrs, key) catch null;
 }
 
 /// SEC-601 verifier, second half: the store's lexical relationship
@@ -1143,6 +1129,8 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
     defer frames.deinit(gpa);
     var declared: std.ArrayListUnmanaged([]const u8) = .empty;
     defer declared.deinit(gpa);
+    var decl_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer decl_seen.deinit(gpa);
     // Hashed — the linear seen-scan was quadratic in the relationship
     // count (Codex #215 r8 PERF-801). Keys are owned decoded ids.
     var ids: std.StringHashMapUnmanaged(void) = .empty;
@@ -1216,18 +1204,13 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             frames.items[frames.items.len - 1].pkg_default;
         {
             var it: AttrScan = .{ .rest = attrs };
-            var decl_names: [16][]const u8 = undefined;
-            var decl_n: usize = 0;
+            decl_seen.clearRetainingCapacity();
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
                 if (is_decl) {
-                    for (decl_names[0..decl_n]) |d| {
-                        if (std.mem.eql(u8, d, attr.name)) return error.MalformedWorkbookXml;
-                    }
-                    if (decl_n >= decl_names.len) return error.MalformedWorkbookXml;
-                    decl_names[decl_n] = attr.name;
-                    decl_n += 1;
+                    const g = try decl_seen.getOrPut(gpa, attr.name);
+                    if (g.found_existing) return error.MalformedWorkbookXml;
                 }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     elem_pkg = bindsNs(gpa, attr.value, isPkgRelsNs) catch |e| switch (e) {
@@ -1258,9 +1241,9 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             // counted — refuse rather than reconcile.
             const parent = frames.items[frames.items.len - 1];
             if (parent.kind != .root or !is_pkg) return error.MalformedWorkbookXml;
-            const id_raw = (wbAttr(attrs, "Id") orelse return error.MalformedWorkbookXml);
-            const type_raw = (wbAttr(attrs, "Type") orelse return error.MalformedWorkbookXml);
-            const target_raw = (wbAttr(attrs, "Target") orelse return error.MalformedWorkbookXml);
+            const id_raw = (wbAttr(gpa, attrs, "Id") orelse return error.MalformedWorkbookXml);
+            const type_raw = (wbAttr(gpa, attrs, "Type") orelse return error.MalformedWorkbookXml);
+            const target_raw = (wbAttr(gpa, attrs, "Target") orelse return error.MalformedWorkbookXml);
             if (entry_idx >= rels.len) return error.MalformedWorkbookXml;
             // `Type` and `Target` verify by the STRICT decode too and
             // must equal what the lenient store cached — its wider
@@ -1284,7 +1267,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 if (!std.mem.eql(u8, target_dec, rels[entry_idx].target)) return error.MalformedWorkbookXml;
             }
             const cached_external = rels[entry_idx].target_mode == .external;
-            if (uniqueAttr(attrs, "TargetMode") catch null) |mode| {
+            if (uniqueAttr(gpa, attrs, "TargetMode") catch null) |mode| {
                 if (std.mem.eql(u8, mode, "External")) {
                     if (!cached_external) return error.MalformedWorkbookXml;
                 } else if (std.mem.eql(u8, mode, "Internal")) {
@@ -2047,6 +2030,51 @@ test "collect: malformed namespace prefixes cannot slip the identity gate (SEC-8
         defer wb.deinit();
         try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
     }
+}
+
+test "scanSheetRules: many distinct legal declarations read — no fixed table (REL-1301)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try buf.appendSlice(testing.allocator, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"");
+    for (0..17) |k| {
+        try buf.appendSlice(testing.allocator, " xmlns:f");
+        try buf.append(testing.allocator, @intCast('a' + k));
+        try buf.appendSlice(testing.allocator, "=\"urn:f\"");
+    }
+    try buf.appendSlice(testing.allocator, ">" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    const rules = try scanRules(a, buf.items);
+    try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "collect: a ninth relationships alias still authorizes its id (REL-1301)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "aliases.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(
+        testing.allocator,
+        io,
+        path,
+        "xl/workbook.xml",
+        "<workbook ",
+        "<workbook xmlns:q1=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q2=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q3=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q4=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q5=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q6=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q7=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:q8=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ",
+    );
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "r:id=\"rId2\"", "q8:id=\"rId2\"");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 5), view.records.len);
 }
 
 test "collect: relationship ids resolve by their decoded spelling (REL-503)" {
