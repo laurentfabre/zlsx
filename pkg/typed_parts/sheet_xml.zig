@@ -122,6 +122,13 @@ pub const FreezePane = struct {
     top_left_cell: []const u8,
 };
 
+/// One contiguity run of the sanitized buffer: `len` bytes starting
+/// at `san_start` were copied VERBATIM from the source part at
+/// `src_start`. Runs break wherever the sanitizer elides (comments,
+/// PIs) or re-encodes (CDATA contents) — those sanitized bytes belong
+/// to no run.
+pub const SrcRun = struct { san_start: u32, src_start: u32, len: u32 };
+
 pub const SheetXml = struct {
     dimension: ?Dimension,
     rows: []Row,
@@ -130,6 +137,15 @@ pub const SheetXml = struct {
     validations: []DataValidation,
     conditional_formats: []ConditionalFormat,
     freeze: ?FreezePane,
+    /// The sanitized buffer every view slice borrows from, plus the
+    /// sanitized→source contiguity runs. The DV/CF formula rewriter
+    /// locates its splice targets by MAPPING a view slice's offset
+    /// back to the source part (`sourceSpanOf`) — four Codex #215
+    /// rounds (r1 REL-103, r2 REL-204, r4 REL-401, r5 REL-501) showed
+    /// that re-scanning the raw source "in lockstep" cannot reproduce
+    /// the sanitizer's lexical state; the map ends the class.
+    sanitized: []const u8 = "",
+    src_runs: []const SrcRun = &.{},
     /// `<row>` elements without a usable `r` — not in `rows`, since the
     /// view has no coordinate for them (the Editor's own scanner numbers
     /// them implicitly). A reader that needs the grid whole refuses
@@ -153,8 +169,36 @@ pub const SheetXml = struct {
         self.hyperlinks = &.{};
         self.validations = &.{};
         self.conditional_formats = &.{};
+        self.sanitized = "";
+        self.src_runs = &.{};
         self.dimension = null;
         self.freeze = null;
+    }
+
+    /// Map a slice BORROWED FROM THIS VIEW back to its span in the
+    /// source part the view was parsed from. Returns null when the
+    /// slice does not lie in the sanitized buffer, or does not sit
+    /// wholly inside one verbatim contiguity run (its bytes crossed a
+    /// stripped construct or were re-encoded from CDATA) — such a
+    /// span has no byte-identical home in the source and cannot be
+    /// spliced.
+    pub fn sourceSpanOf(self: *const SheetXml, slice: []const u8) ?[2]usize {
+        const base = @intFromPtr(self.sanitized.ptr);
+        const p = @intFromPtr(slice.ptr);
+        if (p < base or p - base + slice.len > self.sanitized.len) return null;
+        const off = p - base;
+        // Binary search: the last run with san_start <= off.
+        var lo: usize = 0;
+        var hi: usize = self.src_runs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.src_runs[mid].san_start <= off) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const run = self.src_runs[lo - 1];
+        if (off + slice.len > @as(usize, run.san_start) + run.len) return null;
+        const src_lo = @as(usize, run.src_start) + (off - run.san_start);
+        return .{ src_lo, src_lo + slice.len };
     }
 };
 
@@ -189,8 +233,10 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
     // Strip comments / CDATA / PI once, up front. Every downstream
     // scan operates on the sanitized buffer; no per-tag comment check
     // is needed (and `insideComment` was the O(N²) hot-path on real
-    // worksheets — see doc-comment above).
-    const sanitized = try sanitizeXml(a, xml);
+    // worksheets — see doc-comment above). The contiguity runs come
+    // along so a view slice can be mapped back to its source span.
+    var src_runs: std.ArrayListUnmanaged(SrcRun) = .empty;
+    const sanitized = try sanitizeXml(a, xml, &src_runs);
 
     // Quick well-formedness gate: a worksheet part must contain a
     // `<worksheet` root tag. Anything else is rejected up front so
@@ -217,6 +263,8 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
         .conditional_formats = cfs,
         .freeze = freeze,
         .unaddressed_rows = unaddressed_rows,
+        .sanitized = sanitized,
+        .src_runs = src_runs.items,
         .arena = arena,
     };
 }
@@ -232,7 +280,15 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
 /// This is the perf-critical pre-pass: it converts every downstream
 /// scan from "comment-aware" to "comment-free", eliminating the
 /// O(N²) repeated `lastIndexOf("<!--")` over each tag-match.
-fn sanitizeXml(allocator: std.mem.Allocator, xml: []const u8) ParseError![]const u8 {
+/// `runs`, when non-null, receives the sanitized→source contiguity
+/// map (`SrcRun`) — one entry per maximal verbatim-copied region.
+/// CDATA contents are re-encoded, not copied, so they belong to no
+/// run; a copy that resumes after any elision starts a new run.
+fn sanitizeXml(
+    allocator: std.mem.Allocator,
+    xml: []const u8,
+    runs: ?*std.ArrayListUnmanaged(SrcRun),
+) ParseError![]const u8 {
     assert(xml.len < (1 << 31));
 
     var out: std.ArrayList(u8) = .empty;
@@ -243,6 +299,7 @@ fn sanitizeXml(allocator: std.mem.Allocator, xml: []const u8) ParseError![]const
     while (i < xml.len) {
         const c = xml[i];
         if (c != '<') {
+            try mapRun(allocator, runs, out.items.len, i, 1);
             try out.append(allocator, c);
             i += 1;
             continue;
@@ -271,11 +328,39 @@ fn sanitizeXml(allocator: std.mem.Allocator, xml: []const u8) ParseError![]const
         // Plain tag — copy through to the matching `>`, respecting
         // quoted attribute values (`>` inside `attr="..."` is data).
         const end = findTagEnd(xml, i) orelse return error.MalformedXml;
+        try mapRun(allocator, runs, out.items.len, i, end + 1 - i);
         try out.appendSlice(allocator, xml[i .. end + 1]);
         i = end + 1;
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+/// Record `len` verbatim bytes copied from source offset `src` to
+/// sanitized offset `san` — extending the last run when both sides
+/// are contiguous, else opening a new one.
+fn mapRun(
+    allocator: std.mem.Allocator,
+    runs: ?*std.ArrayListUnmanaged(SrcRun),
+    san: usize,
+    src: usize,
+    len: usize,
+) ParseError!void {
+    const list = runs orelse return;
+    if (list.items.len > 0) {
+        const last = &list.items[list.items.len - 1];
+        if (@as(usize, last.san_start) + last.len == san and
+            @as(usize, last.src_start) + last.len == src)
+        {
+            last.len += @intCast(len);
+            return;
+        }
+    }
+    try list.append(allocator, .{
+        .san_start = @intCast(san),
+        .src_start = @intCast(src),
+        .len = @intCast(len),
+    });
 }
 
 // ─── XML scanner primitives ──────────────────────────────────────────
@@ -345,11 +430,7 @@ fn indexOfTag(hay: []const u8, from: usize, needle: []const u8) ?usize {
 
 /// Match `key="value"` or `key='value'` inside an attribute slice.
 /// Returns the value (no quote-stripping issues, no entity decode).
-/// Pub so the DV/CF rewriter's raw-source walk can mirror this exact
-/// needle when it reproduces `parseValidations`' skip-without-an-index
-/// behaviour for sqref-less entries — the two walks must assign one
-/// element count (Codex #215 r2 REL-204).
-pub fn attrAt(attrs: []const u8, key: []const u8) ?[]const u8 {
+fn attrAt(attrs: []const u8, key: []const u8) ?[]const u8 {
     return attrAtQuote(attrs, key, '"') orelse attrAtQuote(attrs, key, '\'');
 }
 
@@ -1225,6 +1306,35 @@ test "parse: cfRule collects up to three formula bodies in document order" {
     try testing.expect(bodiless.formula == null);
     try testing.expect(bodiless.formula2 == null);
     try testing.expect(bodiless.formula3 == null);
+}
+
+test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has no home" {
+    // A comment before the block shifts sanitized offsets away from
+    // source offsets; the contiguity runs carry the mapping across.
+    const xml =
+        "<worksheet><!-- shift --><conditionalFormatting sqref=\"A1\">" ++
+        "<cfRule type=\"expression\" priority=\"1\"><formula>AB1+C2</formula></cfRule>" ++
+        "</conditionalFormatting></worksheet>";
+    var sx = try parse(testing.allocator, xml);
+    defer sx.deinit(testing.allocator);
+    const f = sx.conditional_formats[0].formula.?;
+    const span = sx.sourceSpanOf(f) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("AB1+C2", xml[span[0]..span[1]]);
+
+    // CDATA contents are re-encoded, not copied — a slice drawn from
+    // them maps to nothing and a splice must refuse rather than guess.
+    const xml2 =
+        "<worksheet><conditionalFormatting sqref=\"A1\">" ++
+        "<cfRule type=\"expression\" priority=\"1\"><formula><![CDATA[X1]]></formula></cfRule>" ++
+        "</conditionalFormatting></worksheet>";
+    var sx2 = try parse(testing.allocator, xml2);
+    defer sx2.deinit(testing.allocator);
+    const f2 = sx2.conditional_formats[0].formula.?;
+    try testing.expectEqualStrings("X1", f2);
+    try testing.expect(sx2.sourceSpanOf(f2) == null);
+
+    // A slice from some other buffer maps to nothing either.
+    try testing.expect(sx.sourceSpanOf("AB1+C2") == null);
 }
 
 test "parse: cfRule formula scan keeps extractInner's bail-on-decoy shape" {

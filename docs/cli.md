@@ -328,8 +328,12 @@ A workbook without conditional formatting is an empty, successful
 stream. The command routes through the package layer like `pivots`, so
 an archive the lenient reader tolerates but the package layer refuses
 is exit 2, and so is any workbook sheet the package layer cannot read
-whole — the sheet graph resolves strictly (the relationship under the
-sheet's `r:id` must exist, be a sheet-family type, be internal, and
+whole — the workbook's `<sheets>` list is verified against a strict
+namespace- and depth-aware read (a ghost `<sheet>` under `<extLst>`
+cannot mint an identity, an entry missing a required carrier refuses
+instead of vanishing), the sheet graph resolves strictly (the
+relationship under the sheet's `r:id` — matched by its DECODED
+spelling — must exist, be a sheet-family type, be internal, and
 reach a part the archive holds that no other sheet reaches — the
 `anchors` rule), and a worksheet-rooted part additionally shares the
 typed view's parse verdict (the same open-time verdicts every
@@ -350,8 +354,10 @@ rebinding the default namespace, a decoy under `<extLst>`) can never
 ghost a record. Namespace bindings compare by their decoded value —
 an entity-spelled alias (`…spreadsheetml&#47;2006/main`) is an alias.
 The grammar is XML's, not a byte pattern: whitespace
-around `=` and either quote read as authored, and a closing tag may
-space before its `>` (`</formula >`). Refused whole (exit 2), nothing
+around `=` and either quote read as authored, a closing tag may space
+before its `>` (`</formula >`), attribute names follow XML's Name
+grammar (`<cfRule/x="y"` is not rule machinery), and a raw `<` in any
+attribute value refuses. Refused whole (exit 2), nothing
 written: mismatched or unterminated nesting anywhere in the part —
 a truncated part, a second root, and nesting past the walker's
 1024-level ceiling included; a `<!DOCTYPE>` or any other markup
