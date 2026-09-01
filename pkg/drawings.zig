@@ -337,13 +337,18 @@ fn scanImagesWithTags(
 ) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
-        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
+        // Anchors, closes and structural children are located as LIVE
+        // exact tags: markup-shaped text inside comments / CDATA / PIs
+        // is not inventory, a commented close must not truncate a live
+        // anchor, and a longer element name must not masquerade as an
+        // anchor wrapper (Codex #214 r5 REL-501).
+        const next = findLiveMarkup(drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
         const block_start = next;
         // Identify anchor opener.
-        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
-        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
-        const is_absolute = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_absolute);
+        const is_two = matchesOpenTag(drawing_part.bytes, i, tags.open_two);
+        const is_one = matchesOpenTag(drawing_part.bytes, i, tags.open_one);
+        const is_absolute = matchesOpenTag(drawing_part.bytes, i, tags.open_absolute);
         if (!is_two and !is_one and !is_absolute) {
             i += tags.xdr_prefix_open.len;
             continue;
@@ -356,7 +361,7 @@ fn scanImagesWithTags(
             tags.close_one
         else
             tags.close_absolute;
-        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse {
+        const close = findLiveMarkup(drawing_part.bytes, i, close_marker) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             break;
         };
@@ -367,8 +372,8 @@ fn scanImagesWithTags(
         // `<xdr:pic>` (a shape, a chart frame) is legitimately not an
         // image in either mode; from the unclosed pic onward the block
         // holds an image the walk cannot read whole.
-        const pic_idx = std.mem.indexOf(u8, block, tags.open_pic) orelse continue;
-        const pic_close = std.mem.indexOfPos(u8, block, pic_idx, tags.close_pic) orelse {
+        const pic_idx = findLiveExactTag(block, 0, tags.open_pic) orelse continue;
+        const pic_close = findLiveMarkup(block, pic_idx, tags.close_pic) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
@@ -497,12 +502,14 @@ fn scanChartsWithTags(
 ) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
-        const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
+        // Live exact tags throughout — see scanImagesWithTags (Codex
+        // #214 r5 REL-501).
+        const next = findLiveMarkup(drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
         const block_start = next;
-        const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
-        const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
-        const is_absolute = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_absolute);
+        const is_two = matchesOpenTag(drawing_part.bytes, i, tags.open_two);
+        const is_one = matchesOpenTag(drawing_part.bytes, i, tags.open_one);
+        const is_absolute = matchesOpenTag(drawing_part.bytes, i, tags.open_absolute);
         if (!is_two and !is_one and !is_absolute) {
             i += tags.xdr_prefix_open.len;
             continue;
@@ -513,7 +520,7 @@ fn scanChartsWithTags(
             tags.close_one
         else
             tags.close_absolute;
-        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse {
+        const close = findLiveMarkup(drawing_part.bytes, i, close_marker) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             break;
         };
@@ -524,7 +531,7 @@ fn scanChartsWithTags(
         // A frame without a chart element (a diagram, a table) is
         // legitimately not a chart in either mode; a chart element
         // the walk cannot follow to its part is a refusal in strict.
-        const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
+        const gf_idx = findLiveExactTag(block, 0, tags.open_graphic_frame) orelse continue;
         // Scan for any `<*:chart` element whose prefix is bound to
         // either chart URI (block-local OR drawing-root). Walking by
         // tag rather than by prefix avoids the "multiple local
@@ -621,8 +628,8 @@ fn extractSeriesRefs(
 
     var primary_open_buf: [128]u8 = undefined;
     var primary_close_buf: [128]u8 = undefined;
-    const primary_open = std.fmt.bufPrint(&primary_open_buf, "<{s}:f>", .{c_prefix}) catch return out.toOwnedSlice(allocator);
-    const primary_close = std.fmt.bufPrint(&primary_close_buf, "</{s}:f>", .{c_prefix}) catch return out.toOwnedSlice(allocator);
+    const primary_open = std.fmt.bufPrint(&primary_open_buf, "<{s}:f", .{c_prefix}) catch return out.toOwnedSlice(allocator);
+    const primary_close = std.fmt.bufPrint(&primary_close_buf, "</{s}:f", .{c_prefix}) catch return out.toOwnedSlice(allocator);
 
     var alt_open_buf: [128]u8 = undefined;
     var alt_close_buf: [128]u8 = undefined;
@@ -631,13 +638,13 @@ fn extractSeriesRefs(
     if (c_prefix_alt) |alt| {
         if (!std.mem.eql(u8, alt, c_prefix)) {
             // Build both needles atomically — if either fails to
-            // format (e.g. a prefix that fits "<alt:f>" but not
-            // "</alt:f>" within the 128-byte buffer), disable the
+            // format (e.g. a prefix that fits "<alt:f" but not
+            // "</alt:f" within the 128-byte buffer), disable the
             // alt scan entirely. Splitting the assignment risked
             // alt_open != null with alt_close == null and a later
             // unwrap would panic.
-            if (std.fmt.bufPrint(&alt_open_buf, "<{s}:f>", .{alt})) |o| {
-                if (std.fmt.bufPrint(&alt_close_buf, "</{s}:f>", .{alt})) |c| {
+            if (std.fmt.bufPrint(&alt_open_buf, "<{s}:f", .{alt})) |o| {
+                if (std.fmt.bufPrint(&alt_close_buf, "</{s}:f", .{alt})) |c| {
                     alt_open = o;
                     alt_close = c;
                 } else |_| {}
@@ -646,49 +653,70 @@ fn extractSeriesRefs(
     }
 
     // Single document-order pass: at each position, find the
-    // EARLIER of the next primary-prefix match and the next
-    // alt-prefix match; consume that one and advance. Preserves
+    // EARLIER of the next primary-prefix carrier and the next
+    // alt-prefix carrier; consume that one and advance. Preserves
     // the documented "flattened in document order" contract even
-    // for mixed-prefix charts. Markup-shaped text inside a comment /
-    // CDATA / PI is not a formula carrier — `<!-- <c:f>Fake!A1</c:f>
-    // -->` must not add a series ref (Codex #214 r2 REL-203) — and
-    // the region-skipping is forward-only with cached candidates, so
-    // a document stuffed with fakes costs linear work (r3 PERF-301).
+    // for mixed-prefix charts. Carriers are LIVE, exact QNames with
+    // XML `Eq` whitespace allowed before either tag's `>` — a legal
+    // `<c:f >` must not be silently omitted, and `<!-- <c:f>… -->`
+    // must not add a ref (Codex #214 r2 REL-203, r5 REL-502). The
+    // region-skipping inside the live search is forward-only, so a
+    // document stuffed with fakes costs linear work (r3 PERF-301).
     var i: usize = 0;
-    var p_pos = std.mem.indexOfPos(u8, xml, 0, primary_open);
-    var a_pos = if (alt_open) |o| std.mem.indexOfPos(u8, xml, 0, o) else null;
     while (true) {
-        if (p_pos != null and p_pos.? < i) p_pos = std.mem.indexOfPos(u8, xml, i, primary_open);
-        if (a_pos != null and a_pos.? < i) a_pos = std.mem.indexOfPos(u8, xml, i, alt_open.?);
-        const winner: enum { primary, alt } = if (p_pos != null and a_pos != null)
-            (if (p_pos.? < a_pos.?) .primary else .alt)
-        else if (p_pos != null) .primary else if (a_pos != null) .alt else break;
-        const open_offset = if (winner == .primary) p_pos.? else a_pos.?;
-        const open_tag = if (winner == .primary) primary_open else alt_open.?;
-        const close_tag = if (winner == .primary) primary_close else alt_close.?;
-        if (nextSkipOpenBefore(xml, i, open_offset)) |skip_at| {
-            i = skipRegionEndFrom(xml, skip_at);
-            continue;
-        }
-        const start = open_offset + open_tag.len;
-        const close_off = std.mem.indexOfPos(u8, xml, start, close_tag) orelse {
+        const p = nextCarrierOpen(xml, i, primary_open);
+        const a = if (alt_open) |o| nextCarrierOpen(xml, i, o) else null;
+        const use_primary = if (p != null and a != null)
+            p.?.at <= a.?.at
+        else
+            p != null;
+        const open = (if (use_primary) p else a) orelse break;
+        const close_needle = if (use_primary) primary_close else alt_close.?;
+        const closed = nextCarrierClose(xml, open.content_start, close_needle) orelse {
             // A real, opened carrier that never closes: lenient keeps
             // the historical truncation; strict refuses rather than
             // silently thinning `series_refs` (REL-203).
             if (mode == .strict) return error.MalformedDrawingXml;
             break;
         };
-        try out.append(allocator, xml[start..close_off]);
-        i = close_off + close_tag.len;
+        try out.append(allocator, xml[open.content_start..closed.at]);
+        i = closed.end;
     }
     return out.toOwnedSlice(allocator);
 }
 
-/// True when `needle` occurs in `xml` OUTSIDE every comment / CDATA /
-/// PI region — element detection that markup-shaped text cannot fool
-/// (Codex #214 r2 REL-203).
-fn hasRealMarkup(xml: []const u8, needle: []const u8) bool {
-    return findLiveMarkup(xml, 0, needle) != null;
+const CarrierOpen = struct { at: usize, content_start: usize };
+const CarrierClose = struct { at: usize, end: usize };
+
+/// The next live `<{p}:f>` open at or after `start`: the exact QName
+/// (a byte terminating the name follows), whitespace tolerated before
+/// the tag's `>` (Codex #214 r5 REL-502).
+fn nextCarrierOpen(xml: []const u8, start: usize, open_needle: []const u8) ?CarrierOpen {
+    var pos = start;
+    while (findLiveMarkup(xml, pos, open_needle)) |at| {
+        const after = at + open_needle.len;
+        if (after >= xml.len) return null;
+        const c = xml[after];
+        if (!(c == '>' or c == ' ' or c == '\t' or c == '\n' or c == '\r')) {
+            pos = at + 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse return null;
+        return .{ .at = at, .content_start = end + 1 };
+    }
+    return null;
+}
+
+/// The matching live `</{p}:f>` close, same tolerance.
+fn nextCarrierClose(xml: []const u8, start: usize, close_needle: []const u8) ?CarrierClose {
+    var pos = start;
+    while (findLiveMarkup(xml, pos, close_needle)) |at| {
+        var j = at + close_needle.len;
+        while (j < xml.len and (xml[j] == ' ' or xml[j] == '\t' or xml[j] == '\n' or xml[j] == '\r')) j += 1;
+        if (j < xml.len and xml[j] == '>') return .{ .at = at, .end = j + 1 };
+        pos = at + 1;
+    }
+    return null;
 }
 
 /// The next occurrence of `needle` at or after `start` that is NOT
@@ -723,6 +751,17 @@ fn findLiveExactTag(xml: []const u8, start: usize, open_needle: []const u8) ?usi
         i = at + 1;
     }
     return null;
+}
+
+/// Does the opening tag at `at` spell exactly `open` (the byte after
+/// the QName terminates the name)? `<xdr:twoCellAnchorFake>` must not
+/// register as a two-cell anchor (Codex #214 r5 REL-501).
+fn matchesOpenTag(xml: []const u8, at: usize, open: []const u8) bool {
+    if (!std.mem.startsWith(u8, xml[at..], open)) return false;
+    const after = at + open.len;
+    if (after >= xml.len) return false;
+    const c = xml[after];
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>';
 }
 
 /// Byte index just past the close of the skip region OPENING at `at`
@@ -774,14 +813,15 @@ fn detectChartTypeWithAlt(
     // The same element found under both prefixes is one plot type,
     // not a compound — track distinct kinds, not matches. Matches
     // inside comments / CDATA / PIs are text, not plot elements
-    // (Codex #214 r2 REL-203).
+    // (Codex #214 r2 REL-203), and the QName must be exact — a
+    // `<c:barChartExtension>` is not a bar chart (r5 REL-503).
     var found: ?ChartType = null;
     for (candidates) |c| {
         var present = false;
         for (prefixes) |maybe_p| {
             const p = maybe_p orelse continue;
             const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ p, c.suffix }) catch continue;
-            if (hasRealMarkup(chart_xml, needle)) present = true;
+            if (findLiveExactTag(chart_xml, 0, needle) != null) present = true;
         }
         if (!present) continue;
         if (found != null) return .other;
@@ -1087,7 +1127,9 @@ fn findBlipEmbedWithAlt(
 fn tryBlipEmbedAt(pic_xml: []const u8, buf: []u8, prefix: []const u8) ?[]const u8 {
     const blip_open = std.fmt.bufPrint(buf, "<{s}:blip", .{prefix}) catch return null;
     var search_at: usize = 0;
-    while (std.mem.indexOfPos(u8, pic_xml, search_at, blip_open)) |blip| {
+    // Live matches only — a commented blip is text, not an image
+    // reference (Codex #214 r5 REL-501).
+    while (findLiveMarkup(pic_xml, search_at, blip_open)) |blip| {
         const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
         if (attrValue(pic_xml[blip .. blip_end + 1], "r:embed")) |rid| return rid;
         search_at = blip_end + 1;
@@ -1966,7 +2008,7 @@ const DrawingTags = struct {
     close_one: []const u8, // "</xdr:oneCellAnchor>"
     open_absolute: []const u8, // "<xdr:absoluteAnchor"
     close_absolute: []const u8, // "</xdr:absoluteAnchor>"
-    open_pic: []const u8, // "<xdr:pic>"
+    open_pic: []const u8, // "<xdr:pic"
     close_pic: []const u8, // "</xdr:pic>"
     open_from: []const u8, // "<xdr:from>"
     close_from: []const u8, // "</xdr:from>"
@@ -1986,7 +2028,10 @@ const DrawingTags = struct {
         const close_one = try writeAndAdvance(&w, "</{s}:oneCellAnchor>", .{p.xdr});
         const open_absolute = try writeAndAdvance(&w, "<{s}:absoluteAnchor", .{p.xdr});
         const close_absolute = try writeAndAdvance(&w, "</{s}:absoluteAnchor>", .{p.xdr});
-        const open_pic = try writeAndAdvance(&w, "<{s}:pic>", .{p.xdr});
+        // `<{s}:pic` without the closing `>`: the element may carry
+        // attributes (`macro`, `fPublished`); the exact-live-tag
+        // lookup supplies the name terminator (r5 REL-501).
+        const open_pic = try writeAndAdvance(&w, "<{s}:pic", .{p.xdr});
         const close_pic = try writeAndAdvance(&w, "</{s}:pic>", .{p.xdr});
         const open_from = try writeAndAdvance(&w, "<{s}:from>", .{p.xdr});
         const close_from = try writeAndAdvance(&w, "</{s}:from>", .{p.xdr});
@@ -2253,8 +2298,10 @@ fn parseCellAnchor(
     close: []const u8,
     xdr_prefix: []const u8,
 ) ?CellAnchor {
-    const o = std.mem.indexOf(u8, xml, open) orelse return null;
-    const c = std.mem.indexOfPos(u8, xml, o, close) orelse return null;
+    // Live matches: a commented `<xdr:from>` fake in the block is not
+    // the anchor's geometry (Codex #214 r5 REL-501).
+    const o = findLiveMarkup(xml, 0, open) orelse return null;
+    const c = findLiveMarkup(xml, o, close) orelse return null;
     const inner = xml[o + open.len .. c];
 
     // 128-byte scratch per needle covers prefixes up to ~110 chars
@@ -2463,6 +2510,10 @@ test "detectChartType: covers all canonical OOXML chart elements" {
     // not a plot (Codex #214 r2 REL-203).
     try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/><!-- <c:lineChart/> -->", "c"));
     try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/><![CDATA[<c:pieChart/>]]>", "c"));
+    // The QName must be exact: a longer element name is not that plot
+    // type and must not fake a compound either (r5 REL-503).
+    try std.testing.expectEqual(ChartType.other, detectChartType("<c:chartSpace><c:barChartExtension/>", "c"));
+    try std.testing.expectEqual(ChartType.pie, detectChartType("<c:chartSpace><c:pieChart/><c:barChartExtension/>", "c"));
 }
 
 test "findDrawingRid: a prefixed drawing element and a non-r relationship prefix resolve when BOUND" {

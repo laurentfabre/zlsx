@@ -809,6 +809,95 @@ test "collect: an extLst decoy before the real extent does not hide it (REL-301)
     try testing.expectEqual(@as(usize, 3), view.records.len);
 }
 
+test "collect: commented anchors are text — not inventory, not truncation, not refusal (REL-501)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const workbook_mod = @import("workbook.zig");
+
+    // A complete commented image anchor and an UNCLOSED commented
+    // anchor shape: neither emits, neither refuses strict.
+    {
+        const path = try tt.path(testing.allocator, io, "c1.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .image_and_chart);
+        try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing2.xml", "</xdr:wsDr>", "<!-- <xdr:oneCellAnchor><xdr:from><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic><xdr:blipFill><a:blip r:embed=\"rIdI1\"/></xdr:blipFill></xdr:pic><xdr:clientData/></xdr:oneCellAnchor><xdr:twoCellAnchor> --></xdr:wsDr>");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+        defer view.deinit();
+        try testing.expectEqual(@as(usize, 3), view.records.len);
+        for (view.records) |r| {
+            if (r == .image) try testing.expect(r.image.from == null or r.image.from.?.col != 8);
+        }
+    }
+    // A commented close tag inside a live anchor must not truncate it.
+    {
+        const path = try tt.path(testing.allocator, io, "c2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .image_and_chart);
+        try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\"", "<!-- </xdr:twoCellAnchor> --><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+        defer view.deinit();
+        try testing.expectEqual(@as(usize, 3), view.records.len);
+        // Report's image is still the intact two-cell anchor.
+        const img = view.records[1].image;
+        try testing.expectEqual(drawings.AnchorKind.two_cell, img.kind);
+        try testing.expect(img.to != null);
+    }
+}
+
+test "collect: legal whitespace before a carrier tag's '>' does not thin series_refs (REL-502)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_ws_carrier.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/charts/chart1.xml", "<c:f>Data!$B$1</c:f>", "<c:f >Data!$B$1</c:f\n>");
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    defer view.deinit();
+    const chart = view.records[2].chart;
+    try testing.expectEqual(@as(usize, 3), chart.series_refs.len);
+    try testing.expectEqualStrings("Data!$B$1", chart.series_refs[0]);
+}
+
+test "walkers: duplicate drawing element — strict refuses, lenient follows the first (MNT-504)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_dup_walkers.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<drawing r:id=\"rIdD1\"/>", "<drawing r:id=\"rIdD1\"/><drawing r:id=\"rIdD1\"/>");
+
+    var store = try PartStore.open(testing.allocator, io, path);
+    defer store.deinit();
+    try testing.expectError(error.MalformedDrawingXml, drawings.imageAnchorsIn(&store, testing.allocator, .strict));
+    try testing.expectError(error.MalformedDrawingXml, drawings.chartAnchorsIn(&store, testing.allocator, .strict));
+    // Lenient follows the first drawing: both sheets' images, one chart.
+    const images = try drawings.imageAnchorsIn(&store, testing.allocator, .lenient);
+    defer testing.allocator.free(images);
+    try testing.expectEqual(@as(usize, 2), images.len);
+    const charts = try drawings.chartAnchorsIn(&store, testing.allocator, .lenient);
+    defer {
+        for (charts) |c| testing.allocator.free(c.series_refs);
+        testing.allocator.free(charts);
+    }
+    try testing.expectEqual(@as(usize, 1), charts.len);
+}
+
 test "collect: comment-shaped plot types and carriers do not pollute chart metadata (REL-203)" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
