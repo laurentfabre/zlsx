@@ -73,9 +73,9 @@ const Subcommand = enum {
     /// parts the reader-only Book has no view of.
     anchors,
     /// S3b slice 5: conditional formats — one record per `<cfRule>`
-    /// across the selected sheets (`pkg/conditional_format_ndjson.zig`
-    /// over `Worksheet.conditionalFormats`). Package-layer route like
-    /// `pivots`: the typed sheet view lives on `zlsx_pkg.Workbook`.
+    /// across the selected sheets (`pkg/conditional_format_ndjson.zig`,
+    /// the strict walk over the inventory `Worksheet.conditionalFormats`
+    /// models). Package-layer route like `pivots`.
     conditional_formats,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
@@ -4536,12 +4536,14 @@ fn runAnchorsCommand(
 
 /// S3b slice 5: `zlsx conditional-formats` — one record per `<cfRule>`,
 /// sheets in workbook order, rules in sheet-document order. Routes
-/// through the package layer like `pivots`: the typed sheet view
-/// (`Worksheet.conditionalFormats`) lives on `zlsx_pkg.Workbook`.
-/// Sheet selection follows the read family — `--sheet` / `--name`
-/// narrow to one sheet, `--all-sheets` / `--sheet-glob` widen, the
-/// default streams every sheet. Contract in docs/cli.md,
-/// "conditional-formats".
+/// through the package layer like `pivots`; the records come from the
+/// strict namespace- and depth-aware walk in
+/// `pkg/conditional_format_ndjson.zig` (the lenient Zig view
+/// `Worksheet.conditionalFormats` keeps its historical contract — the
+/// `anchors` split). Sheet selection follows the read family —
+/// `--sheet` / `--name` narrow to one sheet, `--all-sheets` /
+/// `--sheet-glob` widen, the default streams every sheet. Contract in
+/// docs/cli.md, "conditional-formats".
 fn runConditionalFormatsCommand(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -9868,6 +9870,18 @@ test "parseArgs: conditional-formats token and flag rejections" {
     }
     {
         const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--end-row", "5" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "conditional-formats", "f.xlsx", "--include-blanks" };
         try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
     }
     {

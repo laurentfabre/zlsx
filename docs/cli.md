@@ -293,14 +293,18 @@ no record (chartsheets stay in the `sheet_idx` numbering — they are
 
 `zlsx conditional-formats <file>` (S3b) emits one record per `<cfRule>`:
 sheets in workbook order, rules in sheet-document order, each carrying
-its parent `<conditionalFormatting>` block's `sqref`. The view is
-`Worksheet.conditionalFormats` attributed to workbook sheets — the
-record reports the rule envelope (where it applies, what kind it is,
-its formula bodies, its differential style id and priority), not the
+its parent `<conditionalFormatting>` block's `sqref`. The record
+reports the rule envelope (where it applies, what kind it is, its
+formula bodies, its differential style id and priority), not the
 visual payload: `<colorScale>` / `<dataBar>` / `<iconSet>` children
 and the `<dxfs>` styles they point into stay in their parts,
 byte-preserved, for callers that need them raw (`zlsx_pkg.PartStore`;
-`styles` does not list dxfs).
+`styles` does not list dxfs). The records come from a strict,
+namespace- and depth-aware walk of each sheet part
+(`pkg/conditional_format_ndjson.zig`) — the same inventory the Zig
+view `Worksheet.conditionalFormats` models, read so the wire can
+prove it whole; the Zig view itself keeps its historical lenient
+lexical contract, the split the `anchors` walkers established.
 
 ```jsonl
 {"kind":"conditional_format","sheet":"Data","sheet_idx":0,"sqref":"A1:A4","rule_type":"cellIs","formulas":["2","4"],"dxf_id":0,"priority":1}
@@ -312,7 +316,7 @@ byte-preserved, for callers that need them raw (`zlsx_pkg.PartStore`;
 | `sheet`, `sheet_idx` | The sheet whose part carries the rule. Dropped under `--output compact-ndjson` in favour of the sheet prologue. |
 | `sqref` | The parent block's target list as authored — one or more space-separated A1 areas, entity-decoded, not normalised or split. |
 | `rule_type` | The `type` attribute as written (`cellIs`, `expression`, `colorScale`, `dataBar`, `iconSet`, `containsBlanks`, …) — a token inventory this read does not police. |
-| `formulas` | The rule's `<formula>` bodies, entity-decoded, in document order — up to the schema's three (a `cellIs` `between` carries two, most rules one, the visual-payload rules none). Bodies are located by the typed sheet view's scan — the same one the row/column-edit formula rewriter splices through — so the two surfaces always agree on which body is a rule's formula. |
+| `formulas` | The rule's `<formula>` bodies, entity-decoded, in document order — up to the schema's three (a `cellIs` `between` carries two, most rules one, the visual-payload rules none). Each body is text-only and a direct child of its rule; a fourth formula, one that never closes, or one carrying markup (an element, a comment, a CDATA section — markup is not the formula, the `defined-names` ruling) refuses the read. |
 | `dxf_id` | The differential-style id (0-based into the styles part's `<dxfs>`), or `null`. |
 | `priority` | The rule's cascade priority (lower wins), or `null`. |
 
@@ -326,23 +330,38 @@ is exit 2, and so is any workbook sheet the package layer cannot read
 whole (a dangling sheet relationship, a part that does not parse —
 the same open-time verdicts every `Worksheet` reader shares), even one
 the selection would exclude: the inventory is proven whole before
-selection and pagination apply, the `anchors` rule. A rule
-field the stream cannot carry faithfully refuses the whole command
-(exit 2) rather than emit a record that lies: a `sqref`, rule type or
-formula whose carrier does not decode (a bad entity), decodes to
-non-UTF-8 (NDJSON must stay parseable), or carries embedded markup
-where the schema puts formula text or an attribute value; a sheet-name
-carrier that does not decode — a partial or wrong rule inventory is
-the shape of a guard hole. Boundary conventions the typed view models,
-pinned as the contract: an absent `sqref` or `type` and an empty one
-are one shape (the empty string); a `dxfId` or `priority` that is
-written but not a plain base-10 integer reads as `null` (the
-written-but-invalid convention `tableHeaderRowCount` set); a
-`<conditionalFormatting>` block with no `<cfRule>` children — the
-self-closing spelling included — emits nothing. The view reads the
-sheet part's unprefixed spelling (the one Excel writes); extension-list
+selection and pagination apply, the `anchors` rule.
+
+The strict walk is what lets the stream claim "one record per rule,
+no more, no fewer". A `conditionalFormatting` element is a rule block
+only as a main-namespace direct child of the sheet root (Transitional
+or Strict namespace, bound as the document's default — a root that
+binds neither, or a part that aliases the main namespace to a prefix,
+refuses, the host-predicate rule), a `cfRule` only as a direct child
+of a block, a `formula` only as a text-only direct child of a rule —
+so an extension tree spelling the same names (an `x14` subtree
+rebinding the default namespace, a decoy under `<extLst>`) can never
+ghost a record. Attributes follow XML, not a byte pattern: whitespace
+around `=` and either quote read as authored. Refused whole (exit 2),
+nothing written: mismatched or unterminated nesting anywhere in the
+part; a `<formula>` that never closes (a refusal, not an absence) or
+carries markup; a fourth formula (the schema's `maxOccurs` is 3); a
+duplicate attribute on a block or rule tag; a `sqref`, rule type or
+formula whose carrier does not decode (a bad entity) or decodes to
+non-UTF-8 (NDJSON must stay parseable); a sheet-name carrier that
+does not decode. A partial or wrong rule inventory is the shape of a
+guard hole. Boundary conventions, pinned as the contract: an absent
+`sqref` or `type` and an empty one are one shape (the empty string);
+a `dxfId` or `priority` that is written but not a plain string of
+decimal digits in `u32` range reads as `null` (the written-but-invalid
+convention `tableHeaderRowCount` set — `+1` and `1_0` are not
+numbers); a `<conditionalFormatting>` block with no `<cfRule>`
+children — the self-closing spelling included — emits nothing; a
+`chartsheet` or `dialogsheet` part holds no rules by schema and
+contributes an empty inventory, while a `macrosheet` (which can carry
+conditional formatting) is walked like a worksheet. Extension-list
 conditional formatting (`x14` data bars, icon sets carried under
-`<extLst>`) is a different tree and not part of this view — the edit
+`<extLst>`) is a different tree and not part of this read — the edit
 paths move its `<xm:sqref>` / `<xm:f>` carriers with the grid (S2),
 but no read models it yet.
 
@@ -737,7 +756,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet the workbook cannot read whole, or a sqref / rule type / formula / sheet name whose carrier does not decode, is not UTF-8, or carries embedded markup — its contract above) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet part the strict walk cannot prove whole — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a duplicate attribute on the rule machinery — or a sqref / rule type / formula / sheet-name carrier that does not decode or is not UTF-8 — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
