@@ -14657,6 +14657,8 @@ test {
     _ = @import("defined_name_ndjson.zig");
     // S3b slice 4: same lesson, the anchors NDJSON writer.
     _ = @import("anchor_ndjson.zig");
+    // S3b slice 5: same lesson, the conditional-formats NDJSON writer.
+    _ = @import("conditional_format_ndjson.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {

@@ -104,6 +104,13 @@ pub const ConditionalFormat = struct {
     sqref: []const u8,
     type: []const u8,
     formula: ?[]const u8,
+    /// CT_CfRule allows up to three `<formula>` children — a `cellIs`
+    /// `between` rule carries two bounds. `formula` is the first body
+    /// (the one the DV/CF formula rewriter locates and splices);
+    /// these are the second and third in document order, null when
+    /// the rule spells fewer.
+    formula2: ?[]const u8 = null,
+    formula3: ?[]const u8 = null,
     dxf_id: ?u32,
     priority: ?u32,
 };
@@ -731,6 +738,19 @@ fn extractCellValue(c_body: []const u8, kind: CellType) ?[]const u8 {
 /// `<t xml:space="preserve">`). Returns `null` when the element is
 /// absent. Borrows from `body`.
 fn extractInner(body: []const u8, open_prefix: []const u8, close_tag: []const u8) ?[]const u8 {
+    var rest = body;
+    return extractInnerAdvance(&rest, open_prefix, close_tag);
+}
+
+/// `extractInner`, advancing `rest` past the consumed element so a
+/// caller can collect repeated children (`<cfRule>`'s up-to-three
+/// `<formula>` bodies). First-match semantics are `extractInner`'s
+/// exactly — the scan anchors on the literal prefix and bails (null)
+/// when the first hit is a longer-named element, the same shape the
+/// DV/CF rewriter's `findInnerSpan` bails on, so the two keep
+/// agreeing on which body is "the formula".
+fn extractInnerAdvance(rest: *[]const u8, open_prefix: []const u8, close_tag: []const u8) ?[]const u8 {
+    const body = rest.*;
     const o = std.mem.indexOf(u8, body, open_prefix) orelse return null;
     const after = o + open_prefix.len;
     if (after >= body.len) return null;
@@ -739,9 +759,11 @@ fn extractInner(body: []const u8, open_prefix: []const u8, close_tag: []const u8
     const open_end = findTagEnd(body, o) orelse return null;
     if (open_end > o and body[open_end - 1] == '/') {
         // Self-closing <v/> or <f/> — empty body.
+        rest.* = body[open_end + 1 ..];
         return body[open_end..open_end];
     }
     const close = std.mem.indexOfPos(u8, body, open_end, close_tag) orelse return null;
+    rest.* = body[close + close_tag.len ..];
     return body[open_end + 1 .. close];
 }
 
@@ -941,12 +963,20 @@ fn parseConditionalFormats(a: std.mem.Allocator, xml: []const u8) ParseError![]C
             const priority = parseU32Attr(r_attrs, "priority");
 
             var formula: ?[]const u8 = null;
+            var formula2: ?[]const u8 = null;
+            var formula3: ?[]const u8 = null;
             const r_self_closing = r_open_end > r_open and cf_body[r_open_end - 1] == '/';
             if (!r_self_closing) {
                 const r_close = std.mem.indexOfPos(u8, cf_body, r_open_end, "</cfRule>") orelse
                     return error.MalformedXml;
-                const r_body = cf_body[r_open_end + 1 .. r_close];
-                formula = extractInner(r_body, "<formula", "</formula>");
+                var f_rest = cf_body[r_open_end + 1 .. r_close];
+                formula = extractInnerAdvance(&f_rest, "<formula", "</formula>");
+                if (formula != null) {
+                    formula2 = extractInnerAdvance(&f_rest, "<formula", "</formula>");
+                    if (formula2 != null) {
+                        formula3 = extractInnerAdvance(&f_rest, "<formula", "</formula>");
+                    }
+                }
                 rule_probe = r_close + "</cfRule>".len;
             } else {
                 rule_probe = r_open_end + 1;
@@ -956,6 +986,8 @@ fn parseConditionalFormats(a: std.mem.Allocator, xml: []const u8) ParseError![]C
                 .sqref = sqref,
                 .type = rule_type,
                 .formula = formula,
+                .formula2 = formula2,
+                .formula3 = formula3,
                 .dxf_id = dxf_id,
                 .priority = priority,
             });
@@ -1145,6 +1177,90 @@ test "parse: conditional formats with cfRule" {
     try testing.expectEqualStrings("$B1=TRUE", cf1.formula.?);
     try testing.expectEqual(@as(?u32, 2), cf1.dxf_id);
     try testing.expectEqual(@as(?u32, 3), cf1.priority);
+    // One-formula rules leave the second and third slots empty.
+    try testing.expect(cf0.formula2 == null and cf0.formula3 == null);
+    try testing.expect(cf1.formula2 == null and cf1.formula3 == null);
+}
+
+test "parse: cfRule collects up to three formula bodies in document order" {
+    const xml =
+        \\<worksheet>
+        \\  <sheetData/>
+        \\  <conditionalFormatting sqref="A1:A10">
+        \\    <cfRule type="cellIs" dxfId="0" priority="1" operator="between">
+        \\      <formula>2</formula>
+        \\      <formula>4</formula>
+        \\    </cfRule>
+        \\    <cfRule type="cellIs" priority="2" operator="equal">
+        \\      <formula>1</formula>
+        \\      <formula>2</formula>
+        \\      <formula>3</formula>
+        \\      <formula>ignored past the schema's three</formula>
+        \\    </cfRule>
+        \\    <cfRule type="containsBlanks" priority="3"/>
+        \\  </conditionalFormatting>
+        \\</worksheet>
+    ;
+
+    var sx = try parse(testing.allocator, xml);
+    defer sx.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), sx.conditional_formats.len);
+
+    const between = sx.conditional_formats[0];
+    try testing.expectEqualStrings("2", between.formula.?);
+    try testing.expectEqualStrings("4", between.formula2.?);
+    try testing.expect(between.formula3 == null);
+
+    const three = sx.conditional_formats[1];
+    try testing.expectEqualStrings("1", three.formula.?);
+    try testing.expectEqualStrings("2", three.formula2.?);
+    try testing.expectEqualStrings("3", three.formula3.?);
+
+    const bodiless = sx.conditional_formats[2];
+    try testing.expect(bodiless.formula == null);
+    try testing.expect(bodiless.formula2 == null);
+    try testing.expect(bodiless.formula3 == null);
+}
+
+test "parse: cfRule formula scan keeps extractInner's bail-on-decoy shape" {
+    // A longer-named element at the first `<formula` hit bails the
+    // whole scan (formula == null), exactly as `extractInner` did —
+    // the DV/CF rewriter's `findInnerSpan` bails on the same shape,
+    // and the two must agree on which body is "the formula". A decoy
+    // AFTER a real formula likewise ends the collection there.
+    const xml =
+        \\<worksheet>
+        \\  <sheetData/>
+        \\  <conditionalFormatting sqref="A1">
+        \\    <cfRule type="cellIs" priority="1" operator="equal">
+        \\      <formulaX>9</formulaX>
+        \\      <formula>1</formula>
+        \\    </cfRule>
+        \\    <cfRule type="cellIs" priority="2" operator="between">
+        \\      <formula>1</formula>
+        \\      <formulaX>9</formulaX>
+        \\      <formula>2</formula>
+        \\    </cfRule>
+        \\    <cfRule type="cellIs" priority="3" operator="equal">
+        \\      <formula/>
+        \\      <formula>7</formula>
+        \\    </cfRule>
+        \\  </conditionalFormatting>
+        \\</worksheet>
+    ;
+
+    var sx = try parse(testing.allocator, xml);
+    defer sx.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), sx.conditional_formats.len);
+    try testing.expect(sx.conditional_formats[0].formula == null);
+    try testing.expectEqualStrings("1", sx.conditional_formats[1].formula.?);
+    try testing.expect(sx.conditional_formats[1].formula2 == null);
+    // A self-closing <formula/> is an empty first body; the scan
+    // continues past it to the second.
+    try testing.expectEqualStrings("", sx.conditional_formats[2].formula.?);
+    try testing.expectEqualStrings("7", sx.conditional_formats[2].formula2.?);
 }
 
 test "parse: freeze pane" {

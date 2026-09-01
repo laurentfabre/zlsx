@@ -44,6 +44,7 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx defined-names <file>` | `"defined_name"` | `name, scope, sheet, sheet_idx, body, hidden` — [contract](#defined-names--the-workbook-name-inventory) |
 | `zlsx doc-props <file>` | `"doc_props"` | one record: `creator, last_modified_by, title, subject, description, keywords, category, created, modified, revision, company, manager, application, hyperlink_base, has_custom_properties` — [contract](#doc-props--the-document-properties-report) |
 | `zlsx anchors <file>` | `"image_anchor"`, `"chart_anchor"` | `sheet, sheet_idx, part, anchor, from{}, to{}, absolute{}`, then `bytes` (images) or `chart_type, series_refs[]` (charts) — [contract](#anchors--anchored-images-and-charts) |
+| `zlsx conditional-formats <file>` | `"conditional_format"` | `sheet, sheet_idx, sqref, rule_type, formulas[], dxf_id, priority` — one record per `<cfRule>` — [contract](#conditional-formats--the-rule-inventory) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
@@ -287,6 +288,63 @@ drawings (`<legacyDrawing>`) are not walked; and the walkers cover
 **worksheet** drawings only, so a chartsheet's full-sheet chart emits
 no record (chartsheets stay in the `sheet_idx` numbering — they are
 `<sheets>` entries — they just host no walkable anchors).
+
+#### `conditional-formats` — the rule inventory
+
+`zlsx conditional-formats <file>` (S3b) emits one record per `<cfRule>`:
+sheets in workbook order, rules in sheet-document order, each carrying
+its parent `<conditionalFormatting>` block's `sqref`. The view is
+`Worksheet.conditionalFormats` attributed to workbook sheets — the
+record reports the rule envelope (where it applies, what kind it is,
+its formula bodies, its differential style id and priority), not the
+visual payload: `<colorScale>` / `<dataBar>` / `<iconSet>` children
+and the `<dxfs>` styles they point into stay in their parts,
+byte-preserved, for callers that need them raw (`zlsx_pkg.PartStore`;
+`styles` does not list dxfs).
+
+```jsonl
+{"kind":"conditional_format","sheet":"Data","sheet_idx":0,"sqref":"A1:A4","rule_type":"cellIs","formulas":["2","4"],"dxf_id":0,"priority":1}
+{"kind":"conditional_format","sheet":"Data","sheet_idx":0,"sqref":"C1:C4","rule_type":"colorScale","formulas":[],"dxf_id":null,"priority":3}
+```
+
+| Field | Meaning |
+|---|---|
+| `sheet`, `sheet_idx` | The sheet whose part carries the rule. Dropped under `--output compact-ndjson` in favour of the sheet prologue. |
+| `sqref` | The parent block's target list as authored — one or more space-separated A1 areas, entity-decoded, not normalised or split. |
+| `rule_type` | The `type` attribute as written (`cellIs`, `expression`, `colorScale`, `dataBar`, `iconSet`, `containsBlanks`, …) — a token inventory this read does not police. |
+| `formulas` | The rule's `<formula>` bodies, entity-decoded, in document order — up to the schema's three (a `cellIs` `between` carries two, most rules one, the visual-payload rules none). Bodies are located by the typed sheet view's scan — the same one the row/column-edit formula rewriter splices through — so the two surfaces always agree on which body is a rule's formula. |
+| `dxf_id` | The differential-style id (0-based into the styles part's `<dxfs>`), or `null`. |
+| `priority` | The rule's cascade priority (lower wins), or `null`. |
+
+Sheet selection follows the read family — `--sheet` / `--name` narrow
+to one sheet, `--all-sheets` / `--sheet-glob` widen, the default
+streams every sheet — and `--skip` / `--take` page the record stream.
+A workbook without conditional formatting is an empty, successful
+stream. The command routes through the package layer like `pivots`, so
+an archive the lenient reader tolerates but the package layer refuses
+is exit 2, and so is any workbook sheet the package layer cannot read
+whole (a dangling sheet relationship, a part that does not parse —
+the same open-time verdicts every `Worksheet` reader shares), even one
+the selection would exclude: the inventory is proven whole before
+selection and pagination apply, the `anchors` rule. A rule
+field the stream cannot carry faithfully refuses the whole command
+(exit 2) rather than emit a record that lies: a `sqref`, rule type or
+formula whose carrier does not decode (a bad entity), decodes to
+non-UTF-8 (NDJSON must stay parseable), or carries embedded markup
+where the schema puts formula text or an attribute value; a sheet-name
+carrier that does not decode — a partial or wrong rule inventory is
+the shape of a guard hole. Boundary conventions the typed view models,
+pinned as the contract: an absent `sqref` or `type` and an empty one
+are one shape (the empty string); a `dxfId` or `priority` that is
+written but not a plain base-10 integer reads as `null` (the
+written-but-invalid convention `tableHeaderRowCount` set); a
+`<conditionalFormatting>` block with no `<cfRule>` children — the
+self-closing spelling included — emits nothing. The view reads the
+sheet part's unprefixed spelling (the one Excel writes); extension-list
+conditional formatting (`x14` data bars, icon sets carried under
+`<extLst>`) is a different tree and not part of this view — the edit
+paths move its `<xm:sqref>` / `<xm:f>` carriers with the grid (S2),
+but no read models it yet.
 
 ### Edit (load-modify-save)
 
@@ -532,10 +590,11 @@ is set.
 
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
 unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots` /
-`merges` / `anchors` stream every sheet; `styles` / `sst` / `meta` /
-`list-sheets` are workbook-wide, and so are `defined-names` (a sheet selector
-there narrows by a name's *scope* — see its contract above) and `doc-props`
-(no sheet dimension at all — selectors are tolerated and ignored).
+`merges` / `anchors` / `conditional-formats` stream every sheet; `styles` /
+`sst` / `meta` / `list-sheets` are workbook-wide, and so are `defined-names`
+(a sheet selector there narrows by a name's *scope* — see its contract above)
+and `doc-props` (no sheet dimension at all — selectors are tolerated and
+ignored).
 
 **Sheet selection** — mutually exclusive:
 
@@ -577,9 +636,9 @@ there narrows by a name's *scope* — see its contract above) and `doc-props`
 --output ndjson               # default: invariant-envelope stream
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
-                              # validations / hyperlinks / pivots / merges / anchors —
-                              # a no-op on workbook-scoped sub-commands (defined-names
-                              # and doc-props included)
+                              # validations / hyperlinks / pivots / merges / anchors /
+                              # conditional-formats — a no-op on workbook-scoped
+                              # sub-commands (defined-names and doc-props included)
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -617,6 +676,9 @@ zlsx sst data.xlsx | jq -r '.text' | rg '@\S+\.\S+'
 
 # Merged header bands: every merge that touches row 1.
 zlsx merges data.xlsx --all-sheets | jq 'select(.start_row==1)'
+
+# Every between-rule with both bounds, as TSV.
+zlsx conditional-formats data.xlsx | jq -r 'select(.rule_type=="cellIs" and (.formulas|length)==2) | [.sheet, .sqref, .formulas[0], .formulas[1]] | @tsv'
 
 # Visible workbook-scope names with their bodies, as TSV.
 zlsx defined-names data.xlsx | jq -r 'select(.scope=="workbook" and (.hidden|not)) | [.name, .body] | @tsv'
@@ -675,7 +737,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet the workbook cannot read whole, or a sqref / rule type / formula / sheet name whose carrier does not decode, is not UTF-8, or carries embedded markup — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
