@@ -332,10 +332,13 @@ whole — the workbook's `<sheets>` list is verified against a strict
 namespace- and depth-aware read (a ghost `<sheet>` under `<extLst>`
 cannot mint an identity, an entry missing a required carrier refuses
 instead of vanishing), the sheet graph resolves strictly (the
-relationship under the sheet's `r:id` — matched by its DECODED
-spelling — must exist, be a sheet-family type, be internal, and
-reach a part the archive holds that no other sheet reaches — the
-`anchors` rule), and a worksheet-rooted part additionally shares the
+relationship under the sheet's `r:id` — spelled under a root-declared
+relationships-namespace prefix and matched by its DECODED spelling —
+must exist, be a sheet-family type, be internal, and reach a part the
+archive holds that no other sheet reaches — the `anchors` rule; the
+rels part itself verifies strictly too, so a nested `Relationship`
+decoy or a duplicate id refuses), and a worksheet-rooted part
+additionally shares the
 typed view's parse verdict (the same open-time verdicts every
 `Worksheet` reader shares; a macrosheet part has no typed view, so
 the strict walk's verdict stands alone there) — even for a sheet the
