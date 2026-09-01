@@ -28,15 +28,18 @@ const PartStore = store_mod.PartStore;
 /// prologue record names the sheet once for every record after it.
 pub const Envelope = enum { full, compact };
 
-/// One anchored image, attributed. `from` / `to` are the cell-grid
-/// anchors exactly as `drawings.ImageAnchor` models them (0-based
-/// col/row + EMU offsets); `from` is null — not the walker's zero
-/// sentinel — when the source used `<xdr:absoluteAnchor>`.
+/// One anchored image, attributed. `kind` is the anchor wrapper as
+/// spelled in the drawing XML — the wire's `anchor` field; `from` /
+/// `to` are the cell-grid anchors exactly as `drawings.ImageAnchor`
+/// models them (0-based col/row + EMU offsets); `from` is null — not
+/// the walker's zero sentinel — when the source used
+/// `<xdr:absoluteAnchor>`.
 pub const ImageRecord = struct {
     sheet: []const u8,
     sheet_idx: u32,
     /// Archive name of the image part, e.g. `xl/media/image1.png`.
     part: []const u8,
+    kind: drawings.AnchorKind,
     from: ?drawings.CellAnchor,
     to: ?drawings.CellAnchor,
     absolute: ?drawings.AbsoluteAnchor,
@@ -53,6 +56,7 @@ pub const ChartRecord = struct {
     sheet_idx: u32,
     /// Archive name of the chart part, e.g. `xl/charts/chart1.xml`.
     part: []const u8,
+    kind: drawings.AnchorKind,
     from: ?drawings.CellAnchor,
     to: ?drawings.CellAnchor,
     absolute: ?drawings.AbsoluteAnchor,
@@ -97,8 +101,12 @@ pub const Anchors = struct {
 };
 
 pub const Error = error{
-    /// A sheet-name carrier that does not decode, or decodes to
-    /// non-UTF-8 — the NDJSON must stay parseable.
+    /// A sheet-name carrier that does not decode or decodes to
+    /// non-UTF-8 (the NDJSON must stay parseable), or a sheet list
+    /// the anchors cannot be attributed against: a sheet whose
+    /// relationship dangles, is mistyped or external, whose part the
+    /// archive does not hold, or two `<sheet>` entries reaching one
+    /// part (Codex #214 r1 REL-101/REL-102).
     MalformedWorkbookXml,
     /// An anchor on a worksheet part `xl/workbook.xml` does not list:
     /// the record could not carry a truthful `sheet` / `sheet_idx`,
@@ -128,24 +136,39 @@ pub fn collect(
     const sheet_names = try a.alloc([]const u8, wb.sheets.len);
     for (wb.sheets, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
 
-    // Resolve each workbook sheet to its part, best-effort: a sheet
-    // whose relationship dangles simply owns no part name here. That
-    // sheet cannot host anchors (the walkers never see it), so the
-    // strictness lands where it matters — below, on an anchor whose
-    // part no listed sheet owns.
+    // Resolve each workbook sheet to its part, strictly — the pivots
+    // walk's rule: the relationship must exist under the sheet's
+    // `r:id`, be a sheet-family type, be internal, and reach a part
+    // the archive holds. A listed sheet the walk cannot place makes
+    // the whole inventory unprovable (its drawing, had the part
+    // existed, is unknown), so it refuses rather than emitting under
+    // it (Codex #214 r1 REL-101). Two `<sheet>` entries reaching one
+    // part would emit the same anchor twice under two identities —
+    // refused too (REL-102).
     const wb_rels = store.rels("xl/workbook.xml");
-    const sheet_parts = try a.alloc(?[]const u8, wb.sheets.len);
+    const sheet_parts = try a.alloc([]const u8, wb.sheets.len);
     for (wb.sheets, 0..) |s, i| {
-        sheet_parts[i] = null;
-        const rel = relById(wb_rels, s.r_id) orelse continue;
-        if (rel.target_mode == .external) continue;
-        sheet_parts[i] = try store.resolve("xl/workbook.xml", rel.target);
+        const rel = relById(wb_rels, s.r_id) orelse return error.MalformedWorkbookXml;
+        var typed = false;
+        for (sheet_rel_leaves) |leaf| typed = typed or relLeafIs(rel.type, leaf);
+        if (!typed) return error.MalformedWorkbookXml;
+        if (rel.target_mode == .external) return error.MalformedWorkbookXml;
+        const name = (try store.resolve("xl/workbook.xml", rel.target)) orelse
+            return error.MalformedWorkbookXml;
+        if ((try store.part(name)) == null) return error.MalformedWorkbookXml;
+        for (sheet_parts[0..i]) |prev| {
+            if (std.mem.eql(u8, prev, name)) return error.MalformedWorkbookXml;
+        }
+        sheet_parts[i] = name;
     }
 
-    // The walkers allocate their result slices; handing them the view
-    // arena parks that scaffolding with everything else this view owns.
-    const images = try drawings.imageAnchors(store, a);
-    const charts = try drawings.chartAnchors(store, a);
+    // Strict walk: a drawing structure the walkers recognise but
+    // cannot read whole refuses here rather than thinning the
+    // inventory. The walkers allocate their result slices; handing
+    // them the view arena parks that scaffolding with everything else
+    // this view owns.
+    const images = try drawings.imageAnchorsIn(store, a, .strict);
+    const charts = try drawings.chartAnchorsIn(store, a, .strict);
 
     const image_seen = try a.alloc(bool, images.len);
     @memset(image_seen, false);
@@ -153,23 +176,39 @@ pub fn collect(
     @memset(chart_seen, false);
 
     var records: std.ArrayListUnmanaged(Record) = .empty;
+    var scratch: std.ArrayListUnmanaged(usize) = .empty;
     for (0..wb.sheets.len) |idx| {
-        const part_name = sheet_parts[idx] orelse continue;
+        const part_name = sheet_parts[idx];
+        // Restore document order within the sheet: the mixed-prefix
+        // replay appends alternate-prefixed anchors after the primary
+        // scan, so walker slice order is not document order — the
+        // anchors' doc_offset is (Codex #214 r1 REL-103).
+        scratch.clearRetainingCapacity();
         for (images, 0..) |img, i| {
-            if (!std.mem.eql(u8, img.sheet_part_name, part_name)) continue;
+            if (std.mem.eql(u8, img.sheet_part_name, part_name)) try scratch.append(a, i);
+        }
+        std.sort.insertion(usize, scratch.items, images, imageOffsetLess);
+        for (scratch.items) |i| {
+            const img = images[i];
             image_seen[i] = true;
             try records.append(a, .{ .image = .{
                 .sheet = sheet_names[idx],
                 .sheet_idx = @intCast(idx),
                 .part = try retainPartName(a, img.image_part_name),
-                .from = if (img.absolute == null) img.from else null,
+                .kind = img.kind,
+                .from = if (img.kind == .absolute) null else img.from,
                 .to = img.to,
                 .absolute = img.absolute,
                 .byte_count = img.bytes.len,
             } });
         }
+        scratch.clearRetainingCapacity();
         for (charts, 0..) |ch, i| {
-            if (!std.mem.eql(u8, ch.sheet_part_name, part_name)) continue;
+            if (std.mem.eql(u8, ch.sheet_part_name, part_name)) try scratch.append(a, i);
+        }
+        std.sort.insertion(usize, scratch.items, charts, chartOffsetLess);
+        for (scratch.items) |i| {
+            const ch = charts[i];
             chart_seen[i] = true;
             const refs = try a.alloc([]const u8, ch.series_refs.len);
             for (ch.series_refs, 0..) |raw, ri| refs[ri] = try decodeSeriesRef(a, raw);
@@ -177,7 +216,8 @@ pub fn collect(
                 .sheet = sheet_names[idx],
                 .sheet_idx = @intCast(idx),
                 .part = try retainPartName(a, ch.chart_part_name),
-                .from = if (ch.absolute == null) ch.from else null,
+                .kind = ch.kind,
+                .from = if (ch.kind == .absolute) null else ch.from,
                 .to = ch.to,
                 .absolute = ch.absolute,
                 .chart_type = ch.chart_type,
@@ -213,13 +253,13 @@ pub fn writeAll(out: *std.Io.Writer, view: *const Anchors) !void {
 
 pub fn writeImage(out: *std.Io.Writer, r: ImageRecord, envelope: Envelope) !void {
     try out.writeAll("{\"kind\":\"image_anchor\"");
-    try writeCommon(out, r.sheet, r.sheet_idx, r.part, r.from, r.to, r.absolute, envelope);
+    try writeCommon(out, r.sheet, r.sheet_idx, r.part, r.kind, r.from, r.to, r.absolute, envelope);
     try out.print(",\"bytes\":{d}}}\n", .{r.byte_count});
 }
 
 pub fn writeChart(out: *std.Io.Writer, r: ChartRecord, envelope: Envelope) !void {
     try out.writeAll("{\"kind\":\"chart_anchor\"");
-    try writeCommon(out, r.sheet, r.sheet_idx, r.part, r.from, r.to, r.absolute, envelope);
+    try writeCommon(out, r.sheet, r.sheet_idx, r.part, r.kind, r.from, r.to, r.absolute, envelope);
     try out.print(",\"chart_type\":\"{s}\",\"series_refs\":[", .{@tagName(r.chart_type)});
     for (r.series_refs, 0..) |ref, i| {
         if (i > 0) try out.writeByte(',');
@@ -233,6 +273,7 @@ fn writeCommon(
     sheet: []const u8,
     sheet_idx: u32,
     part: []const u8,
+    kind: drawings.AnchorKind,
     from: ?drawings.CellAnchor,
     to: ?drawings.CellAnchor,
     absolute: ?drawings.AbsoluteAnchor,
@@ -245,13 +286,11 @@ fn writeCommon(
     }
     try out.writeAll(",\"part\":");
     try json.writeString(out, part);
-    const anchor_kind: []const u8 = if (absolute != null)
-        "absolute"
-    else if (to != null)
-        "two_cell"
-    else
-        "one_cell";
-    try out.print(",\"anchor\":\"{s}\",\"from\":", .{anchor_kind});
+    // `anchor` is the wrapper as spelled in the source, never derived
+    // from which optional fields happen to be present — the strict
+    // walk refuses a two-cell anchor whose `<to>` did not parse, so
+    // the spelling and the fields cannot disagree here (REL-101).
+    try out.print(",\"anchor\":\"{s}\",\"from\":", .{@tagName(kind)});
     try writeOptCellAnchor(out, from);
     try out.writeAll(",\"to\":");
     try writeOptCellAnchor(out, to);
@@ -323,15 +362,36 @@ fn relById(rels: []const store_mod.Relationship, raw_rid: []const u8) ?store_mod
     return null;
 }
 
+/// The sheet-family relationship types a `<sheet r:id>` may carry —
+/// the pivots walk's list (`pkg/pivots.zig`), duplicated here because
+/// this module keeps its imports to the walkers it fronts.
+const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
+
+fn relLeafIs(rel_type: []const u8, leaf: []const u8) bool {
+    const l = if (std.mem.lastIndexOfScalar(u8, rel_type, '/')) |i| rel_type[i + 1 ..] else rel_type;
+    return std.ascii.eqlIgnoreCase(l, leaf);
+}
+
+fn imageOffsetLess(images: []const drawings.ImageAnchor, lhs: usize, rhs: usize) bool {
+    return images[lhs].doc_offset < images[rhs].doc_offset;
+}
+
+fn chartOffsetLess(charts: []const drawings.ChartAnchor, lhs: usize, rhs: usize) bool {
+    return charts[lhs].doc_offset < charts[rhs].doc_offset;
+}
+
 // ─── Test fixture ────────────────────────────────────────────────────
 
-/// Writes a real two-sheet workbook whose second sheet (`Report`,
-/// index 1) carries a drawing: a twoCellAnchor image, a oneCellAnchor
-/// chart with three series refs, and — for `.with_absolute` — an
-/// absoluteAnchor image. Injected through a real save/reopen, the
-/// `pivots.fixture` pattern, so the walk reads genuine parts and
-/// refreshed relationship caches. `src/cli.zig` and the tests below
-/// share it.
+/// Writes a real two-sheet workbook with anchors on BOTH sheets:
+/// `Data` (index 0) carries one twoCellAnchor image; `Report` (index
+/// 1) carries a drawing whose DOCUMENT order is chart first — a
+/// oneCellAnchor chart with three series refs, then a twoCellAnchor
+/// image, then (for `.with_absolute`) an absoluteAnchor image — so
+/// the view's images-before-charts regrouping is exercised, not
+/// mirrored (Codex #214 r1 MNT-101). Injected through a real
+/// save/reopen, the `pivots.fixture` pattern, so the walk reads
+/// genuine parts and refreshed relationship caches. `src/cli.zig`
+/// and the tests below share it.
 pub const fixture = struct {
     pub const Kind = enum { image_and_chart, with_absolute };
 
@@ -367,9 +427,10 @@ pub const fixture = struct {
             .image_and_chart => "",
             .with_absolute => "<xdr:absoluteAnchor><xdr:pos x=\"1000\" y=\"2000\"/><xdr:ext cx=\"914400\" cy=\"457200\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"4\" name=\"Picture 2\"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed=\"rIdI1\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:absoluteAnchor>",
         };
+        // Report's drawing: chart FIRST in document order.
         const drawing = try std.fmt.allocPrint(allocator,
             \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            \\<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>19050</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdI1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>{s}<xdr:oneCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="3048000" cy="2286000"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>
+            \\<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="3048000" cy="2286000"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>19050</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdI1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>{s}</xdr:wsDr>
         , .{absolute_block});
         defer allocator.free(drawing);
         try store.addPart(
@@ -391,6 +452,44 @@ pub const fixture = struct {
             \\<drawing r:id="rIdD1"/>
         );
 
+        // Data's drawing: one twoCellAnchor image, so the stream
+        // crosses a sheet boundary.
+        try store.addPart(
+            "xl/drawings/drawing2.xml",
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdI1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>
+            ,
+        );
+        try store.addPart(
+            "xl/drawings/_rels/drawing2.xml.rels",
+            "application/vnd.openxmlformats-package.relationships+xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdI1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>
+            ,
+        );
+        try upsertRels(&store, "xl/worksheets/_rels/sheet1.xml.rels",
+            \\<Relationship Id="rIdD2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing2.xml"/>
+        );
+        try spliceBefore(allocator, &store, "xl/worksheets/sheet1.xml", "</worksheet>",
+            \\<drawing r:id="rIdD2"/>
+        );
+
+        try store.save(io, path);
+    }
+
+    /// Byte-replace the first `old` in one part of a saved workbook
+    /// and save it back — how the refusal tests make a fixture wrong
+    /// in exactly one place (the `pivots.fixture` helper, duplicated
+    /// so this module keeps its imports to the walkers it fronts).
+    pub fn patchPart(allocator: Allocator, io: std.Io, path: []const u8, part: []const u8, old: []const u8, new: []const u8) !void {
+        var store = try PartStore.open(allocator, io, path);
+        defer store.deinit();
+        const p = (try store.part(part)) orelse return error.PartNotFound;
+        const at = std.mem.indexOf(u8, p.bytes, old) orelse return error.PatchAnchorNotFound;
+        const patched = try std.mem.concat(allocator, u8, &.{ p.bytes[0..at], new, p.bytes[at + old.len ..] });
+        defer allocator.free(patched);
+        try store.replacePart(part, patched);
         try store.save(io, path);
     }
 
@@ -440,6 +539,7 @@ test "writeImage: two_cell full and compact, exact bytes" {
         .sheet = "R\"D",
         .sheet_idx = 1,
         .part = "xl/media/image1.png",
+        .kind = .two_cell,
         .from = .{ .col = 1, .col_off = 9525, .row = 2, .row_off = 0 },
         .to = .{ .col = 4, .col_off = 0, .row = 7, .row_off = 19050 },
         .absolute = null,
@@ -469,6 +569,7 @@ test "writeImage: absolute anchor — from and to null, geometry verbatim EMUs" 
         .sheet = "S",
         .sheet_idx = 0,
         .part = "xl/media/image2.png",
+        .kind = .absolute,
         .from = null,
         .to = null,
         .absolute = .{ .x = 1000, .y = 2000, .cx = 914400, .cy = 457200 },
@@ -490,6 +591,7 @@ test "writeChart: one_cell with refs, and an empty refs list" {
         .sheet = "Report",
         .sheet_idx = 1,
         .part = "xl/charts/chart1.xml",
+        .kind = .one_cell,
         .from = .{ .col = 5, .col_off = 0, .row = 1, .row_off = 0 },
         .to = null,
         .absolute = null,
@@ -546,20 +648,122 @@ test "collect: fixture anchors attributed to Report, images before charts, refs 
     defer view.deinit();
 
     try testing.expectEqual(@as(usize, 2), view.sheet_names.len);
-    try testing.expectEqual(@as(usize, 3), view.records.len);
-    // Images (document order: two_cell, then absolute) before charts.
-    try testing.expectEqualStrings("xl/media/image1.png", view.records[0].image.part);
-    try testing.expect(view.records[0].image.to != null);
-    try testing.expect(view.records[1].image.absolute != null);
-    try testing.expect(view.records[1].image.from == null);
-    try testing.expectEqual(@as(u64, fixture.png_bytes.len), view.records[0].image.byte_count);
-    const chart = view.records[2].chart;
+    try testing.expectEqual(@as(usize, 4), view.records.len);
+    // Data's image leads (sheets in workbook order) …
+    try testing.expectEqual(@as(u32, 0), view.records[0].sheetIdx());
+    try testing.expectEqualStrings("Data", view.records[0].image.sheet);
+    try testing.expectEqual(drawings.AnchorKind.two_cell, view.records[0].image.kind);
+    // … then Report's images BEFORE its chart, though the chart is
+    // FIRST in the drawing's document order — the regrouping, not an
+    // echo of the source (MNT-101).
+    try testing.expectEqual(drawings.AnchorKind.two_cell, view.records[1].image.kind);
+    try testing.expect(view.records[1].image.to != null);
+    try testing.expectEqual(drawings.AnchorKind.absolute, view.records[2].image.kind);
+    try testing.expect(view.records[2].image.absolute != null);
+    try testing.expect(view.records[2].image.from == null);
+    try testing.expectEqual(@as(u64, fixture.png_bytes.len), view.records[1].image.byte_count);
+    const chart = view.records[3].chart;
     try testing.expectEqual(@as(u32, 1), chart.sheet_idx);
     try testing.expectEqualStrings("Report", chart.sheet);
+    try testing.expectEqual(drawings.AnchorKind.one_cell, chart.kind);
     try testing.expectEqual(drawings.ChartType.bar, chart.chart_type);
     try testing.expectEqual(@as(usize, 3), chart.series_refs.len);
     try testing.expectEqualStrings("Data!$B$1", chart.series_refs[0]);
-    for (view.records) |r| try testing.expectEqual(@as(u32, 1), r.sheetIdx());
+}
+
+test "collect: mixed-prefix anchors come back in document order (REL-103)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_mixed_prefix.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    // Replace Report's drawing with one that binds TWO prefixes to the
+    // spreadsheetDrawing URI and puts the alternate-prefixed anchor
+    // FIRST. The walkers scan per prefix and replay alternates after
+    // the primary pass, so slice order alone would reverse these.
+    {
+        var store = try PartStore.open(testing.allocator, io, path);
+        defer store.deinit();
+        try store.replacePart("xl/drawings/drawing1.xml",
+            \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            \\<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:x2="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><x2:oneCellAnchor><x2:from><x2:col>7</x2:col><x2:colOff>0</x2:colOff><x2:row>7</x2:row><x2:rowOff>0</x2:rowOff></x2:from><x2:ext cx="1" cy="1"/><x2:pic><x2:nvPicPr><x2:cNvPr id="5" name="P"/><x2:cNvPicPr/></x2:nvPicPr><x2:blipFill><a:blip r:embed="rIdI1"/></x2:blipFill><x2:spPr/></x2:pic><x2:clientData/></x2:oneCellAnchor><xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="1" cy="1"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="6" name="Q"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdI1"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>
+        );
+        try store.save(io, path);
+    }
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    defer view.deinit();
+    // Data's image, then Report's two: the x2-prefixed anchor (col 7)
+    // FIRST — document order restored via doc_offset.
+    try testing.expectEqual(@as(usize, 3), view.records.len);
+    try testing.expectEqual(@as(u32, 7), view.records[1].image.from.?.col);
+    try testing.expectEqual(@as(u32, 1), view.records[2].image.from.?.col);
+}
+
+test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-101)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const workbook_mod = @import("workbook.zig");
+
+    const cases = [_]struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 }{
+        // The sheet's drawing relationship dangles.
+        .{ .name = "a1.xlsx", .part = "xl/worksheets/_rels/sheet2.xml.rels", .old = "../drawings/drawing1.xml", .new = "../drawings/nope.xml" },
+        // A pic's blip relationship names nothing.
+        .{ .name = "a2.xlsx", .part = "xl/drawings/drawing1.xml", .old = "r:embed=\"rIdI1\"", .new = "r:embed=\"rIdXX\"" },
+        // A two-cell anchor whose <to> does not parse must refuse, not
+        // ride out as one_cell.
+        .{ .name = "a3.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:to>", .new = "<xdr:zz>" },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .image_and_chart);
+        try fixture.patchPart(testing.allocator, io, path, case.part, case.old, case.new);
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(
+            error.MalformedDrawingXml,
+            collect(testing.allocator, &wb.store, &wb.workbook),
+        );
+    }
+}
+
+test "collect: a sheet list the anchors cannot be attributed against refuses whole (REL-101/102)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const workbook_mod = @import("workbook.zig");
+
+    const cases = [_]struct { name: []const u8, old: []const u8, new: []const u8 }{
+        // A listed sheet whose part is absent: the inventory under it
+        // is unprovable.
+        .{ .name = "b1.xlsx", .old = "worksheets/sheet2.xml", .new = "worksheets/nope.xml" },
+        // Two <sheet> entries reaching one part: the same anchor would
+        // ride out twice under two identities.
+        .{ .name = "b2.xlsx", .old = "worksheets/sheet1.xml", .new = "worksheets/sheet2.xml" },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .image_and_chart);
+        try fixture.patchPart(testing.allocator, io, path, "xl/_rels/workbook.xml.rels", case.old, case.new);
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(
+            error.MalformedWorkbookXml,
+            collect(testing.allocator, &wb.store, &wb.workbook),
+        );
+    }
 }
 
 test "collect: a workbook without drawings is an empty view" {

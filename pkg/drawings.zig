@@ -41,6 +41,23 @@ const std = @import("std");
 const store_mod = @import("store.zig");
 const PartStore = store_mod.PartStore;
 
+/// Which OOXML anchor wrapper carried the object. Recorded from the
+/// opening tag itself, not inferred from which optional fields parsed
+/// — a `<xdr:twoCellAnchor>` whose `<to>` is unreadable must not
+/// masquerade as a one-cell anchor (Codex #214 r1 REL-101).
+pub const AnchorKind = enum { two_cell, one_cell, absolute };
+
+/// How the walkers treat drawing structures they recognise but cannot
+/// read whole. `lenient` (the historical behavior, and the default
+/// wrappers') skips them — the "no crash, surface what parses"
+/// contract the corpus walks rely on. `strict` refuses with
+/// `error.MalformedDrawingXml` instead: a dangling drawing / image /
+/// chart relationship, a named part that is absent, an anchor whose
+/// `from` / `to` / `pos` / `ext` does not parse, an opened block that
+/// never closes. The NDJSON view reads strict — a partial anchor
+/// inventory is the shape of a guard hole.
+pub const WalkMode = enum { lenient, strict };
+
 pub const CellAnchor = struct {
     /// 0-based column index.
     col: u32,
@@ -87,6 +104,14 @@ pub const ImageAnchor = struct {
     /// Decompressed image bytes (PNG/JPEG/etc.). Borrowed from the
     /// PartStore — caller must not free.
     bytes: []const u8,
+    /// The anchor wrapper as spelled in the drawing XML.
+    kind: AnchorKind,
+    /// Byte offset of the anchor's opening tag within its drawing
+    /// part — the document-order key. The mixed-prefix replay appends
+    /// alternate-prefixed anchors after the primary scan, so slice
+    /// order alone is NOT document order (Codex #214 r1 REL-103);
+    /// sort on this to restore it.
+    doc_offset: usize,
 };
 
 pub const ChartType = enum {
@@ -129,6 +154,11 @@ pub const ChartAnchor = struct {
     series_refs: []const []const u8,
     /// Raw chart-part XML bytes. Borrowed from the PartStore.
     raw_xml: []const u8,
+    /// The anchor wrapper as spelled in the drawing XML.
+    kind: AnchorKind,
+    /// Byte offset of the anchor's opening tag within its drawing
+    /// part — the document-order key (see `ImageAnchor.doc_offset`).
+    doc_offset: usize,
 };
 
 /// Walk every worksheet's `<drawing r:id=...>`, resolve to a drawing
@@ -139,6 +169,10 @@ pub const ChartAnchor = struct {
 /// slices inside each anchor are arena-borrowed from the PartStore
 /// (valid until the store's `deinit`).
 pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnchor {
+    return imageAnchorsIn(store, allocator, .lenient);
+}
+
+pub fn imageAnchorsIn(store: *PartStore, allocator: std.mem.Allocator, mode: WalkMode) ![]ImageAnchor {
     var out: std.ArrayListUnmanaged(ImageAnchor) = .empty;
     errdefer out.deinit(allocator);
 
@@ -149,7 +183,7 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
     for (store.parts) |sheet_part_meta| {
         if (!isSheetPart(sheet_part_meta)) continue;
         const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
-        try collectFromSheet(store, allocator, sheet_part, &out);
+        try collectFromSheet(store, allocator, sheet_part, mode, &out);
     }
 
     return out.toOwnedSlice(allocator);
@@ -163,6 +197,10 @@ pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnc
 /// callers wanting series refs can interrogate raw_xml directly
 /// for now.
 pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnchor {
+    return chartAnchorsIn(store, allocator, .lenient);
+}
+
+pub fn chartAnchorsIn(store: *PartStore, allocator: std.mem.Allocator, mode: WalkMode) ![]ChartAnchor {
     var out: std.ArrayListUnmanaged(ChartAnchor) = .empty;
     // Each appended ChartAnchor owns an allocator-allocated
     // series_refs slice; on partial failure (e.g. OOM during a
@@ -175,7 +213,7 @@ pub fn chartAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ChartAnc
     for (store.parts) |sheet_part_meta| {
         if (!isSheetPart(sheet_part_meta)) continue;
         const sheet_part = (try store.part(sheet_part_meta.name)) orelse continue;
-        try collectChartsFromSheet(store, allocator, sheet_part, &out);
+        try collectChartsFromSheet(store, allocator, sheet_part, mode, &out);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -214,17 +252,29 @@ fn collectFromSheet(
     store: *PartStore,
     allocator: std.mem.Allocator,
     sheet_part: store_mod.Part,
+    mode: WalkMode,
     out: *std.ArrayListUnmanaged(ImageAnchor),
 ) !void {
     // Find `<drawing r:id="..."/>` in the sheet XML. Skip the sheet
-    // entirely if absent (no anchored objects).
+    // entirely if absent (no anchored objects). A sheet that DOES
+    // declare one whose relationship chain dangles is a drawing the
+    // walk cannot read — strict refuses it whole.
     const rid = findDrawingRid(sheet_part.bytes) orelse return;
 
     // Resolve rid → drawing part name via sheet's rels.
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse return;
-    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
-    const drawing_part = try store.part(drawing_part_name) orelse return;
+    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
+    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
+    const drawing_part = try store.part(drawing_part_name) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
 
     // Walk the drawing's twoCellAnchor / oneCellAnchor blocks.
     const drawing_rels = store.rels(drawing_part_name);
@@ -242,18 +292,19 @@ fn collectFromSheet(
     // valid-but-long custom prefixes.
     var primary_buf: [4096]u8 = undefined;
     const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
-    try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
+    try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, mode, out);
 
     // Mixed-prefix bindings: descendant anchors may use a different
     // prefix bound to the same spreadsheetDrawing URI. Replay the
     // scan once per alt prefix; primary-prefixed anchors won't
-    // match, so no duplicates surface.
+    // match, so no duplicates surface. Replay order is NOT document
+    // order — consumers needing that sort on `doc_offset`.
     for (prefixes.xdr_alts()) |alt| {
         var alt_prefixes = prefixes;
         alt_prefixes.xdr = alt;
         var alt_buf: [4096]u8 = undefined;
         const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
-        try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, out);
+        try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, mode, out);
     }
 }
 
@@ -266,12 +317,14 @@ fn scanImagesWithTags(
     sheet_part: store_mod.Part,
     prefixes: DrawingPrefixes,
     tags: DrawingTags,
+    mode: WalkMode,
     out: *std.ArrayListUnmanaged(ImageAnchor),
 ) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
         const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
+        const block_start = next;
         // Identify anchor opener.
         const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
         const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
@@ -280,36 +333,67 @@ fn scanImagesWithTags(
             i += tags.xdr_prefix_open.len;
             continue;
         }
-        // Find close tag.
+        // Find close tag. An opened anchor that never closes is a
+        // malformed drawing, not an absent one.
         const close_marker = if (is_two)
             tags.close_two
         else if (is_one)
             tags.close_one
         else
             tags.close_absolute;
-        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
+        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            break;
+        };
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
 
-        // Only image-bearing anchors are surfaced in v1.
+        // Only image-bearing anchors are surfaced. An anchor with no
+        // `<xdr:pic>` (a shape, a chart frame) is legitimately not an
+        // image in either mode; from the unclosed pic onward the block
+        // holds an image the walk cannot read whole.
         const pic_idx = std.mem.indexOf(u8, block, tags.open_pic) orelse continue;
-        const pic_close = std.mem.indexOfPos(u8, block, pic_idx, tags.close_pic) orelse continue;
+        const pic_close = std.mem.indexOfPos(u8, block, pic_idx, tags.close_pic) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
         const pic_block = block[pic_idx .. pic_close + tags.close_pic.len];
 
-        const embed_rid = findBlipEmbedWithAlt(pic_block, prefixes.a, prefixes.a_alt) orelse continue;
-        const image_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse continue;
-        const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse continue;
-        const image_part = try store.part(image_part_name) orelse continue;
+        const embed_rid = findBlipEmbedWithAlt(pic_block, prefixes.a, prefixes.a_alt) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
+        const image_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
+        const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
+        const image_part = try store.part(image_part_name) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
 
         var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
         var to_anchor: ?CellAnchor = null;
         var absolute: ?AbsoluteAnchor = null;
         if (is_absolute) {
-            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse continue;
+            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse {
+                if (mode == .strict) return error.MalformedDrawingXml;
+                continue;
+            };
         } else {
-            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
+            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse {
+                if (mode == .strict) return error.MalformedDrawingXml;
+                continue;
+            };
             if (is_two) {
                 to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
+                // A two-cell anchor without a readable `<to>` must not
+                // ride out looking like a one-cell anchor (REL-101).
+                if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
             }
         }
 
@@ -320,6 +404,8 @@ fn scanImagesWithTags(
             .to = to_anchor,
             .absolute = absolute,
             .bytes = image_part.bytes,
+            .kind = if (is_absolute) .absolute else if (is_two) .two_cell else .one_cell,
+            .doc_offset = block_start,
         });
     }
 }
@@ -328,13 +414,23 @@ fn collectChartsFromSheet(
     store: *PartStore,
     allocator: std.mem.Allocator,
     sheet_part: store_mod.Part,
+    mode: WalkMode,
     out: *std.ArrayListUnmanaged(ChartAnchor),
 ) !void {
     const rid = findDrawingRid(sheet_part.bytes) orelse return;
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse return;
-    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse return;
-    const drawing_part = try store.part(drawing_part_name) orelse return;
+    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
+    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
+    const drawing_part = try store.part(drawing_part_name) orelse {
+        if (mode == .strict) return error.MalformedDrawingXml;
+        return;
+    };
 
     const drawing_rels = store.rels(drawing_part_name);
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
@@ -345,14 +441,14 @@ fn collectChartsFromSheet(
     // valid-but-long custom prefixes.
     var primary_buf: [4096]u8 = undefined;
     const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
-    try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, out);
+    try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, mode, out);
 
     for (prefixes.xdr_alts()) |alt| {
         var alt_prefixes = prefixes;
         alt_prefixes.xdr = alt;
         var alt_buf: [4096]u8 = undefined;
         const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
-        try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, out);
+        try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, mode, out);
     }
 }
 
@@ -365,12 +461,14 @@ fn scanChartsWithTags(
     sheet_part: store_mod.Part,
     prefixes: DrawingPrefixes,
     tags: DrawingTags,
+    mode: WalkMode,
     out: *std.ArrayListUnmanaged(ChartAnchor),
 ) !void {
     var i: usize = 0;
     while (i < drawing_part.bytes.len) {
         const next = std.mem.indexOfPos(u8, drawing_part.bytes, i, tags.xdr_prefix_open) orelse break;
         i = next;
+        const block_start = next;
         const is_two = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_two);
         const is_one = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_one);
         const is_absolute = std.mem.startsWith(u8, drawing_part.bytes[i..], tags.open_absolute);
@@ -384,11 +482,17 @@ fn scanChartsWithTags(
             tags.close_one
         else
             tags.close_absolute;
-        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse break;
+        const close = std.mem.indexOfPos(u8, drawing_part.bytes, i, close_marker) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            break;
+        };
         const block = drawing_part.bytes[i .. close + close_marker.len];
         i = close + close_marker.len;
 
         // Charts live inside <xdr:graphicFrame>...<c:chart r:id=...
+        // A frame without a chart element (a diagram, a table) is
+        // legitimately not a chart in either mode; a chart element
+        // the walk cannot follow to its part is a refusal in strict.
         const gf_idx = std.mem.indexOf(u8, block, tags.open_graphic_frame) orelse continue;
         // Scan for any `<*:chart` element whose prefix is bound to
         // either chart URI (block-local OR drawing-root). Walking by
@@ -396,23 +500,47 @@ fn scanChartsWithTags(
         // bindings to the same chart URI" failure mode where
         // collect-first-prefix would pick an unused declaration.
         const chart_idx = findLocalChartElement(block, gf_idx, prefixes) orelse continue;
-        const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse continue;
+        const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
         const chart_attrs = block[chart_idx .. chart_end + 1];
-        const embed_rid = attrValue(chart_attrs, "r:id") orelse continue;
+        const embed_rid = attrValue(chart_attrs, "r:id") orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
 
-        const chart_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse continue;
-        const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse continue;
-        const chart_part = try store.part(chart_part_name) orelse continue;
+        const chart_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
+        const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
+        const chart_part = try store.part(chart_part_name) orelse {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            continue;
+        };
 
         var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
         var to_anchor: ?CellAnchor = null;
         var absolute: ?AbsoluteAnchor = null;
         if (is_absolute) {
-            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse continue;
+            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse {
+                if (mode == .strict) return error.MalformedDrawingXml;
+                continue;
+            };
         } else {
-            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse continue;
+            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse {
+                if (mode == .strict) return error.MalformedDrawingXml;
+                continue;
+            };
             if (is_two) {
                 to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
+                // A two-cell anchor without a readable `<to>` must not
+                // ride out looking like a one-cell anchor (REL-101).
+                if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
             }
         }
 
@@ -433,6 +561,8 @@ fn scanChartsWithTags(
             .chart_type = detectChartTypeWithAlt(chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt),
             .series_refs = refs,
             .raw_xml = chart_part.bytes,
+            .kind = if (is_absolute) .absolute else if (is_two) .two_cell else .one_cell,
+            .doc_offset = block_start,
         });
     }
 }
@@ -502,11 +632,12 @@ fn extractSeriesRefs(
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
-/// for the canonical `<{c}:Xchart>` element name. Compound charts
-/// (multiple plot types overlaid) collapse to whichever is found
-/// first; callers needing the full picture can walk raw_xml
-/// directly. `c_prefix` is the document's actual chart-namespace
-/// prefix (canonically "c").
+/// for the canonical `<{c}:Xchart>` element names. A compound chart
+/// (two or more distinct plot types overlaid — bar + line, say)
+/// reports `.other`, matching the enum's contract and the CLI wire
+/// contract (Codex #214 r1 REL-104); callers needing the full
+/// picture can walk raw_xml directly. `c_prefix` is the document's
+/// actual chart-namespace prefix (canonically "c").
 fn detectChartType(chart_xml: []const u8, c_prefix: []const u8) ChartType {
     return detectChartTypeWithAlt(chart_xml, c_prefix, null);
 }
@@ -527,14 +658,21 @@ fn detectChartTypeWithAlt(
         .{ .suffix = "radarChart", .kind = .radar },
     };
     const prefixes = [_]?[]const u8{ c_prefix, c_prefix_alt };
-    for (prefixes) |maybe_p| {
-        const p = maybe_p orelse continue;
-        for (candidates) |c| {
+    // The same element found under both prefixes is one plot type,
+    // not a compound — track distinct kinds, not matches.
+    var found: ?ChartType = null;
+    for (candidates) |c| {
+        var present = false;
+        for (prefixes) |maybe_p| {
+            const p = maybe_p orelse continue;
             const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ p, c.suffix }) catch continue;
-            if (std.mem.indexOf(u8, chart_xml, needle) != null) return c.kind;
+            if (std.mem.indexOf(u8, chart_xml, needle) != null) present = true;
         }
+        if (!present) continue;
+        if (found != null) return .other;
+        found = c.kind;
     }
-    return .other;
+    return found orelse .other;
 }
 
 /// Generic attribute value extractor: find `key="value"` or
@@ -1958,6 +2096,13 @@ test "detectChartType: covers all canonical OOXML chart elements" {
     // Non-canonical prefix: same XML with a different chart-namespace
     // prefix should still detect the chart type.
     try std.testing.expectEqual(ChartType.bar, detectChartType("<chrt:chartSpace><chrt:barChart/>", "chrt"));
+    // A compound chart (two plot types overlaid) reports `.other`, per
+    // the enum's contract — not whichever element happens to be found
+    // first (Codex #214 r1 REL-104).
+    try std.testing.expectEqual(ChartType.other, detectChartType("<c:chartSpace><c:barChart/><c:lineChart/>", "c"));
+    // The same plot type under BOTH prefixes is one type, not a
+    // compound.
+    try std.testing.expectEqual(ChartType.bar, detectChartTypeWithAlt("<c:chartSpace><c:barChart/><c2:barChart/>", "c", "c2"));
 }
 
 test "parseCellAnchor unit test" {

@@ -9572,10 +9572,16 @@ test "runAnchorsCommand: every sheet by default, exact wire shape" {
     const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors }, &w, &err_w);
     try std.testing.expectEqual(@as(u8, 0), rc);
     const png_len = zlsx_pkg.anchors_ndjson.fixture.png_bytes.len;
-    var expected_buf: [2048]u8 = undefined;
+    var expected_buf: [4096]u8 = undefined;
+    // Report's chart is FIRST in its drawing's document order; the
+    // stream still puts the sheet's images first — the regrouping is
+    // the contract, not an echo of the fixture (Codex #214 r1 MNT-101).
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
+        "{{\"kind\":\"image_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,\"part\":\"xl/media/image1.png\"," ++
+            "\"anchor\":\"two_cell\",\"from\":{{\"row\":1,\"col\":1,\"row_off\":0,\"col_off\":0}}," ++
+            "\"to\":{{\"row\":4,\"col\":3,\"row_off\":0,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
+            "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
             "\"anchor\":\"two_cell\",\"from\":{{\"row\":3,\"col\":2,\"row_off\":0,\"col_off\":9525}}," ++
             "\"to\":{{\"row\":8,\"col\":5,\"row_off\":19050,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
             "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
@@ -9585,7 +9591,7 @@ test "runAnchorsCommand: every sheet by default, exact wire shape" {
             "\"anchor\":\"one_cell\",\"from\":{{\"row\":2,\"col\":6,\"row_off\":0,\"col_off\":0}},\"to\":null," ++
             "\"absolute\":null,\"chart_type\":\"bar\"," ++
             "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]}}\n",
-        .{ png_len, png_len },
+        .{ png_len, png_len, png_len },
     );
     try std.testing.expectEqualStrings(expected, w.buffered());
 }
@@ -9600,7 +9606,7 @@ test "runAnchorsCommand: selection, pagination, compact prologue, exit codes" {
     defer std.testing.allocator.free(path);
     try zlsx_pkg.anchors_ndjson.fixture.write(std.testing.allocator, io, path, .image_and_chart);
 
-    // The anchor-less sheet selected by index: an empty, successful stream.
+    // --sheet narrows to Data: just its image, under the full envelope.
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
@@ -9608,20 +9614,51 @@ test "runAnchorsCommand: selection, pagination, compact prologue, exit codes" {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_index = 0 }, &w, &err_w);
         try std.testing.expectEqual(@as(u8, 0), rc);
-        try std.testing.expectEqualStrings("", w.buffered());
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
     }
-    // By name, compact: one prologue, envelope-less records.
+    // Compact across every sheet: one prologue per contributing sheet,
+    // envelope-less records after each.
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
         var err_buf: [256]u8 = undefined;
         var err_w = std.Io.Writer.fixed(&err_buf);
-        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_name = "Report", .output = .compact_ndjson }, &w, &err_w);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .output = .compact_ndjson }, &w, &err_w);
         try std.testing.expectEqual(@as(u8, 0), rc);
         const got = w.buffered();
-        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n{\"kind\":\"image_anchor\",\"part\":"));
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\"kind\":\"sheet\""));
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0}\n{\"kind\":\"image_anchor\",\"part\":"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n{\"kind\":\"image_anchor\",\"part\":") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\"kind\":\"sheet\""));
         try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet_idx\":1,\"part\"") == null);
+    }
+    // Compact + --skip past Data's record: only Report contributes, so
+    // only Report's prologue is emitted.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .output = .compact_ndjson, .skip = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\"kind\":\"sheet\""));
+    }
+    // --skip / --take page GLOBALLY across the sheet boundary: skip
+    // Data's image, take Report's image + chart.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .skip = 1, .take = 2 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Report\","));
+        try std.testing.expect(std.mem.indexOf(u8, got, "{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
     }
     // --sheet-glob widens by name; --skip / --take page the stream.
     {
@@ -9634,6 +9671,16 @@ test "runAnchorsCommand: selection, pagination, compact prologue, exit codes" {
         const got = w.buffered();
         try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"chart_anchor\","));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+    }
+    // A glob matching zero sheets is an empty, successful stream.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runAnchorsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .anchors, .sheet_glob = "Zzz*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
     }
     // Unknown sheet: exit 3, like every read sub-command.
     {

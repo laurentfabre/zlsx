@@ -259,11 +259,23 @@ drawing of shapes only (shapes are not modelled). The command routes
 through the package layer like `pivots`, so an archive the lenient
 reader tolerates but the package layer refuses is exit 2. A read the
 command cannot serve faithfully refuses whole (exit 2) rather than emit
-a record that lies: an anchor on a worksheet part `xl/workbook.xml`
-does not list (the record could not carry a truthful `sheet`), a sheet
-name or series ref whose carrier does not decode or is not UTF-8, a
-series ref with embedded markup, a part name that is not UTF-8 — a
-partial anchor inventory is the shape of a guard hole. Scope notes
+a record that lies or thin the inventory: an anchor on a worksheet part
+`xl/workbook.xml` does not list (the record could not carry a truthful
+`sheet`); a listed sheet the read cannot place — its relationship
+dangling, mistyped or external, its part absent from the archive, or
+two `<sheet>` entries reaching one part (the same anchor would ride
+out twice under two identities); a drawing structure the walkers
+recognise but cannot read whole — a sheet's drawing relationship, a
+pic's image relationship or a frame's chart relationship that dangles
+or names an absent part, an anchor whose `from` / `to` / `pos` /
+`ext` does not parse (a `two_cell` anchor with an unreadable `<to>`
+must not ride out looking like `one_cell`), an anchor block that never
+closes; a sheet name or series ref whose carrier does not decode or is
+not UTF-8, a series ref with embedded markup, a part name that is not
+UTF-8 — a partial anchor inventory is the shape of a guard hole. (The
+Zig walkers `zlsx_pkg.imageAnchors` / `zlsx_pkg.chartAnchors` keep
+their historical lenient contract — skip what does not parse, no
+crash; the CLI reads their strict variant.) Scope notes
 from the underlying walkers: namespace prefixes are resolved from the
 drawing document itself (alternate bindings to the drawing URIs are
 followed — `pkg/drawings.zig` documents the exact scope); legacy VML
@@ -659,7 +671,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (an anchor on a part `xl/workbook.xml` does not list, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |
