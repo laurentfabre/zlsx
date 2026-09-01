@@ -14655,6 +14655,8 @@ test {
     // (the pkg/control.zig lesson, S1). This target is where its
     // decode round-trips and wire-shape pins run.
     _ = @import("defined_name_ndjson.zig");
+    // S3b slice 4: same lesson, the anchors NDJSON writer.
+    _ = @import("anchor_ndjson.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {

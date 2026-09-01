@@ -125,6 +125,9 @@ pub const pivots = @import("pivots.zig");
 /// `WorkbookXml` view, written once for every surface (the
 /// `pivot_ndjson` precedent; the C and Python legs reuse it).
 pub const defined_names_ndjson = @import("defined_name_ndjson.zig");
+/// S3b: the `anchors` NDJSON records — `imageAnchors` + `chartAnchors`
+/// attributed to workbook sheets, written once for every surface.
+pub const anchors_ndjson = @import("anchor_ndjson.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;
