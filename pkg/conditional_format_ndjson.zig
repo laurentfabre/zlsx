@@ -326,6 +326,16 @@ const RawRule = struct {
 /// kinds have no typed view; Codex #215 r4 REL-404).
 const RootKind = enum { worksheet, macrosheet, barren };
 
+/// Microsoft's macro-sheet namespace — the canonical macro-sheet
+/// root is `<xm:macrosheet>` with `xm` bound to it and the DEFAULT
+/// bound to SpreadsheetML main for the children (MS-OFFMACRO; Codex
+/// #215 r20 REL-2001).
+const ms_macro_ns = "http://schemas.microsoft.com/office/excel/2006/main";
+
+fn isMsMacroNs(uri: []const u8) bool {
+    return std.mem.eql(u8, uri, ms_macro_ns);
+}
+
 const main_ns_transitional = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const main_ns_strict = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
@@ -381,6 +391,21 @@ fn isXmlNsUri(uri: []const u8) bool {
 
 fn isXmlnsNsUri(uri: []const u8) bool {
     return std.mem.eql(u8, uri, xmlns_ns_uri);
+}
+
+/// Reset the per-tag declaration set: a declaration-free tag skips
+/// the clear entirely, and oversized capacity is dropped so one wide
+/// tag cannot tax every later tag with a full-capacity metadata
+/// clear — `clearRetainingCapacity` zeroes the whole retained
+/// capacity (Codex #215 r20 PERF-2001).
+fn resetDeclSeen(a: Allocator, m: *std.StringHashMapUnmanaged(void)) void {
+    if (m.count() == 0) return;
+    if (m.capacity() > 64) {
+        m.deinit(a);
+        m.* = .empty;
+    } else {
+        m.clearRetainingCapacity();
+    }
 }
 
 /// In-scope prefix bindings: a declaration stack (per-frame
@@ -659,7 +684,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             // binding ambiguous; refuse before reading either value
             // (Codex #215 r7 SEC-703). Hashed and uncapped — a fixed
             // table rejected valid XML past its size (r13 REL-1301).
-            decl_seen.clearRetainingCapacity();
+            defer resetDeclSeen(a, &decl_seen);
             while (try it.next()) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
@@ -686,7 +711,6 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             .rule = undefined,
         };
         if (frames.items.len == 0) {
-            if (!is_main) return error.MalformedSheetXml;
             root_seen = true;
             // A chartsheet or dialogsheet cannot carry conditional
             // formatting, so it contributes an empty inventory — but
@@ -694,21 +718,48 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             // bypass the second-root and unterminated-nesting checks,
             // so a truncated chartsheet or a `<worksheet/>` followed
             // by a rule-bearing second root would read as an empty
-            // success (Codex #215 r2 REL-201).
-            const barren = std.mem.eql(u8, qname, "chartsheet") or
-                std.mem.eql(u8, qname, "dialogsheet");
-            if (!barren and
-                !std.mem.eql(u8, qname, "worksheet") and
-                !std.mem.eql(u8, qname, "macrosheet"))
-            {
-                return error.MalformedSheetXml;
+            // success (Codex #215 r2 REL-201). Macro sheets have TWO
+            // legal spellings: the noncanonical unprefixed main-ns
+            // `<macrosheet>`, and Microsoft's canonical
+            // `<xm:macrosheet>` whose prefix binds the macro
+            // namespace ON THIS TAG while the default binds main for
+            // the children (r20 REL-2001) — an arbitrary bound
+            // prefix is not that.
+            var barren = false;
+            var accepted = false;
+            if (is_main) {
+                barren = std.mem.eql(u8, qname, "chartsheet") or
+                    std.mem.eql(u8, qname, "dialogsheet");
+                accepted = barren or
+                    std.mem.eql(u8, qname, "worksheet") or
+                    std.mem.eql(u8, qname, "macrosheet");
+                root_kind = if (barren)
+                    .barren
+                else if (std.mem.eql(u8, qname, "macrosheet"))
+                    .macrosheet
+                else
+                    .worksheet;
+            } else if (elem_main and prefixed) {
+                const c = std.mem.indexOfScalar(u8, qname, ':').?;
+                if (std.mem.eql(u8, qname[c + 1 ..], "macrosheet")) {
+                    var decl_name_buf: [64]u8 = undefined;
+                    const p = qname[0..c];
+                    if (p.len + "xmlns:".len <= decl_name_buf.len) {
+                        const want = std.fmt.bufPrint(&decl_name_buf, "xmlns:{s}", .{p}) catch unreachable;
+                        var it3: AttrScan = .{ .rest = attrs };
+                        while (try it3.next()) |attr3| {
+                            if (std.mem.eql(u8, attr3.name, want)) {
+                                if (try bindsNs(a, attr3.value, isMsMacroNs)) {
+                                    accepted = true;
+                                    root_kind = .macrosheet;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-            root_kind = if (barren)
-                .barren
-            else if (std.mem.eql(u8, qname, "macrosheet"))
-                .macrosheet
-            else
-                .worksheet;
+            if (!accepted) return error.MalformedSheetXml;
             frame.kind = if (barren) .barren_root else .root;
         } else {
             const parent = &frames.items[frames.items.len - 1];
@@ -1189,7 +1240,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             // duplicate `xmlns:r` left the prefix collected under an
             // ambiguous binding (Codex #215 r7 SEC-703). Hashed and
             // uncapped (r13 REL-1301).
-            decl_seen.clearRetainingCapacity();
+            defer resetDeclSeen(gpa, &decl_seen);
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
@@ -1404,7 +1455,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             frames.items[frames.items.len - 1].pkg_default;
         {
             var it: AttrScan = .{ .rest = attrs };
-            decl_seen.clearRetainingCapacity();
+            defer resetDeclSeen(gpa, &decl_seen);
             while (it.next() catch return error.MalformedWorkbookXml) |attr| {
                 const is_decl = std.mem.eql(u8, attr.name, "xmlns") or
                     std.mem.startsWith(u8, attr.name, "xmlns:");
@@ -2118,6 +2169,45 @@ test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts 
         defer wb.deinit();
         try std.testing.expectError(case.err, collect(testing.allocator, &wb));
     }
+}
+
+test "scanSheetRules: the canonical xm:macrosheet root reads; foreign bindings refuse (REL-2001)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Microsoft's canonical macro-sheet root: prefix bound to the
+    // macro namespace, default bound to main for the children.
+    const rules = try scanRules(a, "<xm:macrosheet xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</xm:macrosheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+
+    // An arbitrary bound prefix is not the canonical shape.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<xm:macrosheet xmlns:xm=\"urn:foreign\" xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></xm:macrosheet>"));
+}
+
+test "collect: a canonical macro sheet in a real package keeps its rules (REL-2001)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "macro.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    // Convert Report into an xlMacrosheet: the relationship type and
+    // the part's root spelling, canonical xm-prefixed.
+    try fixture.patchPart(testing.allocator, io, path, "xl/_rels/workbook.xml.rels", "officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"", "officeDocument/2006/relationships/xlMacrosheet\" Target=\"worksheets/sheet2.xml\"");
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<worksheet xmlns=", "<xm:macrosheet xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\" xmlns=");
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "</worksheet>", "</xm:macrosheet>");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 5), view.records.len);
+    try testing.expectEqualStrings("Report", view.records[4].sheet);
+    try testing.expectEqualStrings("A1:A2", view.records[4].sqref);
 }
 
 test "collect: decoded-duplicate sheet names refuse (REL-1901)" {
