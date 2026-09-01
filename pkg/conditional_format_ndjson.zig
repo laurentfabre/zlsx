@@ -133,7 +133,19 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     const sheet_count = strict_sheets.items.len;
 
     const sheet_names = try a.alloc([]const u8, sheet_count);
-    for (strict_sheets.items, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
+    {
+        // Two sheets whose names DECODE to one spelling would make
+        // `--name` silently incomplete — the selector stops at the
+        // first index and the later sheet's rules vanish under exit 0
+        // (Codex #215 r19 REL-1901).
+        var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_names.deinit(gpa);
+        for (strict_sheets.items, 0..) |s, i| {
+            sheet_names[i] = try decodeSheetName(a, s.name);
+            const g = try seen_names.getOrPut(gpa, sheet_names[i]);
+            if (g.found_existing) return error.MalformedWorkbookXml;
+        }
+    }
 
     // Resolve each sheet to its part STRICTLY — the anchors
     // collector's rule: the relationship under the entry's id must
@@ -796,7 +808,10 @@ fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
     var j: usize = 0;
     while (j < body.len and !isXmlWs(body[j])) j += 1;
     const target = body[0..j];
-    if (!validNcName(target)) return null;
+    // PITarget is an XML Name — colons are LEGAL there, unlike in the
+    // namespace-constrained element/attribute QNames (Codex #215 r19
+    // REL-1902).
+    if (!validXmlName(target)) return null;
     if (target.len == 3 and
         (target[0] == 'x' or target[0] == 'X') and
         (target[1] == 'm' or target[1] == 'M') and
@@ -966,6 +981,25 @@ fn validNcName(name: []const u8) bool {
             if (!ncNameStartCp(cp)) return false;
             first = false;
         } else if (!ncNameCharCp(cp)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An XML 1.0 `Name` — the NCName code points PLUS `:` anywhere.
+/// Only PI targets use this; element and attribute names stay under
+/// the namespace-constrained QName rule.
+fn validXmlName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    var it = std.unicode.Utf8View.initUnchecked(name).iterator();
+    var first = true;
+    while (it.nextCodepoint()) |cp| {
+        if (first) {
+            if (cp != ':' and !ncNameStartCp(cp)) return false;
+            first = false;
+        } else if (cp != ':' and !ncNameCharCp(cp)) {
             return false;
         }
     }
@@ -2084,6 +2118,35 @@ test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts 
         defer wb.deinit();
         try std.testing.expectError(case.err, collect(testing.allocator, &wb));
     }
+}
+
+test "collect: decoded-duplicate sheet names refuse (REL-1901)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "dupname.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    // `D_x0061_ta` DECODES to `Data` — `--name Data` would silently
+    // omit the later sheet's rules.
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "name=\"Report\"", "name=\"D_x0061_ta\"");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+}
+
+test "scanSheetRules: a colon-bearing PI target is legal (REL-1902)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rules = try scanRules(a, ws_open ++
+        "<?vendor:tool mode=\"x\" <cfRule/> ?>" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
 }
 
 test "scanSheetRules: the XML declaration itself parses strictly (REL-1801)" {

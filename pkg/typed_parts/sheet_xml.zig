@@ -476,16 +476,18 @@ fn mapRun(
     len: usize,
 ) ParseError!void {
     const list = runs orelse return;
-    if (list.items.len >= max_src_runs) return error.MalformedXml;
     if (list.items.len > 0) {
         const last = &list.items[list.items.len - 1];
         if (last.san_start + last.len == san and
             last.src_start + last.len == src)
         {
+            // The contiguous extension allocates nothing — it must
+            // not trip the budget (Codex #215 r19 PERF-1901).
             last.len += len;
             return;
         }
     }
+    if (list.items.len >= max_src_runs) return error.MalformedXml;
     try list.append(allocator, .{
         .san_start = san,
         .src_start = src,
@@ -1458,6 +1460,11 @@ test "mapRun: the mapped-parse run budget refuses dense-construct amplification 
     while (k < max_src_runs) : (k += 1) {
         try mapRun(testing.allocator, &runs, k * 2, k * 4, 1);
     }
+    // AT the ceiling, a contiguous extension of the final run still
+    // reads (it allocates nothing)…
+    try mapRun(testing.allocator, &runs, (max_src_runs - 1) * 2 + 1, (max_src_runs - 1) * 4 + 1, 1);
+    try testing.expectEqual(max_src_runs, runs.items.len);
+    // …and only a NEW discontinuous run refuses.
     try testing.expectError(error.MalformedXml, mapRun(testing.allocator, &runs, max_src_runs * 2, max_src_runs * 4, 1));
 }
 
