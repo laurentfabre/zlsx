@@ -1067,9 +1067,10 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                      "hyperlink_base":…,
         \\                      "has_custom_properties":bool}
         \\                     Absent fields are null; text is as stored
-        \\                     (the values meta and Editor.doc_props hand
-        \\                     over). A workbook with no docProps parts is
-        \\                     a record of nulls. Workbook-scoped: sheet
+        \\                     (meta's values; Python's Editor.doc_props
+        \\                     maps a present-but-empty element to None).
+        \\                     A workbook with no docProps parts is a
+        \\                     record of nulls. Workbook-scoped: sheet
         \\                     selectors are tolerated and ignored.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
@@ -3235,13 +3236,16 @@ fn writeDocPropsCompact(out: *std.Io.Writer, props: ?zlsx_pkg.DocProps) !void {
 /// S3b: `zlsx doc-props` — the document-properties field set as one
 /// `{"kind":"doc_props",…}` record: every `docProps/core.xml` /
 /// `app.xml` field the typed view models (`null` when absent, text as
-/// stored — byte-for-byte the values `Editor.doc_props` and `meta`
-/// hand over) plus `has_custom_properties`. Routes through the package
-/// layer like `pivots`; a workbook with no docProps parts is a record
-/// of nulls — the absence itself is the one fact the line reports. A
-/// field value that is not UTF-8 refuses the whole command before the
-/// first byte (exit 2): the stream is valid NDJSON or nothing.
-/// Contract in docs/cli.md, "doc-props".
+/// stored — `meta`'s values; Python's `Editor.doc_props` diverges only
+/// by the C boundary's conventions, mapping a present-but-empty
+/// element to None and replacing malformed UTF-8) plus
+/// `has_custom_properties`. Routes through the package layer like
+/// `pivots`; a workbook with no docProps parts is a record of nulls —
+/// the absence itself is the one fact the line reports. A field value
+/// that is not UTF-8 refuses the whole command (exit 2) with nothing
+/// written: every read and validation failure lands before the first
+/// byte (only a stdout I/O failure mid-line can truncate the record,
+/// as on any streaming command). Contract in docs/cli.md, "doc-props".
 fn runDocPropsCommand(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -3260,10 +3264,11 @@ fn runDocPropsCommand(
         try err.flush();
         return 2;
     };
-    // Emit-or-nothing: every present value is validated before the
-    // first byte of the record, so an invalid stream is never
-    // half-written. The values pass through writeJsonString verbatim,
-    // so malformed UTF-8 here would be invalid NDJSON under exit 0.
+    // Every present value is validated before the first byte of the
+    // record, so no read or validation failure can half-write it (a
+    // stdout I/O failure mid-line can, as on any streaming command).
+    // The values pass through writeJsonString verbatim, so malformed
+    // UTF-8 here would be invalid NDJSON under exit 0.
     inline for (doc_prop_fields) |name| {
         if (@field(dp, name)) |v| {
             if (!std.unicode.utf8ValidateSlice(v)) {
@@ -9421,8 +9426,10 @@ fn writeDocPropsFixture(
 ) ![:0]u8 {
     const alloc = std.testing.allocator;
     const path = try tt.path(alloc, io, name);
-    errdefer alloc.free(path);
     {
+        // Block-scoped: popped once the fresh file exists, so the
+        // splice half's `defer` below is the only owner of `path`.
+        errdefer alloc.free(path);
         const writer = xlsx.writer_types;
         var w = writer.Writer.init(alloc);
         defer w.deinit();
@@ -9433,8 +9440,8 @@ fn writeDocPropsFixture(
     if (core_xml == null and app_xml == null and !custom) return path;
     // Splice the parts and save to a second file: the store's lazy
     // part reads may still be backed by the source archive.
-    const out_path = try tt.path(alloc, io, "spliced.xlsx");
     defer alloc.free(path);
+    const out_path = try tt.path(alloc, io, "spliced.xlsx");
     errdefer alloc.free(out_path);
     var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
     defer wb.deinit();
@@ -9542,5 +9549,110 @@ test "parseArgs: doc-props token, workbook-scoped flag tolerance" {
         const argv = [_][]const u8{ "doc-props", "f.xlsx", "--sheet", "2", "--format", "csv" };
         const a = try parseArgs(&argv);
         try std.testing.expectEqual(Subcommand.doc_props, a.subcommand);
+    }
+}
+
+test "runDocPropsCommand: a present-but-empty element is \"\", not null (Codex #213 r1)" {
+    // `<dc:creator></dc:creator>` is present-and-empty: the CLI and
+    // `meta` report "", where Python's Editor.doc_props maps the C
+    // boundary's length-zero convention to None — the documented
+    // divergence, pinned from this side.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const core = "<cp:coreProperties><dc:creator></dc:creator></cp:coreProperties>";
+    const path = try writeDocPropsFixture(io, &tt, "cli_doc_props_empty.xlsx", core, null, false);
+    defer std.testing.allocator.free(path);
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runDocPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .doc_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"kind\":\"doc_props\",\"creator\":\"\","));
+}
+
+test "runDocPropsCommand: a stdout that cannot take the record surfaces WriteFailed" {
+    // The validity floor's promise is scoped to read and validation
+    // failures; an I/O failure mid-line is the stream's, reported, not
+    // swallowed.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeDocPropsFixture(io, &tt, "cli_doc_props_tiny_out.xlsx", null, null, false);
+    defer std.testing.allocator.free(path);
+
+    var scratch: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    try std.testing.expectError(
+        error.WriteFailed,
+        runDocPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .doc_props }, &w, &err_w),
+    );
+}
+
+test "writeDocPropsPretty / writeDocPropsCompact: populated objects, exact bytes (Codex #213 r1)" {
+    // The table refactor's byte identity: both meta emitters walked a
+    // hand-listed field sequence before doc_prop_fields; these literals
+    // pin the loop to the same bytes over a fully-populated view.
+    const dp = zlsx_pkg.DocProps{
+        .creator = "C",
+        .last_modified_by = "L",
+        .title = "T",
+        .subject = "S",
+        .description = "D",
+        .keywords = "K",
+        .category = "G",
+        .created = "2026-01-02T03:04:05Z",
+        .modified = "2026-01-02T03:04:06Z",
+        .revision = "9",
+        .company = "Co",
+        .manager = "M",
+        .application = "App",
+        .hyperlink_base = "H",
+        .has_custom_properties = true,
+    };
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeDocPropsPretty(&w, dp);
+        try std.testing.expectEqualStrings(
+            "  \"doc_props\": {\n" ++
+                "    \"creator\": \"C\",\n" ++
+                "    \"last_modified_by\": \"L\",\n" ++
+                "    \"title\": \"T\",\n" ++
+                "    \"subject\": \"S\",\n" ++
+                "    \"description\": \"D\",\n" ++
+                "    \"keywords\": \"K\",\n" ++
+                "    \"category\": \"G\",\n" ++
+                "    \"created\": \"2026-01-02T03:04:05Z\",\n" ++
+                "    \"modified\": \"2026-01-02T03:04:06Z\",\n" ++
+                "    \"revision\": \"9\",\n" ++
+                "    \"company\": \"Co\",\n" ++
+                "    \"manager\": \"M\",\n" ++
+                "    \"application\": \"App\",\n" ++
+                "    \"hyperlink_base\": \"H\",\n" ++
+                "    \"has_custom_properties\": true\n  },\n",
+            w.buffered(),
+        );
+    }
+    {
+        var scratch: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        try writeDocPropsCompact(&w, dp);
+        try std.testing.expectEqualStrings(
+            ",\"doc_props\":{\"creator\":\"C\",\"last_modified_by\":\"L\",\"title\":\"T\"," ++
+                "\"subject\":\"S\",\"description\":\"D\",\"keywords\":\"K\",\"category\":\"G\"," ++
+                "\"created\":\"2026-01-02T03:04:05Z\",\"modified\":\"2026-01-02T03:04:06Z\"," ++
+                "\"revision\":\"9\",\"company\":\"Co\",\"manager\":\"M\",\"application\":\"App\"," ++
+                "\"hyperlink_base\":\"H\",\"has_custom_properties\":true}",
+            w.buffered(),
+        );
     }
 }

@@ -189,7 +189,12 @@ field the typed view models, plus a presence flag for
 `docProps/custom.xml` (whose arbitrary key/value pairs zlsx deliberately
 does not model). This is the read `meta` embeds as its `doc_props`
 object and `Editor.doc_props` returns over the C ABI, promoted to a
-typed report of its own — same fields, same order, same values.
+typed report of its own — same field set, same order, same raw values,
+with two boundary-convention divergences: a present-but-empty element
+(`<dc:creator></dc:creator>`) is `""` here and in `meta`, while the C
+ABI's length-zero convention makes Python's `Editor.doc_props` report
+it as `None`; and a malformed-UTF-8 value refuses here (below) where
+Python decodes it with replacement characters.
 
 ```jsonl
 {"kind":"doc_props","creator":"Alex","last_modified_by":"Alex","title":null,"subject":null,"description":null,"keywords":null,"category":null,"created":"2014-03-07T16:08:25Z","modified":"2017-08-27T03:03:25Z","revision":null,"company":null,"manager":null,"application":"Microsoft Excel","hyperlink_base":null,"has_custom_properties":false}
@@ -199,17 +204,21 @@ Absent fields are `null` — never omitted, so consumers can index without
 existence checks — and a workbook with no docProps parts at all is a
 record of nulls under exit 0: the absence itself is the one fact the
 line reports. Values are the element text **as stored** (XML entities as
-written, timestamps verbatim W3CDTF) — byte-for-byte what
-`Editor.doc_props` and `meta` hand over, not a re-decoding; a field
-value that is not UTF-8 refuses the whole command (exit 2) before the
-first byte, the family's validity floor. The command routes through the
-package layer like `pivots`, so an archive the lenient reader tolerates
-but the package layer refuses is exit 2 (where `meta`, a Book-route
-command, degrades to `"doc_props": null` instead — its own contract).
-There is no sheet dimension: sheet selectors and `--format` are
-tolerated and ignored (the `meta` family's wrapper-friendliness), and
-`--skip` / `--take` do not apply to a single-record report. The
-metadata this command reports is what `scrub-metadata` removes.
+written, timestamps verbatim W3CDTF), not a re-decoding; a field value
+that is not UTF-8 refuses the whole command (exit 2) with nothing
+written, the family's validity floor — every read and validation
+failure lands before the first byte (only a stdout I/O failure mid-line,
+exit 5, can truncate the record, as on any streaming command). The
+command routes through the package layer like `pivots`, so an archive
+the lenient reader tolerates but the package layer refuses is exit 2
+(where `meta`, a Book-route command, degrades to `"doc_props": null`
+instead — its own contract). There is no sheet dimension: sheet
+selectors and `--format` are tolerated and ignored (the `meta` family's
+wrapper-friendliness), and `--skip` / `--take` do not apply to a
+single-record report. The identifying subset of this report is what
+`scrub-metadata` removes by default — `application`, `created`,
+`modified` and `revision` are deliberately preserved by its default
+mask (its contract, not this one).
 
 ### Edit (load-modify-save)
 
