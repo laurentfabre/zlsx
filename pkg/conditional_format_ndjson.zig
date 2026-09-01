@@ -583,6 +583,16 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 continue;
             }
         }
+        if (lt + 1 < xml.len and xml[lt + 1] == '?') {
+            if (isPrologXmlDecl(xml, lt)) {
+                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
+                    return error.MalformedSheetXml;
+                i = end + 2;
+                continue;
+            }
+            i = skipStrictPi(xml, lt) orelse return error.MalformedSheetXml;
+            continue;
+        }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedSheetXml;
         if (skip_to != lt) {
             i = skip_to;
@@ -776,6 +786,36 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
 /// `<!-- bad -- <conditionalFormatting>…</conditionalFormatting> -->`
 /// swallow a rule block into a malformed comment under exit 0 (Codex
 /// #215 r15 REL-1501). Null = malformed or unterminated.
+/// A strict PI skipper for the walkers: the target must be a
+/// non-empty XML Name that is not `xml` in any case (the reserved
+/// declaration target — the prolog's declaration is admitted
+/// separately by position). A delimiter-only skip accepted
+/// `<? <conditionalFormatting>…' as a PI and thinned the inventory
+/// (Codex #215 r17 REL-1702). Null = malformed or unterminated.
+fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
+    const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse return null;
+    const body = xml[lt + 2 .. end];
+    var j: usize = 0;
+    while (j < body.len and !isXmlWs(body[j])) j += 1;
+    const target = body[0..j];
+    if (!validNcName(target)) return null;
+    if (target.len == 3 and
+        (target[0] == 'x' or target[0] == 'X') and
+        (target[1] == 'm' or target[1] == 'M') and
+        (target[2] == 'l' or target[2] == 'L')) return null;
+    return end + 2;
+}
+
+/// The document's XML declaration — admitted only as the very first
+/// construct (a BOM aside).
+fn isPrologXmlDecl(xml: []const u8, lt: usize) bool {
+    const at_start = lt == 0 or
+        (lt == 3 and std.mem.startsWith(u8, xml, "\xEF\xBB\xBF"));
+    if (!at_start) return false;
+    if (lt + 5 > xml.len or !std.mem.eql(u8, xml[lt .. lt + 5], "<?xml")) return false;
+    return lt + 5 >= xml.len or isXmlWs(xml[lt + 5]) or xml[lt + 5] == '?';
+}
+
 fn skipStrictComment(xml: []const u8, lt: usize) ?usize {
     const end = std.mem.indexOfPos(u8, xml, lt + 4, "-->") orelse return null;
     const body = xml[lt + 4 .. end];
@@ -1012,6 +1052,16 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                 continue;
             }
         }
+        if (lt + 1 < xml.len and xml[lt + 1] == '?') {
+            if (isPrologXmlDecl(xml, lt)) {
+                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
+                    return error.MalformedWorkbookXml;
+                i = end + 2;
+                continue;
+            }
+            i = skipStrictPi(xml, lt) orelse return error.MalformedWorkbookXml;
+            continue;
+        }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedWorkbookXml;
         if (skip_to != lt) {
             i = skip_to;
@@ -1223,6 +1273,16 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 i = skipStrictComment(xml, lt) orelse return error.MalformedWorkbookXml;
                 continue;
             }
+        }
+        if (lt + 1 < xml.len and xml[lt + 1] == '?') {
+            if (isPrologXmlDecl(xml, lt)) {
+                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
+                    return error.MalformedWorkbookXml;
+                i = end + 2;
+                continue;
+            }
+            i = skipStrictPi(xml, lt) orelse return error.MalformedWorkbookXml;
+            continue;
         }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedWorkbookXml;
         if (skip_to != lt) {
@@ -1982,6 +2042,75 @@ test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts 
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
         try std.testing.expectError(case.err, collect(testing.allocator, &wb));
+    }
+}
+
+test "scanSheetRules: PIs validate strictly; the prolog declaration stays legal (REL-1702)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cf_doc = "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>";
+    // An empty PITarget is not a PI — a delimiter-only skip let it
+    // swallow rule-shaped bytes.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<? " ++ cf_doc ++ " ?></worksheet>"));
+    // The reserved `xml` target may only be the document's prolog
+    // declaration, never an in-root PI.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<?xml version=\"1.0\"?><sheetData/></worksheet>"));
+    // A valid vendor PI is non-element content wherever it appears —
+    // rule-shaped data inside it stays uncounted, and the prolog
+    // declaration still reads.
+    const rules = try scanRules(a, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++ ws_open ++
+        "<?vendor " ++ cf_doc ++ " ?>" ++ cf_doc ++ "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "collect: carrier classes stay split — ST_Xstring on names, entities-only elsewhere (MNT-1703)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    // `_x006F_` decodes in a sheet NAME (string carrier)…
+    {
+        const path = try tt.path(testing.allocator, io, "car1.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "name=\"Report\"", "name=\"Rep_x006F_rt\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqualStrings("Report", view.sheet_names[1]);
+        try testing.expectEqualStrings("Report", view.records[4].sheet);
+    }
+    // …stays LITERAL in sqref and formulas (formula carrier, no
+    // ST_Xstring layer)…
+    {
+        const path = try tt.path(testing.allocator, io, "car2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "sqref=\"A1:A4\"", "sqref=\"_x0041_1:A4\"");
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<formula>2</formula>", "<formula>_x0041_1</formula>");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqualStrings("_x0041_1:A4", view.records[0].sqref);
+        try testing.expectEqualStrings("_x0041_1", view.records[0].formulas[0]);
+    }
+    // …and an ill-formed escape in a sheet name refuses.
+    {
+        const path = try tt.path(testing.allocator, io, "car3.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "name=\"Report\"", "name=\"Rep_xD800_rt\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
     }
 }
 

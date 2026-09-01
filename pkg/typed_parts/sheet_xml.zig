@@ -208,6 +208,18 @@ pub const SheetXml = struct {
         if (lo == 0) return null;
         const run = self.src_runs[lo - 1];
         if (off + slice.len > run.san_start + run.len) return null;
+        // The exact span only stands when the slice's boundaries are
+        // INTERIOR to the run: a slice starting at the run's first
+        // byte (or ending at its last, with sanitized content beyond)
+        // sits flush against a stripped or re-encoded construct — a
+        // leading `<!--c-->D1` or trailing `D1<!--c-->` body whose
+        // raw form extends into that construct, which only the
+        // verified covering path may decide (Codex #215 r17
+        // REL-1701). Two fully contiguous runs merge at build time,
+        // so a boundary here is always a discontinuity.
+        if (off == run.san_start and lo >= 2) return null;
+        if (off + slice.len == run.san_start + run.len and
+            run.san_start + run.len < self.sanitized.len) return null;
         const src_lo = run.src_start + (off - run.san_start);
         return .{ src_lo, src_lo + slice.len };
     }
@@ -247,9 +259,11 @@ pub const SheetXml = struct {
         return .{ raw_lo, raw_hi };
     }
 
-    /// Source position for a sanitized START offset: inside a run →
-    /// exact; at or past a run's end (a gap) → that run's source end,
-    /// where the re-encoded raw construct begins.
+    /// Source position for a sanitized START offset: interior to a
+    /// run → exact; at a run's first byte after a discontinuity, or
+    /// past a run's end (a gap) → the PRECEDING contiguity's source
+    /// end, where the stripped/re-encoded raw construct begins — so a
+    /// leading comment/PI joins the covering span (REL-1701).
     fn srcPosOfStart(self: *const SheetXml, off: usize) ?usize {
         const runs = self.src_runs;
         var lo: usize = 0;
@@ -260,13 +274,18 @@ pub const SheetXml = struct {
         }
         if (lo == 0) return null;
         const run = runs[lo - 1];
+        if (off == run.san_start and lo >= 2) {
+            const prev = runs[lo - 2];
+            return prev.src_start + prev.len;
+        }
         if (off < run.san_start + run.len) return run.src_start + (off - run.san_start);
         return run.src_start + run.len;
     }
 
-    /// Source position for a sanitized END offset: inside (or at the
-    /// end of) a run → exact; in a gap → the FOLLOWING run's source
-    /// start, where the raw close construct begins.
+    /// Source position for a sanitized END offset: interior to a run
+    /// → exact; at a run's last byte with a following discontinuity,
+    /// or in a gap → the FOLLOWING run's source start, so a trailing
+    /// comment/PI joins the covering span (REL-1701).
     fn srcPosOfEnd(self: *const SheetXml, end_off: usize) ?usize {
         const runs = self.src_runs;
         var lo: usize = 0;
@@ -277,6 +296,9 @@ pub const SheetXml = struct {
         }
         if (lo == 0) return null;
         const run = runs[lo - 1];
+        if (end_off == run.san_start + run.len and lo < runs.len) {
+            return runs[lo].src_start;
+        }
         if (end_off <= run.san_start + run.len) return run.src_start + (end_off - run.san_start);
         if (lo < runs.len) return runs[lo].src_start;
         return null;
