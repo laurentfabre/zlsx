@@ -393,6 +393,22 @@ fn isXmlnsNsUri(uri: []const u8) bool {
     return std.mem.eql(u8, uri, xmlns_ns_uri);
 }
 
+/// The Markup Compatibility and Extensibility namespace (ECMA-376
+/// Part 3). Its DECLARATION is inert — every modern Excel part binds
+/// `mc` and lists `mc:Ignorable` prefixes — but its processing
+/// constructs re-project the tree: `mc:AlternateContent` substitutes
+/// a branch in place, `mc:ProcessContent` lifts a wrapper's children.
+/// The walk implements no MCE processor, so it refuses exactly the
+/// constructs whose projection could reach a recognized slot (Codex
+/// #215 r22 SEC-2201); a deep `mc:AlternateContent` — real worksheets
+/// wrap `<oleObject>` alternates — projects in place inside an
+/// already-opaque subtree and stays walkable.
+const mce_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+fn isMceNs(uri: []const u8) bool {
+    return std.mem.eql(u8, uri, mce_ns);
+}
+
 /// Reset the per-tag declaration set: a declaration-free tag skips
 /// the clear entirely, and oversized capacity is dropped so one wide
 /// tag cannot tax every later tag with a full-capacity metadata
@@ -414,8 +430,10 @@ fn resetDeclSeen(a: Allocator, m: *std.StringHashMapUnmanaged(void)) void {
 /// was quadratic against a tag with many declarations and many
 /// prefixed attributes (Codex #215 r15 PERF-1501).
 const PrefixScope = struct {
-    stack: std.ArrayListUnmanaged([]const u8) = .empty,
-    counts: std.StringHashMapUnmanaged(u32) = .empty,
+    const Entry = struct { prefix: []const u8, prev_mce: ?bool };
+    const Bind = struct { count: u32, mce: bool };
+    stack: std.ArrayListUnmanaged(Entry) = .empty,
+    counts: std.StringHashMapUnmanaged(Bind) = .empty,
 
     fn deinit(self: *PrefixScope, a: Allocator) void {
         self.stack.deinit(a);
@@ -426,21 +444,30 @@ const PrefixScope = struct {
         return self.stack.items.len;
     }
 
-    fn declare(self: *PrefixScope, a: Allocator, p: []const u8) !void {
-        try self.stack.append(a, p);
+    fn declare(self: *PrefixScope, a: Allocator, p: []const u8, mce: bool) !void {
+        const prev: ?bool = if (self.counts.get(p)) |b| b.mce else null;
+        try self.stack.append(a, .{ .prefix = p, .prev_mce = prev });
         const g = try self.counts.getOrPut(a, p);
-        if (g.found_existing) g.value_ptr.* += 1 else g.value_ptr.* = 1;
+        if (g.found_existing) {
+            g.value_ptr.count += 1;
+            g.value_ptr.mce = mce;
+        } else {
+            g.value_ptr.* = .{ .count = 1, .mce = mce };
+        }
     }
 
     fn truncate(self: *PrefixScope, to: usize) void {
         while (self.stack.items.len > to) {
-            const p = self.stack.items[self.stack.items.len - 1];
+            const e = self.stack.items[self.stack.items.len - 1];
             self.stack.items.len -= 1;
-            const v = self.counts.getPtr(p).?;
-            if (v.* == 1) {
-                _ = self.counts.remove(p);
+            const v = self.counts.getPtr(e.prefix).?;
+            if (v.count == 1) {
+                _ = self.counts.remove(e.prefix);
             } else {
-                v.* -= 1;
+                v.count -= 1;
+                // The popped binding shadowed an outer one — restore
+                // that outer binding's classification.
+                v.mce = e.prev_mce.?;
             }
         }
     }
@@ -448,6 +475,12 @@ const PrefixScope = struct {
     fn contains(self: *const PrefixScope, p: []const u8) bool {
         if (std.mem.eql(u8, p, "xml")) return true; // implicitly declared
         return self.counts.contains(p);
+    }
+
+    /// Whether the prefix's INNERMOST in-scope binding is the MCE
+    /// namespace (SEC-2201).
+    fn isMce(self: *const PrefixScope, p: []const u8) bool {
+        return if (self.counts.get(p)) |b| b.mce else false;
     }
 };
 
@@ -476,6 +509,11 @@ fn enterElementScope(
             // SEC-1201).
             if (try bindsNs(scratch, attr.value, isXmlNsUri)) return error.MalformedSheetXml;
             if (try bindsNs(scratch, attr.value, isXmlnsNsUri)) return error.MalformedSheetXml;
+            // A default binding of the MCE namespace is the one way
+            // an UNPREFIXED element could be MCE-bound past the
+            // element rule at the recognized slots; no real producer
+            // default-binds it (SEC-2201).
+            if (try bindsNs(scratch, attr.value, isMceNs)) return error.MalformedSheetXml;
         } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
             const p = attr.name["xmlns:".len..];
             if (std.mem.eql(u8, p, "xmlns")) return error.MalformedSheetXml;
@@ -489,7 +527,7 @@ fn enterElementScope(
                 return error.MalformedSheetXml;
             }
             if (try bindsNs(scratch, attr.value, isXmlnsNsUri)) return error.MalformedSheetXml;
-            try scope.declare(scratch, p);
+            try scope.declare(scratch, p, try bindsNs(scratch, attr.value, isMceNs));
         }
     }
     if (std.mem.indexOfScalar(u8, qname, ':')) |c| {
@@ -501,6 +539,16 @@ fn enterElementScope(
         if (std.mem.startsWith(u8, attr.name, "xmlns:")) continue;
         if (std.mem.indexOfScalar(u8, attr.name, ':')) |c| {
             if (!scope.contains(attr.name[0..c])) return error.MalformedSheetXml;
+            // `mc:Ignorable` (and the preserve lists) are inert for a
+            // reader, but `mc:ProcessContent` marks a wrapper whose
+            // children an MCE processor LIFTS — a chain of such
+            // wrappers from a recognized slot down would project a
+            // deep subtree into it (SEC-2201).
+            if (scope.isMce(attr.name[0..c]) and
+                std.mem.eql(u8, attr.name[c + 1 ..], "ProcessContent"))
+            {
+                return error.MalformedSheetXml;
+            }
         }
     }
 }
@@ -556,8 +604,14 @@ fn xmlCharsValid(s: []const u8) bool {
 /// namespace bound to a prefix anywhere, mismatched or unterminated
 /// nesting, a duplicate attribute on the rule machinery, markup where
 /// the schema puts formula text (a CDATA section included — markup is
-/// not the formula, the defined-names ruling), and a rule spelling
-/// more than the schema's three formulas.
+/// not the formula, the defined-names ruling), a rule spelling more
+/// than the schema's three formulas, and — the walk has no MCE
+/// processor — the MCE constructs whose projection could reach a
+/// recognized slot: an MCE-bound element that is a direct child of
+/// the root, a block or a rule, the `mc:ProcessContent` attribute
+/// anywhere, a default binding of the MCE namespace. The `mc`
+/// declaration, `mc:Ignorable`, and a deeper `mc:AlternateContent`
+/// stay inert (SEC-2201).
 /// The walker's nesting ceiling. Excel writes sheet parts a handful
 /// of levels deep; 1024 is two orders of magnitude of headroom, and a
 /// bound keeps a crafted part from growing the frame stack without
@@ -764,6 +818,18 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             frame.kind = if (barren) .barren_root else .root;
         } else {
             const parent = &frames.items[frames.items.len - 1];
+            // An MCE-bound element AT a recognized slot is where
+            // branch substitution could add or hide a block, a rule
+            // or a formula the walk classifies — deeper MCE projects
+            // in place inside an opaque subtree and stays walkable
+            // (SEC-2201).
+            if (std.mem.indexOfScalar(u8, qname, ':')) |c| {
+                const slot = switch (parent.kind) {
+                    .root, .cf_block, .cf_rule => true,
+                    else => false,
+                };
+                if (slot and scope.isMce(qname[0..c])) return error.MalformedSheetXml;
+            }
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "conditionalFormatting")) {
                 frame.kind = .cf_block;
                 frame.sqref = (try uniqueAttr(a, attrs, "sqref")) orelse "";
@@ -1290,6 +1356,15 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             }
         } else {
             const parent = frames.items[frames.items.len - 1];
+            // Inside `<sheets>` an MCE branch could hide a `<sheet>`
+            // from the identity walk; at workbook level the real
+            // `mc:AlternateContent` (absPath et al.) stays opaque —
+            // hiding `<sheets>` itself trips the exactly-one-wrapper
+            // rule below (SEC-2201).
+            if (parent.kind == .sheets_wrap and prefixed) {
+                const c = std.mem.indexOfScalar(u8, qname, ':').?;
+                if (scope.isMce(qname[0..c])) return error.MalformedWorkbookXml;
+            }
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "sheets")) {
                 kind = .sheets_wrap;
                 wraps_seen += 1;
@@ -2198,6 +2273,69 @@ test "scanSheetRules: a long macro-sheet prefix is not a refusal (REL-2101)" {
         "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
         "</" ++ lp ++ ":macrosheet>");
     try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "scanSheetRules: MCE at a recognized slot refuses; inert MCE reads (SEC-2201)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cf = "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>";
+    // A Choice branch, a Fallback branch, an alternate prefix, a
+    // ProcessContent wrapper, a block-slot AlternateContent and a
+    // default MCE binding would each re-project rule machinery a walk
+    // with no MCE processor cannot see.
+    const refusals = [_][]const u8{
+        ws_open ++ "<mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Choice Requires=\"x14\">" ++ cf ++ "</mc:Choice></mc:AlternateContent></worksheet>",
+        ws_open ++ "<mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Fallback>" ++ cf ++ "</mc:Fallback></mc:AlternateContent></worksheet>",
+        ws_open ++ "<q:AlternateContent xmlns:q=\"" ++ mce_ns ++ "\"><q:Choice Requires=\"x14\">" ++ cf ++ "</q:Choice></q:AlternateContent></worksheet>",
+        ws_open ++ "<w:keep xmlns:w=\"urn:x\" xmlns:mc=\"" ++ mce_ns ++ "\" mc:ProcessContent=\"w:keep\">" ++ cf ++ "</w:keep></worksheet>",
+        ws_open ++ "<conditionalFormatting sqref=\"A1\"><mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Choice Requires=\"x14\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></mc:Choice></mc:AlternateContent></conditionalFormatting></worksheet>",
+        ws_open ++ "<wrap xmlns=\"" ++ mce_ns ++ "\">" ++ cf ++ "</wrap></worksheet>",
+    };
+    for (refusals) |xml| {
+        try testing.expectError(error.MalformedSheetXml, scanRules(a, xml));
+    }
+    // The declaration and `mc:Ignorable` are how every modern Excel
+    // part spells MCE, and a DEEP AlternateContent (the real
+    // `<oleObject>` alternate shape) sits inside an opaque subtree —
+    // all inert, the rule still reads.
+    const inert = try scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:mc=\"" ++ mce_ns ++ "\" mc:Ignorable=\"x14ac\">" ++
+        "<oleObjects><mc:AlternateContent><mc:Choice Requires=\"x14\"><oleObject shapeId=\"1025\"/></mc:Choice><mc:Fallback><oleObject shapeId=\"1025\"/></mc:Fallback></mc:AlternateContent></oleObjects>" ++
+        cf ++ "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), inert.len);
+}
+
+test "collect: an MCE branch around a real sheet's rules refuses (SEC-2201)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "mce_sheet.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<conditionalFormatting", "<mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Choice Requires=\"x14\"><conditionalFormatting");
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "</conditionalFormatting>", "</conditionalFormatting></mc:Choice></mc:AlternateContent>");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+}
+
+test "collect: an MCE branch inside <sheets> refuses (SEC-2201)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "mce_wb.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "<sheet name=\"Report\"", "<mc:AlternateContent xmlns:mc=\"" ++ mce_ns ++ "\"><mc:Choice Requires=\"x15\"><sheet name=\"Report\"");
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "</sheets>", "</mc:Choice></mc:AlternateContent></sheets>");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
 }
 
 test "collect: a canonical macro sheet in a real package keeps its rules (REL-2001)" {

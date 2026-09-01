@@ -372,7 +372,18 @@ formula (the schema's `maxOccurs` is 3); a duplicate attribute on a
 block or rule tag; a `sqref`, rule type or formula whose carrier does not decode (a
 bad entity — the character-reference grammar is exact: `&#+65;` and
 `&#1_0;` are not references) or decodes to non-UTF-8 (NDJSON must
-stay parseable); a sheet-name carrier that does not decode. A partial or wrong rule inventory is the shape of a
+stay parseable); a sheet-name carrier that does not decode; and — the
+walk runs no markup-compatibility (MCE) processor — the MCE constructs
+whose projection could reach a rule-carrying slot: an MCE-bound
+element as a direct child of the sheet root, a block or a rule
+(`mc:AlternateContent` substitutes a branch in place), the
+`mc:ProcessContent` attribute anywhere (it lifts a wrapper's
+children), a default binding of the MCE namespace, and an MCE element
+directly inside the workbook's `<sheets>` list. The `mc` declaration
+and `mc:Ignorable` on a root are inert — every modern Excel part
+carries them — and a deeper `mc:AlternateContent` (the real
+`<oleObject>` alternate shape) sits inside an already-opaque subtree
+and stays walkable. A partial or wrong rule inventory is the shape of a
 guard hole. Boundary conventions, pinned as the contract: an absent
 `sqref` or `type` and an empty one are one shape (the empty string);
 a `dxfId` or `priority` that is written but not a plain string of

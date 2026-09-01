@@ -10078,6 +10078,30 @@ test "runConditionalFormatsCommand: a rule the stream cannot carry refuses whole
     try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
 }
 
+test "runConditionalFormatsCommand: an unprocessed MCE branch refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_cf_mce.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.conditional_formats_ndjson.fixture.write(std.testing.allocator, io, path);
+    // An `mc:AlternateContent` at the rule slot needs an MCE
+    // processor to know what Excel would show — without one the whole
+    // command refuses rather than emit a projection-dependent subset.
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<conditionalFormatting", "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x14\"><conditionalFormatting");
+    try zlsx_pkg.conditional_formats_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet1.xml", "</conditionalFormatting>", "</conditionalFormatting></mc:Choice></mc:AlternateContent>");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
 // ─── S3b slice 3: `doc-props` ────────────────────────────────────────
 
 /// A saved fresh-writer workbook with docProps parts spliced in through
