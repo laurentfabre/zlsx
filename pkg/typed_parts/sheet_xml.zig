@@ -211,6 +211,76 @@ pub const SheetXml = struct {
         const src_lo = run.src_start + (off - run.san_start);
         return .{ src_lo, src_lo + slice.len };
     }
+
+    /// The covering RAW span for a view slice that does NOT sit in
+    /// one verbatim run — a body the sanitizer re-encoded from CDATA,
+    /// or split by a stripped comment/PI. The old raw locator
+    /// replaced the WHOLE raw element body of such formulas, and the
+    /// offset map must not regress that valid XML (Codex #215 r16
+    /// REL-1601): the slice's sanitized boundaries map to the
+    /// enclosing raw span (gap starts resolve to the preceding run's
+    /// end, gap ends to the following run's start — constructs are
+    /// contiguous in source), and the span only stands if
+    /// RE-SANITIZING it reproduces the view slice exactly. Null =
+    /// no faithful cover; OutOfMemory propagates.
+    pub fn sourceCoverOf(
+        self: *const SheetXml,
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        slice: []const u8,
+    ) error{OutOfMemory}!?[2]usize {
+        if (slice.len == 0) return null;
+        const base = @intFromPtr(self.sanitized.ptr);
+        const p = @intFromPtr(slice.ptr);
+        if (p < base or p - base + slice.len > self.sanitized.len) return null;
+        const off = p - base;
+
+        const raw_lo = self.srcPosOfStart(off) orelse return null;
+        const raw_hi = self.srcPosOfEnd(off + slice.len) orelse return null;
+        if (raw_lo >= raw_hi or raw_hi > source.len) return null;
+        const resan = sanitizeXml(allocator, source[raw_lo..raw_hi], null) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer allocator.free(@constCast(resan));
+        if (!std.mem.eql(u8, resan, slice)) return null;
+        return .{ raw_lo, raw_hi };
+    }
+
+    /// Source position for a sanitized START offset: inside a run →
+    /// exact; at or past a run's end (a gap) → that run's source end,
+    /// where the re-encoded raw construct begins.
+    fn srcPosOfStart(self: *const SheetXml, off: usize) ?usize {
+        const runs = self.src_runs;
+        var lo: usize = 0;
+        var hi: usize = runs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (runs[mid].san_start <= off) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const run = runs[lo - 1];
+        if (off < run.san_start + run.len) return run.src_start + (off - run.san_start);
+        return run.src_start + run.len;
+    }
+
+    /// Source position for a sanitized END offset: inside (or at the
+    /// end of) a run → exact; in a gap → the FOLLOWING run's source
+    /// start, where the raw close construct begins.
+    fn srcPosOfEnd(self: *const SheetXml, end_off: usize) ?usize {
+        const runs = self.src_runs;
+        var lo: usize = 0;
+        var hi: usize = runs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (runs[mid].san_start <= end_off) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const run = runs[lo - 1];
+        if (end_off <= run.san_start + run.len) return run.src_start + (end_off - run.san_start);
+        if (lo < runs.len) return runs[lo].src_start;
+        return null;
+    }
 };
 
 pub const ParseError = error{
@@ -312,9 +382,14 @@ fn sanitizeXml(
     while (i < xml.len) {
         const c = xml[i];
         if (c != '<') {
-            try mapRun(allocator, runs, out.items.len, i, 1);
-            try out.append(allocator, c);
-            i += 1;
+            // Batch the whole text run: per-byte appends (and their
+            // per-byte run bookkeeping) doubled the sanitize cost of
+            // the gigabyte-sheet fixtures this pass exists to keep
+            // linear.
+            const start = i;
+            while (i < xml.len and xml[i] != '<') i += 1;
+            try mapRun(allocator, runs, out.items.len, start, i - start);
+            try out.appendSlice(allocator, xml[start..i]);
             continue;
         }
         if (i + 4 <= xml.len and std.mem.eql(u8, xml[i .. i + 4], "<!--")) {
@@ -1360,9 +1435,29 @@ test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has 
     const f2 = sx2.conditional_formats[0].formula.?;
     try testing.expectEqualStrings("X1", f2);
     try testing.expect(sx2.sourceSpanOf(f2) == null);
+    // …but the COVERING raw span exists and is the whole CDATA
+    // construct, verified by re-sanitizing (REL-1601).
+    const cover = (try sx2.sourceCoverOf(testing.allocator, xml2, f2)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("<![CDATA[X1]]>", xml2[cover[0]..cover[1]]);
+
+    // A comment-split body covers the same way.
+    const xml3 =
+        "<worksheet><conditionalFormatting sqref=\"A1\">" ++
+        "<cfRule type=\"expression\" priority=\"1\"><formula>D<!--s-->1</formula></cfRule>" ++
+        "</conditionalFormatting></worksheet>";
+    var sx3 = try parse(testing.allocator, xml3);
+    defer sx3.deinit(testing.allocator);
+    const f3 = sx3.conditional_formats[0].formula.?;
+    try testing.expectEqualStrings("D1", f3);
+    try testing.expect(sx3.sourceSpanOf(f3) == null);
+    const cover3 = (try sx3.sourceCoverOf(testing.allocator, xml3, f3)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("D<!--s-->1", xml3[cover3[0]..cover3[1]]);
 
     // A slice from some other buffer maps to nothing either.
     try testing.expect(sx.sourceSpanOf("AB1+C2") == null);
+    try testing.expect((try sx.sourceCoverOf(testing.allocator, xml, "AB1+C2")) == null);
 }
 
 test "parse: cfRule formula scan keeps extractInner's bail-on-decoy shape" {

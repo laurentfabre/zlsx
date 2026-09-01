@@ -12184,9 +12184,18 @@ fn appendMappedPatch(
     slice: []const u8,
     new: []u8,
 ) Error!void {
-    const span = view.sourceSpanOf(slice) orelse return error.NoSheetData;
-    if (span[1] > source.len) return error.NoSheetData;
-    if (!std.mem.eql(u8, source[span[0]..span[1]], slice)) return error.NoSheetData;
+    if (view.sourceSpanOf(slice)) |span| {
+        if (span[1] > source.len) return error.NoSheetData;
+        if (!std.mem.eql(u8, source[span[0]..span[1]], slice)) return error.NoSheetData;
+        try out.append(a, .{ .start = span[0], .end = span[1], .new = new });
+        return;
+    }
+    // A body the sanitizer re-encoded (CDATA) or split (a stripped
+    // comment/PI) has no single verbatim run — its COVERING raw span,
+    // verified by re-sanitizing, is what the pre-map locator replaced
+    // whole, and valid XML must keep rewriting (Codex #215 r16
+    // REL-1601).
+    const span = (try view.sourceCoverOf(a, source, slice)) orelse return error.NoSheetData;
     try out.append(a, .{ .start = span[0], .end = span[1], .new = new });
 }
 
@@ -16162,6 +16171,66 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     try std.testing.expectEqualStrings("E1", cfs[1].formula.?);
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
+}
+
+test "rewrite DV/CF: CDATA and comment-split formula bodies still rewrite (REL-1601)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-cover-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // Valid XML the map's exact path cannot place: a CDATA-encoded
+        // CF formula and a comment-split DV formula — the pre-map
+        // locator replaced their WHOLE raw bodies, and the covering
+        // span must keep doing so (the fixture keeps a second sheet, so
+        // a mid-sweep refusal would fail the whole edit visibly).
+        const dv =
+            \\<dataValidations count="1"><dataValidation type="whole" operator="greaterThan" sqref="A1:A3"><formula1>D<!--split-->1</formula1></dataValidation></dataValidations>
+        ;
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula><![CDATA[D1]]></formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-cover-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const dvs = try ws.validations();
+    try std.testing.expectEqualStrings("E1", dvs[0].formula1.?);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
+    // The whole raw bodies were replaced — plain text now, exactly as
+    // the pre-map locator wrote them.
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>E1</formula1>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 
