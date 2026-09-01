@@ -265,6 +265,53 @@ def check_cell(surface: str, cell: str, ctx: dict) -> list[str]:
     return [f"{surface}: cell `{cell[:30]}` does not start with ✓ ~ ⛔ — or n/a"]
 
 
+BUILD = REPO / "build.zig"
+
+
+def fuzz_row_problems(matrix: str) -> list[str]:
+    """Every `.fuzz = true` root in build.zig must appear in the
+    coverage-guided-fuzz row of the cross-cutting table, so a fuzz
+    binary cannot be added (or renamed) without the inventory noticing
+    (MNT-2402)."""
+    src = "\n".join(
+        line.split("//", 1)[0]
+        for line in BUILD.read_text(encoding="utf-8").splitlines()
+    )
+    lines = src.splitlines()
+    roots: set[str] = set()
+    for i, line in enumerate(lines):
+        m = re.search(r'\.root_source_file = b\.path\("([^"]+)"\)', line)
+        if not m:
+            continue
+        for look in lines[i + 1 : i + 8]:
+            if "});" in look:
+                break
+            if ".fuzz = true" in look:
+                roots.add(m.group(1))
+                break
+    # The walker loop's roots come from its array literal
+    # (`b.path(w.path)` carries no string to match on).
+    walker = re.search(r"walker_fuzz = \[_\][^;]*?\};", src, re.S)
+    if walker:
+        roots.update(re.findall(r'\.path = "([^"]+)"', walker.group(0)))
+    row = next(
+        (l for l in matrix.splitlines() if l.startswith("| Coverage-guided fuzz binaries")),
+        None,
+    )
+    if row is None:
+        return ["surface-matrix: the coverage-guided fuzz row is missing"]
+    expanded = row
+    for m in re.finditer(r"([^\s`|{]*)\{([^}]*)\}([^\s`|]*)", row):
+        expanded += " " + " ".join(
+            m.group(1) + part + m.group(3) for part in m.group(2).split(",")
+        )
+    return [
+        f"surface-matrix: fuzz row omits `.fuzz = true` root {r} from build.zig"
+        for r in sorted(roots)
+        if r not in expanded
+    ]
+
+
 def main() -> int:
     matrix = MATRIX.read_text(encoding="utf-8")
     members, top_level, errors = zig_index()
@@ -299,6 +346,8 @@ def main() -> int:
             for tok in cells[5].replace("·", " ").split():
                 if not ROW_ID.match(tok) or tok not in ctx["rows"]:
                     problems.append(f"{MATRIX.name}:{lineno}: Row column names unknown row `{tok}`")
+
+    problems += fuzz_row_problems(matrix)
 
     if problems:
         print("\n".join(problems))

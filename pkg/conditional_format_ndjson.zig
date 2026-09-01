@@ -2362,6 +2362,19 @@ test "scanSheetRules: MCE binding state — entity spelling and shadow restore (
         "<mc:AlternateContent><mc:Choice/></mc:AlternateContent></worksheet>"));
 }
 
+/// The rels-part fuzz seed and its matching store entry: with an
+/// EMPTY expected list the verifier exits before the carrier
+/// decoders, so the fuzz walk also runs against one matching internal
+/// relationship (Codex #215 r24 MNT-2401).
+const rels_seed_xml = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"t\" Target=\"x\"/></Relationships>";
+
+fn verifySeedRels(a: Allocator, xml: []const u8) Error!void {
+    const seed = [_]store_mod.Relationship{
+        .{ .id = "rId1", .type = "t", .target = "x", .target_mode = .internal },
+    };
+    return verifyWorkbookRels(a, xml, &seed);
+}
+
 fn fuzzScannersTarget(_: void, smith: *std.testing.Smith) anyerror!void {
     @disableInstrumentation();
     // 4 KiB matches the sheet_edit harness's scratch bound.
@@ -2377,6 +2390,7 @@ fn fuzzScannersTarget(_: void, smith: *std.testing.Smith) anyerror!void {
     var sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
     scanWorkbookSheets(a, input, &sheets) catch {};
     verifyWorkbookRels(a, input, &.{}) catch {};
+    verifySeedRels(a, input) catch {};
 }
 
 /// The shapes the review rounds actually broke, plus the truncations
@@ -2391,7 +2405,7 @@ const scanner_fuzz_corpus = [_][]const u8{
     ws_open ++ "<!--",
     ws_open ++ "<?tgt",
     "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"a\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"t\" Target=\"x\"/></Relationships>",
+    rels_seed_xml,
     "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:mc=",
     ws_open ++ "<a xmlns:b=\"c\" b:d=\"e\"",
     "<<<<>>>>",
@@ -2399,6 +2413,12 @@ const scanner_fuzz_corpus = [_][]const u8{
 
 test "fuzz: the strict scanners never crash on adversarial XML (MNT-2303)" {
     try std.testing.fuzz({}, fuzzScannersTarget, .{ .corpus = &scanner_fuzz_corpus });
+}
+
+test "verifyWorkbookRels: the canonical fuzz seed verifies whole (MNT-2401)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try verifySeedRels(arena.allocator(), rels_seed_xml);
 }
 
 test "collect: an entity-spelled TargetMode verifies by its decoded value (REL-2301)" {
