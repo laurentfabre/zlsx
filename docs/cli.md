@@ -341,15 +341,19 @@ refuses, the host-predicate rule), a `cfRule` only as a direct child
 of a block, a `formula` only as a text-only direct child of a rule —
 so an extension tree spelling the same names (an `x14` subtree
 rebinding the default namespace, a decoy under `<extLst>`) can never
-ghost a record. The grammar is XML's, not a byte pattern: whitespace
+ghost a record. Namespace bindings compare by their decoded value —
+an entity-spelled alias (`…spreadsheetml&#47;2006/main`) is an alias.
+The grammar is XML's, not a byte pattern: whitespace
 around `=` and either quote read as authored, and a closing tag may
 space before its `>` (`</formula >`). Refused whole (exit 2), nothing
 written: mismatched or unterminated nesting anywhere in the part —
 a truncated part, a second root, and nesting past the walker's
-1024-level ceiling included; a `<formula>` that never closes (a
-refusal, not an absence) or carries markup; a fourth formula (the
-schema's `maxOccurs` is 3); a duplicate attribute on a block or rule
-tag; a `sqref`, rule type or formula whose carrier does not decode (a
+1024-level ceiling included; a `<!DOCTYPE>` or any other markup
+declaration (an internal DTD could define entities whose expansion a
+byte walk cannot see — Excel writes none); a `<formula>` that never
+closes (a refusal, not an absence) or carries markup; a fourth
+formula (the schema's `maxOccurs` is 3); a duplicate attribute on a
+block or rule tag; a `sqref`, rule type or formula whose carrier does not decode (a
 bad entity — the character-reference grammar is exact: `&#+65;` and
 `&#1_0;` are not references) or decodes to non-UTF-8 (NDJSON must
 stay parseable); a sheet-name carrier that does not decode. A partial or wrong rule inventory is the shape of a

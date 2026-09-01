@@ -209,6 +209,23 @@ fn isMainNs(uri: []const u8) bool {
         std.mem.eql(u8, uri, main_ns_strict);
 }
 
+/// A namespace declaration binds by its DECODED value — XML resolves
+/// character references in attribute values, so
+/// `xmlns:x="…spreadsheetml&#47;2006/main"` IS a main-namespace alias
+/// and a raw-byte compare read it as foreign, letting a prefixed rule
+/// subtree traverse as opaque (Codex #215 r3 SEC-301; the S7b-5 host
+/// predicate learned the same in Codex #206 r19 SEC-1901, whose
+/// `decodeScalarAttr` form this reuses). A value that does not decode,
+/// or is longer than the decode buffer (no namespace this walk rules
+/// on is), is not one the walk can rule out — refuse.
+fn bindsMainNs(raw: []const u8) Error!bool {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return isMainNs(raw);
+    var buf: [256]u8 = undefined;
+    const decoded = workbook_xml.decodeScalarAttr(&buf, raw) orelse
+        return error.MalformedSheetXml;
+    return isMainNs(decoded);
+}
+
 /// Walk one sheet part and collect its rules — the strict read the
 /// module doc-comment describes. The tree is tokenized whole (the
 /// workbook scanner's comment / CDATA / PI / DOCTYPE skipping, quote-
@@ -248,6 +265,17 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
     var root_closed = false;
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, xml, i, '<')) |lt| {
+        // A DOCTYPE (or any other `<!…>` declaration that is not a
+        // comment or CDATA section) can define general entities whose
+        // expansion this byte walk cannot see — `&cf;` standing for a
+        // whole rule block would read as an empty success. Refuse the
+        // declaration rather than skip it (Codex #215 r3 SEC-302);
+        // Excel writes none.
+        if (lt + 1 < xml.len and xml[lt + 1] == '!') {
+            const is_comment = lt + 4 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 4], "<!--");
+            const is_cdata = lt + 9 <= xml.len and std.mem.eql(u8, xml[lt .. lt + 9], "<![CDATA[");
+            if (!is_comment and !is_cdata) return error.MalformedSheetXml;
+        }
         const skip_to = workbook_xml.skipNonElement(xml, lt) catch return error.MalformedSheetXml;
         if (skip_to != lt) {
             i = skip_to;
@@ -300,9 +328,9 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     if (saw_default) return error.MalformedSheetXml;
                     saw_default = true;
-                    elem_main = isMainNs(attr.value);
+                    elem_main = try bindsMainNs(attr.value);
                 } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
-                    if (isMainNs(attr.value)) return error.MalformedSheetXml;
+                    if (try bindsMainNs(attr.value)) return error.MalformedSheetXml;
                 }
             }
         }
@@ -748,6 +776,76 @@ test "scanSheetRules: sheet-family roots — chartsheet empty, macrosheet walked
         "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
         "</worksheet>");
     try testing.expectEqual(@as(usize, 1), strict.len);
+}
+
+test "scanSheetRules: namespace bindings compare by their decoded value (SEC-301)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An entity-spelled prefix binding IS a main-namespace alias —
+    // XML resolves character references in attribute values, so a
+    // raw-byte compare let a prefixed rule subtree traverse as opaque.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " ++
+        "xmlns:zz=\"http://schemas.openxmlformats.org/spreadsheetml&#47;2006/main\"><sheetData/></worksheet>"));
+
+    // An entity-spelled DEFAULT main binding is the main namespace —
+    // accepted, not a blanket rejection of every `&`.
+    const rules = try scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml&#47;2006/main\">" ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+
+    // A binding value that does not decode is not one the walk can
+    // rule out.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " ++
+        "xmlns:zz=\"http://x&bogus;y\"><sheetData/></worksheet>"));
+}
+
+test "scanSheetRules: a DOCTYPE cannot smuggle rules past the walk (SEC-302)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An internal DTD can define an entity whose expansion IS a rule
+    // block; the byte walk cannot expand it, so the declaration
+    // refuses rather than the part reading as an empty success.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<!DOCTYPE worksheet [" ++
+        "<!ENTITY cf '<conditionalFormatting><cfRule type=\"expression\"><formula>1</formula></cfRule></conditionalFormatting>'" ++
+        "]>" ++ ws_open ++ "&cf;</worksheet>"));
+
+    // The external form refuses too.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<!DOCTYPE worksheet SYSTEM \"sheet.dtd\">" ++
+        ws_open ++ "<sheetData/></worksheet>"));
+
+    // Comments and CDATA sections keep their handling: skipped as
+    // non-elements, never declarations.
+    const rules = try scanRules(a, ws_open ++
+        "<!-- note --><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "collect: a DOCTYPE or an entity-spelled main alias in a real workbook refuses (SEC-301/302)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const cases = [_]struct { name: []const u8, old: []const u8, new: []const u8 }{
+        .{ .name = "sec1.xlsx", .old = "<worksheet ", .new = "<worksheet xmlns:zz=\"http://schemas.openxmlformats.org/spreadsheetml&#47;2006/main\" " },
+        .{ .name = "sec2.xlsx", .old = "<worksheet ", .new = "<!DOCTYPE worksheet [<!ENTITY cf '<cfRule/>'>]><worksheet " },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", case.old, case.new);
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+    }
 }
 
 test "scanSheetRules: early-root shapes cannot bypass whole-part validation (REL-201)" {
