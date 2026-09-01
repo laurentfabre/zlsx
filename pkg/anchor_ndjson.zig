@@ -148,7 +148,7 @@ pub fn collect(
     const wb_rels = store.rels("xl/workbook.xml");
     const sheet_parts = try a.alloc([]const u8, wb.sheets.len);
     for (wb.sheets, 0..) |s, i| {
-        const rel = relById(wb_rels, s.r_id) orelse return error.MalformedWorkbookXml;
+        const rel = (try relById(a, wb_rels, s.r_id)) orelse return error.MalformedWorkbookXml;
         var typed = false;
         for (sheet_rel_leaves) |leaf| typed = typed or relLeafIs(rel.type, leaf);
         if (!typed) return error.MalformedWorkbookXml;
@@ -352,12 +352,22 @@ fn retainPartName(a: Allocator, name: []const u8) Error![]u8 {
     return a.dupe(u8, name);
 }
 
-fn relById(rels: []const store_mod.Relationship, raw_rid: []const u8) ?store_mod.Relationship {
-    var buf: [128]u8 = undefined;
-    const rid = workbook_xml.decodeScalarAttr(&buf, raw_rid) orelse return null;
-    if (rid.len == 0) return null;
+/// Find a relationship by its raw `r:id` attribute value. The store's
+/// `Relationship.id` is entity-decoded, so a rid spelled without
+/// references matches byte-for-byte at ANY length — no fixed decode
+/// buffer to falsely refuse a long-but-valid id (Codex #214 r2
+/// REL-204). Only a rid that actually carries `&` references needs
+/// the allocating decode.
+fn relById(a: Allocator, rels: []const store_mod.Relationship, raw_rid: []const u8) !?store_mod.Relationship {
+    if (raw_rid.len == 0) return null;
     for (rels) |rel| {
-        if (std.mem.eql(u8, rel.id, rid)) return rel;
+        if (std.mem.eql(u8, rel.id, raw_rid)) return rel;
+    }
+    if (std.mem.indexOfScalar(u8, raw_rid, '&') == null) return null;
+    const decoded = try store_mod.decodeXmlEntities(a, raw_rid);
+    if (decoded.len == 0) return null;
+    for (rels) |rel| {
+        if (std.mem.eql(u8, rel.id, decoded)) return rel;
     }
     return null;
 }
@@ -721,6 +731,22 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
         // A two-cell anchor whose <to> does not parse must refuse, not
         // ride out as one_cell.
         .{ .name = "a3.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:to>", .new = "<xdr:zz>" },
+        // A drawing element whose reference cannot be read is a hole,
+        // not an absence (Codex #214 r2 REL-202).
+        .{ .name = "a4.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "<drawing r:id=\"rIdD1\"/>", .new = "<drawing/>" },
+        // A drawing / chart / image edge reaching a relationship of
+        // the WRONG type with an extant target must refuse, not read a
+        // wrong part (REL-202).
+        .{ .name = "a5.xlsx", .part = "xl/worksheets/_rels/sheet2.xml.rels", .old = "relationships/drawing\"", .new = "relationships/hyperlink\"" },
+        .{ .name = "a6.xlsx", .part = "xl/drawings/_rels/drawing1.xml.rels", .old = "relationships/chart\"", .new = "relationships/hyperlink\"" },
+        .{ .name = "a7.xlsx", .part = "xl/drawings/_rels/drawing2.xml.rels", .old = "relationships/image\"", .new = "relationships/hyperlink\"" },
+        // A one-cell anchor's schema-required <xdr:ext> that is
+        // missing or does not parse (Codex #214 r2 REL-201).
+        .{ .name = "a8.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:ext cx=\"3048000\" cy=\"2286000\"/>", .new = "" },
+        .{ .name = "a9.xlsx", .part = "xl/drawings/drawing1.xml", .old = "cx=\"3048000\"", .new = "cx=\"x\"" },
+        // A real, opened <c:f> that never closes silently thinned the
+        // refs list (Codex #214 r2 REL-203).
+        .{ .name = "a10.xlsx", .part = "xl/charts/chart1.xml", .old = "Data!$B$2:$B$4</c:f>", .new = "Data!$B$2:$B$4" },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);
@@ -734,6 +760,60 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
             collect(testing.allocator, &wb.store, &wb.workbook),
         );
     }
+}
+
+test "collect: an alternate relationship-namespace prefix on <drawing> still walks (REL-202)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_rel_prefix.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<drawing r:id=\"rIdD1\"/>", "<drawing rel:id=\"rIdD1\"/>");
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 3), view.records.len);
+}
+
+test "collect: comment-shaped plot types and carriers do not pollute chart metadata (REL-203)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_comment_fakes.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .image_and_chart);
+    try fixture.patchPart(testing.allocator, io, path, "xl/charts/chart1.xml", "</c:plotArea>", "</c:plotArea><!-- <c:lineChart/><c:f>Fake!A1</c:f> -->");
+    const workbook_mod = @import("workbook.zig");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    defer view.deinit();
+    const chart = view.records[2].chart;
+    try testing.expectEqual(drawings.ChartType.bar, chart.chart_type);
+    try testing.expectEqual(@as(usize, 3), chart.series_refs.len);
+}
+
+test "relById: long and entity-spelled relationship ids resolve (REL-204)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const long_id = "rId" ++ ("x" ** 200);
+    const rels = [_]store_mod.Relationship{
+        .{ .id = long_id, .type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet", .target = "worksheets/sheet1.xml", .target_mode = .internal },
+        .{ .id = "r&d", .type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet", .target = "worksheets/sheet2.xml", .target_mode = .internal },
+    };
+    const by_long = (try relById(a, &rels, long_id)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("worksheets/sheet1.xml", by_long.target);
+    const by_entity = (try relById(a, &rels, "r&amp;d")) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("worksheets/sheet2.xml", by_entity.target);
+    try testing.expect((try relById(a, &rels, "rIdNope")) == null);
 }
 
 test "collect: a sheet list the anchors cannot be attributed against refuses whole (REL-101/102)" {

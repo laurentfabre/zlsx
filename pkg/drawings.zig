@@ -257,13 +257,24 @@ fn collectFromSheet(
 ) !void {
     // Find `<drawing r:id="..."/>` in the sheet XML. Skip the sheet
     // entirely if absent (no anchored objects). A sheet that DOES
-    // declare one whose relationship chain dangles is a drawing the
-    // walk cannot read — strict refuses it whole.
-    const rid = findDrawingRid(sheet_part.bytes) orelse return;
+    // declare one whose reference is unreadable or whose relationship
+    // chain dangles is a drawing the walk cannot read — strict
+    // refuses it whole.
+    const rid = switch (findDrawingRef(sheet_part.bytes)) {
+        .absent => return,
+        .malformed => {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            return;
+        },
+        .rid => |r| r,
+    };
 
-    // Resolve rid → drawing part name via sheet's rels.
+    // Resolve rid → drawing part name via sheet's rels. Strict also
+    // requires the relationship's TYPE to be the drawing edge — an id
+    // that reaches a hyperlink relationship with an extant target
+    // would otherwise read a wrong part as a drawing (REL-202).
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse {
+    const drawing_target = (try relTargetForIdTyped(allocator, sheet_rels, rid, "drawing", mode)) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
@@ -363,7 +374,7 @@ fn scanImagesWithTags(
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
-        const image_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse {
+        const image_target = (try relTargetForIdTyped(allocator, drawing_rels, embed_rid, "image", mode)) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
@@ -394,6 +405,11 @@ fn scanImagesWithTags(
                 // A two-cell anchor without a readable `<to>` must not
                 // ride out looking like a one-cell anchor (REL-101).
                 if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
+            } else if (mode == .strict) {
+                // A one-cell anchor's `<xdr:ext>` is schema-required;
+                // strict validates it even though the extent stays
+                // off the wire (REL-201).
+                if (parseExtAttrs(block, 0, tags.open_ext) == null) return error.MalformedDrawingXml;
             }
         }
 
@@ -417,9 +433,16 @@ fn collectChartsFromSheet(
     mode: WalkMode,
     out: *std.ArrayListUnmanaged(ChartAnchor),
 ) !void {
-    const rid = findDrawingRid(sheet_part.bytes) orelse return;
+    const rid = switch (findDrawingRef(sheet_part.bytes)) {
+        .absent => return,
+        .malformed => {
+            if (mode == .strict) return error.MalformedDrawingXml;
+            return;
+        },
+        .rid => |r| r,
+    };
     const sheet_rels = store.rels(sheet_part.name);
-    const drawing_target = (try relTargetForId(allocator, sheet_rels, rid)) orelse {
+    const drawing_target = (try relTargetForIdTyped(allocator, sheet_rels, rid, "drawing", mode)) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
@@ -510,7 +533,7 @@ fn scanChartsWithTags(
             continue;
         };
 
-        const chart_target = (try relTargetForId(allocator, drawing_rels, embed_rid)) orelse {
+        const chart_target = (try relTargetForIdTyped(allocator, drawing_rels, embed_rid, "chart", mode)) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
@@ -541,13 +564,18 @@ fn scanChartsWithTags(
                 // A two-cell anchor without a readable `<to>` must not
                 // ride out looking like a one-cell anchor (REL-101).
                 if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
+            } else if (mode == .strict) {
+                // A one-cell anchor's `<xdr:ext>` is schema-required;
+                // strict validates it even though the extent stays
+                // off the wire (REL-201).
+                if (parseExtAttrs(block, 0, tags.open_ext) == null) return error.MalformedDrawingXml;
             }
         }
 
         // Each chart's own XML may declare a different `c:` prefix
         // — resolve per-chart to be safe.
         const chart_prefixes = resolveDrawingPrefixes(chart_part.bytes);
-        const refs = try extractSeriesRefs(allocator, chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt);
+        const refs = try extractSeriesRefs(allocator, chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt, mode);
         // If `out.append` OOMs after we just allocated `refs`, the
         // caller's outer errdefer frees the rest but `refs` itself
         // hasn't been transferred yet — free it on the failing path.
@@ -578,6 +606,7 @@ fn extractSeriesRefs(
     xml: []const u8,
     c_prefix: []const u8,
     c_prefix_alt: ?[]const u8,
+    mode: WalkMode,
 ) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
@@ -623,12 +652,38 @@ fn extractSeriesRefs(
         const open_offset = if (winner == .primary) p_pos.? else a_pos.?;
         const open_tag = if (winner == .primary) primary_open else alt_open.?;
         const close_tag = if (winner == .primary) primary_close else alt_close.?;
+        // Markup-shaped text inside a comment / CDATA / PI is not a
+        // formula carrier — `<!-- <c:f>Fake!A1</c:f> -->` must not
+        // add a series ref (Codex #214 r2 REL-203). Jump past the
+        // whole region and rescan.
+        if (isInsideCommentOrCdata(xml, open_offset)) {
+            i = skipRegionContaining(xml, open_offset) orelse open_offset + 1;
+            continue;
+        }
         const start = open_offset + open_tag.len;
-        const close_off = std.mem.indexOfPos(u8, xml, start, close_tag) orelse break;
+        const close_off = std.mem.indexOfPos(u8, xml, start, close_tag) orelse {
+            // A real, opened carrier that never closes: lenient keeps
+            // the historical truncation; strict refuses rather than
+            // silently thinning `series_refs` (REL-203).
+            if (mode == .strict) return error.MalformedDrawingXml;
+            break;
+        };
         try out.append(allocator, xml[start..close_off]);
         i = close_off + close_tag.len;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// True when `needle` occurs in `xml` OUTSIDE every comment / CDATA /
+/// PI region — element detection that markup-shaped text cannot fool
+/// (Codex #214 r2 REL-203).
+fn hasRealMarkup(xml: []const u8, needle: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, i, needle)) |at| {
+        if (!isInsideCommentOrCdata(xml, at)) return true;
+        i = skipRegionContaining(xml, at) orelse at + 1;
+    }
+    return false;
 }
 
 /// Best-effort chart-type detection from the chart-part XML. Looks
@@ -659,14 +714,16 @@ fn detectChartTypeWithAlt(
     };
     const prefixes = [_]?[]const u8{ c_prefix, c_prefix_alt };
     // The same element found under both prefixes is one plot type,
-    // not a compound — track distinct kinds, not matches.
+    // not a compound — track distinct kinds, not matches. Matches
+    // inside comments / CDATA / PIs are text, not plot elements
+    // (Codex #214 r2 REL-203).
     var found: ?ChartType = null;
     for (candidates) |c| {
         var present = false;
         for (prefixes) |maybe_p| {
             const p = maybe_p orelse continue;
             const needle = std.fmt.bufPrint(&buf, "<{s}:{s}", .{ p, c.suffix }) catch continue;
-            if (std.mem.indexOf(u8, chart_xml, needle) != null) present = true;
+            if (hasRealMarkup(chart_xml, needle)) present = true;
         }
         if (!present) continue;
         if (found != null) return .other;
@@ -734,9 +791,103 @@ fn attrValue(attrs: []const u8, key: []const u8) ?[]const u8 {
 /// element is always self-closing in OOXML and lives at sheet scope
 /// (one per sheet at most).
 fn findDrawingRid(sheet_xml: []const u8) ?[]const u8 {
-    const tag = findOpeningTag(sheet_xml, "drawing") orelse return null;
-    const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, tag, '>') orelse return null;
-    return attrValue(sheet_xml[tag .. tag_end + 1], "r:id");
+    return switch (findDrawingRef(sheet_xml)) {
+        .rid => |r| r,
+        .absent, .malformed => null,
+    };
+}
+
+/// The sheet's `<drawing>` reference, tri-state: strict callers must
+/// tell "no drawing element" (nothing to walk) from "a drawing element
+/// whose reference cannot be read" (an inventory hole) — one optional
+/// conflated them and strict mode silently skipped the sheet (Codex
+/// #214 r2 REL-202).
+const DrawingRef = union(enum) {
+    absent,
+    rid: []const u8,
+    malformed,
+};
+
+fn findDrawingRef(sheet_xml: []const u8) DrawingRef {
+    const tag = findOpeningTagAnyPrefix(sheet_xml, "drawing") orelse return .absent;
+    const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, tag, '>') orelse return .malformed;
+    const attrs = sheet_xml[tag .. tag_end + 1];
+    // Canonical spelling first; then any-prefix `*:id` — the
+    // relationships namespace is conventionally bound to `r` but OOXML
+    // producers may pick any prefix.
+    if (attrValue(attrs, "r:id")) |rid| return .{ .rid = rid };
+    if (prefixedIdAttrValue(attrs)) |rid| return .{ .rid = rid };
+    return .malformed;
+}
+
+/// `findOpeningTag`, but also matching `<{prefix}:{name}` for any
+/// NCName-shaped prefix — `<x:drawing r:id=…/>` is valid OOXML that
+/// the unprefixed search missed (Codex #214 r2 REL-202).
+fn findOpeningTagAnyPrefix(xml: []const u8, name: []const u8) ?usize {
+    if (findOpeningTag(xml, name)) |i| return i;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, xml, i, ':')) |colon| {
+        i = colon + 1;
+        const after_name = colon + 1 + name.len;
+        if (after_name >= xml.len) return null;
+        if (!std.mem.eql(u8, xml[colon + 1 .. after_name], name)) continue;
+        const c = xml[after_name];
+        if (!(c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>')) continue;
+        // Walk back over the prefix to the `<`; every intervening
+        // byte must be a name char, so a `:drawing` inside an
+        // attribute value or text does not count.
+        var p = colon;
+        var ok = true;
+        while (p > 0) {
+            p -= 1;
+            const pc = xml[p];
+            if (pc == '<') break;
+            if (!(std.ascii.isAlphanumeric(pc) or pc == '_' or pc == '-' or pc == '.')) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok or xml[p] != '<') continue;
+        if (p + 1 == colon) continue; // `<:name` — an empty prefix is not one.
+        return p;
+    }
+    return null;
+}
+
+/// The value of the first attribute spelled `{prefix}:id` (any
+/// non-empty prefix) in an already-narrowed tag-attributes slice.
+/// A bare `id` attribute is NOT a relationship reference and does
+/// not match. Quote-aware, like `attrValue`.
+fn prefixedIdAttrValue(attrs: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < attrs.len) {
+        const c = attrs[i];
+        if (c == '"' or c == '\'') {
+            const close = std.mem.indexOfScalarPos(u8, attrs, i + 1, c) orelse return null;
+            i = close + 1;
+            continue;
+        }
+        const at_word_boundary = i == 0 or
+            attrs[i - 1] == ' ' or attrs[i - 1] == '\t' or
+            attrs[i - 1] == '\n' or attrs[i - 1] == '\r';
+        if (at_word_boundary and c != '<') {
+            // Read a candidate attribute name: NAME chars up to `=`,
+            // whitespace or end.
+            var j = i;
+            while (j < attrs.len) : (j += 1) {
+                const nc = attrs[j];
+                if (nc == '=' or nc == ' ' or nc == '\t' or nc == '\n' or nc == '\r' or nc == '>' or nc == '/') break;
+            }
+            const key = attrs[i..j];
+            if (key.len > 3 and std.mem.endsWith(u8, key, ":id")) {
+                if (attrValue(attrs, key)) |v| return v;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
 }
 
 /// Find the start of an opening tag named `name` in `xml`, tolerating
@@ -1790,6 +1941,33 @@ fn relTargetForId(
     return r.target;
 }
 
+/// `relTargetForId`, but under `.strict` the relationship's TYPE must
+/// carry the expected leaf (`drawing` / `image` / `chart`): an id
+/// that reaches a differently-typed relationship with an extant
+/// target would otherwise produce a semantically false record instead
+/// of refusing (Codex #214 r2 REL-202). `.lenient` keeps the
+/// historical identity-only lookup.
+fn relTargetForIdTyped(
+    allocator: std.mem.Allocator,
+    rels: []const store_mod.Relationship,
+    id: []const u8,
+    leaf: []const u8,
+    mode: WalkMode,
+) !?[]const u8 {
+    const r = (try relForId(allocator, rels, id)) orelse return null;
+    if (r.target_mode == .external) return null;
+    if (mode == .strict and !relLeafIs(r.type, leaf)) return null;
+    return r.target;
+}
+
+/// Case-insensitive comparison of a relationship type's last path
+/// segment (the `pkg/pivots.zig` helper, duplicated to keep this
+/// module import-light).
+fn relLeafIs(rel_type: []const u8, leaf: []const u8) bool {
+    const l = if (std.mem.lastIndexOfScalar(u8, rel_type, '/')) |i| rel_type[i + 1 ..] else rel_type;
+    return std.ascii.eqlIgnoreCase(l, leaf);
+}
+
 /// Decode the same five named entities + numeric refs into `buf`.
 /// Returns null if the decoded form would exceed buf.len. This is
 /// the lookup-key counterpart to store.zig's decodeXmlEntities —
@@ -1880,15 +2058,26 @@ fn parseAbsoluteAnchor(xml: []const u8, open_pos: []const u8, open_ext: []const 
     const x = std.fmt.parseInt(i64, x_str, 10) catch return null;
     const y = std.fmt.parseInt(i64, y_str, 10) catch return null;
 
-    const ext_idx = std.mem.indexOfPos(u8, xml, pos_end, open_ext) orelse return null;
+    const ext = parseExtAttrs(xml, pos_end, open_ext) orelse return null;
+
+    return .{ .x = x, .y = y, .cx = ext.cx, .cy = ext.cy };
+}
+
+/// Parse the `<{xdr}:ext cx="N" cy="N"/>` child starting the search
+/// at `from_idx`. Shared by the absoluteAnchor parser and the strict
+/// one-cell validation: a oneCellAnchor's extent is REQUIRED by the
+/// schema, and a pic- or chart-bearing one-cell anchor whose extent
+/// does not parse must refuse under strict rather than ride out
+/// (Codex #214 r2 REL-201). The value stays off the wire either way.
+fn parseExtAttrs(xml: []const u8, from_idx: usize, open_ext: []const u8) ?struct { cx: i64, cy: i64 } {
+    const ext_idx = std.mem.indexOfPos(u8, xml, from_idx, open_ext) orelse return null;
     const ext_end = std.mem.indexOfScalarPos(u8, xml, ext_idx, '>') orelse return null;
     const ext_attrs = xml[ext_idx .. ext_end + 1];
     const cx_str = attrValue(ext_attrs, "cx") orelse return null;
     const cy_str = attrValue(ext_attrs, "cy") orelse return null;
     const cx = std.fmt.parseInt(i64, cx_str, 10) catch return null;
     const cy = std.fmt.parseInt(i64, cy_str, 10) catch return null;
-
-    return .{ .x = x, .y = y, .cx = cx, .cy = cy };
+    return .{ .cx = cx, .cy = cy };
 }
 
 fn parseCellAnchor(
@@ -2103,6 +2292,24 @@ test "detectChartType: covers all canonical OOXML chart elements" {
     // The same plot type under BOTH prefixes is one type, not a
     // compound.
     try std.testing.expectEqual(ChartType.bar, detectChartTypeWithAlt("<c:chartSpace><c:barChart/><c2:barChart/>", "c", "c2"));
+    // A plot-type element inside a comment or CDATA section is text,
+    // not a plot (Codex #214 r2 REL-203).
+    try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/><!-- <c:lineChart/> -->", "c"));
+    try std.testing.expectEqual(ChartType.bar, detectChartType("<c:chartSpace><c:barChart/><![CDATA[<c:pieChart/>]]>", "c"));
+}
+
+test "findDrawingRid: a prefixed drawing element and a non-r relationship prefix resolve" {
+    // `<x:drawing rel:id=…/>` is valid OOXML the unprefixed literal
+    // search missed (Codex #214 r2 REL-202).
+    try std.testing.expectEqualStrings(
+        "rId9",
+        findDrawingRid("<x:worksheet><x:drawing rel:id=\"rId9\"/></x:worksheet>").?,
+    );
+    // A bare `id` attribute is NOT a relationship reference.
+    try std.testing.expectEqual(@as(?[]const u8, null), findDrawingRid("<sheet><drawing id=\"1\"/></sheet>"));
+    // Tri-state: an unreadable reference is malformed, not absent.
+    try std.testing.expect(findDrawingRef("<sheet><drawing/></sheet>") == .malformed);
+    try std.testing.expect(findDrawingRef("<sheet><sheetData/></sheet>") == .absent);
 }
 
 test "parseCellAnchor unit test" {
