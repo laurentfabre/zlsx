@@ -3780,10 +3780,24 @@ pub const Workbook = struct {
         var sheet_idx: u32 = 0;
         while (sheet_idx < self.sheetCount()) : (sheet_idx += 1) {
             const ws = try self.sheet(sheet_idx);
-            const view = try ws.ensureParsed();
             const ws_name = try store_mod.decodeXmlEntities(a, ws.name());
             defer a.free(ws_name);
-            const part_name = ws.resolved_part_name.?;
+            const part_name = try ws.resolvePartName();
+            // The rewrite works on its own MAPPED view of the current
+            // part bytes: the source map is rewrite-only (ordinary
+            // typed reads never pay for it — Codex #215 r18
+            // PERF-1801), and a fresh parse can never be stale
+            // against the bytes phase B splices.
+            const src_part = (self.store.part(part_name) catch |e| switch (e) {
+                error.OutOfMemory, error.ZipBombSuspected => return e,
+                else => return Error.MalformedSheetXml,
+            }) orelse return Error.MissingSheetPart;
+            var mapped_view = sheet_xml_mod.parseMapped(self.allocator, src_part.bytes) catch |e| switch (e) {
+                error.MalformedXml, error.UnexpectedEof => return Error.MalformedSheetXml,
+                else => |x| return x,
+            };
+            defer mapped_view.deinit(self.allocator);
+            const view = &mapped_view;
 
             // Two phases. Phase A: rewrite each DV/CF formula body
             // against the typed view, building an indexed plan
@@ -3857,12 +3871,14 @@ pub const Workbook = struct {
             try self.store.replacePart(part_name, new_xml);
             count += @intCast(total);
 
-            // Invalidate the cached parsed view: its leaves borrowed
+            // Invalidate any cached parsed view: its leaves borrowed
             // from the old part bytes which `replacePart` swapped.
-            // Mirrors the invalidation pattern in `Workbook.save`.
-            var stale = ws.parsed.?;
-            stale.deinit(self.allocator);
-            ws.parsed = null;
+            // (The rewrite's own mapped view is local; the Worksheet
+            // cache only exists if some earlier reader parsed.)
+            if (ws.parsed) |*stale| {
+                stale.deinit(self.allocator);
+                ws.parsed = null;
+            }
         }
 
         return count;
@@ -16294,7 +16310,7 @@ test "rewrite DV/CF: CDATA and comment-split formula bodies still rewrite (REL-1
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 
-test "rewrite DV/CF: a part swapped under a cached view refuses the mapped splice (REL-1002)" {
+test "rewrite DV/CF: the rewrite reads the CURRENT part bytes, cached views notwithstanding (REL-1002/r18)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -16319,10 +16335,12 @@ test "rewrite DV/CF: a part swapped under a cached view refuses the mapped splic
     var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
     defer wb.deinit();
     const ws = try wb.sheet(0);
-    // Prime the cached view, then swap the part underneath it — even
-    // with byte-identical content, the dupe is a DIFFERENT source and
-    // the mapped splice must refuse rather than trust old offsets
-    // (equality of a short formula body cannot establish identity).
+    // Prime a cached view, then swap the part underneath it. Since
+    // r18 the rewrite parses its OWN mapped view of the CURRENT part
+    // bytes (the map is rewrite-only), so no stale-cache offset can
+    // reach the splice: the swap simply becomes the truth the rewrite
+    // reads, and the identity gate in appendMappedPatch stays as an
+    // internal invariant.
     _ = try ws.conditionalFormats();
     const part_name = try ws.resolvePartName();
     const part = (try wb.store.part(part_name)).?;
@@ -16332,10 +16350,13 @@ test "rewrite DV/CF: a part swapped under a cached view refuses the mapped splic
 
     const ws_name_owned = try std.testing.allocator.dupe(u8, ws.name());
     defer std.testing.allocator.free(ws_name_owned);
-    try std.testing.expectError(error.NoSheetData, wb.rewriteAllValidationsAndConditionalFormats(
+    const count = try wb.rewriteAllValidationsAndConditionalFormats(
         .{ .insert_cols = .{ .at = 4, .count = 1 } },
         ws_name_owned,
-    ));
+    );
+    try std.testing.expectEqual(@as(u32, 1), count);
+    const cfs = try (try wb.sheet(0)).conditionalFormats();
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
 }
 
 test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync the splice (REL-501)" {

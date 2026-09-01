@@ -585,9 +585,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
         }
         if (lt + 1 < xml.len and xml[lt + 1] == '?') {
             if (isPrologXmlDecl(xml, lt)) {
-                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
-                    return error.MalformedSheetXml;
-                i = end + 2;
+                i = skipStrictXmlDecl(xml, lt) orelse return error.MalformedSheetXml;
                 continue;
             }
             i = skipStrictPi(xml, lt) orelse return error.MalformedSheetXml;
@@ -718,8 +716,8 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                     .rule_type = (try uniqueAttr(a, attrs, "type")) orelse "",
                     .formulas = .{ "", "", "" },
                     .formula_count = 0,
-                    .dxf_id = digitU32(try uniqueAttr(a, attrs, "dxfId")),
-                    .priority = digitU32(try uniqueAttr(a, attrs, "priority")),
+                    .dxf_id = try numericAttr(a, try uniqueAttr(a, attrs, "dxfId")),
+                    .priority = try numericAttr(a, try uniqueAttr(a, attrs, "priority")),
                 };
             } else if (parent.kind == .cf_rule and is_main and std.mem.eql(u8, qname, "formula")) {
                 // Text-only, consumed atomically: the FIRST markup
@@ -803,6 +801,40 @@ fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
         (target[0] == 'x' or target[0] == 'X') and
         (target[1] == 'm' or target[1] == 'M') and
         (target[2] == 'l' or target[2] == 'L')) return null;
+    return end + 2;
+}
+
+/// Strictly parse the document's XML declaration: a required
+/// `version="1.0|1.1"`, then optionally `encoding` (a UTF-8 spelling
+/// — the walkers already require UTF-8 bytes) and `standalone`
+/// (`yes`/`no`), in that order, pseudo-attribute grammar only. The
+/// positional predicate alone admitted `<?xml?>` and even rule-shaped
+/// markup inside the declaration (Codex #215 r18 REL-1801). Null =
+/// malformed.
+fn skipStrictXmlDecl(xml: []const u8, lt: usize) ?usize {
+    const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse return null;
+    if (lt + 5 > end) return null;
+    const body = xml[lt + 5 .. end];
+    var it: AttrScan = .{ .rest = body };
+    const v = (it.next() catch return null) orelse return null;
+    if (!std.mem.eql(u8, v.name, "version")) return null;
+    if (!std.mem.eql(u8, v.value, "1.0") and !std.mem.eql(u8, v.value, "1.1")) return null;
+    var saw_encoding = false;
+    var saw_standalone = false;
+    while (it.next() catch return null) |pa| {
+        if (std.mem.eql(u8, pa.name, "encoding")) {
+            if (saw_encoding or saw_standalone) return null;
+            saw_encoding = true;
+            if (!std.ascii.eqlIgnoreCase(pa.value, "UTF-8") and
+                !std.ascii.eqlIgnoreCase(pa.value, "UTF8")) return null;
+        } else if (std.mem.eql(u8, pa.name, "standalone")) {
+            if (saw_standalone) return null;
+            saw_standalone = true;
+            if (!std.mem.eql(u8, pa.value, "yes") and !std.mem.eql(u8, pa.value, "no")) return null;
+        } else {
+            return null;
+        }
+    }
     return end + 2;
 }
 
@@ -974,12 +1006,25 @@ fn uniqueAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u
     return found;
 }
 
-/// A plain base-10 unsigned integer, or null — `+1`, `1_0` and every
-/// other spelling `std.fmt.parseInt` would admit read as absent, the
-/// written-but-invalid convention `tableHeaderRowCount` set (Codex
-/// #215 r1 REL-104).
-fn digitU32(raw: ?[]const u8) ?u32 {
-    const s = raw orelse return null;
+/// A numeric rule attribute: XML character references resolve FIRST
+/// (`dxfId="&#49;"` is 1 — the `styles_xml` numeric precedent; a
+/// reference that does not decode refuses the inventory), THEN the
+/// digit-only/u32-or-null lexical rule applies to the decoded value
+/// (`+1`, `1_0` and overflow read as absent, the written-but-invalid
+/// convention `tableHeaderRowCount` set) — Codex #215 r1 REL-104,
+/// r18 REL-1802.
+fn numericAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?u32 {
+    const raw = raw_opt orelse return null;
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return digitOnlyU32(raw);
+    const decoded = formula_mod.decode.decodeEntities(scratch, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedSheetXml,
+    };
+    defer scratch.free(decoded);
+    return digitOnlyU32(decoded);
+}
+
+fn digitOnlyU32(s: []const u8) ?u32 {
     if (s.len == 0) return null;
     for (s) |c| {
         if (c < '0' or c > '9') return null;
@@ -1054,9 +1099,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
         }
         if (lt + 1 < xml.len and xml[lt + 1] == '?') {
             if (isPrologXmlDecl(xml, lt)) {
-                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
-                    return error.MalformedWorkbookXml;
-                i = end + 2;
+                i = skipStrictXmlDecl(xml, lt) orelse return error.MalformedWorkbookXml;
                 continue;
             }
             i = skipStrictPi(xml, lt) orelse return error.MalformedWorkbookXml;
@@ -1276,9 +1319,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
         }
         if (lt + 1 < xml.len and xml[lt + 1] == '?') {
             if (isPrologXmlDecl(xml, lt)) {
-                const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse
-                    return error.MalformedWorkbookXml;
-                i = end + 2;
+                i = skipStrictXmlDecl(xml, lt) orelse return error.MalformedWorkbookXml;
                 continue;
             }
             i = skipStrictPi(xml, lt) orelse return error.MalformedWorkbookXml;
@@ -2042,6 +2083,67 @@ test "collect: reserved-prefix and undeclared-prefix shapes refuse across parts 
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
         try std.testing.expectError(case.err, collect(testing.allocator, &wb));
+    }
+}
+
+test "scanSheetRules: the XML declaration itself parses strictly (REL-1801)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Version is mandatory; markup inside the declaration is not a
+    // declaration.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<?xml?>" ++ ws_open ++ "<sheetData/></worksheet>"));
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<?xml <conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting> ?>" ++ ws_open ++ "<sheetData/></worksheet>"));
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, "<?xml version=\"2.7\"?>" ++ ws_open ++ "<sheetData/></worksheet>"));
+    // The full standard prolog reads.
+    const rules = try scanRules(a, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++ ws_open ++
+        "<conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>");
+    try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "collect: numeric attrs resolve entities before lexical typing (REL-1802)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    // `priority="&#49;"` IS 1 — references resolve before the
+    // digit-only rule (the styles_xml numeric precedent)…
+    {
+        const path = try tt.path(testing.allocator, io, "num1.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "priority=\"1\" operator=\"between\"", "priority=\"&#49;\" operator=\"between\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqual(@as(?u32, 1), view.records[0].priority);
+    }
+    // …a reference that does not decode refuses the inventory…
+    {
+        const path = try tt.path(testing.allocator, io, "num2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "priority=\"1\" operator=\"between\"", "priority=\"&bogus;\" operator=\"between\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+    }
+    // …and a decoded non-digit spelling still reads as absent.
+    {
+        const path = try tt.path(testing.allocator, io, "num3.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "priority=\"1\" operator=\"between\"", "priority=\"&#43;1\" operator=\"between\"");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        var view = try collect(testing.allocator, &wb);
+        defer view.deinit();
+        try testing.expectEqual(@as(?u32, null), view.records[0].priority);
     }
 }
 

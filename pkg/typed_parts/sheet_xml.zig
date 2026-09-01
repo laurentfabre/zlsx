@@ -131,6 +131,11 @@ pub const FreezePane = struct {
 /// itself is bounded below 2 GiB (Codex #215 r14 REL-1402).
 pub const SrcRun = struct { san_start: usize, src_start: usize, len: usize };
 
+/// The mapped parse's run budget — vastly beyond any real sheet
+/// (runs only break at comments/PIs/CDATA), and a hard stop on the
+/// dense-construct amplification shape (Codex #215 r18 PERF-1801).
+pub const max_src_runs: usize = 1 << 20;
+
 pub const SheetXml = struct {
     dimension: ?Dimension,
     rows: []Row,
@@ -326,6 +331,20 @@ pub const ParseError = error{
 /// real-world fixtures hung CI for >1h). The sanitizer is O(N), and
 /// the rest of the parser sees no comment markers.
 pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml {
+    return parseInner(allocator, xml, false);
+}
+
+/// `parse` with the sanitized→source contiguity map filled in — the
+/// DV/CF rewriter's variant. Mapping is OPT-IN: a crafted part of
+/// dense tiny constructs can spend ~24 bytes of run per handful of
+/// source bytes, so ordinary typed reads (and the CLI's parse-verdict
+/// gate) never pay for a map they discard (Codex #215 r18 PERF-1801);
+/// a mapped parse additionally refuses past `max_src_runs`.
+pub fn parseMapped(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml {
+    return parseInner(allocator, xml, true);
+}
+
+fn parseInner(allocator: std.mem.Allocator, xml: []const u8, mapped: bool) ParseError!SheetXml {
     assert(xml.len < (1 << 31)); // OOXML sheet parts are bounded; refuse 2 GiB+.
     assert(@TypeOf(allocator) == std.mem.Allocator);
 
@@ -339,7 +358,7 @@ pub fn parse(allocator: std.mem.Allocator, xml: []const u8) ParseError!SheetXml 
     // worksheets — see doc-comment above). The contiguity runs come
     // along so a view slice can be mapped back to its source span.
     var src_runs: std.ArrayListUnmanaged(SrcRun) = .empty;
-    const sanitized = try sanitizeXml(a, xml, &src_runs);
+    const sanitized = try sanitizeXml(a, xml, if (mapped) &src_runs else null);
 
     // Quick well-formedness gate: a worksheet part must contain a
     // `<worksheet` root tag. Anything else is rejected up front so
@@ -457,6 +476,7 @@ fn mapRun(
     len: usize,
 ) ParseError!void {
     const list = runs orelse return;
+    if (list.items.len >= max_src_runs) return error.MalformedXml;
     if (list.items.len > 0) {
         const last = &list.items[list.items.len - 1];
         if (last.san_start + last.len == san and
@@ -1419,6 +1439,28 @@ test "parse: cfRule collects up to three formula bodies in document order" {
     try testing.expect(bodiless.formula3 == null);
 }
 
+test "parse carries no source map; parseMapped does (PERF-1801)" {
+    const xml = "<worksheet><!-- c --><sheetData/></worksheet>";
+    var plain = try parse(testing.allocator, xml);
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), plain.src_runs.len);
+    var mapped = try parseMapped(testing.allocator, xml);
+    defer mapped.deinit(testing.allocator);
+    try testing.expect(mapped.src_runs.len >= 2);
+}
+
+test "mapRun: the mapped-parse run budget refuses dense-construct amplification (PERF-1801)" {
+    var runs: std.ArrayListUnmanaged(SrcRun) = .empty;
+    defer runs.deinit(testing.allocator);
+    // Discontinuous appends up to the ceiling succeed; one more
+    // refuses instead of growing without bound.
+    var k: usize = 0;
+    while (k < max_src_runs) : (k += 1) {
+        try mapRun(testing.allocator, &runs, k * 2, k * 4, 1);
+    }
+    try testing.expectError(error.MalformedXml, mapRun(testing.allocator, &runs, max_src_runs * 2, max_src_runs * 4, 1));
+}
+
 test "mapRun: offsets past u32 map without truncation (REL-1402)" {
     // CDATA re-encoding can grow the sanitized buffer past 4 GiB on
     // a sub-2-GiB source, so run offsets are usize — exercised here
@@ -1436,11 +1478,12 @@ test "mapRun: offsets past u32 map without truncation (REL-1402)" {
 test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has no home" {
     // A comment before the block shifts sanitized offsets away from
     // source offsets; the contiguity runs carry the mapping across.
+    // (`parseMapped` — the plain parse carries no map.)
     const xml =
         "<worksheet><!-- shift --><conditionalFormatting sqref=\"A1\">" ++
         "<cfRule type=\"expression\" priority=\"1\"><formula>AB1+C2</formula></cfRule>" ++
         "</conditionalFormatting></worksheet>";
-    var sx = try parse(testing.allocator, xml);
+    var sx = try parseMapped(testing.allocator, xml);
     defer sx.deinit(testing.allocator);
     const f = sx.conditional_formats[0].formula.?;
     const span = sx.sourceSpanOf(f) orelse return error.TestUnexpectedResult;
@@ -1452,7 +1495,7 @@ test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has 
         "<worksheet><conditionalFormatting sqref=\"A1\">" ++
         "<cfRule type=\"expression\" priority=\"1\"><formula><![CDATA[X1]]></formula></cfRule>" ++
         "</conditionalFormatting></worksheet>";
-    var sx2 = try parse(testing.allocator, xml2);
+    var sx2 = try parseMapped(testing.allocator, xml2);
     defer sx2.deinit(testing.allocator);
     const f2 = sx2.conditional_formats[0].formula.?;
     try testing.expectEqualStrings("X1", f2);
@@ -1468,7 +1511,7 @@ test "sourceSpanOf: view slices map to their source bytes; re-encoded CDATA has 
         "<worksheet><conditionalFormatting sqref=\"A1\">" ++
         "<cfRule type=\"expression\" priority=\"1\"><formula>D<!--s-->1</formula></cfRule>" ++
         "</conditionalFormatting></worksheet>";
-    var sx3 = try parse(testing.allocator, xml3);
+    var sx3 = try parseMapped(testing.allocator, xml3);
     defer sx3.deinit(testing.allocator);
     const f3 = sx3.conditional_formats[0].formula.?;
     try testing.expectEqualStrings("D1", f3);
