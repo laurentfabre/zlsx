@@ -528,8 +528,10 @@ fn parseCharRef(digits: []const u8) ?u21 {
     // XML's grammar is `[0-9]+` / `x[0-9a-fA-F]+` exactly.
     // `std.fmt.parseInt` admits a leading `+` and interior
     // underscores, so `&#+65;` and `&#1_0;` decoded instead of
-    // refusing as BadEntity (Codex #215 r2 REL-203).
-    const hex = digits[0] == 'x' or digits[0] == 'X';
+    // refusing as BadEntity (Codex #215 r2 REL-203) — and the hex
+    // marker is lowercase `x` only (`&#X41;` is malformed; r4
+    // REL-405).
+    const hex = digits[0] == 'x';
     const body = if (hex) digits[1..] else digits;
     if (body.len == 0) return null;
     for (body) |c| {
@@ -2952,13 +2954,13 @@ test "decode: parseInt's wider grammar is not a character reference (Codex #215 
     // XML's grammar is `[0-9]+` / `x[0-9a-fA-F]+` exactly — a leading
     // `+`, an interior `_`, or an empty digit run is BadEntity, not a
     // code point.
-    inline for (.{ "&#+65;", "&#1_0;", "&#x+41;", "&#x4_1;", "&#x;", "&#;", "&#-65;" }) |bad| {
+    inline for (.{ "&#+65;", "&#1_0;", "&#x+41;", "&#x4_1;", "&#x;", "&#;", "&#-65;", "&#X41;" }) |bad| {
         try testing.expectError(error.BadEntity, decodeEntities(testing.allocator, bad));
     }
     // The exact grammar still decodes.
-    const ok = try decodeEntities(testing.allocator, "&#65;&#x41;&#X41;");
+    const ok = try decodeEntities(testing.allocator, "&#65;&#x41;");
     defer testing.allocator.free(ok);
-    try testing.expectEqualStrings("AAA", ok);
+    try testing.expectEqualStrings("AA", ok);
 }
 
 test "decode: _x005F_ is the escaped underscore, and it protects what follows" {

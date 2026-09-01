@@ -40,6 +40,7 @@ const std = @import("std");
 const formula_mod = @import("zlsx_formula");
 const workbook_mod = @import("workbook.zig");
 const store_mod = @import("store.zig");
+const drawings = @import("drawings.zig");
 const workbook_xml = @import("typed_parts/root.zig").workbook_xml;
 const json = @import("json_text.zig");
 
@@ -114,14 +115,36 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     const sheet_names = try a.alloc([]const u8, wb.workbook.sheets.len);
     for (wb.workbook.sheets, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
 
+    // Resolve each workbook sheet to its part STRICTLY — the anchors
+    // collector's rule, not `Worksheet.resolvePartName`'s first-match
+    // fast path: the relationship must exist under the sheet's `r:id`,
+    // be a sheet-family type, be internal, and reach a part the
+    // archive holds, and no two `<sheet>` entries may reach one part
+    // (the same rule would ride out twice under two identities) —
+    // Codex #215 r4 REL-402.
+    const wb_rels = wb.store.rels("xl/workbook.xml");
+    const sheet_parts = try a.alloc([]const u8, wb.workbook.sheets.len);
+    for (wb.workbook.sheets, 0..) |s, i| {
+        const rel = (try relById(a, wb_rels, s.r_id)) orelse return error.MalformedWorkbookXml;
+        var typed = false;
+        for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
+        if (!typed) return error.MalformedWorkbookXml;
+        if (rel.target_mode == .external) return error.MalformedWorkbookXml;
+        const name = (try wb.store.resolve("xl/workbook.xml", rel.target)) orelse
+            return error.MalformedWorkbookXml;
+        if ((try wb.store.part(name)) == null) return error.MalformedWorkbookXml;
+        for (sheet_parts[0..i]) |prev| {
+            if (std.mem.eql(u8, prev, name)) return error.MalformedWorkbookXml;
+        }
+        sheet_parts[i] = name;
+    }
+
     var records: std.ArrayListUnmanaged(Record) = .empty;
     for (0..wb.workbook.sheets.len) |idx| {
-        const ws = try wb.sheet(@intCast(idx));
-        const part_name = try ws.resolvePartName();
         // Store failures fold like `Worksheet.ensureParsed`: memory
         // and the archive-wide budget keep their names, everything
         // else is "this sheet is not readable".
-        const part = (wb.store.part(part_name) catch |e| switch (e) {
+        const part = (wb.store.part(sheet_parts[idx]) catch |e| switch (e) {
             error.OutOfMemory, error.ZipBombSuspected => return e,
             else => return error.MalformedSheetXml,
         }) orelse return error.MissingSheetPart;
@@ -132,15 +155,39 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         // individually freed (Codex #215 r2 PERF-201).
         var raw_rules: std.ArrayListUnmanaged(RawRule) = .empty;
         defer raw_rules.deinit(gpa);
-        try scanSheetRules(gpa, part.bytes, &raw_rules);
+        const root = try scanSheetRules(gpa, part.bytes, &raw_rules);
 
+        // The typed sheet view's parse verdict stays part of the
+        // family contract for worksheet parts ("the same open-time
+        // verdicts every `Worksheet` reader shares"): a part the view
+        // refuses — a `<sheetDataQ>` decoy its lexical scan trips on —
+        // refuses here too (Codex #215 r4 REL-404). The other roots
+        // have no typed view; the strict walk's verdict stands alone.
+        if (root == .worksheet) {
+            const ws = try wb.sheet(@intCast(idx));
+            _ = try ws.ensureParsed();
+        }
+
+        // One decode per block: every rule of a `<conditionalFormatting>`
+        // shares the parent's `sqref` SLICE, so decoding it per rule
+        // amplified a large shared sqref by the rule count (Codex #215
+        // r4 PERF-401).
+        var last_sqref_raw: ?[]const u8 = null;
+        var last_sqref_dec: []const u8 = "";
         for (raw_rules.items) |raw| {
+            if (last_sqref_raw == null or
+                raw.sqref.ptr != last_sqref_raw.?.ptr or
+                raw.sqref.len != last_sqref_raw.?.len)
+            {
+                last_sqref_dec = try decodeRuleText(a, raw.sqref);
+                last_sqref_raw = raw.sqref;
+            }
             const formulas = try a.alloc([]const u8, raw.formula_count);
             for (formulas, 0..) |*slot, fi| slot.* = try decodeRuleText(a, raw.formulas[fi]);
             try records.append(a, .{
                 .sheet = sheet_names[idx],
                 .sheet_idx = @intCast(idx),
-                .sqref = try decodeRuleText(a, raw.sqref),
+                .sqref = last_sqref_dec,
                 .rule_type = try decodeRuleText(a, raw.rule_type),
                 .formulas = formulas,
                 .dxf_id = raw.dxf_id,
@@ -201,6 +248,11 @@ const RawRule = struct {
     priority: ?u32,
 };
 
+/// What the part's root turned out to be — the collect layer runs the
+/// typed sheet view's parse gate for `worksheet` roots only (the other
+/// kinds have no typed view; Codex #215 r4 REL-404).
+const RootKind = enum { worksheet, macrosheet, barren };
+
 const main_ns_transitional = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const main_ns_strict = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
@@ -214,15 +266,19 @@ fn isMainNs(uri: []const u8) bool {
 /// `xmlns:x="…spreadsheetml&#47;2006/main"` IS a main-namespace alias
 /// and a raw-byte compare read it as foreign, letting a prefixed rule
 /// subtree traverse as opaque (Codex #215 r3 SEC-301; the S7b-5 host
-/// predicate learned the same in Codex #206 r19 SEC-1901, whose
-/// `decodeScalarAttr` form this reuses). A value that does not decode,
-/// or is longer than the decode buffer (no namespace this walk rules
-/// on is), is not one the walk can rule out — refuse.
-fn bindsMainNs(raw: []const u8) Error!bool {
+/// predicate learned the same in Codex #206 r19 SEC-1901). The decode
+/// is the STRICT one: the scalar decoder passes an unknown named
+/// entity's `&` through verbatim, which read
+/// `<conditionalFormatting xmlns="&bogus;">` as bound-to-foreign and
+/// hid its rules — a binding that does not decode is not one the walk
+/// can rule out (r4 SEC-401).
+fn bindsMainNs(scratch: Allocator, raw: []const u8) Error!bool {
     if (std.mem.indexOfScalar(u8, raw, '&') == null) return isMainNs(raw);
-    var buf: [256]u8 = undefined;
-    const decoded = workbook_xml.decodeScalarAttr(&buf, raw) orelse
-        return error.MalformedSheetXml;
+    const decoded = formula_mod.decode.decodeEntities(scratch, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedSheetXml,
+    };
+    defer scratch.free(decoded);
     return isMainNs(decoded);
 }
 
@@ -249,7 +305,7 @@ fn bindsMainNs(raw: []const u8) Error!bool {
 /// limit (Codex #215 r2 PERF-201).
 const max_depth = 1024;
 
-fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(RawRule)) Error!void {
+fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(RawRule)) Error!RootKind {
     const Kind = enum { root, barren_root, cf_block, cf_rule, other };
     const Frame = struct {
         name: []const u8,
@@ -263,6 +319,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
 
     var root_seen = false;
     var root_closed = false;
+    var root_kind: RootKind = .worksheet;
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, xml, i, '<')) |lt| {
         // A DOCTYPE (or any other `<!…>` declaration that is not a
@@ -328,9 +385,9 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     if (saw_default) return error.MalformedSheetXml;
                     saw_default = true;
-                    elem_main = try bindsMainNs(attr.value);
+                    elem_main = try bindsMainNs(a, attr.value);
                 } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
-                    if (try bindsMainNs(attr.value)) return error.MalformedSheetXml;
+                    if (try bindsMainNs(a, attr.value)) return error.MalformedSheetXml;
                 }
             }
         }
@@ -362,12 +419,24 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             {
                 return error.MalformedSheetXml;
             }
+            root_kind = if (barren)
+                .barren
+            else if (std.mem.eql(u8, qname, "macrosheet"))
+                .macrosheet
+            else
+                .worksheet;
             frame.kind = if (barren) .barren_root else .root;
         } else {
             const parent = &frames.items[frames.items.len - 1];
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "conditionalFormatting")) {
                 frame.kind = .cf_block;
                 frame.sqref = (try uniqueAttr(attrs, "sqref")) orelse "";
+                // Validate the carrier at block open: a ruleless block
+                // — self-closing or paired-empty — emits no record, so
+                // a bad sqref there escaped the per-record decode and
+                // the read succeeded against its own contract (Codex
+                // #215 r4 REL-403).
+                a.free(try decodeRuleText(a, frame.sqref));
             } else if (parent.kind == .cf_block and is_main and std.mem.eql(u8, qname, "cfRule")) {
                 frame.kind = .cf_rule;
                 frame.rule = .{
@@ -428,6 +497,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
     }
     if (!root_seen) return error.MalformedSheetXml;
     if (frames.items.len != 0) return error.MalformedSheetXml;
+    return root_kind;
 }
 
 fn isXmlWs(c: u8) bool {
@@ -530,6 +600,31 @@ fn digitU32(raw: ?[]const u8) ?u32 {
     return std.fmt.parseInt(u32, s, 10) catch null;
 }
 
+/// The sheet-family relationship types a `<sheet r:id>` may carry —
+/// the pivots / anchors walk's list, matched exactly under a known
+/// relationship-type namespace root by `drawings.relTypeIs`.
+const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
+
+/// Find a relationship by its raw `r:id` attribute value — the
+/// `anchor_ndjson` helper, duplicated so this module keeps its imports
+/// narrow. The store's `Relationship.id` is entity-decoded, so a rid
+/// spelled without references matches byte-for-byte at any length;
+/// only one that carries `&` needs the allocating decode.
+fn relById(a: Allocator, rels: []const store_mod.Relationship, raw_rid: []const u8) !?store_mod.Relationship {
+    if (raw_rid.len == 0) return null;
+    for (rels) |rel| {
+        if (std.mem.eql(u8, rel.id, raw_rid)) return rel;
+    }
+    if (std.mem.indexOfScalar(u8, raw_rid, '&') == null) return null;
+    const decoded = try store_mod.decodeXmlEntities(a, raw_rid);
+    defer a.free(decoded);
+    if (decoded.len == 0) return null;
+    for (rels) |rel| {
+        if (std.mem.eql(u8, rel.id, decoded)) return rel;
+    }
+    return null;
+}
+
 fn decodeSheetName(a: Allocator, raw: []const u8) Error![]u8 {
     const decoded = formula_mod.decode.decodeAt(a, .sheet_name, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -623,7 +718,7 @@ const TestTmp = struct {
 fn scanRules(a: Allocator, xml: []const u8) Error![]RawRule {
     var out: std.ArrayListUnmanaged(RawRule) = .empty;
     errdefer out.deinit(a);
-    try scanSheetRules(a, xml, &out);
+    _ = try scanSheetRules(a, xml, &out);
     return try out.toOwnedSlice(a);
 }
 
@@ -824,6 +919,117 @@ test "scanSheetRules: a DOCTYPE cannot smuggle rules past the walk (SEC-302)" {
         "<!-- note --><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
         "</worksheet>");
     try testing.expectEqual(@as(usize, 1), rules.len);
+}
+
+test "scanSheetRules: an undecodable default binding cannot hide rules (SEC-401)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `xmlns="&bogus;"` does not decode — the lenient scalar decoder
+    // passed the `&` through verbatim, read the block as foreign, and
+    // its rules vanished under an exit 0.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<conditionalFormatting xmlns=\"&bogus;\" sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>"));
+}
+
+test "scanSheetRules: a ruleless block still polices its sqref carrier (REL-403)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_][]const u8{
+        // Self-closing with a bad entity, non-UTF-8, and raw markup.
+        ws_open ++ "<conditionalFormatting sqref=\"A1&bogus;\"/></worksheet>",
+        ws_open ++ "<conditionalFormatting sqref=\"A1\xff\"/></worksheet>",
+        ws_open ++ "<conditionalFormatting sqref=\"A1<B\"/></worksheet>",
+        // Paired-empty is the same shape.
+        ws_open ++ "<conditionalFormatting sqref=\"A1&bogus;\"></conditionalFormatting></worksheet>",
+    };
+    for (cases) |xml| {
+        try testing.expectError(error.MalformedSheetXml, scanRules(a, xml));
+    }
+}
+
+test "collect: the sheet graph resolves strictly — the anchors rule (REL-402)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    const rels = "xl/_rels/workbook.xml.rels";
+    const cases = [_]struct { name: []const u8, old: []const u8, new: []const u8 }{
+        // A wrong-type relationship with an extant target.
+        .{ .name = "g1.xlsx", .old = "officeDocument/2006/relationships/worksheet\"", .new = "officeDocument/2006/relationships/hyperlink\"" },
+        // A local-looking External target.
+        .{ .name = "g2.xlsx", .old = "Target=\"worksheets/sheet1.xml\"", .new = "Target=\"worksheets/sheet1.xml\" TargetMode=\"External\"" },
+        // Two <sheet> entries reaching one part.
+        .{ .name = "g3.xlsx", .old = "worksheets/sheet2.xml", .new = "worksheets/sheet1.xml" },
+        // A dangling target.
+        .{ .name = "g4.xlsx", .old = "worksheets/sheet2.xml", .new = "worksheets/nope.xml" },
+    };
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, rels, case.old, case.new);
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    }
+}
+
+test "collect: a worksheet part shares the typed view's parse verdict (REL-404)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "cf_view_verdict.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    // A balanced `<sheetDataQ>` wrapper is an opaque, accepted frame
+    // to the strict walk — but the typed view's lexical scan prefix-
+    // matches it as `<sheetData` and refuses the part. The family
+    // contract says every Worksheet reader shares that verdict.
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "<sheetData>", "<sheetDataQ>");
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "</sheetData>", "</sheetDataQ>");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+}
+
+test "collect: rules of one block share one decoded sqref (PERF-401)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "cf_shared_sqref.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    // Give the between-rule's block a second rule so two records share
+    // one parent sqref.
+    try fixture.patchPart(
+        testing.allocator,
+        io,
+        path,
+        "xl/worksheets/sheet1.xml",
+        "</cfRule></conditionalFormatting>",
+        "</cfRule><cfRule type=\"expression\" priority=\"9\"><formula>1</formula></cfRule></conditionalFormatting>",
+    );
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 6), view.records.len);
+    try testing.expectEqualStrings("A1:A4", view.records[0].sqref);
+    try testing.expectEqualStrings("A1:A4", view.records[1].sqref);
+    // The SAME decoded slice, not a copy per rule — a large shared
+    // sqref must not amplify by the rule count.
+    try testing.expect(view.records[0].sqref.ptr == view.records[1].sqref.ptr);
 }
 
 test "collect: a DOCTYPE or an entity-spelled main alias in a real workbook refuses (SEC-301/302)" {
@@ -1149,6 +1355,14 @@ test "collect: attribute spacing and a third formula through a real saved workbo
     try testing.expectEqual(@as(usize, 3), view.records[0].formulas.len);
     try testing.expectEqualStrings("6", view.records[0].formulas[2]);
     try testing.expectEqual(@as(?u32, null), view.records[1].dxf_id);
+    // The lenient Zig view reads the same third body out of the same
+    // real part — the `formula3` widening exercised through a saved
+    // workbook, not only unit XML (Codex #215 r4 MNT-402).
+    const ws = try wb.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try testing.expectEqualStrings("2", cfs[0].formula.?);
+    try testing.expectEqualStrings("4", cfs[0].formula2.?);
+    try testing.expectEqualStrings("6", cfs[0].formula3.?);
 }
 
 test "collect: a decoded control character rides out as a JSON escape, not raw bytes" {

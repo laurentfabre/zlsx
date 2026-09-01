@@ -172,10 +172,11 @@ A1 text. Sheet names — in the `sheet` field and against `--name` /
 `--sheet-glob` — carry the reader's spelling, exactly as on every
 Book-route command (`rows`, `cells`, `comments`, `validations`,
 `hyperlinks`): XML entities decoded, ST_Xstring `_xHHHH_` escapes as
-written. The package-route commands (`pivots`, `defined-names`) decode
-ST_Xstring too, so the rare sheet name spelled with such an escape
-reads differently across the two families — a reader-level lift on a
-later S3b slice, not a per-command patch (one family, one spelling).
+written. The package-route commands (`pivots`, `defined-names`,
+`anchors`, `conditional-formats`) decode ST_Xstring too, so the rare
+sheet name spelled with such an escape reads differently across the
+two families — a reader-level lift on a later S3b slice, not a
+per-command patch (one family, one spelling).
 One validity floor is this command's own: the sheet name is a merge
 record's only user-text channel, so a selected sheet that has merges
 under a non-UTF-8 name refuses the whole command (exit 2) before any
@@ -327,10 +328,15 @@ A workbook without conditional formatting is an empty, successful
 stream. The command routes through the package layer like `pivots`, so
 an archive the lenient reader tolerates but the package layer refuses
 is exit 2, and so is any workbook sheet the package layer cannot read
-whole (a dangling sheet relationship, a part that does not parse —
-the same open-time verdicts every `Worksheet` reader shares), even one
-the selection would exclude: the inventory is proven whole before
-selection and pagination apply, the `anchors` rule.
+whole — the sheet graph resolves strictly (the relationship under the
+sheet's `r:id` must exist, be a sheet-family type, be internal, and
+reach a part the archive holds that no other sheet reaches — the
+`anchors` rule), and a worksheet-rooted part additionally shares the
+typed view's parse verdict (the same open-time verdicts every
+`Worksheet` reader shares; a macrosheet part has no typed view, so
+the strict walk's verdict stands alone there) — even for a sheet the
+selection would exclude: the inventory is proven whole before
+selection and pagination apply.
 
 The strict walk is what lets the stream claim "one record per rule,
 no more, no fewer". A `conditionalFormatting` element is a rule block

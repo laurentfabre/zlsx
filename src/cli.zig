@@ -9964,7 +9964,7 @@ test "runConditionalFormatsCommand: selection, pagination, compact prologue, exi
         try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, got, "{\"kind\":\"conditional_format\",\"sqref\":"));
         try std.testing.expect(std.mem.indexOf(u8, got, "\"conditional_format\",\"sheet\":") == null);
     }
-    // --skip 1 --take 2 pages data records; prologues are not counted.
+    // --skip 1 --take 2 pages the record stream.
     {
         var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
@@ -9976,6 +9976,34 @@ test "runConditionalFormatsCommand: selection, pagination, compact prologue, exi
         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
         try std.testing.expect(std.mem.indexOf(u8, got, "\"rule_type\":\"expression\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, got, "\"rule_type\":\"colorScale\"") != null);
+    }
+    // compact + --skip 4 --take 1: prologues are not counted by the
+    // pager and a skipped sheet emits no prologue at all — Report's
+    // record is the fifth, so the stream is exactly its prologue and
+    // its record (Codex #215 r4 MNT-402).
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .output = .compact_ndjson, .skip = 4, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"sheet\",\"sheet\":\"Report\",\"sheet_idx\":1}\n" ++
+                "{\"kind\":\"conditional_format\",\"sqref\":\"A1:A2\",\"rule_type\":\"expression\"," ++
+                "\"formulas\":[\"$A1=\\\"R&D\\\"\"],\"dxf_id\":0,\"priority\":1}\n",
+            w.buffered(),
+        );
+    }
+    // --take 0 emits nothing — not even a prologue.
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runConditionalFormatsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .conditional_formats, .output = .compact_ndjson, .take = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
     }
     // --sheet-glob widens by name.
     {

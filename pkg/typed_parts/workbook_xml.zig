@@ -382,8 +382,9 @@ pub fn decodeScalarAttr(buf: []u8, s: []const u8) ?[]const u8 {
                 // Validate the digit run before parseInt — parseInt
                 // accepts `+` signs and `_` separators, which XML
                 // numeric references forbid (`&#+49;` is malformed,
-                // not "1").
-                const is_hex = digits[0] == 'x' or digits[0] == 'X';
+                // not "1"). The hex marker is lowercase `x` only
+                // (Codex #215 r4 REL-405).
+                const is_hex = digits[0] == 'x';
                 const run = if (is_hex) digits[1..] else digits;
                 if (run.len == 0) return null;
                 for (run) |d| {

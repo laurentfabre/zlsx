@@ -12053,8 +12053,80 @@ fn findClosingTagAware(source: []const u8, from: usize, close_tag: []const u8) ?
     return workbook_xml_mod.findClosingTag(source, from, close_tag) catch null;
 }
 
-/// Comment/CDATA/PI/DOCTYPE-aware search for the next tag whose bytes
-/// begin with `prefix` (a literal including the leading `<`). NO name
+/// The DV/CF rewrite walks' non-element skip — the SANITIZER's set,
+/// not the workbook scanner's: comments, CDATA sections and PIs
+/// vanish from (or are escaped into) the typed view's bytes, but a
+/// DOCTYPE — and any other `<!…>` declaration — is KEPT VERBATIM by
+/// `sheet_xml.sanitizeXml`, so the lenient view counts rule-shaped
+/// bytes inside a quoted internal-DTD entity literal and the raw walk
+/// must count them too; `skipNonElement`, which steps over the whole
+/// declaration, desynced the splice lockstep (Codex #215 r4 REL-401).
+/// Null = an unterminated construct (the sanitizer refuses those, so
+/// the typed view never coexists with one).
+fn skipViewNonElement(source: []const u8, at: usize) ?usize {
+    assert(at < source.len and source[at] == '<');
+    if (at + 4 <= source.len and std.mem.eql(u8, source[at .. at + 4], "<!--")) {
+        const end = std.mem.indexOfPos(u8, source, at + 4, "-->") orelse return null;
+        return end + 3;
+    }
+    if (at + 9 <= source.len and std.mem.eql(u8, source[at .. at + 9], "<![CDATA[")) {
+        const end = std.mem.indexOfPos(u8, source, at + 9, "]]>") orelse return null;
+        return end + 3;
+    }
+    if (at + 2 <= source.len and source[at + 1] == '?') {
+        const end = std.mem.indexOfPos(u8, source, at + 2, "?>") orelse return null;
+        return end + 2;
+    }
+    return at;
+}
+
+fn isViewTagBoundary(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>';
+}
+
+/// Exact-name open-tag find with the VIEW's skip set (see
+/// `skipViewNonElement`) and a quote-aware tag end.
+fn findTagOpenViewAware(source: []const u8, from: usize, tag: []const u8) ?RawTagEnd {
+    var i = from;
+    while (std.mem.indexOfScalarPos(u8, source, i, '<')) |lt| {
+        const skip_to = skipViewNonElement(source, lt) orelse return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (lt + 1 + tag.len >= source.len) return null;
+        if (!std.mem.eql(u8, source[lt + 1 .. lt + 1 + tag.len], tag) or
+            !isViewTagBoundary(source[lt + 1 + tag.len]))
+        {
+            i = lt + 1;
+            continue;
+        }
+        var hit = tagEndAware(source, lt) orelse return null;
+        hit.open_lt = lt;
+        return hit;
+    }
+    return null;
+}
+
+/// Literal close-tag find with the VIEW's skip set.
+fn findCloseViewAware(source: []const u8, from: usize, close_tag: []const u8) ?usize {
+    var i = from;
+    while (std.mem.indexOfScalarPos(u8, source, i, '<')) |lt| {
+        const skip_to = skipViewNonElement(source, lt) orelse return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (lt + close_tag.len <= source.len and std.mem.eql(u8, source[lt .. lt + close_tag.len], close_tag)) {
+            return lt;
+        }
+        i = lt + 1;
+    }
+    return null;
+}
+
+/// Search for the next tag whose bytes begin with `prefix` (a literal
+/// including the leading `<`), with the VIEW's skip set. NO name
 /// boundary — deliberately: it mirrors the typed view's `indexOfTag`
 /// PREFIX semantics, so the DV rewriter walk and
 /// `sheet_xml.parseValidations` keep one element count even for a
@@ -12064,7 +12136,7 @@ fn findPrefixTagAware(source: []const u8, from: usize, prefix: []const u8) ?usiz
     assert(prefix.len >= 2 and prefix[0] == '<');
     var i = from;
     while (std.mem.indexOfScalarPos(u8, source, i, '<')) |lt| {
-        const skip_to = workbook_xml_mod.skipNonElement(source, lt) catch return null;
+        const skip_to = skipViewNonElement(source, lt) orelse return null;
         if (skip_to != lt) {
             i = skip_to;
             continue;
@@ -12078,8 +12150,9 @@ fn findPrefixTagAware(source: []const u8, from: usize, prefix: []const u8) ?usiz
 }
 
 /// Quote-aware `>` search from a tag's `<` — the typed view's
-/// `findTagEnd`, on raw source bytes.
-const RawTagEnd = struct { gt_pos: usize, after_gt: usize, self_closing: bool };
+/// `findTagEnd`, on raw source bytes. `open_lt` is filled by
+/// `findTagOpenViewAware`; a direct `tagEndAware` call leaves it 0.
+const RawTagEnd = struct { open_lt: usize = 0, gt_pos: usize, after_gt: usize, self_closing: bool };
 
 fn tagEndAware(source: []const u8, open_lt: usize) ?RawTagEnd {
     assert(open_lt < source.len and source[open_lt] == '<');
@@ -12212,7 +12285,7 @@ fn collectDvCfPatches(
         if (findPrefixTagAware(source, 0, "<dataValidations")) |dv_open| {
             const dv_end = tagEndAware(source, dv_open) orelse return error.NoSheetData;
             if (!dv_end.self_closing) {
-                const dv_close = findClosingTagAware(source, dv_end.after_gt, "</dataValidations>") orelse
+                const dv_close = findCloseViewAware(source, dv_end.after_gt, "</dataValidations>") orelse
                     return error.NoSheetData;
                 const block_hi = dv_close;
                 var probe: usize = dv_end.after_gt;
@@ -12235,7 +12308,7 @@ fn collectDvCfPatches(
                     if (e_end.self_closing) {
                         probe = e_end.after_gt;
                     } else {
-                        const e_close = findClosingTagAware(source, e_end.after_gt, "</dataValidation>") orelse
+                        const e_close = findCloseViewAware(source, e_end.after_gt, "</dataValidation>") orelse
                             return error.NoSheetData;
                         probe = e_close + "</dataValidation>".len;
 
@@ -12259,28 +12332,27 @@ fn collectDvCfPatches(
     }
 
     // ─── CF walk ────────────────────────────────────────────────────
-    // Scanning rides the workbook scanner (`findTagOpen` /
-    // `findClosingTagAware`) for the same reason the cell-formula
-    // collector does (Codex #188 r6, #215 r1 REL-103): a commented-out
-    // `<cfRule>` in the raw source is invisible to the sanitized typed
-    // view, so a raw `indexOfPos` walk counted it and spliced every
-    // later rule's formula one index off; a quoted `>` in an attribute
-    // value ended the open tag early. The typed view strips comments /
-    // CDATA / PIs before counting, so the aware walk stays in lockstep
-    // with `parseConditionalFormats`'s rule order.
+    // Scanning uses the VIEW's skip set (`findTagOpenViewAware` /
+    // `findCloseViewAware`) for the lockstep reason the cell-formula
+    // collector established (Codex #188 r6, #215 r1 REL-103): a
+    // commented-out `<cfRule>` in the raw source is invisible to the
+    // sanitized typed view, so a raw `indexOfPos` walk counted it and
+    // spliced every later rule's formula one index off; a quoted `>`
+    // in an attribute value ended the open tag early; and a DOCTYPE's
+    // bytes — which the sanitizer KEEPS — must stay scannable, so the
+    // walk counts a rule-shaped DTD entity literal exactly as the
+    // view does (#215 r4 REL-401).
     if (cf_f_new.count() > 0) {
         var probe: usize = 0;
         var cf_idx: usize = 0;
-        while ((workbook_xml_mod.findTagOpen(source, probe, "conditionalFormatting") catch
-            return error.NoSheetData)) |cf_hit|
-        {
+        while (findTagOpenViewAware(source, probe, "conditionalFormatting")) |cf_hit| {
             if (cf_hit.self_closing) {
-                probe = cf_hit.after_tag_close;
+                probe = cf_hit.after_gt;
                 continue;
             }
-            const cf_close = findClosingTagAware(source, cf_hit.after_tag_close, "</conditionalFormatting>") orelse
+            const cf_close = findCloseViewAware(source, cf_hit.after_gt, "</conditionalFormatting>") orelse
                 return error.NoSheetData;
-            const cf_body_lo = cf_hit.after_tag_close;
+            const cf_body_lo = cf_hit.after_gt;
             const cf_body_hi = cf_close;
             probe = cf_close + "</conditionalFormatting>".len;
 
@@ -12288,18 +12360,17 @@ fn collectDvCfPatches(
             // cf_idx by one, matching parseConditionalFormats's order.
             var r_probe: usize = cf_body_lo;
             while (r_probe < cf_body_hi) {
-                const r_hit = ((workbook_xml_mod.findTagOpen(source, r_probe, "cfRule") catch
-                    return error.NoSheetData)) orelse break;
+                const r_hit = findTagOpenViewAware(source, r_probe, "cfRule") orelse break;
                 if (r_hit.open_lt >= cf_body_hi) break;
                 if (r_hit.self_closing) {
                     // No body — no formula to splice. Still advance idx.
                     cf_idx += 1;
-                    r_probe = r_hit.after_tag_close;
+                    r_probe = r_hit.after_gt;
                     continue;
                 }
-                const r_close = findClosingTagAware(source, r_hit.after_tag_close, "</cfRule>") orelse
+                const r_close = findCloseViewAware(source, r_hit.after_gt, "</cfRule>") orelse
                     return error.NoSheetData;
-                const r_body_lo = r_hit.after_tag_close;
+                const r_body_lo = r_hit.after_gt;
                 const r_body_hi = r_close;
                 r_probe = r_close + "</cfRule>".len;
 
@@ -12335,13 +12406,12 @@ fn findInnerSpan(
 ) ?[2]usize {
     if (lo >= hi or hi > source.len) return null;
     assert(open_prefix.len >= 2 and open_prefix[0] == '<');
-    const hit = ((workbook_xml_mod.findTagOpen(source, lo, open_prefix[1..]) catch return null) orelse
-        return null);
+    const hit = findTagOpenViewAware(source, lo, open_prefix[1..]) orelse return null;
     if (hit.open_lt >= hi) return null;
     if (hit.self_closing) return null; // no body
-    const close = findClosingTagAware(source, hit.after_tag_close, close_tag) orelse return null;
+    const close = findCloseViewAware(source, hit.after_gt, close_tag) orelse return null;
     if (close >= hi) return null;
-    return .{ hit.after_tag_close, close };
+    return .{ hit.after_gt, close };
 }
 
 /// Linear splice of `source` against `patches`. Each patch's
@@ -16243,6 +16313,80 @@ test "rewrite DV: a dataValidationsX decoy keeps the raw walk in the view's inde
     try std.testing.expectEqual(@as(usize, 2), dvs.len);
     try std.testing.expectEqualStrings("B6", dvs[0].formula1.?);
     try std.testing.expectEqualStrings("B8", dvs[1].formula1.?);
+}
+
+test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep (REL-401)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-dtd-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const cf =
+            \\<conditionalFormatting sqref="D1:D10"><cfRule type="expression" priority="1"><formula>D1</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // Prepend a DOCTYPE whose entity literal spells a whole rule. The
+    // sanitizer KEEPS DTD bytes, so the typed view counts the phantom
+    // rule at index 0 and the live rule at index 1 — the raw walk
+    // must count identically: `skipNonElement`, which steps over the
+    // declaration, put the phantom's replacement into the live rule.
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        const dtd =
+            \\<!DOCTYPE worksheet [<!ENTITY e '<conditionalFormatting sqref="Z1:Z2"><cfRule type="expression" priority="9"><formula>Z9</formula></cfRule></conditionalFormatting>'>]>
+        ;
+        const at = std.mem.indexOf(u8, part.bytes, "<worksheet").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], dtd, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-dtd-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const ws_name_owned = try std.testing.allocator.dupe(u8, (try wb.sheet(0)).name());
+        defer std.testing.allocator.free(ws_name_owned);
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_cols = .{ .at = 4, .count = 1 } },
+            ws_name_owned,
+        );
+        // Phantom "Z9" → "AA9" (inside the DTD literal, as the view
+        // sees it) and live "D1" → "E1" — two rewrites, each landing
+        // in ITS OWN source occurrence.
+        try std.testing.expectEqual(@as(u32, 2), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 2), cfs.len);
+    try std.testing.expectEqualStrings("AA9", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("E1", cfs[1].formula.?);
+    const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 
 test "rewrite CF: a quoted '>' in an attribute does not corrupt the formula splice (REL-103)" {
