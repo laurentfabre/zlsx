@@ -669,6 +669,14 @@ const AttrScan = struct {
     fn next(self: *AttrScan) error{MalformedSheetXml}!?Attr {
         const s = self.rest;
         var i: usize = 0;
+        // XML requires whitespace BETWEEN attributes (and between the
+        // element name and the first — the region handed here always
+        // begins at that boundary): a quoted value directly followed
+        // by another name (`sqref="A1"xmlns="urn:foreign"`) is
+        // malformed, and tokenizing it let an unseparated namespace
+        // rebinding turn a rule block — or a workbook `<sheet>` entry
+        // — opaque under exit 0 (Codex #215 r9 SEC-901).
+        if (s.len != 0 and !isXmlWs(s[0])) return error.MalformedSheetXml;
         while (i < s.len and isXmlWs(s[i])) i += 1;
         if (i >= s.len) {
             self.rest = s[s.len..];
@@ -1664,6 +1672,48 @@ test "collect: sheet identities come from the strict workbook read (SEC-502, REL
         defer view.deinit();
         try testing.expectEqual(@as(usize, 5), view.records.len);
         try testing.expectEqualStrings("Report", view.records[4].sheet);
+    }
+}
+
+test "scanSheetRules: attributes require their XML separator (SEC-901)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A namespace rebinding riding in UNSEPARATED after a quoted
+    // value tokenized, turned the block foreign, and its rule
+    // vanished under exit 0.
+    try testing.expectError(error.MalformedSheetXml, scanRules(a, ws_open ++
+        "<conditionalFormatting sqref=\"A1\"xmlns=\"urn:foreign\"><cfRule type=\"expression\" priority=\"1\"><formula>1</formula></cfRule></conditionalFormatting>" ++
+        "</worksheet>"));
+}
+
+test "collect: separatorless attributes cannot hide a block or a sheet (SEC-901)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+
+    // A CF block cannot disappear behind an unseparated rebinding.
+    {
+        const path = try tt.path(testing.allocator, io, "s1.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet1.xml", "sqref=\"A1:A4\">", "sqref=\"A1:A4\"xmlns=\"urn:foreign\">");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedSheetXml, collect(testing.allocator, &wb));
+    }
+    // A workbook <sheet> identity cannot disappear the same way.
+    {
+        const path = try tt.path(testing.allocator, io, "s2.xlsx");
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "name=\"Report\" ", "name=\"Report\"xmlns=\"urn:foreign\" ");
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
     }
 }
 
