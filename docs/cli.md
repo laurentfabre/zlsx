@@ -274,7 +274,9 @@ a record that lies or thin the inventory: an anchor on a worksheet part
 place (its relationship dangling, mistyped or external, its part
 absent from the archive or unreadable), two `<sheet>` entries reaching
 one part (the same anchor would ride out twice under two identities),
-two names decoding to one spelling; a drawing structure the walkers
+two names decoding to one spelling, an empty `<sheets>` list (a
+sheetless workbook is refused, never served as an empty inventory);
+a drawing structure the walkers
 recognise but cannot read whole — a sheet's drawing relationship, a
 pic's image relationship or a frame's chart relationship that dangles,
 is of the wrong relationship type, or names an absent part, a
@@ -339,7 +341,8 @@ is exit 2, and so is any workbook sheet the package layer cannot read
 whole — sheet identities come from a strict namespace- and depth-aware
 read of the workbook's `<sheets>` list (a ghost `<sheet>` under
 `<extLst>` is not an identity, an entry missing a required carrier
-refuses instead of vanishing, and any root-declared
+refuses instead of vanishing, an empty list refuses — a sheetless
+workbook is never served as an empty inventory — and any root-declared
 relationships-namespace prefix spells the id reference — `q:id` under
 `xmlns:q` reads like `r:id`), the sheet graph resolves strictly (the
 relationship under the entry's id — matched by its DECODED spelling —

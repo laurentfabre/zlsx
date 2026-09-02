@@ -1280,11 +1280,18 @@ const StrictSheet = struct { name: []const u8, rid: []const u8 };
 /// entry refuses; and a standards-valid alternate prefix (`q:id`
 /// under `xmlns:q="…relationships"`) IS an entry — sheet identities
 /// come from this read, not from the lenient projection that only
-/// spells `r:id` (Codex #215 r8 REL-801). The same walk records the
-/// root's `<calcPr>` slot into `calc` for the calc-props read — a
-/// capture only, no verdict of its own here (`CalcPrSlot`).
+/// spells `r:id` (Codex #215 r8 REL-801). The list must hold at least
+/// one entry (CT_Sheets minOccurs=1): a missing `<sheets>` and an
+/// empty `<sheets/>` are the same sheetless workbook, refused rather
+/// than served as an empty inventory (REL-602, #219 r1 REL-101). The
+/// same walk records the root's `<calcPr>` slot into `calc` for the
+/// calc-props read — a capture only, no verdict of its own here
+/// (`CalcPrSlot`).
 fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet), calc: *CalcPrSlot) WorkbookError!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
+    // Entries are counted relative to what the caller already holds,
+    // so a reused list cannot vouch for an empty walk.
+    const entries_before = out.items.len;
     const Kind = enum { root, sheets_wrap, other };
     const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize, mce_chain: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
@@ -1518,6 +1525,12 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     // workbook an empty success with no inventory ever established
     // (Codex #215 r6 REL-602).
     if (wraps_seen != 1) return error.MalformedWorkbookXml;
+    // … and at least one entry in it: CT_Sheets is minOccurs=1, and an
+    // empty `<sheets/>` is the same sheetless workbook REL-602 refuses,
+    // spelled with the wrapper present (Codex #219 r1 S3B-REL-101 —
+    // every read over this inventory, and the C exports built on them,
+    // promised a non-empty stream).
+    if (out.items.len == entries_before) return error.MalformedWorkbookXml;
 }
 
 /// The `<calcPr>` slot as the strict workbook read found it, for the
@@ -1867,6 +1880,24 @@ pub const fixture = struct {
         const patched = try std.mem.concat(allocator, u8, &.{ p.bytes[0..at], new, p.bytes[at + old.len ..] });
         defer allocator.free(patched);
         try store.replacePart(part, patched);
+        try store.save(io, path);
+    }
+
+    /// Replace the workbook's whole `<sheets>…</sheets>` block with an
+    /// empty `<sheets/>`, every sheet part and relationship left in
+    /// the archive — the sheetless shape the strict inventory refuses
+    /// (REL-602 / #219 r1 REL-101), built without knowing the writer's
+    /// exact `<sheet>` spelling.
+    pub fn emptySheets(allocator: Allocator, io: std.Io, path: []const u8) !void {
+        var store = try PartStore.open(allocator, io, path);
+        defer store.deinit();
+        const p = (try store.part("xl/workbook.xml")) orelse return error.PartNotFound;
+        const open = std.mem.indexOf(u8, p.bytes, "<sheets>") orelse return error.PatchAnchorNotFound;
+        const close_tag = "</sheets>";
+        const close = std.mem.indexOfPos(u8, p.bytes, open, close_tag) orelse return error.PatchAnchorNotFound;
+        const patched = try std.mem.concat(allocator, u8, &.{ p.bytes[0..open], "<sheets/>", p.bytes[close + close_tag.len ..] });
+        defer allocator.free(patched);
+        try store.replacePart("xl/workbook.xml", patched);
         try store.save(io, path);
     }
 };
@@ -3621,4 +3652,36 @@ test "collect: a workbook without conditional formats is an empty view" {
     defer view.deinit();
     try testing.expectEqual(@as(usize, 0), view.records.len);
     try testing.expectEqual(@as(usize, 1), view.sheet_names.len);
+}
+
+test "resolveSheets / scanCalcPr: an empty <sheets/> is the sheetless workbook REL-602 refuses (#219 r1 REL-101)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "cf_sheetless.xlsx");
+    defer testing.allocator.free(path);
+    {
+        const zlsx = @import("zlsx");
+        var w = zlsx.Writer.init(testing.allocator);
+        defer w.deinit();
+        var s = try w.addSheet("Only");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    // The wrapper is present and well-formed; only its entries are
+    // gone. The lenient opener accepts the shape (a zero-length typed
+    // inventory), so the strict read is the only guard — every read
+    // built over it, and the C exports promising a non-empty stream,
+    // must refuse rather than serve an empty success.
+    try fixture.emptySheets(testing.allocator, io, path);
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.MalformedWorkbookXml, resolveSheets(testing.allocator, arena.allocator(), &wb));
+    // The calc read runs the same walk: the same verdict.
+    try testing.expectError(error.MalformedWorkbookXml, scanCalcPr(testing.allocator, &wb));
 }

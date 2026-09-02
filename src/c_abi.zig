@@ -6553,10 +6553,11 @@ export fn zlsx_editor_sheet_props_ndjson(
         error.OutOfMemory,
         => return failMapped(e, diag, err_buf, err_buf_len),
     };
-    // An openable workbook lists at least one sheet, so the stream is
-    // never empty in practice; the `(NULL, 0)` arm keeps the buffer
-    // contract uniform with its siblings rather than assert a
-    // property of the strict inventory here.
+    // The strict inventory refuses a sheetless workbook (a missing or
+    // empty `<sheets>`, CT_Sheets minOccurs=1), so the stream is never
+    // empty on success; the `(NULL, 0)` arm keeps the buffer contract
+    // uniform with its siblings rather than assert that property of
+    // another module here.
     if (bytes.len == 0) {
         gpa.free(bytes);
         return ZLSX_OK;
@@ -8990,6 +8991,37 @@ test "S3b sheet_props_ndjson: an inventory the read cannot serve refuses whole, 
         var out_len: usize = 99;
         try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+    // An empty `<sheets/>` — the wrapper present, its entries gone,
+    // every sheet part still in the archive. The lenient opener
+    // accepts it; the strict inventory refuses the sheetless workbook
+    // (CT_Sheets minOccurs=1, the REL-602 rule closed for the
+    // wrapper-present spelling by Codex #219 r1 S3B-REL-101), so
+    // neither export can hand back the empty success its contract
+    // rules out. Both reads share the walk's verdict.
+    {
+        const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_sp_sheetless.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.conditional_formats_ndjson.fixture.emptySheets(alloc, io, path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqual(plane_none, diag.plane);
         try std.testing.expect(out_ptr == null);
         try std.testing.expectEqual(@as(usize, 0), out_len);

@@ -3315,6 +3315,23 @@ def _patch_parts(path, patches):
 _CALC_PR = b'<calcPr calcId="191029" fullCalcOnLoad="1" iterate="true" iterateCount="100" iterateDelta="0.001"/>'
 
 
+def _sheetless_copy(src, dst):
+    """`src` with its whole `<sheets>…</sheets>` block replaced by an
+    empty `<sheets/>` at `dst`, every sheet part and relationship kept
+    — the sheetless shape the strict inventory refuses."""
+    import re
+    import zipfile
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            if item.filename == "xl/workbook.xml":
+                new = re.sub(rb"<sheets>.*?</sheets>", b"<sheets/>", blob, count=1, flags=re.S)
+                assert new != blob
+                blob = new
+            zout.writestr(item, blob)
+
+
 def _sheet_props_workbook(path):
     """The pkg fixture (`sheet_props_ndjson.zig::fixture.write`) rebuilt
     by hand: Data frozen, Report split with a fractional split, Bare
@@ -3512,6 +3529,20 @@ def test_sheet_props_refusal_is_typed(tmp_path):
             ed.sheet_props()
         assert info.value.error_name == "MalformedWorkbookXml"
         assert ed.calc_props() == _CALC_PROPS_EXPECTED
+
+    # An empty `<sheets/>`: the lenient opener accepts the sheetless
+    # workbook, the strict inventory refuses it (CT_Sheets minOccurs=1)
+    # — never `[]` from a read whose contract is one record per sheet.
+    # Both reads share the walk's verdict.
+    sheetless = tmp_path / "sheetless.xlsx"
+    _sheetless_copy(src, sheetless)
+    with zlsx.edit(sheetless) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.sheet_props()
+        assert info.value.error_name == "MalformedWorkbookXml"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.calc_props()
+        assert info.value.error_name == "MalformedWorkbookXml"
 
     ed = zlsx.edit(src)
     ed.close()

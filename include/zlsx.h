@@ -1941,10 +1941,12 @@ int32_t zlsx_editor_anchors_ndjson(zlsx_editor_t * ed,
  * sweeps they carry (a rename renaming `sheet`, a row insert growing
  * `dimension` and moving a frozen pane's split and `top_left_cell`)
  * are visible immediately; staged cell writes never touch the extent
- * or the views. An openable workbook lists at least one sheet, so the
- * buffer is never empty on ZLSX_OK. An inventory that cannot be served
- * faithfully refuses whole — a sheet list the strict workbook read
- * cannot prove (MalformedWorkbookXml), or a sheet part the strict walk
+ * or the views. The buffer is never empty on ZLSX_OK: a sheetless
+ * workbook (a missing or empty <sheets>) is refused, below. An
+ * inventory that cannot be served faithfully refuses whole — a sheet
+ * list the strict workbook read cannot prove (MalformedWorkbookXml:
+ * a ghost or carrier-less entry, an unprovable relationship, two
+ * entries reaching one part, an empty list), or a sheet part the strict walk
  * cannot prove a pane / extent for (MalformedSheetXml: a second
  * <dimension> / <sheetViews> / first-view <pane>, a duplicate
  * attribute on that machinery, an MCE construct at a recognized slot,
@@ -1969,8 +1971,8 @@ int32_t zlsx_editor_sheet_props_ndjson(zlsx_editor_t * ed,
  * read cannot report faithfully refuses (MalformedWorkbookXml,
  * ZLSX_REFUSED): two <calcPr> at the slot, one an MCE branch could
  * project there, a duplicate attribute, a carrier that does not
- * decode — and a <sheets> list the same strict walk cannot prove.
- * Release with zlsx_buffer_release. */
+ * decode — and a <sheets> list the same strict walk cannot prove
+ * (two wrappers, an empty one). Release with zlsx_buffer_release. */
 int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
