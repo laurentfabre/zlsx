@@ -5678,12 +5678,13 @@ pub const Workbook = struct {
     /// graphs; unreferenced parts are dead weight). A true cleanup
     /// requires `PartStore.removePart`; that's a future iter.
     ///
-    /// **Cross-references not rewritten (v1).** `<definedName>` slots
-    /// with `localSheetId == sheet_idx` (sheet-scoped names), formulas
-    /// referencing the deleted sheet, and hyperlink targets pointing at
-    /// it remain on the wire and will produce `#REF!` or
-    /// `Reference is not valid` in Excel after open. Same scope
-    /// boundary as `renameSheet`'s `m3-defnames-hyperlinks` follow-up.
+    /// **Cross-references.** The five carrier sweeps run for a delete
+    /// too — cell formulas, defined-name bodies, hyperlink locations,
+    /// DV/CF formulas and `<xm:f>` extensions all spell references
+    /// into the deleted sheet as `#REF!` (the rewriter's
+    /// deleted-sheet convention) before the workbook.xml and rels
+    /// patches land. A mid-sweep failure after the first install
+    /// marks the workbook torn, `renameSheet`'s contract.
     ///
     /// **Errors:**
     ///   - `SheetIndexOutOfRange` — `sheet_idx >= sheetCount()`.
@@ -9405,14 +9406,28 @@ fn locateWorkbookXmlSheetName(
     assert(src.len > 0);
 
     // Find the Nth `<sheet ` (note the boundary — distinguishes
-    // `<sheets>`, `<sheetData>`, etc.).
+    // `<sheets>`, `<sheetData>`, etc.). Non-elements are skipped
+    // whole: a commented-out `<sheet …>` is prose, not an identity,
+    // and counting it desynced `seen` from the real inventory —
+    // patching the comment, or refusing a valid workbook (Codex #216
+    // r15 S3B-REL-1502).
     var search_from: usize = 0;
     var seen: u32 = 0;
     var elem_attrs_start: usize = 0;
     var elem_attrs_end: usize = 0;
     while (true) {
-        const open = std.mem.indexOfPos(u8, src, search_from, "<sheet") orelse
+        const lt = std.mem.indexOfScalarPos(u8, src, search_from, '<') orelse
             return error.SheetElementNotFound;
+        if (lt + 1 < src.len and (src[lt + 1] == '!' or src[lt + 1] == '?')) {
+            search_from = workbook_xml_mod.skipNonElement(src, lt) catch
+                return error.SheetElementNotFound;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, src[lt..], "<sheet")) {
+            search_from = lt + 1;
+            continue;
+        }
+        const open = lt;
         const after = open + "<sheet".len;
         if (after >= src.len) return error.SheetElementNotFound;
         const boundary = src[after];
@@ -16247,9 +16262,12 @@ test "renameSheet: a quoted '>' and a bare token in the sheet element do not bre
         // behind a "refusal".
         const part = (try wb.store.part("xl/workbook.xml")).?;
         const at = std.mem.indexOf(u8, part.bytes, "<sheet state=\"visible\" name=").?;
+        // A comment decoy spelling sheet 0's OWN name sits before the
+        // real inventory: counting it desynced `seen` and the old
+        // patcher renamed the comment (Codex #216 r15 S3B-REL-1502).
         const patched = try std.mem.concat(std.testing.allocator, u8, &.{
             part.bytes[0..at],
-            "<sheet probe=\"a>b\" bogus state=\"visible\" name=",
+            "<!-- <sheet name=\"Sheet1\"/> --><sheet probe=\"a>b\" bogus state=\"visible\" name=",
             part.bytes[at + "<sheet state=\"visible\" name=".len ..],
         });
         defer std.testing.allocator.free(patched);
@@ -16264,6 +16282,8 @@ test "renameSheet: a quoted '>' and a bare token in the sheet element do not bre
     try std.testing.expectEqualStrings("Zed", wb.workbook.sheets[0].name);
     const part = (try wb.store.part("xl/workbook.xml")).?;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "probe=\"a>b\" bogus state=\"visible\" name=\"Zed\"") != null);
+    // The comment decoy is untouched prose.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <sheet name=\"Sheet1\"/> -->") != null);
 }
 
 test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {

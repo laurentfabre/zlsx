@@ -232,6 +232,17 @@ fn processColTag(
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     };
+    // Grid-validate BEFORE any arithmetic: a `max="4294967295"`
+    // trapped on the `+ 1` in safe builds before the intended
+    // ColEditExceedsMaxCol refusal could fire (Codex #216 r15
+    // S3B-REL-1506). Out-of-grid or inverted bounds are junk this
+    // handler has always passed through verbatim.
+    if (old_min == 0 or old_max == 0 or old_min > max_col_1based or
+        old_max > max_col_1based or old_min > old_max)
+    {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
     var new_min = old_min;
     var new_max = old_max;
     var drop = false;
@@ -276,8 +287,22 @@ fn processColTag(
     }
     if (split_emit_first_max) |first_max| {
         // Emit two <col> entries: one for the unchanged head, one
-        // for the shifted tail.
-        try emitColEntry(allocator, out, attrs, src, t, old_min, first_max);
+        // for the shifted tail. The HEAD copy is forced self-closing:
+        // duplicating an explicit-close source's open tag twice left
+        // the first element unclosed (`<col…><col…></col>`) — the
+        // source's own close (its `/>`, or the `</col>` that follows
+        // in the stream) terminates the tail copy (Codex #216 r15
+        // S3B-REL-1501).
+        var head: std.ArrayListUnmanaged(u8) = .empty;
+        defer head.deinit(allocator);
+        try emitColEntry(allocator, &head, attrs, src, t, old_min, first_max);
+        if (std.mem.endsWith(u8, head.items, "/>")) {
+            try out.appendSlice(allocator, head.items);
+        } else {
+            std.debug.assert(head.items.len > 0 and head.items[head.items.len - 1] == '>');
+            try out.appendSlice(allocator, head.items[0 .. head.items.len - 1]);
+            try out.appendSlice(allocator, "/>");
+        }
         try emitColEntry(allocator, out, attrs, src, t, new_min, new_max);
     } else {
         try emitColEntry(allocator, out, attrs, src, t, new_min, new_max);
@@ -2795,6 +2820,33 @@ test "sqref validates BOTH axes strictly; the grammar refuses out-of-grid spelli
     const bad4 = try wrapSheet(a, "<conditionalFormatting sqref=\"A\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
     defer a.free(bad4);
     try testing.expectError(error.MalformedXml, applyRowEditToWorksheet(a, bad4, 1, .insert));
+}
+
+test "col split: the head copy self-closes; junk bounds pass through untrapped (S3B-REL-1501, S3B-REL-1506)" {
+    const a = testing.allocator;
+    // Explicit-close source, split by an inside insert: the head is
+    // FORCED self-closing, the tail keeps the source's `>` and the
+    // stream's own `</col>` closes it — two complete elements.
+    const src = try wrapSheet(a, "<cols><col min=\"2\" max=\"4\" width=\"9\"></col></cols>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 3, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<col min=\"2\" max=\"2\" width=\"9\"/><col min=\"4\" max=\"5\" width=\"9\"></col>") != null);
+
+    // A self-closing source splits into two self-closed elements.
+    const src2 = try wrapSheet(a, "<cols><col min=\"2\" max=\"4\"/></cols>");
+    defer a.free(src2);
+    const out2 = try applyColEditToWorksheet(a, src2, 3, .insert);
+    defer a.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "<col min=\"2\" max=\"2\"/><col min=\"4\" max=\"5\"/>") != null);
+
+    // An out-of-grid max is junk: passed through verbatim, with no
+    // `+ 1` to trap on the way to the refusal.
+    const src3 = try wrapSheet(a, "<cols><col min=\"2\" max=\"4294967295\"/></cols>");
+    defer a.free(src3);
+    const out3 = try applyColEditToWorksheet(a, src3, 1, .insert);
+    defer a.free(out3);
+    try testing.expect(std.mem.indexOf(u8, out3, "max=\"4294967295\"") != null);
 }
 
 test "getAttr acceptance parity: bare tokens, spaced Eq, either quote — one table (S3B-REL-1001)" {
