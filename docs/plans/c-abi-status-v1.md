@@ -1047,9 +1047,12 @@ skip that fails on the spreads path has already reset the reader's
 lists and left them partially refilled from the torn row — in-house r1
 S3B-REL-101/102 — so a view kept across the `-1` bounded the getters on
 the old row over the torn one); `Rows.skip` zeroes its length before it
-raises and `Rows.parse_date` bounds on it before the index narrows. The
-only observable change to the two siblings is `-1` / `None` where they
-used to answer for a row that was not current.
+raises — on its pre-0.8.0 drain fallback too (in-house r2 S3B-REL-202)
+— and `Rows.parse_date` bounds on it before the index narrows. A
+zero-length skip is the no-op the contract reads as on both surfaces:
+no `zlsx_rows_next` is stood in for, so the current row stays current.
+The only observable change to the two siblings is `-1` / `None` where
+they used to answer for a row that was not current.
 
 **Not a `zlsx_status_v1` export, deliberately**: nothing here can refuse
 — the reader decided the fields while yielding the row, and a getter on
@@ -1072,11 +1075,14 @@ slave whose base was never seen (a value cell), a `t="dataTable"` body
 identity, so a `1` / `-1` that wrote anything is caught on every cell
 kind (in-house r1 S3B-MNT-105/106); no current row before the first
 `next`, past each row's end, at `maxInt(usize)`, past the end of the
-sheet, after a skip and after a skip that FAILS on a torn row (the
-style and date getters agreeing at each, the reader's lists shown to
-hold the torn row's remains); the date getter through a fast-path skip
-over a dated row; the buffer opener reading the same fields; a fresh
-writer's cells answering `1` everywhere. `tests/c_abi_smoke.c`
+sheet, after a skip and after a skip that FAILS on a torn row (one
+`expectNoRowAt` per site: the trio, the style getter and the date
+getter agreeing, the reader's lists shown to hold the torn row's
+remains); the date getter through a fast-path skip over a dated row
+(the reader's `row_cells` still two wide — row 1 — while nothing is
+current) and a zero-length skip keeping the row current; the buffer
+opener reading the same fields; a fresh writer's cells answering `1`
+everywhere. `tests/c_abi_smoke.c`
 `#error`s without the macro and takes the three addresses. Python
 (`test_basic.py`, "rows_formula" / "parse_date_answers"): the six rows'
 four lists, the empty lists before the first row / past the end / after
@@ -1084,7 +1090,9 @@ four lists, the empty lists before the first row / past the end / after
 `read_all` unchanged, the closed-iterator error on each accessor,
 `open_bytes` parity, a fresh writer's row, the older-dylib
 `RuntimeError` after the closed check, a probe that must agree with the
-library version, `parse_date` through a fast-path skip, and — where a
-CLI build sits beside the dylib — `zlsx cells --include-blanks`'s `t` /
+library version, `parse_date` through a fast-path skip and a
+zero-length skip, the pre-0.8.0 drain fallback (`_HAS_ROWS_SKIP` forced
+off) leaving no current row, and — where a CLI build sits beside the
+dylib — `zlsx cells --include-blanks`'s `t` /
 `formula` / `formula_ref` / `v` / `cached` equal to the accessors and
 the row values cell for cell (ten formula cells, three error cells).

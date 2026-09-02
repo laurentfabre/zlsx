@@ -1404,6 +1404,10 @@ class Rows:
                 except StopIteration:
                     break
                 skipped += 1
+            # The drained rows were never yielded to the caller: no
+            # current row, as on the library path (in-house r2
+            # S3B-REL-202).
+            self._current_len = 0
             return skipped
 
         out = ctypes.c_size_t(0)

@@ -3860,7 +3860,7 @@ _FORMULA_TORN_TAIL = b'<row r="7"><c r="A7"><f>Z9</f><v>9</v></c><c r="B7"'
 
 
 def _formula_workbook(path, tail=b""):
-    """One row through the writer (A1 = 1), then rows 2–5 spliced into
+    """One row through the writer (A1 = 1), then rows 2–6 spliced into
     the sheet part before `</sheetData>` — the writer authors neither
     shared formulas nor `t="e"` cells: a stand-alone formula, an
     entity-bearing one, a formula-only cell, a shared base + slave, an
@@ -4111,6 +4111,9 @@ def test_rows_parse_date_answers_for_the_current_row_only(tmp_path):
             assert rows.parse_date(0) == _dt.datetime(2023, 1, 1)
             assert rows.parse_date(1) is None
             assert rows.parse_date(-1) is None
+            # A zero-length skip is a no-op: the row stays current.
+            assert rows.skip(0) == 0
+            assert rows.parse_date(0) == _dt.datetime(2023, 1, 1)
             assert rows.skip(1) == 1
             assert rows.parse_date(0) is None
             assert next(rows) == ["three"]
@@ -4118,3 +4121,34 @@ def test_rows_parse_date_answers_for_the_current_row_only(tmp_path):
             with pytest.raises(StopIteration):
                 next(rows)
             assert rows.parse_date(0) is None
+
+
+def test_rows_skip_drain_fallback_leaves_no_current_row(tmp_path, monkeypatch):
+    """The pre-0.8.0 fallback drains rows through `next()`; the drained
+    rows were never yielded, so afterwards there is no current row —
+    the same answer the library path gives (in-house r2 S3B-REL-202)."""
+    import datetime as _dt
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_PARSE_DATE:
+        pytest.skip("loaded libzlsx predates parse_date ABI (0.2.6+)")
+    path = tmp_path / "skip_fallback.xlsx"
+    with zlsx.write(path) as w:
+        date_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd"))
+        sheet = w.add_sheet("S")
+        sheet.write_row([44927, "one"], styles=[date_style, 0])
+        sheet.write_row(["two", "two", "two"])
+        sheet.write_row(["three"])
+    monkeypatch.setattr(ffi, "_HAS_ROWS_SKIP", False)
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            assert rows.parse_date(0) == _dt.datetime(2023, 1, 1)
+            assert rows.skip(0) == 0
+            assert rows.style_indices() == [date_style, None]
+            assert rows.skip(1) == 1
+            assert rows.style_indices() == []
+            assert rows.parse_date(0) is None
+            assert next(rows) == ["three"]
+            assert rows.skip(5) == 0
+            assert rows.style_indices() == []

@@ -980,7 +980,9 @@ export fn zlsx_rows_next(
 /// the rows belonging to earlier partitions.
 ///
 /// The cells of the most recently yielded row are invalidated, exactly
-/// as `zlsx_rows_next` invalidates them.
+/// as `zlsx_rows_next` invalidates them — on -1 as well as on 0; a
+/// zero-length skip is the no-op the contract reads as, and leaves the
+/// current row current.
 export fn zlsx_rows_skip(
     rows: *Rows,
     n: usize,
@@ -990,6 +992,13 @@ export fn zlsx_rows_skip(
 ) callconv(.c) i32 {
     const rs: *RowsState = @ptrCast(@alignCast(rows));
 
+    // Zero rows: no `zlsx_rows_next` is stood in for, so the current
+    // row stays current (py-zlsx returns before the call for the same
+    // reason — in-house r2 quick win).
+    if (n == 0) {
+        if (out_skipped) |o| o.* = 0;
+        return 0;
+    }
     // The C-side cell view belongs to a row that is now behind us —
     // whether or not the skip lands: on the formula-spreads path the
     // reader decodes through `next()`, which resets its per-row lists
@@ -1166,7 +1175,8 @@ export fn zlsx_datetime_to_serial(
 /// date-styled number, writing the decoded `CDateTime` into `out`.
 /// Returns 0 on success (non-null DateTime), 1 when the cell isn't
 /// a date (wrong type / non-date numFmt / out-of-range serial), -1
-/// when `col_idx` is past the row width.
+/// when there is no current row or `col_idx` is past it (`out`
+/// untouched).
 ///
 /// Callers that want both the raw number AND the DateTime should
 /// still use the cells array from `zlsx_rows_next` + this
@@ -1183,13 +1193,10 @@ export fn zlsx_rows_parse_date(
     // so bounding on them alone served a skipped-past row's date
     // (in-house r1 S3B-REL-103/104).
     if (col_idx >= rs.c_cells.items.len) return -1;
-    const dt = rs.inner.parseDate(col_idx) orelse {
-        // Distinguish "col_idx out of range" from "cell isn't a date".
-        // styleIndices / row_cells share the same bounded length;
-        // anything past that is -1.
-        if (col_idx >= rs.inner.row_cells.items.len) return -1;
-        return 1;
-    };
+    // Within the view every column exists in the reader's row too (the
+    // two are built in lockstep on a yielded row), so a null here is
+    // "not a date", never "out of range".
+    const dt = rs.inner.parseDate(col_idx) orelse return 1;
     out.* = .{
         .year = dt.year,
         .month = dt.month,
@@ -9708,7 +9715,7 @@ test "S3b sheet_state: a fresh writer's sheets carry no attribute and read visib
 
 // ─── S3b slice 11: formula text and error tags on the row iterator ───
 
-/// Rows 2–5 spliced into the writer's sheet part before `</sheetData>`
+/// Rows 2–6 spliced into the writer's sheet part before `</sheetData>`
 /// — the writer authors neither shared formulas nor `t="e"` cells, so
 /// the fixture is the test's. Row 1 is the writer's (`A1` = 1).
 ///   row 2: A2 stand-alone `A1*2` cached 2 · B2 an entity-bearing body
@@ -9888,6 +9895,18 @@ fn expectNoDateRow(rows: *Rows, col: usize) !void {
     try std.testing.expectEqual(@as(u8, 5), dt.second);
 }
 
+/// All five per-column getters agree that `col` is not on the current
+/// row — the trio, the style getter and the date getter answer -1 and
+/// write nothing (in-house r2 S3B-DOC-206: one call per site, so the
+/// claim "agreeing at each" is the test).
+fn expectNoRowAt(rows: *Rows, col: usize) !void {
+    try S3b11Probe.at(rows, col).expectNone(-1);
+    var style: u32 = 0xABCD;
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows, col, &style));
+    try std.testing.expectEqual(@as(u32, 0xABCD), style);
+    try expectNoDateRow(rows, col);
+}
+
 fn expectCellString(cell: CCell, want: []const u8) !void {
     try std.testing.expectEqual(@intFromEnum(CellTag.string), cell.tag);
     try std.testing.expectEqualStrings(want, cell.str_ptr[0..cell.str_len]);
@@ -9918,12 +9937,8 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     var cells_len: usize = 0;
 
     // Before the first row there is no current row: -1, nothing written
-    // — the style and date getters agree.
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
-    var style: u32 = 0xABCD;
-    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
-    try std.testing.expectEqual(@as(u32, 0xABCD), style);
-    try expectNoDateRow(rows.?, 0);
+    // — every getter on the handle agrees.
+    try expectNoRowAt(rows.?, 0);
 
     // Row 1 — the writer's value cell: every getter says 1; past the
     // end of the row every getter says -1.
@@ -9931,8 +9946,8 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try std.testing.expectEqual(@as(usize, 1), cells_len);
     try expectCellInt(cells_ptr[0], 1);
     try S3b11Probe.at(rows.?, 0).expectNone(1);
-    try S3b11Probe.at(rows.?, 1).expectNone(-1);
-    try S3b11Probe.at(rows.?, std.math.maxInt(usize)).expectNone(-1);
+    try expectNoRowAt(rows.?, 1);
+    try expectNoRowAt(rows.?, std.math.maxInt(usize));
 
     // Row 2 — stand-alone formulas: the text is the `<f>` body,
     // entity-decoded; the cell is the cached `<v>`, or empty for a
@@ -9945,7 +9960,7 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try expectCellString(cells_ptr[1], "xy");
     try S3b11Probe.at(rows.?, 2).expectFormula("A1/0");
     try std.testing.expectEqual(@intFromEnum(CellTag.empty), cells_ptr[2].tag);
-    try S3b11Probe.at(rows.?, 3).expectNone(-1);
+    try expectNoRowAt(rows.?, 3);
 
     // Row 3 — a shared base and its slave, an error cell, and a formula
     // whose cached value is an error literal (the formula wins; the
@@ -9960,6 +9975,7 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try expectCellString(cells_ptr[2], "#DIV/0!");
     try S3b11Probe.at(rows.?, 3).expectFormula("1/0");
     try expectCellString(cells_ptr[3], "#DIV/0!");
+    try expectNoRowAt(rows.?, 4);
 
     // Row 4 — an array base and the slave inside its rectangle, which
     // has no `<f>` of its own.
@@ -9970,6 +9986,7 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try S3b11Probe.at(rows.?, 1).expectSlave(0, 4);
     try expectCellInt(cells_ptr[1], 2);
     try S3b11Probe.at(rows.?, 2).expectError("#N/A");
+    try expectNoRowAt(rows.?, 3);
 
     // Row 5 — a gap cell is a value cell to every getter; the error
     // literal keeps its bytes.
@@ -9979,7 +9996,7 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try S3b11Probe.at(rows.?, 0).expectNone(1);
     try S3b11Probe.at(rows.?, 1).expectError("#REF!");
     try expectCellString(cells_ptr[1], "#REF!");
-    try S3b11Probe.at(rows.?, 2).expectNone(-1);
+    try expectNoRowAt(rows.?, 2);
 
     // Row 6 — the header's edge promises: an empty `<f></f>` is own
     // text of length 0 behind a written (non-sentinel) pointer; a slave
@@ -9993,15 +10010,12 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try expectCellInt(cells_ptr[1], 8);
     try S3b11Probe.at(rows.?, 2).expectFormula("x");
     try expectCellInt(cells_ptr[2], 7);
+    try expectNoRowAt(rows.?, 3);
 
-    // Past the end there is no current row again — for the trio and
-    // for the style and date getters alike.
+    // Past the end there is no current row again — for every getter
+    // on the handle alike.
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
-    style = 0xABCD;
-    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
-    try std.testing.expectEqual(@as(u32, 0xABCD), style);
-    try expectNoDateRow(rows.?, 0);
+    try expectNoRowAt(rows.?, 0);
 }
 
 test "S3b rows formulas: a skip clears the current row for every side-channel getter, and the buffer opener agrees" {
@@ -10038,11 +10052,7 @@ test "S3b rows formulas: a skip clears the current row for every side-channel ge
     var skipped: usize = 0;
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 1, &skipped, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 1), skipped);
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
-    var style: u32 = 0xABCD;
-    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
-    try std.testing.expectEqual(@as(u32, 0xABCD), style);
-    try expectNoDateRow(rows.?, 0);
+    try expectNoRowAt(rows.?, 0);
 
     // Row 4 lands next — the array slave still resolves to its base
     // (the spread state survives the skip) and the error literal reads.
@@ -10113,18 +10123,14 @@ test "S3b rows formulas: a skip that fails leaves no current row either (in-hous
     try std.testing.expectEqual(@as(i32, -1), zlsx_rows_skip(rows.?, 10, &skipped, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("MalformedXml", std.mem.sliceTo(&err_buf, 0));
     try std.testing.expectEqual(@as(usize, 0xAAAA), skipped);
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
-    var style: u32 = 0xABCD;
-    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
-    try std.testing.expectEqual(@as(u32, 0xABCD), style);
-    try expectNoDateRow(rows.?, 0);
+    try expectNoRowAt(rows.?, 0);
     // The reader's lists do hold the torn row's remains — the view is
     // what keeps them off the ABI.
     try std.testing.expect(rows_inner(rows.?).formulaStrings().len > 0);
     // And no later call resurrects a row: the tear reports again or
     // the sheet ends, never a stale 1.
     try std.testing.expect(zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len) != 1);
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    try expectNoRowAt(rows.?, 0);
 }
 
 fn rows_inner(rows: *Rows) *const xlsx.Rows {
@@ -10163,28 +10169,35 @@ test "S3b rows formulas: the date getter answers for the current row only, throu
     var cells_ptr: [*]const CCell = undefined;
     var cells_len: usize = 0;
 
-    try expectNoDateRow(rows.?, 0);
+    try expectNoRowAt(rows.?, 0);
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     var dt: CDateTime = undefined;
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_parse_date(rows.?, 0, &dt));
     try std.testing.expectEqual(@as(u16, 2023), dt.year);
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_parse_date(rows.?, 1, &dt));
-    try expectNoDateRow(rows.?, 2);
+    try expectNoRowAt(rows.?, 2);
+
+    // A zero-length skip is a no-op: the row stays current.
+    var zero_skipped: usize = 7;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 0, &zero_skipped, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 0), zero_skipped);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_parse_date(rows.?, 0, &dt));
+    try std.testing.expectEqual(@as(u16, 2023), dt.year);
 
     // Skip row 2 on the fast path: the reader's `row_cells` still hold
-    // row 1 (the date), but nothing is current.
+    // row 1 (the date — two cells, not row 2's three), but nothing is
+    // current to any getter.
     var skipped: usize = 0;
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 1, &skipped, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 1), skipped);
-    try std.testing.expect(rows_inner(rows.?).row_cells.items.len > 0);
-    try expectNoDateRow(rows.?, 0);
-    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    try std.testing.expectEqual(@as(usize, 2), rows_inner(rows.?).row_cells.items.len);
+    try expectNoRowAt(rows.?, 0);
 
     // Row 3 lands: one string cell, no date; past its end -1.
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 1), cells_len);
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_parse_date(rows.?, 0, &dt));
-    try expectNoDateRow(rows.?, 1);
+    try expectNoRowAt(rows.?, 1);
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
-    try expectNoDateRow(rows.?, 0);
+    try expectNoRowAt(rows.?, 0);
 }
