@@ -184,8 +184,11 @@ pub const Error = error{
     /// Unicode-fold caveat).
     SheetNameInUse,
     /// Internal invariant: the existing sheet name in `WorkbookXml`
-    /// exceeds 128 bytes. OOXML-conformant inputs cannot trip this —
-    /// surfaces only on hand-crafted / corrupted workbook.xml.
+    /// is EMPTY — an OOXML-invariant violation only a hand-crafted /
+    /// corrupted workbook.xml can carry. (The ABI-frozen name
+    /// predates #216 r17, which dropped the historical 128-byte
+    /// carrier bound: a valid escape-heavy name legitimately
+    /// exceeds it.)
     InternalSheetNameTooLong,
     /// `Workbook.renameSheet` could not locate the target `<sheet>`
     /// element in the source `xl/workbook.xml` bytes. Surfaces only
@@ -4873,8 +4876,9 @@ pub const Workbook = struct {
         try validateSheetName(new_name);
         try self.assertSheetNameAvailable(sheet_idx, new_name);
 
-        // Capture old name into a stack copy: step 4 re-parses the
-        // workbook view, freeing the arena that backs `sheets[i].name`.
+        // Capture old name into an allocator-owned copy: step 4
+        // re-parses the workbook view, freeing the arena that backs
+        // `sheets[i].name`.
         // We need the old bytes alive across step 2 (rewriter) and step
         // 3 (XML patch — the patch reads from the source bytes still
         // holding the old name).
