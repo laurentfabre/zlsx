@@ -1652,7 +1652,7 @@ pub const PartStore = struct {
         self: *const PartStore,
         owner_part_name: []const u8,
         target: []const u8,
-    ) !?[]const u8 {
+    ) std.mem.Allocator.Error!?[]const u8 {
         const ar_alloc = @constCast(&self.arena).allocator();
         return self.resolveInto(ar_alloc, owner_part_name, target);
     }

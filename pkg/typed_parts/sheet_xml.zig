@@ -578,34 +578,42 @@ fn indexOfTag(hay: []const u8, from: usize, needle: []const u8) ?usize {
 
 /// Match `key="value"` or `key='value'` inside an attribute slice.
 /// Returns the value (no quote-stripping issues, no entity decode).
+/// Extract `key`'s value from an attribute region — an attribute-by-
+/// attribute walk with exact-name matching, either quote style, and
+/// XML `S? '=' S?` spacing: the SAME acceptance as the byte walkers'
+/// `getAttr` (src/xlsx.zig), so the typed view and the transform can
+/// never disagree about whether an attribute exists. The old
+/// contiguous `key="` search dropped a spaced-Eq `sqref = "B1:B4"`
+/// from the view while the walker shifted its envelope, and the
+/// formula sweep then skipped the rule the walker had moved (Codex
+/// #216 r9 S3B-REL-912).
 fn attrAt(attrs: []const u8, key: []const u8) ?[]const u8 {
-    return attrAtQuote(attrs, key, '"') orelse attrAtQuote(attrs, key, '\'');
-}
-
-fn attrAtQuote(attrs: []const u8, key: []const u8, quote: u8) ?[]const u8 {
     assert(key.len > 0);
-    assert(key.len < 64);
-    var buf: [80]u8 = undefined;
-    if (key.len + 2 > buf.len) return null;
-    @memcpy(buf[0..key.len], key);
-    buf[key.len] = '=';
-    buf[key.len + 1] = quote;
-    const needle = buf[0 .. key.len + 2];
-
-    // Scan with a left-boundary check so `key` doesn't match the
-    // tail of another attribute name (e.g. searching `id` shouldn't
-    // hit `r:id` or `xr:id`). Boundary chars are space/tab/lf/cr or
-    // start-of-slice.
-    var probe: usize = 0;
-    while (std.mem.indexOfPos(u8, attrs, probe, needle)) |hit| {
-        const left_ok = hit == 0 or isAttrBoundary(attrs[hit - 1]);
-        if (!left_ok) {
-            probe = hit + 1;
-            continue;
-        }
-        const start = hit + needle.len;
-        const close = std.mem.indexOfScalarPos(u8, attrs, start, quote) orelse return null;
-        return attrs[start..close];
+    var i: usize = 0;
+    while (i < attrs.len) {
+        while (i < attrs.len and isAttrBoundary(attrs[i])) i += 1;
+        if (i >= attrs.len) break;
+        const name_start = i;
+        while (i < attrs.len and attrs[i] != '=' and !isAttrBoundary(attrs[i])) i += 1;
+        const name = attrs[name_start..i];
+        // Skip whitespace after the name; a token with no `=` — the
+        // tag name at the slice's head (callers here pass the whole
+        // `<tag …` region), a self-close `/`, a bare attribute — is
+        // stepped over, not a dead end.
+        while (i < attrs.len and isAttrBoundary(attrs[i])) i += 1;
+        if (i >= attrs.len) break;
+        if (attrs[i] != '=') continue;
+        i += 1;
+        while (i < attrs.len and isAttrBoundary(attrs[i])) i += 1;
+        if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) break;
+        const quote = attrs[i];
+        i += 1;
+        const val_start = i;
+        while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return null; // unterminated value
+        const val = attrs[val_start..i];
+        i += 1;
+        if (std.mem.eql(u8, name, key)) return val;
     }
     return null;
 }

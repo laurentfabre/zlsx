@@ -12186,9 +12186,10 @@ fn collectCellFormulaPatches(
 /// no lockstep to lose. Four Codex #215 rounds (r1 REL-103, r2
 /// REL-204, r4 REL-401, r5 REL-501) each found another way a raw walk
 /// diverged from the sanitized view's lexical state — comment decoys,
-/// prefix-matched outer blocks, DTD bytes the sanitizer keeps, comment
-/// markers nested inside DTD literals — and the offset map ends the
-/// class: the splice target IS the view's formula, by construction. A
+/// prefix-matched outer blocks, DTD bytes the sanitizer formerly kept
+/// (it elides declarations whole since #216 r5), comment markers
+/// nested inside DTD literals — and the offset map ends the class:
+/// the splice target IS the view's formula, by construction. A
 /// slice that does not map to one verbatim source run (a body the
 /// sanitizer re-encoded from CDATA, or one crossing a stripped
 /// construct), or whose mapped source bytes no longer equal the
@@ -16108,6 +16109,52 @@ test "rewrite CF: all three formula slots shift, not just the first (S3B-REL-801
     try std.testing.expectEqualStrings("B6", cfs[0].formula.?);
     try std.testing.expectEqualStrings("B8", cfs[0].formula2.?);
     try std.testing.expectEqualStrings("B10", cfs[0].formula3.?);
+}
+
+test "insertRow: a spaced-Eq DV moves envelope AND formula together (S3B-REL-912)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-speq-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // XML §3.1 `Eq ::= S? '=' S?`: the spacing is legal, the byte
+        // walker's getAttr reads through it — and the typed view's
+        // old contiguous `sqref="` search did not, so the FULL edit
+        // shifted this envelope while the sweep never saw the rule's
+        // formula.
+        const dv =
+            \\<dataValidations count="1"><dataValidation type="custom" sqref = "B1:B4"><formula1>B1+1</formula1></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-speq-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "sqref = \"B2:B5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
 }
 
 test "rewrite CF: a commented-out cfRule decoy does not shift the splice lockstep (REL-103)" {
