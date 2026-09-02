@@ -1778,3 +1778,16 @@ if _HAS_CONDITIONAL_FORMATS:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_conditional_formats_ndjson.restype = ctypes.c_int32
+
+# S3b slice 7: the anchors read, the same buffer contract.
+_HAS_ANCHORS = hasattr(lib, "zlsx_editor_anchors_ndjson") and _HAS_BUFFER_RELEASE and _HAS_DIAG_RELEASE
+if _HAS_ANCHORS:
+    lib.zlsx_editor_anchors_ndjson.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_anchors_ndjson.restype = ctypes.c_int32

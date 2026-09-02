@@ -50,6 +50,9 @@
 #if !defined(ZLSX_HAS_CONDITIONAL_FORMATS)
 #error "ZLSX_HAS_CONDITIONAL_FORMATS missing"
 #endif
+#if !defined(ZLSX_HAS_ANCHORS)
+#error "ZLSX_HAS_ANCHORS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -102,6 +105,8 @@ static const void *const s3a_exports[] = {
     (const void *)&zlsx_editor_defined_names_ndjson,
     /* S3b slice 6: the conditional-formats read rides it too. */
     (const void *)&zlsx_editor_conditional_formats_ndjson,
+    /* S3b slice 7: the anchors read. */
+    (const void *)&zlsx_editor_anchors_ndjson,
 };
 
 const void *zlsx_c_abi_smoke_anchor_m9a2(void);

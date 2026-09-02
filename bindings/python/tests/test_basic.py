@@ -3017,6 +3017,277 @@ def test_conditional_formats_refusal_is_typed(tmp_path):
         ed.conditional_formats()
 
 
+def _require_anchors():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_ANCHORS:
+        pytest.skip("anchors read not exposed in loaded libzlsx (requires 0.9.0+)")
+
+
+_ANCHORS_PNG = b"\x89PNG\r\n\x1a\n01234567"
+
+_ANCHORS_NS = (
+    'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+
+_ANCHORS_PIC = (
+    '<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="{name}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+    '<xdr:blipFill><a:blip r:embed="rIdI1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+    '<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
+)
+
+_ANCHORS_CHART_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    '<c:chart><c:plotArea><c:layout/><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/>'
+    '<c:tx><c:strRef><c:f>Data!$B$1</c:f></c:strRef></c:tx>'
+    '<c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f></c:strRef></c:cat>'
+    '<c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f></c:numRef></c:val>'
+    '</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>'
+)
+
+# Report's drawing: the chart FIRST in document order, then a two-cell
+# image, then an absolute image — the view regroups images before
+# charts, so the fixture must not mirror the stream (the pkg fixture's
+# shape, `anchor_ndjson.zig::fixture.write(.with_absolute)`).
+_ANCHORS_DRAWING1 = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    f'<xdr:wsDr {_ANCHORS_NS}>'
+    '<xdr:oneCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+    '<xdr:ext cx="3048000" cy="2286000"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>'
+    '<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+    '<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>'
+    '<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+    '<xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>19050</xdr:rowOff></xdr:to>'
+    + _ANCHORS_PIC.format(id=2, name="Picture 1") + '<xdr:clientData/></xdr:twoCellAnchor>'
+    '<xdr:absoluteAnchor><xdr:pos x="1000" y="2000"/><xdr:ext cx="914400" cy="457200"/>'
+    + _ANCHORS_PIC.format(id=4, name="Picture 2") + '<xdr:clientData/></xdr:absoluteAnchor>'
+    '</xdr:wsDr>'
+)
+
+# Data's drawing: one two-cell image, so the stream crosses a sheet
+# boundary.
+_ANCHORS_DRAWING2 = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    f'<xdr:wsDr {_ANCHORS_NS}>'
+    '<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+    '<xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+    + _ANCHORS_PIC.format(id=2, name="Logo") + '<xdr:clientData/></xdr:twoCellAnchor>'
+    '</xdr:wsDr>'
+)
+
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _rels_xml(*rels):
+    body = "".join(
+        f'<Relationship Id="{rid}" Type="{_REL_NS}/{leaf}" Target="{target}"/>'
+        for rid, leaf, target in rels
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + body + "</Relationships>"
+    )
+
+
+def _anchors_workbook(path):
+    """A real two-sheet workbook with anchors on BOTH sheets, the pkg
+    fixture rebuilt by hand: the writer has no drawing surface, so the
+    parts ride in through the archive."""
+    import os
+    import zipfile
+
+    with zlsx.write(path) as w:
+        data = w.add_sheet("Data")
+        data.write_row(["Region", "Qty"])
+        data.write_row(["East", 3])
+        data.write_row(["West", 4])
+        data.write_row(["East", 5])
+        w.add_sheet("Report").write_row(["drawing host"])
+
+    tmp = str(path) + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                blob = blob.replace(
+                    b"</Types>",
+                    b'<Default Extension="png" ContentType="image/png"/>'
+                    b'<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+                    b'<Override PartName="/xl/drawings/drawing2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+                    b'<Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+                    b"</Types>",
+                )
+            elif item.filename == "xl/worksheets/sheet1.xml":
+                blob = blob.replace(b"</worksheet>", b'<drawing r:id="rIdD2"/></worksheet>')
+            elif item.filename == "xl/worksheets/sheet2.xml":
+                blob = blob.replace(b"</worksheet>", b'<drawing r:id="rIdD1"/></worksheet>')
+            zout.writestr(item, blob)
+        zout.writestr("xl/media/image1.png", _ANCHORS_PNG)
+        zout.writestr("xl/charts/chart1.xml", _ANCHORS_CHART_XML)
+        zout.writestr("xl/drawings/drawing1.xml", _ANCHORS_DRAWING1)
+        zout.writestr("xl/drawings/_rels/drawing1.xml.rels", _rels_xml(("rIdI1", "image", "../media/image1.png"), ("rIdC1", "chart", "../charts/chart1.xml")))
+        zout.writestr("xl/drawings/drawing2.xml", _ANCHORS_DRAWING2)
+        zout.writestr("xl/drawings/_rels/drawing2.xml.rels", _rels_xml(("rIdI1", "image", "../media/image1.png")))
+        zout.writestr("xl/worksheets/_rels/sheet1.xml.rels", _rels_xml(("rIdD2", "drawing", "../drawings/drawing2.xml")))
+        zout.writestr("xl/worksheets/_rels/sheet2.xml.rels", _rels_xml(("rIdD1", "drawing", "../drawings/drawing1.xml")))
+    os.replace(tmp, path)
+
+
+def _patched_copy(src, dst, part, old, new):
+    """`src` with the first `old` in `part` replaced by `new`, at `dst`."""
+    import zipfile
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            if item.filename == part:
+                assert old in blob
+                blob = blob.replace(old, new, 1)
+            zout.writestr(item, blob)
+
+
+_ANCHORS_EXPECTED = [
+    {"kind": "image_anchor", "sheet": "Data", "sheet_idx": 0, "part": "xl/media/image1.png",
+     "anchor": "two_cell", "from": {"row": 1, "col": 1, "row_off": 0, "col_off": 0},
+     "to": {"row": 4, "col": 3, "row_off": 0, "col_off": 0}, "absolute": None, "bytes": len(_ANCHORS_PNG)},
+    {"kind": "image_anchor", "sheet": "Report", "sheet_idx": 1, "part": "xl/media/image1.png",
+     "anchor": "two_cell", "from": {"row": 3, "col": 2, "row_off": 0, "col_off": 9525},
+     "to": {"row": 8, "col": 5, "row_off": 19050, "col_off": 0}, "absolute": None, "bytes": len(_ANCHORS_PNG)},
+    {"kind": "image_anchor", "sheet": "Report", "sheet_idx": 1, "part": "xl/media/image1.png",
+     "anchor": "absolute", "from": None, "to": None,
+     "absolute": {"x": 1000, "y": 2000, "cx": 914400, "cy": 457200}, "bytes": len(_ANCHORS_PNG)},
+    {"kind": "chart_anchor", "sheet": "Report", "sheet_idx": 1, "part": "xl/charts/chart1.xml",
+     "anchor": "one_cell", "from": {"row": 2, "col": 6, "row_off": 0, "col_off": 0}, "to": None,
+     "absolute": None, "chart_type": "bar",
+     "series_refs": ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]},
+]
+
+
+def test_anchors_frozen_shape_and_empty_on_plain_workbook(tmp_path):
+    """`Editor.anchors()` / `zlsx.anchors(path)` return the `zlsx anchors`
+    records as dicts — sheets in workbook order, a sheet's images before
+    its charts (Report's chart is FIRST in its drawing), all three anchor
+    kinds; `[]` without drawings."""
+    _require_anchors()
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    assert zlsx.anchors(plain) == []
+    with zlsx.edit(plain) as ed:
+        assert ed.anchors() == []
+
+    src = tmp_path / "anchors.xlsx"
+    _anchors_workbook(src)
+    assert zlsx.anchors(src) == _ANCHORS_EXPECTED
+    with zlsx.edit(src) as ed:
+        assert ed.anchors() == _ANCHORS_EXPECTED
+
+
+def test_anchors_read_the_editors_current_state(tmp_path):
+    """A sheet rename is visible immediately in `sheet`, and a row
+    insert moves the edited sheet's anchor with the grid while the
+    other sheet's stay, no save in between. Chart parts are
+    byte-preserved, so their refs do not follow either edit."""
+    _require_anchors()
+    _require_structural()
+    src = tmp_path / "anchors.xlsx"
+    _anchors_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "Facts")
+        records = ed.anchors()
+        assert [r["sheet"] for r in records] == ["Facts", "Report", "Report", "Report"]
+        # Chart parts are byte-preserved through every edit today (the
+        # surface matrix's contract): the chart's refs still spell the
+        # old name, and the read reports the bytes faithfully. Routing
+        # chart `<c:f>` carriers through the formula rewriter is the
+        # recorded S3b follow-up — this pin flips when it lands.
+        assert records[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]
+
+        ed.insert_row(0, 1)
+        moved = ed.anchors()
+    assert (moved[0]["from"], moved[0]["to"]) == (
+        {"row": 2, "col": 1, "row_off": 0, "col_off": 0},
+        {"row": 5, "col": 3, "row_off": 0, "col_off": 0},
+    )
+    assert moved[1]["from"] == {"row": 3, "col": 2, "row_off": 0, "col_off": 9525}  # Report did not move
+    assert moved[3]["from"] == {"row": 2, "col": 6, "row_off": 0, "col_off": 0}
+    assert moved[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]
+
+
+def test_anchors_refusal_is_typed(tmp_path):
+    """An inventory the read cannot serve faithfully raises a typed
+    `ZlsxRefusal` — never a partial list."""
+    _require_anchors()
+    import zipfile
+
+    src = tmp_path / "anchors.xlsx"
+    _anchors_workbook(src)
+
+    # Data's image blip names a relationship its drawing does not hold:
+    # the drawing graph cannot be read whole.
+    broken = tmp_path / "broken.xlsx"
+    _patched_copy(src, broken, "xl/drawings/drawing2.xml", b'r:embed="rIdI1"', b'r:embed="rIdXX"')
+    with zlsx.edit(broken) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.anchors()
+        assert info.value.error_name == "MalformedDrawingXml"
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+
+    # A broken SECOND sheet refuses whole — Data's perfectly servable
+    # record is never handed out.
+    broken2 = tmp_path / "broken2.xlsx"
+    _patched_copy(src, broken2, "xl/drawings/drawing1.xml", b"<xdr:to>", b"<xdr:zz>")
+    with zlsx.edit(broken2) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.anchors()
+        assert info.value.error_name == "MalformedDrawingXml"
+
+    # A bad entity in a sheet-name carrier: the workbook-level read
+    # refuses before any drawing is walked.
+    broken3 = tmp_path / "broken3.xlsx"
+    _patched_copy(src, broken3, "xl/workbook.xml", b'name="Report"', b'name="Rep&bogus;ort"')
+    with zlsx.edit(broken3) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.anchors()
+        assert info.value.error_name == "MalformedWorkbookXml"
+
+    # A copy of Report's part under a name no <sheet> entry reaches,
+    # its drawing reference and rels riding along: the anchors on it
+    # cannot be attributed, and the read refuses rather than drop them.
+    orphan = tmp_path / "orphan.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(orphan, "w", zipfile.ZIP_DEFLATED) as zout:
+        # Read the copies BEFORE the rewrite loop: writestr mutates the
+        # shared ZipInfo objects (header offsets), after which zin can
+        # no longer read by name.
+        sheet2 = zin.read("xl/worksheets/sheet2.xml")
+        rels2 = zin.read("xl/worksheets/_rels/sheet2.xml.rels")
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                blob = blob.replace(
+                    b"</Types>",
+                    b'<Override PartName="/xl/worksheets/sheet9.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+                )
+            zout.writestr(item, blob)
+        zout.writestr("xl/worksheets/sheet9.xml", sheet2)
+        zout.writestr("xl/worksheets/_rels/sheet9.xml.rels", rels2)
+    with zlsx.edit(orphan) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.anchors()
+        assert info.value.error_name == "DrawingOnUnlistedSheet"
+
+    ed = zlsx.edit(src)
+    ed.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.anchors()
+
+
 def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path):
     """c_uint32 wraps modulo 2**32: without a guard, rename_sheet(2**32, …)
     would rename sheet 0. Every integer-bearing structural method rejects

@@ -2,22 +2,26 @@
 //! (`docs/cli.md`, "anchors"), written once for every surface.
 //!
 //! `zlsx anchors` emits these through its own selection and pagination;
-//! the C and Python legs of row S3b hand over the same bytes when they
-//! land — the `pivot_ndjson.zig` / `defined_name_ndjson.zig` precedent.
+//! the C (`zlsx_editor_anchors_ndjson`) and Python (`Editor.anchors`)
+//! legs of row S3b hand over the same bytes — the `pivot_ndjson.zig` /
+//! `defined_name_ndjson.zig` precedent.
 //!
 //! The view is `drawings.imageAnchors` + `drawings.chartAnchors`
 //! attributed to workbook sheets: the walkers key anchors by worksheet
 //! *part* name, this module resolves each part back to the `<sheets>`
-//! entry that owns it so every record carries the same `sheet` /
-//! `sheet_idx` envelope as the rest of the read family. Image bytes and
-//! chart XML stay off the wire — the record reports the anchor geometry
-//! and where the payload lives (`part`), not the payload itself.
+//! entry that owns it — through the strict sheet inventory the
+//! conditional-formats read established — so every record carries the
+//! same `sheet` / `sheet_idx` envelope as the rest of the read family.
+//! Image bytes and chart XML stay off the wire — the record reports the
+//! anchor geometry and where the payload lives (`part`), not the
+//! payload itself.
 
 const std = @import("std");
 const formula = @import("zlsx_formula");
 const drawings = @import("drawings.zig");
 const store_mod = @import("store.zig");
-const workbook_xml = @import("typed_parts/root.zig").workbook_xml;
+const workbook_mod = @import("workbook.zig");
+const cf_ndjson = @import("conditional_format_ndjson.zig");
 const json = @import("json_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -89,8 +93,9 @@ pub const Record = union(enum) {
 /// strings; `deinit` frees them.
 pub const Anchors = struct {
     arena: std.heap.ArenaAllocator,
-    /// Decoded sheet names, parallel to `WorkbookXml.sheets` — the
-    /// inventory the CLI's selectors and the `sheet` field read from.
+    /// Decoded sheet names in workbook order — the strict inventory
+    /// (`conditional_format_ndjson.resolveSheets`) the CLI's selectors
+    /// and the `sheet` field read from.
     sheet_names: []const []const u8,
     records: []const Record,
 
@@ -101,74 +106,75 @@ pub const Anchors = struct {
 };
 
 pub const Error = error{
-    /// A sheet-name carrier that does not decode or decodes to
-    /// non-UTF-8 (the NDJSON must stay parseable), or a sheet list
-    /// the anchors cannot be attributed against: a sheet whose
-    /// relationship dangles, is mistyped or external, whose part the
-    /// archive does not hold, or two `<sheet>` entries reaching one
-    /// part (Codex #214 r1 REL-101/REL-102).
+    /// A sheet list the strict workbook read cannot prove
+    /// (`conditional_format_ndjson.resolveSheets`): a sheet-name
+    /// carrier that does not decode or decodes to non-UTF-8 (the
+    /// NDJSON must stay parseable), two names decoding to one
+    /// spelling, a sheet whose relationship dangles, is mistyped or
+    /// external, whose part the archive does not hold or cannot
+    /// materialise, or two `<sheet>` entries reaching one part (Codex
+    /// #214 r1 REL-101/REL-102).
     MalformedWorkbookXml,
     /// An anchor on a worksheet part `xl/workbook.xml` does not list:
     /// the record could not carry a truthful `sheet` / `sheet_idx`,
     /// and dropping it would be a partial inventory.
     DrawingOnUnlistedSheet,
-    /// A part name or series ref the NDJSON cannot carry faithfully:
-    /// not UTF-8, a ref whose carrier does not decode, or a ref with
-    /// embedded markup.
+    /// A drawing graph the strict walk cannot read whole (a dangling
+    /// or mistyped edge, an anchor that does not parse, a part along
+    /// the chain the store cannot materialise), or a part name or
+    /// series ref the NDJSON cannot carry faithfully: not UTF-8, a
+    /// ref whose carrier does not decode, or a ref with embedded
+    /// markup.
     MalformedDrawingXml,
     OutOfMemory,
 };
 
+/// What `collect` itself can raise — `Error` plus the archive-wide
+/// decompression caps, which keep their name across every boundary.
+/// Closed and explicit so the C boundary's status mapping is
+/// compiler-checked, not assumed (the conditional-formats read's
+/// rule, Codex #216 r1 S3B-ERR-602 / r8 S3B-MNT-911).
+pub const CollectError = Error || error{ZipBombSuspected};
+
 /// Collect and attribute every anchor. A read this module cannot serve
 /// faithfully refuses whole — a partial anchor inventory is the shape
 /// of a guard hole, as the pivot and defined-name reads established.
-/// Store-level failures (a part that does not decompress) pass through
-/// as their own errors.
-pub fn collect(
-    gpa: Allocator,
-    store: *PartStore,
-    wb: *const workbook_xml.WorkbookXml,
-) !Anchors {
+pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!Anchors {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const sheet_names = try a.alloc([]const u8, wb.sheets.len);
-    for (wb.sheets, 0..) |s, i| sheet_names[i] = try decodeSheetName(a, s.name);
-
-    // Resolve each workbook sheet to its part, strictly — the pivots
-    // walk's rule: the relationship must exist under the sheet's
-    // `r:id`, be a sheet-family type, be internal, and reach a part
-    // the archive holds. A listed sheet the walk cannot place makes
+    // The sheet inventory is the STRICT read the conditional-formats
+    // collector established (`resolveSheets`): `<sheet>` entries
+    // proven by a namespace- and depth-aware walk of `xl/workbook.xml`
+    // rather than the lenient lexical projection, relationships
+    // verified against a strict read of the rels part, ids matched by
+    // their decoded meaning, names refused when two decode to one
+    // spelling, and every entry resolved — into THIS view's arena —
+    // to a sheet-family, internal part the archive holds that no
+    // other entry reaches. A listed sheet the walk cannot place makes
     // the whole inventory unprovable (its drawing, had the part
     // existed, is unknown), so it refuses rather than emitting under
-    // it (Codex #214 r1 REL-101). Two `<sheet>` entries reaching one
-    // part would emit the same anchor twice under two identities —
-    // refused too (REL-102).
-    const wb_rels = store.rels("xl/workbook.xml");
-    const sheet_parts = try a.alloc([]const u8, wb.sheets.len);
-    for (wb.sheets, 0..) |s, i| {
-        const rel = (try relById(a, wb_rels, s.r_id)) orelse return error.MalformedWorkbookXml;
-        var typed = false;
-        for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
-        if (!typed) return error.MalformedWorkbookXml;
-        if (rel.target_mode == .external) return error.MalformedWorkbookXml;
-        const name = (try store.resolve("xl/workbook.xml", rel.target)) orelse
-            return error.MalformedWorkbookXml;
-        if ((try store.part(name)) == null) return error.MalformedWorkbookXml;
-        for (sheet_parts[0..i]) |prev| {
-            if (std.mem.eql(u8, prev, name)) return error.MalformedWorkbookXml;
-        }
-        sheet_parts[i] = name;
-    }
+    // it (Codex #214 r1 REL-101/REL-102).
+    const inventory = try cf_ndjson.resolveSheets(gpa, a, wb);
+    const sheet_names = inventory.names;
+    const sheet_parts = inventory.parts;
 
     // Strict walk: a drawing structure the walkers recognise but
     // cannot read whole refuses here rather than thinning the
-    // inventory. The walkers allocate their result slices; handing
-    // them the view arena parks that scaffolding with everything else
-    // this view owns.
-    const images = try drawings.imageAnchorsIn(store, a, .strict);
-    const charts = try drawings.chartAnchorsIn(store, a, .strict);
+    // inventory. The walkers allocate their result slices and their
+    // scratch in the allocator they are handed; the view arena parks
+    // that with everything else this view owns. The walkers read
+    // sheet, drawing, relationship, chart and image parts through the
+    // store and raise its errors unfolded — memory and the
+    // archive-wide budget keep their names, everything else (a part
+    // the store cannot materialise mid-chain) is a drawing graph the
+    // walk cannot read whole. Every LISTED sheet part was already
+    // probed by the inventory, so a broken one refused there with the
+    // workbook's verdict; what folds here is the drawing family and
+    // any worksheet part the workbook does not list.
+    const images = drawings.imageAnchorsIn(&wb.store, a, .strict) catch |e| return foldWalkError(e);
+    const charts = drawings.chartAnchorsIn(&wb.store, a, .strict) catch |e| return foldWalkError(e);
 
     const image_seen = try a.alloc(bool, images.len);
     @memset(image_seen, false);
@@ -177,7 +183,7 @@ pub fn collect(
 
     var records: std.ArrayListUnmanaged(Record) = .empty;
     var scratch: std.ArrayListUnmanaged(usize) = .empty;
-    for (0..wb.sheets.len) |idx| {
+    for (0..sheet_names.len) |idx| {
         const part_name = sheet_parts[idx];
         // Restore document order within the sheet: the mixed-prefix
         // replay appends alternate-prefixed anchors after the primary
@@ -319,13 +325,15 @@ fn writeOptCellAnchor(out: *std.Io.Writer, anchor: ?drawings.CellAnchor) !void {
     );
 }
 
-fn decodeSheetName(a: Allocator, raw: []const u8) Error![]u8 {
-    const decoded = formula.decode.decodeAt(a, .sheet_name, raw) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.MalformedWorkbookXml,
+/// The walkers' error surface is inferred — the store's own set rides
+/// through them. Fold it to the closed `CollectError` here, at the
+/// one place the walk is entered.
+fn foldWalkError(e: anyerror) CollectError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ZipBombSuspected => error.ZipBombSuspected,
+        else => error.MalformedDrawingXml,
     };
-    if (!std.unicode.utf8ValidateSlice(decoded)) return error.MalformedWorkbookXml;
-    return decoded;
 }
 
 /// A `<c:f>` body is a formula carrier: entities resolve, everything
@@ -351,33 +359,6 @@ fn retainPartName(a: Allocator, name: []const u8) Error![]u8 {
     if (!std.unicode.utf8ValidateSlice(name)) return error.MalformedDrawingXml;
     return a.dupe(u8, name);
 }
-
-/// Find a relationship by its raw `r:id` attribute value. The store's
-/// `Relationship.id` is entity-decoded, so a rid spelled without
-/// references matches byte-for-byte at ANY length — no fixed decode
-/// buffer to falsely refuse a long-but-valid id (Codex #214 r2
-/// REL-204). Only a rid that actually carries `&` references needs
-/// the allocating decode.
-fn relById(a: Allocator, rels: []const store_mod.Relationship, raw_rid: []const u8) !?store_mod.Relationship {
-    if (raw_rid.len == 0) return null;
-    for (rels) |rel| {
-        if (std.mem.eql(u8, rel.id, raw_rid)) return rel;
-    }
-    if (std.mem.indexOfScalar(u8, raw_rid, '&') == null) return null;
-    const decoded = try store_mod.decodeXmlEntities(a, raw_rid);
-    if (decoded.len == 0) return null;
-    for (rels) |rel| {
-        if (std.mem.eql(u8, rel.id, decoded)) return rel;
-    }
-    return null;
-}
-
-/// The sheet-family relationship types a `<sheet r:id>` may carry —
-/// the pivots walk's list (`pkg/pivots.zig`). Each is matched by
-/// `drawings.relTypeIs`, i.e. exactly under a known relationship-type
-/// namespace root — a foreign URI merely ENDING in `/worksheet` is
-/// not a sheet edge (Codex #214 r3 REL-303).
-const sheet_rel_leaves = [_][]const u8{ "worksheet", "chartsheet", "dialogsheet", "xlMacrosheet", "xlIntlMacrosheet" };
 
 fn imageOffsetLess(images: []const drawings.ImageAnchor, lhs: usize, rhs: usize) bool {
     return images[lhs].doc_offset < images[rhs].doc_offset;
@@ -647,11 +628,10 @@ test "collect: fixture anchors attributed to Report, images before charts, refs 
     defer testing.allocator.free(path);
     try fixture.write(testing.allocator, io, path, .with_absolute);
 
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
 
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
 
     try testing.expectEqual(@as(usize, 2), view.sheet_names.len);
@@ -700,10 +680,9 @@ test "collect: mixed-prefix anchors come back in document order (REL-103)" {
         );
         try store.save(io, path);
     }
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     // Data's image, then Report's two: the x2-prefixed anchor (col 7)
     // FIRST — document order restored via doc_offset.
@@ -718,7 +697,6 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const workbook_mod = @import("workbook.zig");
 
     const cases = [_]struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8 }{
         // The sheet's drawing relationship dangles.
@@ -770,7 +748,7 @@ test "collect: a drawing graph edge the walk cannot follow refuses whole (REL-10
         defer wb.deinit();
         try testing.expectError(
             error.MalformedDrawingXml,
-            collect(testing.allocator, &wb.store, &wb.workbook),
+            collect(testing.allocator, &wb),
         );
     }
 }
@@ -787,10 +765,9 @@ test "collect: an alternate relationship-namespace prefix on <drawing> still wal
     // The alternate prefix is DECLARED — an unbound or foreign-bound
     // prefix is not a relationship reference (r3 REL-302).
     try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "<drawing r:id=\"rIdD1\"/>", "<drawing xmlns:rel=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" rel:id=\"rIdD1\"/>");
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     try testing.expectEqual(@as(usize, 3), view.records.len);
 }
@@ -805,10 +782,9 @@ test "collect: an extLst decoy before the real extent does not hide it (REL-301)
     defer testing.allocator.free(path);
     try fixture.write(testing.allocator, io, path, .image_and_chart);
     try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<xdr:ext cx=\"3048000\" cy=\"2286000\"/>", "<xdr:extLst foo=\"1\"/><xdr:ext cx=\"3048000\" cy=\"2286000\"/>");
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     try testing.expectEqual(@as(usize, 3), view.records.len);
 }
@@ -819,7 +795,6 @@ test "collect: commented anchors are text — not inventory, not truncation, not
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const workbook_mod = @import("workbook.zig");
 
     // A complete commented image anchor and an UNCLOSED commented
     // anchor shape: neither emits, neither refuses strict.
@@ -830,7 +805,7 @@ test "collect: commented anchors are text — not inventory, not truncation, not
         try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing2.xml", "</xdr:wsDr>", "<!-- <xdr:oneCellAnchor><xdr:from><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic><xdr:blipFill><a:blip r:embed=\"rIdI1\"/></xdr:blipFill></xdr:pic><xdr:clientData/></xdr:oneCellAnchor><xdr:twoCellAnchor> --></xdr:wsDr>");
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
-        var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+        var view = try collect(testing.allocator, &wb);
         defer view.deinit();
         try testing.expectEqual(@as(usize, 3), view.records.len);
         for (view.records) |r| {
@@ -845,7 +820,7 @@ test "collect: commented anchors are text — not inventory, not truncation, not
         try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\"", "<!-- </xdr:twoCellAnchor> --><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\"");
         var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
         defer wb.deinit();
-        var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+        var view = try collect(testing.allocator, &wb);
         defer view.deinit();
         try testing.expectEqual(@as(usize, 3), view.records.len);
         // Report's image is still the intact two-cell anchor.
@@ -865,10 +840,9 @@ test "collect: legal whitespace before a carrier tag's '>' does not thin series_
     defer testing.allocator.free(path);
     try fixture.write(testing.allocator, io, path, .image_and_chart);
     try fixture.patchPart(testing.allocator, io, path, "xl/charts/chart1.xml", "<c:f>Data!$B$1</c:f>", "<c:f >Data!$B$1</c:f\n>");
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     const chart = view.records[2].chart;
     try testing.expectEqual(@as(usize, 3), chart.series_refs.len);
@@ -931,30 +905,67 @@ test "collect: comment-shaped plot types and carriers do not pollute chart metad
     defer testing.allocator.free(path);
     try fixture.write(testing.allocator, io, path, .image_and_chart);
     try fixture.patchPart(testing.allocator, io, path, "xl/charts/chart1.xml", "</c:plotArea>", "</c:plotArea><!-- <c:lineChart/><c:f>Fake!A1</c:f> -->");
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     const chart = view.records[2].chart;
     try testing.expectEqual(drawings.ChartType.bar, chart.chart_type);
     try testing.expectEqual(@as(usize, 3), chart.series_refs.len);
 }
 
-test "relById: long and entity-spelled relationship ids resolve (REL-204)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+test "collect: long and entity-spelled sheet relationship ids resolve through the strict inventory (REL-204)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    // The rid the writer minted for Report, respelled: once past any
+    // fixed decode buffer, once with a reference — both must still
+    // place the sheet (the lenient-era `relById` pin, now the strict
+    // inventory's). A rid nothing binds refuses with the workbook's
+    // verdict.
     const long_id = "rId" ++ ("x" ** 200);
-    const rels = [_]store_mod.Relationship{
-        .{ .id = long_id, .type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet", .target = "worksheets/sheet1.xml", .target_mode = .internal },
-        .{ .id = "r&d", .type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet", .target = "worksheets/sheet2.xml", .target_mode = .internal },
+    const cases = [_]struct { name: []const u8, wb_new: []const u8, rels_new: ?[]const u8, ok: bool }{
+        .{ .name = "c1.xlsx", .wb_new = "r:id=\"" ++ long_id ++ "\"", .rels_new = "Id=\"" ++ long_id ++ "\"", .ok = true },
+        .{ .name = "c2.xlsx", .wb_new = "r:id=\"r&amp;d\"", .rels_new = "Id=\"r&amp;d\"", .ok = true },
+        .{ .name = "c3.xlsx", .wb_new = "r:id=\"rIdNope\"", .rels_new = null, .ok = false },
     };
-    const by_long = (try relById(a, &rels, long_id)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("worksheets/sheet1.xml", by_long.target);
-    const by_entity = (try relById(a, &rels, "r&amp;d")) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("worksheets/sheet2.xml", by_entity.target);
-    try testing.expect((try relById(a, &rels, "rIdNope")) == null);
+    for (cases) |case| {
+        const path = try tt.path(testing.allocator, io, case.name);
+        defer testing.allocator.free(path);
+        try fixture.write(testing.allocator, io, path, .image_and_chart);
+        // Report's rid comes from the sheet entry itself rather than
+        // an assumption about the writer's numbering.
+        const old_rid = blk: {
+            var store = try PartStore.open(testing.allocator, io, path);
+            defer store.deinit();
+            const wb_part = (try store.part("xl/workbook.xml")) orelse return error.PartNotFound;
+            const entry = std.mem.indexOf(u8, wb_part.bytes, "name=\"Report\"") orelse return error.TestUnexpectedResult;
+            const rid_at = std.mem.indexOfPos(u8, wb_part.bytes, entry, "r:id=\"") orelse return error.TestUnexpectedResult;
+            const rid_end = std.mem.indexOfScalarPos(u8, wb_part.bytes, rid_at + 6, '"') orelse return error.TestUnexpectedResult;
+            break :blk try testing.allocator.dupe(u8, wb_part.bytes[rid_at + 6 .. rid_end]);
+        };
+        defer testing.allocator.free(old_rid);
+        const wb_old = try std.fmt.allocPrint(testing.allocator, "r:id=\"{s}\"", .{old_rid});
+        defer testing.allocator.free(wb_old);
+        const rels_old = try std.fmt.allocPrint(testing.allocator, "Id=\"{s}\"", .{old_rid});
+        defer testing.allocator.free(rels_old);
+        try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", wb_old, case.wb_new);
+        if (case.rels_new) |rels_new| {
+            try fixture.patchPart(testing.allocator, io, path, "xl/_rels/workbook.xml.rels", rels_old, rels_new);
+        }
+        var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+        defer wb.deinit();
+        if (case.ok) {
+            var view = try collect(testing.allocator, &wb);
+            defer view.deinit();
+            try testing.expectEqual(@as(usize, 3), view.records.len);
+            try testing.expectEqualStrings("Report", view.records[2].chart.sheet);
+        } else {
+            try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
+        }
+    }
 }
 
 test "collect: a sheet list the anchors cannot be attributed against refuses whole (REL-101/102)" {
@@ -963,7 +974,6 @@ test "collect: a sheet list the anchors cannot be attributed against refuses who
     const io = threaded.io();
     var tt = TestTmp.init();
     defer tt.deinit();
-    const workbook_mod = @import("workbook.zig");
 
     const cases = [_]struct { name: []const u8, old: []const u8, new: []const u8 }{
         // A listed sheet whose part is absent: the inventory under it
@@ -985,7 +995,7 @@ test "collect: a sheet list the anchors cannot be attributed against refuses who
         defer wb.deinit();
         try testing.expectError(
             error.MalformedWorkbookXml,
-            collect(testing.allocator, &wb.store, &wb.workbook),
+            collect(testing.allocator, &wb),
         );
     }
 }
@@ -1006,10 +1016,9 @@ test "collect: a workbook without drawings is an empty view" {
         try s.writeRow(&.{.{ .integer = 1 }});
         try w.save(io, path);
     }
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
-    var view = try collect(testing.allocator, &wb.store, &wb.workbook);
+    var view = try collect(testing.allocator, &wb);
     defer view.deinit();
     try testing.expectEqual(@as(usize, 0), view.records.len);
     try testing.expectEqual(@as(usize, 1), view.sheet_names.len);
@@ -1045,11 +1054,10 @@ test "collect: an anchor on a worksheet part xl/workbook.xml does not list refus
         );
         try store.save(io, path);
     }
-    const workbook_mod = @import("workbook.zig");
     var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
     defer wb.deinit();
     try testing.expectError(
         error.DrawingOnUnlistedSheet,
-        collect(testing.allocator, &wb.store, &wb.workbook),
+        collect(testing.allocator, &wb),
     );
 }

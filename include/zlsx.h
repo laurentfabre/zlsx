@@ -1895,11 +1895,43 @@ int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* The S3b `anchors` records — one {"kind":"image_anchor",…} line per
+ * anchored image and one {"kind":"chart_anchor",…} line per anchored
+ * chart, sheets in workbook order, a sheet's images before its
+ * charts, each class in drawing-document order — as a
+ * library-allocated UTF-8 buffer, byte-for-byte what
+ * `zlsx anchors <file>` prints with no selector (docs/cli.md,
+ * "anchors"). The record is the anchor geometry (anchor ∈ two_cell /
+ * one_cell / absolute, from / to 1-based with EMU offsets, absolute
+ * {x,y,cx,cy} in EMUs) and where the payload lives (part; an image's
+ * byte count; a chart's chart_type + entity-decoded series_refs),
+ * never the payload — image bytes and chart XML stay in their parts.
+ * Read over the editor's current parts: structural edits and the
+ * drawing sweeps they carry (a row insert moving an anchor, a rename
+ * renaming `sheet`) are visible immediately; staged cell writes never
+ * touch a drawing. Chart parts are byte-preserved through every edit
+ * today, so a chart's series_refs keep spelling what the part holds —
+ * an old sheet name after a rename, pre-edit rows after an insert;
+ * the read reports the bytes faithfully. A workbook without
+ * anchored objects is ZLSX_OK with (*out, *out_len) = (NULL, 0). An
+ * inventory that cannot be served faithfully refuses whole — a sheet
+ * list the strict workbook read cannot prove (MalformedWorkbookXml),
+ * a drawing graph the strict walk cannot read whole
+ * (MalformedDrawingXml), or an anchor on a worksheet part the workbook
+ * does not list (DrawingOnUnlistedSheet), all ZLSX_REFUSED — rather
+ * than hand over a record that lies or a list with a hole. (An
+ * archive past the decompression caps fails at open.) Release with
+ * zlsx_buffer_release. */
+int32_t zlsx_editor_anchors_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
 #define ZLSX_HAS_DEFINED_NAMES    1   /* editor defined_names_ndjson (the read; the writer's add_defined_name predates the macros) */
 #define ZLSX_HAS_CONDITIONAL_FORMATS 1   /* editor conditional_formats_ndjson (the read; the writer's add_conditional_format_* predate the macros) */
+#define ZLSX_HAS_ANCHORS          1   /* editor anchors_ndjson */
 
 
 #ifdef __cplusplus
