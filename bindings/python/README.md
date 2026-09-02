@@ -335,10 +335,10 @@ entity-decoded `series_refs`), never the payload: image bytes and chart
 XML stay in their parts. Structural edits and the drawing sweeps they
 carry are visible immediately — a rename renames `sheet`, a row insert
 moves the edited sheet's anchors with the grid — and staged cell writes
-never touch a drawing. Chart parts are byte-preserved through every
-edit today, so a chart's `series_refs` keep spelling what the part
-holds (an old sheet name after a rename, pre-edit rows after an
-insert); the read reports the bytes faithfully.
+never touch a drawing. A chart's `series_refs` ride the formula
+rewriter with every other carrier (the chart `<c:f>` sweep), so after a
+rename or a row / column edit on the sheet they name the read reports
+the respelled part.
 
 `Editor.sheet_props()` / `zlsx.sheet_props(path)` and
 `Editor.calc_props()` / `zlsx.calc_props(path)` are the same pattern
@@ -559,7 +559,7 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.8.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
-- Pictures — image *payloads* and image authoring are Zig-only today (S5; the anchors themselves read through `Editor.anchors()`); charts are byte-preserved through edits and their anchors and series refs read through `Editor.anchors()`, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
+- Pictures — image *payloads* and image authoring are Zig-only today (S5; the anchors themselves read through `Editor.anchors()`); charts follow structural edits (their series formulas ride the formula rewriter — the chart `<c:f>` sweep) and their anchors and series refs read through `Editor.anchors()`, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
 
 ## Thread safety
 

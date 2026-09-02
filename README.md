@@ -84,8 +84,8 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   ZIP-substitution
   architecture: untouched entries pass through verbatim, only patched parts
   re-deflate — a 67 KB workbook round-trips in ~5 ms. Structural edits shift
-  cell refs, formulas, merged ranges, panes, tables, drawings, comments and
-  sparkline / extension formulas together; anything the rewriter cannot shift
+  cell refs, formulas, merged ranges, panes, tables, drawings, comments,
+  sparkline / extension formulas and chart series formulas together; anything the rewriter cannot shift
   safely is **refused with a typed error instead of corrupting the file**
   ([refusal audit](docs/plans/refusal-audit.md)). Sheets a pivot *hosts on*
   or *reads from* are both detected through the typed pivot graph

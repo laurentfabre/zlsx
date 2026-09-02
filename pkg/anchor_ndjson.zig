@@ -17,7 +17,6 @@
 //! payload itself.
 
 const std = @import("std");
-const formula = @import("zlsx_formula");
 const drawings = @import("drawings.zig");
 const store_mod = @import("store.zig");
 const workbook_mod = @import("workbook.zig");
@@ -340,15 +339,14 @@ fn foldWalkError(e: anyerror) CollectError {
 /// else passes through. A raw `<` in the element text can only open
 /// markup (CDATA, a comment) the chart's own consumers do not read
 /// through, and a ref that does not decode or is not UTF-8 would make
-/// the stream lie or stop parsing — all three refuse.
+/// the stream lie or stop parsing — all three refuse. The rule is
+/// `Workbook.decodeChartFormulaBody`, the one the chart `<c:f>` sweep
+/// rewrites under: what this read serves is what the sweep moves.
 fn decodeSeriesRef(a: Allocator, raw: []const u8) Error![]u8 {
-    if (std.mem.indexOfScalar(u8, raw, '<') != null) return error.MalformedDrawingXml;
-    const decoded = formula.decode.decodeAt(a, .cell_formula_body, raw) catch |e| switch (e) {
+    return workbook_mod.decodeChartFormulaBody(a, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.MalformedDrawingXml,
+        error.MalformedChartXml => return error.MalformedDrawingXml,
     };
-    if (!std.unicode.utf8ValidateSlice(decoded)) return error.MalformedDrawingXml;
-    return decoded;
 }
 
 /// Part names come from the archive directory; the store admits any

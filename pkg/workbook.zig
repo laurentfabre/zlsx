@@ -50,6 +50,7 @@ const recovery_record = @import("recovery_record.zig");
 const sheet_edit = @import("sheet_edit.zig");
 const coords = @import("zlsx_refs");
 const drawing_edit = @import("drawing_edit.zig");
+const drawings = @import("drawings.zig");
 const vml_edit = @import("vml_edit.zig");
 const table_edit = @import("table_edit.zig");
 /// S6: the pivot graph, read-only (`Workbook.pivotTables`).
@@ -388,6 +389,20 @@ pub const Error = error{
     /// leave one carrier stale. The Editor remaps this to
     /// `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`.
     MalformedExtensionXml,
+    /// A structural edit found a chart `<c:f>` formula carrier it
+    /// cannot rewrite wholly — no `</c:f>`, markup inside the body,
+    /// carrier text inside an unterminated comment / CDATA / PI, a
+    /// body that does not decode or is not UTF-8 — or a chart part
+    /// the archive cannot materialise, in some chart of the
+    /// workbook. Chart series formulas (`<c:tx>`, `<c:cat>`,
+    /// `<c:val>`, …) are routed through the formula rewriter under
+    /// every row / col / sheet edit (`rewriteAllChartFormulas`, the
+    /// S2 shape); the contract is all-or-nothing, so
+    /// `preflightChartFormulas` refuses the whole edit BEFORE its
+    /// first mutation rather than leave one chart stale. The Editor
+    /// remaps this to `RowEditUnsafeForSheet` / `ColEditUnsafeForSheet`
+    /// on row / column edits, as it does `MalformedExtensionXml`.
+    MalformedChartXml,
     /// `Workbook.deleteRow` would remove a structured table's header
     /// row (top of `<table ref>` when `headerRowCount >= 1`, the
     /// default). Like `TableCollapseUnsafe`, the Editor pre-flight
@@ -4035,6 +4050,118 @@ pub const Workbook = struct {
         return count;
     }
 
+    /// All-or-nothing gate for the chart `<c:f>` sweep: walk every
+    /// chart part's formula carriers with `drawings.ChartFormulaWalk`
+    /// under the strict mode and decode each body by the anchors
+    /// read's own rule (`decodeChartFormulaBody`), refusing
+    /// `MalformedChartXml` on the first carrier that cannot be
+    /// rewritten wholly. Pure — reads part bytes, mutates nothing.
+    /// Every structural edit calls this beside
+    /// `preflightExtensionFormulas`, BEFORE its first mutation, for
+    /// the same reason: the sweeps persist part-by-part, so a refusal
+    /// raised from inside `rewriteAllChartFormulas` would land after
+    /// the worksheet sweeps had already replaced parts.
+    pub fn preflightChartFormulas(self: *Workbook) Error!void {
+        const a = self.allocator;
+        for (self.store.parts) |meta| {
+            if (!isChartPart(meta)) continue;
+            // A chart part the store cannot materialise is that part's
+            // verdict — `carrierPart` maps the store's read errors,
+            // the sibling preflights' rule (Codex #207 r6 REL-603).
+            const part = (try self.carrierPart(meta.name, error.MalformedChartXml)) orelse continue;
+            var walk = drawings.ChartFormulaWalk.init(part.bytes);
+            while (try walk.next(.strict)) |f| {
+                const decoded = try decodeChartFormulaBody(a, part.bytes[f.body_start..f.body_end]);
+                a.free(decoded);
+            }
+        }
+    }
+
+    /// Apply a structural-edit rewrite to every `<c:f>` formula of
+    /// every chart part (`xl/charts/chartN.xml` and any part of the
+    /// chart content type), persisting in place via
+    /// `store.replacePart`. Returns the count of bodies whose rewrite
+    /// produced different bytes.
+    ///
+    /// This is the chart `<c:f>` sweep — the S2 `<xm:f>` precedent
+    /// (`rewriteAllExtensionFormulas`) applied to the one carrier
+    /// class no edit path touched until it landed: a chart's series
+    /// name (`<c:tx><c:strRef><c:f>`), categories (`<c:cat>`), values
+    /// (`<c:val>`, `<c:xVal>` / `<c:yVal>` / `<c:bubbleSize>`) are
+    /// workbook formulas — `Data!$B$2:$B$4`, `'R&D'!$A$1` — so a
+    /// sheet rename, a sheet delete or a row / column edit on the
+    /// sheet they name must respell them exactly as it respells a
+    /// cell formula, or the chart reopens plotting the wrong cells
+    /// (S3b slice 7 made the skew observable through the anchors
+    /// read; the chart part itself was byte-preserved through every
+    /// edit before this sweep). A pivot chart's carriers name the
+    /// pivot's host cells and move with the hosted rectangle (S7a)
+    /// like any other; its `<c:pivotSource><c:name>` is a
+    /// `[book]sheet!pivot` locator, not a formula, and is left as
+    /// written — the same documented spelling the pivot cache's own
+    /// `worksheetSource@sheet` keeps under a rename.
+    ///
+    /// Same contract as `rewriteAllExtensionFormulas`: `target_sheet`
+    /// scopes a row / column edit, bodies decode on the way in
+    /// (`decodeChartFormulaBody` — the anchors read's rule, so what
+    /// the read serves the sweep moves) and re-escape on the way out
+    /// (`spliceFormulas`), a no-op rewrite leaves the source bytes —
+    /// entity spellings included — untouched, and every other byte of
+    /// the part is preserved. No host: a chart formula lives outside
+    /// any sheet's grid, and Excel spells every reference in one
+    /// sheet-qualified — a bare ref is not a spelling Excel writes or
+    /// opens, so, as for a defined name, the rewriter sees no
+    /// `on_sheet` (a bare ref shifts under the permissive default,
+    /// relative R1C1 parts are left alone). The carrier walk is
+    /// `drawings.ChartFormulaWalk`, shared with the anchors read; a
+    /// carrier it cannot read is refused by `preflightChartFormulas`
+    /// before any sweep runs, so an error here is `OutOfMemory` or a
+    /// `replacePart`-ordering bug.
+    pub fn rewriteAllChartFormulas(
+        self: *Workbook,
+        edit: zlsx.formula_rewriter.RewriteEdit,
+        target_sheet: ?[]const u8,
+    ) Error!u32 {
+        var count: u32 = 0;
+        const a = self.allocator;
+        const sheet_order = try self.sheetOrderSnapshot();
+        defer self.freeSheetOrder(sheet_order);
+
+        // Part metadata is iterated by index: `replacePart` swaps a
+        // part's bytes in place and never reallocates the table.
+        var part_idx: usize = 0;
+        while (part_idx < self.store.parts.len) : (part_idx += 1) {
+            const meta = self.store.parts[part_idx];
+            if (!isChartPart(meta)) continue;
+            const part = (try self.carrierPart(meta.name, error.MalformedChartXml)) orelse continue;
+            const source = part.bytes;
+
+            var patches: std.ArrayList(SourcePatch) = .empty;
+            defer {
+                for (patches.items) |p| a.free(@constCast(p.new));
+                patches.deinit(a);
+            }
+
+            var walk = drawings.ChartFormulaWalk.init(source);
+            while (try walk.next(.strict)) |f| {
+                const decoded = try decodeChartFormulaBody(a, source[f.body_start..f.body_end]);
+                defer a.free(decoded);
+                if (try maybeRewriteDecoded(a, decoded, null, target_sheet, sheet_order, edit)) |new| {
+                    errdefer a.free(new);
+                    try patches.append(a, .{ .start = f.body_start, .end = f.body_end, .new = new });
+                }
+            }
+            if (patches.items.len == 0) continue;
+
+            const new_xml = try spliceFormulas(a, source, patches.items);
+            defer a.free(new_xml);
+            try self.store.replacePart(meta.name, new_xml);
+            count += @intCast(patches.items.len);
+        }
+
+        return count;
+    }
+
     /// Apply a structural-edit rewrite to every formula in every
     /// sheet. Walks each worksheet, materializes its SheetXml, runs
     /// `zlsx.formula_rewriter.rewriteFormula` on each cell that has
@@ -4865,11 +4992,13 @@ pub const Workbook = struct {
     /// per-sheet rather than per-write, so the ASCII compromise is
     /// retained here pending a follow-up iter.
     ///
-    /// **Carrier coverage.** Five sweeps retarget every cross-sheet
+    /// **Carrier coverage.** Six sweeps retarget every cross-sheet
     /// reference: cell formulas, defined-name bodies, internal
-    /// hyperlink locations, DV/CF formulas, and `<xm:f>` extension
+    /// hyperlink locations, DV/CF formulas, `<xm:f>` extension
     /// formulas (the B2 iter-er-5 lift — earlier iterations rewrote
-    /// only cell formulas).
+    /// only cell formulas) and chart `<c:f>` series formulas (the
+    /// chart sweep — until it, chart parts were byte-preserved and
+    /// reopened naming the old sheet).
     pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
         try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
@@ -4912,7 +5041,7 @@ pub const Workbook = struct {
 
         // The workbook.xml patch is the rename's LAST mutation —
         // locate its target FIRST, so a sheet element the patcher
-        // cannot read refuses before the five sweeps have rewritten
+        // cannot read refuses before the six sweeps have rewritten
         // anything, instead of tearing after them (Codex #216 r14
         // S3B-REL-1402).
         _ = try locateWorkbookXmlSheetName(self, sheet_idx, old_name_owned);
@@ -4934,15 +5063,17 @@ pub const Workbook = struct {
         // until the next manual save in Excel. Each rewriter is
         // tolerant of "no carriers in the workbook" — they short-
         // circuit on empty workbooks rather than erroring, so
-        // calling all five unconditionally is cheap. The `<xm:f>`
-        // gate runs first: it is the one sweep with a refusal, and
-        // the refusal must land before the first `replacePart`.
+        // calling all six unconditionally is cheap. The `<xm:f>` and
+        // chart gates run first: they are the sweeps with a refusal,
+        // and the refusal must land before the first `replacePart`.
         try self.preflightExtensionFormulas();
+        try self.preflightChartFormulas();
         _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
         _ = try self.rewriteAllExtensionFormulas(edit, null);
+        _ = try self.rewriteAllChartFormulas(edit, null);
 
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
@@ -5070,11 +5201,13 @@ pub const Workbook = struct {
             .table = renamed.display_name,
         };
         try self.preflightExtensionFormulas();
+        try self.preflightChartFormulas();
         const count = try self.rewriteAllFormulas(edit, null, scope);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
         _ = try self.rewriteAllExtensionFormulas(edit, null);
+        _ = try self.rewriteAllChartFormulas(edit, null);
 
         // Step 4: commit the part and sync the header cell.
         if (!std.mem.eql(u8, table_part.bytes, renamed.bytes)) {
@@ -5706,12 +5839,12 @@ pub const Workbook = struct {
     /// graphs; unreferenced parts are dead weight). A true cleanup
     /// requires `PartStore.removePart`; that's a future iter.
     ///
-    /// **Cross-references.** The five carrier sweeps run for a delete
+    /// **Cross-references.** The six carrier sweeps run for a delete
     /// too — cell formulas, defined-name bodies, hyperlink locations,
-    /// DV/CF formulas and `<xm:f>` extensions all spell references
-    /// into the deleted sheet as `#REF!` (the rewriter's
-    /// deleted-sheet convention) before the workbook.xml and rels
-    /// patches land. A mid-sweep failure after the first install
+    /// DV/CF formulas, `<xm:f>` extensions and chart `<c:f>` series
+    /// formulas all spell references into the deleted sheet as
+    /// `#REF!` (the rewriter's deleted-sheet convention) before the
+    /// workbook.xml and rels patches land. A mid-sweep failure after the first install
     /// marks the workbook torn, `renameSheet`'s contract.
     ///
     /// **Errors:**
@@ -5757,10 +5890,11 @@ pub const Workbook = struct {
         // B2 iter-er-5 lift (deleteSheet defined-names axis): rewrite
         // every cross-sheet ref to the doomed sheet across the
         // remaining sheets. Cell formulas, defined-name formulas,
-        // internal hyperlink locations, and DV / CF formulas all
-        // collapse to `#REF!` on the qualifier-matching path. Bare
-        // refs are unaffected (the deleted sheet's own formulas
-        // are dropped with the sheet, not rewritten).
+        // internal hyperlink locations, DV / CF formulas and chart
+        // series formulas all collapse to `#REF!` on the
+        // qualifier-matching path. Bare refs are unaffected (the
+        // deleted sheet's own formulas are dropped with the sheet,
+        // not rewritten).
         const doomed_name_src = self.workbook.sheets[sheet_idx].name;
         // Decoded per the rewrite boundary's decode-in contract —
         // formula qualifiers arrive decoded, so the edit name must
@@ -5780,11 +5914,13 @@ pub const Workbook = struct {
         errdefer self.allocator.free(new_slots);
         const edit: zlsx.formula_rewriter.RewriteEdit = .{ .delete_sheet = doomed_name_owned };
         try self.preflightExtensionFormulas();
+        try self.preflightChartFormulas();
         _ = try self.rewriteAllFormulas(edit, null, null);
         _ = try self.rewriteAllDefinedNames(edit, null);
         _ = try self.rewriteAllHyperlinkLocations(edit, null);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, null);
         _ = try self.rewriteAllExtensionFormulas(edit, null);
+        _ = try self.rewriteAllChartFormulas(edit, null);
 
         try patchWorkbookXmlRemoveSheet(self, sheet_idx);
         try patchWorkbookRelsRemoveRelationship(self, r_id_owned);
@@ -5872,16 +6008,17 @@ pub const Workbook = struct {
     /// `<xm:sqref>`), and the workbook-wide sweeps then move what
     /// the byte transform cannot: formulas in every dialect, defined
     /// names, hyperlink locations, DV/CF formula bodies (all three
-    /// CF slots), `<xm:f>` extension formulas, tables, drawings,
-    /// comments, pivot locations and sources.
+    /// CF slots), `<xm:f>` extension formulas, chart `<c:f>` series
+    /// formulas, tables, drawings, comments, pivot locations and
+    /// sources.
     ///
     /// **Refusal contract.** Refuses with
     /// `error.SheetHasUnsavedMutations` / `error.SheetHasUnsavedAppends`
     /// if the sheet has staged setCell deltas or appendRows — those
     /// index into the pre-shift refs and would produce stale output
     /// (the Editor layer folds both into
-    /// `RowEditRequiresCleanSheet`). The transform, extension, table
-    /// and pivot PREFLIGHTS refuse before the first mutation with
+    /// `RowEditRequiresCleanSheet`). The transform, extension, chart,
+    /// table and pivot PREFLIGHTS refuse before the first mutation with
     /// their `docs/plans/c-abi-status-v1.md` §10 typed verdicts; a
     /// LATER sweep failure, once anything has installed, marks the
     /// workbook torn (`StructuralEditIncomplete` on every subsequent
@@ -6039,10 +6176,12 @@ pub const Workbook = struct {
         // passes preflight cannot newly refuse on the swept bytes;
         // an error there anyway falls under the documented
         // post-validation contract (discard, reopen). The `<xm:f>`
-        // gate is the same shape one level up: every sheet's
-        // extension formulas must be readable before any sweep
-        // replaces a part (all-or-nothing, S2).
+        // and chart gates are the same shape one level up: every
+        // sheet's extension formulas and every chart's series
+        // formulas must be readable before any sweep replaces a part
+        // (all-or-nothing, S2 and the chart sweep).
         try self.preflightExtensionFormulas();
+        try self.preflightChartFormulas();
         {
             const pre = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
             const probe = if (spec.row) |r|
@@ -6159,17 +6298,20 @@ pub const Workbook = struct {
 
         // B2 iter-er-5 lift (row/col axes), remaining carriers:
         // defined names, internal hyperlink locations, DV/CF
-        // formulas and (S2) `<extLst>` `<xm:f>` formulas. All four
-        // splice text in place and carry no host, so they compose
-        // with the byte transform in either order; the formula sweep
-        // already ran ABOVE the transform (see there for why). The
-        // `<xm:f>` sweep and the transform touch the same `<extLst>`
-        // — the transform shifts `<xm:sqref>`, the sweep splices
-        // `<xm:f>` bodies — on disjoint bytes.
+        // formulas, (S2) `<extLst>` `<xm:f>` formulas and chart
+        // `<c:f>` series formulas. All five splice text in place and
+        // carry no host, so they compose with the byte transform in
+        // either order; the formula sweep already ran ABOVE the
+        // transform (see there for why). The `<xm:f>` sweep and the
+        // transform touch the same `<extLst>` — the transform shifts
+        // `<xm:sqref>`, the sweep splices `<xm:f>` bodies — on
+        // disjoint bytes; the chart sweep touches parts no other
+        // sweep reads.
         _ = try self.rewriteAllDefinedNames(edit, target);
         _ = try self.rewriteAllHyperlinkLocations(edit, target);
         _ = try self.rewriteAllValidationsAndConditionalFormats(edit, target);
         _ = try self.rewriteAllExtensionFormulas(edit, target);
+        _ = try self.rewriteAllChartFormulas(edit, target);
 
         // S7b-5: the consumers' output cells, last — over the host
         // sheets as every sweep above left them.
@@ -12088,28 +12230,81 @@ fn maybeRewrite(
     edit: zlsx.formula_rewriter.RewriteEdit,
 ) Error!?[]u8 {
     if (body.len == 0) return null;
+    // Decode-in: DV/CF bodies are raw XML inner text and the patch
+    // splice re-escapes on emit (`spliceFormulas`). A null return
+    // (no-op rewrite) leaves the source bytes — original entity
+    // spellings included — untouched.
+    const decoded = try store_mod.decodeXmlEntities(a, body);
+    defer a.free(decoded);
+    return maybeRewriteDecoded(a, decoded, on_sheet, target_sheet, sheet_order, edit);
+}
+
+/// `maybeRewrite` for a body the caller has already decoded by its
+/// carrier's own rule (the chart sweep's `decodeChartFormulaBody`).
+fn maybeRewriteDecoded(
+    a: Allocator,
+    decoded: []const u8,
+    on_sheet: ?[]const u8,
+    target_sheet: ?[]const u8,
+    sheet_order: ?[]const []const u8,
+    edit: zlsx.formula_rewriter.RewriteEdit,
+) Error!?[]u8 {
+    if (decoded.len == 0) return null;
     const ctx = zlsx.formula_rewriter.RewriteContext{
         .on_sheet = on_sheet,
         .target_sheet = target_sheet,
         .sheet_order = sheet_order,
         .edit = edit,
     };
-    // Decode-in: DV/CF bodies are raw XML inner text and the patch
-    // splice re-escapes on emit (`spliceFormulas`). A null return
-    // (no-op rewrite) leaves the source bytes — original entity
-    // spellings included — untouched.
-    const decoded = try store_mod.decodeXmlEntities(a, body);
-    const rewritten = zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx) catch |err| {
-        a.free(decoded);
-        return err;
-    };
-    const unchanged = std.mem.eql(u8, rewritten, decoded);
-    a.free(decoded);
-    if (unchanged) {
+    const rewritten = try zlsx.formula_rewriter.rewriteFormula(a, decoded, ctx);
+    if (std.mem.eql(u8, rewritten, decoded)) {
         a.free(rewritten);
         return null;
     }
     return rewritten;
+}
+
+/// The chart content type (ECMA-376 §12.3.2). Content types do not
+/// change between Transitional and Strict, so one spelling covers
+/// both; a part with no resolvable content type is still a chart when
+/// it sits at the canonical `xl/charts/chart<N>.xml` — the whole
+/// substring between `chart` and `.xml` must be digits, the
+/// `drawings.isSheetPart` rule (a `chart1_backup.xml` is not one).
+const ct_chart = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+
+fn isChartPart(part: store_mod.Part) bool {
+    if (part.content_type) |ct| {
+        if (std.mem.eql(u8, ct, ct_chart)) return true;
+    }
+    const prefix = "xl/charts/chart";
+    const suffix = ".xml";
+    if (!std.mem.startsWith(u8, part.name, prefix)) return false;
+    if (!std.mem.endsWith(u8, part.name, suffix)) return false;
+    if (part.name.len <= prefix.len + suffix.len) return false;
+    const num = part.name[prefix.len .. part.name.len - suffix.len];
+    for (num) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// A chart `<c:f>` body is a formula carrier: entities resolve,
+/// everything else passes through. A raw `<` in the element text can
+/// only open markup (CDATA, a comment) the chart's own consumers do
+/// not read through, and a body that does not decode or is not UTF-8
+/// cannot be served or respelled faithfully — all three refuse. The
+/// ONE acceptance rule for a chart formula body: the anchors read
+/// (`anchor_ndjson`) and the sweep (`rewriteAllChartFormulas`) both
+/// call it, so what the read serves is exactly what the sweep moves.
+pub fn decodeChartFormulaBody(a: Allocator, raw: []const u8) error{ MalformedChartXml, OutOfMemory }![]u8 {
+    if (std.mem.indexOfScalar(u8, raw, '<') != null) return error.MalformedChartXml;
+    const decoded = engine.decode.decodeAt(a, .cell_formula_body, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedChartXml,
+    };
+    if (!std.unicode.utf8ValidateSlice(decoded)) {
+        a.free(decoded);
+        return error.MalformedChartXml;
+    }
+    return decoded;
 }
 
 /// The table a cell's BARE structured refs bind to: `scope.table`
@@ -26824,4 +27019,396 @@ test "S3a: a setCell overwrite that fails on any allocation leaves the previous 
         try w.save(io, src);
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, setCellOverwriteForFailures, .{ io, src });
+}
+
+// ─── chart <c:f> series formulas (the chart sweep) ───────────────────
+
+const chart_fixture = @import("anchor_ndjson.zig").fixture;
+
+/// The anchors fixture: `Data` (index 0) with an image, `Report`
+/// (index 1) with a bar chart whose three `<c:f>` carriers name
+/// `Data` — series name `Data!$B$1`, categories `Data!$A$2:$A$4`,
+/// values `Data!$B$2:$B$4` — and an image. Written to a fresh path
+/// under `.zig-cache/` so a test can patch parts before opening.
+fn writeChartFixture(io: std.Io, buf: *[256]u8, tag: []const u8) ![]const u8 {
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const path = try std.fmt.bufPrint(buf, ".zig-cache/test-chart-{s}-{d}.xlsx", .{ tag, prng.random().int(u32) });
+    try chart_fixture.write(std.testing.allocator, io, path, .image_and_chart);
+    return path;
+}
+
+fn dupePart(wb: *Workbook, name: []const u8) ![]u8 {
+    const part = (try wb.store.part(name)) orelse return error.MissingSheetPart;
+    return std.testing.allocator.dupe(u8, part.bytes);
+}
+
+const chart_part = "xl/charts/chart1.xml";
+const chart_refs_before = "<c:tx><c:strRef><c:f>Data!$B$1</c:f></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f></c:numRef></c:val>";
+
+/// The chart part with its three bodies respelled and EVERY other
+/// byte as the fixture wrote it — the byte-preserving splice's claim.
+fn expectChartRefs(wb: *Workbook, name: []const u8, cat: []const u8, val: []const u8) !void {
+    const a = std.testing.allocator;
+    const got = try dupePart(wb, chart_part);
+    defer a.free(got);
+    const want_refs = try std.fmt.allocPrint(a, "<c:tx><c:strRef><c:f>{s}</c:f></c:strRef></c:tx><c:cat><c:strRef><c:f>{s}</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>{s}</c:f></c:numRef></c:val>", .{ name, cat, val });
+    defer a.free(want_refs);
+    const pristine = std.mem.indexOf(u8, chart_fixture_chart_xml, chart_refs_before) orelse return error.TestUnexpectedResult;
+    const want = try std.mem.concat(a, u8, &.{ chart_fixture_chart_xml[0..pristine], want_refs, chart_fixture_chart_xml[pristine + chart_refs_before.len ..] });
+    defer a.free(want);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+const chart_fixture_chart_xml =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart><c:plotArea><c:layout/><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>Data!$B$1</c:f></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>
+;
+
+test "Workbook.rewriteAllChartFormulas: a rename respells every chart series formula, the rest of the part byte-identical" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "rename");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    // The fixture is what the sweep will read.
+    const before = try dupePart(&wb, chart_part);
+    defer a.free(before);
+    try std.testing.expectEqualStrings(chart_fixture_chart_xml, before);
+
+    // The sweep on its own: three bodies changed, counted once each.
+    try wb.preflightChartFormulas();
+    try std.testing.expectEqual(@as(u32, 3), try wb.rewriteAllChartFormulas(.{ .rename_sheet = .{ .old = "Data", .new = "Facts" } }, null));
+    try expectChartRefs(&wb, "Facts!$B$1", "Facts!$A$2:$A$4", "Facts!$B$2:$B$4");
+    // A rewrite that changes nothing leaves the part alone: no count,
+    // no replacement.
+    const installs = wb.store.installs;
+    try std.testing.expectEqual(@as(u32, 0), try wb.rewriteAllChartFormulas(.{ .rename_sheet = .{ .old = "Nowhere", .new = "Else" } }, null));
+    try std.testing.expectEqual(installs, wb.store.installs);
+}
+
+test "Workbook.renameSheet: chart series formulas follow the rename — quoted spellings, entities re-escaped, the host's rename a no-op" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "rename-wb");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    // Renaming the HOST (`Report`, which carries the chart) touches no
+    // carrier: the chart names `Data`, not its host.
+    try wb.renameSheet(1, "Dashboard");
+    try expectChartRefs(&wb, "Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4");
+    // A name that needs quoting is quoted as the cell-formula sweep
+    // quotes it.
+    try wb.renameSheet(0, "Raw Data");
+    try expectChartRefs(&wb, "'Raw Data'!$B$1", "'Raw Data'!$A$2:$A$4", "'Raw Data'!$B$2:$B$4");
+    // A name with an XML-special byte re-escapes on the way out
+    // (`spliceFormulas`) — the part stays well-formed XML.
+    try wb.renameSheet(0, "R&D");
+    try expectChartRefs(&wb, "'R&amp;D'!$B$1", "'R&amp;D'!$A$2:$A$4", "'R&amp;D'!$B$2:$B$4");
+    // …and decodes on the way back in: the anchors read reports the
+    // decoded spelling, and a further rename finds the qualifier.
+    {
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), anchors.len);
+        try std.testing.expectEqual(@as(usize, 3), anchors[0].series_refs.len);
+        try std.testing.expectEqualStrings("'R&amp;D'!$B$1", anchors[0].series_refs[0]);
+    }
+    try wb.renameSheet(0, "Data");
+    try expectChartRefs(&wb, "Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4");
+
+    // The respelled part is what a save persists, and a reopened
+    // workbook's read agrees.
+    try wb.renameSheet(0, "Facts");
+    try wb.save(io, path);
+    var wb2 = try Workbook.open(a, io, path);
+    defer wb2.deinit();
+    try expectChartRefs(&wb2, "Facts!$B$1", "Facts!$A$2:$A$4", "Facts!$B$2:$B$4");
+}
+
+test "Workbook row / column edits: chart series formulas shift with the grid of the sheet they name, and only that sheet" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "rowcol");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    // An edit on the HOST sheet (`Report`) moves the chart's anchor
+    // (the drawing sweep) and none of its carriers.
+    try wb.insertRow(1, 1);
+    try expectChartRefs(&wb, "Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4");
+    // An insert above the ranges on `Data` shifts all three.
+    try wb.insertRow(0, 1);
+    try expectChartRefs(&wb, "Data!$B$2", "Data!$A$3:$A$5", "Data!$B$3:$B$5");
+    // An insert INSIDE the category / value ranges grows them; the
+    // series-name cell above stays.
+    try wb.insertRow(0, 4);
+    try expectChartRefs(&wb, "Data!$B$2", "Data!$A$3:$A$6", "Data!$B$3:$B$6");
+    // A delete of the row the series name sits on collapses that
+    // carrier to `Data!#REF!` — the rewriter's convention for a
+    // qualified ref whose cell is gone, Excel's spelling too — and
+    // pulls the ranges up.
+    try wb.deleteRow(0, 2);
+    try expectChartRefs(&wb, "Data!#REF!", "Data!$A$2:$A$5", "Data!$B$2:$B$5");
+    // A column delete: the category column collapses, the value
+    // column slides left.
+    try wb.deleteColumn(0, 1);
+    try expectChartRefs(&wb, "Data!#REF!", "Data!#REF!", "Data!$A$2:$A$5");
+    // A column insert before it slides it right again.
+    try wb.insertColumn(0, 1);
+    try expectChartRefs(&wb, "Data!#REF!", "Data!#REF!", "Data!$B$2:$B$5");
+}
+
+test "Workbook.deleteSheet: chart series formulas into the doomed sheet collapse to #REF!" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "delete");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try wb.deleteSheet(0);
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+    try expectChartRefs(&wb, "#REF!", "#REF!", "#REF!");
+}
+
+test "Workbook.rewriteAllChartFormulas: no-op count == 0 on a workbook without charts" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
+    defer wb.deinit();
+    try wb.preflightChartFormulas();
+    const count = try wb.rewriteAllChartFormulas(.{ .insert_rows = .{ .at = 1, .count = 1 } }, null);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "Workbook: a chart series carrier the walk cannot read refuses every structural edit before its first mutation" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+
+    const Case = struct { tag: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        // No close.
+        .{ .tag = "unclosed", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!$B$1" },
+        // Markup in the body: a comment, a CDATA section.
+        .{ .tag = "comment", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!<!-- x -->$B$1</c:f>" },
+        .{ .tag = "cdata", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f><![CDATA[Data!$B$1]]></c:f>" },
+        // A body that does not decode, one that is not UTF-8 — the
+        // anchors read's own refusals (`decodeChartFormulaBody`).
+        .{ .tag = "entity", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!$B&bogus;$1</c:f>" },
+        .{ .tag = "utf8", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!$B\xff$1</c:f>" },
+        // Carrier text inside an unterminated comment after the live
+        // carriers: live or decoy is undecidable.
+        .{ .tag = "open-comment", .old = "</c:chartSpace>", .new = "</c:chartSpace><!-- <c:f>Data!$B$1</c:f>" },
+    };
+    for (cases) |case| {
+        var buf: [256]u8 = undefined;
+        const path = try writeChartFixture(io, &buf, case.tag);
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        try chart_fixture.patchPart(a, io, path, chart_part, case.old, case.new);
+
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        const report_before = try dupeSheetPart(&wb, 1);
+        defer a.free(report_before);
+        const data_before = try dupeSheetPart(&wb, 0);
+        defer a.free(data_before);
+        const chart_before = try dupePart(&wb, chart_part);
+        defer a.free(chart_before);
+        try std.testing.expectError(error.MalformedChartXml, wb.preflightChartFormulas());
+
+        // Every structural edit refuses up front, whichever sheet it
+        // names — the S2 `<xm:f>` contract.
+        try std.testing.expectError(error.MalformedChartXml, wb.insertRow(1, 1));
+        try std.testing.expectError(error.MalformedChartXml, wb.deleteRow(0, 1));
+        try std.testing.expectError(error.MalformedChartXml, wb.insertColumn(0, 1));
+        try std.testing.expectError(error.MalformedChartXml, wb.deleteColumn(1, 1));
+        try std.testing.expectError(error.MalformedChartXml, wb.renameSheet(0, "Renamed"));
+        try std.testing.expectError(error.MalformedChartXml, wb.deleteSheet(0));
+
+        // Nothing installed, nothing moved, the workbook not torn.
+        try std.testing.expect(!wb.hasUnsavedChanges());
+        try std.testing.expect(!wb.torn_edit);
+        const report_after = try dupeSheetPart(&wb, 1);
+        defer a.free(report_after);
+        const data_after = try dupeSheetPart(&wb, 0);
+        defer a.free(data_after);
+        const chart_after = try dupePart(&wb, chart_part);
+        defer a.free(chart_after);
+        try std.testing.expectEqualStrings(report_before, report_after);
+        try std.testing.expectEqualStrings(data_before, data_after);
+        try std.testing.expectEqualStrings(chart_before, chart_after);
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectEqualStrings("Data", (try wb.sheet(0)).name());
+    }
+}
+
+test "Workbook.rewriteAllChartFormulas: decoys are text, self-closing carriers are empty, Strict and mixed chart-prefix bindings are walked" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+
+    // Decoys before and after the live carriers, plus an empty
+    // carrier in both spellings: neither spliced nor refused, the
+    // live three move, every decoy byte survives.
+    {
+        var buf: [256]u8 = undefined;
+        const path = try writeChartFixture(io, &buf, "decoys");
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        const decoys_before = "<!-- <c:f>Data!$B$1</c:f> --><?pi <c:f>Data!$A$1 ?><![CDATA[<c:f>Data!$B$1</c:f>]]><c:f/><c:f />";
+        try chart_fixture.patchPart(a, io, path, chart_part, "<c:chart>", decoys_before ++ "<c:chart>");
+        try chart_fixture.patchPart(a, io, path, chart_part, "</c:chartSpace>", "<!-- <c:f>Data!$B$1 --></c:chartSpace>");
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.renameSheet(0, "Facts");
+        const got = try dupePart(&wb, chart_part);
+        defer a.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, decoys_before ++ "<c:chart>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<!-- <c:f>Data!$B$1 --></c:chartSpace>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:tx><c:strRef><c:f>Facts!$B$1</c:f></c:strRef></c:tx><c:cat><c:strRef><c:f>Facts!$A$2:$A$4</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Facts!$B$2:$B$4</c:f></c:numRef></c:val>") != null);
+    }
+    // A chart bound to the Strict chart namespace under the canonical
+    // prefix, and one binding BOTH namespaces with the value carrier
+    // under the Strict prefix: the walk follows the part's own
+    // bindings, as the anchors read does.
+    {
+        var buf: [256]u8 = undefined;
+        const path = try writeChartFixture(io, &buf, "strict-ns");
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        try chart_fixture.patchPart(a, io, path, chart_part, "xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"", "xmlns:c=\"http://purl.oclc.org/ooxml/drawingml/chart\"");
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.renameSheet(0, "Facts");
+        const got = try dupePart(&wb, chart_part);
+        defer a.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Facts!$B$1</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Facts!$A$2:$A$4</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Facts!$B$2:$B$4</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "Data!") == null);
+    }
+    {
+        var buf: [256]u8 = undefined;
+        const path = try writeChartFixture(io, &buf, "mixed-ns");
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        try chart_fixture.patchPart(a, io, path, chart_part, "xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"", "xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:cs=\"http://purl.oclc.org/ooxml/drawingml/chart\"");
+        try chart_fixture.patchPart(a, io, path, chart_part, "<c:f>Data!$B$2:$B$4</c:f>", "<cs:f>Data!$B$2:$B$4</cs:f>");
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        const got = try dupePart(&wb, chart_part);
+        defer a.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Data!$B$2</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Data!$A$3:$A$5</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "<cs:f>Data!$B$3:$B$5</cs:f>") != null);
+        // The read reports the same three, in document order.
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), anchors.len);
+        try std.testing.expectEqual(@as(usize, 3), anchors[0].series_refs.len);
+        try std.testing.expectEqualStrings("Data!$B$2", anchors[0].series_refs[0]);
+        try std.testing.expectEqualStrings("Data!$A$3:$A$5", anchors[0].series_refs[1]);
+        try std.testing.expectEqualStrings("Data!$B$3:$B$5", anchors[0].series_refs[2]);
+    }
+}
+
+test "Workbook chart sweep: corpus charts follow a rename and a host-row insert; a pivot chart's pivotSource locator is left as written" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    const src_path = "tests/corpus/openxlsx_loadExample.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(a, io, src_path);
+    defer wb.deinit();
+    var iris_idx: ?u32 = null;
+    var pivot_idx: ?u32 = null;
+    var i: u32 = 0;
+    while (i < wb.sheetCount()) : (i += 1) {
+        const n = (try wb.sheet(i)).name();
+        if (std.mem.eql(u8, n, "IrisSample")) iris_idx = i;
+        if (std.mem.eql(u8, n, "mtCars Pivot")) pivot_idx = i;
+    }
+    // chart1 plots `IrisSample!$D$2:$D$51`; chart2 is a pivot chart
+    // over the pivot hosted on `mtCars Pivot` (nine carriers).
+    try wb.renameSheet(iris_idx.?, "Iris");
+    {
+        const c1 = try dupePart(&wb, "xl/charts/chart1.xml");
+        defer a.free(c1);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "<c:f>Iris!$D$2:$D$51</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "IrisSample") == null);
+    }
+    try wb.renameSheet(pivot_idx.?, "Cars");
+    {
+        const c2 = try dupePart(&wb, "xl/charts/chart2.xml");
+        defer a.free(c2);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$B$1</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$A$2:$A$5</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$D$2:$D$5</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "'mtCars Pivot'!") == null);
+        // Recorded, not lifted: `<c:pivotSource><c:name>` is a
+        // `[book]sheet!pivot` locator, not a formula — it keeps the old
+        // spelling, as the cache's `worksheetSource@sheet` does.
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:name>[loadExample.xlsx]mtCars Pivot!PivotTable3</c:name>") != null);
+    }
+    // A row insert above the hosted pivot moves the pivot (S7a) AND
+    // the pivot chart's carriers into its cells.
+    try wb.insertRow(pivot_idx.?, 1);
+    {
+        const c2 = try dupePart(&wb, "xl/charts/chart2.xml");
+        defer a.free(c2);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$B$2</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$A$3:$A$6</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$D$3:$D$6</c:f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c2, "<c:f>Cars!$B$1</c:f>") == null);
+    }
+}
+
+test "checkAllAllocationFailures: the chart sweep leaks nothing under OOM" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "oom");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const H = struct {
+        fn run(allocator: Allocator, inner_io: std.Io, p: []const u8) !void {
+            var wb = try Workbook.open(allocator, inner_io, p);
+            defer wb.deinit();
+            try wb.preflightChartFormulas();
+            const n = try wb.rewriteAllChartFormulas(.{ .rename_sheet = .{ .old = "Data", .new = "Facts" } }, null);
+            if (n != 3) return error.WrongCount;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{ io, path });
 }

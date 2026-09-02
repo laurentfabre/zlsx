@@ -628,7 +628,9 @@ fn scanChartsWithTags(
 /// `xml`. Series names, categories, and values all flow through
 /// `<{c}:f>`, so the flattened list captures every workbook
 /// reference the chart pulls from. `c_prefix` is the document's
-/// actual chart-namespace prefix (canonically "c").
+/// actual chart-namespace prefix (canonically "c"). One walk serves
+/// this read and the structural-edit sweep
+/// (`Workbook.rewriteAllChartFormulas`): `ChartFormulaWalk` below.
 fn extractSeriesRefs(
     allocator: std.mem.Allocator,
     xml: []const u8,
@@ -638,90 +640,194 @@ fn extractSeriesRefs(
 ) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
+    var walk = ChartFormulaWalk.initWithPrefixes(xml, c_prefix, c_prefix_alt);
+    while (walk.next(mode) catch |e| switch (e) {
+        // A carrier the walk cannot read whole: strict refuses rather
+        // than silently thin `series_refs` (REL-203); the walk's own
+        // verdict is the sweep's name, this read's is the drawing's.
+        error.MalformedChartXml => return error.MalformedDrawingXml,
+    }) |f| {
+        try out.append(allocator, xml[f.body_start..f.body_end]);
+    }
+    return out.toOwnedSlice(allocator);
+}
 
-    var primary_open_buf: [128]u8 = undefined;
-    var primary_close_buf: [128]u8 = undefined;
-    const primary_open = std.fmt.bufPrint(&primary_open_buf, "<{s}:f", .{c_prefix}) catch return out.toOwnedSlice(allocator);
-    const primary_close = std.fmt.bufPrint(&primary_close_buf, "</{s}:f", .{c_prefix}) catch return out.toOwnedSlice(allocator);
+/// One `<{c}:f>` formula carrier of a chart part, as byte offsets
+/// into the part: `body_start..body_end` is the element's raw inner
+/// text (still entity-encoded — the rewrite boundary decodes on the
+/// way in and re-escapes on the way out), `next` is where the scan
+/// resumes. A self-closing `<c:f/>` is an empty carrier
+/// (`body_start == body_end`), the schema-equivalent spelling of
+/// `<c:f></c:f>`.
+pub const ChartFormula = struct { body_start: usize, body_end: usize, next: usize };
 
-    var alt_open_buf: [128]u8 = undefined;
-    var alt_close_buf: [128]u8 = undefined;
-    var alt_open: ?[]const u8 = null;
-    var alt_close: ?[]const u8 = null;
-    if (c_prefix_alt) |alt| {
-        if (!std.mem.eql(u8, alt, c_prefix)) {
-            // Build both needles atomically — if either fails to
-            // format (e.g. a prefix that fits "<alt:f" but not
-            // "</alt:f" within the 128-byte buffer), disable the
-            // alt scan entirely. Splitting the assignment risked
-            // alt_open != null with alt_close == null and a later
-            // unwrap would panic.
-            if (std.fmt.bufPrint(&alt_open_buf, "<{s}:f", .{alt})) |o| {
-                if (std.fmt.bufPrint(&alt_close_buf, "</{s}:f", .{alt})) |c| {
+/// The `<{c}:f>` carrier walk of one chart part — the ONE definition
+/// of "a chart formula carrier" for the anchors read
+/// (`extractSeriesRefs`) and the structural-edit sweep
+/// (`Workbook.rewriteAllChartFormulas` / `preflightChartFormulas`),
+/// so what one reports the other moves.
+///
+/// Carriers are LIVE, exact QNames under the prefix bound to the
+/// chart namespace (Transitional or Strict; both when a part binds
+/// both — one document-order pass across the two spellings), with
+/// XML `Eq` whitespace allowed before either tag's `>`; markup-shaped
+/// text inside a comment, CDATA section or PI is text (a commented
+/// `<c:f>` is neither a ref nor a refusal). Candidates are cached per
+/// prefix and refreshed only once the scan passes them, so a dense
+/// part with an enabled-but-unused alternate prefix costs linear
+/// work (Codex #214 r6 PERF-602).
+///
+/// What the walk cannot read whole is decided by `mode`, the
+/// `WalkMode` split every drawing walker makes. `.lenient` is the
+/// historical read: an opened carrier that never closes ends the
+/// walk, a body holding markup is returned as it lies. `.strict` is
+/// the S2 `<xm:f>` rule (`sheet_edit.nextXmFormula`): a carrier with
+/// no close, a body with a `<` in it (the schema's element text is a
+/// simple type — a `<` can only open a nested element, a comment or
+/// a CDATA section, none of which a byte-preserving splice can carry
+/// through), or an unterminated comment / CDATA / PI holding carrier
+/// text (live or decoy is then undecidable) refuses
+/// `error.MalformedChartXml`. A prefix the 128-byte needle scratch
+/// cannot spell is a part strict cannot scan (refused) and lenient
+/// ends on; an alternate prefix that long is dropped, as the read
+/// always dropped it.
+pub const ChartFormulaWalk = struct {
+    xml: []const u8,
+    c_prefix: []const u8,
+    c_prefix_alt: ?[]const u8,
+    /// Scan position: every carrier before it has been returned.
+    i: usize = 0,
+    /// Cached next-candidate per prefix (see the struct doc).
+    primary: ?CarrierOpen = null,
+    alt: ?CarrierOpen = null,
+    primed: bool = false,
+
+    /// Resolve the chart prefix from the part's own declarations
+    /// (`resolveDrawingPrefixes`: the root's binding of the
+    /// Transitional / Strict chart namespace, the canonical `c` when
+    /// neither is declared).
+    pub fn init(xml: []const u8) ChartFormulaWalk {
+        const p = resolveDrawingPrefixes(xml);
+        return initWithPrefixes(xml, p.c, p.c_alt);
+    }
+
+    pub fn initWithPrefixes(xml: []const u8, c_prefix: []const u8, c_prefix_alt: ?[]const u8) ChartFormulaWalk {
+        const alt: ?[]const u8 = if (c_prefix_alt) |a| (if (std.mem.eql(u8, a, c_prefix)) null else a) else null;
+        return .{ .xml = xml, .c_prefix = c_prefix, .c_prefix_alt = alt };
+    }
+
+    /// The next carrier at or after the scan position, or `null` when
+    /// the rest of the part carries none.
+    pub fn next(self: *ChartFormulaWalk, mode: WalkMode) error{MalformedChartXml}!?ChartFormula {
+        const xml = self.xml;
+        // Needles are spelled per call into stack scratch: the walk is
+        // a value (the read returns it by value), so it cannot hold
+        // slices into its own buffers.
+        var primary_open_buf: [128]u8 = undefined;
+        var primary_close_buf: [128]u8 = undefined;
+        const primary_open = std.fmt.bufPrint(&primary_open_buf, "<{s}:f", .{self.c_prefix}) catch return self.unscannable(mode);
+        const primary_close = std.fmt.bufPrint(&primary_close_buf, "</{s}:f", .{self.c_prefix}) catch return self.unscannable(mode);
+
+        var alt_open_buf: [128]u8 = undefined;
+        var alt_close_buf: [128]u8 = undefined;
+        var alt_open: ?[]const u8 = null;
+        var alt_close: ?[]const u8 = null;
+        if (self.c_prefix_alt) |alt_prefix| {
+            // Both needles or neither — a prefix that fits `<alt:f` but
+            // not `</alt:f` must not leave an open with no close.
+            if (std.fmt.bufPrint(&alt_open_buf, "<{s}:f", .{alt_prefix})) |o| {
+                if (std.fmt.bufPrint(&alt_close_buf, "</{s}:f", .{alt_prefix})) |c| {
                     alt_open = o;
                     alt_close = c;
                 } else |_| {}
             } else |_| {}
         }
-    }
 
-    // Single document-order pass: at each position, find the
-    // EARLIER of the next primary-prefix carrier and the next
-    // alt-prefix carrier; consume that one and advance. Preserves
-    // the documented "flattened in document order" contract even
-    // for mixed-prefix charts. Carriers are LIVE, exact QNames with
-    // XML `Eq` whitespace allowed before either tag's `>` — a legal
-    // `<c:f >` must not be silently omitted, and `<!-- <c:f>… -->`
-    // must not add a ref (Codex #214 r2 REL-203, r5 REL-502). The
-    // region-skipping inside the live search is forward-only, so a
-    // document stuffed with fakes costs linear work (r3 PERF-301).
-    // Candidates are CACHED per prefix and refreshed only once the
-    // scan passes them: without this, an enabled-but-unused alternate
-    // prefix rescans its entire remaining suffix for every primary
-    // carrier — Θ(n²) on dense charts (Codex #214 r6 PERF-602).
-    var i: usize = 0;
-    var p = nextCarrierOpen(xml, 0, primary_open);
-    var a = if (alt_open) |o| nextCarrierOpen(xml, 0, o) else null;
-    while (true) {
-        if (p != null and p.?.at < i) p = nextCarrierOpen(xml, i, primary_open);
-        if (a != null and a.?.at < i) a = nextCarrierOpen(xml, i, alt_open.?);
-        const use_primary = if (p != null and a != null)
-            p.?.at <= a.?.at
+        if (!self.primed) {
+            self.primary = nextCarrierOpen(xml, self.i, primary_open);
+            self.alt = if (alt_open) |o| nextCarrierOpen(xml, self.i, o) else null;
+            self.primed = true;
+        }
+        if (self.primary != null and self.primary.?.at < self.i) self.primary = nextCarrierOpen(xml, self.i, primary_open);
+        if (self.alt != null and self.alt.?.at < self.i) self.alt = nextCarrierOpen(xml, self.i, alt_open.?);
+        const use_primary = if (self.primary != null and self.alt != null)
+            self.primary.?.at <= self.alt.?.at
         else
-            p != null;
-        const open = (if (use_primary) p else a) orelse break;
+            self.primary != null;
+        const open = (if (use_primary) self.primary else self.alt) orelse {
+            // No live carrier ahead. Strict still asks whether carrier
+            // TEXT sits inside an unterminated comment / CDATA / PI
+            // beyond the scan position — live or decoy is undecidable
+            // there, the S2 rule refuses rather than guess.
+            const carrier_text_ahead = std.mem.indexOfPos(u8, xml, self.i, primary_open) != null or
+                (alt_open != null and std.mem.indexOfPos(u8, xml, self.i, alt_open.?) != null);
+            if (mode == .strict and carrier_text_ahead and unterminatedSkipRegionFrom(xml, self.i)) {
+                return error.MalformedChartXml;
+            }
+            self.i = xml.len;
+            return null;
+        };
+        if (open.self_closing) {
+            self.i = open.content_start;
+            return .{ .body_start = open.content_start, .body_end = open.content_start, .next = open.content_start };
+        }
         const close_needle = if (use_primary) primary_close else alt_close.?;
         const closed = nextCarrierClose(xml, open.content_start, close_needle) orelse {
             // A real, opened carrier that never closes: lenient keeps
-            // the historical truncation; strict refuses rather than
-            // silently thinning `series_refs` (REL-203).
-            if (mode == .strict) return error.MalformedDrawingXml;
-            break;
+            // the historical truncation; strict refuses (REL-203).
+            if (mode == .strict) return error.MalformedChartXml;
+            self.i = xml.len;
+            return null;
         };
-        try out.append(allocator, xml[open.content_start..closed.at]);
-        i = closed.end;
+        const body = xml[open.content_start..closed.at];
+        if (mode == .strict and std.mem.indexOfScalar(u8, body, '<') != null) return error.MalformedChartXml;
+        self.i = closed.end;
+        return .{ .body_start = open.content_start, .body_end = closed.at, .next = closed.end };
     }
-    return out.toOwnedSlice(allocator);
+
+    fn unscannable(self: *ChartFormulaWalk, mode: WalkMode) error{MalformedChartXml}!?ChartFormula {
+        if (mode == .strict) return error.MalformedChartXml;
+        self.i = self.xml.len;
+        return null;
+    }
+};
+
+/// Is there a comment / CDATA / PI opened at or after `from` that
+/// never closes? The regions are walked in order, each terminated one
+/// stepped over whole, so a `-->` inside a CDATA section is CDATA
+/// text, not a comment close.
+fn unterminatedSkipRegionFrom(xml: []const u8, from: usize) bool {
+    var pos = from;
+    while (nextSkipOpenBefore(xml, pos, xml.len)) |at| {
+        pos = skipRegionCloseFrom(xml, at) orelse return true;
+    }
+    return false;
 }
 
-const CarrierOpen = struct { at: usize, content_start: usize };
+const CarrierOpen = struct {
+    at: usize,
+    content_start: usize,
+    /// `<c:f/>` — an empty carrier; `content_start` is past the `>`.
+    self_closing: bool,
+};
 const CarrierClose = struct { at: usize, end: usize };
 
 /// The next live `<{p}:f>` open at or after `start`: the exact QName
-/// (a byte terminating the name follows), whitespace tolerated before
-/// the tag's `>` (Codex #214 r5 REL-502).
+/// (a byte terminating the name follows — whitespace, `/` or `>`),
+/// whitespace tolerated before the tag's `>` (Codex #214 r5 REL-502).
+/// A `/` before the `>` is the self-closing spelling.
 fn nextCarrierOpen(xml: []const u8, start: usize, open_needle: []const u8) ?CarrierOpen {
     var pos = start;
     while (findLiveMarkup(xml, pos, open_needle)) |at| {
         const after = at + open_needle.len;
         if (after >= xml.len) return null;
         const c = xml[after];
-        if (!(c == '>' or c == ' ' or c == '\t' or c == '\n' or c == '\r')) {
+        if (!(c == '>' or c == '/' or c == ' ' or c == '\t' or c == '\n' or c == '\r')) {
             pos = at + 1;
             continue;
         }
         const end = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse return null;
-        return .{ .at = at, .content_start = end + 1 };
+        return .{ .at = at, .content_start = end + 1, .self_closing = xml[end - 1] == '/' };
     }
     return null;
 }
@@ -787,16 +893,22 @@ fn matchesOpenTag(xml: []const u8, at: usize, open: []const u8) bool {
 /// (`<!--`, `<![CDATA[` or `<?`). An unterminated region swallows the
 /// rest of the document, matching `skipRegionContaining`.
 fn skipRegionEndFrom(xml: []const u8, at: usize) usize {
+    return skipRegionCloseFrom(xml, at) orelse xml.len;
+}
+
+/// `skipRegionEndFrom` that tells an unterminated region (`null`)
+/// from one whose close is the document's last bytes.
+fn skipRegionCloseFrom(xml: []const u8, at: usize) ?usize {
     if (at + 4 <= xml.len and std.mem.startsWith(u8, xml[at..], "<!--")) {
-        const close = std.mem.indexOfPos(u8, xml, at + 4, "-->") orelse return xml.len;
+        const close = std.mem.indexOfPos(u8, xml, at + 4, "-->") orelse return null;
         return close + 3;
     }
     if (at + 9 <= xml.len and std.mem.startsWith(u8, xml[at..], "<![CDATA[")) {
-        const close = std.mem.indexOfPos(u8, xml, at + 9, "]]>") orelse return xml.len;
+        const close = std.mem.indexOfPos(u8, xml, at + 9, "]]>") orelse return null;
         return close + 3;
     }
     if (at + 2 <= xml.len and std.mem.startsWith(u8, xml[at..], "<?")) {
-        const close = std.mem.indexOfPos(u8, xml, at + 2, "?>") orelse return xml.len;
+        const close = std.mem.indexOfPos(u8, xml, at + 2, "?>") orelse return null;
         return close + 2;
     }
     return at + 1;
@@ -3324,4 +3436,96 @@ test "findDrawingRid tolerates XML whitespace after tag name" {
         @as(?[]const u8, null),
         findDrawingRid("<sheet><drawingthing r:id=\"rIdX\"/></sheet>"),
     );
+}
+
+test "ChartFormulaWalk: one carrier walk for the read and the sweep — self-closing, decoys, strict refusals" {
+    const a = std.testing.allocator;
+    // Self-closing carriers are EMPTY carriers in both spellings — the
+    // schema-equivalent of `<c:f></c:f>`, which the read always
+    // reported; `<c:f />` used to mis-scan to the next close and
+    // return the markup in between as a ref.
+    const sc = "<c:chartSpace><c:f/><c:f />text<c:f></c:f><c:f>R!A1</c:f></c:chartSpace>";
+    const sc_refs = try extractSeriesRefs(a, sc, "c", null, .strict);
+    defer a.free(sc_refs);
+    try std.testing.expectEqual(@as(usize, 4), sc_refs.len);
+    try std.testing.expectEqualStrings("", sc_refs[0]);
+    try std.testing.expectEqualStrings("", sc_refs[1]);
+    try std.testing.expectEqualStrings("", sc_refs[2]);
+    try std.testing.expectEqualStrings("R!A1", sc_refs[3]);
+    // The spans the sweep splices at slice to exactly those bodies, and
+    // the walk resumes past each carrier's close.
+    var walk = ChartFormulaWalk.init(sc);
+    const f0 = (try walk.next(.strict)).?;
+    try std.testing.expectEqual(f0.body_start, f0.body_end);
+    try std.testing.expectEqual(@as(usize, "<c:chartSpace><c:f/>".len), f0.next);
+    const f1 = (try walk.next(.strict)).?;
+    try std.testing.expectEqual(f1.body_start, f1.body_end);
+    const f2 = (try walk.next(.strict)).?;
+    try std.testing.expectEqual(f2.body_start, f2.body_end);
+    const f3 = (try walk.next(.strict)).?;
+    try std.testing.expectEqualStrings("R!A1", sc[f3.body_start..f3.body_end]);
+    try std.testing.expectEqualStrings("</c:chartSpace>", sc[f3.next..]);
+    try std.testing.expectEqual(@as(?ChartFormula, null), try walk.next(.strict));
+    try std.testing.expectEqual(@as(?ChartFormula, null), try walk.next(.strict));
+
+    // Strict refuses what a byte-preserving splice cannot carry
+    // through: an opened carrier that never closes, markup in a body
+    // (a comment, a CDATA section — the schema's element text is a
+    // simple type), carrier text inside an UNTERMINATED comment (live
+    // or decoy is undecidable). Lenient keeps the historical read:
+    // truncate at the unclosed carrier, return a body as it lies.
+    const unclosed = "<c:chartSpace><c:f>R!A1</c:f><c:f>R!B1</c:chartSpace>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, unclosed, "c", null, .strict));
+    const unclosed_len = try extractSeriesRefs(a, unclosed, "c", null, .lenient);
+    defer a.free(unclosed_len);
+    try std.testing.expectEqual(@as(usize, 1), unclosed_len.len);
+    try std.testing.expectEqualStrings("R!A1", unclosed_len[0]);
+
+    const markup = "<c:chartSpace><c:f>R!<!-- x -->A1</c:f></c:chartSpace>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, markup, "c", null, .strict));
+    const markup_len = try extractSeriesRefs(a, markup, "c", null, .lenient);
+    defer a.free(markup_len);
+    try std.testing.expectEqual(@as(usize, 1), markup_len.len);
+    try std.testing.expectEqualStrings("R!<!-- x -->A1", markup_len[0]);
+    const cdata = "<c:chartSpace><c:f><![CDATA[R!A1]]></c:f></c:chartSpace>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, cdata, "c", null, .strict));
+
+    const open_comment = "<c:chartSpace><c:f>R!A1</c:f><!-- <c:f>Fake!A1</c:f>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, open_comment, "c", null, .strict));
+    const open_comment_len = try extractSeriesRefs(a, open_comment, "c", null, .lenient);
+    defer a.free(open_comment_len);
+    try std.testing.expectEqual(@as(usize, 1), open_comment_len.len);
+    // The alternate prefix's text counts too.
+    const open_alt = "<c:chartSpace><c2:f>A!A1</c2:f><![CDATA[<c2:f>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, open_alt, "c", "c2", .strict));
+
+    // A TERMINATED decoy is text — not a ref, not a refusal — and an
+    // unterminated region holding no carrier text refuses nothing
+    // (there is no live-or-decoy question to decide).
+    const decoys = "<c:chartSpace><!-- <c:f>Fake!A1</c:f> --><?pi <c:f>Fake!B1 ?><![CDATA[<c:f>Fake!C1</c:f>]]><c:f>R!A1</c:f><!-- <c:f>Fake!D1</c:f> --></c:chartSpace>";
+    const decoy_refs = try extractSeriesRefs(a, decoys, "c", null, .strict);
+    defer a.free(decoy_refs);
+    try std.testing.expectEqual(@as(usize, 1), decoy_refs.len);
+    try std.testing.expectEqualStrings("R!A1", decoy_refs[0]);
+    const trailing_open = "<c:chartSpace><c:f>R!A1</c:f><!-- no carrier here";
+    const trailing_refs = try extractSeriesRefs(a, trailing_open, "c", null, .strict);
+    defer a.free(trailing_refs);
+    try std.testing.expectEqual(@as(usize, 1), trailing_refs.len);
+
+    // `init` resolves the part's own binding: a Strict-namespace chart
+    // under a non-canonical prefix, and a part binding both URIs.
+    const strict_ns = "<cs:chartSpace xmlns:cs=\"http://purl.oclc.org/ooxml/drawingml/chart\"><cs:f>S!A1</cs:f><c:f>not bound</c:f></cs:chartSpace>";
+    var sw = ChartFormulaWalk.init(strict_ns);
+    const s0 = (try sw.next(.strict)).?;
+    try std.testing.expectEqualStrings("S!A1", strict_ns[s0.body_start..s0.body_end]);
+    try std.testing.expectEqual(@as(?ChartFormula, null), try sw.next(.strict));
+    const both = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:cs=\"http://purl.oclc.org/ooxml/drawingml/chart\"><cs:f>S!A1</cs:f><c:f>T!A1</c:f><cs:f>S!B1</cs:f></c:chartSpace>";
+    var bw = ChartFormulaWalk.init(both);
+    const b0 = (try bw.next(.strict)).?;
+    const b1 = (try bw.next(.strict)).?;
+    const b2 = (try bw.next(.strict)).?;
+    try std.testing.expectEqualStrings("S!A1", both[b0.body_start..b0.body_end]);
+    try std.testing.expectEqualStrings("T!A1", both[b1.body_start..b1.body_end]);
+    try std.testing.expectEqualStrings("S!B1", both[b2.body_start..b2.body_end]);
+    try std.testing.expectEqual(@as(?ChartFormula, null), try bw.next(.strict));
 }

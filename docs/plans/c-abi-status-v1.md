@@ -368,7 +368,7 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 |---|---|
 | `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
 | The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
-| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `SqrefCollapseUnsafe` (a delete collapsing EVERY area of a DV/CF `sqref` — S3b slice 6 r4), `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
+| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `SqrefCollapseUnsafe` (a delete collapsing EVERY area of a DV/CF `sqref` — S3b slice 6 r4), `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedChartXml` (a chart `<c:f>` series carrier the sweep cannot read whole — the chart sweep, the `MalformedExtensionXml` shape: refused before the first mutation, folded into the two `*UnsafeForSheet` names on row / column edits), `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
 | `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing among the workbook's readable tables (decision S3a-9); a `<tablePart>` whose relationship, part or display name is broken refuses instead (`MissingRelationship` / `MalformedTableXml`, r6 REL-604) |
 | The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored sheet name that is EMPTY — an OOXML-invariant violation no argument fixes; the historical 128-byte carrier bound fell in #216 r17, a valid escape-heavy name legitimately exceeds it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
@@ -735,18 +735,26 @@ the sheet inventory is a fresh strict read of the current
 `xl/workbook.xml` — so a rename renames `sheet`, a row insert on the
 image's sheet moves its `from` / `to` with the grid while the other
 sheet's anchors stay, all visible immediately; staged cell writes never
-touch a drawing, so nothing about this read waits for save. **What the
-read makes observable and this slice does NOT lift**: chart parts are
-byte-preserved through every edit (the surface matrix's charts
-contract; no edit path in `pkg/workbook.zig` touches `xl/charts/*`),
-so a chart's `<c:f>` bodies keep spelling the old sheet name after a
-rename and pre-edit rows after an insert — the read reports those
-bytes faithfully, and both legs pin that. Routing chart `<c:f>`
-carriers through the formula rewriter — the `<xm:f>` precedent (S2:
-carrier scan, decode, rewrite, byte-preserving splice, all-or-nothing
-refusal) — is the recorded S3b follow-up; it is a carrier class of its
-own (pivot charts included), pre-existing and identical on `main`,
-and outside this read's diff. Repeated
+touch a drawing, so nothing about this read waits for save. **The
+chart `<c:f>` sweep (landed after slice 11, the S3b follow-up this
+read made observable)**: a chart's series formulas — `<c:tx>`,
+`<c:cat>`, `<c:val>` / `<c:xVal>` / `<c:yVal>` / `<c:bubbleSize>`
+carriers — ride the formula rewriter under every structural edit
+(`Workbook.rewriteAllChartFormulas`: the `<xm:f>` precedent — carrier
+walk, decode, rewrite, byte-preserving splice, all-or-nothing refusal
+by `Workbook.preflightChartFormulas` BEFORE the first mutation), so
+`series_refs` spell the new sheet name after a rename, shifted rows
+after an insert on the sheet they name, `#REF!` after that sheet's
+delete, and the rest of the chart part is byte-identical. The carrier
+walk (`drawings.ChartFormulaWalk`) and the body acceptance
+(`Workbook.decodeChartFormulaBody`) are shared with this read, so what
+the read serves is exactly what the sweep moves; a carrier the walk
+cannot read whole is this read's `MalformedDrawingXml` and the edit's
+`MalformedChartXml` (§10). Pivot charts ride too — their carriers name
+the pivot's host cells and move with the hosted rectangle (S7a) — while
+`<c:pivotSource><c:name>` (a `[book]sheet!pivot` locator, not a formula)
+keeps its spelling, as the cache's `worksheetSource@sheet` does under a
+rename. Repeated
 reads stay bounded: the drawing walkers used to resolve every part
 name along the relationship chain into the store's lifetime arena —
 the S3B-MEM-603 shape, unbounded growth for a long-lived editor
@@ -760,8 +768,9 @@ pkg fixture (all three anchor kinds, a sheet boundary, chart-first
 document order regrouped); the rename AND a row insert visible with no
 save — the rename pinning `sheet`, the insert pinning the edited
 sheet's `from` / `to` moved beside the other sheet's unmoved anchors,
-and the chart's refs pinned UNMOVED under both (the byte-preserved
-contract above — the pin flips when the follow-up lands);
+and the chart's refs pinned RESPELLED under both (the chart sweep:
+`Facts!$B$1` after the rename, `Facts!$B$2` / `Facts!$A$3:$A$5` /
+`Facts!$B$3:$B$5` after the insert on the sheet they name);
 `(NULL, 0)` on a workbook without drawings with the poison reset;
 `NullOutPointer` / `InvalidInput` as call errors; poisoned outputs
 reset on the refusal and undersized-diag paths, the rejected diag

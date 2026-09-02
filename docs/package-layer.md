@@ -163,7 +163,11 @@ function pointer to keep the graph a DAG.
   walker silently skips them.
 - **External-workbook chart series refs** (`[Book.xlsx]Sheet1!A1`
   patterns inside `<c:f>`) — surfaced verbatim in `series_refs`;
-  no path-resolution or external-part fetching.
+  no path-resolution or external-part fetching. Local refs, by
+  contrast, ride the formula rewriter under every structural edit
+  (`Workbook.rewriteAllChartFormulas`, over the same carrier walk
+  `chartAnchors` reads with — `ChartFormulaWalk`), so a rename or a
+  row / column edit on the named sheet respells them in the part.
 - **Pivot tables** — read as a typed graph (`Workbook.pivotTables`;
   `zlsx_pkg.pivots.collect` over a `PartStore` plus its parsed
   `typed_parts.workbook_xml` view): tables with host
