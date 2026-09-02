@@ -1311,9 +1311,18 @@ pub fn shiftSingleA1Row(ref: []const u8, row: u32, kind: RowEditKind, buf: *[16]
     return try std.fmt.bufPrint(buf, "{s}{d}", .{ ref[0..letters_end], new_row });
 }
 
-/// Emit the original `<tag attrs>` with `attr_name="..."` value
-/// replaced by `new_value`. `tag_name_len` is the length of the
-/// tag name including the leading `<` (e.g. `"<c".len` = 2).
+/// Emit the original `<tag attrs>` with `attr_name`'s value replaced
+/// by `new_value`. `tag_name_len` is the length of the tag name
+/// including the leading `<` (e.g. `"<c".len` = 2). A one-entry
+/// wrapper over the exact attribute walker — the historical substring
+/// body (`indexOf` of `name="`) was the FIFTH attribute
+/// implementation in the edit pipeline, with an acceptance all its
+/// own: contiguous double quotes only, substring rather than
+/// exact-name matching. A cell spelled `r = 'A99'` was read by the
+/// unified grammar and then could not be spliced, so the row
+/// renumbered around a cell that kept its old address while the
+/// formula sweep had already moved its body; an `x:r="Z9"` decoy took
+/// the splice meant for `r` (Codex #216 r13 S3B-REL-1301).
 pub fn writeWithReplacedAttr(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1323,35 +1332,8 @@ pub fn writeWithReplacedAttr(
     attr_name: []const u8,
     new_value: []const u8,
 ) !void {
-    const attrs_full_start = t.start + tag_name_len;
-    const attrs_full_end = t.after_open - 1;
-    const attrs = src[attrs_full_start..attrs_full_end];
-    // Find the `name="..."` occurrence inside attrs.
-    var pat_buf: [32]u8 = undefined;
-    const pat = try std.fmt.bufPrint(&pat_buf, "{s}=\"", .{attr_name});
-    const pat_off = std.mem.indexOf(u8, attrs, pat) orelse {
-        try out.appendSlice(allocator, src[t.start..t.after_open]);
-        return;
-    };
-    const val_start_in_src = attrs_full_start + pat_off + pat.len;
-    // Bound the search to the tag's own extent. Searching all of `src`
-    // meant an unterminated attribute value — `<autoFilter ref="A1:E10>`
-    // — matched a quote belonging to some later element, putting
-    // `val_end_in_src` past `t.after_open` and making the final
-    // `src[val_end_in_src..t.after_open]` slice backwards: a panic, not
-    // a typed error, on input any corrupt or hand-edited sheet part can
-    // carry. Found by fuzzing, 2026-07-27.
-    const val_end_in_src = blk: {
-        const found = std.mem.indexOfScalarPos(u8, src, val_start_in_src, '"') orelse
-            break :blk null;
-        break :blk if (found < t.after_open) found else null;
-    } orelse {
-        try out.appendSlice(allocator, src[t.start..t.after_open]);
-        return;
-    };
-    try out.appendSlice(allocator, src[t.start..val_start_in_src]);
-    try out.appendSlice(allocator, new_value);
-    try out.appendSlice(allocator, src[val_end_in_src..t.after_open]);
+    const subs = [_]AttrSub{.{ .name = attr_name, .new_value = new_value }};
+    return writeWithReplacedAttrs(allocator, out, src, t, tag_name_len, &subs);
 }
 
 /// Rewrite the row attribute on `<row r="…">`. Just delegates to

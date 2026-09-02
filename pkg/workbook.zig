@@ -16206,6 +16206,59 @@ test "insertRow: a formula cell behind a bare token relocates without desync (S3
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c bogus r=\"A100\"><f>A99</f>") != null);
 }
 
+test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-legacy-writer-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        // Legal spellings the substring writer could not splice: a
+        // spaced single-quoted row and cell ref (it knew only
+        // contiguous `name="`), and an `x:r` decoy that took the
+        // splice meant for `r`. The formula sweep moved the bodies
+        // regardless, so the coordinates froze beside moved formulas.
+        const row = "<row r = '98'><c x:r=\"Z9\" r=\"B98\"><v>1</v></c><c r = 'A98'><f>A97</f><v>0</v></c></row>";
+        const at = std.mem.indexOf(u8, part.bytes, "</sheetData>").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], row, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-legacy-writer-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    // The row and both cells moved — spelling (spacing, quote style)
+    // preserved — the decoy untouched, the formula on the same grid.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<row r = '99'>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c x:r=\"Z9\" r=\"B99\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c r = 'A99'><f>A98</f>") != null);
+}
+
 test "insertRow: a bare token before sqref splits neither envelope from formula (S3B-REL-1001)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
