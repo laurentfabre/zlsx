@@ -4862,11 +4862,11 @@ pub const Workbook = struct {
     /// per-sheet rather than per-write, so the ASCII compromise is
     /// retained here pending a follow-up iter.
     ///
-    /// **Defined names.** Sheet-qualified `<definedName>` formulas
-    /// (`Sheet2!$A$1` etc.) are NOT rewritten by this iter — only
-    /// per-cell formulas via `rewriteAllFormulas`. Hyperlink targets
-    /// pointing at the renamed sheet are likewise unaltered. A future
-    /// iter (`m3-defnames-hyperlinks`) covers both.
+    /// **Carrier coverage.** Five sweeps retarget every cross-sheet
+    /// reference: cell formulas, defined-name bodies, internal
+    /// hyperlink locations, DV/CF formulas, and `<xm:f>` extension
+    /// formulas (the B2 iter-er-5 lift — earlier iterations rewrote
+    /// only cell formulas).
     pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
         try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
@@ -4901,6 +4901,13 @@ pub const Workbook = struct {
         const edit: zlsx.formula_rewriter.RewriteEdit = .{
             .rename_sheet = .{ .old = old_name_decoded, .new = new_name },
         };
+
+        // The workbook.xml patch is the rename's LAST mutation —
+        // locate its target FIRST, so a sheet element the patcher
+        // cannot read refuses before the five sweeps have rewritten
+        // anything, instead of tearing after them (Codex #216 r14
+        // S3B-REL-1402).
+        _ = try locateWorkbookXmlSheetName(self, sheet_idx, old_name_owned);
 
         // B2 iter-er-5 lift (rename_sheet axis): walk every cross-
         // sheet reference carrier and rewrite the renamed sheet's
@@ -9379,25 +9386,26 @@ fn asciiCaseInsensitiveEql(a: []const u8, b: []const u8) bool {
 /// an external tool with surprising attribute ordering, we refuse to
 /// rewrite an element whose old name doesn't match what we believe it
 /// should be (`SheetElementNotFound`).
-fn patchWorkbookXmlSheetName(
+/// Locate the `name` attribute's VALUE span of the `sheet_idx`-th
+/// `<sheet>` element of `xl/workbook.xml`. Quote-aware tag ends (a
+/// legal quoted `>` inside another attribute no longer truncates the
+/// element) and the ONE attribute walk every reader shares (a bare
+/// token is stepped over, not an error) — and callable as a
+/// PRE-SWEEP preflight, so a locate failure refuses the rename
+/// BEFORE the five sweeps have rewritten anything, instead of
+/// tearing after them (Codex #216 r14 S3B-REL-1402).
+fn locateWorkbookXmlSheetName(
     self: *Workbook,
     sheet_idx: u32,
     expected_old: []const u8,
-    new_name: []const u8,
-) Error!void {
+) Error!struct { value_start: usize, value_end: usize } {
     assert(expected_old.len > 0);
-    assert(new_name.len > 0);
-    assert(sheet_idx < self.workbook.sheets.len);
-
     const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
     const src = part.bytes;
     assert(src.len > 0);
 
-    // Find the Nth `<sheet ` (note the trailing space — distinguishes
-    // from `<sheets>`, `<sheetData>`, etc.) Also accept `<sheet/>`-
-    // style self-close as a defensive fallback. We require an
-    // attribute-bearing form for a name to be present, so primarily
-    // match `<sheet ` and `<sheet\t` / `<sheet\n`.
+    // Find the Nth `<sheet ` (note the boundary — distinguishes
+    // `<sheets>`, `<sheetData>`, etc.).
     var search_from: usize = 0;
     var seen: u32 = 0;
     var elem_attrs_start: usize = 0;
@@ -9408,9 +9416,6 @@ fn patchWorkbookXmlSheetName(
         const after = open + "<sheet".len;
         if (after >= src.len) return error.SheetElementNotFound;
         const boundary = src[after];
-        // Distinguish `<sheet[ /\t\r\n]` from `<sheets`, `<sheetData`,
-        // `<sheetView`, `<sheetFormatPr`, `<sheetPr`, `<sheetCalcPr`,
-        // `<sheetProtection` and friends.
         const is_sheet_elem = switch (boundary) {
             ' ', '\t', '\r', '\n', '/' => true,
             else => false,
@@ -9419,11 +9424,25 @@ fn patchWorkbookXmlSheetName(
             search_from = after;
             continue;
         }
-        // Find the closing `>` that terminates this open tag. Sheet
-        // elements are leaves (`<sheet ... />` or `<sheet ...></sheet>`
-        // with empty body); we just need the first `>` past `after`.
-        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse
+        // The closing `>` of this open tag, QUOTE-AWARE: a `>` inside
+        // a quoted attribute value is data, and the bare scalar scan
+        // truncated the element there and lost the `name` attribute
+        // after it.
+        const gt = blk: {
+            var j = after;
+            var q: ?u8 = null;
+            while (j < src.len) : (j += 1) {
+                const c = src[j];
+                if (q) |qq| {
+                    if (c == qq) q = null;
+                } else if (c == '"' or c == '\'') {
+                    q = c;
+                } else if (c == '>') {
+                    break :blk j;
+                }
+            }
             return error.SheetElementNotFound;
+        };
         if (seen == sheet_idx) {
             elem_attrs_start = after;
             elem_attrs_end = if (gt > 0 and src[gt - 1] == '/') gt - 1 else gt;
@@ -9434,45 +9453,32 @@ fn patchWorkbookXmlSheetName(
     }
     assert(elem_attrs_end >= elem_attrs_start);
 
-    // Find `name="..."` (or `name='...'`) inside this element's
-    // attribute span. Must be a real attribute, not a substring of
-    // another attribute's value: we anchor on a preceding whitespace
-    // OR the start of the attribute span.
+    // The shared attribute walk over this element's region: exact
+    // name, either quote, XML `S` spacing, valueless tokens stepped
+    // over, unterminated values a dead end.
     const attrs = src[elem_attrs_start..elem_attrs_end];
     const NameAttr = struct { value_start: usize, value_end: usize };
     const found: NameAttr = blk: {
         var i: usize = 0;
         while (i < attrs.len) {
-            // Skip leading whitespace.
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
             if (i >= attrs.len) break;
             const key_start = i;
-            while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
-                attrs[i] != '\t' and attrs[i] != '\r' and attrs[i] != '\n') : (i += 1)
-            {}
-            const key_end = i;
-            // Skip = and any padding.
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
-            if (i >= attrs.len or attrs[i] != '=') return error.SheetElementNotFound;
+            while (i < attrs.len and attrs[i] != '=' and !isXmlSByte(attrs[i])) i += 1;
+            const key = attrs[key_start..i];
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
+            if (i >= attrs.len) break;
+            if (attrs[i] != '=') continue;
             i += 1;
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
-            if (i >= attrs.len) return error.SheetElementNotFound;
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
+            if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) break;
             const quote = attrs[i];
-            if (quote != '"' and quote != '\'') return error.SheetElementNotFound;
             i += 1;
             const val_start = i;
-            while (i < attrs.len and attrs[i] != quote) : (i += 1) {}
-            if (i >= attrs.len) return error.SheetElementNotFound;
+            while (i < attrs.len and attrs[i] != quote) i += 1;
+            if (i >= attrs.len) break; // unterminated value
             const val_end = i;
-            i += 1; // past closing quote
-
-            const key = attrs[key_start..key_end];
+            i += 1;
             if (std.mem.eql(u8, key, "name")) {
                 break :blk .{
                     .value_start = elem_attrs_start + val_start,
@@ -9488,12 +9494,26 @@ fn patchWorkbookXmlSheetName(
     // wire — but for unescaped ASCII names like "Sheet1" the byte
     // comparison is correct) must match `expected_old`.
     if (!std.mem.eql(u8, src[found.value_start..found.value_end], expected_old)) {
-        // Tolerate XML-escaped equivalents: if a name contains `&` or
-        // `<` we'd see entities here; for ASCII-clean names this is
-        // straight equality. If the wire form differs, it's not the
-        // element we expected to rewrite.
         return error.SheetElementNotFound;
     }
+    return .{ .value_start = found.value_start, .value_end = found.value_end };
+}
+
+fn isXmlSByte(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn patchWorkbookXmlSheetName(
+    self: *Workbook,
+    sheet_idx: u32,
+    expected_old: []const u8,
+    new_name: []const u8,
+) Error!void {
+    assert(new_name.len > 0);
+    assert(sheet_idx < self.workbook.sheets.len);
+    const found = try locateWorkbookXmlSheetName(self, sheet_idx, expected_old);
+    const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+    const src = part.bytes;
 
     // Build the patched part: prefix + escaped new name + suffix.
     var out: std.ArrayList(u8) = .empty;
@@ -16204,6 +16224,46 @@ test "insertRow: a formula cell behind a bare token relocates without desync (S3
     const part_name = try ws.resolvePartName();
     const part = (try wb2.store.part(part_name)).?;
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c bogus r=\"A100\"><f>A99</f>") != null);
+}
+
+test "renameSheet: a quoted '>' and a bare token in the sheet element do not break the patch (S3B-REL-1402)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rename-quotegt-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A quoted `>` before `name=` truncated the old bare tag-end
+        // scan mid-element, and a bare token was a hard error in the
+        // old attribute loop — BOTH after the five rename sweeps had
+        // already rewritten every carrier, leaving the workbook torn
+        // behind a "refusal".
+        const part = (try wb.store.part("xl/workbook.xml")).?;
+        const at = std.mem.indexOf(u8, part.bytes, "<sheet state=\"visible\" name=").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{
+            part.bytes[0..at],
+            "<sheet probe=\"a>b\" bogus state=\"visible\" name=",
+            part.bytes[at + "<sheet state=\"visible\" name=".len ..],
+        });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart("xl/workbook.xml", patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try wb.renameSheet(0, "Zed");
+    try std.testing.expectEqualStrings("Zed", wb.workbook.sheets[0].name);
+    const part = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "probe=\"a>b\" bogus state=\"visible\" name=\"Zed\"") != null);
 }
 
 test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {

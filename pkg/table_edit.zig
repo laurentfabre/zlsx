@@ -1228,9 +1228,12 @@ fn emitRenamedOpenTag(
 const AttrSpan = struct { val_start: usize, val_end: usize };
 
 /// The VALUE span of `attr_name` inside an open tag's attribute
-/// region, in absolute `src` offsets. Mirrors `getAttr`'s walk —
-/// both quote styles, whitespace around `=` — so anything the
-/// pre-flight found, the splice finds.
+/// region, in absolute `src` offsets. The IDENTICAL walk to every
+/// other attribute reader — XML §2.3's four `S` bytes only, one
+/// explicit `=`, a valueless token stepped over, null on an
+/// unterminated value — so anything the pre-flight found, the splice
+/// finds, and nothing more (Codex #216 r14 S3B-REL-1401: this copy
+/// kept the pre-unification scan).
 fn findAttrValueSpan(
     src: []const u8,
     attrs_start: usize,
@@ -1239,12 +1242,16 @@ fn findAttrValueSpan(
 ) ?AttrSpan {
     var i = attrs_start;
     while (i < attrs_end) {
-        while (i < attrs_end and std.ascii.isWhitespace(src[i])) i += 1;
+        while (i < attrs_end and isXmlS(src[i])) i += 1;
         if (i >= attrs_end) break;
         const name_start = i;
-        while (i < attrs_end and src[i] != '=' and !std.ascii.isWhitespace(src[i])) i += 1;
+        while (i < attrs_end and src[i] != '=' and !isXmlS(src[i])) i += 1;
         const this_name = src[name_start..i];
-        while (i < attrs_end and (src[i] == '=' or std.ascii.isWhitespace(src[i]))) i += 1;
+        while (i < attrs_end and isXmlS(src[i])) i += 1;
+        if (i >= attrs_end) break;
+        if (src[i] != '=') continue;
+        i += 1;
+        while (i < attrs_end and isXmlS(src[i])) i += 1;
         if (i >= attrs_end or (src[i] != '"' and src[i] != '\'')) break;
         const quote = src[i];
         i += 1;
@@ -1258,6 +1265,10 @@ fn findAttrValueSpan(
         }
     }
     return null;
+}
+
+fn isXmlS(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 /// STRING-carrier decode (XML entities + ST_Xstring) — the codec

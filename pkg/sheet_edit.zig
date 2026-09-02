@@ -295,56 +295,24 @@ fn emitColEntry(
     new_min: u32,
     new_max: u32,
 ) !void {
+    // Two substitutions through the ONE exact attribute walker — the
+    // historical hand-rolled emit loop here was the last divergent
+    // writer: its name scan stopped only at `=`, so a bare token
+    // consumed the NEXT attribute's value (`<col bogus min="2" …>`
+    // emitted `bogus="2"` and the schema-required `min` vanished),
+    // and it re-normalised Eq spacing the readers preserve (Codex
+    // #216 r14 S3B-REL-1401). The walker also keeps the original
+    // self-close bytes verbatim, retiring the trailing-`/` heuristic.
+    _ = attrs;
     var min_buf: [12]u8 = undefined;
     var max_buf: [12]u8 = undefined;
     const min_s = try std.fmt.bufPrint(&min_buf, "{d}", .{new_min});
     const max_s = try std.fmt.bufPrint(&max_buf, "{d}", .{new_max});
-    try out.appendSlice(allocator, "<col");
-    var ai: usize = 0;
-    while (ai < attrs.len) {
-        const ws_start = ai;
-        while (ai < attrs.len and (attrs[ai] == ' ' or attrs[ai] == '\t' or
-            attrs[ai] == '\n' or attrs[ai] == '\r')) ai += 1;
-        try out.appendSlice(allocator, attrs[ws_start..ai]);
-        if (ai >= attrs.len) break;
-        const name_start = ai;
-        while (ai < attrs.len and attrs[ai] != '=' and attrs[ai] != ' ' and
-            attrs[ai] != '\t' and attrs[ai] != '\n' and attrs[ai] != '\r') ai += 1;
-        const aname = attrs[name_start..ai];
-        while (ai < attrs.len and attrs[ai] != '=') ai += 1;
-        if (ai >= attrs.len) break;
-        ai += 1;
-        while (ai < attrs.len and (attrs[ai] == ' ' or attrs[ai] == '\t' or
-            attrs[ai] == '\n' or attrs[ai] == '\r')) ai += 1;
-        if (ai >= attrs.len or (attrs[ai] != '"' and attrs[ai] != '\'')) break;
-        const quote = attrs[ai];
-        ai += 1;
-        const val_start = ai;
-        while (ai < attrs.len and attrs[ai] != quote) ai += 1;
-        const val = attrs[val_start..ai];
-        if (ai < attrs.len) ai += 1;
-        try out.appendSlice(allocator, aname);
-        try out.append(allocator, '=');
-        try out.append(allocator, quote);
-        if (std.mem.eql(u8, aname, "min")) {
-            try out.appendSlice(allocator, min_s);
-        } else if (std.mem.eql(u8, aname, "max")) {
-            try out.appendSlice(allocator, max_s);
-        } else {
-            try out.appendSlice(allocator, val);
-        }
-        try out.append(allocator, quote);
-    }
-    // OOXML <col/> is always an empty element. Detect the original
-    // self-closing form (last non-ws byte of attrs is `/`) and
-    // emit `/>` accordingly, so we don't leave open `<col>` tags.
-    const trimmed_attrs = std.mem.trimEnd(u8, attrs, " \t\r\n");
-    const was_self_closing = trimmed_attrs.len > 0 and trimmed_attrs[trimmed_attrs.len - 1] == '/';
-    if (was_self_closing) {
-        try out.appendSlice(allocator, "/>");
-    } else {
-        try out.appendSlice(allocator, src[t.after_open - 1 .. t.after_open]);
-    }
+    const subs = [_]AttrSub{
+        .{ .name = "min", .new_value = min_s },
+        .{ .name = "max", .new_value = max_s },
+    };
+    try writeWithReplacedAttrs(allocator, out, src, t, "<col".len, &subs);
 }
 
 fn processMergeCellTagCol(
