@@ -1261,8 +1261,8 @@ class Rows:
         ``None`` when the source `<c>` had no ``s`` attribute (General
         format). Layout mirrors the last row returned by ``next()`` so
         positional indexing matches; ``[]`` before the first row, after
-        ``skip()`` and once ``next()`` has raised (there is no current
-        row then). Raises :class:`RuntimeError` if the loaded libzlsx
+        a ``skip(n)`` with ``n >= 1`` (``skip(0)`` is a no-op) and once
+        ``next()`` has raised (there is no current row then). Raises :class:`RuntimeError` if the loaded libzlsx
         predates the 0.2.6+ numFmt ABI."""
         if not self._handle:
             raise ZlsxError("Rows iterator is closed")
@@ -1290,7 +1290,8 @@ class Rows:
     # changed shape: a formula cell's element is its cached value and
     # an error cell's is the literal string. Each accessor mirrors
     # `style_indices` — one list aligned to the last row `next()`
-    # yielded, empty before the first row and after `skip()`.
+    # yielded, empty before the first row, after a `skip(n)` with
+    # `n >= 1` and once `next()` has raised.
 
     def _require_rows_formulas(self) -> None:
         if not self._handle:

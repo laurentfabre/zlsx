@@ -1028,8 +1028,8 @@ export fn zlsx_rows_style_at(
     const rs: *RowsState = @ptrCast(@alignCast(rows));
     // Bound on the C-side view, not the reader's parallel list: the
     // view is what the last `zlsx_rows_next` handed the caller —
-    // emptied at the end of the sheet, on a parse error and by
-    // `zlsx_rows_skip` — whereas the reader's per-row lists keep the
+    // emptied at the end of the sheet, on a parse error and by a
+    // non-empty `zlsx_rows_skip` — whereas the reader's per-row lists keep the
     // last decoded row through a fast-path skip: a stale style for a
     // row the caller never saw (S3b slice 11; the three side-channel
     // getters below share the rule).
@@ -10042,16 +10042,20 @@ test "S3b rows formulas: a skip clears the current row for every side-channel ge
     var cells_ptr: [*]const CCell = undefined;
     var cells_len: usize = 0;
 
-    // Row 2 has a formula in every column and a style-less cell; after
-    // skipping row 3 nothing is current — the reader's per-row lists
-    // still hold the last decoded row (the fixture has formula spreads,
-    // so the skip decoded it), but no getter serves it.
+    // Row 2 has a formula in every column; after skipping row 3 nothing
+    // is current — the reader's per-row lists still hold the last
+    // decoded row (the fixture has formula spreads, so the skip decoded
+    // it: row 3, four slots wide), but no getter serves it.
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try S3b11Probe.at(rows.?, 0).expectFormula("A1*2");
     var skipped: usize = 0;
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 1, &skipped, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 1), skipped);
+    // The premise that makes the -1 discriminate against the old
+    // reader-list bound (in-house r3 S3B-MNT-304): row 3's four slots
+    // (row 2 had three) sit stale behind the empty view.
+    try std.testing.expectEqual(@as(usize, 4), rows_inner(rows.?).row_cells.items.len);
     try expectNoRowAt(rows.?, 0);
 
     // Row 4 lands next — the array slave still resolves to its base
@@ -10131,6 +10135,23 @@ test "S3b rows formulas: a skip that fails leaves no current row either (in-hous
     // the sheet ends, never a stale 1.
     try std.testing.expect(zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len) != 1);
     try expectNoRowAt(rows.?, 0);
+
+    // `zlsx_rows_next` itself on the torn row: a fresh iterator reads
+    // rows 1–6, then answers -1 with the same diagnostic and no current
+    // row — the view is emptied before the reader is asked, not after
+    // (in-house r3 S3B-MNT-303: the -1 half of the rule, driven
+    // directly).
+    {
+        const fresh = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+        try std.testing.expect(fresh != null);
+        defer zlsx_rows_close(fresh);
+        for (0..6) |_| try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(fresh.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try S3b11Probe.at(fresh.?, 2).expectFormula("x");
+        @memset(&err_buf, 0);
+        try std.testing.expectEqual(@as(i32, -1), zlsx_rows_next(fresh.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedXml", std.mem.sliceTo(&err_buf, 0));
+        try expectNoRowAt(fresh.?, 0);
+    }
 }
 
 fn rows_inner(rows: *Rows) *const xlsx.Rows {

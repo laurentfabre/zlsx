@@ -1005,10 +1005,11 @@ written when column `col_idx` of the current row is that kind of cell;
 `1` when it is not (the out params untouched); `-1` when `col_idx` is out
 of range for the current row. "The current row" is the one the last
 `zlsx_rows_next` returned `1` for — before the first call, after a `0`
-(end of sheet) or a `-1` (parse error), and after `zlsx_rows_skip`
-whether it returned `0` or `-1`, there is none and every per-column
-getter on the handle answers `-1` (`zlsx_rows_style_at` and
-`zlsx_rows_parse_date` included). The pointers have the
+(end of sheet) or a `-1` (parse error), and after a non-zero
+`zlsx_rows_skip` whether it returned `0` or `-1`, there is none and
+every per-column getter on the handle answers `-1` (`zlsx_rows_style_at`
+and `zlsx_rows_parse_date` included); a zero-length skip is a no-op
+and keeps the row. The pointers have the
 cells' lifetime (until the next `zlsx_rows_next` / `zlsx_rows_skip` or a
 close); `out_col` is 0-based (A = 0) and `out_row` 1-based, the
 `zlsx_merge_range_t` convention.
@@ -1050,7 +1051,11 @@ the old row over the torn one); `Rows.skip` zeroes its length before it
 raises — on its pre-0.8.0 drain fallback too (in-house r2 S3B-REL-202)
 — and `Rows.parse_date` bounds on it before the index narrows. A
 zero-length skip is the no-op the contract reads as on both surfaces:
-no `zlsx_rows_next` is stood in for, so the current row stays current.
+no `zlsx_rows_next` is stood in for, so the current row stays current —
+the four header sentences that state the rule (`zlsx_rows_next`,
+`zlsx_rows_skip`, the getters' block, `zlsx_rows_parse_date`) and the
+binding's docstrings all carry the `n >= 1` qualifier (in-house r3
+S3B-DOC-301).
 The only observable change to the two siblings is `-1` / `None` where
 they used to answer for a row that was not current.
 
@@ -1075,8 +1080,10 @@ slave whose base was never seen (a value cell), a `t="dataTable"` body
 identity, so a `1` / `-1` that wrote anything is caught on every cell
 kind (in-house r1 S3B-MNT-105/106); no current row before the first
 `next`, past each row's end, at `maxInt(usize)`, past the end of the
-sheet, after a skip and after a skip that FAILS on a torn row (one
-`expectNoRowAt` per site: the trio, the style getter and the date
+sheet, after a skip, after a skip that FAILS on a torn row and after a
+`zlsx_rows_next` that fails on it directly — the `-1` half of the rule
+on both surfaces (in-house r3 S3B-MNT-303) — (one `expectNoRowAt` per
+site: the trio, the style getter and the date
 getter agreeing, the reader's lists shown to hold the torn row's
 remains); the date getter through a fast-path skip over a dated row
 (the reader's `row_cells` still two wide — row 1 — while nothing is

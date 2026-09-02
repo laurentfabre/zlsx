@@ -482,8 +482,9 @@ void zlsx_rows_close(zlsx_rows_t * rows);
  * The row yielded by the last 1 is "the current row" for every
  * per-column getter on the handle (zlsx_rows_style_at(),
  * zlsx_rows_parse_date() and the formula / error getters); after a 0
- * or a -1, and after zlsx_rows_skip() whether it returned 0 or -1,
- * there is none and every getter returns -1.
+ * or a -1, and after a zlsx_rows_skip() of n >= 1 whether it returned
+ * 0 or -1, there is none and every getter returns -1 (a zero-length
+ * skip is a no-op and keeps the row).
  */
 int32_t zlsx_rows_next(zlsx_rows_t         * rows,
                        const zlsx_cell_t ** out_cells,
@@ -505,7 +506,8 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
  *
  * Invalidates the cells of the most recently yielded row, exactly as
  * zlsx_rows_next() does — on -1 as well as on 0: there is no current
- * row afterwards either way.
+ * row afterwards either way. A zero-length skip (n == 0) is a no-op:
+ * it writes 0 to *out_skipped and leaves the current row current.
  */
 int32_t zlsx_rows_skip(zlsx_rows_t * rows,
                        size_t        n,
@@ -535,8 +537,8 @@ int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
  * zlsx_rows_style_at's contract: 0 and the out params written when
  * the cell is that kind of cell; 1 when it is not (the out params
  * untouched); -1 when `col_idx` is out of range for the current row
- * — before the first zlsx_rows_next(), after zlsx_rows_skip(), or
- * past the row's end. Pointers are valid until the next
+ * — before the first zlsx_rows_next(), after its 0 / -1, after a
+ * zlsx_rows_skip() of n >= 1, or past the row's end. Pointers are valid until the next
  * zlsx_rows_next() / zlsx_rows_skip() or a close, the cells' own
  * lifetime. For a formula cell exactly one of zlsx_rows_formula_at()
  * and zlsx_rows_formula_ref_at() returns 0 and zlsx_rows_error_at()
@@ -644,7 +646,7 @@ typedef struct {
  *    1 → not a date (wrong type / non-date numFmt / out-of-range serial)
  *   -1 → `col_idx` is past the row width, or there is no current row
  *        (before the first zlsx_rows_next(), after its 0 / -1, after
- *        zlsx_rows_skip()) — `*out` untouched
+ *        a zlsx_rows_skip() of n >= 1) — `*out` untouched
  *
  * Combines the existing `zlsx_rows_style_at` + `zlsx_is_date_format`
  * + `xlsx.fromExcelSerial` chain into one call.

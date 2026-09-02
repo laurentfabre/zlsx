@@ -3954,6 +3954,20 @@ def test_rows_formula_and_error_side_channels(tmp_path):
                 assert rows.error_strings() == []
                 assert rows.style_indices() == []
                 assert rows.parse_date(0) is None
+            # `next()` itself on the torn row: the same error, the same
+            # empty answers — the `-1` half of `__next__`'s zeroing,
+            # driven directly (in-house r3 S3B-MNT-303).
+            with torn_book.sheet(0).rows() as rows:
+                for _ in range(6):
+                    next(rows)
+                assert rows.formula_strings() == ["", None, "x"]
+                with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+                    next(rows)
+                assert rows.formula_strings() == []
+                assert rows.formula_refs() == []
+                assert rows.error_strings() == []
+                assert rows.style_indices() == []
+                assert rows.parse_date(0) is None
         # The value list is what it always was: cached values and the
         # error literal as a plain str.
         _, data = book.sheet(0).read_all()
