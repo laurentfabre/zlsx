@@ -302,8 +302,8 @@ pub fn writeRecord(out: *std.Io.Writer, r: Record, envelope: Envelope) !void {
     try out.writeAll("}\n");
 }
 
-/// The unselected stream — every record, emission order. The future C
-/// leg's entry point.
+/// The unselected stream — every record, emission order. The C leg's
+/// entry point (`zlsx_editor_conditional_formats_ndjson`).
 pub fn writeAll(out: *std.Io.Writer, view: *const ConditionalFormats) !void {
     for (view.records) |r| try writeRecord(out, r, .full);
 }
@@ -2457,7 +2457,7 @@ test "collect: a decoded External sheet target refuses by POLICY, not by spellin
     try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
 }
 
-test "writeAll: the future C handoff writes the full stream byte-exactly (MNT-2302)" {
+test "writeAll: the C handoff writes the full stream byte-exactly (MNT-2302)" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

@@ -6315,6 +6315,75 @@ fn definedNamesNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]
     return out.toOwnedSlice();
 }
 
+/// The S3b `conditional-formats` records — one
+/// `{"kind":"conditional_format",…}` line per `<cfRule>`, sheets in
+/// workbook order, rules in sheet-document order — as a
+/// library-allocated UTF-8 buffer, byte-for-byte what
+/// `zlsx conditional-formats <file>` prints with no selector
+/// (docs/cli.md, "conditional-formats"). The record is the rule
+/// envelope (`sqref`, `rule_type`, `formulas`, `dxf_id`, `priority`),
+/// not the visual payload — `<colorScale>` / `<dataBar>` / `<iconSet>`
+/// bodies and the `<dxfs>` styles stay in their parts. Read over the
+/// editor's current parts: structural edits and the DV/CF sweeps they
+/// carry are visible immediately; staged cell writes never touch the
+/// rule machinery. A workbook without conditional formatting is
+/// ZLSX_OK with `(NULL, 0)`. An inventory that cannot be served
+/// faithfully refuses whole — a sheet list the strict workbook read
+/// cannot prove (`MalformedWorkbookXml`) or a sheet part the strict
+/// walk cannot (`MalformedSheetXml`), both -2 — rather than hand over
+/// a record that lies. Release with `zlsx_buffer_release`.
+export fn zlsx_editor_conditional_formats_ndjson(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail: a rejected sibling
+    // leaves the accepted ones releasable.
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    const bytes = conditionalFormatsNdjsonOwned(gpa, &state.inner.workbook) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The conditional-format records as one owned buffer in `alloc` — the
+/// shared writer (`pkg/conditional_format_ndjson.zig`) over the
+/// editor's current parts, so the bytes are the CLI's. The allocating
+/// writer reports a failed growth as `WriteFailed`; at this boundary
+/// that is an allocation failure and crosses as `-3`, the pivots
+/// builder's rule.
+fn conditionalFormatsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
+    var view = try zlsx_pkg.conditional_formats_ndjson.collect(alloc, wb);
+    defer view.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.conditional_formats_ndjson.writeAll(&out.writer, &view) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
 // ─── M9a1 tests ──────────────────────────────────────────────────────
 
 /// A1 = 1 (plain), B1 = formula "A1+2" with cached <v>0</v> — one
@@ -7809,6 +7878,211 @@ test "S3b defined_names_ndjson: every allocation failure is OutOfMemory, never W
     var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
     defer wb.deinit();
     try std.testing.checkAllAllocationFailures(alloc, definedNamesNdjsonForFailures, .{&wb});
+}
+
+/// The pkg fixture (`conditional_format_ndjson.zig::fixture.write`)
+/// rebuilt through the C writer surface, so the frozen stream below is
+/// pinned across the boundary a binding crosses: one dxf, four rule
+/// kinds on `Data`, an escaping-heavy expression on `Report`.
+fn writeS3bConditionalFormatsFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_writer_close(w);
+    var dxf = std.mem.zeroes(CDxf);
+    dxf.bold = 1;
+    dxf.has_fill = 1;
+    dxf.fill_fg_argb = 0xFFFFC7CE;
+    var dxf_id: u32 = 99;
+    if (zlsx_writer_add_dxf(w, &dxf, &dxf_id, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const s1 = "Data";
+    const sw1 = zlsx_writer_add_sheet(w, s1.ptr, s1.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const row1 = [_]CCell{ toCCell(.{ .integer = 1 }), toCCell(.{ .integer = 5 }), toCCell(.{ .integer = 9 }), toCCell(.{ .integer = 3 }) };
+    if (zlsx_sheet_writer_write_row(sw1, &row1, row1.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const row2 = [_]CCell{ toCCell(.{ .integer = 2 }), toCCell(.{ .integer = 6 }), toCCell(.{ .integer = 10 }), toCCell(.{ .integer = 4 }) };
+    if (zlsx_sheet_writer_write_row(sw1, &row2, row2.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const r1 = "A1:A4";
+    const f1 = "2";
+    const f2 = "4";
+    if (zlsx_sheet_writer_add_conditional_format_cell_is(sw1, r1.ptr, r1.len, ZLSX_DV_OP_BETWEEN, f1.ptr, f1.len, f2.ptr, f2.len, dxf_id, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const r2 = "B1:B4";
+    const fe = "B1>3";
+    if (zlsx_sheet_writer_add_conditional_format_expression(sw1, r2.ptr, r2.len, fe.ptr, fe.len, dxf_id, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const r3 = "C1:C4";
+    if (zlsx_sheet_writer_add_conditional_format_color_scale(sw1, r3.ptr, r3.len, 0xFFF8696B, 0, 0, 0xFF63BE7B, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const r4 = "D1:D4";
+    if (zlsx_sheet_writer_add_conditional_format_data_bar(sw1, r4.ptr, r4.len, 0xFF638EC6, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const s2 = "Report";
+    const sw2 = zlsx_writer_add_sheet(w, s2.ptr, s2.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    const cells2 = [_]CCell{toCCell(.{ .string = "R&D" })};
+    if (zlsx_sheet_writer_write_row(sw2, &cells2, cells2.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    const r5 = "A1:A2";
+    const fr = "$A1=\"R&D\"";
+    if (zlsx_sheet_writer_add_conditional_format_expression(sw2, r5.ptr, r5.len, fr.ptr, fr.len, dxf_id, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    if (zlsx_writer_save(w, path.ptr, path.len, &err_buf, err_buf.len) != 0)
+        return error.TestUnexpectedResult;
+    return path;
+}
+
+test "S3b conditional_formats_ndjson: the shared writer's bytes, current after a rename, empty without rules" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    {
+        const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        // The frozen stream — the literal the shared writer's own test
+        // pins over the same fixture (MNT-2302; docs/cli.md,
+        // "conditional-formats").
+        const expected =
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"A1:A4\"," ++
+            "\"rule_type\":\"cellIs\",\"formulas\":[\"2\",\"4\"],\"dxf_id\":0,\"priority\":1}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"B1:B4\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"B1>3\"],\"dxf_id\":0,\"priority\":2}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"C1:C4\"," ++
+            "\"rule_type\":\"colorScale\",\"formulas\":[],\"dxf_id\":null,\"priority\":3}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Data\",\"sheet_idx\":0,\"sqref\":\"D1:D4\"," ++
+            "\"rule_type\":\"dataBar\",\"formulas\":[],\"dxf_id\":null,\"priority\":4}\n" ++
+            "{\"kind\":\"conditional_format\",\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"," ++
+            "\"rule_type\":\"expression\",\"formulas\":[\"$A1=\\\"R&D\\\"\"],\"dxf_id\":0,\"priority\":1}\n";
+        try std.testing.expectEqualStrings(expected, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // A structural edit is what the read sees: the sheet inventory
+        // is re-read from the current workbook.xml, no save in between.
+        const nm = "Facts";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const got = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Facts\",\"sheet_idx\":0,\"sqref\":\"A1:A4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Data\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // NULL out pointers are about the call — either one, with the
+        // present one reset from its poison.
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_conditional_formats_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        out_ptr = @ptrFromInt(0x1000);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        // Re-poisoned: the NULL-editor path's own reset is what this pins.
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_conditional_formats_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+
+        // struct_size below v1: the outputs reset first, then the diag
+        // is rejected before a byte of it is written — the whole struct
+        // compared, not a field or two.
+        var small = std.mem.zeroes(CDiag);
+        small.struct_size = @sizeOf(CDiag) - 1;
+        small.plane = 7;
+        small.error_name[0] = 'x';
+        const small_before = std.mem.toBytes(small);
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        const small_after = std.mem.toBytes(small);
+        try std.testing.expectEqualSlices(u8, &small_before, &small_after);
+    }
+    // No conditional formatting: success, nothing to release, the
+    // poison reset.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3b_no_cf.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3b conditional_formats_ndjson: an inventory the read cannot serve refuses whole, nothing handed out" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf_broken.xlsx");
+    defer alloc.free(path);
+    // A bad entity in one formula body: the open parser keeps raw
+    // spans, so the editor opens; the decode at read time refuses the
+    // whole view — the sheet part's verdict, not the workbook's.
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "<formula>2</formula>", "<formula>2&bogus;</formula>");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    // Poisoned on entry: the refusal path itself must reset the pair.
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+    try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+fn conditionalFormatsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try conditionalFormatsNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+test "S3b conditional_formats_ndjson: every allocation failure is OutOfMemory, never WriteFailed" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf_oom.xlsx");
+    defer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    // Prime the workbook-owned caches (part names, part bytes) so the
+    // sweep exercises the builder's own allocations — the shared
+    // writer's own OOM test does the same.
+    {
+        const primed = try conditionalFormatsNdjsonOwned(alloc, &wb);
+        alloc.free(primed);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, conditionalFormatsNdjsonForFailures, .{&wb});
 }
 
 /// Flip one byte deep inside the stored payload of `part`, found by

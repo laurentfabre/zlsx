@@ -565,3 +565,57 @@ entity with nothing handed out and the name in diag + errbuf; an
 allocation-failure sweep over `definedNamesNdjsonOwned`. The smoke gate
 takes the address and `#error`s without the macro; the Python leg pins
 the parsed records, the refusal type and the closed-editor error.
+
+## 13. S3b slice 6 — the `conditional-formats` read (2026-09-02)
+
+One export, the slice-2 pattern verbatim:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_conditional_formats_ndjson` (+ `zlsx_buffer_release`) | `_HAS_CONDITIONAL_FORMATS` | `ZLSX_HAS_CONDITIONAL_FORMATS` |
+
+(`_HAS_CONDITIONAL_FORMAT`, singular, probes the writer's
+`add_conditional_format_*` family and predates this capability.)
+
+**The bytes are the CLI's**: the S3b gate froze the
+`conditional-formats` record in `docs/cli.md`, and the record is text.
+The export hands over the NDJSON bytes of
+`pkg/conditional_format_ndjson.zig` — the shared strict walk + record
+writer `zlsx conditional-formats` prints through — built by
+`c_abi.zig::conditionalFormatsNdjsonOwned(alloc, wb)` over the editor's
+current parts: every rule, sheets in workbook order, rules in
+sheet-document order, no selector (the CLI's default stream). A workbook
+without conditional formatting is `ZLSX_OK` with `(NULL, 0)`; release
+with `zlsx_buffer_release`. The allocating writer's `WriteFailed`
+crosses as `-3`, the pivots builder's rule. Python parses one JSON
+object per line (`Editor.conditional_formats()` /
+`zlsx.conditional_formats(path)`).
+
+**Two refusals, both already in the vocabulary**: a sheet list the
+strict workbook read cannot prove is `MalformedWorkbookXml`, a sheet
+part the strict walk cannot serve faithfully (the `docs/cli.md`
+contract: nesting, namespace shape, formula arity and markup, carriers
+that do not decode) is `MalformedSheetXml` — both `-2`, members of
+`structural_refusals` since S3a. No new name crosses.
+
+**Timing**: conditional formats live in the sheet parts, which
+structural edits and their DV/CF sweeps rewrite in place before the
+call returns, and the sheet inventory is a fresh strict read of the
+current `xl/workbook.xml` — so edits (a rename renaming the `sheet`
+field, an insert moving `sqref` and the formula bodies) are visible
+immediately; staged cell writes never touch the rule machinery, so
+nothing about this read waits for save.
+
+**Tests** (`src/c_abi.zig`, "S3b conditional_formats_ndjson …"): the
+buffer equal to the shared writer's frozen stream (MNT-2302's literal)
+over the pkg fixture rebuilt through the C writer surface (one dxf,
+four rule kinds, an escaping-heavy expression); the rename visible with
+no save; `(NULL, 0)` on a workbook without rules with the poison reset;
+`NullOutPointer` / `InvalidInput` as call errors; poisoned outputs
+reset on the refusal and undersized-diag paths, the rejected diag
+byte-for-byte untouched; `-2` `MalformedSheetXml` on a bad entity in a
+formula body with nothing handed out and the name in diag + errbuf; an
+allocation-failure sweep over `conditionalFormatsNdjsonOwned` (caches
+primed first, the shared writer's own OOM-test shape). The smoke gate
+takes the address and `#error`s without the macro; the Python leg pins
+the parsed records, the refusal type and the closed-editor error.

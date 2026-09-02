@@ -74,6 +74,7 @@ __all__ = [
     "ZlsxRefusal",
     "pivots",
     "defined_names",
+    "conditional_formats",
     "FormulaSpec",
     "RecalcOptions",
     "RecalcReport",
@@ -3771,7 +3772,7 @@ class Editor:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
 
-    # ── Defined names (S3b, the typed read) ───────────────────────
+    # ── S3b typed reads: defined names, conditional formats ───────
 
     def defined_names(self) -> list[dict]:
         """The workbook's defined names as ``zlsx defined-names``
@@ -3811,6 +3812,55 @@ class Editor:
                 raise _refusal_from_diag(diag)
             if rc != _ffi.ZLSX_OK:
                 raise ZlsxError(f"zlsx_editor_defined_names_ndjson: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
+
+    def conditional_formats(self) -> list[dict]:
+        """The workbook's conditional-format rules as
+        ``zlsx conditional-formats`` reports them: one
+        ``{"kind": "conditional_format", …}`` record per ``<cfRule>``
+        — sheets in workbook order, rules in sheet-document order —
+        parsed from the same NDJSON bytes the CLI prints (docs/cli.md,
+        "conditional-formats"). Each record is the rule envelope
+        (``sheet``, ``sheet_idx``, ``sqref``, ``rule_type``,
+        ``formulas``, ``dxf_id``, ``priority``), not the visual
+        payload: ``<colorScale>`` / ``<dataBar>`` / ``<iconSet>``
+        bodies and the ``<dxfs>`` styles stay in their parts. Read
+        over the editor's current parts: structural edits and the
+        DV/CF sweeps they carry are visible immediately; staged cell
+        writes never touch the rule machinery. ``[]`` for a workbook
+        without conditional formatting. An inventory that cannot be
+        served faithfully raises :class:`ZlsxRefusal`
+        (``MalformedWorkbookXml`` for a sheet list the strict workbook
+        read cannot prove, ``MalformedSheetXml`` for a sheet part the
+        strict walk cannot) rather than return a record that lies."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_CONDITIONAL_FORMATS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_conditional_formats_ndjson "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        import json
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = _ffi.lib.zlsx_editor_conditional_formats_ndjson(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"zlsx_editor_conditional_formats_ndjson: {_decode_err(self._err)}")
             if not out_len.value:
                 return []
             text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
@@ -4213,6 +4263,14 @@ def defined_names(path: Union[str, Path]) -> list[dict]:
     returning."""
     with Editor(path) as ed:
         return ed.defined_names()
+
+
+def conditional_formats(path: Union[str, Path]) -> list[dict]:
+    """The conditional-format rules of the workbook at ``path`` —
+    :meth:`Editor.conditional_formats` over a fresh editor, closed
+    before returning."""
+    with Editor(path) as ed:
+        return ed.conditional_formats()
 
 
 # ─── Embeddings (E5) ─────────────────────────────────────────────────

@@ -1763,3 +1763,18 @@ if _HAS_DEFINED_NAMES:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_defined_names_ndjson.restype = ctypes.c_int32
+
+# S3b slice 6: the conditional-formats read, the same buffer contract.
+# Plural + `_FORMATS`, the read — the writer's add_conditional_format_*
+# probes are per-method and predate this capability.
+_HAS_CONDITIONAL_FORMATS = hasattr(lib, "zlsx_editor_conditional_formats_ndjson") and _HAS_BUFFER_RELEASE and _HAS_DIAG_RELEASE
+if _HAS_CONDITIONAL_FORMATS:
+    lib.zlsx_editor_conditional_formats_ndjson.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_conditional_formats_ndjson.restype = ctypes.c_int32
