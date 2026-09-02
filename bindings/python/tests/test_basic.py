@@ -3773,10 +3773,53 @@ def test_book_sheet_state_matches_the_cli_spelling(tmp_path):
         pytest.skip("no local zlsx CLI build at zig-out/bin/zlsx")
     path = tmp_path / "sheet_state_cli.xlsx"
     _sheet_state_workbook(path)
-    out = subprocess.run([str(cli), "list-sheets", str(path)], check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(
+        [str(cli), "list-sheets", str(path)], check=True, capture_output=True, encoding="utf-8"
+    ).stdout
     records = [json.loads(line) for line in out.splitlines() if line]
     with zlsx.open(path) as book:
         assert [(r["sheet_idx"], r["sheet"], r["state"]) for r in records] == [
             (i, name, book.sheet_state(i)) for i, name in enumerate(book.sheets)
         ]
     assert [r["state"] for r in records] == _SHEET_STATE_EXPECTED
+
+
+def test_book_sheet_state_defensive_branches(tmp_path, monkeypatch):
+    """The two branches a healthy 0.9.0 dylib never takes: a code the
+    binding does not know (a newer library) is a `ZlsxError`, an older
+    dylib without the export is a `RuntimeError` on both the method and
+    the property — and the selector rule runs before either probe."""
+    import zlsx._ffi as ffi
+
+    _require_sheet_state()
+    path = tmp_path / "sheet_state_defensive.xlsx"
+    with zlsx.write(path) as w:
+        w.add_sheet("A").write_row([1])
+    with zlsx.open(path) as book:
+        monkeypatch.setattr(ffi.lib, "zlsx_sheet_state", lambda handle, idx: 7)
+        with pytest.raises(zlsx.ZlsxError, match="returned 7"):
+            book.sheet_state(0)
+        # A -1 past the binding's own bound keeps the selector contract.
+        monkeypatch.setattr(ffi.lib, "zlsx_sheet_state", lambda handle, idx: -1)
+        with pytest.raises(IndexError):
+            book.sheet_state("A")
+        monkeypatch.setattr(ffi, "_HAS_SHEET_STATE", False)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.sheet_state(0)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.sheet(0).state
+        with pytest.raises(IndexError):
+            book.sheet_state(3)
+        with pytest.raises(KeyError):
+            book.sheet_state("Nope")
+
+
+def test_sheet_state_probe_agrees_with_the_library_version():
+    """A dylib at or past 0.9.0 exports `zlsx_sheet_state`; a probe that
+    says otherwise is a packaging error, not a reason to skip the block
+    above (the S3a release-symbol probe test's precedent)."""
+    import zlsx._ffi as ffi
+
+    major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
+    if (major, minor) >= (0, 9):
+        assert ffi._HAS_SHEET_STATE, "libzlsx >= 0.9.0 must export zlsx_sheet_state"

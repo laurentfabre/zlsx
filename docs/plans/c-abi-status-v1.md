@@ -912,9 +912,10 @@ both reads and the closed-editor error.
 One export on the READER handle. The row's Zig surface is the reader's
 `Sheet.state`, and the C reader family (`zlsx_sheet_count` /
 `zlsx_sheet_name` / `zlsx_sheet_index_by_name`) is where per-sheet
-scalars live; the editor's C surface enumerates no sheets at all, so
-an NDJSON handover over `Workbook` (the slice-2/6/7/9 shape) would
-have invented a second inventory for one enum per sheet. One macro,
+scalars live; the editor's C surface has no sheet count / name
+export (its per-sheet reads are typed NDJSON records), so an NDJSON
+handover over `Workbook` (the slice-2/6/7/9 shape) would have invented
+a second inventory for one enum per sheet. One macro,
 one probe, no release function:
 
 | Export | Probe (`_ffi.py`) | Header macro |
@@ -956,8 +957,9 @@ spliced through the archive (the writer authors none — `Ledger`
 hidden, `Secret` veryHidden, `Odd` an unrecognised value, `Data` no
 attribute) reads 0 / 1 / 2 / 0 through the path opener and the buffer
 opener, `-1` at the first index past the end and at `UINT32_MAX`, the
-veryHidden sheet found by name with its rows intact and the count
-unchanged; a fresh writer's sheets read visible. `tests/c_abi_smoke.c`
+veryHidden sheet found by name, its name intact, its one row read
+through `zlsx_rows_open` / `zlsx_rows_next`, and the count unchanged;
+a fresh writer's sheets read visible. `tests/c_abi_smoke.c`
 `#error`s without the macro, static-asserts the three codes and takes
 the address. Python (`test_basic.py`, "sheet_state"): the spellings by
 index and by name, `Sheet.state`, the selector errors, the closed-book

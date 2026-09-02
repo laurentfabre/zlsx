@@ -572,8 +572,8 @@ workbook sheet, in workbook order:
 | Field | Meaning |
 |---|---|
 | `sheet` | The sheet's name, entity-decoded. |
-| `sheet_idx` | Its 0-based position in the workbook's `<sheets>` list. |
-| `state` | The `<sheet state="…">` attribute as the reader modelled it: `visible`, `hidden` (Excel's *Hide*) or `veryHidden` (unreachable from Excel's UI — only VBA / the object model reveals such a sheet, so this stream is how a caller scanning a workbook learns it exists). A missing or unrecognised attribute reads as `visible`, the schema default — visibility never fails an open. |
+| `sheet_idx` | Its 0-based position in the reader's sheet inventory — `<sheets>` order, minus any `<sheet>` the reader cannot resolve (no `name`, no `r:id`, or a dangling relationship), which consumes no index. The same index `--sheet`, `rows`, `cells` and `zlsx_sheet_state` use. |
+| `state` | The `<sheet state="…">` attribute as the reader modelled it: `visible`, `hidden` (Excel's *Hide*) or `veryHidden` (unreachable from Excel's UI — only VBA / the object model reveals such a sheet, so this stream is how a caller scanning a workbook learns it exists). The value is compared as written — an entity-spelled value is unrecognised — and a missing or unrecognised attribute reads as `visible`, the schema default: visibility never fails an open. |
 
 Hidden sheets stay in the inventory: `sheet_idx` counts them, `--sheet` /
 `--name` select them, `rows` reads them. The same field reaches the C ABI

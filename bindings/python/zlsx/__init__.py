@@ -540,18 +540,28 @@ class Book:
         ``"visible"``, the schema default. Hidden sheets stay in
         :attr:`sheets` and read like any other. Requires libzlsx 0.9.0+
         (``zlsx_sheet_state``)."""
+        # The selector rule first, the probe second — a closed book or a
+        # bad selector is the same error whatever dylib is loaded (the
+        # `merged_ranges` order).
+        idx = self._sheet_index(selector)
         if not _ffi._HAS_SHEET_STATE:
             raise RuntimeError(
                 "loaded libzlsx does not expose sheet_state (requires 0.9.0+); "
                 "upgrade libzlsx"
             )
-        idx = self._sheet_index(selector)
         code = _ffi.lib.zlsx_sheet_state(self._handle, idx)
+        if code < 0:
+            # Unreachable through `_sheet_index`'s bound unless `sheets`
+            # was mutated behind the binding; keep the selector contract
+            # even then. That bound is the only guard: ctypes wraps a
+            # negative int silently under a `c_uint32` argtype.
+            raise IndexError(
+                f"sheet index {idx} out of range (libzlsx reports {code})"
+            )
         try:
             return _SHEET_STATE_NAMES[code]
         except KeyError:
-            # -1 cannot follow a resolved index; any other code is a
-            # library the binding does not know.
+            # A code this binding does not know — a newer library.
             raise ZlsxError(f"zlsx_sheet_state({idx}) returned {code}") from None
 
     def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:

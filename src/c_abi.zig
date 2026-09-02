@@ -9491,10 +9491,21 @@ fn writeS3bSheetStateFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8
 // ZLSX_SHEET_STATE_*), pinned here and static-asserted in
 // tests/c_abi_smoke.c so the two hand-maintained spellings cannot
 // drift apart.
-test "S3b sheet_state: the codes are the header's" {
+test "S3b sheet_state: the codes are the header's, in the reader enum's order, and the spellings are the CLI's" {
     try std.testing.expectEqual(@as(i32, 0), ZLSX_SHEET_STATE_VISIBLE);
     try std.testing.expectEqual(@as(i32, 1), ZLSX_SHEET_STATE_HIDDEN);
     try std.testing.expectEqual(@as(i32, 2), ZLSX_SHEET_STATE_VERY_HIDDEN);
+    // The codes follow `xlsx.SheetState`'s declaration order, and the
+    // strings py-zlsx maps them back to (`_SHEET_STATE_NAMES`) are the
+    // reader's own `toString` — what `zlsx list-sheets` prints. Pinned
+    // here because `zig build test` is the hard CI gate; the Python
+    // parity test runs only on the best-effort Windows lane.
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(xlsx.SheetState.visible));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(xlsx.SheetState.hidden));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(xlsx.SheetState.very_hidden));
+    try std.testing.expectEqualStrings("visible", xlsx.SheetState.visible.toString());
+    try std.testing.expectEqualStrings("hidden", xlsx.SheetState.hidden.toString());
+    try std.testing.expectEqualStrings("veryHidden", xlsx.SheetState.very_hidden.toString());
 }
 
 test "S3b sheet_state: the reader's <sheet state> through the C ABI — the schema default, out of range, the buffer opener" {
@@ -9523,14 +9534,26 @@ test "S3b sheet_state: the reader's <sheet state> through the C ABI — the sche
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, 4));
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, std.math.maxInt(u32)));
     // Composes with the name lookup: the veryHidden sheet is found by
-    // name and its rows still read — nothing about visibility gates
-    // the data.
+    // name, its name is intact, and its one row reads through the row
+    // iterator — nothing about visibility gates the data.
     const secret = zlsx_sheet_index_by_name(book.?, "Secret", 6);
     try std.testing.expectEqual(@as(i32, 2), secret);
     try std.testing.expectEqual(ZLSX_SHEET_STATE_VERY_HIDDEN, zlsx_sheet_state(book.?, @intCast(secret)));
     var name_buf: [16]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 6), zlsx_sheet_name(book.?, 2, &name_buf, name_buf.len));
     try std.testing.expectEqualStrings("Secret", std.mem.sliceTo(&name_buf, 0));
+    {
+        const rows = zlsx_rows_open(book.?, @intCast(secret), &err_buf, err_buf.len);
+        try std.testing.expect(rows != null);
+        defer zlsx_rows_close(rows);
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(usize, 1), cells_len);
+        try std.testing.expectEqual(@intFromEnum(CellTag.string), cells_ptr[0].tag);
+        try std.testing.expectEqualStrings("Secret", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    }
 
     // The buffer opener models the same field from the same bytes.
     var from_bytes: ?*Book = null;
