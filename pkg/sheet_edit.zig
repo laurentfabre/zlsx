@@ -2842,6 +2842,17 @@ test "sqref validates BOTH axes strictly; the grammar refuses out-of-grid spelli
     try testing.expectError(error.MalformedXml, applyRowEditToWorksheet(a, bad4, 1, .insert));
 }
 
+test "getAttr acceptance parity: bare tokens, spaced Eq, either quote — one table (S3B-REL-1001)" {
+    // The walkers' reader and the typed view's `attrAt` must accept
+    // the same shapes, or one side moves what the other froze.
+    try testing.expectEqualStrings("B1:B4", getAttr("bogus sqref=\"B1:B4\"", "sqref").?);
+    try testing.expectEqualStrings("B1:B4", getAttr("sqref = \"B1:B4\"", "sqref").?);
+    try testing.expectEqualStrings("B1:B4", getAttr("sqref='B1:B4'", "sqref").?);
+    try testing.expectEqualStrings("B1:B4", getAttr("x:sqref=\"Z9\" sqref=\"B1:B4\"", "sqref").?);
+    // An unquoted value stops both readers.
+    try testing.expect(getAttr("a=b sqref=\"B1:B4\"", "sqref") == null);
+}
+
 test "shiftSqrefArea boundary table: reversed corners, dangling anchors, maximal spellings, TL deletes (S3B-TEST-905)" {
     var buf: [40]u8 = undefined;
     // Reversed corners refuse — Excel writes normalized.

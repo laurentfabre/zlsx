@@ -16157,6 +16157,52 @@ test "insertRow: a spaced-Eq DV moves envelope AND formula together (S3B-REL-912
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
 }
 
+test "insertRow: a bare token before sqref splits neither envelope from formula (S3B-REL-1001)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-bare-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A bare token is malformed XML, but the two attribute
+        // readers must still AGREE about the attributes after it: the
+        // old getAttr stopped here while the view's attrAt stepped
+        // over, so the sweep moved the formula while the walker froze
+        // the envelope.
+        const dv =
+            \\<dataValidations count="1"><dataValidation bogus type="custom" sqref="B1:B4"><formula1>B1+1</formula1></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-bare-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "sqref=\"B2:B5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
+}
+
 test "rewrite CF: a commented-out cfRule decoy does not shift the splice lockstep (REL-103)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

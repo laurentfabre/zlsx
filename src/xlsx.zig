@@ -2514,8 +2514,18 @@ pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
         const name_start = i;
         while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
         const attr_name = attrs[name_start..i];
-        // Skip `=` and optional whitespace, then quote
-        while (i < attrs.len and (attrs[i] == '=' or std.ascii.isWhitespace(attrs[i]))) i += 1;
+        // Skip whitespace after the name; a token with no `=` (a bare
+        // attribute, a stray `/`) is stepped over, not a dead end —
+        // the typed view's `attrAt` walks the same way, and the two
+        // must agree about whether an attribute EXISTS or a DV/CF
+        // envelope freezes beside a swept formula (Codex #216 r10
+        // S3B-REL-1001; the combined `=`-or-whitespace skip conflated
+        // "no equals" with "spaced equals").
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        if (i >= attrs.len) break;
+        if (attrs[i] != '=') continue;
+        i += 1;
+        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
         if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) break;
         const quote = attrs[i];
         i += 1;
