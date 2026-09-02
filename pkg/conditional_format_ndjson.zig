@@ -102,13 +102,21 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// What `collect` itself can raise — `Error` plus the two verdicts
+/// that keep their own names across every boundary: the archive-wide
+/// decompression caps, and a sheet part the store lost between the
+/// graph proof and the walk. Closed and explicit so the C boundary's
+/// status mapping is compiler-checked, not assumed (Codex #216 r1
+/// S3B-ERR-602).
+pub const CollectError = Error || error{ ZipBombSuspected, MissingSheetPart };
+
 /// Collect every rule of every workbook sheet. A read this module
 /// cannot serve faithfully refuses whole — even for a sheet the CLI's
 /// selection would exclude: the inventory is proven whole before
 /// selection and pagination apply, the `anchors` rule. A sheet the
 /// workbook itself cannot place (a dangling relationship, a part the
 /// archive does not hold) passes through as `Workbook`'s own error.
-pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
+pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!ConditionalFormats {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -125,7 +133,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     defer strict_sheets.deinit(gpa);
     {
         const wb_part = (wb.store.part("xl/workbook.xml") catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedWorkbookXml,
         }) orelse return error.MalformedWorkbookXml;
         try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets);
@@ -162,7 +171,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     // (Codex #215 r6 SEC-601).
     {
         const rels_part = wb.store.part("xl/_rels/workbook.xml.rels") catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedWorkbookXml,
         };
         if (rels_part) |rp| {
@@ -197,9 +207,22 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
         if (!typed) return error.MalformedWorkbookXml;
         if (rel.target_mode == .external) return error.MalformedWorkbookXml;
-        const name = (try wb.store.resolve("xl/workbook.xml", rel.target)) orelse
+        // Resolved into the VIEW arena, not the store's lifetime arena
+        // — a long-lived editor repeats this read per call, and the
+        // store variant would retain every resolved path until close
+        // (Codex #216 r1 S3B-MEM-603).
+        const name = (try wb.store.resolveOwned(a, "xl/workbook.xml", rel.target)) orelse
             return error.MalformedWorkbookXml;
-        if ((try wb.store.part(name)) == null) return error.MalformedWorkbookXml;
+        // This lookup MATERIALISES on first touch — its store failures
+        // fold like every other part read here, or a bad CRC would
+        // escape with the zip layer's own name (Codex #216 r1
+        // S3B-ERR-602). The sheet loop below then only cache-hits.
+        const probed = wb.store.part(name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
+            else => return error.MalformedWorkbookXml,
+        };
+        if (probed == null) return error.MalformedWorkbookXml;
         const g = try seen_targets.getOrPut(gpa, name);
         if (g.found_existing) return error.MalformedWorkbookXml;
         sheet_parts[i] = name;
@@ -211,7 +234,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         // and the archive-wide budget keep their names, everything
         // else is "this sheet is not readable".
         const part = (wb.store.part(sheet_parts[idx]) catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedSheetXml,
         }) orelse return error.MissingSheetPart;
 
@@ -235,7 +259,7 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         // typed view; the strict walk's verdict stands alone.
         if (root == .worksheet) {
             var gate = sheet_xml.parse(gpa, part.bytes) catch |e| switch (e) {
-                error.OutOfMemory => return e,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => return error.MalformedSheetXml,
             };
             gate.deinit(gpa);
@@ -302,8 +326,8 @@ pub fn writeRecord(out: *std.Io.Writer, r: Record, envelope: Envelope) !void {
     try out.writeAll("}\n");
 }
 
-/// The unselected stream — every record, emission order. The future C
-/// leg's entry point.
+/// The unselected stream — every record, emission order. The C leg's
+/// entry point (`zlsx_editor_conditional_formats_ndjson`).
 pub fn writeAll(out: *std.Io.Writer, view: *const ConditionalFormats) !void {
     for (view.records) |r| try writeRecord(out, r, .full);
 }
@@ -2457,7 +2481,7 @@ test "collect: a decoded External sheet target refuses by POLICY, not by spellin
     try testing.expectError(error.MalformedWorkbookXml, collect(testing.allocator, &wb));
 }
 
-test "writeAll: the future C handoff writes the full stream byte-exactly (MNT-2302)" {
+test "writeAll: the C handoff writes the full stream byte-exactly (MNT-2302)" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -3221,6 +3245,38 @@ test "collect: fixture rules attributed in sheet then document order, entities d
     try testing.expectEqual(@as(u32, 1), report.sheet_idx);
     try testing.expectEqualStrings("$A1=\"R&D\"", report.formulas[0]);
     try testing.expectEqual(@as(?u32, 1), report.priority);
+}
+
+test "collect: repeated reads leave the store's resident bytes flat (S3B-MEM-603)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "cf_retention.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    // Prime every store-side cache (part bytes, rels) so the loop
+    // below measures only what a repeated read RETAINS.
+    {
+        var primed = try collect(testing.allocator, &wb);
+        primed.deinit();
+    }
+    const before = wb.store.residentBytes();
+    // 1024 reads resolve ~2 sheet targets each; through the store's
+    // lifetime arena that is ~50 KiB of growth — far past any chunk
+    // slack — so this pins that resolution lands in the VIEW's arena
+    // (`resolveOwned`), reclaimed at deinit, and a revert to
+    // `store.resolve` fails here even though the OOM sweep cannot see
+    // the store's own allocator.
+    for (0..1024) |_| {
+        var view = try collect(testing.allocator, &wb);
+        view.deinit();
+    }
+    try testing.expectEqual(before, wb.store.residentBytes());
 }
 
 test "collect: allocation failures surface as OutOfMemory, never a partial view" {

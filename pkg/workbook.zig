@@ -184,8 +184,11 @@ pub const Error = error{
     /// Unicode-fold caveat).
     SheetNameInUse,
     /// Internal invariant: the existing sheet name in `WorkbookXml`
-    /// exceeds 128 bytes. OOXML-conformant inputs cannot trip this —
-    /// surfaces only on hand-crafted / corrupted workbook.xml.
+    /// is EMPTY — an OOXML-invariant violation only a hand-crafted /
+    /// corrupted workbook.xml can carry. (The ABI-frozen name
+    /// predates #216 r17, which dropped the historical 128-byte
+    /// carrier bound: a valid escape-heavy name legitimately
+    /// exceeds it.)
     InternalSheetNameTooLong,
     /// `Workbook.renameSheet` could not locate the target `<sheet>`
     /// element in the source `xl/workbook.xml` bytes. Surfaces only
@@ -352,6 +355,15 @@ pub const Error = error{
     /// `ColEditUnsafeForSheet`, so this variant only surfaces when a
     /// caller bypasses Editor. Surfaces from `pkg/table_edit.zig`.
     TableCollapseUnsafe,
+    /// `Workbook.{deleteRow, deleteColumn}` would collapse EVERY area
+    /// of a `<conditionalFormatting>` or `<dataValidation>` `sqref` —
+    /// Excel deletes the rule outright, and this walker cannot excise
+    /// an element with children mid-walk, so leaving the bytes would
+    /// silently retarget the rule to whatever slides into its old
+    /// coordinates (Codex #216 r4 S3B-REL-805). Refused pre-mutation,
+    /// the `TableCollapseUnsafe` shape. Surfaces from
+    /// `pkg/sheet_edit.zig`.
+    SqrefCollapseUnsafe,
     /// A row/col edit on a sheet a pivot renders on or reads from
     /// that no rewriter admits: inside a hosted pivot's footprint
     /// (S7a), a delete of a source's header row or only row, a column
@@ -3809,6 +3821,8 @@ pub const Workbook = struct {
             var dv_f1_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var dv_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var cf_f_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var cf_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var cf_f3_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             defer {
                 var it1 = dv_f1_new.iterator();
                 while (it1.next()) |e| a.free(e.value_ptr.*);
@@ -3819,6 +3833,12 @@ pub const Workbook = struct {
                 var it3 = cf_f_new.iterator();
                 while (it3.next()) |e| a.free(e.value_ptr.*);
                 cf_f_new.deinit(a);
+                var it4 = cf_f2_new.iterator();
+                while (it4.next()) |e| a.free(e.value_ptr.*);
+                cf_f2_new.deinit(a);
+                var it5 = cf_f3_new.iterator();
+                while (it5.next()) |e| a.free(e.value_ptr.*);
+                cf_f3_new.deinit(a);
             }
 
             for (view.validations, 0..) |dv, i| {
@@ -3835,6 +3855,12 @@ pub const Workbook = struct {
                     }
                 }
             }
+            // All three schema slots, not just the first: a `cellIs`
+            // `between` carries two formulas, and slice 5 widened the
+            // typed view to the schema's three — a sweep that moved
+            // only slot 1 left `<formula>B2</formula>` beside a moved
+            // sibling, the exact skew the sqref shift closed for the
+            // envelope (Codex #216 r3 S3B-REL-801).
             for (view.conditional_formats, 0..) |cf, j| {
                 if (cf.formula) |f| {
                     if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
@@ -3842,9 +3868,22 @@ pub const Workbook = struct {
                         try cf_f_new.put(a, j, new);
                     }
                 }
+                if (cf.formula2) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
+                        errdefer a.free(new);
+                        try cf_f2_new.put(a, j, new);
+                    }
+                }
+                if (cf.formula3) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
+                        errdefer a.free(new);
+                        try cf_f3_new.put(a, j, new);
+                    }
+                }
             }
 
-            const total = dv_f1_new.count() + dv_f2_new.count() + cf_f_new.count();
+            const total = dv_f1_new.count() + dv_f2_new.count() +
+                cf_f_new.count() + cf_f2_new.count() + cf_f3_new.count();
             if (total == 0) continue;
 
             // Phase B: walk source XML, build patch list of source-
@@ -3857,7 +3896,7 @@ pub const Workbook = struct {
 
             var patches: std.ArrayList(SourcePatch) = .empty;
             defer patches.deinit(a);
-            try collectDvCfPatches(a, source, view, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new);
+            try collectDvCfPatches(a, source, view, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new, &cf_f2_new, &cf_f3_new);
 
             // Sanity: every queued rewrite should have located a
             // splice site in the source (typed view and source share
@@ -4826,28 +4865,33 @@ pub const Workbook = struct {
     /// per-sheet rather than per-write, so the ASCII compromise is
     /// retained here pending a follow-up iter.
     ///
-    /// **Defined names.** Sheet-qualified `<definedName>` formulas
-    /// (`Sheet2!$A$1` etc.) are NOT rewritten by this iter — only
-    /// per-cell formulas via `rewriteAllFormulas`. Hyperlink targets
-    /// pointing at the renamed sheet are likewise unaltered. A future
-    /// iter (`m3-defnames-hyperlinks`) covers both.
+    /// **Carrier coverage.** Five sweeps retarget every cross-sheet
+    /// reference: cell formulas, defined-name bodies, internal
+    /// hyperlink locations, DV/CF formulas, and `<xm:f>` extension
+    /// formulas (the B2 iter-er-5 lift — earlier iterations rewrote
+    /// only cell formulas).
     pub fn renameSheet(self: *Workbook, sheet_idx: u32, new_name: []const u8) Error!void {
         try self.requireCompleteStructuralState();
         if (sheet_idx >= self.sheetCount()) return error.SheetIndexOutOfRange;
         try validateSheetName(new_name);
         try self.assertSheetNameAvailable(sheet_idx, new_name);
 
-        // Capture old name into a stack copy: step 4 re-parses the
-        // workbook view, freeing the arena that backs `sheets[i].name`.
+        // Capture old name into an allocator-owned copy: step 4
+        // re-parses the workbook view, freeing the arena that backs
+        // `sheets[i].name`.
         // We need the old bytes alive across step 2 (rewriter) and step
         // 3 (XML patch — the patch reads from the source bytes still
         // holding the old name).
         const old_name = self.workbook.sheets[sheet_idx].name;
         if (old_name.len == 0) return error.InternalSheetNameTooLong; // OOXML invariant
-        if (old_name.len > 128) return error.InternalSheetNameTooLong;
-        var old_buf: [128]u8 = undefined;
-        @memcpy(old_buf[0..old_name.len], old_name);
-        const old_name_owned = old_buf[0..old_name.len];
+        // Allocator-owned, not a fixed stack buffer: a VALID name of
+        // 26 `&`s escapes to 130 raw carrier bytes, so the old
+        // 128-byte refusal made any escape-heavy name unrenamable
+        // once written (Codex #216 r17 S3B-REL-1701). The copy must
+        // outlive step 4's view re-parse, which frees the arena
+        // backing `sheets[i].name`.
+        const old_name_owned = try self.allocator.dupe(u8, old_name);
+        defer self.allocator.free(old_name_owned);
 
         // The view name is raw attribute bytes (`R&amp;D`); the
         // rewriter's decode-in contract wants the decoded form. The
@@ -4865,6 +4909,22 @@ pub const Workbook = struct {
         const edit: zlsx.formula_rewriter.RewriteEdit = .{
             .rename_sheet = .{ .old = old_name_decoded, .new = new_name },
         };
+
+        // The workbook.xml patch is the rename's LAST mutation —
+        // locate its target FIRST, so a sheet element the patcher
+        // cannot read refuses before the five sweeps have rewritten
+        // anything, instead of tearing after them (Codex #216 r14
+        // S3B-REL-1402).
+        _ = try locateWorkbookXmlSheetName(self, sheet_idx, old_name_owned);
+
+        // The postcondition's expected WIRE spelling, built before
+        // the first mutation: the post-refresh check then compares
+        // raw bytes without allocating, so nothing can report a
+        // failure after the rename has already landed (Codex #216
+        // r17 S3B-REL-1702).
+        var expected_wire: std.ArrayList(u8) = .empty;
+        defer expected_wire.deinit(self.allocator);
+        try appendXmlEscaped(self.allocator, &expected_wire, new_name);
 
         // B2 iter-er-5 lift (rename_sheet axis): walk every cross-
         // sheet reference carrier and rewrite the renamed sheet's
@@ -4887,9 +4947,14 @@ pub const Workbook = struct {
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
 
-        // Postcondition: the in-memory view now reports the new name.
+        // Postcondition: the refreshed view spells the canonical
+        // escaped carrier of the new name (`R&D` refreshes as
+        // `R&amp;D`) — raw bytes against the wire spelling built
+        // BEFORE mutation, no allocation and no fallible work after
+        // the rename has landed (Codex #216 r16 S3B-REL-1507, r17
+        // S3B-REL-1702).
         assert(sheet_idx < self.workbook.sheets.len);
-        assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
+        assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, expected_wire.items));
     }
 
     /// Rename a column of the table whose `displayName` matches
@@ -5615,7 +5680,13 @@ pub const Workbook = struct {
         assert(new_name.len > 0);
         for (self.workbook.sheets, 0..) |s, i| {
             if (i == sheet_idx) continue;
-            if (asciiCaseInsensitiveEql(s.name, new_name)) return error.SheetNameInUse;
+            // The view holds RAW attribute bytes; `new_name` is
+            // decoded input. Comparing raw to decoded let a rename to
+            // `R&D` slide past an existing sheet stored as `R&amp;D`
+            // — a semantic duplicate (Codex #216 r16 S3B-REL-1507).
+            const stored = try store_mod.decodeXmlEntities(self.allocator, s.name);
+            defer self.allocator.free(stored);
+            if (asciiCaseInsensitiveEql(stored, new_name)) return error.SheetNameInUse;
         }
     }
 
@@ -5635,12 +5706,13 @@ pub const Workbook = struct {
     /// graphs; unreferenced parts are dead weight). A true cleanup
     /// requires `PartStore.removePart`; that's a future iter.
     ///
-    /// **Cross-references not rewritten (v1).** `<definedName>` slots
-    /// with `localSheetId == sheet_idx` (sheet-scoped names), formulas
-    /// referencing the deleted sheet, and hyperlink targets pointing at
-    /// it remain on the wire and will produce `#REF!` or
-    /// `Reference is not valid` in Excel after open. Same scope
-    /// boundary as `renameSheet`'s `m3-defnames-hyperlinks` follow-up.
+    /// **Cross-references.** The five carrier sweeps run for a delete
+    /// too — cell formulas, defined-name bodies, hyperlink locations,
+    /// DV/CF formulas and `<xm:f>` extensions all spell references
+    /// into the deleted sheet as `#REF!` (the rewriter's
+    /// deleted-sheet convention) before the workbook.xml and rels
+    /// patches land. A mid-sweep failure after the first install
+    /// marks the workbook torn, `renameSheet`'s contract.
     ///
     /// **Errors:**
     ///   - `SheetIndexOutOfRange` — `sheet_idx >= sheetCount()`.
@@ -5794,40 +5866,43 @@ pub const Workbook = struct {
     /// Insert a blank row at position `before_row` (1-based) in
     /// sheet `sheet_idx`. Every existing row at or below `before_row`
     /// shifts down by 1.  Mutates the workbook's PartStore in
-    /// place: the sheet part is re-emitted with `<row r=>` /
-    /// `<c r="…">` / `<mergeCells>` / `<dimension>` shifted by
-    /// one row.
+    /// place: the sheet part is re-emitted with the coordinate
+    /// carriers shifted (rows, cells, merges, dimension, panes,
+    /// autoFilter, view/sort state, DV/CF `sqref` envelopes,
+    /// `<xm:sqref>`), and the workbook-wide sweeps then move what
+    /// the byte transform cannot: formulas in every dialect, defined
+    /// names, hyperlink locations, DV/CF formula bodies (all three
+    /// CF slots), `<xm:f>` extension formulas, tables, drawings,
+    /// comments, pivot locations and sources.
     ///
     /// **Refusal contract.** Refuses with
-    /// `error.RowEditRequiresCleanSheet` if the sheet has any
-    /// staged appendRows or setCell deltas — those deltas index
-    /// into the pre-shift refs and would produce stale output.
-    ///
-    /// **Cross-sheet rewrite.** Cross-sheet formula refs / defined
-    /// names / hyperlinks / DV-CF formulas are NOT yet rewritten
-    /// for row inserts. Sheets that carry those constructs anywhere
-    /// in the workbook are refused at the editor layer
-    /// (`Editor.insertRow`); the iter-er-5 row/col-axis lifts
-    /// (blocked on this PR's typed surface, plus the
-    /// rewriter-call wiring) are tracked in
-    /// `docs/plans/refusal-audit.md`.
+    /// `error.SheetHasUnsavedMutations` / `error.SheetHasUnsavedAppends`
+    /// if the sheet has staged setCell deltas or appendRows — those
+    /// index into the pre-shift refs and would produce stale output
+    /// (the Editor layer folds both into
+    /// `RowEditRequiresCleanSheet`). The transform, extension, table
+    /// and pivot PREFLIGHTS refuse before the first mutation with
+    /// their `docs/plans/c-abi-status-v1.md` §10 typed verdicts; a
+    /// LATER sweep failure, once anything has installed, marks the
+    /// workbook torn (`StructuralEditIncomplete` on every subsequent
+    /// STRUCTURAL edit or save) — discard and reopen rather than
+    /// ship the tear.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }
 
     /// Delete row `row` (1-based) in sheet `sheet_idx`. Every row
     /// > `row` shifts up by 1; cells in the deleted row are
-    /// dropped. Same refusal contract + cross-sheet-rewrite
-    /// limitations as `insertRow`.
+    /// dropped. Same carrier coverage and refusal contract as
+    /// `insertRow`.
     pub fn deleteRow(self: *Workbook, sheet_idx: u32, row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete }, null);
     }
 
     /// Insert a blank column at position `before_col` (1-based, A=1)
     /// in sheet `sheet_idx`. Every existing column at or right of
-    /// `before_col` shifts right by 1. Same refusal contract as
-    /// `insertRow`; cross-sheet rewrite is the same iter-er-5
-    /// follow-up.
+    /// `before_col` shifts right by 1. Same carrier coverage and
+    /// refusal contract as `insertRow`.
     pub fn insertColumn(self: *Workbook, sheet_idx: u32, before_col_1based: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert }, null);
     }
@@ -9340,38 +9415,50 @@ fn asciiCaseInsensitiveEql(a: []const u8, b: []const u8) bool {
 /// an external tool with surprising attribute ordering, we refuse to
 /// rewrite an element whose old name doesn't match what we believe it
 /// should be (`SheetElementNotFound`).
-fn patchWorkbookXmlSheetName(
+/// Locate the `name` attribute's VALUE span of the `sheet_idx`-th
+/// `<sheet>` element of `xl/workbook.xml`. Quote-aware tag ends (a
+/// legal quoted `>` inside another attribute no longer truncates the
+/// element) and the ONE attribute walk every reader shares (a bare
+/// token is stepped over, not an error) — and callable as a
+/// PRE-SWEEP preflight, so a locate failure refuses the rename
+/// BEFORE the five sweeps have rewritten anything, instead of
+/// tearing after them (Codex #216 r14 S3B-REL-1402).
+fn locateWorkbookXmlSheetName(
     self: *Workbook,
     sheet_idx: u32,
     expected_old: []const u8,
-    new_name: []const u8,
-) Error!void {
+) Error!struct { value_start: usize, value_end: usize } {
     assert(expected_old.len > 0);
-    assert(new_name.len > 0);
-    assert(sheet_idx < self.workbook.sheets.len);
-
     const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
     const src = part.bytes;
     assert(src.len > 0);
 
-    // Find the Nth `<sheet ` (note the trailing space — distinguishes
-    // from `<sheets>`, `<sheetData>`, etc.) Also accept `<sheet/>`-
-    // style self-close as a defensive fallback. We require an
-    // attribute-bearing form for a name to be present, so primarily
-    // match `<sheet ` and `<sheet\t` / `<sheet\n`.
+    // Find the Nth `<sheet ` (note the boundary — distinguishes
+    // `<sheets>`, `<sheetData>`, etc.). Non-elements are skipped
+    // whole: a commented-out `<sheet …>` is prose, not an identity,
+    // and counting it desynced `seen` from the real inventory —
+    // patching the comment, or refusing a valid workbook (Codex #216
+    // r15 S3B-REL-1502).
     var search_from: usize = 0;
     var seen: u32 = 0;
     var elem_attrs_start: usize = 0;
     var elem_attrs_end: usize = 0;
     while (true) {
-        const open = std.mem.indexOfPos(u8, src, search_from, "<sheet") orelse
+        const lt = std.mem.indexOfScalarPos(u8, src, search_from, '<') orelse
             return error.SheetElementNotFound;
+        if (lt + 1 < src.len and (src[lt + 1] == '!' or src[lt + 1] == '?')) {
+            search_from = workbook_xml_mod.skipNonElement(src, lt) catch
+                return error.SheetElementNotFound;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, src[lt..], "<sheet")) {
+            search_from = lt + 1;
+            continue;
+        }
+        const open = lt;
         const after = open + "<sheet".len;
         if (after >= src.len) return error.SheetElementNotFound;
         const boundary = src[after];
-        // Distinguish `<sheet[ /\t\r\n]` from `<sheets`, `<sheetData`,
-        // `<sheetView`, `<sheetFormatPr`, `<sheetPr`, `<sheetCalcPr`,
-        // `<sheetProtection` and friends.
         const is_sheet_elem = switch (boundary) {
             ' ', '\t', '\r', '\n', '/' => true,
             else => false,
@@ -9380,11 +9467,25 @@ fn patchWorkbookXmlSheetName(
             search_from = after;
             continue;
         }
-        // Find the closing `>` that terminates this open tag. Sheet
-        // elements are leaves (`<sheet ... />` or `<sheet ...></sheet>`
-        // with empty body); we just need the first `>` past `after`.
-        const gt = std.mem.indexOfScalarPos(u8, src, after, '>') orelse
+        // The closing `>` of this open tag, QUOTE-AWARE: a `>` inside
+        // a quoted attribute value is data, and the bare scalar scan
+        // truncated the element there and lost the `name` attribute
+        // after it.
+        const gt = blk: {
+            var j = after;
+            var q: ?u8 = null;
+            while (j < src.len) : (j += 1) {
+                const c = src[j];
+                if (q) |qq| {
+                    if (c == qq) q = null;
+                } else if (c == '"' or c == '\'') {
+                    q = c;
+                } else if (c == '>') {
+                    break :blk j;
+                }
+            }
             return error.SheetElementNotFound;
+        };
         if (seen == sheet_idx) {
             elem_attrs_start = after;
             elem_attrs_end = if (gt > 0 and src[gt - 1] == '/') gt - 1 else gt;
@@ -9395,45 +9496,32 @@ fn patchWorkbookXmlSheetName(
     }
     assert(elem_attrs_end >= elem_attrs_start);
 
-    // Find `name="..."` (or `name='...'`) inside this element's
-    // attribute span. Must be a real attribute, not a substring of
-    // another attribute's value: we anchor on a preceding whitespace
-    // OR the start of the attribute span.
+    // The shared attribute walk over this element's region: exact
+    // name, either quote, XML `S` spacing, valueless tokens stepped
+    // over, unterminated values a dead end.
     const attrs = src[elem_attrs_start..elem_attrs_end];
     const NameAttr = struct { value_start: usize, value_end: usize };
     const found: NameAttr = blk: {
         var i: usize = 0;
         while (i < attrs.len) {
-            // Skip leading whitespace.
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
             if (i >= attrs.len) break;
             const key_start = i;
-            while (i < attrs.len and attrs[i] != '=' and attrs[i] != ' ' and
-                attrs[i] != '\t' and attrs[i] != '\r' and attrs[i] != '\n') : (i += 1)
-            {}
-            const key_end = i;
-            // Skip = and any padding.
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
-            if (i >= attrs.len or attrs[i] != '=') return error.SheetElementNotFound;
+            while (i < attrs.len and attrs[i] != '=' and !isXmlSByte(attrs[i])) i += 1;
+            const key = attrs[key_start..i];
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
+            if (i >= attrs.len) break;
+            if (attrs[i] != '=') continue;
             i += 1;
-            while (i < attrs.len and (attrs[i] == ' ' or attrs[i] == '\t' or
-                attrs[i] == '\r' or attrs[i] == '\n')) : (i += 1)
-            {}
-            if (i >= attrs.len) return error.SheetElementNotFound;
+            while (i < attrs.len and isXmlSByte(attrs[i])) i += 1;
+            if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) break;
             const quote = attrs[i];
-            if (quote != '"' and quote != '\'') return error.SheetElementNotFound;
             i += 1;
             const val_start = i;
-            while (i < attrs.len and attrs[i] != quote) : (i += 1) {}
-            if (i >= attrs.len) return error.SheetElementNotFound;
+            while (i < attrs.len and attrs[i] != quote) i += 1;
+            if (i >= attrs.len) break; // unterminated value
             const val_end = i;
-            i += 1; // past closing quote
-
-            const key = attrs[key_start..key_end];
+            i += 1;
             if (std.mem.eql(u8, key, "name")) {
                 break :blk .{
                     .value_start = elem_attrs_start + val_start,
@@ -9449,12 +9537,26 @@ fn patchWorkbookXmlSheetName(
     // wire — but for unescaped ASCII names like "Sheet1" the byte
     // comparison is correct) must match `expected_old`.
     if (!std.mem.eql(u8, src[found.value_start..found.value_end], expected_old)) {
-        // Tolerate XML-escaped equivalents: if a name contains `&` or
-        // `<` we'd see entities here; for ASCII-clean names this is
-        // straight equality. If the wire form differs, it's not the
-        // element we expected to rewrite.
         return error.SheetElementNotFound;
     }
+    return .{ .value_start = found.value_start, .value_end = found.value_end };
+}
+
+fn isXmlSByte(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn patchWorkbookXmlSheetName(
+    self: *Workbook,
+    sheet_idx: u32,
+    expected_old: []const u8,
+    new_name: []const u8,
+) Error!void {
+    assert(new_name.len > 0);
+    assert(sheet_idx < self.workbook.sheets.len);
+    const found = try locateWorkbookXmlSheetName(self, sheet_idx, expected_old);
+    const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+    const src = part.bytes;
 
     // Build the patched part: prefix + escaped new name + suffix.
     var out: std.ArrayList(u8) = .empty;
@@ -12147,9 +12249,10 @@ fn collectCellFormulaPatches(
 /// no lockstep to lose. Four Codex #215 rounds (r1 REL-103, r2
 /// REL-204, r4 REL-401, r5 REL-501) each found another way a raw walk
 /// diverged from the sanitized view's lexical state — comment decoys,
-/// prefix-matched outer blocks, DTD bytes the sanitizer keeps, comment
-/// markers nested inside DTD literals — and the offset map ends the
-/// class: the splice target IS the view's formula, by construction. A
+/// prefix-matched outer blocks, DTD bytes the sanitizer formerly kept
+/// (it elides declarations whole since #216 r5), comment markers
+/// nested inside DTD literals — and the offset map ends the class:
+/// the splice target IS the view's formula, by construction. A
 /// slice that does not map to one verbatim source run (a body the
 /// sanitizer re-encoded from CDATA, or one crossing a stripped
 /// construct), or whose mapped source bytes no longer equal the
@@ -12166,6 +12269,8 @@ fn collectDvCfPatches(
     dv_f1_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     dv_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     cf_f_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    cf_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    cf_f3_new: *const std.AutoHashMapUnmanaged(usize, []u8),
 ) Error!void {
     assert(source.len > 0);
     // The view must have been parsed from THESE bytes — a part
@@ -12189,6 +12294,14 @@ fn collectDvCfPatches(
     var it3 = cf_f_new.iterator();
     while (it3.next()) |e| {
         try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula.?, e.value_ptr.*);
+    }
+    var it4 = cf_f2_new.iterator();
+    while (it4.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula2.?, e.value_ptr.*);
+    }
+    var it5 = cf_f3_new.iterator();
+    while (it5.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula3.?, e.value_ptr.*);
     }
 }
 
@@ -16010,6 +16123,327 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     try std.testing.expectEqual(@as(?u32, 2), cfs[1].priority);
 }
 
+test "rewrite CF: all three formula slots shift, not just the first (S3B-REL-801)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-slots-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A `between` carries two formulas; a third is schema-legal
+        // (CT_CfRule formula{0..3}) even if Excel's UI never authors
+        // it — the sweep that moved only slot 1 left `B7` and `B9`
+        // beside a moved `B5`, the body-side twin of the sqref skew.
+        const cf =
+            \\<conditionalFormatting sqref="A1:A10"><cfRule type="cellIs" operator="between" priority="1"><formula>B5</formula><formula>B7</formula><formula>B9</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-slots-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_rows = .{ .at = 4, .count = 1 } },
+            null,
+        );
+        // B5 → B6, B7 → B8, B9 → B10: three bodies, three rewrites.
+        try std.testing.expectEqual(@as(u32, 3), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("B6", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("B8", cfs[0].formula2.?);
+    try std.testing.expectEqualStrings("B10", cfs[0].formula3.?);
+}
+
+test "insertRow: a spaced-Eq DV moves envelope AND formula together (S3B-REL-912)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-speq-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // XML §3.1 `Eq ::= S? '=' S?`: the spacing is legal, the byte
+        // walker's getAttr reads through it — and the typed view's
+        // old contiguous `sqref="` search did not, so the FULL edit
+        // shifted this envelope while the sweep never saw the rule's
+        // formula.
+        const dv =
+            \\<dataValidations count="1"><dataValidation type="custom" sqref = "B1:B4"><formula1>B1+1</formula1></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-speq-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "sqref = \"B2:B5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
+}
+
+test "insertRow: a formula cell behind a bare token relocates without desync (S3B-REL-1201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-bare-f-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        // A `bogus` token before `r=`: the typed view stepped over it
+        // and inventoried the formula; the raw locator (workbook_xml's
+        // getAttr, the third reader) stopped at it — the splice-count
+        // assert tripped, or with asserts off the cell moved while
+        // its formula stayed.
+        const at = std.mem.indexOf(u8, part.bytes, "</sheetData>").?;
+        const row = "<row r=\"99\"><c bogus r=\"A99\"><f>A98</f><v>0</v></c></row>";
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], row, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-bare-f-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c bogus r=\"A100\"><f>A99</f>") != null);
+}
+
+test "renameSheet: a quoted '>' and a bare token in the sheet element do not break the patch (S3B-REL-1402)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-rename-quotegt-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A quoted `>` before `name=` truncated the old bare tag-end
+        // scan mid-element, and a bare token was a hard error in the
+        // old attribute loop — BOTH after the five rename sweeps had
+        // already rewritten every carrier, leaving the workbook torn
+        // behind a "refusal".
+        const part = (try wb.store.part("xl/workbook.xml")).?;
+        const at = std.mem.indexOf(u8, part.bytes, "<sheet state=\"visible\" name=").?;
+        // A comment decoy spelling sheet 0's OWN name sits before the
+        // real inventory: counting it desynced `seen` and the old
+        // patcher renamed the comment (Codex #216 r15 S3B-REL-1502).
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{
+            part.bytes[0..at],
+            "<!-- <sheet name=\"Sheet1\"/> --><sheet probe=\"a>b\" bogus state=\"visible\" name=",
+            part.bytes[at + "<sheet state=\"visible\" name=".len ..],
+        });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart("xl/workbook.xml", patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    try wb.renameSheet(0, "Zed");
+    try std.testing.expectEqualStrings("Zed", wb.workbook.sheets[0].name);
+    const part = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "probe=\"a>b\" bogus state=\"visible\" name=\"Zed\"") != null);
+    // The comment decoy is untouched prose.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <sheet name=\"Sheet1\"/> -->") != null);
+}
+
+test "renameSheet: entity-bearing names rename and collide by their MEANING (S3B-REL-1507)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
+    defer wb.deinit();
+    // Previously: the postcondition compared the refreshed RAW bytes
+    // (`R&amp;D`) to the decoded input and asserted after every
+    // mutation had landed.
+    try wb.renameSheet(0, "R&D");
+    const part = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "name=\"R&amp;D\"") != null);
+    // A second sheet cannot take the same MEANING, however the first
+    // is spelled on the wire.
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "R&D"));
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "r&d"));
+
+    // An escape-heavy VALID name (26 scalars, 130 carrier bytes once
+    // escaped) renames in — and renames back OUT again: the old
+    // 128-byte stack copy refused the second rename (Codex #216 r17
+    // S3B-REL-1701).
+    const amps = "&&&&&&&&&&&&&&&&&&&&&&&&&&";
+    try wb.renameSheet(1, amps);
+    try wb.renameSheet(1, "Plain");
+    const part2 = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part2.bytes, "name=\"Plain\"") != null);
+}
+
+test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-legacy-writer-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        // Legal spellings the substring writer could not splice: a
+        // spaced single-quoted row and cell ref (it knew only
+        // contiguous `name="`), and an `x:r` decoy that took the
+        // splice meant for `r`. The formula sweep moved the bodies
+        // regardless, so the coordinates froze beside moved formulas.
+        const row = "<row r = '98'><c x:r=\"Z9\" r=\"B98\"><v>1</v></c><c r = 'A98'><f>A97</f><v>0</v></c></row>";
+        const at = std.mem.indexOf(u8, part.bytes, "</sheetData>").?;
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], row, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-legacy-writer-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    // The row and both cells moved — spelling (spacing, quote style)
+    // preserved — the decoy untouched, the formula on the same grid.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<row r = '99'>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c x:r=\"Z9\" r=\"B99\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c r = 'A99'><f>A98</f>") != null);
+}
+
+test "insertRow: a bare token before sqref splits neither envelope from formula (S3B-REL-1001)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-bare-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A bare token is malformed XML, but the two attribute
+        // readers must still AGREE about the attributes after it: the
+        // old getAttr stopped here while the view's attrAt stepped
+        // over, so the sweep moved the formula while the walker froze
+        // the envelope.
+        const dv =
+            \\<dataValidations count="1"><dataValidation bogus type="custom" sqref="B1:B4"><formula1>B1+1</formula1></dataValidation></dataValidations>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, dv, "");
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-bare-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "sqref=\"B2:B5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
+}
+
 test "rewrite CF: a commented-out cfRule decoy does not shift the splice lockstep (REL-103)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -16116,7 +16550,7 @@ test "rewrite DV: a dataValidationsX decoy keeps the raw walk in the view's inde
     try std.testing.expectEqualStrings("B8", dvs[1].formula1.?);
 }
 
-test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep (REL-401)" {
+test "rewrite DV/CF: DTD prose is never inventoried; the declaration survives byte-identical (REL-401, S3B-REL-903)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -16138,11 +16572,12 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    // Prepend a DOCTYPE whose entity literal spells a whole rule. The
-    // sanitizer KEEPS DTD bytes, so the typed view counts the phantom
-    // rule at index 0 and the live rule at index 1 — the raw walk
-    // must count identically: `skipNonElement`, which steps over the
-    // declaration, put the phantom's replacement into the live rule.
+    // Prepend a DOCTYPE whose entity literal spells a whole rule.
+    // The sanitizer now skips declarations whole (Codex #216 r5
+    // S3B-REL-903), so the typed view holds ONLY the live rule and
+    // the whole edit — transform and sweep — leaves the DTD's bytes
+    // identical: the two halves of one edit may not disagree about
+    // the same prose.
     {
         var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
@@ -16170,10 +16605,9 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
             .{ .insert_cols = .{ .at = 4, .count = 1 } },
             ws_name_owned,
         );
-        // Phantom "Z9" → "AA9" (inside the DTD literal, as the view
-        // sees it) and live "D1" → "E1" — two rewrites, each landing
-        // in ITS OWN source occurrence.
-        try std.testing.expectEqual(@as(u32, 2), count);
+        // Only the live "D1" → "E1" — the DTD's rule-shaped entity
+        // literal is prose the view never inventories.
+        try std.testing.expectEqual(@as(u32, 1), count);
         try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
@@ -16182,11 +16616,12 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const cfs = try ws.conditionalFormats();
-    try std.testing.expectEqual(@as(usize, 2), cfs.len);
-    try std.testing.expectEqualStrings("AA9", cfs[0].formula.?);
-    try std.testing.expectEqualStrings("E1", cfs[1].formula.?);
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
+    // The DTD survives byte-identical — sqref, priority and formula
+    // all as authored.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>Z9</formula></cfRule></conditionalFormatting>'>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 
@@ -16359,7 +16794,7 @@ test "rewrite DV/CF: the rewrite reads the CURRENT part bytes, cached views notw
     try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
 }
 
-test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync the splice (REL-501)" {
+test "rewrite DV/CF: comment markers nested inside a DTD literal stay prose, skipped whole (REL-501, S3B-REL-903)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -16382,12 +16817,13 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // The DTD's quoted literal holds a COMMENT-WRAPPED rule and a
-    // plain rule. The sanitizer copies the whole declaration verbatim
-    // (the markers sit inside quotes), so the typed view counts BOTH
-    // phantoms plus the live rule; a raw walk that skipped comment
-    // markers wherever they appeared counted one fewer and spliced a
-    // phantom's replacement into the live formula (Codex #215 r5
-    // REL-501 — the shape one level below r4's).
+    // plain rule — comment markers nested inside quotes, the shape
+    // that desynced the #215 r5 lockstep. Under the r5 slice-6
+    // contract (Codex #216 S3B-REL-903) the whole declaration is
+    // skipped structurally — quotes honoured first, so the nested
+    // markers never even read as comments — and NOTHING inside it is
+    // inventoried or swept: only the live rule moves, and the DTD
+    // survives byte-identical.
     {
         var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
@@ -16415,9 +16851,9 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
             .{ .insert_cols = .{ .at = 4, .count = 1 } },
             ws_name_owned,
         );
-        // Comment-phantom Y9→Z9, phantom Z9→AA9, live D1→E1 — three
-        // rewrites, each landing in ITS OWN source occurrence.
-        try std.testing.expectEqual(@as(u32, 3), count);
+        // Only the live D1→E1 — the DTD's two rule-shaped phantoms
+        // are prose the view never inventories.
+        try std.testing.expectEqual(@as(u32, 1), count);
         try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
@@ -16426,13 +16862,13 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const cfs = try ws.conditionalFormats();
-    try std.testing.expectEqual(@as(usize, 3), cfs.len);
-    try std.testing.expectEqualStrings("Z9", cfs[0].formula.?);
-    try std.testing.expectEqualStrings("AA9", cfs[1].formula.?);
-    try std.testing.expectEqualStrings("E1", cfs[2].formula.?);
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <conditionalFormatting sqref=\"Y1\"><cfRule type=\"expression\" priority=\"8\"><formula>Z9</formula>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "priority=\"9\"><formula>AA9</formula>") != null);
+    // The DTD — nested comment markers, both phantoms — survives
+    // byte-identical.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <conditionalFormatting sqref=\"Y1\"><cfRule type=\"expression\" priority=\"8\"><formula>Y9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "priority=\"9\"><formula>Z9</formula>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 

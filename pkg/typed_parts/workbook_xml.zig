@@ -558,11 +558,54 @@ pub fn skipNonElement(xml: []const u8, at: usize) Error!usize {
         return end + 2;
     }
     if (at + 2 <= xml.len and xml[at + 1] == '!') {
-        // `<!DOCTYPE …>` and friends. We consume up to the next bare
-        // `>` outside any quoted region. DOCTYPE is rare in xlsx but
-        // handling it keeps the scanner well-defined.
-        const close = try findBareGt(xml, at + 2);
-        return close + 1;
+        // `<!DOCTYPE …>` and friends. The declaration can carry an
+        // internal subset — `[` … `]` holding entity declarations,
+        // comments (whose text may hold `>`), and PIs — so the scan
+        // is structural: quotes, subset depth, and embedded comments
+        // all honoured. A bare-`>` scan stopped inside a subset
+        // comment and handed the walkers the DTD's prose as live
+        // markup (Codex #216 r5 S3B-REL-901). DOCTYPE is rare in
+        // xlsx but handling it keeps the scanner well-defined.
+        var i: usize = at + 2;
+        var subset_depth: usize = 0;
+        while (i < xml.len) {
+            const c = xml[i];
+            if (c == '"' or c == '\'') {
+                const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse
+                    return error.MalformedXml;
+                i = close + 1;
+                continue;
+            }
+            if (c == '<' and i + 4 <= xml.len and std.mem.eql(u8, xml[i .. i + 4], "<!--")) {
+                const end = std.mem.indexOfPos(u8, xml, i + 4, "-->") orelse
+                    return error.MalformedXml;
+                i = end + 3;
+                continue;
+            }
+            if (c == '<' and i + 2 <= xml.len and xml[i + 1] == '?') {
+                // A PI in the subset is opaque like a comment: its
+                // text can spell `]` and `>` that would otherwise
+                // close the subset and the declaration mid-PI (Codex
+                // #216 r7 S3B-REL-908).
+                const end = std.mem.indexOfPos(u8, xml, i + 2, "?>") orelse
+                    return error.MalformedXml;
+                i = end + 2;
+                continue;
+            }
+            if (c == '[') {
+                subset_depth += 1;
+                i += 1;
+                continue;
+            }
+            if (c == ']') {
+                subset_depth -|= 1;
+                i += 1;
+                continue;
+            }
+            if (c == '>' and subset_depth == 0) return i + 1;
+            i += 1;
+        }
+        return error.MalformedXml;
     }
     return at;
 }
@@ -594,22 +637,6 @@ fn findTagEnd(xml: []const u8, attrs_start: usize) Error!?TagEnd {
         i += 1;
     }
     return null;
-}
-
-fn findBareGt(xml: []const u8, from: usize) Error!usize {
-    var i: usize = from;
-    while (i < xml.len) {
-        const c = xml[i];
-        if (c == '"' or c == '\'') {
-            const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse
-                return error.MalformedXml;
-            i = close + 1;
-            continue;
-        }
-        if (c == '>') return i;
-        i += 1;
-    }
-    return error.MalformedXml;
 }
 
 /// Find the byte index just past `<section>` (the opening element of
@@ -661,20 +688,30 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
 
 /// Pull a quoted attribute value out of an attributes region. Mirrors
 /// the helper in `src/xlsx.zig` (kept private here so this file is
-/// self-contained per the project's per-typed-part isolation rule).
-/// Values are returned verbatim — no entity decoding.
+/// self-contained per the project's per-typed-part isolation rule) —
+/// and MUST keep the identical walk: XML §2.3's four `S` bytes only,
+/// one explicit `=`, a valueless token stepped over rather than a
+/// dead end, null on an unterminated value. This copy kept the pre-
+/// unification algorithm and fed the formula rewriter's raw locator a
+/// THIRD acceptance — `<c bogus r="A1">` visible to the typed view,
+/// invisible here, tripping the splice-count assert (Codex #216 r12
+/// S3B-REL-1201). Values are returned verbatim — no entity decoding.
 pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
     assert(name.len > 0);
     var i: usize = 0;
     while (i < attrs.len) {
-        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
 
         const name_start = i;
-        while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and attrs[i] != '=' and !isXmlS(attrs[i])) i += 1;
         const attr_name = attrs[name_start..i];
 
-        while (i < attrs.len and (attrs[i] == '=' or std.ascii.isWhitespace(attrs[i]))) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
+        if (i >= attrs.len) break;
+        if (attrs[i] != '=') continue;
+        i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
         if (attrs[i] != '"' and attrs[i] != '\'') break;
 
@@ -682,12 +719,17 @@ pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
         i += 1;
         const val_start = i;
         while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return null; // unterminated value
         const val = attrs[val_start..i];
-        if (i < attrs.len) i += 1;
+        i += 1;
 
         if (std.mem.eql(u8, attr_name, name)) return val;
     }
     return null;
+}
+
+fn isXmlS(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -841,6 +883,39 @@ test "parse: skips comments, CDATA, and processing instructions" {
     try std.testing.expectEqualStrings("Real", wb.sheets[0].name);
     try std.testing.expectEqual(@as(usize, 1), wb.defined_names.len);
     try std.testing.expectEqualStrings("WithCdata", wb.defined_names[0].name);
+}
+
+test "getAttr: the shared acceptance — bare tokens, spaced Eq, XML-S only, unterminated null (S3B-REL-1201)" {
+    try std.testing.expectEqualStrings("A1", getAttr("bogus r=\"A1\"", "r").?);
+    try std.testing.expectEqualStrings("A1", getAttr("r = \"A1\"", "r").?);
+    try std.testing.expectEqualStrings("A1", getAttr("r='A1'", "r").?);
+    try std.testing.expect(getAttr("r\x0b=\"A1\"", "r") == null);
+    try std.testing.expect(getAttr("r=\"A1", "r") == null);
+    try std.testing.expect(getAttr("a=b r=\"A1\"", "r") == null);
+}
+
+test "skipNonElement: declarations scan structurally — subsets, conditional sections, quotes (S3B-TEST-906)" {
+    // Without subset-depth tracking the scan stops at the `>` of the
+    // inner `<!ELEMENT …>` declaration, mid-subset.
+    const dtd = "<!DOCTYPE ws [<!ELEMENT a (b)>]><x/>";
+    try std.testing.expectEqual(dtd.len - "<x/>".len, try skipNonElement(dtd, 0));
+    // A subset comment carrying `] >` closes neither the subset nor
+    // the declaration.
+    const cmt = "<!DOCTYPE ws [<!-- ] > -->]><y/>";
+    try std.testing.expectEqual(cmt.len - "<y/>".len, try skipNonElement(cmt, 0));
+    // A conditional section's brackets balance through `]]>`.
+    const inc = "<![INCLUDE[<x>]]><z/>";
+    try std.testing.expectEqual(inc.len - "<z/>".len, try skipNonElement(inc, 0));
+    // A quoted `>` is data.
+    const q = "<!DOCTYPE a SYSTEM \"b>c\"><w/>";
+    try std.testing.expectEqual(q.len - "<w/>".len, try skipNonElement(q, 0));
+    // A PI in the subset is opaque: its `]` and `>` close nothing —
+    // without the PI branch, this scan ended inside the PI and the
+    // walkers dispatched its rule-shaped prose (S3B-REL-908).
+    const pi = "<!DOCTYPE ws [<?pi ] > <conditionalFormatting sqref=\"Z9\"> ?>]><v/>";
+    try std.testing.expectEqual(pi.len - "<v/>".len, try skipNonElement(pi, 0));
+    // An unterminated quote is an error, never a scan past the end.
+    try std.testing.expectError(error.MalformedXml, skipNonElement("<!DOCTYPE a \"unclosed", 0));
 }
 
 test "parse: handles attribute values containing '>'" {

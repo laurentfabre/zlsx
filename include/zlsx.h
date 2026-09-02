@@ -1757,7 +1757,9 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
  *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
  *     MalformedCommentsXml, MalformedTableXml, the *CoordinateOverflow
- *     trio, PivotEditUnsafe, MissingSheetPart, NoSheetData; a generic
+ *     trio, PivotEditUnsafe, SqrefCollapseUnsafe — a delete collapsing
+ *     EVERY area of a DV/CF sqref, which Excel resolves by deleting the
+ *     rule — MissingSheetPart, NoSheetData; a generic
  *     MalformedXml from a rewriter's consistency guard stays -1) — the
  *     full list is
  *     docs/plans/c-abi-status-v1.md §10; the typed worksheet parser's
@@ -1870,10 +1872,34 @@ int32_t zlsx_editor_defined_names_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* The S3b `conditional-formats` records — one
+ * {"kind":"conditional_format",…} line per <cfRule>, sheets in
+ * workbook order, rules in sheet-document order — as a
+ * library-allocated UTF-8 buffer, byte-for-byte what
+ * `zlsx conditional-formats <file>` prints with no selector
+ * (docs/cli.md, "conditional-formats"). The record is the rule
+ * envelope (sqref, rule_type, formulas, dxf_id, priority), not the
+ * visual payload — <colorScale> / <dataBar> / <iconSet> bodies and
+ * the <dxfs> styles stay in their parts. Read over the editor's
+ * current parts: structural edits and the DV/CF sweeps they carry are
+ * visible immediately; staged cell writes never touch the rule
+ * machinery. A workbook without conditional formatting is ZLSX_OK
+ * with (*out, *out_len) = (NULL, 0). An inventory that cannot be
+ * served faithfully refuses whole — a sheet list the strict workbook
+ * read cannot prove (MalformedWorkbookXml) or a sheet part the strict
+ * walk cannot (MalformedSheetXml), both ZLSX_REFUSED — rather than
+ * hand over a record that lies. (An archive past the decompression
+ * caps fails at open — the caps are checked on the open-time
+ * directory walk.) Release with zlsx_buffer_release. */
+int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
 #define ZLSX_HAS_DEFINED_NAMES    1   /* editor defined_names_ndjson (the read; the writer's add_defined_name predates the macros) */
+#define ZLSX_HAS_CONDITIONAL_FORMATS 1   /* editor conditional_formats_ndjson (the read; the writer's add_conditional_format_* predate the macros) */
 
 
 #ifdef __cplusplus

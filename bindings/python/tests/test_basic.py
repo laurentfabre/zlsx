@@ -2827,6 +2827,196 @@ def test_defined_names_refusal_is_typed(tmp_path):
         ed.defined_names()
 
 
+# ── S3b slice 6: the conditional-formats read through the C ABI ───────
+
+
+def _require_conditional_formats():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_CONDITIONAL_FORMATS:
+        pytest.skip("conditional-formats read not exposed in loaded libzlsx (requires 0.9.0+)")
+
+
+def _cf_workbook(path):
+    with zlsx.write(path) as w:
+        dxf = w.add_dxf(zlsx.Dxf(font_bold=True, fill_fg_argb=0xFFFFC7CE))
+        data = w.add_sheet("Data")
+        data.write_row([1, 5, 9, 3])
+        data.write_row([2, 6, 10, 4])
+        data.add_conditional_format_cell_is("A1:A4", "between", "2", "4", dxf)
+        data.add_conditional_format_expression("B1:B4", "B1>3", dxf)
+        data.add_conditional_format_color_scale("C1:C4", 0xFFF8696B, None, 0xFF63BE7B)
+        data.add_conditional_format_data_bar("D1:D4", 0xFF638EC6)
+        report = w.add_sheet("Report")
+        report.write_row(["R&D"])
+        report.add_conditional_format_expression("A1:A2", '$A1="R&D"', dxf)
+
+
+def test_conditional_formats_frozen_shape_and_empty_on_plain_workbook(tmp_path):
+    """`Editor.conditional_formats()` / `zlsx.conditional_formats(path)`
+    return the `zlsx conditional-formats` records as dicts — sheets in
+    workbook order, rules in sheet-document order, the rule envelope
+    only; `[]` without rules."""
+    _require_conditional_formats()
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    assert zlsx.conditional_formats(plain) == []
+    with zlsx.edit(plain) as ed:
+        assert ed.conditional_formats() == []
+
+    src = tmp_path / "cf.xlsx"
+    _cf_workbook(src)
+    assert zlsx.conditional_formats(src) == [
+        {"kind": "conditional_format", "sheet": "Data", "sheet_idx": 0, "sqref": "A1:A4",
+         "rule_type": "cellIs", "formulas": ["2", "4"], "dxf_id": 0, "priority": 1},
+        {"kind": "conditional_format", "sheet": "Data", "sheet_idx": 0, "sqref": "B1:B4",
+         "rule_type": "expression", "formulas": ["B1>3"], "dxf_id": 0, "priority": 2},
+        {"kind": "conditional_format", "sheet": "Data", "sheet_idx": 0, "sqref": "C1:C4",
+         "rule_type": "colorScale", "formulas": [], "dxf_id": None, "priority": 3},
+        {"kind": "conditional_format", "sheet": "Data", "sheet_idx": 0, "sqref": "D1:D4",
+         "rule_type": "dataBar", "formulas": [], "dxf_id": None, "priority": 4},
+        {"kind": "conditional_format", "sheet": "Report", "sheet_idx": 1, "sqref": "A1:A2",
+         "rule_type": "expression", "formulas": ['$A1="R&D"'], "dxf_id": 0, "priority": 1},
+    ]
+
+
+def test_conditional_formats_read_the_editors_current_state(tmp_path):
+    """A sheet rename is visible immediately, and a row insert moves
+    the ENVELOPE with the bodies — sqref and formula on one grid, no
+    save in between (Codex #216 r1 S3B-REL-301)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf.xlsx"
+    _cf_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "Facts")
+        records = ed.conditional_formats()
+        sheets = [r["sheet"] for r in records]
+        assert sheets == ["Facts", "Facts", "Facts", "Facts", "Report"]
+        assert records[0]["sqref"] == "A1:A4"
+
+        ed.insert_row(0, 1)
+        moved = ed.conditional_formats()
+    assert [(r["sqref"], r["formulas"]) for r in moved] == [
+        ("A2:A5", ["2", "4"]),
+        ("B2:B5", ["B2>3"]),
+        ("C2:C5", []),
+        ("D2:D5", []),
+        ("A1:A2", ['$A1="R&D"']),  # the other sheet did not move
+    ]
+
+
+def test_conditional_formats_entity_rename_round_trips(tmp_path):
+    """Renaming to an entity-bearing name works and the CF read
+    reports the decoded meaning; a second sheet cannot take the same
+    meaning however the first is spelled (Codex #216 r16
+    S3B-REL-1507)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf.xlsx"
+    _cf_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "R&D")
+        records = ed.conditional_formats()
+        assert records[0]["sheet"] == "R&D"
+        with pytest.raises(zlsx.ZlsxRefusal):
+            ed.rename_sheet(1, "r&d")
+
+
+def test_conditional_formats_between_moves_both_formulas(tmp_path):
+    """A `cellIs between` carries two formulas — a sweep that moved
+    only the first left `B2` beside a moved sibling (Codex #216 r3
+    S3B-REL-801)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf_between.xlsx"
+    with zlsx.write(src) as w:
+        dxf = w.add_dxf(zlsx.Dxf(font_bold=True))
+        data = w.add_sheet("Data")
+        data.write_row([1, 5])
+        data.write_row([2, 6])
+        data.add_conditional_format_cell_is("A1:A4", "between", "B1", "B2", dxf)
+
+    with zlsx.edit(src) as ed:
+        ed.insert_row(0, 1)
+        records = ed.conditional_formats()
+    assert [(r["sqref"], r["formulas"]) for r in records] == [
+        ("A2:A5", ["B2", "B3"]),
+    ]
+
+
+def test_conditional_formats_collapse_delete_refuses_typed(tmp_path):
+    """Deleting the only row a rule targets raises
+    `ZlsxRefusal(SqrefCollapseUnsafe)` and mutates nothing — Excel
+    deletes such a rule outright; zlsx refuses rather than silently
+    retarget it (Codex #216 r4 S3B-REL-805)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf_collapse.xlsx"
+    with zlsx.write(src) as w:
+        dxf = w.add_dxf(zlsx.Dxf(font_bold=True))
+        data = w.add_sheet("Data")
+        data.write_row([1, 2, 3, 4])
+        data.add_conditional_format_expression("A1:D1", "A1>0", dxf)
+
+    with zlsx.edit(src) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_row(0, 1)
+        assert info.value.error_name == "SqrefCollapseUnsafe"
+        assert [(r["sqref"], r["formulas"]) for r in ed.conditional_formats()] == [
+            ("A1:D1", ["A1>0"]),
+        ]
+
+
+def test_conditional_formats_refusal_is_typed(tmp_path):
+    """An inventory the read cannot serve faithfully raises
+    `ZlsxRefusal(MalformedSheetXml)` — never a partial list."""
+    _require_conditional_formats()
+    import zipfile
+
+    src = tmp_path / "cf.xlsx"
+    _cf_workbook(src)
+
+    # A bad entity in one formula body: the editor opens (the open
+    # parser keeps raw spans); the decode at read time refuses the
+    # whole view with the sheet part's verdict.
+    broken = tmp_path / "broken.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(broken, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b"<formula>2</formula>", b"<formula>2&bogus;</formula>")
+            zout.writestr(item, data)
+
+    with zlsx.edit(broken) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.conditional_formats()
+        assert info.value.error_name == "MalformedSheetXml"
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+
+    # A broken SECOND sheet refuses whole — the first sheet's four
+    # perfectly servable records are never handed out.
+    broken2 = tmp_path / "broken2.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(broken2, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/worksheets/sheet2.xml":
+                data = data.replace(b"$A1=", b"$A1&bogus;=")
+            zout.writestr(item, data)
+
+    with zlsx.edit(broken2) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.conditional_formats()
+        assert info.value.error_name == "MalformedSheetXml"
+
+    ed = zlsx.edit(src)
+    ed.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.conditional_formats()
+
+
 def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path):
     """c_uint32 wraps modulo 2**32: without a guard, rename_sheet(2**32, …)
     would rename sheet 0. Every integer-bearing structural method rejects

@@ -368,10 +368,10 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 |---|---|
 | `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
 | The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
-| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
+| The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `SqrefCollapseUnsafe` (a delete collapsing EVERY area of a DV/CF `sqref` — S3b slice 6 r4), `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
 | `DuplicateSheetName` (add / rename; ASCII case-insensitive, footnote ¹⁴ of the surface matrix), `TableColumnNameInUse` — a name the workbook holds | `TableNotFound`, `TableColumnNotFound` — a selector that names nothing among the workbook's readable tables (decision S3a-9); a `<tablePart>` whose relationship, part or display name is broken refuses instead (`MissingRelationship` / `MalformedTableXml`, r6 REL-604) |
-| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored name past the rename's 128-byte bound — no argument fixes it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
+| The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored sheet name that is EMPTY — an OOXML-invariant violation no argument fixes; the historical 128-byte carrier bound fell in #216 r17, a valid escape-heavy name legitimately exceeds it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
 | | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
 
@@ -565,3 +565,116 @@ entity with nothing handed out and the name in diag + errbuf; an
 allocation-failure sweep over `definedNamesNdjsonOwned`. The smoke gate
 takes the address and `#error`s without the macro; the Python leg pins
 the parsed records, the refusal type and the closed-editor error.
+
+## 13. S3b slice 6 — the `conditional-formats` read (2026-09-02)
+
+One export, the slice-2 pattern verbatim:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_conditional_formats_ndjson` (+ `zlsx_buffer_release`) | `_HAS_CONDITIONAL_FORMATS` | `ZLSX_HAS_CONDITIONAL_FORMATS` |
+
+(`_HAS_CONDITIONAL_FORMAT`, singular, probes the writer's
+`add_conditional_format_*` family and predates this capability.)
+
+**The bytes are the CLI's**: the S3b gate froze the
+`conditional-formats` record in `docs/cli.md`, and the record is text.
+The export hands over the NDJSON bytes of
+`pkg/conditional_format_ndjson.zig` — the shared strict walk + record
+writer `zlsx conditional-formats` prints through — built by
+`c_abi.zig::conditionalFormatsNdjsonOwned(alloc, wb)` over the editor's
+current parts: every rule, sheets in workbook order, rules in
+sheet-document order, no selector (the CLI's default stream). A workbook
+without conditional formatting is `ZLSX_OK` with `(NULL, 0)`; release
+with `zlsx_buffer_release`. The allocating writer's `WriteFailed`
+crosses as `-3`, the pivots builder's rule. Python parses one JSON
+object per line (`Editor.conditional_formats()` /
+`zlsx.conditional_formats(path)`).
+
+**The refusals, all already in the vocabulary**: a sheet list the
+strict workbook read cannot prove is `MalformedWorkbookXml` — a part
+the archive cannot materialise at the graph probe folds there too
+(round 1, S3B-ERR-602: a bad CRC no longer escapes with the zip
+layer's own name) — and a sheet part the strict walk cannot serve
+faithfully (the `docs/cli.md` contract: nesting, namespace shape,
+formula arity and markup, carriers that do not decode) is
+`MalformedSheetXml`; both `-2`, members of `structural_refusals` since
+S3a. `collect`'s error surface is the closed, compiler-checked
+`CollectError`: those two plus `OutOfMemory` (`-3`),
+`MissingSheetPart` (`-2`, typed but unreachable once the graph probe
+holds), and `ZipBombSuspected` — the S1 decompression-caps verdict,
+typed in the set for honesty but effectively open-time: the caps
+admit every entry on the open-time directory walk (`src/cli.zig`,
+`classifyTopLevelError`), so it fires where the ABI has no diag to
+carry it — the pointer-returning path open and `zlsx_open_buffer`,
+whose shipped contract is `-1`. Round 1 (S3B-ERR-601) remapped it to
+`-2`; round 2 (S3B-ERR-702) ruled that an ABI break on the diag-less
+opener and reverted it — it stays a DELIBERATE generic `-1` with its
+name in errbuf, pinned by a `statusOf` test, until a status-bearing
+open ABI exists. No new name crosses.
+
+**Timing**: conditional formats live in the sheet parts, which
+structural edits and their DV/CF sweeps rewrite in place before the
+call returns, and the sheet inventory is a fresh strict read of the
+current `xl/workbook.xml` — so edits (a rename renaming the `sheet`
+field, an insert moving `sqref` and the formula bodies) are visible
+immediately; staged cell writes never touch the rule machinery, so
+nothing about this read waits for save. The `sqref` half of that
+claim is round 1's own repair (S3B-REL-301): the worksheet transform
+historically moved only the formula bodies — an insert rewrote
+`B1>3` to `B2>3` while `sqref="B1:B4"` stayed, a skew every consumer
+(Excel included, after save) could observe — and
+`pkg/sheet_edit.zig::processSqrefListTag` now shifts
+`conditionalFormatting@sqref` and `dataValidation@sqref` with the
+merge-rect interval semantics — shift / grow / shrink, a collapsed
+area dropped from the list, whole-column (`A:A`) and whole-row
+(`1:1`) spellings absorbing the cross-axis edit and shifting as
+intervals along their own, `$` anchors parsed and preserved, the
+value entity-DECODED before parsing, BOTH axes validated by the
+strict ST_Ref grammar — not just the edited one (rounds 3–4,
+S3B-REL-802/803). An area the grammar refuses fails the whole edit
+pre-mutation, the `<xm:f>` all-or-nothing posture — a frozen
+envelope beside swept bodies is exactly the skew this repair closes
+— and a delete that collapses EVERY area refuses too
+(`SqrefCollapseUnsafe`, -2, the `TableCollapseUnsafe` shape): Excel
+deletes the rule outright, the walker cannot excise an element with
+children mid-walk, and kept bytes would silently retarget the rule
+to whatever slides into its old coordinates (r4 S3B-REL-805).
+Comments, CDATA sections, PIs and DOCTYPE constructs pass through
+both walkers verbatim — a tag spelled inside one is prose, neither
+rewritten nor refused on (r4 S3B-REL-804). The bodies
+themselves: round 3 (S3B-REL-801) extended the DV/CF sweep from CF
+formula slot 1 to all three schema slots, so a `cellIs` `between`
+moves both its formulas with the envelope. Repeated reads stay
+bounded: sheet targets resolve into the view's own arena
+(`PartStore.resolveOwned`, S3B-MEM-603), not the store's lifetime
+arena.
+
+**Tests** (`src/c_abi.zig`, "S3b conditional_formats_ndjson …"): the
+buffer equal to the shared writer's frozen stream (MNT-2302's literal)
+over the pkg fixture rebuilt through the C writer surface (one dxf,
+four rule kinds, an escaping-heavy expression); the rename AND a row
+insert visible with no save — the insert pinning `sqref` and formula
+on one grid (`A2:A5` beside `B2>3`), the other sheet unmoved; `(NULL,
+0)` on a workbook without rules with the poison reset;
+`NullOutPointer` / `InvalidInput` as call errors; poisoned outputs
+reset on the refusal and undersized-diag paths, the rejected diag
+byte-for-byte untouched; `-2` `MalformedSheetXml` on a bad entity in a
+formula body with nothing handed out and the name in diag + errbuf;
+the whole-refusal pins round 1 added (S3B-TEST-605): a broken SECOND
+sheet behind four servable records refuses whole, a bad entity in a
+sheet-name carrier is `MalformedWorkbookXml`, a flipped payload byte
+folds at the graph probe, and `statusOf(ZipBombSuspected)` is the
+deliberate `-1` (r2);
+an allocation-failure sweep over `conditionalFormatsNdjsonOwned`
+(caches primed first, the shared writer's own OOM-test shape); the
+sqref-shift unit tests in `pkg/sheet_edit.zig` (insert above / inside,
+delete inside, collapse-drop, the all-collapse refusal for CF and DV,
+the column axis, the `dataValidations` wrapper decoy, whole-column /
+whole-row absorption + interval shifting + collapse, `$`-anchor
+round-trips, both-axes grid validation, entity decode with a
+byte-preserving no-op, garbage refusal, comment / CDATA decoy
+pass-through). The smoke gate takes the address and `#error`s without
+the macro; the Python leg pins the parsed records, the insert-row
+move, the `between` both-slots move, both refusal shapes and the
+closed-editor error.

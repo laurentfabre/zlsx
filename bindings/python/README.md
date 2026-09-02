@@ -261,7 +261,9 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
-| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies |
+| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies — and `conditional_formats()` on a sheet list the strict workbook read cannot prove |
+| `MalformedSheetXml` | also `conditional_formats()` on a sheet part the strict walk cannot serve faithfully — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a carrier that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable records too) |
+| `SqrefCollapseUnsafe` | `delete_row` / `delete_column` that would collapse EVERY area of a `<conditionalFormatting>` or `<dataValidation>` `sqref` — Excel deletes such a rule outright; zlsx refuses rather than silently retarget it to the cells that slide into its place |
 | `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit`, the carrier verdicts `MalformedSheetXml` / `MalformedDrawingXml` / `MalformedVmlDrawing` / `MalformedCommentsXml` / `MalformedTableXml` / `*CoordinateOverflow`, the workbook's own `MalformedWorkbookXml` / `IdSpaceExhausted` / … | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read or materialise. The list is §10 of `docs/plans/c-abi-status-v1.md`; a generic `MalformedXml` from a rewriter's consistency guard stays a plain `ZlsxError` |
 
 `ZlsxRefusal` is a `ZlsxError`; `ZlsxFormulaRefusal` (the engine's
@@ -298,6 +300,18 @@ formula text as authored — nothing resolved or rewritten), `hidden`
 `xl/workbook.xml` only, so the read never waits for `save`: structural
 edits and the name sweeps they carry — a sheet rename rewriting the
 bodies — are visible immediately.
+
+`Editor.conditional_formats()` / `zlsx.conditional_formats(path)` are
+the same pattern over the `zlsx conditional-formats` records
+([docs/cli.md](../../docs/cli.md), "conditional-formats"): one
+`{"kind": "conditional_format", …}` dict per `<cfRule>` — sheets in
+workbook order, rules in sheet-document order — carrying the rule
+envelope (`sheet`, `sheet_idx`, `sqref`, `rule_type`, `formulas`,
+`dxf_id`, `priority`), not the visual payload: `<colorScale>` /
+`<dataBar>` / `<iconSet>` bodies and the `<dxfs>` styles stay in their
+parts. The read never waits for `save` either: structural edits and
+the DV/CF sweeps they carry are visible immediately, and staged
+`set_cell` / `append_rows` writes never touch the rule machinery.
 
 ## Spark (PySpark Data Source)
 
@@ -464,6 +478,9 @@ with zlsx.write("out.xlsx") as w:
   — the `zlsx pivots` records as dicts
 - Defined names, typed read (0.9.0+): `Editor.defined_names()` /
   `zlsx.defined_names(path)` — the `zlsx defined-names` records as dicts
+- Conditional formats, typed read (0.9.0+): `Editor.conditional_formats()` /
+  `zlsx.conditional_formats(path)` — the `zlsx conditional-formats` records
+  as dicts
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

@@ -1652,12 +1652,37 @@ pub const PartStore = struct {
         self: *const PartStore,
         owner_part_name: []const u8,
         target: []const u8,
-    ) !?[]const u8 {
+    ) std.mem.Allocator.Error!?[]const u8 {
+        const ar_alloc = @constCast(&self.arena).allocator();
+        return self.resolveInto(ar_alloc, owner_part_name, target);
+    }
+
+    /// `resolve` with the result in caller-owned memory. The arena
+    /// variant above retains every resolved path for the store's
+    /// lifetime — the right trade for one-shot resolution at open, and
+    /// unbounded growth for a read a long-lived editor repeats per
+    /// call (Codex #216 r1 S3B-MEM-603). A repeated reader passes its
+    /// own per-call arena or frees the slice itself.
+    pub fn resolveOwned(
+        self: *const PartStore,
+        allocator: std.mem.Allocator,
+        owner_part_name: []const u8,
+        target: []const u8,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        return self.resolveInto(allocator, owner_part_name, target);
+    }
+
+    fn resolveInto(
+        self: *const PartStore,
+        out_alloc: std.mem.Allocator,
+        owner_part_name: []const u8,
+        target: []const u8,
+    ) std.mem.Allocator.Error!?[]const u8 {
         if (target.len == 0) return null;
         if (looksExternal(target)) return null;
         // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".
         if (target[0] == '/') {
-            return try self.dupeArena(target[1..]);
+            return try out_alloc.dupe(u8, target[1..]);
         }
         // Relative target: collapse against owner's parent dir.
         const owner_dir = parentDir(owner_part_name);
@@ -1688,8 +1713,7 @@ pub const PartStore = struct {
             total += s.len;
             if (i + 1 < stack.items.len) total += 1;
         }
-        const ar_alloc = @constCast(&self.arena).allocator();
-        const out = try ar_alloc.alloc(u8, total);
+        const out = try out_alloc.alloc(u8, total);
         var w: usize = 0;
         for (stack.items, 0..) |s, i| {
             @memcpy(out[w .. w + s.len], s);
