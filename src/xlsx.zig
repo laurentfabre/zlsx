@@ -2507,12 +2507,17 @@ pub fn findTagOpen(xml: []const u8, from: usize, tag: []const u8) ?TagOpen {
 pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < attrs.len) {
-        // Skip whitespace
-        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        // Skip whitespace — XML §2.3's four `S` bytes exactly, the
+        // same predicate the typed view's `attrAt` and the exact
+        // writer use. `std.ascii.isWhitespace` also admitted VT and
+        // FF, so `sqref\x0B="…"` existed for this reader alone and
+        // its envelope froze beside a swept formula (Codex #216 r11
+        // S3B-REL-1101).
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
         // Scan attribute name
         const name_start = i;
-        while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and attrs[i] != '=' and !isXmlS(attrs[i])) i += 1;
         const attr_name = attrs[name_start..i];
         // Skip whitespace after the name; a token with no `=` (a bare
         // attribute, a stray `/`) is stepped over, not a dead end —
@@ -2521,21 +2526,26 @@ pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
         // envelope freezes beside a swept formula (Codex #216 r10
         // S3B-REL-1001; the combined `=`-or-whitespace skip conflated
         // "no equals" with "spaced equals").
-        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
         if (attrs[i] != '=') continue;
         i += 1;
-        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len or (attrs[i] != '"' and attrs[i] != '\'')) break;
         const quote = attrs[i];
         i += 1;
         const val_start = i;
         while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return null; // unterminated value — `attrAt`'s verdict
         const val = attrs[val_start..i];
-        if (i < attrs.len) i += 1; // past closing quote
+        i += 1; // past closing quote
         if (std.mem.eql(u8, attr_name, name)) return val;
     }
     return null;
+}
+
+fn isXmlS(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 fn extractVValue(body: []const u8) ?[]const u8 {

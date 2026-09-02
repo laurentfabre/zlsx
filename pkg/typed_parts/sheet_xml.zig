@@ -1253,6 +1253,15 @@ const minimal_sheet_xml =
     \\</worksheet>
 ;
 
+test "attrAt: XML-S whitespace only, unterminated value is null (S3B-REL-1101)" {
+    try testing.expectEqualStrings("B1:B4", attrAt("<dv sqref = \"B1:B4\">", "sqref").?);
+    try testing.expectEqualStrings("B1:B4", attrAt("<dv bogus sqref=\"B1:B4\">", "sqref").?);
+    // VT / FF are not XML `S` — the name is `sqref\x0B`, not `sqref`.
+    try testing.expect(attrAt("<dv sqref\x0b=\x0b\"B1:B4\">", "sqref") == null);
+    try testing.expect(attrAt("<dv sqref\x0c=\"B1:B4\">", "sqref") == null);
+    try testing.expect(attrAt("<dv sqref=\"B1:B4", "sqref") == null);
+}
+
 test "parse: minimal sheet, one row, one numeric cell" {
     var sx = try parse(testing.allocator, minimal_sheet_xml);
     defer sx.deinit(testing.allocator);

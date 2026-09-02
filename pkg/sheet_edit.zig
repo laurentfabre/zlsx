@@ -2851,6 +2851,14 @@ test "getAttr acceptance parity: bare tokens, spaced Eq, either quote — one ta
     try testing.expectEqualStrings("B1:B4", getAttr("x:sqref=\"Z9\" sqref=\"B1:B4\"", "sqref").?);
     // An unquoted value stops both readers.
     try testing.expect(getAttr("a=b sqref=\"B1:B4\"", "sqref") == null);
+    // VT and FF are NOT XML `S`: a name "spaced" with them is a
+    // different name to every reader — `std.ascii.isWhitespace` gave
+    // this reader a wider acceptance all its own (S3B-REL-1101).
+    try testing.expect(getAttr("sqref\x0b=\x0b\"B1:B4\"", "sqref") == null);
+    try testing.expect(getAttr("sqref\x0c=\"B1:B4\"", "sqref") == null);
+    // An unterminated value is null, the view's verdict — not a
+    // suffix.
+    try testing.expect(getAttr("sqref=\"B1:B4", "sqref") == null);
 }
 
 test "shiftSqrefArea boundary table: reversed corners, dangling anchors, maximal spellings, TL deletes (S3B-TEST-905)" {
