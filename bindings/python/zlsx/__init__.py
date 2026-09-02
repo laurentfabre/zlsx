@@ -3855,7 +3855,7 @@ class Editor:
     def rename_sheet(self, sheet_idx: int, name: str) -> None:
         """Rename sheet ``sheet_idx``; cross-sheet references
         (``'Old'!A1``, defined names, hyperlink locations, DV / CF,
-        ``<xm:f>`` extensions) follow. A pivot cache whose source is
+        ``<xm:f>`` extensions, chart ``<c:f>`` series formulas) follow. A pivot cache whose source is
         spelled by sheet name (``worksheetSource@sheet``) does **not**
         — the spelling goes stale and :meth:`pivots` reports it as
         ``"resolved": null`` (a Zig-editor hole this row inherits, listed

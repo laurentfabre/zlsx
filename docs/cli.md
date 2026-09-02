@@ -257,7 +257,7 @@ bytes with no selector.
 | `absolute` | `{"x","y","cx","cy"}` in EMUs, verbatim, for `"absolute"` anchors; `null` otherwise. |
 | `bytes` | Image records only: the image part's decompressed size in bytes. The payload itself is never on the wire. |
 | `chart_type` | Chart records only: the detected chart-XML element — `bar`, `line`, `pie`, `scatter`, `area`, `bubble`, `radar`, or `other` for unrecognised / compound charts. |
-| `series_refs` | Chart records only: every `<c:f>` formula ref of the chart part, entity-decoded, flattened in document order (series names, categories, values); an empty carrier (`<c:f></c:f>`, `<c:f/>`) is an empty string. Empty for a chart of inline literal data. The refs follow structural edits (the chart `<c:f>` sweep), so after a rename or a row / column edit on the sheet they name the record spells the respelled part. |
+| `series_refs` | Chart records only: every `<c:f>` formula ref of the chart part, entity-decoded, flattened in document order (series names, categories, values); an empty carrier (`<c:f></c:f>`, `<c:f/>`) is an empty string; the walk is element-agnostic, so a linked chart title's `<c:f>` rides in the same list. Empty for a chart of inline literal data. The refs follow structural edits (the chart `<c:f>` sweep), so after a rename or a row / column edit on the sheet they name the record spells the respelled part. |
 
 Sheet selection follows the read family — `--sheet` / `--name` narrow to
 one sheet, `--all-sheets` / `--sheet-glob` widen, the default streams

@@ -251,8 +251,9 @@ for p in zlsx.pivots("report.xlsx"):       # the `zlsx pivots` records, as dicts
 A structural edit carries the rewriters the CLI's `insert-row` family
 carries — formulas in every dialect (A1, 3D, R1C1, structured
 references), defined names, hyperlinks, DV / CF, merges, panes,
-autoFilter, tables, drawings, comments, `<xm:f>` extensions, a hosted
-pivot's rectangle and a cache's source range (a source whose content
+autoFilter, tables, drawings, comments, `<xm:f>` extensions, chart
+`<c:f>` series formulas, a hosted pivot's rectangle and a cache's source
+range (a source whose content
 changes is rebuilt during the edit and committed by `save`). One hole
 the row inherits from the Zig editor: `rename_sheet` / `delete_sheet`
 do not rewrite a pivot cache's `worksheetSource@sheet`, so a source
@@ -520,8 +521,9 @@ with zlsx.write("out.xlsx") as w:
   `delete_column` / `add_sheet` / `rename_sheet` / `delete_sheet` /
   `rename_table_column`, with every cross-part rewriter (formulas in every
   dialect, defined names, hyperlinks, DV / CF, merges, panes, autoFilter,
-  tables, drawings, comments, `<xm:f>` extensions, pivot locations and
-  sources); what cannot be kept consistent refuses with a typed
+  tables, drawings, comments, `<xm:f>` extensions, chart `<c:f>` series
+  formulas, pivot locations and sources); what cannot be kept consistent
+  refuses with a typed
   `ZlsxRefusal` — see *Structural edits & pivots*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts

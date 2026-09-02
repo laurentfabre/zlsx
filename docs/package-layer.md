@@ -172,8 +172,11 @@ function pointer to keep the graph a DAG.
   `zlsx_pkg.pivots.collect` over a `PartStore` plus its parsed
   `typed_parts.workbook_xml` view): tables with host
   sheet and output rectangle, caches with their source resolved to the
-  sheet it reads from, field schema, records part. Never emitted or
-  rewritten; the parts stay byte-preserved through every edit.
+  sheet it reads from, field schema, records part. Moved by the
+  structural edits — a hosted rectangle's `location@ref` (S7a), a
+  source's range with the cache rebuilt and its consumers re-laid
+  (S7b), the provable source-column edits (S7c) — the rest refusing per
+  case; `docs/plans/surface-matrix.md` §1 is the per-surface truth.
 - **Per-part inferred metadata refresh** — `replacePart` /
   `addPart` install fresh bytes for the touched part(s), but
   metadata derived from `[Content_Types].xml` or `_rels/*.rels`

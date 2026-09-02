@@ -655,11 +655,11 @@ fn extractSeriesRefs(
 /// One `<{c}:f>` formula carrier of a chart part, as byte offsets
 /// into the part: `body_start..body_end` is the element's raw inner
 /// text (still entity-encoded — the rewrite boundary decodes on the
-/// way in and re-escapes on the way out), `next` is where the scan
-/// resumes. A self-closing `<c:f/>` is an empty carrier
-/// (`body_start == body_end`), the schema-equivalent spelling of
-/// `<c:f></c:f>`.
-pub const ChartFormula = struct { body_start: usize, body_end: usize, next: usize };
+/// way in and re-escapes on the way out); the walk itself resumes
+/// past the carrier's close. A self-closing `<c:f/>` is an empty
+/// carrier (`body_start == body_end`), the schema-equivalent
+/// spelling of `<c:f></c:f>`.
+pub const ChartFormula = struct { body_start: usize, body_end: usize };
 
 /// The `<{c}:f>` carrier walk of one chart part — the ONE definition
 /// of "a chart formula carrier" for the anchors read
@@ -679,18 +679,28 @@ pub const ChartFormula = struct { body_start: usize, body_end: usize, next: usiz
 ///
 /// What the walk cannot read whole is decided by `mode`, the
 /// `WalkMode` split every drawing walker makes. `.lenient` is the
-/// historical read: an opened carrier that never closes ends the
-/// walk, a body holding markup is returned as it lies. `.strict` is
-/// the S2 `<xm:f>` rule (`sheet_edit.nextXmFormula`): a carrier with
-/// no close, a body with a `<` in it (the schema's element text is a
-/// simple type — a `<` can only open a nested element, a comment or
-/// a CDATA section, none of which a byte-preserving splice can carry
-/// through), or an unterminated comment / CDATA / PI holding carrier
-/// text (live or decoy is then undecidable) refuses
-/// `error.MalformedChartXml`. A prefix the 128-byte needle scratch
-/// cannot spell is a part strict cannot scan (refused) and lenient
-/// ends on; an alternate prefix that long is dropped, as the read
-/// always dropped it.
+/// historical read: an opened carrier that never closes (a start tag
+/// truncated at the end of the part included) ends the walk, a body
+/// holding markup is returned as it lies. `.strict` is the S2 `<xm:f>`
+/// rule (`sheet_edit.nextXmFormula`), refusing `error.MalformedChartXml`
+/// for exactly four shapes: a carrier with no close (the truncated
+/// start tag included); a body with a `<` in it (the schema's element
+/// text is a simple type — a `<` can only open a nested element, a
+/// comment or a CDATA section, none of which a byte-preserving splice
+/// can carry through); an unterminated comment / CDATA / PI with a
+/// carrier START TAG — the exact QName, not any `<c:f`-prefixed
+/// element such as `<c:formatCode>` — inside it, where live or decoy
+/// is undecidable (a trailing unterminated region holding no carrier
+/// tag refuses nothing, and the probe is one forward pass — Codex
+/// CF-PERF-101 / CF-REL-101); and a chart-namespace prefix longer
+/// than the 125-byte needle scratch, which strict cannot scan
+/// (lenient ends on it, serving nothing, as the read always did; an
+/// alternate prefix that long is dropped). A part that binds the
+/// chart namespace as its DEFAULT namespace (`<chartSpace
+/// xmlns="…/chart"><f>`) has no prefixed carrier and is walked by
+/// neither mode — the prefix resolver reads `xmlns:` bindings only,
+/// the documented limit of every drawing walker; no known producer
+/// spells a chart that way.
 pub const ChartFormulaWalk = struct {
     xml: []const u8,
     c_prefix: []const u8,
@@ -755,21 +765,28 @@ pub const ChartFormulaWalk = struct {
         else
             self.primary != null;
         const open = (if (use_primary) self.primary else self.alt) orelse {
-            // No live carrier ahead. Strict still asks whether carrier
-            // TEXT sits inside an unterminated comment / CDATA / PI
-            // beyond the scan position — live or decoy is undecidable
-            // there, the S2 rule refuses rather than guess.
-            const carrier_text_ahead = std.mem.indexOfPos(u8, xml, self.i, primary_open) != null or
-                (alt_open != null and std.mem.indexOfPos(u8, xml, self.i, alt_open.?) != null);
-            if (mode == .strict and carrier_text_ahead and unterminatedSkipRegionFrom(xml, self.i)) {
+            // No live carrier ahead. Strict still asks whether a
+            // carrier START TAG sits inside an unterminated comment /
+            // CDATA / PI beyond the scan position — live or decoy is
+            // undecidable there, the S2 rule refuses rather than guess.
+            // Strict only: lenient never asked, and the read's public
+            // lenient path must not pay for the pass.
+            if (mode == .strict and unterminatedRegionHoldsCarrier(xml, self.i, primary_open, alt_open)) {
                 return error.MalformedChartXml;
             }
             self.i = xml.len;
             return null;
         };
+        if (open.truncated) {
+            // `<c:f` or `<c:f ` as the part's last bytes: a start tag
+            // with no `>` is a carrier with no close.
+            if (mode == .strict) return error.MalformedChartXml;
+            self.i = xml.len;
+            return null;
+        }
         if (open.self_closing) {
             self.i = open.content_start;
-            return .{ .body_start = open.content_start, .body_end = open.content_start, .next = open.content_start };
+            return .{ .body_start = open.content_start, .body_end = open.content_start };
         }
         const close_needle = if (use_primary) primary_close else alt_close.?;
         const closed = nextCarrierClose(xml, open.content_start, close_needle) orelse {
@@ -782,7 +799,7 @@ pub const ChartFormulaWalk = struct {
         const body = xml[open.content_start..closed.at];
         if (mode == .strict and std.mem.indexOfScalar(u8, body, '<') != null) return error.MalformedChartXml;
         self.i = closed.end;
-        return .{ .body_start = open.content_start, .body_end = closed.at, .next = closed.end };
+        return .{ .body_start = open.content_start, .body_end = closed.at };
     }
 
     fn unscannable(self: *ChartFormulaWalk, mode: WalkMode) error{MalformedChartXml}!?ChartFormula {
@@ -792,14 +809,39 @@ pub const ChartFormulaWalk = struct {
     }
 };
 
-/// Is there a comment / CDATA / PI opened at or after `from` that
-/// never closes? The regions are walked in order, each terminated one
-/// stepped over whole, so a `-->` inside a CDATA section is CDATA
-/// text, not a comment close.
-fn unterminatedSkipRegionFrom(xml: []const u8, from: usize) bool {
+/// Does a comment / CDATA / PI opened at or after `from` never close,
+/// with a carrier start tag (the exact QName under either needle)
+/// inside it? One forward pass over `<`: each terminated region is
+/// stepped whole from its own opener — so a `-->` inside a CDATA
+/// section is CDATA text — and an unterminated one swallows the rest
+/// of the part, so the question reduces to "does the swallowed tail
+/// spell a carrier tag". Linear in the part (the region-by-region
+/// rescan it replaces was quadratic in the number of trailing
+/// regions — Codex CF-PERF-101).
+fn unterminatedRegionHoldsCarrier(xml: []const u8, from: usize, primary_open: []const u8, alt_open: ?[]const u8) bool {
     var pos = from;
-    while (nextSkipOpenBefore(xml, pos, xml.len)) |at| {
-        pos = skipRegionCloseFrom(xml, at) orelse return true;
+    while (std.mem.indexOfScalarPos(u8, xml, pos, '<')) |lt| {
+        // `skipRegionCloseFrom` answers `lt + 1` for a `<` that opens
+        // no region and null only for an unterminated one.
+        pos = skipRegionCloseFrom(xml, lt) orelse {
+            return carrierTagFrom(xml, lt, primary_open) or
+                (alt_open != null and carrierTagFrom(xml, lt, alt_open.?));
+        };
+    }
+    return false;
+}
+
+/// A carrier start tag at or after `from`: the needle followed by a
+/// name terminator (whitespace, `/`, `>`) — or by nothing, the tag
+/// truncated at the end of the part. `<c:formatCode` is not one.
+fn carrierTagFrom(xml: []const u8, from: usize, needle: []const u8) bool {
+    var pos = from;
+    while (std.mem.indexOfPos(u8, xml, pos, needle)) |at| {
+        const after = at + needle.len;
+        if (after >= xml.len) return true;
+        const c = xml[after];
+        if (c == '>' or c == '/' or c == ' ' or c == '\t' or c == '\n' or c == '\r') return true;
+        pos = at + 1;
     }
     return false;
 }
@@ -809,25 +851,32 @@ const CarrierOpen = struct {
     content_start: usize,
     /// `<c:f/>` — an empty carrier; `content_start` is past the `>`.
     self_closing: bool,
+    /// The start tag is the part's last bytes (`<c:f`, `<c:f ` with no
+    /// `>` after it): a carrier with no close. `content_start` and
+    /// `self_closing` are meaningless then.
+    truncated: bool,
 };
 const CarrierClose = struct { at: usize, end: usize };
 
 /// The next live `<{p}:f>` open at or after `start`: the exact QName
 /// (a byte terminating the name follows — whitespace, `/` or `>`),
 /// whitespace tolerated before the tag's `>` (Codex #214 r5 REL-502).
-/// A `/` before the `>` is the self-closing spelling.
+/// A `/` before the `>` is the self-closing spelling; a tag the part
+/// ends inside is returned `truncated` rather than dropped (Codex
+/// CF-REL-101).
 fn nextCarrierOpen(xml: []const u8, start: usize, open_needle: []const u8) ?CarrierOpen {
     var pos = start;
     while (findLiveMarkup(xml, pos, open_needle)) |at| {
         const after = at + open_needle.len;
-        if (after >= xml.len) return null;
+        if (after >= xml.len) return .{ .at = at, .content_start = xml.len, .self_closing = false, .truncated = true };
         const c = xml[after];
         if (!(c == '>' or c == '/' or c == ' ' or c == '\t' or c == '\n' or c == '\r')) {
             pos = at + 1;
             continue;
         }
-        const end = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse return null;
-        return .{ .at = at, .content_start = end + 1, .self_closing = xml[end - 1] == '/' };
+        const end = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse
+            return .{ .at = at, .content_start = xml.len, .self_closing = false, .truncated = true };
+        return .{ .at = at, .content_start = end + 1, .self_closing = xml[end - 1] == '/', .truncated = false };
     }
     return null;
 }
@@ -3457,14 +3506,14 @@ test "ChartFormulaWalk: one carrier walk for the read and the sweep — self-clo
     var walk = ChartFormulaWalk.init(sc);
     const f0 = (try walk.next(.strict)).?;
     try std.testing.expectEqual(f0.body_start, f0.body_end);
-    try std.testing.expectEqual(@as(usize, "<c:chartSpace><c:f/>".len), f0.next);
+    try std.testing.expectEqual(@as(usize, "<c:chartSpace><c:f/>".len), f0.body_start);
     const f1 = (try walk.next(.strict)).?;
     try std.testing.expectEqual(f1.body_start, f1.body_end);
     const f2 = (try walk.next(.strict)).?;
     try std.testing.expectEqual(f2.body_start, f2.body_end);
     const f3 = (try walk.next(.strict)).?;
     try std.testing.expectEqualStrings("R!A1", sc[f3.body_start..f3.body_end]);
-    try std.testing.expectEqualStrings("</c:chartSpace>", sc[f3.next..]);
+    try std.testing.expectEqualStrings("</c:f></c:chartSpace>", sc[f3.body_end..]);
     try std.testing.expectEqual(@as(?ChartFormula, null), try walk.next(.strict));
     try std.testing.expectEqual(@as(?ChartFormula, null), try walk.next(.strict));
 
@@ -3511,6 +3560,29 @@ test "ChartFormulaWalk: one carrier walk for the read and the sweep — self-clo
     const trailing_refs = try extractSeriesRefs(a, trailing_open, "c", null, .strict);
     defer a.free(trailing_refs);
     try std.testing.expectEqual(@as(usize, 1), trailing_refs.len);
+    // The probe keys on the exact QName: `<c:formatCode>` — which
+    // follows the last carrier of nearly every chart Excel writes —
+    // is not carrier text, so a trailing unterminated region after it
+    // refuses nothing (Codex CF-REL-101).
+    const format_code_tail = "<c:chartSpace><c:f>R!A1</c:f><c:numCache><c:formatCode>General</c:formatCode></c:numCache><!-- x";
+    const format_code_refs = try extractSeriesRefs(a, format_code_tail, "c", null, .strict);
+    defer a.free(format_code_refs);
+    try std.testing.expectEqual(@as(usize, 1), format_code_refs.len);
+    try std.testing.expectEqualStrings("R!A1", format_code_refs[0]);
+    // …while a carrier tag inside the region still does, whichever
+    // terminator follows it — including the end of the part.
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, "<c:chartSpace><c:f>R!A1</c:f><c:formatCode/><!-- <c:f", "c", null, .strict));
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, "<c:chartSpace><c:f>R!A1</c:f><!-- <c:f />", "c", null, .strict));
+    // A start tag the part ends inside is a carrier with no close:
+    // strict refuses, lenient ends with what came before (it used to
+    // be dropped in both modes).
+    for ([_][]const u8{ "<c:chartSpace><c:f>R!A1</c:f><c:f", "<c:chartSpace><c:f>R!A1</c:f><c:f " }) |truncated| {
+        try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, truncated, "c", null, .strict));
+        const kept = try extractSeriesRefs(a, truncated, "c", null, .lenient);
+        defer a.free(kept);
+        try std.testing.expectEqual(@as(usize, 1), kept.len);
+        try std.testing.expectEqualStrings("R!A1", kept[0]);
+    }
 
     // `init` resolves the part's own binding: a Strict-namespace chart
     // under a non-canonical prefix, and a part binding both URIs.
@@ -3528,4 +3600,50 @@ test "ChartFormulaWalk: one carrier walk for the read and the sweep — self-clo
     try std.testing.expectEqualStrings("T!A1", both[b1.body_start..b1.body_end]);
     try std.testing.expectEqualStrings("S!B1", both[b2.body_start..b2.body_end]);
     try std.testing.expectEqual(@as(?ChartFormula, null), try bw.next(.strict));
+
+    // The documented limits, pinned so they stay true: a chart prefix
+    // the needle scratch cannot spell is a part strict cannot scan
+    // (refused) and lenient serves nothing on, as the read always did;
+    // a part binding the chart namespace as its DEFAULT namespace has
+    // no prefixed carrier for either mode.
+    const long_prefix = "p" ** 130;
+    const long_bound = "<" ++ long_prefix ++ ":chartSpace xmlns:" ++ long_prefix ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><" ++ long_prefix ++ ":f>R!A1</" ++ long_prefix ++ ":f></" ++ long_prefix ++ ":chartSpace>";
+    try std.testing.expectError(error.MalformedDrawingXml, extractSeriesRefs(a, long_bound, long_prefix, null, .strict));
+    const long_len = try extractSeriesRefs(a, long_bound, long_prefix, null, .lenient);
+    defer a.free(long_len);
+    try std.testing.expectEqual(@as(usize, 0), long_len.len);
+    const default_ns = "<chartSpace xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><f>Data!$A$1</f></chartSpace>";
+    var dw = ChartFormulaWalk.init(default_ns);
+    try std.testing.expectEqual(@as(?ChartFormula, null), try dw.next(.strict));
+}
+
+test "ChartFormulaWalk: the strict tail probe is one pass — a part with many trailing comments walks in linear time (CF-PERF-101)" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // 200 000 terminated comments after a `<c:formatCode>` (the shape
+    // that made the old region-by-region probe rescan the remainder
+    // per region: 23 s for 80 000 comments in ReleaseFast). The bound
+    // is generous for Debug and CI noise; the quadratic shape needs
+    // minutes here, so it is not a flaky pin.
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer xml.deinit(a);
+    try xml.appendSlice(a, "<c:chartSpace><c:f>R!A1</c:f><c:numCache><c:formatCode>General</c:formatCode></c:numCache>");
+    for (0..200_000) |_| try xml.appendSlice(a, "<!-- x -->");
+    try xml.appendSlice(a, "</c:chartSpace>");
+    const started = std.Io.Clock.now(.awake, io).nanoseconds;
+    const refs = try extractSeriesRefs(a, xml.items, "c", null, .strict);
+    defer a.free(refs);
+    const elapsed_ns = std.Io.Clock.now(.awake, io).nanoseconds - started;
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("R!A1", refs[0]);
+    try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
+    // And the same tail left unterminated: still one pass, still no
+    // carrier tag inside it, still served.
+    xml.items.len -= "</c:chartSpace>".len;
+    try xml.appendSlice(a, "<!-- open");
+    const open_refs = try extractSeriesRefs(a, xml.items, "c", null, .strict);
+    defer a.free(open_refs);
+    try std.testing.expectEqual(@as(usize, 1), open_refs.len);
 }

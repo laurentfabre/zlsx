@@ -366,7 +366,7 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 
 | `-2` (`ZLSX_REFUSED`, `diag.error_name`) | `-1` (`ZLSX_ERROR`, `errbuf`) |
 |---|---|
-| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
+| `RowEditUnsafeForSheet`, `ColEditUnsafeForSheet` — the editor's fold of its pre-flights: inside a hosted pivot's footprint, a host a pivot also reads, a table collapse / header-row delete, an `<xm:f>` carrier the scan cannot read, a chart `<c:f>` carrier the walk cannot read whole | `SheetIndexOutOfRange`, `RowIndexOutOfRange`, `ColumnIndexOutOfRange` (a 0-based `UINT32_MAX` column has no 1-based spelling and is refused before the conversion) |
 | The worksheet transform's own verdicts, from its pre-mutation probe: `RowEditExceedsMaxRow`, `ColEditExceedsMaxCol`, `SplitPaneNotSupported`, `MalformedPaneSplit`, `MalformedSheetXml` | |
 | The sweeps' — a carrier the walkers cannot read or move: `MalformedDrawingXml`, `DrawingCoordinateOverflow`, `MalformedVmlDrawing`, `VmlCoordinateOverflow`, `MalformedCommentsXml`, `MalformedTableXml`, `TableCoordinateOverflow`, `TableCollapseUnsafe`, `TableHeaderRowDeleteUnsafe`, `SqrefCollapseUnsafe` (a delete collapsing EVERY area of a DV/CF `sqref` — S3b slice 6 r4), `PivotEditUnsafe`, `MalformedExtensionXml`, `MalformedChartXml` (a chart `<c:f>` series carrier the sweep cannot read whole — the chart sweep, the `MalformedExtensionXml` shape: refused before the first mutation, folded into the two `*UnsafeForSheet` names on row / column edits), `MalformedSheetRels`, `MalformedWorkbookRels`, `MalformedDrawingRels`, `MissingSheetPart`, `NoSheetData` (and the workbook layer's `LastSheetUndeletable` / `SheetNameInUse`, should a path surface them unfolded) | |
 | `CannotDeleteLastSheet` | `InvalidSheetName`, `InvalidTableColumnName` — Excel would not take the name |
@@ -509,7 +509,9 @@ without either macro.
     comments, table — that the store cannot materialise is that
     carrier's own verdict (`Workbook.carrierPart`: `MalformedDrawingXml`
     / `MalformedVmlDrawing` / `MalformedCommentsXml` /
-    `MalformedTableXml`), as the worksheet and pivot parts already were;
+    `MalformedTableXml` / `MalformedChartXml` — the chart sweep's
+    preflight walks every chart part the same way), as the worksheet and
+    pivot parts already were;
     `OutOfMemory` / `ZipBombSuspected` keep theirs. The three
     identifier increments of `addSheet` are checked
     (`IdSpaceExhausted`).
@@ -745,16 +747,32 @@ walk, decode, rewrite, byte-preserving splice, all-or-nothing refusal
 by `Workbook.preflightChartFormulas` BEFORE the first mutation), so
 `series_refs` spell the new sheet name after a rename, shifted rows
 after an insert on the sheet they name, `#REF!` after that sheet's
-delete, and the rest of the chart part is byte-identical. The carrier
-walk (`drawings.ChartFormulaWalk`) and the body acceptance
+delete (a qualified reference into it; a carrier already at
+`Sheet!#REF!` — an error token, not a reference — keeps its qualifier
+under a rename and a delete, the rewriter's single-qualifier rule on
+every carrier, cell formulas included), and the rest of the chart part
+is byte-identical. The parts walked are every part of the chart
+content type, every `xl/charts/chart<N>.xml`, and every chart-typed
+relationship target of a drawing — the edge this read follows — so the
+two enumerations cannot disagree on a chart the read serves. The
+carrier walk (`drawings.ChartFormulaWalk`) and the body acceptance
 (`Workbook.decodeChartFormulaBody`) are shared with this read, so what
 the read serves is exactly what the sweep moves; a carrier the walk
-cannot read whole is this read's `MalformedDrawingXml` and the edit's
-`MalformedChartXml` (§10). Pivot charts ride too — their carriers name
-the pivot's host cells and move with the hosted rectangle (S7a) — while
-`<c:pivotSource><c:name>` (a `[book]sheet!pivot` locator, not a formula)
-keeps its spelling, as the cache's `worksheetSource@sheet` does under a
-rename. Repeated
+cannot read whole — no close (a start tag truncated at the end of the
+part included), markup in a body, a carrier start tag inside an
+unterminated comment / CDATA / PI, a chart-namespace prefix longer than
+the walk's needle scratch — is this read's `MalformedDrawingXml` and
+the edit's `MalformedChartXml` (§10). Pivot charts ride too — their
+carriers name the pivot's host cells and shift with the hosted
+rectangle (S7a); a re-layout that changes the rectangle's extent
+(S7b-5, S7c-2) is not re-derived into the chart, Excel's refresh-on-load
+rebuilds the series — while `<c:pivotSource><c:name>` (a
+`[book]sheet!pivot` locator, not a formula) keeps its spelling, as the
+cache's `worksheetSource@sheet` does under a rename. Not walked, by
+design: chartex parts (`<cx:f>`), the `c15:` data-label range
+extension, and a part binding the chart namespace as its default
+namespace (`<chartSpace xmlns="…/chart"><f>` — no known producer
+spells one). Repeated
 reads stay bounded: the drawing walkers used to resolve every part
 name along the relationship chain into the store's lifetime arena —
 the S3B-MEM-603 shape, unbounded growth for a long-lived editor
