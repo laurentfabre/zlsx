@@ -75,6 +75,7 @@ __all__ = [
     "pivots",
     "defined_names",
     "conditional_formats",
+    "anchors",
     "FormulaSpec",
     "RecalcOptions",
     "RecalcReport",
@@ -3870,6 +3871,66 @@ class Editor:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
 
+    def anchors(self) -> list[dict]:
+        """The workbook's anchored images and charts as ``zlsx anchors``
+        reports them: one ``{"kind": "image_anchor", …}`` record per
+        anchored image and one ``{"kind": "chart_anchor", …}`` record
+        per anchored chart — sheets in workbook order, a sheet's images
+        before its charts, each class in drawing-document order —
+        parsed from the same NDJSON bytes the CLI prints (docs/cli.md,
+        "anchors"). Each record is the anchor geometry (``anchor`` in
+        ``two_cell`` / ``one_cell`` / ``absolute``, ``from`` / ``to``
+        1-based with EMU offsets, ``absolute`` ``{x, y, cx, cy}`` in
+        EMUs) and where the payload lives (``part``; an image's
+        ``bytes`` count; a chart's ``chart_type`` and entity-decoded
+        ``series_refs``), never the payload: image bytes and chart XML
+        stay in their parts. Read over the editor's current parts:
+        structural edits and the drawing sweeps they carry (a row
+        insert moving an anchor, a rename renaming ``sheet``) are
+        visible immediately; staged cell writes never touch a drawing.
+        Chart parts are byte-preserved through every edit today, so a
+        chart's ``series_refs`` keep spelling what the part holds — an
+        old sheet name after a rename, pre-edit rows after an insert;
+        the read reports the bytes faithfully. ``[]`` for a workbook
+        without anchored objects. An inventory that cannot be served
+        faithfully raises
+        :class:`ZlsxRefusal` (``MalformedWorkbookXml`` for a sheet list
+        the strict workbook read cannot prove, ``MalformedDrawingXml``
+        for a drawing graph the strict walk cannot read whole,
+        ``DrawingOnUnlistedSheet`` for an anchor on a worksheet part the
+        workbook does not list) rather than return a record that lies
+        or a list with a hole. An archive past the decompression caps
+        fails at open."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_ANCHORS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_anchors_ndjson "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        import json
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = _ffi.lib.zlsx_editor_anchors_ndjson(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"zlsx_editor_anchors_ndjson: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
+
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
 
@@ -4272,6 +4333,14 @@ def conditional_formats(path: Union[str, Path]) -> list[dict]:
     before returning."""
     with Editor(path) as ed:
         return ed.conditional_formats()
+
+
+def anchors(path: Union[str, Path]) -> list[dict]:
+    """The anchored images and charts of the workbook at ``path`` —
+    :meth:`Editor.anchors` over a fresh editor, closed before
+    returning."""
+    with Editor(path) as ed:
+        return ed.anchors()
 
 
 # ─── Embeddings (E5) ─────────────────────────────────────────────────

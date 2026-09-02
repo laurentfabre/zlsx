@@ -110,25 +110,42 @@ pub const Error = error{
 /// S3B-ERR-602).
 pub const CollectError = Error || error{ ZipBombSuspected, MissingSheetPart };
 
-/// Collect every rule of every workbook sheet. A read this module
-/// cannot serve faithfully refuses whole — even for a sheet the CLI's
-/// selection would exclude: the inventory is proven whole before
-/// selection and pagination apply, the `anchors` rule. A sheet the
-/// workbook itself cannot place (a dangling relationship, a part the
-/// archive does not hold) passes through as `Workbook`'s own error.
-pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!ConditionalFormats {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const a = arena.allocator();
+/// The workbook side of `Error` — what the strict `xl/workbook.xml`
+/// and `workbook.xml.rels` readers raise. Narrower than `Error` so a
+/// consumer that only needs the sheet inventory (the anchors
+/// collector) inherits no sheet-part verdict it can never produce.
+pub const WorkbookError = error{ MalformedWorkbookXml, OutOfMemory };
 
-    // The AUTHORITATIVE sheet inventory is the strict namespace- and
-    // depth-aware read of `xl/workbook.xml` (`scanWorkbookSheets`) —
-    // not the lenient lexical projection, which counts `<sheet>` tags
-    // document-wide, drops carrier-less entries silently, and only
-    // spells the literal `r:id` (Codex #215 r5 SEC-502, r8 REL-801:
-    // a ghost under `<extLst>` is excluded here, a real entry missing
-    // a carrier refuses, and a valid alternate relationships prefix
-    // is an identity).
+/// What `resolveSheets` can raise: the workbook verdicts plus the
+/// archive-wide decompression caps, which keep their name across
+/// every boundary.
+pub const InventoryError = WorkbookError || error{ZipBombSuspected};
+
+/// The strict sheet inventory of a workbook: every `<sheet>` entry
+/// the strict read proves, decoded and placed. Both slices live in
+/// the arena `resolveSheets` was handed and are parallel — `parts[i]`
+/// is the worksheet part `names[i]` reaches.
+pub const SheetInventory = struct {
+    /// Decoded sheet names, workbook order.
+    names: []const []const u8,
+    /// The part each entry's relationship reaches, already probed
+    /// (materialised) in the store.
+    parts: []const []const u8,
+};
+
+/// The AUTHORITATIVE sheet inventory, shared by every read that
+/// attributes per-sheet records (this module's rules, the anchors
+/// collector): the strict namespace- and depth-aware read of
+/// `xl/workbook.xml` (`scanWorkbookSheets`) — not the lenient lexical
+/// projection, which counts `<sheet>` tags document-wide, drops
+/// carrier-less entries silently, and only spells the literal `r:id`
+/// (Codex #215 r5 SEC-502, r8 REL-801: a ghost under `<extLst>` is
+/// excluded here, a real entry missing a carrier refuses, and a valid
+/// alternate relationships prefix is an identity) — then each entry
+/// resolved to its part strictly. Names and parts land in `a` (the
+/// caller's view arena); scratch lives on `gpa` and is reclaimed
+/// before return.
+pub fn resolveSheets(gpa: Allocator, a: Allocator, wb: *workbook_mod.Workbook) InventoryError!SheetInventory {
     var strict_sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
     defer strict_sheets.deinit(gpa);
     {
@@ -227,6 +244,24 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!Conditio
         if (g.found_existing) return error.MalformedWorkbookXml;
         sheet_parts[i] = name;
     }
+    return .{ .names = sheet_names, .parts = sheet_parts };
+}
+
+/// Collect every rule of every workbook sheet. A read this module
+/// cannot serve faithfully refuses whole — even for a sheet the CLI's
+/// selection would exclude: the inventory is proven whole before
+/// selection and pagination apply, the `anchors` rule. A sheet the
+/// workbook itself cannot place (a dangling relationship, a part the
+/// archive does not hold) passes through as `Workbook`'s own error.
+pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!ConditionalFormats {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const inventory = try resolveSheets(gpa, a, wb);
+    const sheet_names = inventory.names;
+    const sheet_parts = inventory.parts;
+    const sheet_count = sheet_names.len;
 
     var records: std.ArrayListUnmanaged(Record) = .empty;
     for (0..sheet_count) |idx| {
@@ -1230,7 +1265,7 @@ const StrictSheet = struct { name: []const u8, rid: []const u8 };
 /// under `xmlns:q="…relationships"`) IS an entry — sheet identities
 /// come from this read, not from the lenient projection that only
 /// spells `r:id` (Codex #215 r8 REL-801).
-fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet)) Error!void {
+fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet)) WorkbookError!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, sheets_wrap, other };
     const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize };
@@ -1317,7 +1352,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
 
         const prefix_mark = scope.mark();
         enterElementScope(gpa, &scope, qname, attrs) catch |e| switch (e) {
-            error.OutOfMemory => return e,
+            error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedWorkbookXml,
         };
         var elem_main = if (frames.items.len == 0)
@@ -1341,18 +1376,18 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                 }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     elem_main = bindsMainNs(gpa, attr.value) catch |e| switch (e) {
-                        error.OutOfMemory => return e,
+                        error.OutOfMemory => return error.OutOfMemory,
                         else => return error.MalformedWorkbookXml,
                     };
                 } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
                     const main = bindsMainNs(gpa, attr.value) catch |e| switch (e) {
-                        error.OutOfMemory => return e,
+                        error.OutOfMemory => return error.OutOfMemory,
                         else => return error.MalformedWorkbookXml,
                     };
                     if (main) return error.MalformedWorkbookXml;
                     const prefix = attr.name["xmlns:".len..];
                     const is_rel = bindsRelNs(gpa, attr.value) catch |e| switch (e) {
-                        error.OutOfMemory => return e,
+                        error.OutOfMemory => return error.OutOfMemory,
                         else => return error.MalformedWorkbookXml,
                     };
                     if (frames.items.len == 0) {
@@ -1445,7 +1480,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
 /// malformed region reads as "absent" for the caller's orelse-refusal
 /// — but OutOfMemory PROPAGATES (the allocation-failure sweep caught
 /// a `catch null` swallowing it into a spurious refusal).
-fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
+fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) WorkbookError!?[]const u8 {
     return uniqueAttr(a, attrs, key) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -1460,7 +1495,7 @@ fn wbAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
 /// attrs refuse), an exact `TargetMode` spelling when present, unique
 /// STRICTLY-DECODED ids, and the store's decoded id sequence equal to
 /// the strict one — so `relById`'s first match is THE match.
-fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.Relationship) Error!void {
+fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.Relationship) WorkbookError!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, other };
     const Frame = struct { name: []const u8, kind: Kind, pkg_default: bool, prefix_mark: usize };
@@ -1546,7 +1581,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
 
         const prefix_mark = scope.mark();
         enterElementScope(gpa, &scope, qname, attrs) catch |e| switch (e) {
-            error.OutOfMemory => return e,
+            error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedWorkbookXml,
         };
         var elem_pkg = if (frames.items.len == 0)
@@ -1565,12 +1600,12 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 }
                 if (std.mem.eql(u8, attr.name, "xmlns")) {
                     elem_pkg = bindsNs(gpa, attr.value, isPkgRelsNs) catch |e| switch (e) {
-                        error.OutOfMemory => return e,
+                        error.OutOfMemory => return error.OutOfMemory,
                         else => return error.MalformedWorkbookXml,
                     };
                 } else if (std.mem.startsWith(u8, attr.name, "xmlns:")) {
                     const pkg = bindsNs(gpa, attr.value, isPkgRelsNs) catch |e| switch (e) {
-                        error.OutOfMemory => return e,
+                        error.OutOfMemory => return error.OutOfMemory,
                         else => return error.MalformedWorkbookXml,
                     };
                     if (pkg) return error.MalformedWorkbookXml;
@@ -1603,7 +1638,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             // `TargetMode` spelling must agree with the cached enum.
             {
                 const type_dec = decodeRelText(gpa, type_raw) catch |e| switch (e) {
-                    error.OutOfMemory => return e,
+                    error.OutOfMemory => return error.OutOfMemory,
                     else => return error.MalformedWorkbookXml,
                 };
                 defer gpa.free(type_dec);
@@ -1611,7 +1646,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
             }
             {
                 const target_dec = decodeRelText(gpa, target_raw) catch |e| switch (e) {
-                    error.OutOfMemory => return e,
+                    error.OutOfMemory => return error.OutOfMemory,
                     else => return error.MalformedWorkbookXml,
                 };
                 defer gpa.free(target_dec);
@@ -1623,7 +1658,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 // valid spelling of the enum and a raw compare refused
                 // it (Codex #215 r23 REL-2301).
                 const mode_dec = decodeRelText(gpa, mode) catch |e| switch (e) {
-                    error.OutOfMemory => return e,
+                    error.OutOfMemory => return error.OutOfMemory,
                     else => return error.MalformedWorkbookXml,
                 };
                 defer gpa.free(mode_dec);
@@ -1638,7 +1673,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
                 return error.MalformedWorkbookXml;
             }
             const id = decodeRelText(gpa, id_raw) catch |e| switch (e) {
-                error.OutOfMemory => return e,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => return error.MalformedWorkbookXml,
             };
             errdefer gpa.free(id);
@@ -1667,7 +1702,7 @@ fn verifyWorkbookRels(gpa: Allocator, xml: []const u8, rels: []const store_mod.R
 /// Strict entities-only decode for relationship ids in the verifier —
 /// the sheet-side carrier decode with the workbook error name folded
 /// by the caller.
-fn decodeRelText(a: Allocator, raw: []const u8) Error![]u8 {
+fn decodeRelText(a: Allocator, raw: []const u8) WorkbookError![]u8 {
     if (std.mem.indexOfScalar(u8, raw, '<') != null) return error.MalformedWorkbookXml;
     const decoded = formula_mod.decode.decodeEntities(a, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1679,7 +1714,7 @@ fn decodeRelText(a: Allocator, raw: []const u8) Error![]u8 {
     return decoded;
 }
 
-fn decodeSheetName(a: Allocator, raw: []const u8) Error![]u8 {
+fn decodeSheetName(a: Allocator, raw: []const u8) WorkbookError![]u8 {
     const decoded = formula_mod.decode.decodeAt(a, .sheet_name, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedWorkbookXml,

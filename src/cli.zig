@@ -4473,7 +4473,7 @@ fn runAnchorsCommand(
         return openFailureExit(e);
     };
     defer wb.deinit();
-    var view = zlsx_pkg.anchors_ndjson.collect(alloc, &wb.store, &wb.workbook) catch |e| {
+    var view = zlsx_pkg.anchors_ndjson.collect(alloc, &wb) catch |e| {
         try err.print("zlsx: cannot read anchors in '{s}': {s}\n", .{ args.file, @errorName(e) });
         try err.flush();
         return 2;

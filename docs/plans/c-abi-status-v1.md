@@ -678,3 +678,105 @@ pass-through). The smoke gate takes the address and `#error`s without
 the macro; the Python leg pins the parsed records, the insert-row
 move, the `between` both-slots move, both refusal shapes and the
 closed-editor error.
+
+## 14. S3b slice 7 — the `anchors` read (2026-09-02)
+
+One export, the slice-2 pattern verbatim:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_anchors_ndjson` (+ `zlsx_buffer_release`) | `_HAS_ANCHORS` | `ZLSX_HAS_ANCHORS` |
+
+**The bytes are the CLI's**: the S3b gate froze the `anchors` record in
+`docs/cli.md`, and the record is text. The export hands over the NDJSON
+bytes of `pkg/anchor_ndjson.zig` — the shared collector + record writer
+`zlsx anchors` prints through — built by
+`c_abi.zig::anchorsNdjsonOwned(alloc, wb)` over the editor's current
+parts: every anchored image (`image_anchor`) and chart
+(`chart_anchor`), sheets in workbook order, a sheet's images before
+its charts, each class in drawing-document order, no selector (the
+CLI's default stream). The record is the anchor geometry and where the
+payload lives — never the payload: image bytes and chart XML stay in
+their parts. A workbook without anchored objects is `ZLSX_OK` with
+`(NULL, 0)`; release with `zlsx_buffer_release`. The allocating
+writer's `WriteFailed` crosses as `-3`, the pivots builder's rule.
+Python parses one JSON object per line (`Editor.anchors()` /
+`zlsx.anchors(path)`).
+
+**The refusals — one new name**: `DrawingOnUnlistedSheet` joins
+`structural_refusals` (§10's vocabulary, `-2`): an anchored object on
+a worksheet part `xl/workbook.xml` does not list, which no record
+could attribute truthfully and no faithful inventory could drop. The
+other two were already there: a sheet list the strict workbook read
+cannot prove is `MalformedWorkbookXml` — the same strict inventory the
+conditional-formats read established (§13), now SHARED as
+`conditional_format_ndjson.resolveSheets` and used by the anchors
+collector in place of its lenient `WorkbookXml.sheets` projection, so
+the ghost-entry, carrier-less-entry, alternate-prefix, decoded-rid,
+verified-rels, duplicate-decoded-name and graph-probe rules of #215 /
+#216 hold for anchors too (a part the archive cannot materialise
+folds there, S3B-ERR-602's shape) — and a drawing graph the strict
+walk cannot read whole is `MalformedDrawingXml` (the `docs/cli.md`
+contract: a dangling, mistyped or external edge, an absent part, an
+anchor whose `from` / `to` / `pos` / `ext` does not parse, an
+unclosed anchor or `<c:f>`, a second live `<drawing>`, a carrier that
+does not decode; and, folded at the one place the walk is entered, a
+drawing-family part the store cannot materialise — the walkers' error
+surface is inferred, so the collector folds it to the closed set
+rather than let the zip layer's own name cross). `collect`'s error
+surface is the closed, compiler-checked `CollectError`: those three
+plus `OutOfMemory` (`-3`) and `ZipBombSuspected` — typed for honesty,
+effectively open-time, the deliberate `-1` §13 records. The export's
+switch is exhaustive with no `else` (S3B-MNT-911's rule).
+
+**Timing**: anchors live in the drawing parts, which structural edits
+and their drawing sweeps rewrite in place before the call returns, and
+the sheet inventory is a fresh strict read of the current
+`xl/workbook.xml` — so a rename renames `sheet`, a row insert on the
+image's sheet moves its `from` / `to` with the grid while the other
+sheet's anchors stay, all visible immediately; staged cell writes never
+touch a drawing, so nothing about this read waits for save. **What the
+read makes observable and this slice does NOT lift**: chart parts are
+byte-preserved through every edit (the surface matrix's charts
+contract; no edit path in `pkg/workbook.zig` touches `xl/charts/*`),
+so a chart's `<c:f>` bodies keep spelling the old sheet name after a
+rename and pre-edit rows after an insert — the read reports those
+bytes faithfully, and both legs pin that. Routing chart `<c:f>`
+carriers through the formula rewriter — the `<xm:f>` precedent (S2:
+carrier scan, decode, rewrite, byte-preserving splice, all-or-nothing
+refusal) — is the recorded S3b follow-up; it is a carrier class of its
+own (pivot charts included), pre-existing and identical on `main`,
+and outside this read's diff. Repeated
+reads stay bounded: the drawing walkers used to resolve every part
+name along the relationship chain into the store's lifetime arena —
+the S3B-MEM-603 shape, unbounded growth for a long-lived editor
+repeating the read per call — and now resolve into the walk's own
+allocator as scratch freed before return (the resolved names were only
+ever lookup keys; the anchors carry the store's part names).
+
+**Tests** (`src/c_abi.zig`, "S3b anchors_ndjson …"): the buffer equal
+to the shared writer's frozen stream (the CLI test's literal) over the
+pkg fixture (all three anchor kinds, a sheet boundary, chart-first
+document order regrouped); the rename AND a row insert visible with no
+save — the rename pinning `sheet`, the insert pinning the edited
+sheet's `from` / `to` moved beside the other sheet's unmoved anchors,
+and the chart's refs pinned UNMOVED under both (the byte-preserved
+contract above — the pin flips when the follow-up lands);
+`(NULL, 0)` on a workbook without drawings with the poison reset;
+`NullOutPointer` / `InvalidInput` as call errors; poisoned outputs
+reset on the refusal and undersized-diag paths, the rejected diag
+byte-for-byte untouched; `-2` with the name in diag + errbuf and
+nothing handed out for a dangling blip edge, a broken SECOND sheet
+behind a servable first record, a bad entity in a sheet-name carrier,
+a series ref that does not decode, an orphan worksheet part
+(`DrawingOnUnlistedSheet`), and a flipped payload byte in a listed
+sheet part (`MalformedWorkbookXml`, the graph probe) versus a drawing
+part (`MalformedDrawingXml`, the walk fold); `statusOf` covers the new
+name; an allocation-failure sweep over `anchorsNdjsonOwned`. In
+`pkg/anchor_ndjson.zig` the collector tests moved to the new
+signature and the lenient-era `relById` pin became a strict-inventory
+pin (a 200-byte rid, an entity-spelled rid, an unbound rid). The
+smoke gate takes the address and `#error`s without the macro; the
+Python leg builds the fixture through the archive (the writer has no
+drawing surface), pins the parsed records, the rename + insert-row
+moves, four refusal shapes and the closed-editor error.

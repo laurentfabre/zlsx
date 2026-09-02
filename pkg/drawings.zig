@@ -167,7 +167,9 @@ pub const ChartAnchor = struct {
 ///
 /// Allocations come from `allocator` for the returned slice; string
 /// slices inside each anchor are arena-borrowed from the PartStore
-/// (valid until the store's `deinit`).
+/// (valid until the store's `deinit`). The walk's own scratch — the
+/// part names it resolves along the relationship chain — is freed
+/// before return; nothing a walk allocates lands in the store.
 pub fn imageAnchors(store: *PartStore, allocator: std.mem.Allocator) ![]ImageAnchor {
     return imageAnchorsIn(store, allocator, .lenient);
 }
@@ -282,10 +284,17 @@ fn collectFromSheet(
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
-    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse {
+    // Resolved names are lookup keys for the walk, nothing more: the
+    // anchors carry the store's own part names. Scratch in the
+    // caller's allocator, freed before return — the store's arena
+    // variant would retain every path for the store's lifetime, and a
+    // long-lived editor repeats this walk per typed read (Codex #216
+    // r1 S3B-MEM-603).
+    const drawing_part_name = (try store.resolveOwned(allocator, sheet_part.name, drawing_target)) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
+    defer allocator.free(drawing_part_name);
     const drawing_part = try store.part(drawing_part_name) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
@@ -387,10 +396,11 @@ fn scanImagesWithTags(
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
-        const image_part_name = (try store.resolve(drawing_part_name, image_target)) orelse {
+        const image_part_name = (try store.resolveOwned(allocator, drawing_part_name, image_target)) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
+        defer allocator.free(image_part_name);
         const image_part = try store.part(image_part_name) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
@@ -459,10 +469,12 @@ fn collectChartsFromSheet(
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
-    const drawing_part_name = (try store.resolve(sheet_part.name, drawing_target)) orelse {
+    // Scratch resolution, the image walk's rule (S3B-MEM-603).
+    const drawing_part_name = (try store.resolveOwned(allocator, sheet_part.name, drawing_target)) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
     };
+    defer allocator.free(drawing_part_name);
     const drawing_part = try store.part(drawing_part_name) orelse {
         if (mode == .strict) return error.MalformedDrawingXml;
         return;
@@ -552,10 +564,11 @@ fn scanChartsWithTags(
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
-        const chart_part_name = (try store.resolve(drawing_part_name, chart_target)) orelse {
+        const chart_part_name = (try store.resolveOwned(allocator, drawing_part_name, chart_target)) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
+        defer allocator.free(chart_part_name);
         const chart_part = try store.part(chart_part_name) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;

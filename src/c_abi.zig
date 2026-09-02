@@ -5942,6 +5942,11 @@ const structural_refusals = [_]anyerror{
     error.MalformedDrawingRels,
     error.MissingSheetPart,
     error.NoSheetData,
+    // The anchors read's own verdict (S3b slice 7): an anchored
+    // object on a worksheet part `xl/workbook.xml` does not list — no
+    // record could carry a truthful `sheet` / `sheet_idx`, and
+    // dropping it would be a partial inventory.
+    error.DrawingOnUnlistedSheet,
     // The workbook's own structure, found broken on the way — a name
     // the workbook holds that no rename argument can fix, a part or a
     // relationship the archive lost (Codex #207 r3 REL-303).
@@ -6403,6 +6408,88 @@ fn conditionalFormatsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workboo
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     zlsx_pkg.conditional_formats_ndjson.writeAll(&out.writer, &view) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
+/// The S3b `anchors` records — one `{"kind":"image_anchor",…}` line
+/// per anchored image and one `{"kind":"chart_anchor",…}` line per
+/// anchored chart, sheets in workbook order, a sheet's images before
+/// its charts, each class in drawing-document order — as a
+/// library-allocated UTF-8 buffer, byte-for-byte what
+/// `zlsx anchors <file>` prints with no selector (docs/cli.md,
+/// "anchors"). The record is the anchor geometry and where the
+/// payload lives (`part`, an image's `bytes` count, a chart's
+/// `chart_type` + entity-decoded `series_refs`), never the payload:
+/// image bytes and chart XML stay in their parts. Read over the
+/// editor's current parts: structural edits and the drawing sweeps
+/// they carry (a row insert moving an anchor's `from` / `to`, a
+/// rename renaming `sheet`) are visible immediately; staged cell
+/// writes never touch a drawing. A workbook without anchored objects
+/// is ZLSX_OK with `(NULL, 0)`. An inventory that cannot be served
+/// faithfully refuses whole — a sheet list the strict workbook read
+/// cannot prove (`MalformedWorkbookXml`), a drawing graph the strict
+/// walk cannot read whole (`MalformedDrawingXml`), or an anchor on a
+/// worksheet part the workbook does not list
+/// (`DrawingOnUnlistedSheet`), all -2 — rather than hand over a
+/// record that lies or a list with a hole. Release with
+/// `zlsx_buffer_release`.
+export fn zlsx_editor_anchors_ndjson(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail: a rejected sibling
+    // leaves the accepted ones releasable.
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    // Exhaustive over the closed `CollectError` — no `else`, so a
+    // future member breaks this compile and forces a status decision
+    // (the conditional-formats read's rule, Codex #216 r8
+    // S3B-MNT-911).
+    const bytes = anchorsNdjsonOwned(gpa, &state.inner.workbook) catch |e| switch (e) {
+        error.MalformedWorkbookXml,
+        error.DrawingOnUnlistedSheet,
+        error.MalformedDrawingXml,
+        error.ZipBombSuspected,
+        error.OutOfMemory,
+        => return failMapped(e, diag, err_buf, err_buf_len),
+    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The anchor records as one owned buffer in `alloc` — the shared
+/// writer (`pkg/anchor_ndjson.zig`) over the editor's current parts,
+/// so the bytes are the CLI's. The allocating writer reports a failed
+/// growth as `WriteFailed`; at this boundary that is an allocation
+/// failure and crosses as `-3`, the pivots builder's rule.
+fn anchorsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) zlsx_pkg.anchors_ndjson.CollectError![]u8 {
+    var view = try zlsx_pkg.anchors_ndjson.collect(alloc, wb);
+    defer view.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.anchors_ndjson.writeAll(&out.writer, &view) catch |e| switch (e) {
         error.WriteFailed => return error.OutOfMemory,
     };
     return out.toOwnedSlice();
@@ -8252,6 +8339,295 @@ test "S3b conditional_formats_ndjson: every allocation failure is OutOfMemory, n
     try std.testing.checkAllAllocationFailures(alloc, conditionalFormatsNdjsonForFailures, .{&wb});
 }
 
+/// The pkg anchors fixture (`anchor_ndjson.zig::fixture.write`,
+/// `.with_absolute`): `Data` carries one two-cell image; `Report`'s
+/// drawing is chart-first in document order — a one-cell bar chart
+/// with three series refs, a two-cell image, an absolute image — so
+/// the stream crosses a sheet boundary, regroups images before
+/// charts, and carries all three anchor kinds across the boundary a
+/// binding crosses. No C authoring surface writes drawings, so the
+/// fixture stays the package's.
+fn writeS3bAnchorsFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(alloc, io, path, .with_absolute);
+    return path;
+}
+
+/// The frozen stream over that fixture — the literal the CLI's own
+/// `runAnchorsCommand` test pins (docs/cli.md, "anchors").
+const s3b_anchors_frozen = std.fmt.comptimePrint(
+    "{{\"kind\":\"image_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,\"part\":\"xl/media/image1.png\"," ++
+        "\"anchor\":\"two_cell\",\"from\":{{\"row\":1,\"col\":1,\"row_off\":0,\"col_off\":0}}," ++
+        "\"to\":{{\"row\":4,\"col\":3,\"row_off\":0,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
+        "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
+        "\"anchor\":\"two_cell\",\"from\":{{\"row\":3,\"col\":2,\"row_off\":0,\"col_off\":9525}}," ++
+        "\"to\":{{\"row\":8,\"col\":5,\"row_off\":19050,\"col_off\":0}},\"absolute\":null,\"bytes\":{d}}}\n" ++
+        "{{\"kind\":\"image_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\"," ++
+        "\"anchor\":\"absolute\",\"from\":null,\"to\":null," ++
+        "\"absolute\":{{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}},\"bytes\":{d}}}\n" ++
+        "{{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/charts/chart1.xml\"," ++
+        "\"anchor\":\"one_cell\",\"from\":{{\"row\":2,\"col\":6,\"row_off\":0,\"col_off\":0}},\"to\":null," ++
+        "\"absolute\":null,\"chart_type\":\"bar\"," ++
+        "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]}}\n",
+    .{ zlsx_pkg.anchors_ndjson.fixture.png_bytes.len, zlsx_pkg.anchors_ndjson.fixture.png_bytes.len, zlsx_pkg.anchors_ndjson.fixture.png_bytes.len },
+);
+
+test "S3b anchors_ndjson: the shared writer's bytes, current after a rename and a row insert, empty without drawings" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    {
+        const path = try writeS3bAnchorsFixture(io, &tt, "s3b_anchors.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(s3b_anchors_frozen, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // A structural edit is what the read sees: the sheet inventory
+        // is re-read from the current workbook.xml, no save in between.
+        const nm = "Facts";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const got = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Facts\",\"sheet_idx\":0,"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Data\"") == null);
+        // Chart parts are byte-preserved through every edit today (the
+        // surface matrix's contract): the chart's refs still spell the
+        // old name and the read reports the bytes faithfully. Routing
+        // chart `<c:f>` carriers through the formula rewriter is the
+        // recorded S3b follow-up — this pin flips when it lands.
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // A row insert on the image's sheet moves its anchor with the
+        // grid — the drawing sweep's work, visible with no save.
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const moved = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sheet\":\"Facts\",\"sheet_idx\":0,\"part\":\"xl/media/image1.png\",\"anchor\":\"two_cell\",\"from\":{\"row\":2,\"col\":1,\"row_off\":0,\"col_off\":0},\"to\":{\"row\":5,\"col\":3,\"row_off\":0,\"col_off\":0}") != null);
+        // The other sheet's anchors did not move, and the chart part
+        // stayed byte-identical (its refs into the edited sheet are
+        // the follow-up above).
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\",\"anchor\":\"two_cell\",\"from\":{\"row\":3,\"col\":2,\"row_off\":0,\"col_off\":9525}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":6,\"row_off\":0,\"col_off\":0}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // NULL out pointers are about the call — either one, with the
+        // present one reset from its poison.
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_anchors_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        out_ptr = @ptrFromInt(0x1000);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_anchors_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        // Re-poisoned: the NULL-editor path's own reset is what this pins.
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_anchors_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+
+        // struct_size below v1: the outputs reset first, then the diag
+        // is rejected before a byte of it is written — the whole struct
+        // compared, not a field or two.
+        var small = std.mem.zeroes(CDiag);
+        small.struct_size = @sizeOf(CDiag) - 1;
+        small.plane = 7;
+        small.error_name[0] = 'x';
+        const small_before = std.mem.toBytes(small);
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        const small_after = std.mem.toBytes(small);
+        try std.testing.expectEqualSlices(u8, &small_before, &small_after);
+    }
+    // No drawings: success, nothing to release, the poison reset.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3b_no_anchors.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3b anchors_ndjson: an inventory the read cannot serve refuses whole, typed, nothing handed out" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const patch = zlsx_pkg.anchors_ndjson.fixture.patchPart;
+
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8, verdict: []const u8 };
+    const cases = [_]Case{
+        // Data's image blip names a relationship the drawing's rels
+        // do not hold: the drawing graph cannot be read whole.
+        .{ .name = "s3b_anchors_blip.xlsx", .part = "xl/drawings/drawing2.xml", .old = "r:embed=\"rIdI1\"", .new = "r:embed=\"rIdXX\"", .verdict = "MalformedDrawingXml" },
+        // The SECOND sheet's drawing is the broken one while Data's
+        // record is perfectly servable — the whole-inventory rule
+        // hands out nothing.
+        .{ .name = "s3b_anchors_second.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:to>", .new = "<xdr:zz>", .verdict = "MalformedDrawingXml" },
+        // A bad entity in a sheet-name carrier: the workbook-level
+        // decode refuses before any drawing is walked.
+        .{ .name = "s3b_anchors_wb.xlsx", .part = "xl/workbook.xml", .old = "name=\"Report\"", .new = "name=\"Rep&bogus;ort\"", .verdict = "MalformedWorkbookXml" },
+        // A series ref whose carrier does not decode: the record
+        // would lie, so the walk refuses it.
+        .{ .name = "s3b_anchors_ref.xlsx", .part = "xl/charts/chart1.xml", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!$B&bogus;$1</c:f>", .verdict = "MalformedDrawingXml" },
+    };
+    for (cases) |case| {
+        const path = try writeS3bAnchorsFixture(io, &tt, case.name);
+        defer alloc.free(path);
+        try patch(alloc, io, path, case.part, case.old, case.new);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        // Poisoned on entry: the refusal path itself must reset the pair.
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(case.verdict, diagName(&diag));
+        try std.testing.expectEqualStrings(case.verdict, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+}
+
+test "S3b anchors_ndjson: an anchor on a worksheet part the workbook does not list is DrawingOnUnlistedSheet" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bAnchorsFixture(io, &tt, "s3b_anchors_orphan.xlsx");
+    defer alloc.free(path);
+    // A copy of Report's part under a name no <sheet> entry reaches,
+    // its drawing reference and rels riding along: the walkers still
+    // key the anchors by the part, the inventory cannot attribute
+    // them, and the read refuses rather than drop them.
+    {
+        var store = try zlsx_pkg.PartStore.open(alloc, io, path);
+        defer store.deinit();
+        const sheet2 = (try store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult;
+        try store.addPart("xl/worksheets/sheet9.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml", sheet2.bytes);
+        const rels = (try store.part("xl/worksheets/_rels/sheet2.xml.rels")) orelse return error.TestUnexpectedResult;
+        try store.addPart("xl/worksheets/_rels/sheet9.xml.rels", "application/vnd.openxmlformats-package.relationships+xml", rels.bytes);
+        try store.save(io, path);
+    }
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("DrawingOnUnlistedSheet", diagName(&diag));
+    try std.testing.expectEqualStrings("DrawingOnUnlistedSheet", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+test "S3b anchors_ndjson: a part the archive cannot materialise folds to the graph it breaks" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    // A listed sheet part: the inventory's probe materialises it
+    // first, so the zip layer's own error folds to the workbook's
+    // verdict there (the conditional-formats read's rule, Codex #216
+    // r1 S3B-ERR-602).
+    {
+        const path = try writeS3bAnchorsFixture(io, &tt, "s3b_anchors_crc_sheet.xlsx");
+        defer alloc.free(path);
+        try corruptPartPayload(alloc, io, path, "xl/worksheets/sheet2.xml");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+    // A drawing part: only the walk reaches it, and a chain it cannot
+    // follow is a drawing graph that cannot be read whole — never the
+    // zip layer's own name across the boundary.
+    {
+        const path = try writeS3bAnchorsFixture(io, &tt, "s3b_anchors_crc_drawing.xlsx");
+        defer alloc.free(path);
+        try corruptPartPayload(alloc, io, path, "xl/drawings/drawing1.xml");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+}
+
+fn anchorsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try anchorsNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+test "S3b anchors_ndjson: every allocation failure is OutOfMemory, never WriteFailed" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bAnchorsFixture(io, &tt, "s3b_anchors_oom.xlsx");
+    defer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    // Prime the workbook-owned caches (part names, part bytes) so the
+    // sweep exercises the builder's own allocations — the shared
+    // writer's own OOM test does the same.
+    {
+        const primed = try anchorsNdjsonOwned(alloc, &wb);
+        alloc.free(primed);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, anchorsNdjsonForFailures, .{&wb});
+}
+
 /// Flip one byte deep inside the stored payload of `part`, found by
 /// walking the local file headers by name (the name also appears in
 /// `[Content_Types].xml` and the rels, so a plain search would land in
@@ -8468,6 +8844,7 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.ColEditExceedsMaxCol));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.SplitPaneNotSupported));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedDrawingXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.DrawingOnUnlistedSheet));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.SqrefCollapseUnsafe));

@@ -261,8 +261,10 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
-| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies — and `conditional_formats()` on a sheet list the strict workbook read cannot prove |
+| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies — and `conditional_formats()` / `anchors()` on a sheet list the strict workbook read cannot prove |
 | `MalformedSheetXml` | also `conditional_formats()` on a sheet part the strict walk cannot serve faithfully — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a carrier that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable records too) |
+| `MalformedDrawingXml` | also `anchors()` on a drawing graph the strict walk cannot read whole — a dangling or mistyped edge, an anchor that does not parse, a part along the chain the store cannot materialise, a series ref that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable record too) |
+| `DrawingOnUnlistedSheet` | `anchors()` on an anchored object whose worksheet part `xl/workbook.xml` does not list — no record could carry a truthful `sheet`, and dropping it would leave a hole |
 | `SqrefCollapseUnsafe` | `delete_row` / `delete_column` that would collapse EVERY area of a `<conditionalFormatting>` or `<dataValidation>` `sqref` — Excel deletes such a rule outright; zlsx refuses rather than silently retarget it to the cells that slide into its place |
 | `RowEditExceedsMaxRow` / `ColEditExceedsMaxCol` / `SplitPaneNotSupported` / `MalformedPaneSplit`, the carrier verdicts `MalformedSheetXml` / `MalformedDrawingXml` / `MalformedVmlDrawing` / `MalformedCommentsXml` / `MalformedTableXml` / `*CoordinateOverflow`, the workbook's own `MalformedWorkbookXml` / `IdSpaceExhausted` / … | the worksheet transform's and the sweeps' own verdicts, with their precise names — a cell that would leave the grid, a split pane, a part the walkers cannot read or materialise. The list is §10 of `docs/plans/c-abi-status-v1.md`; a generic `MalformedXml` from a rewriter's consistency guard stays a plain `ZlsxError` |
 
@@ -312,6 +314,24 @@ envelope (`sheet`, `sheet_idx`, `sqref`, `rule_type`, `formulas`,
 parts. The read never waits for `save` either: structural edits and
 the DV/CF sweeps they carry are visible immediately, and staged
 `set_cell` / `append_rows` writes never touch the rule machinery.
+
+`Editor.anchors()` / `zlsx.anchors(path)` are the same pattern over the
+`zlsx anchors` records ([docs/cli.md](../../docs/cli.md), "anchors"):
+one `{"kind": "image_anchor", …}` dict per anchored image and one
+`{"kind": "chart_anchor", …}` dict per anchored chart — sheets in
+workbook order, a sheet's images before its charts, each class in
+drawing-document order — carrying the anchor geometry (`anchor` in
+`two_cell` / `one_cell` / `absolute`, `from` / `to` 1-based with EMU
+offsets, `absolute` `{x, y, cx, cy}` in EMUs) and where the payload
+lives (`part`; an image's `bytes` count; a chart's `chart_type` and
+entity-decoded `series_refs`), never the payload: image bytes and chart
+XML stay in their parts. Structural edits and the drawing sweeps they
+carry are visible immediately — a rename renames `sheet`, a row insert
+moves the edited sheet's anchors with the grid — and staged cell writes
+never touch a drawing. Chart parts are byte-preserved through every
+edit today, so a chart's `series_refs` keep spelling what the part
+holds (an old sheet name after a rename, pre-edit rows after an
+insert); the read reports the bytes faithfully.
 
 ## Spark (PySpark Data Source)
 
@@ -481,6 +501,9 @@ with zlsx.write("out.xlsx") as w:
 - Conditional formats, typed read (0.9.0+): `Editor.conditional_formats()` /
   `zlsx.conditional_formats(path)` — the `zlsx conditional-formats` records
   as dicts
+- Image / chart anchors, typed read (0.9.0+): `Editor.anchors()` /
+  `zlsx.anchors(path)` — the `zlsx anchors` records as dicts (geometry and
+  part names; the image bytes and chart XML stay in the archive)
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
@@ -491,7 +514,7 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.8.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
-- Pictures — image anchors (read) and image authoring are Zig-only today (S3b / S5); charts are byte-preserved through edits but not exposed, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
+- Pictures — image *payloads* and image authoring are Zig-only today (S5; the anchors themselves read through `Editor.anchors()`); charts are byte-preserved through edits and their anchors and series refs read through `Editor.anchors()`, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
 
 ## Thread safety
 

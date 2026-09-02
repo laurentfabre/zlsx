@@ -231,11 +231,15 @@ workbook order, a sheet's images before its charts, each class in
 drawing-document order. The view is `zlsx_pkg.imageAnchors` +
 `zlsx_pkg.chartAnchors` attributed to workbook sheets — the walkers key
 anchors by worksheet *part*, the command resolves each part back to the
-`<sheets>` entry that owns it so every record carries the read family's
-`sheet` / `sheet_idx` envelope. The payloads stay in the archive: an
-image record reports the part's decompressed size (`bytes`), a chart
-record its detected type and formula refs — `zlsx-extract-images` or
-`zlsx_pkg.PartStore` fetch the bytes by `part`.
+`<sheets>` entry that owns it (through the same strict sheet inventory
+`conditional-formats` reads, below — not the lenient projection) so
+every record carries the read family's `sheet` / `sheet_idx` envelope.
+The payloads stay in the archive: an image record reports the part's
+decompressed size (`bytes`), a chart record its detected type and
+formula refs — `zlsx-extract-images` or `zlsx_pkg.PartStore` fetch the
+bytes by `part`. The C ABI (`zlsx_editor_anchors_ndjson`) and py-zlsx
+(`Editor.anchors()` / `zlsx.anchors(path)`) hand over these exact
+bytes with no selector.
 
 ```jsonl
 {"kind":"image_anchor","sheet":"Report","sheet_idx":1,"part":"xl/media/image1.png","anchor":"two_cell","from":{"row":3,"col":2,"row_off":0,"col_off":9525},"to":{"row":8,"col":5,"row_off":19050,"col_off":0},"absolute":null,"bytes":4096}
@@ -263,10 +267,12 @@ reader tolerates but the package layer refuses is exit 2. A read the
 command cannot serve faithfully refuses whole (exit 2) rather than emit
 a record that lies or thin the inventory: an anchor on a worksheet part
 `xl/workbook.xml` does not list (the record could not carry a truthful
-`sheet`); a listed sheet the read cannot place — its relationship
-dangling, mistyped or external, its part absent from the archive, or
-two `<sheet>` entries reaching one part (the same anchor would ride
-out twice under two identities); a drawing structure the walkers
+`sheet`); a sheet list the strict workbook read cannot prove — the
+`conditional-formats` contract below: a listed sheet the read cannot
+place (its relationship dangling, mistyped or external, its part
+absent from the archive or unreadable), two `<sheet>` entries reaching
+one part (the same anchor would ride out twice under two identities),
+two names decoding to one spelling; a drawing structure the walkers
 recognise but cannot read whole — a sheet's drawing relationship, a
 pic's image relationship or a frame's chart relationship that dangles,
 is of the wrong relationship type, or names an absent part, a
