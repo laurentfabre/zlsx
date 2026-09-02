@@ -688,20 +688,30 @@ fn findSectionClose(xml: []const u8, from: usize, section: []const u8) ?usize {
 
 /// Pull a quoted attribute value out of an attributes region. Mirrors
 /// the helper in `src/xlsx.zig` (kept private here so this file is
-/// self-contained per the project's per-typed-part isolation rule).
-/// Values are returned verbatim — no entity decoding.
+/// self-contained per the project's per-typed-part isolation rule) —
+/// and MUST keep the identical walk: XML §2.3's four `S` bytes only,
+/// one explicit `=`, a valueless token stepped over rather than a
+/// dead end, null on an unterminated value. This copy kept the pre-
+/// unification algorithm and fed the formula rewriter's raw locator a
+/// THIRD acceptance — `<c bogus r="A1">` visible to the typed view,
+/// invisible here, tripping the splice-count assert (Codex #216 r12
+/// S3B-REL-1201). Values are returned verbatim — no entity decoding.
 pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
     assert(name.len > 0);
     var i: usize = 0;
     while (i < attrs.len) {
-        while (i < attrs.len and std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
 
         const name_start = i;
-        while (i < attrs.len and attrs[i] != '=' and !std.ascii.isWhitespace(attrs[i])) i += 1;
+        while (i < attrs.len and attrs[i] != '=' and !isXmlS(attrs[i])) i += 1;
         const attr_name = attrs[name_start..i];
 
-        while (i < attrs.len and (attrs[i] == '=' or std.ascii.isWhitespace(attrs[i]))) i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
+        if (i >= attrs.len) break;
+        if (attrs[i] != '=') continue;
+        i += 1;
+        while (i < attrs.len and isXmlS(attrs[i])) i += 1;
         if (i >= attrs.len) break;
         if (attrs[i] != '"' and attrs[i] != '\'') break;
 
@@ -709,12 +719,17 @@ pub fn getAttr(attrs: []const u8, name: []const u8) ?[]const u8 {
         i += 1;
         const val_start = i;
         while (i < attrs.len and attrs[i] != quote) i += 1;
+        if (i >= attrs.len) return null; // unterminated value
         const val = attrs[val_start..i];
-        if (i < attrs.len) i += 1;
+        i += 1;
 
         if (std.mem.eql(u8, attr_name, name)) return val;
     }
     return null;
+}
+
+fn isXmlS(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -868,6 +883,15 @@ test "parse: skips comments, CDATA, and processing instructions" {
     try std.testing.expectEqualStrings("Real", wb.sheets[0].name);
     try std.testing.expectEqual(@as(usize, 1), wb.defined_names.len);
     try std.testing.expectEqualStrings("WithCdata", wb.defined_names[0].name);
+}
+
+test "getAttr: the shared acceptance — bare tokens, spaced Eq, XML-S only, unterminated null (S3B-REL-1201)" {
+    try std.testing.expectEqualStrings("A1", getAttr("bogus r=\"A1\"", "r").?);
+    try std.testing.expectEqualStrings("A1", getAttr("r = \"A1\"", "r").?);
+    try std.testing.expectEqualStrings("A1", getAttr("r='A1'", "r").?);
+    try std.testing.expect(getAttr("r\x0b=\"A1\"", "r") == null);
+    try std.testing.expect(getAttr("r=\"A1", "r") == null);
+    try std.testing.expect(getAttr("a=b r=\"A1\"", "r") == null);
 }
 
 test "skipNonElement: declarations scan structurally — subsets, conditional sections, quotes (S3B-TEST-906)" {

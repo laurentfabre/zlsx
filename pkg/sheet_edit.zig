@@ -2378,14 +2378,19 @@ fn writeWithReplacedAttrs(
         while (i < end and (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r')) i += 1;
         try out.appendSlice(allocator, src[ws_start..i]);
         if (i >= end) break;
-        // Reached the closing `>` or self-close `/>` — emit verbatim
-        // and stop.
-        if (src[i] == '/' or src[i] == '>') {
+        // Reached the closing `>`, or the self-close's `/` — which is
+        // terminal ONLY as the final `/>`: the readers scan a `/`
+        // INSIDE a token as a name byte (`junk/foo="x"` is one name
+        // to them), so treating any `/` as the self-close made this
+        // writer bail with the shifted value unwritten while the
+        // sweep still moved the bodies (Codex #216 r12 S3B-REL-1202).
+        if (src[i] == '>' or (src[i] == '/' and i + 2 == end)) {
             try out.appendSlice(allocator, src[i..end]);
             return;
         }
         const name_start = i;
-        while (i < end and src[i] != '=' and !isXmlWs(src[i]) and src[i] != '/' and src[i] != '>') i += 1;
+        while (i < end and src[i] != '=' and !isXmlWs(src[i]) and src[i] != '>' and
+            !(src[i] == '/' and i + 2 == end)) i += 1;
         const name = src[name_start..i];
         // XML §3.1 `Eq ::= S? '=' S?`: whitespace on either side of the
         // `=` is legal, and `getAttr` reads through it — so the writer
@@ -2859,6 +2864,25 @@ test "getAttr acceptance parity: bare tokens, spaced Eq, either quote — one ta
     // An unterminated value is null, the view's verdict — not a
     // suffix.
     try testing.expect(getAttr("sqref=\"B1:B4", "sqref") == null);
+}
+
+test "a slash-bearing token is one name to the writer too; only the final /> is terminal (S3B-REL-1202)" {
+    const a = testing.allocator;
+    // The readers scan `junk/foo` as one name and reach the sqref
+    // after it; the writer treated the `/` as the self-close and
+    // bailed with the shifted value unwritten — the envelope frozen
+    // beside swept bodies once more.
+    const src = try wrapSheet(a, "<dataValidation junk/foo=\"x\" sqref=\"B1:B4\"><formula1>1</formula1></dataValidation>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "junk/foo=\"x\" sqref=\"B2:B5\"") != null);
+    // The genuine self-close still terminates.
+    const src2 = try wrapSheet(a, "<dataValidation sqref=\"B1:B4\"/>");
+    defer a.free(src2);
+    const out2 = try applyRowEditToWorksheet(a, src2, 1, .insert);
+    defer a.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "<dataValidation sqref=\"B2:B5\"/>") != null);
 }
 
 test "shiftSqrefArea boundary table: reversed corners, dangling anchors, maximal spellings, TL deletes (S3B-TEST-905)" {

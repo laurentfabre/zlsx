@@ -16157,6 +16157,55 @@ test "insertRow: a spaced-Eq DV moves envelope AND formula together (S3B-REL-912
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula1>B2+1</formula1>") != null);
 }
 
+test "insertRow: a formula cell behind a bare token relocates without desync (S3B-REL-1201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-bare-f-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        const ws0 = try wb.sheet(0);
+        const part_name = try ws0.resolvePartName();
+        const part = (try wb.store.part(part_name)).?;
+        // A `bogus` token before `r=`: the typed view stepped over it
+        // and inventoried the formula; the raw locator (workbook_xml's
+        // getAttr, the third reader) stopped at it — the splice-count
+        // assert tripped, or with asserts off the cell moved while
+        // its formula stayed.
+        const at = std.mem.indexOf(u8, part.bytes, "</sheetData>").?;
+        const row = "<row r=\"99\"><c bogus r=\"A99\"><f>A98</f><v>0</v></c></row>";
+        const patched = try std.mem.concat(std.testing.allocator, u8, &.{ part.bytes[0..at], row, part.bytes[at..] });
+        defer std.testing.allocator.free(patched);
+        try wb.store.replacePart(part_name, patched);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-bare-f-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const part_name = try ws.resolvePartName();
+    const part = (try wb2.store.part(part_name)).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<c bogus r=\"A100\"><f>A99</f>") != null);
+}
+
 test "insertRow: a bare token before sqref splits neither envelope from formula (S3B-REL-1001)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
