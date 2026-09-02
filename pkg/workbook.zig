@@ -4930,9 +4930,17 @@ pub const Workbook = struct {
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
 
-        // Postcondition: the in-memory view now reports the new name.
+        // Postcondition: the refreshed view SPELLS the new name. The
+        // view holds raw attribute bytes — a rename to `R&D` refreshes
+        // as `R&amp;D` — so the comparison decodes first; the old
+        // raw-vs-decoded compare asserted after every mutation had
+        // landed (Codex #216 r16 S3B-REL-1507).
         assert(sheet_idx < self.workbook.sheets.len);
-        assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, new_name));
+        if (std.debug.runtime_safety) {
+            const refreshed = try store_mod.decodeXmlEntities(self.allocator, self.workbook.sheets[sheet_idx].name);
+            defer self.allocator.free(refreshed);
+            assert(std.mem.eql(u8, refreshed, new_name));
+        }
     }
 
     /// Rename a column of the table whose `displayName` matches
@@ -5658,7 +5666,13 @@ pub const Workbook = struct {
         assert(new_name.len > 0);
         for (self.workbook.sheets, 0..) |s, i| {
             if (i == sheet_idx) continue;
-            if (asciiCaseInsensitiveEql(s.name, new_name)) return error.SheetNameInUse;
+            // The view holds RAW attribute bytes; `new_name` is
+            // decoded input. Comparing raw to decoded let a rename to
+            // `R&D` slide past an existing sheet stored as `R&amp;D`
+            // — a semantic duplicate (Codex #216 r16 S3B-REL-1507).
+            const stored = try store_mod.decodeXmlEntities(self.allocator, s.name);
+            defer self.allocator.free(stored);
+            if (asciiCaseInsensitiveEql(stored, new_name)) return error.SheetNameInUse;
         }
     }
 
@@ -16284,6 +16298,27 @@ test "renameSheet: a quoted '>' and a bare token in the sheet element do not bre
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "probe=\"a>b\" bogus state=\"visible\" name=\"Zed\"") != null);
     // The comment decoy is untouched prose.
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <sheet name=\"Sheet1\"/> -->") != null);
+}
+
+test "renameSheet: entity-bearing names rename and collide by their MEANING (S3B-REL-1507)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var wb = try Workbook.open(std.testing.allocator, io, src_path);
+    defer wb.deinit();
+    // Previously: the postcondition compared the refreshed RAW bytes
+    // (`R&amp;D`) to the decoded input and asserted after every
+    // mutation had landed.
+    try wb.renameSheet(0, "R&D");
+    const part = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "name=\"R&amp;D\"") != null);
+    // A second sheet cannot take the same MEANING, however the first
+    // is spelled on the wire.
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "R&D"));
+    try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "r&d"));
 }
 
 test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {

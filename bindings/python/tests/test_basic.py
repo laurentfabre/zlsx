@@ -2907,6 +2907,24 @@ def test_conditional_formats_read_the_editors_current_state(tmp_path):
     ]
 
 
+def test_conditional_formats_entity_rename_round_trips(tmp_path):
+    """Renaming to an entity-bearing name works and the CF read
+    reports the decoded meaning; a second sheet cannot take the same
+    meaning however the first is spelled (Codex #216 r16
+    S3B-REL-1507)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf.xlsx"
+    _cf_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "R&D")
+        records = ed.conditional_formats()
+        assert records[0]["sheet"] == "R&D"
+        with pytest.raises(zlsx.ZlsxRefusal):
+            ed.rename_sheet(1, "r&d")
+
+
 def test_conditional_formats_between_moves_both_formulas(tmp_path):
     """A `cellIs between` carries two formulas — a sweep that moved
     only the first left `B2` beside a moved sibling (Codex #216 r3
