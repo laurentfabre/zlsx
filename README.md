@@ -419,7 +419,7 @@ contract: [docs/cli.md](docs/cli.md).**
 
 | Family | Commands |
 |---|---|
-| Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `pivots` · `merges` · `defined-names` · `doc-props` · `anchors` · `conditional-formats` · `styles` · `sst` |
+| Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `pivots` · `merges` · `defined-names` · `doc-props` · `anchors` · `conditional-formats` · `sheet-props` · `calc-props` · `styles` · `sst` |
 | Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` · `rename-table-column` |
 | Privacy | `scrub-metadata` · `embed --strip` · `embed --prune` |
 | Embeddings | `embed --extract` · `embed --vectors` |

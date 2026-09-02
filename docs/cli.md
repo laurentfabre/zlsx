@@ -45,6 +45,8 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx doc-props <file>` | `"doc_props"` | one record: `creator, last_modified_by, title, subject, description, keywords, category, created, modified, revision, company, manager, application, hyperlink_base, has_custom_properties` — [contract](#doc-props--the-document-properties-report) |
 | `zlsx anchors <file>` | `"image_anchor"`, `"chart_anchor"` | `sheet, sheet_idx, part, anchor, from{}, to{}, absolute{}`, then `bytes` (images) or `chart_type, series_refs[]` (charts) — [contract](#anchors--anchored-images-and-charts) |
 | `zlsx conditional-formats <file>` | `"conditional_format"` | `sheet, sheet_idx, sqref, rule_type, formulas[], dxf_id, priority` — one record per `<cfRule>` — [contract](#conditional-formats--the-rule-inventory) |
+| `zlsx sheet-props <file>` | `"sheet_props"` | `sheet, sheet_idx, dimension, pane{x_split, y_split, top_left_cell, active_pane, state}` — one record per sheet — [contract](#sheet-props--panes-and-the-extent) |
+| `zlsx calc-props <file>` | `"calc_props"` | one record: `calc_id, full_calc_on_load, iterate, iterate_count, iterate_delta` — [contract](#calc-props--the-calculation-properties) |
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
@@ -173,7 +175,7 @@ A1 text. Sheet names — in the `sheet` field and against `--name` /
 Book-route command (`rows`, `cells`, `comments`, `validations`,
 `hyperlinks`): XML entities decoded, ST_Xstring `_xHHHH_` escapes as
 written. The package-route commands (`pivots`, `defined-names`,
-`anchors`, `conditional-formats`) decode ST_Xstring too, so the rare
+`anchors`, `conditional-formats`, `sheet-props`) decode ST_Xstring too, so the rare
 sheet name spelled with such an escape reads differently across the
 two families — a reader-level lift on a later S3b slice, not a
 per-command patch (one family, one spelling).
@@ -424,6 +426,128 @@ delete that collapses EVERY area of a rule (`SqrefCollapseUnsafe`):
 Excel deletes such a rule outright, and zlsx refuses rather than
 silently retarget it to the cells that slide into its place.
 
+#### `sheet-props` — panes and the extent
+
+`zlsx sheet-props <file>` (S3b) emits one record per workbook sheet,
+workbook order: the sheet's `<dimension ref>` — the used-range extent as
+authored — and the `<pane>` of its first `<sheetView>` as authored:
+`xSplit` / `ySplit` / `topLeftCell` / `activePane` / `state`. This is
+the read the Zig views `Worksheet.dimension` and `Worksheet.freezePane`
+model, promoted to a typed report with one deliberate divergence: the
+lenient `freezePane` narrows to frozen panes (`state="frozen"` /
+`"frozenSplit"`, integer splits, the first such pane anywhere in the
+part) and keeps that contract; this read reports split panes too, as
+written, from the schema slot only. The records come from a strict,
+namespace- and depth-aware walk of each sheet part
+(`pkg/sheet_props_ndjson.zig`, on the `conditional-formats` scanner's
+lexical layer).
+
+```jsonl
+{"kind":"sheet_props","sheet":"Data","sheet_idx":0,"dimension":"A1:B3","pane":{"x_split":2,"y_split":1,"top_left_cell":"C2","active_pane":"bottomRight","state":"frozen"}}
+{"kind":"sheet_props","sheet":"Report","sheet_idx":1,"dimension":"A1:C2","pane":{"x_split":2865,"y_split":1215.5,"top_left_cell":"C4","active_pane":"bottomRight","state":"split"}}
+{"kind":"sheet_props","sheet":"Bare","sheet_idx":2,"dimension":null,"pane":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `sheet`, `sheet_idx` | The sheet. Dropped under `--output compact-ndjson` in favour of the sheet prologue (one per record here — every sheet contributes exactly one). |
+| `dimension` | The `<dimension ref>` as authored (entity-decoded, not normalised, not recomputed from the cells), or `null` when the sheet spells neither the element nor its attribute — a fresh zlsx `Writer` workbook, for one. |
+| `pane` | The first `<sheetView>`'s `<pane>`, or `null` when the sheet or that view has none. Present, each field is the attribute as authored or `null` when absent — no schema default is applied (Excel reads an absent `activePane` as `bottomRight` and an absent `state` as `split`; the wire says what the file says). |
+| `pane.x_split`, `pane.y_split` | `xSplit` / `ySplit` as JSON numbers: a frozen pane's column / row counts, a split pane's position in twips (1/20 pt), a fractional value kept. |
+| `pane.top_left_cell` | The `topLeftCell` A1 reference — the first visible cell of the bottom-right pane. |
+| `pane.active_pane` | The `activePane` token (`bottomRight`, `topRight`, `bottomLeft`, `topLeft`) — a token inventory this read does not police. |
+| `pane.state` | The `state` token (`frozen`, `frozenSplit`, `split`) — likewise. |
+
+Sheet selection follows the read family — `--sheet` / `--name` narrow
+to one sheet, `--all-sheets` / `--sheet-glob` widen, the default
+streams every sheet — and `--skip` / `--take` page the record stream.
+Every sheet emits exactly one record, so the unselected stream's length
+is the workbook's sheet count. The command routes through the package
+layer like `pivots`, under the `conditional-formats` inventory and
+refusal rules: sheet identities come from the strict `<sheets>` read,
+the sheet graph resolves strictly, a worksheet-rooted part shares the
+typed view's parse verdict, and any sheet part the walk cannot prove —
+even one the selection would exclude — refuses the whole command (exit
+2), nothing written.
+
+The strict walk is what lets each record claim "this is the slot". A
+`dimension` is the extent only as a main-namespace direct child of a
+`worksheet` or `macrosheet` root (the roots the schema gives one); a
+`sheetViews` only as a direct child of a root whose views carry panes
+(`worksheet`, `macrosheet`, `dialogsheet` — a `chartsheet`'s
+`<sheetView>` cannot hold a pane by schema, so a chartsheet's record is
+two nulls); a `sheetView` only as its direct child; a `pane` only as a
+direct child of the FIRST `sheetView`. Everything else is opaque: a
+`<pane>` under `<customSheetViews>` (a real corpus shape), a
+`<dimension>` under `<extLst>` or inside a subtree that rebinds the
+default namespace, a commented-out slot — none of these is reported,
+none refuses. Later `<sheetView>` elements (Excel writes one per extra
+window open on the sheet) keep their own panes in the part; the record
+reports the primary view's. Refused whole (exit 2), nothing written: a
+second `<dimension>`, `<sheetViews>` or first-view `<pane>` (each
+maxOccurs=1 — which one Excel honours is not the reader's to guess), a
+duplicate attribute on that machinery, the main namespace bound to a
+prefix, mismatched or unterminated nesting, a DOCTYPE, an MCE
+construct at a recognized slot (the walk has no MCE processor: an
+`mc:AlternateContent` under the root, the views wrapper or the first
+view; `mc:ProcessContent` anywhere), and a carrier the stream cannot
+carry faithfully — a `ref` / `topLeftCell` / `activePane` / `state`
+that does not decode, is not UTF-8, or carries markup. Boundary
+conventions, pinned as the contract: `x_split` / `y_split` decode
+their entities first (`&#50;` is `2`; an undecodable carrier is exit
+2, not `null`), then read as an `xsd:double` lexical or `null` — the
+written-but-invalid convention the family's numeric attributes set
+(`1_0`, `0x10`, `abc` are not doubles; `INF` / `NaN` are, but have no
+JSON spelling and read `null` too). A `<dimension>` without `ref` and
+a `<pane/>` without attributes are present-and-empty: `dimension` is
+`null` either way, `pane` is an object of nulls.
+
+#### `calc-props` — the calculation properties
+
+`zlsx calc-props <file>` (S3b) emits the workbook's `<calcPr>` as
+**one** NDJSON record: `calcId`, `fullCalcOnLoad`, `iterate`,
+`iterateCount`, `iterateDelta` — the field set the Zig view
+`Workbook.calcProperties` models, read strictly from `xl/workbook.xml`
+and reported as authored. The lenient view applies its own defaults
+(`iterate` / `fullCalcOnLoad` false when absent, anything but `true` /
+`1` false) and keeps them; this read reports `null` for what the file
+does not say.
+
+```jsonl
+{"kind":"calc_props","calc_id":191029,"full_calc_on_load":true,"iterate":false,"iterate_count":100,"iterate_delta":0.001}
+```
+
+Absent attributes are `null` — never omitted — and a workbook with no
+`<calcPr>` at all is a record of nulls under exit 0 (the `doc-props`
+convention; an empty `<calcPr/>` is the same record — absent and empty
+are one shape on the wire). `calc_id` / `iterate_count` are
+`xsd:unsignedInt` (a digit-only `u32` or `null`), `full_calc_on_load`
+/ `iterate` are `xsd:boolean` (`true` / `false` / `1` / `0`, else
+`null` — the lenient view reads `yes` as false, this read reports that
+nothing lexical was said), `iterate_delta` an `xsd:double` (or `null`
+— a non-finite value has no JSON spelling); every typed attribute
+decodes its entities first, and an undecodable carrier refuses (exit
+2). An entity-spelled or non-numeric `calcId` / `iterateCount` /
+`iterateDelta` never reaches this read through the CLI: `Workbook.open`'s
+lenient parse refuses it first, at open (its own contract — the
+strict decode above is the family's, kept for the surfaces to come).
+The element is the slot only as a main-namespace direct child
+of the `<workbook>` root: a `<calcPr>` under `<extLst>` or inside a
+rebound subtree is not reported; two at the slot refuse — which one
+Excel honours is not the reader's to guess — and so does a `<calcPr>`
+inside an `mc:AlternateContent` branch under the root (the walk has no
+MCE processor; the real root-level `mc:AlternateContent` Excel writes
+for `x15ac:absPath` stays inert). The record is read and validated
+whole before the first byte is written. The read runs the same strict
+workbook walk the sheet inventory comes from, so a `<sheets>` list it
+cannot prove refuses here too (exit 2), though no sheet part is read.
+The command routes through the package layer like `pivots`, so an
+archive the lenient reader tolerates but the package layer refuses is
+exit 2. There is no sheet dimension: sheet selectors, `--format` and
+`--output compact-ndjson` are tolerated and ignored (the `doc-props` /
+`meta` wrapper-friendliness), and `--skip` / `--take` do not apply to
+a single-record report.
+
 ### Edit (load-modify-save)
 
 Every edit sub-command reads `<file>`, applies the change, and atomic-renames
@@ -668,11 +792,11 @@ is set.
 
 **Default sheet scope** differs by family: `rows` / `cells` read sheet 0
 unless told otherwise; `comments` / `validations` / `hyperlinks` / `pivots` /
-`merges` / `anchors` / `conditional-formats` stream every sheet; `styles` /
-`sst` / `meta` / `list-sheets` are workbook-wide, and so are `defined-names`
-(a sheet selector there narrows by a name's *scope* — see its contract above)
-and `doc-props` (no sheet dimension at all — selectors are tolerated and
-ignored).
+`merges` / `anchors` / `conditional-formats` / `sheet-props` stream every
+sheet; `styles` / `sst` / `meta` / `list-sheets` are workbook-wide, and so are
+`defined-names` (a sheet selector there narrows by a name's *scope* — see its
+contract above), `doc-props` and `calc-props` (no sheet dimension at all —
+selectors are tolerated and ignored).
 
 **Sheet selection** — mutually exclusive:
 
@@ -715,8 +839,9 @@ ignored).
 --output compact-ndjson       # sheet-prologue variant (drops sheet/sheet_idx on data
                               # records); applies to rows / cells / comments /
                               # validations / hyperlinks / pivots / merges / anchors /
-                              # conditional-formats — a no-op on workbook-scoped
-                              # sub-commands (defined-names and doc-props included)
+                              # conditional-formats / sheet-props — a no-op on
+                              # workbook-scoped sub-commands (defined-names,
+                              # doc-props and calc-props included)
 --output pretty-json          # meta + list-sheets only: single collapsed JSON object
                               # (rejected on the streaming sub-commands)
 ```
@@ -758,6 +883,12 @@ zlsx merges data.xlsx --all-sheets | jq 'select(.start_row==1)'
 # Every cellIs rule with exactly two formula bodies (between / notBetween — the
 # operator itself is not on the wire), as TSV.
 zlsx conditional-formats data.xlsx | jq -r 'select(.rule_type=="cellIs" and (.formulas|length)==2) | [.sheet, .sqref, .formulas[0], .formulas[1]] | @tsv'
+
+# Every frozen pane: sheet, frozen column / row counts, first scrolling cell.
+zlsx sheet-props data.xlsx | jq -r 'select(.pane.state=="frozen") | [.sheet, .pane.x_split, .pane.y_split, .pane.top_left_cell] | @tsv'
+
+# Does the workbook ask Excel to recalculate everything on open?
+zlsx calc-props data.xlsx | jq '.full_calc_on_load == true'
 
 # Visible workbook-scope names with their bodies, as TSV.
 zlsx defined-names data.xlsx | jq -r 'select(.scope=="workbook" and (.hidden|not)) | [.name, .body] | @tsv'
@@ -816,7 +947,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet part the strict walk cannot prove whole — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a duplicate attribute on the rule machinery — or a sqref / rule type / formula / sheet-name carrier that does not decode or is not UTF-8 — its contract above) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet part the strict walk cannot prove whole — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a duplicate attribute on the rule machinery — or a sqref / rule type / formula / sheet-name carrier that does not decode or is not UTF-8 — its contract above) — or, on `sheet-props`, a sheet part the strict walk cannot prove a pane / extent for (a second `<dimension>` / `<sheetViews>` / first-view `<pane>`, a duplicate attribute on that machinery, an MCE construct at a recognized slot, or a `ref` / pane carrier that does not decode or is not UTF-8 — its contract above) — or, on `calc-props`, a `<calcPr>` slot the read cannot report faithfully (two at the slot, one an MCE branch could project there, a duplicate attribute, a carrier that does not decode — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

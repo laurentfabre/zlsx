@@ -77,6 +77,19 @@ const Subcommand = enum {
     /// the strict walk over the inventory `Worksheet.conditionalFormats`
     /// models). Package-layer route like `pivots`.
     conditional_formats,
+    /// S3b slice 8: sheet properties — one record per selected sheet
+    /// carrying the `<dimension>` extent and the first view's `<pane>`
+    /// as authored (`pkg/sheet_props_ndjson.zig`, the strict walk over
+    /// what the lenient `Worksheet.dimension` / `freezePane` model).
+    /// Package-layer route like `pivots`.
+    sheet_props,
+    /// S3b slice 8: calculation properties — one
+    /// `{"kind":"calc_props",…}` record from `xl/workbook.xml`'s
+    /// `<calcPr>` (the `Workbook.calcProperties` field set, read
+    /// strictly). Package-layer route like `pivots`; no sheet
+    /// dimension, so it joins `doc-props`'s workbook-scoped flag
+    /// tolerance.
+    calc_props,
     /// iter-lms-4 follow-up: append rows from stdin (NDJSON, one
     /// JSON array per row) to a sheet of an existing xlsx and save
     /// to `--out`. Requires `--sheet N` and `--out PATH`.
@@ -345,6 +358,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
         if (std.mem.eql(u8, a, "doc-props")) return .doc_props;
         if (std.mem.eql(u8, a, "anchors")) return .anchors;
         if (std.mem.eql(u8, a, "conditional-formats")) return .conditional_formats;
+        if (std.mem.eql(u8, a, "sheet-props")) return .sheet_props;
+        if (std.mem.eql(u8, a, "calc-props")) return .calc_props;
         return .rows; // first positional is the file path
     }
     return .rows;
@@ -458,8 +473,11 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         // format flags are tolerated and dropped, the meta family's
         // wrapper-friendliness.
         .doc_props,
+        // S3b slice 8: calc-props is the same shape — one record, no
+        // sheet dimension.
+        .calc_props,
         => true,
-        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .anchors, .conditional_formats, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
+        .rows, .cells, .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .anchors, .conditional_formats, .sheet_props, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => false,
     };
 
     var out: Args = .{ .file = "", .subcommand = detected_sub };
@@ -700,6 +718,8 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                     std.mem.eql(u8, a, "doc-props") or
                     std.mem.eql(u8, a, "anchors") or
                     std.mem.eql(u8, a, "conditional-formats") or
+                    std.mem.eql(u8, a, "sheet-props") or
+                    std.mem.eql(u8, a, "calc-props") or
                     std.mem.eql(u8, a, "append-rows") or
                     std.mem.eql(u8, a, "set-cell") or
                     std.mem.eql(u8, a, "insert-row") or
@@ -728,7 +748,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.start_row != null or out.end_row != null) {
         switch (detected_sub) {
             .rows, .cells, .comments => {},
-            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .sheet_props, .calc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -740,7 +760,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.range != null) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .sheet_props, .calc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -772,7 +792,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.include_blanks) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .sheet_props, .calc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -781,7 +801,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     if (out.with_styles) {
         switch (detected_sub) {
             .rows, .cells => {},
-            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
+            .comments, .validations, .hyperlinks, .pivots, .merges, .defined_names, .doc_props, .anchors, .conditional_formats, .sheet_props, .calc_props, .meta, .list_sheets, .styles, .sst, .append_rows, .set_cell, .insert_row, .delete_row, .insert_column, .delete_column, .add_sheet, .rename_sheet, .delete_sheet, .rename_table_column, .scrub_metadata, .embed => {
                 return ArgError.BadArgValue;
             },
         }
@@ -877,8 +897,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\
         \\  --sheet N         0-indexed sheet to read (default: 0; on
         \\                    pivots every host sheet, on merges,
-        \\                    anchors and conditional-formats every
-        \\                    sheet, on defined-names every name)
+        \\                    anchors, conditional-formats and
+        \\                    sheet-props every sheet, on defined-names
+        \\                    every name)
         \\  --name NAME       select sheet by name (conflicts with --sheet)
         \\  --all-sheets      (iter59c) iterate every sheet. Mutually
         \\                    exclusive with --sheet / --name / --sheet-glob.
@@ -907,9 +928,10 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Applies globally to the record stream of
         \\                    rows / cells / comments / validations /
         \\                    hyperlinks / pivots / merges / defined-names /
-        \\                    anchors / conditional-formats / styles / sst.
-        \\                    Ignored by meta, list-sheets and doc-props
-        \\                    (a single-record report).
+        \\                    anchors / conditional-formats / sheet-props /
+        \\                    styles / sst. Ignored by meta, list-sheets,
+        \\                    doc-props and calc-props (single-record
+        \\                    reports).
         \\  --take N          stop after N emitted records. Same scope
         \\                    as --skip; combine for middle-slice paging.
         \\  --start-row R     (iter59b) 1-based OOXML row; drop records
@@ -918,8 +940,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    global). Valid for rows / cells / comments
         \\                    only; rejected on validations / hyperlinks
         \\                    / pivots / merges / defined-names / doc-props
-        \\                    / anchors / conditional-formats / meta /
-        \\                    list-sheets / styles / sst.
+        \\                    / anchors / conditional-formats / sheet-props
+        \\                    / calc-props / meta / list-sheets / styles /
+        \\                    sst.
         \\  --end-row R       (iter59b) 1-based OOXML row; stop emitting
         \\                    after row R (inclusive). Same scope and
         \\                    sub-command constraints as --start-row.
@@ -975,18 +998,19 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                                     cells / rows / comments /
         \\                                     validations / hyperlinks / pivots
         \\                                     / merges / anchors /
-        \\                                     conditional-formats.
+        \\                                     conditional-formats / sheet-props.
         \\                                     `--skip`/`--take` still slice
         \\                                     data records (prologues aren't
         \\                                     counted). On `meta` the
         \\                                     per-sheet records drop
         \\                                     `sheet`/`sheet_idx`; on
         \\                                     `list-sheets` / `styles` / `sst`
-        \\                                     / `defined-names` / `doc-props`
-        \\                                     it's effectively a no-op (a
-        \\                                     defined name's sheet fields are
-        \\                                     its SCOPE, not a host location;
-        \\                                     doc-props has no sheet fields).
+        \\                                     / `defined-names` / `doc-props` /
+        \\                                     `calc-props` it's effectively a
+        \\                                     no-op (a defined name's sheet
+        \\                                     fields are its SCOPE, not a host
+        \\                                     location; doc-props and
+        \\                                     calc-props have no sheet fields).
         \\                    pretty-json      meta-only. Collapses workbook
         \\                                     + sheets into one 2-space-
         \\                                     indented JSON object. The
@@ -1121,6 +1145,29 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     dxf_id/priority are null when absent. The
         \\                     visual payload (colorScale / dataBar /
         \\                     iconSet children) stays in the part.
+        \\  sheet-props        one NDJSON record per sheet (S3b): the
+        \\                     <dimension> extent and the first
+        \\                     <sheetView>'s <pane>, each as authored:
+        \\                     {"kind":"sheet_props","sheet":"S","sheet_idx":0,
+        \\                      "dimension":"A1:D9","pane":{"x_split":2,
+        \\                      "y_split":1,"top_left_cell":"C2",
+        \\                      "active_pane":"bottomRight","state":"frozen"}}
+        \\                     dimension is null when the sheet spells
+        \\                     none; pane is null when the first view has
+        \\                     none, and each pane field is null when
+        \\                     absent (no schema default applied). Split
+        \\                     panes are reported as written — x_split /
+        \\                     y_split are doubles: cell counts when
+        \\                     frozen, twips when split.
+        \\  calc-props         the workbook's <calcPr> as ONE NDJSON
+        \\                     record (S3b):
+        \\                     {"kind":"calc_props","calc_id":191029,
+        \\                      "full_calc_on_load":true,"iterate":false,
+        \\                      "iterate_count":100,"iterate_delta":0.001}
+        \\                     Absent attributes are null; a workbook
+        \\                     without <calcPr> is a record of nulls.
+        \\                     Workbook-scoped: sheet selectors are
+        \\                     tolerated and ignored.
         \\  append-rows        load-modify-save: append rows to an existing
         \\                     sheet, atomic-rename to --out. Reads NDJSON
         \\                     row arrays from stdin (one JSON array per
@@ -2108,6 +2155,10 @@ fn runMain(init: std.process.Init) !u8 {
         // S3b slice 5: conditional formats — the typed sheet view lives
         // on the package layer's Workbook; same pre-Book dispatch.
         .conditional_formats => if (!args.list_sheets) return try runConditionalFormatsCommand(alloc, proc_io, args, out, err),
+        // S3b slice 8: sheet / calc properties — strict reads on the
+        // package layer's Workbook; same pre-Book dispatch.
+        .sheet_props => if (!args.list_sheets) return try runSheetPropsCommand(alloc, proc_io, args, out, err),
+        .calc_props => if (!args.list_sheets) return try runCalcPropsCommand(alloc, proc_io, args, out, err),
         else => {},
     }
 
@@ -2225,6 +2276,8 @@ fn runMain(init: std.process.Init) !u8 {
         .doc_props,
         .anchors,
         .conditional_formats,
+        .sheet_props,
+        .calc_props,
         => unreachable,
         .rows, .cells => {},
     }
@@ -2286,6 +2339,8 @@ fn runMain(init: std.process.Init) !u8 {
         .doc_props,
         .anchors,
         .conditional_formats,
+        .sheet_props,
+        .calc_props,
         => unreachable,
     }
     return 0;
@@ -4614,6 +4669,121 @@ fn runConditionalFormatsCommand(
         }
         try zlsx_pkg.conditional_formats_ndjson.writeRecord(out, r, if (compact) .compact else .full);
     }
+    try out.flush();
+    return 0;
+}
+
+/// S3b slice 8: `zlsx sheet-props` — one record per sheet, workbook
+/// order: the `<dimension>` extent and the first `<sheetView>`'s
+/// `<pane>` as authored. Routes through the package layer like
+/// `pivots`; the records come from the strict namespace- and
+/// depth-aware walk in `pkg/sheet_props_ndjson.zig` (the lenient Zig
+/// views `Worksheet.dimension` / `Worksheet.freezePane` keep their
+/// historical contract — the `conditional-formats` split). Sheet
+/// selection follows the read family — `--sheet` / `--name` narrow to
+/// one sheet, `--all-sheets` / `--sheet-glob` widen, the default
+/// streams every sheet. Contract in docs/cli.md, "sheet-props".
+fn runSheetPropsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    var view = zlsx_pkg.sheet_props_ndjson.collect(alloc, &wb) catch |e| {
+        try err.print("zlsx: cannot read sheet properties in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    defer view.deinit();
+
+    const filter: ?usize = blk: {
+        if (args.all_sheets or args.sheet_glob != null) break :blk null;
+        if (args.sheet_index) |idx| {
+            if (idx >= view.sheet_names.len) {
+                try err.writeAll("zlsx: sheet not found\n");
+                try err.flush();
+                return 3;
+            }
+            break :blk idx;
+        }
+        if (args.sheet_name) |name| {
+            for (view.sheet_names, 0..) |s, i| {
+                if (std.mem.eql(u8, s, name)) break :blk i;
+            }
+            try err.writeAll("zlsx: sheet not found\n");
+            try err.flush();
+            return 3;
+        }
+        break :blk null;
+    };
+
+    var pg = Pagination.init(args.skip, args.take);
+    const compact = args.output == .compact_ndjson;
+    for (view.records) |r| {
+        if (signals.shouldStop()) return 0;
+        const sheet_idx: usize = r.sheet_idx;
+        if (filter) |f| {
+            if (sheet_idx != f) continue;
+        } else if (args.sheet_glob != null or args.all_sheets) {
+            if (!isSheetIncluded(args, r.sheet, sheet_idx)) continue;
+        }
+        switch (pg.consume()) {
+            .drop => continue,
+            // Flush before the early return: runMain's deferred flush
+            // swallows errors, so a --take'd stream that relied on it
+            // would report exit 0 on a failed final write instead of
+            // the documented exit 5 (the Codex #211 r1 lesson).
+            .stop => {
+                try out.flush();
+                return 0;
+            },
+            .emit => {},
+        }
+        // One record per sheet, so every emitted record opens its own
+        // prologue under the compact envelope.
+        if (compact) try writeCompactSheetPrologue(out, r.sheet, sheet_idx);
+        try zlsx_pkg.sheet_props_ndjson.writeSheetRecord(out, r, if (compact) .compact else .full);
+    }
+    try out.flush();
+    return 0;
+}
+
+/// S3b slice 8: `zlsx calc-props` — the workbook's `<calcPr>` as ONE
+/// record, read strictly by `pkg/sheet_props_ndjson.zig` (the lenient
+/// `Workbook.calcProperties` keeps its historical contract). Routes
+/// through the package layer like `pivots`. No sheet dimension: sheet
+/// selectors are tolerated and ignored, and `--skip` / `--take` do not
+/// apply to a single-record report (the `doc-props` shape). Contract
+/// in docs/cli.md, "calc-props".
+fn runCalcPropsCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+    // Read and validated whole before the first byte of the record,
+    // so no read failure can half-write it (a stdout I/O failure
+    // mid-line can, as on any streaming command).
+    const rec = zlsx_pkg.sheet_props_ndjson.collectCalc(alloc, &wb) catch |e| {
+        try err.print("zlsx: cannot read calculation properties in '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return 2;
+    };
+    try zlsx_pkg.sheet_props_ndjson.writeCalcRecord(out, rec);
     try out.flush();
     return 0;
 }
@@ -10122,6 +10292,364 @@ test "runConditionalFormatsCommand: an undecodable numeric carrier refuses whole
     try std.testing.expectEqual(@as(u8, 2), rc);
     try std.testing.expectEqualStrings("", w.buffered());
     try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
+// ─── S3b slice 8: `sheet-props` / `calc-props` ───────────────────────
+
+test "parseArgs: sheet-props token and flag rejections" {
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.sheet_props, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // Sheet records are sheet-keyed, not row-keyed, and stream.
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--end-row", "5" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--include-blanks" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--output", "pretty-json" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--format", "csv" };
+        try std.testing.expectError(ArgError.BadFormat, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    // The selectors and pagination parse like the rest of the family.
+    {
+        const argv = [_][]const u8{ "sheet-props", "f.xlsx", "--sheet-glob", "Rep*", "--skip", "1", "--take", "2", "--output", "compact-ndjson" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqualStrings("Rep*", a.sheet_glob.?);
+        try std.testing.expectEqual(@as(?usize, 1), a.skip);
+        try std.testing.expectEqual(@as(?usize, 2), a.take);
+        try std.testing.expectEqual(OutputMode.compact_ndjson, a.output);
+    }
+}
+
+test "parseArgs: calc-props token, workbook-scoped tolerance, row-shape rejections" {
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.calc_props, a.subcommand);
+        try std.testing.expectEqualStrings("f.xlsx", a.file);
+    }
+    // Sheet selectors and --format are tolerated (the doc-props /
+    // meta wrapper-friendliness) …
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--sheet", "3", "--format", "csv", "--output", "compact-ndjson" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.calc_props, a.subcommand);
+        try std.testing.expectEqual(@as(?usize, 3), a.sheet_index);
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--all-sheets" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.all_sheets);
+    }
+    // … while the row-shape flags stay rejected.
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--range", "A1:B2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--start-row", "2" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--header" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--include-blanks" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--with-styles" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "calc-props", "f.xlsx", "--output", "pretty-json" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+}
+
+test "runSheetPropsCommand: every sheet by default, exact wire shape" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_sheet_props.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(std.testing.allocator, io, path);
+
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sheet_props\",\"sheet\":\"Data\",\"sheet_idx\":0,\"dimension\":\"A1:B3\"," ++
+            "\"pane\":{\"x_split\":2,\"y_split\":1,\"top_left_cell\":\"C2\",\"active_pane\":\"bottomRight\",\"state\":\"frozen\"}}\n" ++
+            "{\"kind\":\"sheet_props\",\"sheet\":\"Report\",\"sheet_idx\":1,\"dimension\":\"A1:C2\"," ++
+            "\"pane\":{\"x_split\":2865,\"y_split\":1215.5,\"top_left_cell\":\"C4\",\"active_pane\":\"bottomRight\",\"state\":\"split\"}}\n" ++
+            "{\"kind\":\"sheet_props\",\"sheet\":\"Bare\",\"sheet_idx\":2,\"dimension\":null,\"pane\":null}\n",
+        w.buffered(),
+    );
+}
+
+test "runSheetPropsCommand: selection, pagination, compact prologue, exit codes" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_sheet_props_sel.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(std.testing.allocator, io, path);
+
+    // --sheet narrows to Report: just its record, under the full envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_index = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet_props\",\"sheet\":\"Report\",\"sheet_idx\":1,"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+    }
+    // compact-ndjson: one prologue per sheet, records drop the envelope.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .output = .compact_ndjson }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "{\"kind\":\"sheet\","));
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "{\"kind\":\"sheet_props\",\"dimension\":"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet_props\",\"sheet\":") == null);
+    }
+    // --skip 1 --take 1 pages the record stream: Report alone.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .skip = 1, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"state\":\"split\"") != null);
+    }
+    // compact + --skip 2 --take 1: prologues are not counted by the
+    // pager and a skipped sheet emits no prologue — Bare's record is
+    // the third, so the stream is exactly its prologue and its record.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .output = .compact_ndjson, .skip = 2, .take = 1 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"sheet\",\"sheet\":\"Bare\",\"sheet_idx\":2}\n" ++
+                "{\"kind\":\"sheet_props\",\"dimension\":null,\"pane\":null}\n",
+            w.buffered(),
+        );
+    }
+    // --take 0 emits nothing — not even a prologue.
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .output = .compact_ndjson, .take = 0 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+    }
+    // --sheet-glob widens by name.
+    {
+        var scratch: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_glob = "*a*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        const got = w.buffered();
+        // Data and Bare match; Report does not.
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Report\"") == null);
+    }
+    // A glob matching zero sheets is an empty, successful stream;
+    // an unknown sheet is exit 3, like every read sub-command.
+    {
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_glob = "Zzz*" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings("", w.buffered());
+        const rc2 = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_name = "Nope" }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc2);
+        const rc3 = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_index = 9 }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 3), rc3);
+    }
+}
+
+test "runSheetPropsCommand: a fresh writer workbook is a stream of two-null records" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_sheet_props_plain.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var s0 = try w.addSheet("Only");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 0), rc);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sheet_props\",\"sheet\":\"Only\",\"sheet_idx\":0,\"dimension\":null,\"pane\":null}\n",
+        w.buffered(),
+    );
+}
+
+test "runSheetPropsCommand: a carrier the stream cannot carry refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_sheet_props_bad_ref.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(std.testing.allocator, io, path);
+    // A bad entity in the LAST sheet's extent, and a sheet the
+    // selection would exclude: the whole command refuses — the
+    // inventory is proven whole before selection applies.
+    try zlsx_pkg.sheet_props_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/worksheets/sheet2.xml", "ref=\"A1:C2\"", "ref=\"A1&bogus;C2\"");
+    var scratch: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runSheetPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .sheet_props, .sheet_index = 0 }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedSheetXml") != null);
+}
+
+test "runCalcPropsCommand: exact wire shape, selectors ignored, the absent record" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_calc_props.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(std.testing.allocator, io, path);
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runCalcPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .calc_props }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"calc_props\",\"calc_id\":191029,\"full_calc_on_load\":true,\"iterate\":true,\"iterate_count\":100,\"iterate_delta\":0.001}\n",
+            w.buffered(),
+        );
+    }
+    // Sheet selectors, --skip / --take and the compact envelope are
+    // tolerated and change nothing — one record, no sheet dimension.
+    {
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runCalcPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .calc_props, .sheet_index = 7, .skip = 3, .take = 0, .output = .compact_ndjson }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"kind\":\"calc_props\",\"calc_id\":191029,"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+    }
+    // A fresh writer workbook carries no <calcPr>: the record of nulls.
+    {
+        const plain = try tt.path(std.testing.allocator, io, "cli_calc_props_plain.xlsx");
+        defer std.testing.allocator.free(plain);
+        const writer = xlsx.writer_types;
+        var ww = writer.Writer.init(std.testing.allocator);
+        defer ww.deinit();
+        var s0 = try ww.addSheet("Only");
+        try s0.writeRow(&.{.{ .integer = 1 }});
+        try ww.save(io, plain);
+        var scratch: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const rc = try runCalcPropsCommand(std.testing.allocator, io, .{ .file = plain, .subcommand = .calc_props }, &w, &err_w);
+        try std.testing.expectEqual(@as(u8, 0), rc);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"calc_props\",\"calc_id\":null,\"full_calc_on_load\":null,\"iterate\":null,\"iterate_count\":null,\"iterate_delta\":null}\n",
+            w.buffered(),
+        );
+    }
+}
+
+test "runCalcPropsCommand: a slot the read cannot report faithfully refuses whole (exit 2)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "cli_calc_props_dup.xlsx");
+    defer std.testing.allocator.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(std.testing.allocator, io, path);
+    // Two <calcPr> at the slot: which one Excel honours is not the
+    // reader's to guess.
+    try zlsx_pkg.sheet_props_ndjson.fixture.patchPart(std.testing.allocator, io, path, "xl/workbook.xml", "</workbook>", "<calcPr calcId=\"1\"/></workbook>");
+    var scratch: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    var err_buf: [512]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    const rc = try runCalcPropsCommand(std.testing.allocator, io, .{ .file = path, .subcommand = .calc_props }, &w, &err_w);
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expectEqualStrings("", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, err_w.buffered(), "MalformedWorkbookXml") != null);
 }
 
 // ─── S3b slice 3: `doc-props` ────────────────────────────────────────

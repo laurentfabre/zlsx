@@ -1931,6 +1931,33 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(cf_fuzz_tests).step);
 
+    // S3b slice 8: the strict sheet-props scanner (`scanSheetProps`)
+    // is a fourth walker over attacker-controlled XML on the same
+    // lexical layer; the module above does not import it, so it needs
+    // its own `-ffuzz` root (the MNT-2303 rule).
+    const sheet_props_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/sheet_props_ndjson.zig"),
+        .target = target,
+        .optimize = optimize,
+        .fuzz = true,
+    });
+    sheet_props_fuzz_mod.addImport("zlsx_control", control_mod);
+    sheet_props_fuzz_mod.addImport("zlsx", zlsx_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_sst_plan", sst_plan_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_styles_plan", styles_plan_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_workbook_xml_plan", workbook_xml_plan_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_zip", zip_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_fresh_emit", fresh_emit_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_nfc", nfc_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_refs", refs_mod);
+    sheet_props_fuzz_mod.addImport("zlsx_formula", formula_pkg_mod);
+    const sheet_props_fuzz_tests = b.addTest(.{
+        .root_module = sheet_props_fuzz_mod,
+        .test_runner = fuzz_test_runner,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(sheet_props_fuzz_tests).step);
+
     // tests/package_corpus.zig — corpus-level integration test for
     // the package layer. Imports `zlsx_pkg` and walks every fixture
     // through PartStore.open + partNames + imageAnchors +
