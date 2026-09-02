@@ -220,6 +220,10 @@ class ZlsxError(RuntimeError):
 
 _ERR_BUF_LEN = 256
 
+# `zlsx_sheet_state` codes → the OOXML spelling `zlsx list-sheets`
+# prints (`<sheet state="…">`); the header's ZLSX_SHEET_STATE_* order.
+_SHEET_STATE_NAMES = {0: "visible", 1: "hidden", 2: "veryHidden"}
+
 
 def _decode_err(buf: ctypes.Array) -> str:
     return bytes(buf.value).decode("utf-8", errors="replace")
@@ -497,8 +501,10 @@ class Book:
                 _ffi.lib.zlsx_sheet_name(self._handle, i, name_buf, len(name_buf))
             self.sheets.append(name_buf.value.decode("utf-8", errors="replace"))
 
-    def sheet(self, selector: Union[int, str]) -> "Sheet":
-        """Select a sheet by 0-based index or by name."""
+    def _sheet_index(self, selector: Union[int, str]) -> int:
+        """Resolve a 0-based index or a name to the index — the one
+        selector rule :meth:`sheet` and :meth:`sheet_state` share
+        (``IndexError`` / ``KeyError`` / ``TypeError``)."""
         if not self._handle:
             raise ZlsxError("Book is closed")
         if isinstance(selector, int):
@@ -506,7 +512,7 @@ class Book:
                 raise IndexError(
                     f"sheet index {selector} out of range (workbook has {len(self.sheets)})"
                 )
-            return Sheet(self, selector)
+            return selector
         if isinstance(selector, str):
             name_bytes = selector.encode("utf-8")
             idx = _ffi.lib.zlsx_sheet_index_by_name(
@@ -514,10 +520,51 @@ class Book:
             )
             if idx < 0:
                 raise KeyError(f"no sheet named {selector!r}")
-            return Sheet(self, idx)
+            return idx
         raise TypeError(
             f"sheet selector must be int or str, got {type(selector).__name__}"
         )
+
+    def sheet(self, selector: Union[int, str]) -> "Sheet":
+        """Select a sheet by 0-based index or by name."""
+        return Sheet(self, self._sheet_index(selector))
+
+    def sheet_state(self, selector: Union[int, str]) -> str:
+        """Visibility of one sheet, by 0-based index or by name:
+        ``"visible"``, ``"hidden"`` (Excel's *Hide*) or ``"veryHidden"``
+        (unreachable from Excel's UI — only VBA / the object model
+        reveals such a sheet, so this is how a caller scanning a
+        workbook learns it exists). The ``<sheet state="…">`` attribute
+        as the reader modelled it, spelled as ``zlsx list-sheets``
+        prints it; a missing or unrecognised ``state`` reads as
+        ``"visible"``, the schema default. Hidden sheets stay in
+        :attr:`sheets` and read like any other. Requires libzlsx 0.9.0+
+        (``zlsx_sheet_state``)."""
+        # The selector rule first, the probe second — a closed book or a
+        # bad selector is the same error whatever dylib is loaded (the
+        # `merged_ranges` order).
+        idx = self._sheet_index(selector)
+        if not _ffi._HAS_SHEET_STATE:
+            raise RuntimeError(
+                "loaded libzlsx does not expose sheet_state (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+        code = _ffi.lib.zlsx_sheet_state(self._handle, idx)
+        if code == -1:
+            # The export's one out-of-range code — unreachable through
+            # `_sheet_index`'s bound unless `sheets` was mutated behind the
+            # binding; keep the selector contract even then. That bound is
+            # the only guard: ctypes wraps a negative int silently under a
+            # `c_uint32` argtype. Any other unknown code falls through to
+            # the "newer library" error below.
+            raise IndexError(
+                f"sheet index {idx} out of range (libzlsx reports {code})"
+            )
+        try:
+            return _SHEET_STATE_NAMES[code]
+        except KeyError:
+            # A code this binding does not know — a newer library.
+            raise ZlsxError(f"zlsx_sheet_state({idx}) returned {code}") from None
 
     def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:
         """Merged cell ranges declared in sheet ``sheet_idx``'s
@@ -1040,6 +1087,13 @@ class Sheet:
         self._book = book
         self.index = index
         self.name = book.sheets[index]
+
+    @property
+    def state(self) -> str:
+        """This sheet's visibility — :meth:`Book.sheet_state` for
+        :attr:`index` (``"visible"`` / ``"hidden"`` / ``"veryHidden"``).
+        Requires libzlsx 0.9.0+."""
+        return self._book.sheet_state(self.index)
 
     def rows(self) -> "Rows":
         """Return a row iterator. Each iteration yields a ``list`` whose

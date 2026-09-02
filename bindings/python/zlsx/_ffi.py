@@ -143,6 +143,15 @@ lib.zlsx_sheet_index_by_name.argtypes = [
 ]
 lib.zlsx_sheet_index_by_name.restype = ctypes.c_int32
 
+# S3b slice 10 (0.9.0+): sheet visibility on the reader handle — the
+# `<sheet state="…">` code of one sheet (0 visible / 1 hidden /
+# 2 veryHidden, -1 out of range). Probe + skip so older dylibs keep
+# importing; `Book.sheet_state` raises RuntimeError without it.
+_HAS_SHEET_STATE = hasattr(lib, "zlsx_sheet_state")
+if _HAS_SHEET_STATE:
+    lib.zlsx_sheet_state.argtypes = [book_handle, ctypes.c_uint32]
+    lib.zlsx_sheet_state.restype = ctypes.c_int32
+
 lib.zlsx_rows_open.argtypes = [
     book_handle,
     ctypes.c_uint32,

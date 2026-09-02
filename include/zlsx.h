@@ -131,6 +131,23 @@ int32_t zlsx_sheet_index_by_name(zlsx_book_t * book,
                                  size_t          name_len);
 
 /*
+ * Sheet visibility — the <sheet state="…"> attribute of sheet `idx`
+ * as the reader modelled it: ZLSX_SHEET_STATE_VISIBLE, _HIDDEN
+ * (Excel's Hide) or _VERY_HIDDEN (unreachable from Excel's UI — only
+ * VBA / the object model reveals such a sheet, so a caller scanning a
+ * workbook has no other way to learn it exists). A missing or
+ * unrecognised `state` reads as visible, the schema default — the
+ * same rule `zlsx list-sheets` prints, from the same field. Hidden
+ * sheets stay in the inventory: zlsx_sheet_count / zlsx_sheet_name /
+ * the row iterators enumerate them regardless. Returns -1 if idx is
+ * out of range. 0.9.0+ (probe: ZLSX_HAS_SHEET_STATE).
+ */
+#define ZLSX_SHEET_STATE_VISIBLE      0
+#define ZLSX_SHEET_STATE_HIDDEN       1
+#define ZLSX_SHEET_STATE_VERY_HIDDEN  2
+int32_t zlsx_sheet_state(zlsx_book_t * book, uint32_t idx);
+
+/*
  * Merged cell range for a sheet. Columns are 0-based (A=0),
  * rows are 1-based (row1=1) — matches the Zig/Python API.
  */
@@ -1987,6 +2004,7 @@ int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
 #define ZLSX_HAS_CONDITIONAL_FORMATS 1   /* editor conditional_formats_ndjson (the read; the writer's add_conditional_format_* predate the macros) */
 #define ZLSX_HAS_ANCHORS          1   /* editor anchors_ndjson */
 #define ZLSX_HAS_SHEET_PROPS      1   /* editor sheet_props_ndjson + calc_props_ndjson */
+#define ZLSX_HAS_SHEET_STATE      1   /* reader sheet_state (S3b slice 10) */
 
 
 #ifdef __cplusplus

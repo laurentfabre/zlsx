@@ -7472,12 +7472,55 @@ test "runListSheetsCommand emits one sheet record per sheet" {
     var w = std.Io.Writer.fixed(&scratch);
     try runListSheetsCommand(&w, &book, .ndjson);
     // Z4: every record now carries `state`. Writer-produced sheets are
-    // all visible; the veryHidden path is covered by the sheet-state
-    // test below.
+    // all visible; the hidden / veryHidden spellings are pinned by the
+    // S3b slice 10 test below.
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0,\"state\":\"visible\"}\n" ++
             "{\"kind\":\"sheet\",\"sheet\":\"Other\",\"sheet_idx\":1,\"state\":\"visible\"}\n" ++
             "{\"kind\":\"sheet\",\"sheet\":\"She\\\"et\",\"sheet_idx\":2,\"state\":\"visible\"}\n",
+        w.buffered(),
+    );
+}
+
+test "runListSheetsCommand spells hidden / veryHidden as the C ABI and py-zlsx do (S3b slice 10)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const tmp_path = try tt.path(std.testing.allocator, io, "cli_list_sheets_state.xlsx");
+    defer std.testing.allocator.free(tmp_path);
+    {
+        const writer = xlsx.writer_types;
+        var w = writer.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        for ([_][]const u8{ "Data", "Ledger", "Secret", "Odd" }) |name| {
+            var s = try w.addSheet(name);
+            try s.writeRow(&.{.{ .string = name }});
+        }
+        try w.save(io, tmp_path);
+    }
+    // The writer authors no `state`; the three attributes are spliced
+    // through the archive — the C ABI / py-zlsx fixture's shape, so the
+    // literals below are the ones `Book.sheet_state` returns and
+    // `zlsx_sheet_state`'s codes name. `Odd` carries an unrecognised
+    // value: the reader folds it to the schema default.
+    const patch = zlsx_pkg.pivots.fixture.patchPart;
+    try patch(std.testing.allocator, io, tmp_path, "xl/workbook.xml", "name=\"Ledger\"", "name=\"Ledger\" state=\"hidden\"");
+    try patch(std.testing.allocator, io, tmp_path, "xl/workbook.xml", "name=\"Secret\"", "name=\"Secret\" state=\"veryHidden\"");
+    try patch(std.testing.allocator, io, tmp_path, "xl/workbook.xml", "name=\"Odd\"", "name=\"Odd\" state=\"bogus\"");
+
+    var book = try xlsx.Book.open(std.testing.allocator, io, tmp_path);
+    defer book.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&scratch);
+    try runListSheetsCommand(&w, &book, .ndjson);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sheet\",\"sheet\":\"Data\",\"sheet_idx\":0,\"state\":\"visible\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Ledger\",\"sheet_idx\":1,\"state\":\"hidden\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Secret\",\"sheet_idx\":2,\"state\":\"veryHidden\"}\n" ++
+            "{\"kind\":\"sheet\",\"sheet\":\"Odd\",\"sheet_idx\":3,\"state\":\"visible\"}\n",
         w.buffered(),
     );
 }
