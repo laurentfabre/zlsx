@@ -6495,6 +6495,159 @@ fn anchorsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) zlsx_pkg
     return out.toOwnedSlice();
 }
 
+/// The S3b `sheet-props` records — one `{"kind":"sheet_props",…}`
+/// line per workbook sheet, workbook order — as a library-allocated
+/// UTF-8 buffer, byte-for-byte what `zlsx sheet-props <file>` prints
+/// with no selector (docs/cli.md, "sheet-props"). Each record is the
+/// sheet's `<dimension ref>` as authored (null when the element or
+/// the attribute is absent) and the `<pane>` of its FIRST
+/// `<sheetView>` as authored (null when there is none): `x_split` /
+/// `y_split` / `top_left_cell` / `active_pane` / `state`, each null
+/// when the source omits it, no schema default applied, split panes
+/// reported as written (the lenient `Worksheet.freezePane` narrows to
+/// frozen panes; this read does not). Read over the editor's current
+/// parts: structural edits and the sheet sweeps they carry (a rename
+/// renaming `sheet`, a row insert growing `dimension` and moving a
+/// frozen pane's split and `top_left_cell`) are visible immediately;
+/// staged cell writes never touch the extent or the views. An
+/// inventory that cannot be served faithfully refuses whole — a sheet
+/// list the strict workbook read cannot prove (`MalformedWorkbookXml`)
+/// or a sheet part the strict walk cannot prove a pane / extent for
+/// (`MalformedSheetXml`: a second `<dimension>` / `<sheetViews>` /
+/// first-view `<pane>`, a duplicate attribute on that machinery, an
+/// MCE construct at a recognized slot, a carrier that does not
+/// decode), both -2 — rather than hand over a record that lies or a
+/// list with a hole. Release with `zlsx_buffer_release`.
+export fn zlsx_editor_sheet_props_ndjson(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail: a rejected sibling
+    // leaves the accepted ones releasable.
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    // Exhaustive over the closed `CollectError` — no `else`, so a
+    // future member breaks this compile and forces a status decision
+    // (the conditional-formats read's rule, Codex #216 r8
+    // S3B-MNT-911).
+    const bytes = sheetPropsNdjsonOwned(gpa, &state.inner.workbook) catch |e| switch (e) {
+        error.MalformedWorkbookXml,
+        error.MalformedSheetXml,
+        error.MissingSheetPart,
+        error.ZipBombSuspected,
+        error.OutOfMemory,
+        => return failMapped(e, diag, err_buf, err_buf_len),
+    };
+    // An openable workbook lists at least one sheet, so the stream is
+    // never empty in practice; the `(NULL, 0)` arm keeps the buffer
+    // contract uniform with its siblings rather than assert a
+    // property of the strict inventory here.
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The sheet-props records as one owned buffer in `alloc` — the
+/// shared writer (`pkg/sheet_props_ndjson.zig`) over the editor's
+/// current parts, so the bytes are the CLI's. The allocating writer
+/// reports a failed growth as `WriteFailed`; at this boundary that is
+/// an allocation failure and crosses as `-3`, the pivots builder's
+/// rule.
+fn sheetPropsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) zlsx_pkg.sheet_props_ndjson.CollectError![]u8 {
+    var view = try zlsx_pkg.sheet_props_ndjson.collect(alloc, wb);
+    defer view.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.sheet_props_ndjson.writeAll(&out.writer, &view) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
+/// The S3b `calc-props` record — the ONE `{"kind":"calc_props",…}`
+/// line of `xl/workbook.xml`'s `<calcPr>` — as a library-allocated
+/// UTF-8 buffer, byte-for-byte what `zlsx calc-props <file>` prints
+/// (docs/cli.md, "calc-props"): `calc_id` / `full_calc_on_load` /
+/// `iterate` / `iterate_count` / `iterate_delta` as authored, every
+/// field null when the element or the attribute is absent (a workbook
+/// without `<calcPr>` is a record of nulls, never an empty buffer —
+/// the doc-props convention). Read over the editor's current parts:
+/// `zlsx_editor_mark_recalc_on_load` and a recalc that lands set
+/// `fullCalcOnLoad="1"` in place, visible immediately; staged cell
+/// writes never touch the element. A slot the read cannot report
+/// faithfully refuses (`MalformedWorkbookXml`, -2): two `<calcPr>` at
+/// the slot, one an MCE branch could project there, a duplicate
+/// attribute, a carrier that does not decode. Release with
+/// `zlsx_buffer_release`.
+export fn zlsx_editor_calc_props_ndjson(
+    ed: ?*Editor,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+
+    // Exhaustive over the closed `CalcError` — no `else`.
+    const bytes = calcPropsNdjsonOwned(gpa, &state.inner.workbook) catch |e| switch (e) {
+        error.MalformedWorkbookXml,
+        error.ZipBombSuspected,
+        error.OutOfMemory,
+        => return failMapped(e, diag, err_buf, err_buf_len),
+    };
+    // The record writer always emits its one line: an absent
+    // `<calcPr>` is a record of nulls, so a caller never sees
+    // `(NULL, 0)` on success.
+    std.debug.assert(bytes.len != 0);
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The calc-props record as one owned buffer in `alloc` — the shared
+/// writer over the editor's current `xl/workbook.xml`, so the bytes
+/// are the CLI's. `WriteFailed` crosses as `-3`, as above.
+fn calcPropsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) zlsx_pkg.sheet_props_ndjson.CalcError![]u8 {
+    const rec = try zlsx_pkg.sheet_props_ndjson.collectCalc(alloc, wb);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.sheet_props_ndjson.writeCalcRecord(&out.writer, rec) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
 // ─── M9a1 tests ──────────────────────────────────────────────────────
 
 /// A1 = 1 (plain), B1 = formula "A1+2" with cached <v>0</v> — one
@@ -8626,6 +8779,382 @@ test "S3b anchors_ndjson: every allocation failure is OutOfMemory, never WriteFa
         alloc.free(primed);
     }
     try std.testing.checkAllAllocationFailures(alloc, anchorsNdjsonForFailures, .{&wb});
+}
+
+/// The pkg sheet-props fixture (`sheet_props_ndjson.zig::fixture.write`):
+/// `Data` carries a frozen pane and a spliced extent, `Report` a
+/// split pane with a fractional split and an extent, `Bare` neither,
+/// and the workbook a full `<calcPr>` — so the stream carries a
+/// frozen record, a split record (which the lenient view would
+/// narrow away) and a record of nulls, and the calc record has every
+/// field set. The writer emits no `<dimension>`, no `<calcPr>` and
+/// has no split-pane surface, so the fixture stays the package's.
+fn writeS3bSheetPropsFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    try zlsx_pkg.sheet_props_ndjson.fixture.write(alloc, io, path);
+    return path;
+}
+
+/// The frozen streams over that fixture — the literals the CLI's own
+/// `runSheetPropsCommand` / `runCalcPropsCommand` tests pin
+/// (docs/cli.md, "sheet-props" / "calc-props").
+const s3b_sheet_props_frozen =
+    "{\"kind\":\"sheet_props\",\"sheet\":\"Data\",\"sheet_idx\":0,\"dimension\":\"A1:B3\"," ++
+    "\"pane\":{\"x_split\":2,\"y_split\":1,\"top_left_cell\":\"C2\",\"active_pane\":\"bottomRight\",\"state\":\"frozen\"}}\n" ++
+    "{\"kind\":\"sheet_props\",\"sheet\":\"Report\",\"sheet_idx\":1,\"dimension\":\"A1:C2\"," ++
+    "\"pane\":{\"x_split\":2865,\"y_split\":1215.5,\"top_left_cell\":\"C4\",\"active_pane\":\"bottomRight\",\"state\":\"split\"}}\n" ++
+    "{\"kind\":\"sheet_props\",\"sheet\":\"Bare\",\"sheet_idx\":2,\"dimension\":null,\"pane\":null}\n";
+const s3b_calc_props_frozen =
+    "{\"kind\":\"calc_props\",\"calc_id\":191029,\"full_calc_on_load\":true,\"iterate\":true,\"iterate_count\":100,\"iterate_delta\":0.001}\n";
+const s3b_calc_props_absent =
+    "{\"kind\":\"calc_props\",\"calc_id\":null,\"full_calc_on_load\":null,\"iterate\":null,\"iterate_count\":null,\"iterate_delta\":null}\n";
+
+test "S3b sheet_props_ndjson: the shared writer's bytes, current after a rename and a row insert, the call errors" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_sheet_props.xlsx");
+    defer alloc.free(path);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings(s3b_sheet_props_frozen, out_ptr.?[0..out_len]);
+    zlsx_buffer_release(out_ptr, out_len);
+
+    // A structural edit is what the read sees: the sheet inventory is
+    // re-read from the current workbook.xml, no save in between.
+    const nm = "Facts";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    const renamed = out_ptr.?[0..out_len];
+    try std.testing.expect(std.mem.startsWith(u8, renamed, "{\"kind\":\"sheet_props\",\"sheet\":\"Facts\",\"sheet_idx\":0,\"dimension\":\"A1:B3\","));
+    try std.testing.expect(std.mem.indexOf(u8, renamed, "\"sheet\":\"Data\"") == null);
+    zlsx_buffer_release(out_ptr, out_len);
+
+    // A row insert below the frozen row on that sheet: the sheet
+    // sweep grows the extent and moves the pane's top-left cell with
+    // the grid while the split itself (one frozen row above the
+    // insertion) holds — visible with no save. The other sheets'
+    // records are untouched.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 0, 2, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sheet_props\",\"sheet\":\"Facts\",\"sheet_idx\":0,\"dimension\":\"A1:B4\"," ++
+            "\"pane\":{\"x_split\":2,\"y_split\":1,\"top_left_cell\":\"C3\",\"active_pane\":\"bottomRight\",\"state\":\"frozen\"}}\n" ++
+            "{\"kind\":\"sheet_props\",\"sheet\":\"Report\",\"sheet_idx\":1,\"dimension\":\"A1:C2\"," ++
+            "\"pane\":{\"x_split\":2865,\"y_split\":1215.5,\"top_left_cell\":\"C4\",\"active_pane\":\"bottomRight\",\"state\":\"split\"}}\n" ++
+            "{\"kind\":\"sheet_props\",\"sheet\":\"Bare\",\"sheet_idx\":2,\"dimension\":null,\"pane\":null}\n",
+        out_ptr.?[0..out_len],
+    );
+    zlsx_buffer_release(out_ptr, out_len);
+
+    // The split pane the record reports is the one the row edit
+    // refuses: the read and the editor's own contract agree, and the
+    // refused edit leaves the stream exactly as it was.
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 1, 1, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SplitPaneNotSupported", diagName(&diag));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expect(std.mem.indexOf(u8, out_ptr.?[0..out_len], "\"sheet\":\"Report\",\"sheet_idx\":1,\"dimension\":\"A1:C2\",\"pane\":{\"x_split\":2865,\"y_split\":1215.5,\"top_left_cell\":\"C4\"") != null);
+    zlsx_buffer_release(out_ptr, out_len);
+
+    // NULL out pointers are about the call — either one, with the
+    // present one reset from its poison.
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_sheet_props_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+    out_ptr = @ptrFromInt(0x1000);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expect(out_ptr == null);
+    // Re-poisoned: the NULL-editor path's own reset is what this pins.
+    out_ptr = @ptrFromInt(0x1000);
+    out_len = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_sheet_props_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+
+    // struct_size below v1: the outputs reset first, then the diag
+    // is rejected before a byte of it is written — the whole struct
+    // compared, not a field or two.
+    var small = std.mem.zeroes(CDiag);
+    small.struct_size = @sizeOf(CDiag) - 1;
+    small.plane = 7;
+    small.error_name[0] = 'x';
+    const small_before = std.mem.toBytes(small);
+    out_ptr = @ptrFromInt(0x1000);
+    out_len = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+    const small_after = std.mem.toBytes(small);
+    try std.testing.expectEqualSlices(u8, &small_before, &small_after);
+
+    // A NULL diag is allowed on the success path, as on every sibling.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+    try std.testing.expect(out_len != 0);
+    zlsx_buffer_release(out_ptr, out_len);
+}
+
+test "S3b sheet_props_ndjson: a fresh writer's sheets are records of nulls, never an empty stream" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3aFixture(io, &tt, "s3b_sheet_props_plain.xlsx");
+    defer alloc.free(path);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+    const got = out_ptr.?[0..out_len];
+    // One record per sheet, each with neither extent nor pane: the
+    // fresh writer emits no `<dimension>` and no views without a
+    // freeze.
+    try std.testing.expectEqual(@as(usize, std.mem.count(u8, got, "\n")), std.mem.count(u8, got, "\"dimension\":null,\"pane\":null}\n"));
+    try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"sheet_props\",\"sheet\":"));
+    zlsx_buffer_release(out_ptr, out_len);
+}
+
+test "S3b sheet_props_ndjson: an inventory the read cannot serve refuses whole, typed, nothing handed out" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const patch = zlsx_pkg.sheet_props_ndjson.fixture.patchPart;
+
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8, verdict: []const u8 };
+    const cases = [_]Case{
+        // Two extents on Data: maxOccurs=1 is a refusal, not a pick.
+        .{ .name = "s3b_sp_dim2.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<dimension ref=\"A1:B3\"/>", .new = "<dimension ref=\"A1:B3\"/><dimension ref=\"A1\"/>", .verdict = "MalformedSheetXml" },
+        // The SECOND sheet's pane carries a duplicate attribute while
+        // Data's record is perfectly servable — the whole-inventory
+        // rule hands out nothing.
+        .{ .name = "s3b_sp_second.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "state=\"split\"", .new = "state=\"split\" state=\"frozen\"", .verdict = "MalformedSheetXml" },
+        // A pane carrier that does not decode: the record would lie.
+        .{ .name = "s3b_sp_carrier.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "topLeftCell=\"C4\"", .new = "topLeftCell=\"C&bogus;\"", .verdict = "MalformedSheetXml" },
+        // An MCE branch at the views slot: the walk cannot rule a
+        // projected pane in or out.
+        .{ .name = "s3b_sp_mce.xlsx", .part = "xl/worksheets/sheet2.xml", .old = "<sheetViews>", .new = "<sheetViews><mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x14\"/></mc:AlternateContent>", .verdict = "MalformedSheetXml" },
+        // A bad entity in a sheet-name carrier: the workbook-level
+        // read refuses before any sheet part is walked.
+        .{ .name = "s3b_sp_wb.xlsx", .part = "xl/workbook.xml", .old = "name=\"Report\"", .new = "name=\"Rep&bogus;ort\"", .verdict = "MalformedWorkbookXml" },
+    };
+    for (cases) |case| {
+        const path = try writeS3bSheetPropsFixture(io, &tt, case.name);
+        defer alloc.free(path);
+        try patch(alloc, io, path, case.part, case.old, case.new);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        // Poisoned on entry: the refusal path itself must reset the pair.
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(case.verdict, diagName(&diag));
+        try std.testing.expectEqualStrings(case.verdict, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+    // A listed sheet part the archive cannot materialise: the
+    // inventory's probe reaches it first, so the zip layer's own
+    // error folds to the workbook's verdict there (the
+    // conditional-formats read's rule, Codex #216 r1 S3B-ERR-602).
+    {
+        const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_sp_crc.xlsx");
+        defer alloc.free(path);
+        try corruptPartPayload(alloc, io, path, "xl/worksheets/sheet3.xml");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_sheet_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+}
+
+test "S3b calc_props_ndjson: the shared writer's bytes, the absent record, mark-recalc visible with no save, the call errors" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    {
+        const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_calc_props.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(s3b_calc_props_frozen, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // A rename is a workbook.xml rewrite the read re-walks; the
+        // `<calcPr>` slot rides through it untouched.
+        const nm = "Facts";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(s3b_calc_props_frozen, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        // NULL out pointers are about the call — either one, with the
+        // present one reset from its poison.
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_calc_props_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        out_ptr = @ptrFromInt(0x1000);
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_calc_props_ndjson(ed, &out_ptr, null, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_calc_props_ndjson(null, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+
+        var small = std.mem.zeroes(CDiag);
+        small.struct_size = @sizeOf(CDiag) - 1;
+        small.plane = 7;
+        small.error_name[0] = 'x';
+        const small_before = std.mem.toBytes(small);
+        out_ptr = @ptrFromInt(0x1000);
+        out_len = 99;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &small, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        const small_after = std.mem.toBytes(small);
+        try std.testing.expectEqualSlices(u8, &small_before, &small_after);
+    }
+    // No `<calcPr>`: a record of nulls, never `(NULL, 0)` — and the
+    // mark-only transaction's `fullCalcOnLoad="1"` lands in the live
+    // part, so the next read reports it with no save in between.
+    {
+        const path = try writeS3aFixture(io, &tt, "s3b_calc_props_plain.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(s3b_calc_props_absent, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_mark_recalc_on_load(ed, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"calc_props\",\"calc_id\":null,\"full_calc_on_load\":true,\"iterate\":null,\"iterate_count\":null,\"iterate_delta\":null}\n",
+            out_ptr.?[0..out_len],
+        );
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3b calc_props_ndjson: a slot the read cannot report faithfully refuses whole, typed, nothing handed out" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const patch = zlsx_pkg.sheet_props_ndjson.fixture.patchPart;
+    const full = "<calcPr calcId=\"191029\" fullCalcOnLoad=\"1\" iterate=\"true\" iterateCount=\"100\" iterateDelta=\"0.001\"/>";
+
+    const Case = struct { name: []const u8, old: []const u8, new: []const u8 };
+    const cases = [_]Case{
+        // Two at the slot: which one Excel honours is not the reader's
+        // to guess.
+        .{ .name = "s3b_cp_two.xlsx", .old = "</workbook>", .new = "<calcPr calcId=\"1\"/></workbook>" },
+        // A branch an MCE processor could project into the slot.
+        .{ .name = "s3b_cp_mce.xlsx", .old = full, .new = "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x15\"><calcPr calcId=\"1\"/></mc:Choice></mc:AlternateContent>" },
+        // A duplicate attribute; a carrier that does not decode.
+        .{ .name = "s3b_cp_dup.xlsx", .old = full, .new = "<calcPr calcId=\"1\" calcId=\"2\"/>" },
+        .{ .name = "s3b_cp_carrier.xlsx", .old = full, .new = "<calcPr iterate=\"&bogus;\"/>" },
+        // A `<sheets>` list the strict workbook walk cannot prove: the
+        // calc read runs the same walk, the same verdict.
+        .{ .name = "s3b_cp_sheets.xlsx", .old = "</sheets>", .new = "</sheets><sheets/>" },
+    };
+    for (cases) |case| {
+        const path = try writeS3bSheetPropsFixture(io, &tt, case.name);
+        defer alloc.free(path);
+        try patch(alloc, io, path, "xl/workbook.xml", case.old, case.new);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+        var out_len: usize = 99;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_calc_props_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expect(out_ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+}
+
+fn sheetPropsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try sheetPropsNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+fn calcPropsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
+    const bytes = try calcPropsNdjsonOwned(alloc, wb);
+    alloc.free(bytes);
+}
+
+test "S3b sheet_props_ndjson / calc_props_ndjson: every allocation failure is OutOfMemory, never WriteFailed" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_sheet_props_oom.xlsx");
+    defer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    // Prime the workbook-owned caches (part names, part bytes) so the
+    // sweeps exercise the builders' own allocations — the shared
+    // writer's own OOM test does the same.
+    {
+        const primed = try sheetPropsNdjsonOwned(alloc, &wb);
+        alloc.free(primed);
+        const primed_calc = try calcPropsNdjsonOwned(alloc, &wb);
+        alloc.free(primed_calc);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, sheetPropsNdjsonForFailures, .{&wb});
+    try std.testing.checkAllAllocationFailures(alloc, calcPropsNdjsonForFailures, .{&wb});
 }
 
 /// Flip one byte deep inside the stored payload of `part`, found by

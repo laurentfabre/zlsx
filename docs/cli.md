@@ -440,7 +440,9 @@ part) and keeps that contract; this read reports split panes too, as
 written, from the schema slot only. The records come from a strict,
 namespace- and depth-aware walk of each sheet part
 (`pkg/sheet_props_ndjson.zig`, on the `conditional-formats` scanner's
-lexical layer).
+lexical layer). The C ABI (`zlsx_editor_sheet_props_ndjson`) and
+py-zlsx (`Editor.sheet_props()` / `zlsx.sheet_props(path)`) hand over
+these exact bytes with no selector.
 
 ```jsonl
 {"kind":"sheet_props","sheet":"Data","sheet_idx":0,"dimension":"A1:B3","pane":{"x_split":2,"y_split":1,"top_left_cell":"C2","active_pane":"bottomRight","state":"frozen"}}
@@ -513,7 +515,9 @@ a `<pane/>` without attributes are present-and-empty: `dimension` is
 and reported as authored. The lenient view applies its own defaults
 (`iterate` / `fullCalcOnLoad` false when absent, anything but `true` /
 `1` false) and keeps them; this read reports `null` for what the file
-does not say.
+does not say. The C ABI (`zlsx_editor_calc_props_ndjson`) and py-zlsx
+(`Editor.calc_props()` / `zlsx.calc_props(path)`) hand over this exact
+line.
 
 ```jsonl
 {"kind":"calc_props","calc_id":191029,"full_calc_on_load":true,"iterate":false,"iterate_count":100,"iterate_delta":0.001}

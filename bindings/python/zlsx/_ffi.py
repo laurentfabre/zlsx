@@ -1791,3 +1791,25 @@ if _HAS_ANCHORS:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_anchors_ndjson.restype = ctypes.c_int32
+
+# S3b slice 9: the sheet-props and calc-props reads, the same buffer
+# contract. One probe for the pair — the header's ZLSX_HAS_SHEET_PROPS
+# covers both exports, so a dylib has either both or neither.
+_HAS_SHEET_PROPS = (
+    hasattr(lib, "zlsx_editor_sheet_props_ndjson")
+    and hasattr(lib, "zlsx_editor_calc_props_ndjson")
+    and _HAS_BUFFER_RELEASE
+    and _HAS_DIAG_RELEASE
+)
+if _HAS_SHEET_PROPS:
+    for _fn in (lib.zlsx_editor_sheet_props_ndjson, lib.zlsx_editor_calc_props_ndjson):
+        _fn.argtypes = [
+            editor_handle,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+            ctypes.POINTER(ctypes.c_size_t),                 # out_len
+            ctypes.POINTER(DiagV1),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        _fn.restype = ctypes.c_int32
+    del _fn

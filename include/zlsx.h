@@ -1926,12 +1926,62 @@ int32_t zlsx_editor_anchors_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* The S3b `sheet-props` records — one {"kind":"sheet_props",…} line
+ * per workbook sheet, workbook order — as a library-allocated UTF-8
+ * buffer, byte-for-byte what `zlsx sheet-props <file>` prints with no
+ * selector (docs/cli.md, "sheet-props"). Each record is the sheet's
+ * <dimension ref> as authored (null when the element or the attribute
+ * is absent) and the <pane> of its FIRST <sheetView> as authored (null
+ * when there is none): x_split / y_split / top_left_cell / active_pane
+ * / state, each null when the source omits it, no schema default
+ * applied, split panes reported as written (the lenient
+ * Worksheet.freezePane narrows to frozen panes; this read does not).
+ * Later <sheetView> elements keep their own panes in the part. Read
+ * over the editor's current parts: structural edits and the sheet
+ * sweeps they carry (a rename renaming `sheet`, a row insert growing
+ * `dimension` and moving a frozen pane's split and `top_left_cell`)
+ * are visible immediately; staged cell writes never touch the extent
+ * or the views. An openable workbook lists at least one sheet, so the
+ * buffer is never empty on ZLSX_OK. An inventory that cannot be served
+ * faithfully refuses whole — a sheet list the strict workbook read
+ * cannot prove (MalformedWorkbookXml), or a sheet part the strict walk
+ * cannot prove a pane / extent for (MalformedSheetXml: a second
+ * <dimension> / <sheetViews> / first-view <pane>, a duplicate
+ * attribute on that machinery, an MCE construct at a recognized slot,
+ * a carrier that does not decode), both ZLSX_REFUSED — rather than
+ * hand over a record that lies or a list with a hole. (An archive
+ * past the decompression caps fails at open.) Release with
+ * zlsx_buffer_release. */
+int32_t zlsx_editor_sheet_props_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* The S3b `calc-props` record — the ONE {"kind":"calc_props",…} line
+ * of xl/workbook.xml's <calcPr> — as a library-allocated UTF-8 buffer,
+ * byte-for-byte what `zlsx calc-props <file>` prints (docs/cli.md,
+ * "calc-props"): calc_id / full_calc_on_load / iterate / iterate_count
+ * / iterate_delta as authored, every field null when the element or
+ * the attribute is absent (a workbook without <calcPr> is a record of
+ * nulls, never an empty buffer — the doc-props convention). Read over
+ * the editor's current parts: zlsx_editor_mark_recalc_on_load and a
+ * recalc that lands set fullCalcOnLoad="1" in place, visible
+ * immediately; staged cell writes never touch the element. A slot the
+ * read cannot report faithfully refuses (MalformedWorkbookXml,
+ * ZLSX_REFUSED): two <calcPr> at the slot, one an MCE branch could
+ * project there, a duplicate attribute, a carrier that does not
+ * decode — and a <sheets> list the same strict walk cannot prove.
+ * Release with zlsx_buffer_release. */
+int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
 #define ZLSX_HAS_DEFINED_NAMES    1   /* editor defined_names_ndjson (the read; the writer's add_defined_name predates the macros) */
 #define ZLSX_HAS_CONDITIONAL_FORMATS 1   /* editor conditional_formats_ndjson (the read; the writer's add_conditional_format_* predate the macros) */
 #define ZLSX_HAS_ANCHORS          1   /* editor anchors_ndjson */
+#define ZLSX_HAS_SHEET_PROPS      1   /* editor sheet_props_ndjson + calc_props_ndjson */
 
 
 #ifdef __cplusplus

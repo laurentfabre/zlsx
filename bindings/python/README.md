@@ -261,8 +261,8 @@ the edit **refuses** rather than corrupt it, as a `ZlsxRefusal` whose
 | `CannotDeleteLastSheet` | `delete_sheet` on the only sheet |
 | `TableColumnNameInUse` | `rename_table_column` to a name another column holds |
 | `MalformedPivotXml` | `pivots()` on a graph it cannot read whole — never a partial inventory |
-| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies — and `conditional_formats()` / `anchors()` on a sheet list the strict workbook read cannot prove |
-| `MalformedSheetXml` | also `conditional_formats()` on a sheet part the strict walk cannot serve faithfully — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a carrier that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable records too) |
+| `MalformedWorkbookXml` | also `defined_names()` on an inventory it cannot serve faithfully — a carrier that does not decode, malformed UTF-8, a body with embedded markup — never a record that lies — and `conditional_formats()` / `anchors()` / `sheet_props()` / `calc_props()` on a sheet list the strict workbook read cannot prove; `calc_props()` also on a `<calcPr>` slot it cannot report faithfully — two at the slot, one an MCE branch could project there, a duplicate attribute, a carrier that does not decode |
+| `MalformedSheetXml` | also `conditional_formats()` on a sheet part the strict walk cannot serve faithfully — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a carrier that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable records too); and `sheet_props()` on a sheet part the strict walk cannot prove a pane / extent for — a second `<dimension>` / `<sheetViews>` / first-view `<pane>`, a duplicate attribute on that machinery, an MCE construct at a recognized slot, a carrier that does not decode |
 | `MalformedDrawingXml` | also `anchors()` on a drawing graph the strict walk cannot read whole — a dangling or mistyped edge, an anchor that does not parse, a part along the chain the store cannot materialise, a series ref that does not decode — never a partial inventory (a broken second sheet refuses the first sheet's servable record too) |
 | `DrawingOnUnlistedSheet` | `anchors()` on an anchored object whose worksheet part `xl/workbook.xml` does not list — no record could carry a truthful `sheet`, and dropping it would leave a hole |
 | `SqrefCollapseUnsafe` | `delete_row` / `delete_column` that would collapse EVERY area of a `<conditionalFormatting>` or `<dataValidation>` `sqref` — Excel deletes such a rule outright; zlsx refuses rather than silently retarget it to the cells that slide into its place |
@@ -332,6 +332,28 @@ never touch a drawing. Chart parts are byte-preserved through every
 edit today, so a chart's `series_refs` keep spelling what the part
 holds (an old sheet name after a rename, pre-edit rows after an
 insert); the read reports the bytes faithfully.
+
+`Editor.sheet_props()` / `zlsx.sheet_props(path)` and
+`Editor.calc_props()` / `zlsx.calc_props(path)` are the same pattern
+over the `zlsx sheet-props` and `zlsx calc-props` records
+([docs/cli.md](../../docs/cli.md), "sheet-props" / "calc-props"):
+one `{"kind": "sheet_props", …}` dict per workbook sheet, workbook
+order — the sheet's `<dimension ref>` as authored (`None` when the
+element or the attribute is absent) and the `<pane>` of its first
+`<sheetView>` as authored (`None` when there is none; `x_split` /
+`y_split` / `top_left_cell` / `active_pane` / `state`, each `None` when
+the source omits it, split panes reported as written) — and ONE
+`{"kind": "calc_props", …}` dict for the workbook's `<calcPr>`
+(`calc_id` / `full_calc_on_load` / `iterate` / `iterate_count` /
+`iterate_delta` as authored, every field `None` when absent — a
+workbook without `<calcPr>` is a dict of `None`s, the `doc_props()`
+convention). Structural edits and the sheet sweeps they carry are
+visible immediately — a rename renames `sheet`, a row insert grows
+`dimension` and moves a frozen pane's split and `top_left_cell` with
+the grid (a split pane is the one such an edit refuses,
+`SplitPaneNotSupported`) — and `mark_recalc_on_load()` lands
+`full_calc_on_load` in place; staged cell writes never touch the
+extent, the views or `<calcPr>`.
 
 ## Spark (PySpark Data Source)
 
@@ -504,6 +526,11 @@ with zlsx.write("out.xlsx") as w:
 - Image / chart anchors, typed read (0.9.0+): `Editor.anchors()` /
   `zlsx.anchors(path)` — the `zlsx anchors` records as dicts (geometry and
   part names; the image bytes and chart XML stay in the archive)
+- Panes, `<dimension>` and calc properties, typed read (0.9.0+):
+  `Editor.sheet_props()` / `zlsx.sheet_props(path)` — the `zlsx sheet-props`
+  records as dicts (the extent and the first view's pane as authored, split
+  panes included) — and `Editor.calc_props()` / `zlsx.calc_props(path)` — the
+  one `zlsx calc-props` record as a dict
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)
