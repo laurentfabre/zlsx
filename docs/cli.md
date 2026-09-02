@@ -823,6 +823,17 @@ is set.
 - **Error cells** carry the literal Excel error string in `v` (`"#DIV/0!"`,
   `"#N/A"`, …).
 
+The C ABI and py-zlsx report the same three fields beside the row
+iterator's cells (0.9.0+): `zlsx_rows_formula_at` / `zlsx_rows_formula_ref_at`
+/ `zlsx_rows_error_at` with `zlsx_rows_style_at`'s per-column contract, and
+`Rows.formula_strings()` / `formula_refs()` / `error_strings()` — one list per
+accessor aligned to the row `next()` yielded. The cell itself stays what it
+always was there: the cached value for a formula cell (`cached` here; empty
+for a formula-only cell) and the literal string for an error cell. The
+precedence is the same on every surface — a formula whose cached value is an
+error literal is `t:"formula"`, never `t:"error"`. Contract:
+`docs/plans/c-abi-status-v1.md` §17.
+
 ---
 
 ## Flags

@@ -942,13 +942,19 @@ export fn zlsx_rows_next(
 ) callconv(.c) i32 {
     const rs: *RowsState = @ptrCast(@alignCast(rows));
 
+    // The C-side view is "the current row" for every per-column
+    // getter (`zlsx_rows_style_at` and the S3b slice 11 trio); it is
+    // rebuilt on 1 and emptied on 0 / -1, so after the end of the
+    // sheet or a parse error no getter serves a row the caller no
+    // longer has — the reader's own per-row lists are cleared at the
+    // end of the sheet but not on every failure path.
+    rs.c_cells.clearRetainingCapacity();
     const maybe = rs.inner.next() catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };
     const cells = maybe orelse return 0;
 
-    rs.c_cells.clearRetainingCapacity();
     rs.c_cells.ensureTotalCapacity(gpa, cells.len) catch {
         writeError(err_buf, err_buf_len, "OutOfMemory");
         return -1;
@@ -1004,10 +1010,108 @@ export fn zlsx_rows_style_at(
     out_style_idx: *u32,
 ) callconv(.c) i32 {
     const rs: *RowsState = @ptrCast(@alignCast(rows));
+    // Bound on the C-side view, not the reader's parallel list: the
+    // view is what the last `zlsx_rows_next` handed the caller —
+    // emptied at the end of the sheet, on a parse error and by
+    // `zlsx_rows_skip` — whereas the reader's per-row lists keep the
+    // last decoded row through a fast-path skip: a stale style for a
+    // row the caller never saw (S3b slice 11; the three side-channel
+    // getters below share the rule).
+    if (col_idx >= rs.c_cells.items.len) return -1;
     const styles = rs.inner.styleIndices();
-    if (col_idx >= styles.len) return -1;
-    const s = styles[col_idx] orelse return 1;
+    const s = (if (col_idx < styles.len) styles[col_idx] else null) orelse return 1;
     out_style_idx.* = s;
+    return 0;
+}
+
+// ─── S3b slice 11: formula text and error tags on the row iterator ───
+//
+// The reader keeps three per-row side channels beside the cells
+// (`Rows.formulaStrings` / `formulaRefs` / `errorStrings`) so the
+// `Cell` union never grew a formula or an error arm: a formula cell's
+// slot holds its cached `<v>` value and an error cell's slot holds the
+// literal as a plain string. The C ABI mirrors that — `zlsx_cell_t`
+// and its tags are untouched (an added tag would have turned every
+// existing caller's error literal into "unknown tag") — and hands the
+// channels over as per-column getters with `zlsx_rows_style_at`'s
+// contract: 0 + out params, 1 "not that kind of cell", -1 out of range
+// for the current row. The three are mutually exclusive by the
+// reader's construction (`consumeCell`: exactly one formula slot for
+// a formula cell, and the error slot is cleared when either is set).
+
+/// Own formula text for column `col_idx` of the most recently yielded
+/// row: the `<f>` body, entity-decoded — a stand-alone formula, a
+/// shared-formula base or an array-formula base (the CLI's
+/// `t:"formula"` + `formula`). Returns 0 and writes `*out_ptr` /
+/// `*out_len` (the cells' lifetime: until the next `zlsx_rows_next` /
+/// `zlsx_rows_skip` or a close); 1 when the cell carries no `<f>` body
+/// of its own — a value cell, an error cell, or a shared / array slave
+/// (see `zlsx_rows_formula_ref_at`); -1 when `col_idx` is out of range
+/// for the current row. The out params are written only on 0.
+export fn zlsx_rows_formula_at(
+    rows: *Rows,
+    col_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    if (col_idx >= rs.c_cells.items.len) return -1;
+    const strings = rs.inner.formulaStrings();
+    const text = (if (col_idx < strings.len) strings[col_idx] else null) orelse return 1;
+    const empty_bytes: [*]const u8 = @ptrCast("");
+    out_ptr.* = if (text.len == 0) empty_bytes else text.ptr;
+    out_len.* = text.len;
+    return 0;
+}
+
+/// Base cell of the shared- or array-formula slave at column `col_idx`
+/// of the most recently yielded row: the cell carries no `<f>` body of
+/// its own — `<f t="shared" si="N"/>`, or a cell inside an earlier
+/// `<f t="array" ref="…">` rectangle — and its formula is the base's
+/// text (the CLI's `t:"formula"` + `formula_ref`). Returns 0 and writes
+/// `*out_col` (0-based, A = 0) / `*out_row` (1-based); 1 when the cell
+/// is not a slave; -1 when `col_idx` is out of range for the current
+/// row. A slave whose base the reader never saw (a `si` with no base
+/// above it) reads as a value cell — the reader's rule. The out params
+/// are written only on 0.
+export fn zlsx_rows_formula_ref_at(
+    rows: *Rows,
+    col_idx: usize,
+    out_col: *u32,
+    out_row: *u32,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    if (col_idx >= rs.c_cells.items.len) return -1;
+    const bases = rs.inner.formulaRefs();
+    const base = (if (col_idx < bases.len) bases[col_idx] else null) orelse return 1;
+    out_col.* = base.col;
+    out_row.* = base.row;
+    return 0;
+}
+
+/// Error literal at column `col_idx` of the most recently yielded row:
+/// the `<v>` body of a `t="e"` cell (`#DIV/0!`, `#N/A`, `#REF!`,
+/// `#VALUE!`, `#NUM!`, `#NAME?`, `#NULL!`, `#GETTING_DATA`), which the
+/// cell array hands over as an ordinary ZLSX_CELL_STRING of the same
+/// bytes (the CLI's `t:"error"` + `v`). Returns 0 and writes `*out_ptr`
+/// / `*out_len` (the cells' lifetime); 1 when the cell is not an error
+/// cell — including a formula cell whose cached value is an error
+/// literal, where the formula wins (the CLI's `t:"formula"` with
+/// `cached:"#DIV/0!"`); -1 when `col_idx` is out of range for the
+/// current row. The out params are written only on 0.
+export fn zlsx_rows_error_at(
+    rows: *Rows,
+    col_idx: usize,
+    out_ptr: *[*]const u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    if (col_idx >= rs.c_cells.items.len) return -1;
+    const errors = rs.inner.errorStrings();
+    const literal = (if (col_idx < errors.len) errors[col_idx] else null) orelse return 1;
+    const empty_bytes: [*]const u8 = @ptrCast("");
+    out_ptr.* = if (literal.len == 0) empty_bytes else literal.ptr;
+    out_len.* = literal.len;
     return 0;
 }
 
@@ -9587,4 +9691,306 @@ test "S3b sheet_state: a fresh writer's sheets carry no attribute and read visib
     try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 0));
     try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 1));
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, 2));
+}
+
+// ─── S3b slice 11: formula text and error tags on the row iterator ───
+
+/// Rows 2–5 spliced into the writer's sheet part before `</sheetData>`
+/// — the writer authors neither shared formulas nor `t="e"` cells, so
+/// the fixture is the test's. Row 1 is the writer's (`A1` = 1).
+///   row 2: A2 stand-alone `A1*2` cached 2 · B2 an entity-bearing body
+///          (`"x"&amp;"y"&lt;&gt;A1`, decoded `"x"&"y"<>A1`) cached `xy`
+///          · C2 formula-only (`A1/0`, no `<v>`)
+///   row 3: A3 shared base `A2+1` (ref A3:B3, si 0) cached 3 · B3 its
+///          slave (`<f t="shared" si="0"/>`) cached 4 · C3 `t="e"`
+///          `#DIV/0!` · D3 a formula (`1/0`) whose cached value is the
+///          same literal — the formula wins
+///   row 4: A4 array base `A1*{1,2}` (ref A4:B4) cached 1 · B4 the
+///          array slave (no `<f>` at all) cached 2 · C4 `t="e"` `#N/A`
+///   row 5: A5 a gap · B5 `t="e"` `#REF!`
+const s3b11_rows =
+    "<row r=\"2\">" ++
+    "<c r=\"A2\"><f>A1*2</f><v>2</v></c>" ++
+    "<c r=\"B2\" t=\"str\"><f>\"x\"&amp;\"y\"&lt;&gt;A1</f><v>xy</v></c>" ++
+    "<c r=\"C2\"><f>A1/0</f></c>" ++
+    "</row>" ++
+    "<row r=\"3\">" ++
+    "<c r=\"A3\"><f t=\"shared\" ref=\"A3:B3\" si=\"0\">A2+1</f><v>3</v></c>" ++
+    "<c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>4</v></c>" ++
+    "<c r=\"C3\" t=\"e\"><v>#DIV/0!</v></c>" ++
+    "<c r=\"D3\" t=\"e\"><f>1/0</f><v>#DIV/0!</v></c>" ++
+    "</row>" ++
+    "<row r=\"4\">" ++
+    "<c r=\"A4\"><f t=\"array\" ref=\"A4:B4\">A1*{1,2}</f><v>1</v></c>" ++
+    "<c r=\"B4\"><v>2</v></c>" ++
+    "<c r=\"C4\" t=\"e\"><v>#N/A</v></c>" ++
+    "</row>" ++
+    "<row r=\"5\">" ++
+    "<c r=\"B5\" t=\"e\"><v>#REF!</v></c>" ++
+    "</row>";
+
+fn writeS3bFormulaFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    {
+        var w = xlsx.Writer.init(alloc);
+        defer w.deinit();
+        var sheet = try w.addSheet("Data");
+        try sheet.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, path);
+    }
+    // `</sheetData>` occurs once in a one-sheet writer part; the rows
+    // land after the writer's row 1, in order.
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "</sheetData>", s3b11_rows ++ "</sheetData>");
+    return path;
+}
+
+/// The three getters on one column, with sentinels in every out param
+/// so a 1 / -1 that wrote anything is caught.
+const S3b11Probe = struct {
+    formula: i32,
+    formula_text: []const u8,
+    ref: i32,
+    ref_col: u32,
+    ref_row: u32,
+    err: i32,
+    err_text: []const u8,
+
+    fn at(rows: *Rows, col: usize) S3b11Probe {
+        const sentinel: [*]const u8 = @ptrCast("sentinel");
+        var f_ptr: [*]const u8 = sentinel;
+        var f_len: usize = 8;
+        var r_col: u32 = 0xDEAD;
+        var r_row: u32 = 0xBEEF;
+        var e_ptr: [*]const u8 = sentinel;
+        var e_len: usize = 8;
+        const f = zlsx_rows_formula_at(rows, col, &f_ptr, &f_len);
+        const r = zlsx_rows_formula_ref_at(rows, col, &r_col, &r_row);
+        const e = zlsx_rows_error_at(rows, col, &e_ptr, &e_len);
+        return .{
+            .formula = f,
+            .formula_text = f_ptr[0..f_len],
+            .ref = r,
+            .ref_col = r_col,
+            .ref_row = r_row,
+            .err = e,
+            .err_text = e_ptr[0..e_len],
+        };
+    }
+
+    /// Every getter said "not that kind of cell" (or out of range) and
+    /// left its out params alone.
+    fn expectNone(self: S3b11Probe, code: i32) !void {
+        try std.testing.expectEqual(code, self.formula);
+        try std.testing.expectEqual(code, self.ref);
+        try std.testing.expectEqual(code, self.err);
+        try std.testing.expectEqualStrings("sentinel", self.formula_text);
+        try std.testing.expectEqualStrings("sentinel", self.err_text);
+        try std.testing.expectEqual(@as(u32, 0xDEAD), self.ref_col);
+        try std.testing.expectEqual(@as(u32, 0xBEEF), self.ref_row);
+    }
+
+    fn expectFormula(self: S3b11Probe, text: []const u8) !void {
+        try std.testing.expectEqual(@as(i32, 0), self.formula);
+        try std.testing.expectEqualStrings(text, self.formula_text);
+        try std.testing.expectEqual(@as(i32, 1), self.ref);
+        try std.testing.expectEqual(@as(i32, 1), self.err);
+        try std.testing.expectEqualStrings("sentinel", self.err_text);
+    }
+
+    fn expectSlave(self: S3b11Probe, col: u32, row: u32) !void {
+        try std.testing.expectEqual(@as(i32, 1), self.formula);
+        try std.testing.expectEqual(@as(i32, 0), self.ref);
+        try std.testing.expectEqual(col, self.ref_col);
+        try std.testing.expectEqual(row, self.ref_row);
+        try std.testing.expectEqual(@as(i32, 1), self.err);
+        try std.testing.expectEqualStrings("sentinel", self.formula_text);
+        try std.testing.expectEqualStrings("sentinel", self.err_text);
+    }
+
+    fn expectError(self: S3b11Probe, literal: []const u8) !void {
+        try std.testing.expectEqual(@as(i32, 1), self.formula);
+        try std.testing.expectEqual(@as(i32, 1), self.ref);
+        try std.testing.expectEqual(@as(i32, 0), self.err);
+        try std.testing.expectEqualStrings(literal, self.err_text);
+        try std.testing.expectEqualStrings("sentinel", self.formula_text);
+    }
+};
+
+fn expectCellString(cell: CCell, want: []const u8) !void {
+    try std.testing.expectEqual(@intFromEnum(CellTag.string), cell.tag);
+    try std.testing.expectEqualStrings(want, cell.str_ptr[0..cell.str_len]);
+}
+
+fn expectCellInt(cell: CCell, want: i64) !void {
+    try std.testing.expectEqual(@intFromEnum(CellTag.integer), cell.tag);
+    try std.testing.expectEqual(want, cell.i);
+}
+
+test "S3b rows formulas: the reader's three side channels through the C ABI — text, base ref, error literal, the precedence rule, the cached value" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bFormulaFixture(io, &tt, "s3b_formulas.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+
+    // Before the first row there is no current row: -1, nothing written
+    // — the style getter agrees.
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    var style: u32 = 0xABCD;
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
+    try std.testing.expectEqual(@as(u32, 0xABCD), style);
+
+    // Row 1 — the writer's value cell: every getter says 1; past the
+    // end of the row every getter says -1.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), cells_len);
+    try expectCellInt(cells_ptr[0], 1);
+    try S3b11Probe.at(rows.?, 0).expectNone(1);
+    try S3b11Probe.at(rows.?, 1).expectNone(-1);
+    try S3b11Probe.at(rows.?, std.math.maxInt(usize)).expectNone(-1);
+
+    // Row 2 — stand-alone formulas: the text is the `<f>` body,
+    // entity-decoded; the cell is the cached `<v>`, or empty for a
+    // formula-only cell.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("A1*2");
+    try expectCellInt(cells_ptr[0], 2);
+    try S3b11Probe.at(rows.?, 1).expectFormula("\"x\"&\"y\"<>A1");
+    try expectCellString(cells_ptr[1], "xy");
+    try S3b11Probe.at(rows.?, 2).expectFormula("A1/0");
+    try std.testing.expectEqual(@intFromEnum(CellTag.empty), cells_ptr[2].tag);
+    try S3b11Probe.at(rows.?, 3).expectNone(-1);
+
+    // Row 3 — a shared base and its slave, an error cell, and a formula
+    // whose cached value is an error literal (the formula wins; the
+    // cell array carries the literal as a string either way).
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 4), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("A2+1");
+    try expectCellInt(cells_ptr[0], 3);
+    try S3b11Probe.at(rows.?, 1).expectSlave(0, 3);
+    try expectCellInt(cells_ptr[1], 4);
+    try S3b11Probe.at(rows.?, 2).expectError("#DIV/0!");
+    try expectCellString(cells_ptr[2], "#DIV/0!");
+    try S3b11Probe.at(rows.?, 3).expectFormula("1/0");
+    try expectCellString(cells_ptr[3], "#DIV/0!");
+
+    // Row 4 — an array base and the slave inside its rectangle, which
+    // has no `<f>` of its own.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("A1*{1,2}");
+    try expectCellInt(cells_ptr[0], 1);
+    try S3b11Probe.at(rows.?, 1).expectSlave(0, 4);
+    try expectCellInt(cells_ptr[1], 2);
+    try S3b11Probe.at(rows.?, 2).expectError("#N/A");
+
+    // Row 5 — a gap cell is a value cell to every getter; the error
+    // literal keeps its bytes.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 2), cells_len);
+    try std.testing.expectEqual(@intFromEnum(CellTag.empty), cells_ptr[0].tag);
+    try S3b11Probe.at(rows.?, 0).expectNone(1);
+    try S3b11Probe.at(rows.?, 1).expectError("#REF!");
+    try expectCellString(cells_ptr[1], "#REF!");
+    try S3b11Probe.at(rows.?, 2).expectNone(-1);
+
+    // Past the end there is no current row again — for the trio and
+    // for the style getter alike.
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    style = 0xABCD;
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
+    try std.testing.expectEqual(@as(u32, 0xABCD), style);
+}
+
+test "S3b rows formulas: a skip clears the current row for every side-channel getter, and the buffer opener agrees" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bFormulaFixture(io, &tt, "s3b_formulas_skip.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    var book: ?*Book = null;
+    {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 24));
+        book = zlsx_book_open_buffer(bytes.ptr, bytes.len, &err_buf, err_buf.len);
+        std.testing.allocator.free(bytes);
+    }
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+
+    // Row 2 has a formula in every column and a style-less cell; after
+    // skipping row 3 nothing is current — the reader's per-row lists
+    // still hold the last decoded row (the fixture has formula spreads,
+    // so the skip decoded it), but no getter serves it.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try S3b11Probe.at(rows.?, 0).expectFormula("A1*2");
+    var skipped: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 1, &skipped, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), skipped);
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    var style: u32 = 0xABCD;
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
+    try std.testing.expectEqual(@as(u32, 0xABCD), style);
+
+    // Row 4 lands next — the array slave still resolves to its base
+    // (the spread state survives the skip) and the error literal reads.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("A1*{1,2}");
+    try S3b11Probe.at(rows.?, 1).expectSlave(0, 4);
+    try S3b11Probe.at(rows.?, 2).expectError("#N/A");
+    try expectCellString(cells_ptr[2], "#N/A");
+}
+
+test "S3b rows formulas: a fresh writer's value cells answer 1 on every getter" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3aFixture(io, &tt, "s3b_formulas_fresh.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+    var seen: usize = 0;
+    while (zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len) == 1) {
+        seen += 1;
+        for (0..cells_len) |col| try S3b11Probe.at(rows.?, col).expectNone(1);
+        try S3b11Probe.at(rows.?, cells_len).expectNone(-1);
+    }
+    try std.testing.expect(seen > 0);
 }

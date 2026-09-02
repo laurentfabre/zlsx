@@ -3823,3 +3823,226 @@ def test_sheet_state_probe_agrees_with_the_library_version():
     major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
     if (major, minor) >= (0, 9):
         assert ffi._HAS_SHEET_STATE, "libzlsx >= 0.9.0 must export zlsx_sheet_state"
+
+
+# ─── S3b slice 11: formula text and error tags on the row iterator ───
+
+_FORMULA_ROWS = (
+    b'<row r="2">'
+    b'<c r="A2"><f>A1*2</f><v>2</v></c>'
+    b'<c r="B2" t="str"><f>"x"&amp;"y"&lt;&gt;A1</f><v>xy</v></c>'
+    b'<c r="C2"><f>A1/0</f></c>'
+    b'</row>'
+    b'<row r="3">'
+    b'<c r="A3"><f t="shared" ref="A3:B3" si="0">A2+1</f><v>3</v></c>'
+    b'<c r="B3"><f t="shared" si="0"/><v>4</v></c>'
+    b'<c r="C3" t="e"><v>#DIV/0!</v></c>'
+    b'<c r="D3" t="e"><f>1/0</f><v>#DIV/0!</v></c>'
+    b'</row>'
+    b'<row r="4">'
+    b'<c r="A4"><f t="array" ref="A4:B4">A1*{1,2}</f><v>1</v></c>'
+    b'<c r="B4"><v>2</v></c>'
+    b'<c r="C4" t="e"><v>#N/A</v></c>'
+    b'</row>'
+    b'<row r="5">'
+    b'<c r="B5" t="e"><v>#REF!</v></c>'
+    b'</row>'
+)
+
+
+def _formula_workbook(path):
+    """One row through the writer (A1 = 1), then rows 2–5 spliced into
+    the sheet part before `</sheetData>` — the writer authors neither
+    shared formulas nor `t="e"` cells: a stand-alone formula, an
+    entity-bearing one, a formula-only cell, a shared base + slave, an
+    error cell, a formula whose cached value is an error, an array base
+    + slave, a gap before an error cell (the src/c_abi.zig fixture)."""
+    with zlsx.write(path) as w:
+        w.add_sheet("Data").write_row([1])
+    _patch_parts(path, [
+        ("xl/worksheets/sheet1.xml", b"</sheetData>", _FORMULA_ROWS + b"</sheetData>"),
+    ])
+
+
+# (values, formula_strings, formula_refs, error_strings) per row — the
+# lists the three accessors return beside the row `next()` yields.
+_FORMULA_EXPECTED = [
+    ([1], [None], [None], [None]),
+    ([2, "xy", None], ["A1*2", '"x"&"y"<>A1', "A1/0"], [None] * 3, [None] * 3),
+    (
+        [3, 4, "#DIV/0!", "#DIV/0!"],
+        ["A2+1", None, None, "1/0"],
+        [None, zlsx.CellRef(0, 3), None, None],
+        [None, None, "#DIV/0!", None],
+    ),
+    ([1, 2, "#N/A"], ["A1*{1,2}", None, None], [None, zlsx.CellRef(0, 4), None], [None, None, "#N/A"]),
+    ([None, "#REF!"], [None, None], [None, None], [None, "#REF!"]),
+]
+
+
+def _require_rows_formulas():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_ROWS_FORMULAS:
+        pytest.skip("libzlsx lacks the row formula / error getters (0.9.0+)")
+
+
+def _read_with_side_channels(rows):
+    return [
+        (row, rows.formula_strings(), rows.formula_refs(), rows.error_strings())
+        for row in rows
+    ]
+
+
+def test_rows_formula_and_error_side_channels(tmp_path):
+    _require_rows_formulas()
+    path = tmp_path / "formulas.xlsx"
+    _formula_workbook(path)
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            # No current row before the first `next()`.
+            assert rows.formula_strings() == []
+            assert rows.formula_refs() == []
+            assert rows.error_strings() == []
+            assert _read_with_side_channels(rows) == _FORMULA_EXPECTED
+            # Past the end there is no current row.
+            assert rows.formula_strings() == []
+            assert rows.formula_refs() == []
+            assert rows.error_strings() == []
+            assert rows.style_indices() == []
+        # `skip` clears the current row.
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            assert rows.formula_strings() == [None]
+            assert rows.skip(1) == 1
+            assert rows.formula_strings() == []
+            assert rows.formula_refs() == []
+            assert rows.error_strings() == []
+            assert next(rows) == [3, 4, "#DIV/0!", "#DIV/0!"]
+            assert rows.formula_refs() == [None, zlsx.CellRef(0, 3), None, None]
+        # The value list is what it always was: cached values and the
+        # error literal as a plain str.
+        _, data = book.sheet(0).read_all()
+        assert data == [values for values, _, _, _ in _FORMULA_EXPECTED]
+    # A closed iterator refuses before any probe.
+    with zlsx.open(path) as book:
+        rows = book.sheet(0).rows()
+        rows.close()
+        for accessor in (rows.formula_strings, rows.formula_refs, rows.error_strings):
+            with pytest.raises(zlsx.ZlsxError):
+                accessor()
+    # The buffer opener reads the same fields from the same bytes.
+    with zlsx.open_bytes(path.read_bytes()) as book:
+        with book.sheet(0).rows() as rows:
+            assert _read_with_side_channels(rows) == _FORMULA_EXPECTED
+
+
+def test_rows_formula_fresh_writer_has_no_side_channels(tmp_path):
+    _require_rows_formulas()
+    path = tmp_path / "formulas_fresh.xlsx"
+    with zlsx.write(path) as w:
+        # The gap in the middle is a positional empty cell to the
+        # reader; a trailing None is not written at all.
+        w.add_sheet("Data").write_row([1, None, "two", 3.5, True])
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            row = next(rows)
+            assert row == [1, None, "two", 3.5, True]
+            assert rows.formula_strings() == [None] * 5
+            assert rows.formula_refs() == [None] * 5
+            assert rows.error_strings() == [None] * 5
+
+
+def _a1_to_ref(a1):
+    col = 0
+    i = 0
+    while i < len(a1) and a1[i].isalpha():
+        col = col * 26 + (ord(a1[i].upper()) - ord("A") + 1)
+        i += 1
+    return zlsx.CellRef(col - 1, int(a1[i:]))
+
+
+def test_rows_formula_matches_the_cli_records(tmp_path):
+    """`zlsx cells` prints `t:"formula"` (`formula` / `formula_ref`) and
+    `t:"error"` (`v`) from the fields these accessors report — the same
+    text, the same base, the same literal, cell for cell, and a plain
+    tag everywhere else. Runs only where a local CLI build sits beside
+    the dylib."""
+    import json
+    import subprocess
+
+    _require_rows_formulas()
+    candidates = [REPO_ROOT / "zig-out" / "bin" / name for name in ("zlsx", "zlsx.exe")]
+    cli = next((c for c in candidates if c.exists()), None)
+    if cli is None:
+        pytest.skip("no local zlsx CLI build at zig-out/bin/zlsx")
+    path = tmp_path / "formulas_cli.xlsx"
+    _formula_workbook(path)
+    out = subprocess.run(
+        [str(cli), "cells", str(path), "--include-blanks"],
+        check=True, capture_output=True, encoding="utf-8",
+    ).stdout
+    records = [json.loads(line) for line in out.splitlines() if line]
+    assert all(r["kind"] == "cell" for r in records)
+    cli_view = {
+        (r["row"], r["col"] - 1): (
+            r["t"],
+            r.get("formula"),
+            _a1_to_ref(r["formula_ref"]) if "formula_ref" in r else None,
+            r["v"] if r["t"] == "error" else None,
+        )
+        for r in records
+    }
+    py_view = {}
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            for row_idx, row in enumerate(rows, start=1):
+                for col, (formula, ref, err) in enumerate(
+                    zip(rows.formula_strings(), rows.formula_refs(), rows.error_strings())
+                ):
+                    tag = "formula" if (formula is not None or ref is not None) else (
+                        "error" if err is not None else "plain"
+                    )
+                    py_view[(row_idx, col)] = (tag, formula, ref, err)
+    assert set(cli_view) == set(py_view)
+    for key, (tag, formula, ref, err) in py_view.items():
+        cli_tag, cli_formula, cli_ref, cli_err = cli_view[key]
+        if tag == "plain":
+            assert cli_tag not in ("formula", "error"), key
+        else:
+            assert cli_tag == tag, key
+        assert (cli_formula, cli_ref, cli_err) == (formula, ref, err), key
+    assert sum(1 for t, *_ in py_view.values() if t == "formula") == 8
+    assert sum(1 for t, *_ in py_view.values() if t == "error") == 3
+
+
+def test_rows_formula_defensive_branches(tmp_path, monkeypatch):
+    """An older dylib without the trio is a `RuntimeError` on each
+    accessor — after the closed-iterator check, so a closed iterator is
+    the same `ZlsxError` whatever dylib is loaded."""
+    import zlsx._ffi as ffi
+
+    _require_rows_formulas()
+    path = tmp_path / "formulas_defensive.xlsx"
+    _formula_workbook(path)
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            next(rows)
+            monkeypatch.setattr(ffi, "_HAS_ROWS_FORMULAS", False)
+            for accessor in (rows.formula_strings, rows.formula_refs, rows.error_strings):
+                with pytest.raises(RuntimeError):
+                    accessor()
+            rows.close()
+            for accessor in (rows.formula_strings, rows.formula_refs, rows.error_strings):
+                with pytest.raises(zlsx.ZlsxError):
+                    accessor()
+
+
+def test_rows_formulas_probe_agrees_with_the_library_version():
+    """A dylib at or past 0.9.0 exports the trio; a probe that says
+    otherwise is a packaging error, not a reason to skip the block
+    above (the sheet_state precedent)."""
+    import zlsx._ffi as ffi
+
+    major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
+    if (major, minor) >= (0, 9):
+        assert ffi._HAS_ROWS_FORMULAS, "libzlsx >= 0.9.0 must export zlsx_rows_formula_at / _formula_ref_at / _error_at"

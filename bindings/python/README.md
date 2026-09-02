@@ -34,6 +34,12 @@ with zlsx.open("workbook.xlsx") as book:
 
     summary = book.sheet("Summary")          # by name also works
     header = next(summary.rows())
+
+    with book.sheet(0).rows() as rows:       # formula text + error tags (0.9.0+)
+        for row in rows:                      # row: cached values / error literals, as ever
+            formulas = rows.formula_strings() # ['A1*2', None, ...] — own <f> text
+            bases = rows.formula_refs()       # [None, CellRef(0, 3), ...] — a slave's base
+            errors = rows.error_strings()     # [None, '#DIV/0!', ...] — t="e" cells
 ```
 
 ### From bytes — no file, no temp path
@@ -536,6 +542,13 @@ with zlsx.write("out.xlsx") as w:
   the `<sheet state>` attribute as `zlsx list-sheets` spells it (`visible` /
   `hidden` / `veryHidden`; a missing or unrecognised value reads `visible`);
   hidden sheets stay in `Book.sheets` and read like any other
+- Formula text and error tags on read (0.9.0+): `Rows.formula_strings()` /
+  `Rows.formula_refs()` / `Rows.error_strings()` — the `<f>` body
+  (entity-decoded), a shared / array slave's base cell, and the `t="e"`
+  literal, one list per accessor aligned to the row `next()` yielded (the
+  `formula` / `formula_ref` / `v` of `zlsx cells`); the row itself keeps the
+  cached value and the literal string, so nothing that read before reads
+  differently. A formula whose cached value is an error is a formula
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

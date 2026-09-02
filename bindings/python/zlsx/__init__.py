@@ -20,6 +20,12 @@ Cell type mapping (``zlsx_cell_tag_t`` → Python):
     integer → int  (never rounded)
     number  → float
     boolean → bool
+
+A formula cell arrives as its cached value (``None`` when the file
+stores none) and an error cell (``#DIV/0!``, ``#N/A``, …) as the
+literal ``str``; the row iterator's :meth:`Rows.formula_strings`,
+:meth:`Rows.formula_refs` and :meth:`Rows.error_strings` tell them
+apart (libzlsx 0.9.0+).
 """
 
 from __future__ import annotations
@@ -1236,6 +1242,11 @@ class Rows:
             self._err,
             _ERR_BUF_LEN,
         )
+        if rc <= 0:
+            # No current row any more — the side-channel accessors
+            # (`style_indices`, `formula_strings`, …) answer for the
+            # row the last successful `next()` yielded, and only that.
+            self._current_len = 0
         if rc == 0:
             raise StopIteration
         if rc < 0:
@@ -1268,6 +1279,96 @@ class Rows:
                 out.append(None)
             else:
                 # Out of range shouldn't happen within _current_len.
+                out.append(None)
+        return out
+
+    # ── S3b slice 11: the formula / error side channels ──────────────
+    #
+    # The reader keeps them beside the cells so the value list never
+    # changed shape: a formula cell's element is its cached value and
+    # an error cell's is the literal string. Each accessor mirrors
+    # `style_indices` — one list aligned to the last row `next()`
+    # yielded, empty before the first row and after `skip()`.
+
+    def _require_rows_formulas(self) -> None:
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
+        if not _ffi._HAS_ROWS_FORMULAS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose the row formula / error "
+                "side channels (requires 0.9.0+); upgrade libzlsx"
+            )
+
+    def formula_strings(self) -> list[str | None]:
+        """Own formula text for each cell of the most recently yielded
+        row — the ``<f>`` body with XML entities decoded — for a
+        stand-alone formula, a shared-formula base or an array-formula
+        base; ``None`` for a value cell, an error cell, or a shared /
+        array slave (see :meth:`formula_refs`). The row's element at
+        the same index is the cached value (``None`` for a formula-only
+        cell). The ``formula`` field of ``zlsx cells``' ``t:"formula"``
+        records. Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[str | None] = []
+        ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        length = ctypes.c_size_t()
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_formula_at(
+                self._handle, col, ctypes.byref(ptr), ctypes.byref(length)
+            )
+            if rc == 0:
+                out.append(
+                    ""
+                    if length.value == 0
+                    else ctypes.string_at(ptr, length.value).decode("utf-8", errors="replace")
+                )
+            else:
+                out.append(None)
+        return out
+
+    def formula_refs(self) -> list[CellRef | None]:
+        """Base cell of each shared- or array-formula slave in the most
+        recently yielded row — a cell with no ``<f>`` body of its own
+        whose formula is the base's text — as a :class:`CellRef`
+        (``col`` 0-based, ``row`` 1-based); ``None`` elsewhere. Exactly
+        one of :meth:`formula_strings` and this is set for a formula
+        cell. The ``formula_ref`` field of ``zlsx cells``' ``t:"formula"``
+        records (as A1 there). Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[CellRef | None] = []
+        col_out = ctypes.c_uint32(0)
+        row_out = ctypes.c_uint32(0)
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_formula_ref_at(
+                self._handle, col, ctypes.byref(col_out), ctypes.byref(row_out)
+            )
+            out.append(CellRef(int(col_out.value), int(row_out.value)) if rc == 0 else None)
+        return out
+
+    def error_strings(self) -> list[str | None]:
+        """The Excel error literal (``"#DIV/0!"``, ``"#N/A"``, ``"#REF!"``,
+        ``"#VALUE!"``, ``"#NUM!"``, ``"#NAME?"``, ``"#NULL!"``,
+        ``"#GETTING_DATA"``) for each ``t="e"`` cell of the most
+        recently yielded row; ``None`` elsewhere — including a formula
+        cell whose cached value is an error, where the formula wins.
+        The row's element at the same index is the same literal as a
+        plain ``str``. The ``v`` of ``zlsx cells``' ``t:"error"``
+        records. Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[str | None] = []
+        ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        length = ctypes.c_size_t()
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_error_at(
+                self._handle, col, ctypes.byref(ptr), ctypes.byref(length)
+            )
+            if rc == 0:
+                out.append(
+                    ""
+                    if length.value == 0
+                    else ctypes.string_at(ptr, length.value).decode("utf-8", errors="replace")
+                )
+            else:
                 out.append(None)
         return out
 
