@@ -495,10 +495,12 @@ carry faithfully — a `ref` / `topLeftCell` / `activePane` / `state`
 that does not decode, is not UTF-8, or carries markup. Boundary
 conventions, pinned as the contract: `x_split` / `y_split` decode
 their entities first (`&#50;` is `2`; an undecodable carrier is exit
-2, not `null`), then read as an `xsd:double` lexical or `null` — the
-written-but-invalid convention the family's numeric attributes set
-(`1_0`, `0x10`, `abc` are not doubles; `INF` / `NaN` are, but have no
-JSON spelling and read `null` too). A `<dimension>` without `ref` and
+2, not `null`), collapse boundary XML whitespace (XSD's
+`whiteSpace="collapse"` for the atomic types — `" 2 "` is `2`; an
+interior run is not a number), then read as an `xsd:double` lexical
+or `null` — the written-but-invalid convention the family's numeric
+attributes set (`1_0`, `0x10`, `abc` are not doubles; `INF` / `NaN`
+are, but have no JSON spelling and read `null` too). A `<dimension>` without `ref` and
 a `<pane/>` without attributes are present-and-empty: `dimension` is
 `null` either way, `pane` is an object of nulls.
 
@@ -526,8 +528,9 @@ are one shape on the wire). `calc_id` / `iterate_count` are
 `null` — the lenient view reads `yes` as false, this read reports that
 nothing lexical was said), `iterate_delta` an `xsd:double` (or `null`
 — a non-finite value has no JSON spelling); every typed attribute
-decodes its entities first, and an undecodable carrier refuses (exit
-2). An entity-spelled or non-numeric `calcId` / `iterateCount` /
+decodes its entities first (an undecodable carrier refuses, exit 2),
+then collapses boundary XML whitespace (XSD's `whiteSpace="collapse"`
+— `" 100 "` is `100`), then types lexically. An entity-spelled or non-numeric `calcId` / `iterateCount` /
 `iterateDelta` never reaches this read through the CLI: `Workbook.open`'s
 lenient parse refuses it first, at open (its own contract — the
 strict decode above is the family's, kept for the surfaces to come).
@@ -535,9 +538,13 @@ The element is the slot only as a main-namespace direct child
 of the `<workbook>` root: a `<calcPr>` under `<extLst>` or inside a
 rebound subtree is not reported; two at the slot refuse — which one
 Excel honours is not the reader's to guess — and so does a `<calcPr>`
-inside an `mc:AlternateContent` branch under the root (the walk has no
-MCE processor; the real root-level `mc:AlternateContent` Excel writes
-for `x15ac:absPath` stays inert). The record is read and validated
+reached from the root through MCE elements alone (an
+`mc:AlternateContent` / `mc:Choice` / `mc:Fallback` chain — the one
+path an MCE processor, which the walk lacks, could project it into
+the slot by; the real root-level `mc:AlternateContent` Excel writes
+for `x15ac:absPath` stays inert, and a `<calcPr>` below any ordinary
+wrapper — `<extLst>` included, even inside such a branch — is neither
+reported nor a refusal). The record is read and validated
 whole before the first byte is written. The read runs the same strict
 workbook walk the sheet inventory comes from, so a `<sheets>` list it
 cannot prove refuses here too (exit 2), though no sheet part is read.
@@ -885,7 +892,7 @@ zlsx merges data.xlsx --all-sheets | jq 'select(.start_row==1)'
 zlsx conditional-formats data.xlsx | jq -r 'select(.rule_type=="cellIs" and (.formulas|length)==2) | [.sheet, .sqref, .formulas[0], .formulas[1]] | @tsv'
 
 # Every frozen pane: sheet, frozen column / row counts, first scrolling cell.
-zlsx sheet-props data.xlsx | jq -r 'select(.pane.state=="frozen") | [.sheet, .pane.x_split, .pane.y_split, .pane.top_left_cell] | @tsv'
+zlsx sheet-props data.xlsx | jq -r 'select(.pane.state=="frozen" or .pane.state=="frozenSplit") | [.sheet, .pane.x_split, .pane.y_split, .pane.top_left_cell] | @tsv'
 
 # Does the workbook ask Excel to recalculate everything on open?
 zlsx calc-props data.xlsx | jq '.full_calc_on_load == true'

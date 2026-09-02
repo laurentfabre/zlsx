@@ -1286,7 +1286,7 @@ const StrictSheet = struct { name: []const u8, rid: []const u8 };
 fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet), calc: *CalcPrSlot) WorkbookError!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, sheets_wrap, other };
-    const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize, mce: bool };
+    const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize, mce_chain: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(gpa);
     var scope: PrefixScope = .{};
@@ -1424,11 +1424,21 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
         const is_main = !prefixed and elem_main;
 
         var kind: Kind = .other;
-        var under_mce = false;
+        // Whether THIS element's children would land at the root slot
+        // under an MCE processor: true for the root itself, and for
+        // an MCE-bound element whose every ancestor below the root is
+        // MCE-bound too (the `mc:AlternateContent` / `mc:Choice` /
+        // `mc:Fallback` chain a processor substitutes in place). Any
+        // ordinary wrapper on the path — `<extLst>`, a foreign
+        // container, a plain element inside a Choice — breaks the
+        // chain: after projection it, not its content, sits at the
+        // root (Codex #218 r1 S3B-REL-102).
+        var mce_chain = false;
         if (frames.items.len == 0) {
             if (!is_main or !std.mem.eql(u8, qname, "workbook")) return error.MalformedWorkbookXml;
             root_seen = true;
             kind = .root;
+            mce_chain = true;
             if (te.self_closing) {
                 root_closed = true;
             }
@@ -1439,12 +1449,11 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             // `mc:AlternateContent` (absPath et al.) stays opaque —
             // hiding `<sheets>` itself trips the exactly-one-wrapper
             // rule below (SEC-2201).
-            under_mce = parent.mce;
             if (prefixed) {
                 const c = std.mem.indexOfScalar(u8, qname, ':').?;
                 if (scope.isMce(qname[0..c])) {
                     if (parent.kind == .sheets_wrap) return error.MalformedWorkbookXml;
-                    under_mce = true;
+                    mce_chain = parent.mce_chain;
                 }
             }
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "sheets")) {
@@ -1453,13 +1462,14 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
                 if (wraps_seen > 1) return error.MalformedWorkbookXml;
             } else if (is_main and std.mem.eql(u8, qname, "calcPr")) {
                 // The calc-props slot: counted at the root, flagged
-                // under an MCE branch the processor the walk lacks
-                // could project into the root, opaque elsewhere
+                // when only MCE elements stand between it and the root
+                // (the one path the processor the walk lacks could
+                // project it into the slot by), opaque elsewhere
                 // (`<extLst>` decoys are not entries — SEC-502).
                 if (parent.kind == .root) {
                     calc.count += 1;
                     if (calc.count == 1) calc.attrs = attrs;
-                } else if (under_mce) {
+                } else if (parent.mce_chain) {
                     calc.mce_shadowed = true;
                 }
             } else if (parent.kind == .sheets_wrap and is_main and std.mem.eql(u8, qname, "sheet")) {
@@ -1495,7 +1505,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             scope.truncate(prefix_mark);
         } else {
             if (frames.items.len >= max_depth) return error.MalformedWorkbookXml;
-            try frames.append(gpa, .{ .name = qname, .kind = kind, .main_default = elem_main, .prefix_mark = prefix_mark, .mce = under_mce });
+            try frames.append(gpa, .{ .name = qname, .kind = kind, .main_default = elem_main, .prefix_mark = prefix_mark, .mce_chain = mce_chain });
         }
         i = te.after_gt;
     }
@@ -1515,13 +1525,14 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
 /// region of the first main-namespace `<calcPr>` that is a direct
 /// child of the root (borrowing the cached part's bytes), how many
 /// such elements the root carries (the schema allows one; the consumer
-/// refuses more), and whether a main-namespace `calcPr` sits under an
-/// MCE-bound element anywhere — a branch an MCE processor could
-/// project INTO the root slot, which the walk (no MCE processor)
-/// cannot rule in or out (SEC-2201's closed form). A `calcPr` under
-/// `<extLst>` or any other opaque subtree is neither: not an entry,
-/// not a shadow. This module and the anchors collector ignore the
-/// slot.
+/// refuses more), and whether a main-namespace `calcPr` sits directly
+/// under an unbroken chain of MCE-bound elements from the root — the
+/// one path an MCE processor could project it INTO the root slot by,
+/// which the walk (no MCE processor) cannot rule in or out (SEC-2201's
+/// closed form). A `calcPr` below any ordinary wrapper — `<extLst>`,
+/// a foreign container, a plain element inside a Choice — is neither:
+/// not an entry, not a shadow (Codex #218 r1 S3B-REL-102). This
+/// module and the anchors collector ignore the slot.
 pub const CalcPrSlot = struct {
     attrs: ?[]const u8 = null,
     count: u32 = 0,

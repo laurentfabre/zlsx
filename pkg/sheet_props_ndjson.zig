@@ -47,8 +47,10 @@
 //! entities-only attribute carriers (no ST_Xstring layer, the C1
 //! ruling) — a carrier that does not decode, decodes to non-UTF-8, or
 //! carries markup refuses the whole read. The typed attributes decode
-//! their entities FIRST (an undecodable carrier refuses), then type
-//! lexically: `calcId` / `iterateCount` digit-only u32 or null;
+//! their entities FIRST (an undecodable carrier refuses), collapse
+//! boundary XML whitespace (XSD's `whiteSpace="collapse"` for the
+//! atomic types), then type lexically: `calcId` / `iterateCount`
+//! digit-only u32 or null;
 //! `xSplit` / `ySplit` / `iterateDelta` an `xsd:double` lexical or
 //! null (a non-finite value — `INF`, `NaN`, an overflow — has no JSON
 //! spelling and reads null with the rest); `fullCalcOnLoad` /
@@ -254,10 +256,10 @@ fn calcFromAttrs(scratch: Allocator, attrs: []const u8) Error!CalcRecord {
     // tag (the S7b-4 rule) on each lookup, so the five reads share one
     // verdict about the region.
     return .{
-        .calc_id = try cf.numericAttr(scratch, try cf.uniqueAttr(scratch, attrs, "calcId")),
+        .calc_id = try uintAttr(scratch, try cf.uniqueAttr(scratch, attrs, "calcId")),
         .full_calc_on_load = try boolAttr(scratch, try cf.uniqueAttr(scratch, attrs, "fullCalcOnLoad")),
         .iterate = try boolAttr(scratch, try cf.uniqueAttr(scratch, attrs, "iterate")),
-        .iterate_count = try cf.numericAttr(scratch, try cf.uniqueAttr(scratch, attrs, "iterateCount")),
+        .iterate_count = try uintAttr(scratch, try cf.uniqueAttr(scratch, attrs, "iterateCount")),
         .iterate_delta = try doubleAttr(scratch, try cf.uniqueAttr(scratch, attrs, "iterateDelta")),
     };
 }
@@ -528,13 +530,22 @@ fn scanSheetProps(a: Allocator, xml: []const u8) Error!RawSheetProps {
                 } else if (std.mem.eql(u8, qname, "sheetViews") and hasPaneSlot(root_kind)) {
                     wrappers_seen += 1;
                     if (wrappers_seen > 1) return error.MalformedSheetXml;
+                    // The wrapper carries no attribute this read
+                    // consumes, but it is slot machinery: a name twice
+                    // on its start tag refuses like on `<pane>` (Codex
+                    // #218 r1 S3B-REL-101).
+                    _ = try cf.uniqueAttr(a, attrs, "");
                     kind = .sheet_views;
                 }
             } else if (parent.kind == .sheet_views and is_main and std.mem.eql(u8, qname, "sheetView")) {
                 views_seen += 1;
                 // Only the FIRST view is a slot; later views are the
-                // extra windows' — opaque here, reported by no field.
-                if (views_seen == 1) kind = .first_view;
+                // extra windows' — opaque here, reported by no field,
+                // their attributes unpoliced like any opaque tag's.
+                if (views_seen == 1) {
+                    _ = try cf.uniqueAttr(a, attrs, "");
+                    kind = .first_view;
+                }
             } else if (parent.kind == .first_view and is_main and std.mem.eql(u8, qname, "pane")) {
                 panes_seen += 1;
                 if (panes_seen > 1) return error.MalformedSheetXml;
@@ -598,17 +609,26 @@ fn decodeOpt(a: Allocator, raw: ?[]const u8) Error!?[]const u8 {
 
 /// A typed attribute: XML character references resolve FIRST (a
 /// reference that does not decode refuses the read — `numericAttr`'s
-/// rule, Codex #215 r18 REL-1802), THEN the lexical rule applies to
-/// the decoded value.
+/// rule, Codex #215 r18 REL-1802), THEN boundary XML whitespace
+/// collapses — XSD fixes `whiteSpace` to `collapse` for every atomic
+/// type these attributes carry, so `" 2 "` and `"&#x20;true "` are
+/// the typed values `2` and `true` (Codex #218 r1 S3B-REL-103); an
+/// interior run would leave the token invalid under every lexical
+/// rule below, so trimming the ends is the whole of collapse here —
+/// THEN the lexical rule applies.
 fn typedAttr(comptime T: type, comptime lex: fn ([]const u8) ?T, scratch: Allocator, raw_opt: ?[]const u8) Error!?T {
     const raw = raw_opt orelse return null;
-    if (std.mem.indexOfScalar(u8, raw, '&') == null) return lex(raw);
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) return lex(collapseWs(raw));
     const decoded = formula_mod.decode.decodeEntities(scratch, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedSheetXml,
     };
     defer scratch.free(decoded);
-    return lex(decoded);
+    return lex(collapseWs(decoded));
+}
+
+fn collapseWs(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\n\r");
 }
 
 fn boolAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?bool {
@@ -617,6 +637,13 @@ fn boolAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?bool {
 
 fn doubleAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?f64 {
     return typedAttr(f64, xsdDouble, scratch, raw_opt);
+}
+
+/// `xsd:unsignedInt` — the conditional-formats `numericAttr` rule
+/// (digit-only, `u32` range, else null) behind the same decode-then-
+/// collapse discipline as the other typed attributes here.
+fn uintAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?u32 {
+    return typedAttr(u32, cf.digitOnlyU32, scratch, raw_opt);
 }
 
 /// `xsd:boolean`'s lexical space, exactly: `true` / `false` / `1` /
@@ -824,6 +851,22 @@ test "xsdDouble: the schema's lexical space, not parseFloat's" {
     for (bad) |s| try testing.expectEqual(@as(?f64, null), xsdDouble(s));
 }
 
+test "typedAttr: boundary whitespace collapses after the decode; interior whitespace stays invalid (REL-103)" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(?f64, 2), try doubleAttr(a, " 2 "));
+    try testing.expectEqual(@as(?f64, 0.5), try doubleAttr(a, "&#x20;.5&#x20;"));
+    try testing.expectEqual(@as(?f64, 2865), try doubleAttr(a, "\t2865\r\n"));
+    try testing.expectEqual(@as(?f64, null), try doubleAttr(a, "1 0"));
+    try testing.expectEqual(@as(?f64, null), try doubleAttr(a, " "));
+    try testing.expectEqual(@as(?bool, true), try boolAttr(a, " true "));
+    try testing.expectEqual(@as(?bool, false), try boolAttr(a, "&#48; "));
+    try testing.expectEqual(@as(?bool, null), try boolAttr(a, "tr ue"));
+    try testing.expectEqual(@as(?u32, 191029), try uintAttr(a, " 191029 "));
+    try testing.expectEqual(@as(?u32, null), try uintAttr(a, "19 1029"));
+    try testing.expectEqual(@as(?u32, null), try uintAttr(a, ""));
+    try testing.expectError(error.MalformedSheetXml, doubleAttr(a, " &bogus; "));
+}
+
 test "xsdBoolean: exactly the four lexicals" {
     try testing.expectEqual(@as(?bool, true), xsdBoolean("true"));
     try testing.expectEqual(@as(?bool, true), xsdBoolean("1"));
@@ -908,7 +951,11 @@ test "scanSheetProps: decoys at other depths are opaque, not the slot" {
     const second_view = try scan(a, ws_open ++
         "<sheetViews><sheetView workbookViewId=\"0\"/><sheetView workbookViewId=\"1\"><pane ySplit=\"1\" state=\"frozen\"/></sheetView></sheetViews><sheetData/></worksheet>");
     try testing.expect(second_view.pane == null);
-    // … and a second view's second pane is opaque, not a refusal.
+    // … and a second view's second pane, or its duplicate attribute,
+    // is opaque, not a refusal — it is not slot machinery.
+    const second_view_attrs = try scan(a, ws_open ++
+        "<sheetViews><sheetView workbookViewId=\"0\"/><sheetView workbookViewId=\"1\" workbookViewId=\"2\"/></sheetViews><sheetData/></worksheet>");
+    try testing.expect(second_view_attrs.pane == null);
     const second_view_dup = try scan(a, ws_open ++
         "<sheetViews><sheetView workbookViewId=\"0\"><pane state=\"split\"/></sheetView><sheetView workbookViewId=\"1\"><pane/><pane/></sheetView></sheetViews><sheetData/></worksheet>");
     try testing.expectEqualStrings("split", second_view_dup.pane.?.state.?);
@@ -969,6 +1016,8 @@ test "scanSheetProps: malformed structures refuse rather than pick" {
         ws_open ++ "<dimension ref=\"A1\" ref=\"B2\"/><sheetData/></worksheet>",
         ws_open ++ "<sheetViews><sheetView><pane state=\"frozen\" state=\"split\"/></sheetView></sheetViews><sheetData/></worksheet>",
         ws_open ++ "<sheetViews><sheetView><pane xSplit=\"1\" foo=\"1\" foo=\"2\"/></sheetView></sheetViews><sheetData/></worksheet>",
+        ws_open ++ "<sheetViews foo=\"1\" foo=\"2\"><sheetView/></sheetViews><sheetData/></worksheet>",
+        ws_open ++ "<sheetViews><sheetView workbookViewId=\"0\" workbookViewId=\"1\"><pane/></sheetView></sheetViews><sheetData/></worksheet>",
         // MCE at the recognized slots (SEC-2201).
         ws_open ++ "<mc:AlternateContent " ++ mce ++ "><mc:Choice><dimension ref=\"A1\"/></mc:Choice></mc:AlternateContent><sheetData/></worksheet>",
         ws_open ++ "<sheetViews><mc:AlternateContent " ++ mce ++ "><mc:Choice><sheetView/></mc:Choice></mc:AlternateContent></sheetViews><sheetData/></worksheet>",
@@ -1131,6 +1180,34 @@ test "calcFromAttrs: the numeric carriers decode entities first and type lexical
     try testing.expectError(error.MalformedSheetXml, calcFromAttrs(a, " calcId=\"1\"x=\"2\""));
 }
 
+test "collect: whitespace-padded typed attributes read as their values on the wire (REL-103)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "sheet_props_ws.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "xSplit=\"2865\"", "xSplit=\" 2865 \"");
+    try fixture.patchPart(testing.allocator, io, path, "xl/worksheets/sheet2.xml", "ySplit=\"1215.5\"", "ySplit=\"&#x20;1215.5&#x9;\"");
+    try fixture.patchPart(testing.allocator, io, path, "xl/workbook.xml", "iterate=\"true\"", "iterate=\"&#x20;true \"");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(testing.allocator, &wb);
+    defer view.deinit();
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSheetRecord(&w, view.records[1], .compact);
+    try testing.expectEqualStrings(
+        "{\"kind\":\"sheet_props\",\"dimension\":\"A1:C2\"," ++
+            "\"pane\":{\"x_split\":2865,\"y_split\":1215.5,\"top_left_cell\":\"C4\",\"active_pane\":\"bottomRight\",\"state\":\"split\"}}\n",
+        w.buffered(),
+    );
+    const calc = try collectCalc(testing.allocator, &wb);
+    try testing.expectEqual(@as(?bool, true), calc.iterate);
+}
+
 test "collect: a carrier the stream cannot carry faithfully refuses whole" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1258,6 +1335,18 @@ test "collectCalc: absent, empty, whitespace-closed, decoyed and doubled slots" 
         .{ .name = "c9.xlsx", .new = "<calcPr iterate=\"&bogus;\"/>", .want = null },
         // A `<calcPr>` under a rebound default namespace is foreign.
         .{ .name = "c10.xlsx", .new = "<foo xmlns=\"urn:x\"><calcPr calcId=\"1\"/></foo>", .want = CalcRecord.absent },
+        // An MCE branch BELOW an ordinary wrapper cannot project into
+        // the root slot: neither counted nor shadowing (Codex #218 r1
+        // S3B-REL-102) — and the real root record beside it survives.
+        .{ .name = "c11.xlsx", .new = "<extLst><ext uri=\"{x}\"><mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x15\"><calcPr calcId=\"7\"/></mc:Choice></mc:AlternateContent></ext></extLst>", .want = CalcRecord.absent },
+        .{ .name = "c12.xlsx", .new = full ++ "<extLst><ext uri=\"{x}\"><mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x15\"><calcPr calcId=\"7\"/></mc:Choice></mc:AlternateContent></ext></extLst>", .want = .{ .calc_id = 191029, .full_calc_on_load = true, .iterate = true, .iterate_count = 100, .iterate_delta = 0.001 } },
+        // A root MCE branch whose choice is an ordinary wrapper: after
+        // projection the wrapper sits at the root, its `calcPr` below
+        // it — not the slot.
+        .{ .name = "c13.xlsx", .new = "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x15\"><foo><calcPr calcId=\"7\"/></foo></mc:Choice></mc:AlternateContent>", .want = CalcRecord.absent },
+        // … while a Choice-then-Fallback chain straight from the root
+        // still shadows.
+        .{ .name = "c14.xlsx", .new = "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x15\"/><mc:Fallback><calcPr calcId=\"7\"/></mc:Fallback></mc:AlternateContent>", .want = null },
     };
     for (cases) |case| {
         const path = try tt.path(testing.allocator, io, case.name);
