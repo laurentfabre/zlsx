@@ -352,6 +352,15 @@ pub const Error = error{
     /// `ColEditUnsafeForSheet`, so this variant only surfaces when a
     /// caller bypasses Editor. Surfaces from `pkg/table_edit.zig`.
     TableCollapseUnsafe,
+    /// `Workbook.{deleteRow, deleteColumn}` would collapse EVERY area
+    /// of a `<conditionalFormatting>` or `<dataValidation>` `sqref` —
+    /// Excel deletes the rule outright, and this walker cannot excise
+    /// an element with children mid-walk, so leaving the bytes would
+    /// silently retarget the rule to whatever slides into its old
+    /// coordinates (Codex #216 r4 S3B-REL-805). Refused pre-mutation,
+    /// the `TableCollapseUnsafe` shape. Surfaces from
+    /// `pkg/sheet_edit.zig`.
+    SqrefCollapseUnsafe,
     /// A row/col edit on a sheet a pivot renders on or reads from
     /// that no rewriter admits: inside a hosted pivot's footprint
     /// (S7a), a delete of a source's header row or only row, a column

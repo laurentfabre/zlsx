@@ -5930,6 +5930,11 @@ const structural_refusals = [_]anyerror{
     error.TableCoordinateOverflow,
     error.TableCollapseUnsafe,
     error.TableHeaderRowDeleteUnsafe,
+    // A delete that collapses EVERY area of a DV/CF `sqref` — Excel
+    // deletes the rule outright; zlsx cannot excise it mid-walk and
+    // refuses rather than silently retarget it (Codex #216 r4
+    // S3B-REL-805, the TableCollapseUnsafe shape).
+    error.SqrefCollapseUnsafe,
     error.PivotEditUnsafe,
     error.MalformedExtensionXml,
     error.MalformedSheetRels,
@@ -8407,6 +8412,7 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedDrawingXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.SqrefCollapseUnsafe));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.InternalSheetNameTooLong));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedWorkbookXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.IdSpaceExhausted));

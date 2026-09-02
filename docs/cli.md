@@ -408,12 +408,15 @@ under row / column edits too (S3b slice 6):
 the grid — merge-rect interval semantics: shift, grow on an insert
 inside, shrink on a delete inside, a collapsed area dropped from the
 list, whole-column (`A:A`) and whole-row (`1:1`) areas absorbing the
-cross-axis edit and shifting as intervals along their own, the value
-entity-decoded before parsing — in the same edit that the formula
-sweep moves the rule's `<formula>` bodies (all three schema slots),
-so this read reports envelope and bodies on one grid after an edit.
-An sqref area the edit cannot read as any of those forms refuses the
-whole edit before anything mutates.
+cross-axis edit and shifting as intervals along their own, `$`
+anchors preserved, the value entity-decoded before parsing — in the
+same edit that the formula sweep moves the rule's `<formula>` bodies
+(all three schema slots), so this read reports envelope and bodies
+on one grid after an edit. An sqref area the strict grammar cannot
+read refuses the whole edit before anything mutates, and so does a
+delete that collapses EVERY area of a rule (`SqrefCollapseUnsafe`):
+Excel deletes such a rule outright, and zlsx refuses rather than
+silently retarget it to the cells that slide into its place.
 
 ### Edit (load-modify-save)
 

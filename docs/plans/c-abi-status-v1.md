@@ -629,13 +629,20 @@ historically moved only the formula bodies — an insert rewrote
 merge-rect interval semantics — shift / grow / shrink, a collapsed
 area dropped from the list, whole-column (`A:A`) and whole-row
 (`1:1`) spellings absorbing the cross-axis edit and shifting as
-intervals along their own, the value entity-DECODED before parsing
-(round 3, S3B-REL-802). The element is kept as written only when
-every area collapses (excising children mid-walk is not the walker's
-shape; the swept bodies still land on the post-edit grid); an area
-that parses as NO sqref form refuses the whole edit pre-mutation,
-the `<xm:f>` all-or-nothing posture — a frozen envelope beside
-swept bodies is exactly the skew this repair closes. The bodies
+intervals along their own, `$` anchors parsed and preserved, the
+value entity-DECODED before parsing, BOTH axes validated by the
+strict ST_Ref grammar — not just the edited one (rounds 3–4,
+S3B-REL-802/803). An area the grammar refuses fails the whole edit
+pre-mutation, the `<xm:f>` all-or-nothing posture — a frozen
+envelope beside swept bodies is exactly the skew this repair closes
+— and a delete that collapses EVERY area refuses too
+(`SqrefCollapseUnsafe`, -2, the `TableCollapseUnsafe` shape): Excel
+deletes the rule outright, the walker cannot excise an element with
+children mid-walk, and kept bytes would silently retarget the rule
+to whatever slides into its old coordinates (r4 S3B-REL-805).
+Comments, CDATA sections, PIs and DOCTYPE constructs pass through
+both walkers verbatim — a tag spelled inside one is prose, neither
+rewritten nor refused on (r4 S3B-REL-804). The bodies
 themselves: round 3 (S3B-REL-801) extended the DV/CF sweep from CF
 formula slot 1 to all three schema slots, so a `cellIs` `between`
 moves both its formulas with the envelope. Repeated reads stay
@@ -662,8 +669,12 @@ deliberate `-1` (r2);
 an allocation-failure sweep over `conditionalFormatsNdjsonOwned`
 (caches primed first, the shared writer's own OOM-test shape); the
 sqref-shift unit tests in `pkg/sheet_edit.zig` (insert above / inside,
-delete inside, collapse-drop, all-collapse keep, the column axis, the
-`dataValidations` wrapper decoy, the unshiftable whole-column
-posture). The smoke gate takes the address and `#error`s without the
-macro; the Python leg pins the parsed records, the insert-row move,
-both refusal shapes and the closed-editor error.
+delete inside, collapse-drop, the all-collapse refusal for CF and DV,
+the column axis, the `dataValidations` wrapper decoy, whole-column /
+whole-row absorption + interval shifting + collapse, `$`-anchor
+round-trips, both-axes grid validation, entity decode with a
+byte-preserving no-op, garbage refusal, comment / CDATA decoy
+pass-through). The smoke gate takes the address and `#error`s without
+the macro; the Python leg pins the parsed records, the insert-row
+move, the `between` both-slots move, both refusal shapes and the
+closed-editor error.
