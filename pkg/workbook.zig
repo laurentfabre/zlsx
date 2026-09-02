@@ -4112,6 +4112,9 @@ pub const Workbook = struct {
             if (!isDrawingPart(meta)) continue;
             for (self.store.rels(meta.name)) |rel| {
                 if (!drawings.relTypeIs(rel.type, "chart")) continue;
+                // An external chart lives in another package: nothing
+                // here to move (the read's `relTargetForIdTyped` rule).
+                if (rel.target_mode == .external) continue;
                 const resolved = (try self.store.resolveOwned(a, meta.name, rel.target)) orelse continue;
                 defer a.free(resolved);
                 try appendChartPartName(a, &seen, &names, resolved);
