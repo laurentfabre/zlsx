@@ -3809,6 +3809,8 @@ pub const Workbook = struct {
             var dv_f1_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var dv_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             var cf_f_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var cf_f2_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
+            var cf_f3_new: std.AutoHashMapUnmanaged(usize, []u8) = .{};
             defer {
                 var it1 = dv_f1_new.iterator();
                 while (it1.next()) |e| a.free(e.value_ptr.*);
@@ -3819,6 +3821,12 @@ pub const Workbook = struct {
                 var it3 = cf_f_new.iterator();
                 while (it3.next()) |e| a.free(e.value_ptr.*);
                 cf_f_new.deinit(a);
+                var it4 = cf_f2_new.iterator();
+                while (it4.next()) |e| a.free(e.value_ptr.*);
+                cf_f2_new.deinit(a);
+                var it5 = cf_f3_new.iterator();
+                while (it5.next()) |e| a.free(e.value_ptr.*);
+                cf_f3_new.deinit(a);
             }
 
             for (view.validations, 0..) |dv, i| {
@@ -3835,6 +3843,12 @@ pub const Workbook = struct {
                     }
                 }
             }
+            // All three schema slots, not just the first: a `cellIs`
+            // `between` carries two formulas, and slice 5 widened the
+            // typed view to the schema's three — a sweep that moved
+            // only slot 1 left `<formula>B2</formula>` beside a moved
+            // sibling, the exact skew the sqref shift closed for the
+            // envelope (Codex #216 r3 S3B-REL-801).
             for (view.conditional_formats, 0..) |cf, j| {
                 if (cf.formula) |f| {
                     if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
@@ -3842,9 +3856,22 @@ pub const Workbook = struct {
                         try cf_f_new.put(a, j, new);
                     }
                 }
+                if (cf.formula2) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
+                        errdefer a.free(new);
+                        try cf_f2_new.put(a, j, new);
+                    }
+                }
+                if (cf.formula3) |f| {
+                    if (try maybeRewrite(a, f, ws_name, target_sheet, sheet_order, edit)) |new| {
+                        errdefer a.free(new);
+                        try cf_f3_new.put(a, j, new);
+                    }
+                }
             }
 
-            const total = dv_f1_new.count() + dv_f2_new.count() + cf_f_new.count();
+            const total = dv_f1_new.count() + dv_f2_new.count() +
+                cf_f_new.count() + cf_f2_new.count() + cf_f3_new.count();
             if (total == 0) continue;
 
             // Phase B: walk source XML, build patch list of source-
@@ -3857,7 +3884,7 @@ pub const Workbook = struct {
 
             var patches: std.ArrayList(SourcePatch) = .empty;
             defer patches.deinit(a);
-            try collectDvCfPatches(a, source, view, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new);
+            try collectDvCfPatches(a, source, view, &patches, &dv_f1_new, &dv_f2_new, &cf_f_new, &cf_f2_new, &cf_f3_new);
 
             // Sanity: every queued rewrite should have located a
             // splice site in the source (typed view and source share
@@ -12166,6 +12193,8 @@ fn collectDvCfPatches(
     dv_f1_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     dv_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
     cf_f_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    cf_f2_new: *const std.AutoHashMapUnmanaged(usize, []u8),
+    cf_f3_new: *const std.AutoHashMapUnmanaged(usize, []u8),
 ) Error!void {
     assert(source.len > 0);
     // The view must have been parsed from THESE bytes — a part
@@ -12189,6 +12218,14 @@ fn collectDvCfPatches(
     var it3 = cf_f_new.iterator();
     while (it3.next()) |e| {
         try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula.?, e.value_ptr.*);
+    }
+    var it4 = cf_f2_new.iterator();
+    while (it4.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula2.?, e.value_ptr.*);
+    }
+    var it5 = cf_f3_new.iterator();
+    while (it5.next()) |e| {
+        try appendMappedPatch(a, source, view, out, view.conditional_formats[e.key_ptr.*].formula3.?, e.value_ptr.*);
     }
 }
 
@@ -16008,6 +16045,57 @@ test "Workbook.rewriteAllValidationsAndConditionalFormats: insert_cols shifts CF
     try std.testing.expectEqual(@as(?u32, 0), cfs[0].dxf_id);
     try std.testing.expectEqual(@as(?u32, 1), cfs[0].priority);
     try std.testing.expectEqual(@as(?u32, 2), cfs[1].priority);
+}
+
+test "rewrite CF: all three formula slots shift, not just the first (S3B-REL-801)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src_path = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, src_path, .{}) catch return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-dvcf-slots-{d}.xlsx", .{prng.random().int(u32)});
+
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, src_path);
+        defer wb.deinit();
+        // A `between` carries two formulas; a third is schema-legal
+        // (CT_CfRule formula{0..3}) even if Excel's UI never authors
+        // it — the sweep that moved only slot 1 left `B7` and `B9`
+        // beside a moved `B5`, the body-side twin of the sqref skew.
+        const cf =
+            \\<conditionalFormatting sqref="A1:A10"><cfRule type="cellIs" operator="between" priority="1"><formula>B5</formula><formula>B7</formula><formula>B9</formula></cfRule></conditionalFormatting>
+        ;
+        try injectDvAndCfIntoSheet(std.testing.allocator, &wb, 0, "", cf);
+        try wb.save(io, tmp_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var tmp2_buf: [256]u8 = undefined;
+    const tmp2_path = try std.fmt.bufPrint(&tmp2_buf, ".zig-cache/test-dvcf-slots-out-{d}.xlsx", .{prng.random().int(u32)});
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const count = try wb.rewriteAllValidationsAndConditionalFormats(
+            .{ .insert_rows = .{ .at = 4, .count = 1 } },
+            null,
+        );
+        // B5 → B6, B7 → B8, B9 → B10: three bodies, three rewrites.
+        try std.testing.expectEqual(@as(u32, 3), count);
+        try wb.save(io, tmp2_path);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, tmp2_path);
+    defer wb2.deinit();
+    const ws = try wb2.sheet(0);
+    const cfs = try ws.conditionalFormats();
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("B6", cfs[0].formula.?);
+    try std.testing.expectEqualStrings("B8", cfs[0].formula2.?);
+    try std.testing.expectEqualStrings("B10", cfs[0].formula3.?);
 }
 
 test "rewrite CF: a commented-out cfRule decoy does not shift the splice lockstep (REL-103)" {

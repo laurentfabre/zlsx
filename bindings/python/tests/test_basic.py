@@ -2907,6 +2907,28 @@ def test_conditional_formats_read_the_editors_current_state(tmp_path):
     ]
 
 
+def test_conditional_formats_between_moves_both_formulas(tmp_path):
+    """A `cellIs between` carries two formulas — a sweep that moved
+    only the first left `B2` beside a moved sibling (Codex #216 r3
+    S3B-REL-801)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf_between.xlsx"
+    with zlsx.write(src) as w:
+        dxf = w.add_dxf(zlsx.Dxf(font_bold=True))
+        data = w.add_sheet("Data")
+        data.write_row([1, 5])
+        data.write_row([2, 6])
+        data.add_conditional_format_cell_is("A1:A4", "between", "B1", "B2", dxf)
+
+    with zlsx.edit(src) as ed:
+        ed.insert_row(0, 1)
+        records = ed.conditional_formats()
+    assert [(r["sqref"], r["formulas"]) for r in records] == [
+        ("A2:A5", ["B2", "B3"]),
+    ]
+
+
 def test_conditional_formats_refusal_is_typed(tmp_path):
     """An inventory the read cannot serve faithfully raises
     `ZlsxRefusal(MalformedSheetXml)` — never a partial list."""

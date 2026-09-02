@@ -626,10 +626,20 @@ historically moved only the formula bodies — an insert rewrote
 (Excel included, after save) could observe — and
 `pkg/sheet_edit.zig::processSqrefListTag` now shifts
 `conditionalFormatting@sqref` and `dataValidation@sqref` with the
-merge-rect interval semantics (shift / grow / shrink, a collapsed
-area dropped, the element kept as written when every area collapses
-or one does not parse — the `<xm:sqref>` posture). Repeated reads
-stay bounded: sheet targets resolve into the view's own arena
+merge-rect interval semantics — shift / grow / shrink, a collapsed
+area dropped from the list, whole-column (`A:A`) and whole-row
+(`1:1`) spellings absorbing the cross-axis edit and shifting as
+intervals along their own, the value entity-DECODED before parsing
+(round 3, S3B-REL-802). The element is kept as written only when
+every area collapses (excising children mid-walk is not the walker's
+shape; the swept bodies still land on the post-edit grid); an area
+that parses as NO sqref form refuses the whole edit pre-mutation,
+the `<xm:f>` all-or-nothing posture — a frozen envelope beside
+swept bodies is exactly the skew this repair closes. The bodies
+themselves: round 3 (S3B-REL-801) extended the DV/CF sweep from CF
+formula slot 1 to all three schema slots, so a `cellIs` `between`
+moves both its formulas with the envelope. Repeated reads stay
+bounded: sheet targets resolve into the view's own arena
 (`PartStore.resolveOwned`, S3B-MEM-603), not the store's lifetime
 arena.
 
