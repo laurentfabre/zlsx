@@ -14689,6 +14689,8 @@ test {
     _ = @import("anchor_ndjson.zig");
     // S3b slice 5: same lesson, the conditional-formats NDJSON writer.
     _ = @import("conditional_format_ndjson.zig");
+    // S3b slice 8: same lesson, the sheet-props / calc-props writer.
+    _ = @import("sheet_props_ndjson.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {

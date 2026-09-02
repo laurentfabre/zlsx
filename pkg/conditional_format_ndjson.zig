@@ -35,6 +35,14 @@
 //! carries embedded markup refuses the whole read — a partial or
 //! wrong rule inventory is the shape of a guard hole, as the pivot,
 //! defined-name and anchor reads established.
+//!
+//! The lexical layer below — the prefix scope, the attribute
+//! tokenizer, the strict prolog / comment / PI skippers, the root
+//! classifier, the carrier decoders — is `pub` for the sibling strict
+//! reads that walk the same parts (the sheet-props read,
+//! `sheet_props_ndjson.zig`), so one grammar rules every typed read;
+//! the walk loops themselves stay per module, each classifying its
+//! own schema slots.
 
 const std = @import("std");
 const formula_mod = @import("zlsx_formula");
@@ -154,7 +162,10 @@ pub fn resolveSheets(gpa: Allocator, a: Allocator, wb: *workbook_mod.Workbook) I
             error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedWorkbookXml,
         }) orelse return error.MalformedWorkbookXml;
-        try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets);
+        // The calc-props slot rides the same walk; this read has no
+        // use for it (`scanCalcPr` is the calc-props entry).
+        var calc_slot: CalcPrSlot = .{};
+        try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets, &calc_slot);
     }
     const sheet_count = strict_sheets.items.len;
 
@@ -385,20 +396,59 @@ const RawRule = struct {
 /// kinds have no typed view; Codex #215 r4 REL-404).
 const RootKind = enum { worksheet, macrosheet, barren };
 
+/// The sheet-family roots a sheet part may open with — the one root
+/// rule every strict sheet walk (this module's rules, the sheet-props
+/// read) applies at its first element.
+pub const SheetRoot = enum { worksheet, macrosheet, chartsheet, dialogsheet };
+
+/// Classify a part's root element, or null when it is not a
+/// sheet-family root. `is_main` / `elem_main` are the walk's namespace
+/// verdicts for the element (unprefixed under a main default; the
+/// main namespace is the element's default). Macro sheets have TWO
+/// legal spellings: the noncanonical unprefixed main-ns
+/// `<macrosheet>`, and Microsoft's canonical `<xm:macrosheet>` whose
+/// prefix binds the macro namespace ON THIS TAG while the default
+/// binds main for the children (Codex #215 r20 REL-2001) — an
+/// arbitrary bound prefix is not that. Structural compare — a fixed
+/// name buffer put an artificial ceiling on a valid prefix's length
+/// (r21 REL-2101).
+pub fn classifySheetRoot(scratch: Allocator, qname: []const u8, attrs: []const u8, is_main: bool, elem_main: bool) Error!?SheetRoot {
+    if (is_main) {
+        if (std.mem.eql(u8, qname, "worksheet")) return .worksheet;
+        if (std.mem.eql(u8, qname, "macrosheet")) return .macrosheet;
+        if (std.mem.eql(u8, qname, "chartsheet")) return .chartsheet;
+        if (std.mem.eql(u8, qname, "dialogsheet")) return .dialogsheet;
+        return null;
+    }
+    const c = std.mem.indexOfScalar(u8, qname, ':') orelse return null;
+    if (!elem_main) return null;
+    if (!std.mem.eql(u8, qname[c + 1 ..], "macrosheet")) return null;
+    const p = qname[0..c];
+    var it: AttrScan = .{ .rest = attrs };
+    while (try it.next()) |attr| {
+        if (std.mem.startsWith(u8, attr.name, "xmlns:") and
+            std.mem.eql(u8, attr.name["xmlns:".len..], p))
+        {
+            return if (try bindsNs(scratch, attr.value, isMsMacroNs)) .macrosheet else null;
+        }
+    }
+    return null;
+}
+
 /// Microsoft's macro-sheet namespace — the canonical macro-sheet
 /// root is `<xm:macrosheet>` with `xm` bound to it and the DEFAULT
 /// bound to SpreadsheetML main for the children (MS-OFFMACRO; Codex
 /// #215 r20 REL-2001).
 const ms_macro_ns = "http://schemas.microsoft.com/office/excel/2006/main";
 
-fn isMsMacroNs(uri: []const u8) bool {
+pub fn isMsMacroNs(uri: []const u8) bool {
     return std.mem.eql(u8, uri, ms_macro_ns);
 }
 
 const main_ns_transitional = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const main_ns_strict = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
-fn isMainNs(uri: []const u8) bool {
+pub fn isMainNs(uri: []const u8) bool {
     return std.mem.eql(u8, uri, main_ns_transitional) or
         std.mem.eql(u8, uri, main_ns_strict);
 }
@@ -414,7 +464,7 @@ fn isMainNs(uri: []const u8) bool {
 /// `<conditionalFormatting xmlns="&bogus;">` as bound-to-foreign and
 /// hid its rules — a binding that does not decode is not one the walk
 /// can rule out (r4 SEC-401).
-fn bindsMainNs(scratch: Allocator, raw: []const u8) Error!bool {
+pub fn bindsMainNs(scratch: Allocator, raw: []const u8) Error!bool {
     return bindsNs(scratch, raw, isMainNs);
 }
 
@@ -464,7 +514,7 @@ fn isXmlnsNsUri(uri: []const u8) bool {
 /// already-opaque subtree and stays walkable.
 const mce_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
-fn isMceNs(uri: []const u8) bool {
+pub fn isMceNs(uri: []const u8) bool {
     return std.mem.eql(u8, uri, mce_ns);
 }
 
@@ -473,7 +523,7 @@ fn isMceNs(uri: []const u8) bool {
 /// tag cannot tax every later tag with a full-capacity metadata
 /// clear — `clearRetainingCapacity` zeroes the whole retained
 /// capacity (Codex #215 r20 PERF-2001).
-fn resetDeclSeen(a: Allocator, m: *std.StringHashMapUnmanaged(void)) void {
+pub fn resetDeclSeen(a: Allocator, m: *std.StringHashMapUnmanaged(void)) void {
     if (m.count() == 0) return;
     if (m.capacity() > 64) {
         m.deinit(a);
@@ -488,22 +538,22 @@ fn resetDeclSeen(a: Allocator, m: *std.StringHashMapUnmanaged(void)) void {
 /// hash map, so the per-attribute lookup is O(1) — the linear scan
 /// was quadratic against a tag with many declarations and many
 /// prefixed attributes (Codex #215 r15 PERF-1501).
-const PrefixScope = struct {
+pub const PrefixScope = struct {
     const Entry = struct { prefix: []const u8, prev_mce: ?bool };
     const Bind = struct { count: u32, mce: bool };
     stack: std.ArrayListUnmanaged(Entry) = .empty,
     counts: std.StringHashMapUnmanaged(Bind) = .empty,
 
-    fn deinit(self: *PrefixScope, a: Allocator) void {
+    pub fn deinit(self: *PrefixScope, a: Allocator) void {
         self.stack.deinit(a);
         self.counts.deinit(a);
     }
 
-    fn mark(self: *const PrefixScope) usize {
+    pub fn mark(self: *const PrefixScope) usize {
         return self.stack.items.len;
     }
 
-    fn declare(self: *PrefixScope, a: Allocator, p: []const u8, mce: bool) !void {
+    pub fn declare(self: *PrefixScope, a: Allocator, p: []const u8, mce: bool) !void {
         const prev: ?bool = if (self.counts.get(p)) |b| b.mce else null;
         try self.stack.append(a, .{ .prefix = p, .prev_mce = prev });
         const g = try self.counts.getOrPut(a, p);
@@ -515,7 +565,7 @@ const PrefixScope = struct {
         }
     }
 
-    fn truncate(self: *PrefixScope, to: usize) void {
+    pub fn truncate(self: *PrefixScope, to: usize) void {
         while (self.stack.items.len > to) {
             const e = self.stack.items[self.stack.items.len - 1];
             self.stack.items.len -= 1;
@@ -531,14 +581,14 @@ const PrefixScope = struct {
         }
     }
 
-    fn contains(self: *const PrefixScope, p: []const u8) bool {
+    pub fn contains(self: *const PrefixScope, p: []const u8) bool {
         if (std.mem.eql(u8, p, "xml")) return true; // implicitly declared
         return self.counts.contains(p);
     }
 
     /// Whether the prefix's INNERMOST in-scope binding is the MCE
     /// namespace (SEC-2201).
-    fn isMce(self: *const PrefixScope, p: []const u8) bool {
+    pub fn isMce(self: *const PrefixScope, p: []const u8) bool {
         return if (self.counts.get(p)) |b| b.mce else false;
     }
 };
@@ -552,7 +602,7 @@ const PrefixScope = struct {
 /// not mint the `xmlns` prefix as a relationship authorizer (Codex
 /// #215 r11 SEC-1101). Declarations THEMSELVES are never candidates
 /// for `<p>:id` matching — callers skip `xmlns`-family names.
-fn enterElementScope(
+pub fn enterElementScope(
     scratch: Allocator,
     scope: *PrefixScope,
     qname: []const u8,
@@ -612,7 +662,7 @@ fn enterElementScope(
     }
 }
 
-fn bindsNs(scratch: Allocator, raw: []const u8, comptime pred: fn ([]const u8) bool) Error!bool {
+pub fn bindsNs(scratch: Allocator, raw: []const u8, comptime pred: fn ([]const u8) bool) Error!bool {
     // A binding that is not UTF-8, or that holds characters XML 1.0
     // forbids outright (`&#0;`, a literal C0 control, U+FFFE), is not
     // one the walk can rule out — each read as bound-to-foreign and
@@ -675,7 +725,7 @@ fn xmlCharsValid(s: []const u8) bool {
 /// of levels deep; 1024 is two orders of magnitude of headroom, and a
 /// bound keeps a crafted part from growing the frame stack without
 /// limit (Codex #215 r2 PERF-201).
-const max_depth = 1024;
+pub const max_depth = 1024;
 
 fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(RawRule)) Error!RootKind {
     // The whole part must be UTF-8 before any byte-level scan — a
@@ -831,50 +881,16 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
             // bypass the second-root and unterminated-nesting checks,
             // so a truncated chartsheet or a `<worksheet/>` followed
             // by a rule-bearing second root would read as an empty
-            // success (Codex #215 r2 REL-201). Macro sheets have TWO
-            // legal spellings: the noncanonical unprefixed main-ns
-            // `<macrosheet>`, and Microsoft's canonical
-            // `<xm:macrosheet>` whose prefix binds the macro
-            // namespace ON THIS TAG while the default binds main for
-            // the children (r20 REL-2001) — an arbitrary bound
-            // prefix is not that.
-            var barren = false;
-            var accepted = false;
-            if (is_main) {
-                barren = std.mem.eql(u8, qname, "chartsheet") or
-                    std.mem.eql(u8, qname, "dialogsheet");
-                accepted = barren or
-                    std.mem.eql(u8, qname, "worksheet") or
-                    std.mem.eql(u8, qname, "macrosheet");
-                root_kind = if (barren)
-                    .barren
-                else if (std.mem.eql(u8, qname, "macrosheet"))
-                    .macrosheet
-                else
-                    .worksheet;
-            } else if (elem_main and prefixed) {
-                const c = std.mem.indexOfScalar(u8, qname, ':').?;
-                if (std.mem.eql(u8, qname[c + 1 ..], "macrosheet")) {
-                    // Structural compare — a fixed name buffer put an
-                    // artificial ceiling on a valid prefix's length
-                    // (Codex #215 r21 REL-2101).
-                    const p = qname[0..c];
-                    var it3: AttrScan = .{ .rest = attrs };
-                    while (try it3.next()) |attr3| {
-                        if (std.mem.startsWith(u8, attr3.name, "xmlns:") and
-                            std.mem.eql(u8, attr3.name["xmlns:".len..], p))
-                        {
-                            if (try bindsNs(a, attr3.value, isMsMacroNs)) {
-                                accepted = true;
-                                root_kind = .macrosheet;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!accepted) return error.MalformedSheetXml;
-            frame.kind = if (barren) .barren_root else .root;
+            // success (Codex #215 r2 REL-201). The root rule itself
+            // is the family's (`classifySheetRoot`).
+            const root = (try classifySheetRoot(a, qname, attrs, is_main, elem_main)) orelse
+                return error.MalformedSheetXml;
+            root_kind = switch (root) {
+                .worksheet => .worksheet,
+                .macrosheet => .macrosheet,
+                .chartsheet, .dialogsheet => .barren,
+            };
+            frame.kind = if (root_kind == .barren) .barren_root else .root;
         } else {
             const parent = &frames.items[frames.items.len - 1];
             // An MCE-bound element AT a recognized slot is where
@@ -979,7 +995,7 @@ fn scanSheetRules(a: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(Ra
 /// separately by position). A delimiter-only skip accepted
 /// `<? <conditionalFormatting>…' as a PI and thinned the inventory
 /// (Codex #215 r17 REL-1702). Null = malformed or unterminated.
-fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
+pub fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
     const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse return null;
     const body = xml[lt + 2 .. end];
     var j: usize = 0;
@@ -1003,7 +1019,7 @@ fn skipStrictPi(xml: []const u8, lt: usize) ?usize {
 /// positional predicate alone admitted `<?xml?>` and even rule-shaped
 /// markup inside the declaration (Codex #215 r18 REL-1801). Null =
 /// malformed.
-fn skipStrictXmlDecl(xml: []const u8, lt: usize) ?usize {
+pub fn skipStrictXmlDecl(xml: []const u8, lt: usize) ?usize {
     const end = std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse return null;
     if (lt + 5 > end) return null;
     const body = xml[lt + 5 .. end];
@@ -1032,7 +1048,7 @@ fn skipStrictXmlDecl(xml: []const u8, lt: usize) ?usize {
 
 /// The document's XML declaration — admitted only as the very first
 /// construct (a BOM aside).
-fn isPrologXmlDecl(xml: []const u8, lt: usize) bool {
+pub fn isPrologXmlDecl(xml: []const u8, lt: usize) bool {
     const at_start = lt == 0 or
         (lt == 3 and std.mem.startsWith(u8, xml, "\xEF\xBB\xBF"));
     if (!at_start) return false;
@@ -1040,7 +1056,7 @@ fn isPrologXmlDecl(xml: []const u8, lt: usize) bool {
     return lt + 5 >= xml.len or isXmlWs(xml[lt + 5]) or xml[lt + 5] == '?';
 }
 
-fn skipStrictComment(xml: []const u8, lt: usize) ?usize {
+pub fn skipStrictComment(xml: []const u8, lt: usize) ?usize {
     const end = std.mem.indexOfPos(u8, xml, lt + 4, "-->") orelse return null;
     const body = xml[lt + 4 .. end];
     if (std.mem.indexOf(u8, body, "--") != null) return null;
@@ -1048,20 +1064,20 @@ fn skipStrictComment(xml: []const u8, lt: usize) ?usize {
     return end + 3;
 }
 
-fn isXmlWs(c: u8) bool {
+pub fn isXmlWs(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
-fn isTagBoundary(c: u8) bool {
+pub fn isTagBoundary(c: u8) bool {
     return isXmlWs(c) or c == '/' or c == '>';
 }
 
-const TagEnd = struct { attrs_end: usize, after_gt: usize, self_closing: bool };
+pub const TagEnd = struct { attrs_end: usize, after_gt: usize, self_closing: bool };
 
 /// Quote-aware scan from the end of the tag name to the tag's `>` —
 /// an attribute value may contain `>` (Codex #215 r1 REL-103 caught
 /// the rewriter's bare scan on the same shape).
-fn tagEnd(xml: []const u8, attrs_start: usize) ?TagEnd {
+pub fn tagEnd(xml: []const u8, attrs_start: usize) ?TagEnd {
     var i = attrs_start;
     while (i < xml.len) : (i += 1) {
         const c = xml[i];
@@ -1077,7 +1093,7 @@ fn tagEnd(xml: []const u8, attrs_start: usize) ?TagEnd {
     return null;
 }
 
-const Attr = struct { name: []const u8, value: []const u8 };
+pub const Attr = struct { name: []const u8, value: []const u8 };
 
 /// Strict attribute tokenizer: `name = "value"` with XML whitespace
 /// allowed around `=` (valid XML the exact-needle scan reported as
@@ -1087,10 +1103,10 @@ const Attr = struct { name: []const u8, value: []const u8 };
 /// past the tokenizer and classify as rule machinery; Codex #215 r5
 /// REL-502), and a raw `<` in any value is ill-formed XML. A region
 /// that does not tokenize refuses the part.
-const AttrScan = struct {
+pub const AttrScan = struct {
     rest: []const u8,
 
-    fn next(self: *AttrScan) error{MalformedSheetXml}!?Attr {
+    pub fn next(self: *AttrScan) error{MalformedSheetXml}!?Attr {
         const s = self.rest;
         var i: usize = 0;
         // XML requires whitespace BETWEEN attributes (and between the
@@ -1134,7 +1150,7 @@ const AttrScan = struct {
 /// empty first half) are malformed namespace XML that slipped a
 /// colon-agnostic NameChar check and reopened the relationship-
 /// identity boundary (Codex #215 r8 SEC-801).
-fn validQName(name: []const u8) bool {
+pub fn validQName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (std.mem.indexOfScalar(u8, name, ':')) |c| {
         if (c == 0 or c == name.len - 1) return false;
@@ -1204,7 +1220,7 @@ fn ncNameCharCp(cp: u21) bool {
 /// empty `key` to run the duplicate check alone. Hashed and uncapped
 /// — a fixed table rejected valid XML past its size (Codex #215 r13
 /// REL-1301).
-fn uniqueAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
+pub fn uniqueAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u8 {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
     var found: ?[]const u8 = null;
@@ -1224,7 +1240,7 @@ fn uniqueAttr(a: Allocator, attrs: []const u8, key: []const u8) Error!?[]const u
 /// (`+1`, `1_0` and overflow read as absent, the written-but-invalid
 /// convention `tableHeaderRowCount` set) — Codex #215 r1 REL-104,
 /// r18 REL-1802.
-fn numericAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?u32 {
+pub fn numericAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?u32 {
     const raw = raw_opt orelse return null;
     if (std.mem.indexOfScalar(u8, raw, '&') == null) return digitOnlyU32(raw);
     const decoded = formula_mod.decode.decodeEntities(scratch, raw) catch |e| switch (e) {
@@ -1235,7 +1251,7 @@ fn numericAttr(scratch: Allocator, raw_opt: ?[]const u8) Error!?u32 {
     return digitOnlyU32(decoded);
 }
 
-fn digitOnlyU32(s: []const u8) ?u32 {
+pub fn digitOnlyU32(s: []const u8) ?u32 {
     if (s.len == 0) return null;
     for (s) |c| {
         if (c < '0' or c > '9') return null;
@@ -1264,11 +1280,13 @@ const StrictSheet = struct { name: []const u8, rid: []const u8 };
 /// entry refuses; and a standards-valid alternate prefix (`q:id`
 /// under `xmlns:q="…relationships"`) IS an entry — sheet identities
 /// come from this read, not from the lenient projection that only
-/// spells `r:id` (Codex #215 r8 REL-801).
-fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet)) WorkbookError!void {
+/// spells `r:id` (Codex #215 r8 REL-801). The same walk records the
+/// root's `<calcPr>` slot into `calc` for the calc-props read — a
+/// capture only, no verdict of its own here (`CalcPrSlot`).
+fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmanaged(StrictSheet), calc: *CalcPrSlot) WorkbookError!void {
     if (!std.unicode.utf8ValidateSlice(xml)) return error.MalformedWorkbookXml;
     const Kind = enum { root, sheets_wrap, other };
-    const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize };
+    const Frame = struct { name: []const u8, kind: Kind, main_default: bool, prefix_mark: usize, mce_chain: bool };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer frames.deinit(gpa);
     var scope: PrefixScope = .{};
@@ -1406,10 +1424,21 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
         const is_main = !prefixed and elem_main;
 
         var kind: Kind = .other;
+        // Whether THIS element's children would land at the root slot
+        // under an MCE processor: true for the root itself, and for
+        // an MCE-bound element whose every ancestor below the root is
+        // MCE-bound too (the `mc:AlternateContent` / `mc:Choice` /
+        // `mc:Fallback` chain a processor substitutes in place). Any
+        // ordinary wrapper on the path — `<extLst>`, a foreign
+        // container, a plain element inside a Choice — breaks the
+        // chain: after projection it, not its content, sits at the
+        // root (Codex #218 r1 S3B-REL-102).
+        var mce_chain = false;
         if (frames.items.len == 0) {
             if (!is_main or !std.mem.eql(u8, qname, "workbook")) return error.MalformedWorkbookXml;
             root_seen = true;
             kind = .root;
+            mce_chain = true;
             if (te.self_closing) {
                 root_closed = true;
             }
@@ -1420,14 +1449,29 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             // `mc:AlternateContent` (absPath et al.) stays opaque —
             // hiding `<sheets>` itself trips the exactly-one-wrapper
             // rule below (SEC-2201).
-            if (parent.kind == .sheets_wrap and prefixed) {
+            if (prefixed) {
                 const c = std.mem.indexOfScalar(u8, qname, ':').?;
-                if (scope.isMce(qname[0..c])) return error.MalformedWorkbookXml;
+                if (scope.isMce(qname[0..c])) {
+                    if (parent.kind == .sheets_wrap) return error.MalformedWorkbookXml;
+                    mce_chain = parent.mce_chain;
+                }
             }
             if (parent.kind == .root and is_main and std.mem.eql(u8, qname, "sheets")) {
                 kind = .sheets_wrap;
                 wraps_seen += 1;
                 if (wraps_seen > 1) return error.MalformedWorkbookXml;
+            } else if (is_main and std.mem.eql(u8, qname, "calcPr")) {
+                // The calc-props slot: counted at the root, flagged
+                // when only MCE elements stand between it and the root
+                // (the one path the processor the walk lacks could
+                // project it into the slot by), opaque elsewhere
+                // (`<extLst>` decoys are not entries — SEC-502).
+                if (parent.kind == .root) {
+                    calc.count += 1;
+                    if (calc.count == 1) calc.attrs = attrs;
+                } else if (parent.mce_chain) {
+                    calc.mce_shadowed = true;
+                }
             } else if (parent.kind == .sheets_wrap and is_main and std.mem.eql(u8, qname, "sheet")) {
                 const name_attr = ((try wbAttr(gpa, attrs, "name")) orelse return error.MalformedWorkbookXml);
                 if ((try wbAttr(gpa, attrs, "sheetId")) == null) return error.MalformedWorkbookXml;
@@ -1461,7 +1505,7 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
             scope.truncate(prefix_mark);
         } else {
             if (frames.items.len >= max_depth) return error.MalformedWorkbookXml;
-            try frames.append(gpa, .{ .name = qname, .kind = kind, .main_default = elem_main, .prefix_mark = prefix_mark });
+            try frames.append(gpa, .{ .name = qname, .kind = kind, .main_default = elem_main, .prefix_mark = prefix_mark, .mce_chain = mce_chain });
         }
         i = te.after_gt;
     }
@@ -1474,6 +1518,43 @@ fn scanWorkbookSheets(gpa: Allocator, xml: []const u8, out: *std.ArrayListUnmana
     // workbook an empty success with no inventory ever established
     // (Codex #215 r6 REL-602).
     if (wraps_seen != 1) return error.MalformedWorkbookXml;
+}
+
+/// The `<calcPr>` slot as the strict workbook read found it, for the
+/// sheet-props read (`sheet_props_ndjson.collectCalc`): the attribute
+/// region of the first main-namespace `<calcPr>` that is a direct
+/// child of the root (borrowing the cached part's bytes), how many
+/// such elements the root carries (the schema allows one; the consumer
+/// refuses more), and whether a main-namespace `calcPr` sits directly
+/// under an unbroken chain of MCE-bound elements from the root — the
+/// one path an MCE processor could project it INTO the root slot by,
+/// which the walk (no MCE processor) cannot rule in or out (SEC-2201's
+/// closed form). A `calcPr` below any ordinary wrapper — `<extLst>`,
+/// a foreign container, a plain element inside a Choice — is neither:
+/// not an entry, not a shadow (Codex #218 r1 S3B-REL-102). This
+/// module and the anchors collector ignore the slot.
+pub const CalcPrSlot = struct {
+    attrs: ?[]const u8 = null,
+    count: u32 = 0,
+    mce_shadowed: bool = false,
+};
+
+/// The strict `<calcPr>` read of `xl/workbook.xml` — the walk
+/// `resolveSheets` runs (so the `<sheets>` structure it polices holds
+/// here too), without resolving the sheet parts: the calc-props read
+/// has no per-sheet dimension and pays for none. The slot's slices
+/// borrow the store's cached part.
+pub fn scanCalcPr(gpa: Allocator, wb: *workbook_mod.Workbook) InventoryError!CalcPrSlot {
+    const wb_part = (wb.store.part("xl/workbook.xml") catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ZipBombSuspected => return error.ZipBombSuspected,
+        else => return error.MalformedWorkbookXml,
+    }) orelse return error.MalformedWorkbookXml;
+    var strict_sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
+    defer strict_sheets.deinit(gpa);
+    var slot: CalcPrSlot = .{};
+    try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets, &slot);
+    return slot;
 }
 
 /// `uniqueAttr` with the workbook part's error name: a duplicate or
@@ -1731,7 +1812,7 @@ fn decodeSheetName(a: Allocator, raw: []const u8) WorkbookError![]u8 {
 /// and a decoded value that is not UTF-8 refuse — the JSON writer
 /// passes bytes through verbatim, so admitting one would emit invalid
 /// NDJSON under an exit 0.
-fn decodeRuleText(a: Allocator, raw: []const u8) Error![]u8 {
+pub fn decodeRuleText(a: Allocator, raw: []const u8) Error![]u8 {
     if (std.mem.indexOfScalar(u8, raw, '<') != null) return error.MalformedSheetXml;
     const decoded = formula_mod.decode.decodeAt(a, .cell_formula_body, raw) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2447,7 +2528,8 @@ fn fuzzScannersTarget(_: void, smith: *std.testing.Smith) anyerror!void {
     var rules: std.ArrayListUnmanaged(RawRule) = .empty;
     _ = scanSheetRules(a, input, &rules) catch {};
     var sheets: std.ArrayListUnmanaged(StrictSheet) = .empty;
-    scanWorkbookSheets(a, input, &sheets) catch {};
+    var calc_slot: CalcPrSlot = .{};
+    scanWorkbookSheets(a, input, &sheets, &calc_slot) catch {};
     verifyWorkbookRels(a, input, &.{}) catch {};
     verifySeedRels(a, input) catch {};
 }

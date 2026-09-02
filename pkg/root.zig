@@ -132,6 +132,10 @@ pub const anchors_ndjson = @import("anchor_ndjson.zig");
 /// `Worksheet.conditionalFormats` attributed to workbook sheets,
 /// written once for every surface.
 pub const conditional_formats_ndjson = @import("conditional_format_ndjson.zig");
+/// S3b: the `sheet-props` / `calc-props` NDJSON records — panes,
+/// `<dimension>` and `<calcPr>` read strictly, attributed to workbook
+/// sheets, written once for every surface.
+pub const sheet_props_ndjson = @import("sheet_props_ndjson.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;
