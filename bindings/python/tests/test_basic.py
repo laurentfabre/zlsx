@@ -3765,8 +3765,11 @@ def test_book_sheet_state_matches_the_cli_spelling(tmp_path):
     import subprocess
 
     _require_sheet_state()
-    cli = REPO_ROOT / "zig-out" / "bin" / "zlsx"
-    if not cli.exists():
+    # `zig build` installs the CLI beside the dylib; CI's pytest lane
+    # (windows-runtime) builds it too, as `zlsx.exe`.
+    candidates = [REPO_ROOT / "zig-out" / "bin" / name for name in ("zlsx", "zlsx.exe")]
+    cli = next((c for c in candidates if c.exists()), None)
+    if cli is None:
         pytest.skip("no local zlsx CLI build at zig-out/bin/zlsx")
     path = tmp_path / "sheet_state_cli.xlsx"
     _sheet_state_workbook(path)
