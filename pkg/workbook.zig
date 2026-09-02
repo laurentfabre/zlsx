@@ -4880,10 +4880,14 @@ pub const Workbook = struct {
         // holding the old name).
         const old_name = self.workbook.sheets[sheet_idx].name;
         if (old_name.len == 0) return error.InternalSheetNameTooLong; // OOXML invariant
-        if (old_name.len > 128) return error.InternalSheetNameTooLong;
-        var old_buf: [128]u8 = undefined;
-        @memcpy(old_buf[0..old_name.len], old_name);
-        const old_name_owned = old_buf[0..old_name.len];
+        // Allocator-owned, not a fixed stack buffer: a VALID name of
+        // 26 `&`s escapes to 130 raw carrier bytes, so the old
+        // 128-byte refusal made any escape-heavy name unrenamable
+        // once written (Codex #216 r17 S3B-REL-1701). The copy must
+        // outlive step 4's view re-parse, which frees the arena
+        // backing `sheets[i].name`.
+        const old_name_owned = try self.allocator.dupe(u8, old_name);
+        defer self.allocator.free(old_name_owned);
 
         // The view name is raw attribute bytes (`R&amp;D`); the
         // rewriter's decode-in contract wants the decoded form. The
@@ -4909,6 +4913,15 @@ pub const Workbook = struct {
         // S3B-REL-1402).
         _ = try locateWorkbookXmlSheetName(self, sheet_idx, old_name_owned);
 
+        // The postcondition's expected WIRE spelling, built before
+        // the first mutation: the post-refresh check then compares
+        // raw bytes without allocating, so nothing can report a
+        // failure after the rename has already landed (Codex #216
+        // r17 S3B-REL-1702).
+        var expected_wire: std.ArrayList(u8) = .empty;
+        defer expected_wire.deinit(self.allocator);
+        try appendXmlEscaped(self.allocator, &expected_wire, new_name);
+
         // B2 iter-er-5 lift (rename_sheet axis): walk every cross-
         // sheet reference carrier and rewrite the renamed sheet's
         // qualifiers in place. Until iter-er-5, only formula cells
@@ -4930,17 +4943,14 @@ pub const Workbook = struct {
         try patchWorkbookXmlSheetName(self, sheet_idx, old_name_owned, new_name);
         try refreshWorkbookXmlView(self);
 
-        // Postcondition: the refreshed view SPELLS the new name. The
-        // view holds raw attribute bytes — a rename to `R&D` refreshes
-        // as `R&amp;D` — so the comparison decodes first; the old
-        // raw-vs-decoded compare asserted after every mutation had
-        // landed (Codex #216 r16 S3B-REL-1507).
+        // Postcondition: the refreshed view spells the canonical
+        // escaped carrier of the new name (`R&D` refreshes as
+        // `R&amp;D`) — raw bytes against the wire spelling built
+        // BEFORE mutation, no allocation and no fallible work after
+        // the rename has landed (Codex #216 r16 S3B-REL-1507, r17
+        // S3B-REL-1702).
         assert(sheet_idx < self.workbook.sheets.len);
-        if (std.debug.runtime_safety) {
-            const refreshed = try store_mod.decodeXmlEntities(self.allocator, self.workbook.sheets[sheet_idx].name);
-            defer self.allocator.free(refreshed);
-            assert(std.mem.eql(u8, refreshed, new_name));
-        }
+        assert(std.mem.eql(u8, self.workbook.sheets[sheet_idx].name, expected_wire.items));
     }
 
     /// Rename a column of the table whose `displayName` matches
@@ -16319,6 +16329,16 @@ test "renameSheet: entity-bearing names rename and collide by their MEANING (S3B
     // is spelled on the wire.
     try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "R&D"));
     try std.testing.expectError(error.SheetNameInUse, wb.renameSheet(1, "r&d"));
+
+    // An escape-heavy VALID name (26 scalars, 130 carrier bytes once
+    // escaped) renames in — and renames back OUT again: the old
+    // 128-byte stack copy refused the second rename (Codex #216 r17
+    // S3B-REL-1701).
+    const amps = "&&&&&&&&&&&&&&&&&&&&&&&&&&";
+    try wb.renameSheet(1, amps);
+    try wb.renameSheet(1, "Plain");
+    const part2 = (try wb.store.part("xl/workbook.xml")).?;
+    try std.testing.expect(std.mem.indexOf(u8, part2.bytes, "name=\"Plain\"") != null);
 }
 
 test "insertRow: spaced and single-quoted coordinates splice; a prefixed decoy does not (S3B-REL-1301)" {

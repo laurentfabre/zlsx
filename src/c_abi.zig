@@ -8302,8 +8302,10 @@ test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the 
         try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqual(plane_none, diag.plane);
     }
-    // A sheet name the workbook already holds past the rename's 128-byte
-    // internal bound: nothing the caller passes can fix it, -2.
+    // A stored name past the OLD internal 128-byte bound: that bound
+    // fell in #216 r17 — a valid escape-heavy name legitimately
+    // exceeds it — so the rename now ADMITS the oversized stored
+    // carrier and repairs it; validation applies to the NEW name.
     {
         const path = try writeS3aFixture(io, &tt, "s3a_longname.xlsx");
         defer alloc.free(path);
@@ -8312,9 +8314,7 @@ test "S3a: what the lazy reads raise crosses as the workbook's verdict, not the 
         defer zlsx_editor_close(ed);
         var diag = freshDiag();
         const nm = "Fine";
-        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_sheet(ed, 1, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
-        try std.testing.expectEqualStrings("InternalSheetNameTooLong", diagName(&diag));
-        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 1, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
     }
     // A worksheet part whose payload the store cannot materialise
     // (its CRC no longer matches): the archive opens, the lazy read
