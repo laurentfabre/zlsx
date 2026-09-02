@@ -20,6 +20,12 @@ Cell type mapping (``zlsx_cell_tag_t`` → Python):
     integer → int  (never rounded)
     number  → float
     boolean → bool
+
+A formula cell arrives as its cached value (``None`` when the file
+stores none) and an error cell (``#DIV/0!``, ``#N/A``, …) as the
+literal ``str``; the row iterator's :meth:`Rows.formula_strings`,
+:meth:`Rows.formula_refs` and :meth:`Rows.error_strings` tell them
+apart (libzlsx 0.9.0+).
 """
 
 from __future__ import annotations
@@ -1236,6 +1242,11 @@ class Rows:
             self._err,
             _ERR_BUF_LEN,
         )
+        if rc <= 0:
+            # No current row any more — the side-channel accessors
+            # (`style_indices`, `formula_strings`, …) answer for the
+            # row the last successful `next()` yielded, and only that.
+            self._current_len = 0
         if rc == 0:
             raise StopIteration
         if rc < 0:
@@ -1249,8 +1260,11 @@ class Rows:
         """Style index for each cell in the most recently yielded row.
         ``None`` when the source `<c>` had no ``s`` attribute (General
         format). Layout mirrors the last row returned by ``next()`` so
-        positional indexing matches. Raises :class:`RuntimeError` if
-        the loaded libzlsx predates the 0.2.6+ numFmt ABI."""
+        positional indexing matches; ``[]`` before the first row, after
+        a ``skip(n)`` with ``n >= 1`` (``skip(0)`` is a no-op) and once
+        ``next()`` has raised (there is no current row then). Raises
+        :class:`RuntimeError` if the loaded libzlsx predates the 0.2.6+
+        numFmt ABI."""
         if not self._handle:
             raise ZlsxError("Rows iterator is closed")
         if not _ffi._HAS_NUM_FMT:
@@ -1271,6 +1285,97 @@ class Rows:
                 out.append(None)
         return out
 
+    # ── S3b slice 11: the formula / error side channels ──────────────
+    #
+    # The reader keeps them beside the cells so the value list never
+    # changed shape: a formula cell's element is its cached value and
+    # an error cell's is the literal string. Each accessor mirrors
+    # `style_indices` — one list aligned to the last row `next()`
+    # yielded, empty before the first row, after a `skip(n)` with
+    # `n >= 1` and once `next()` has raised.
+
+    def _require_rows_formulas(self) -> None:
+        if not self._handle:
+            raise ZlsxError("Rows iterator is closed")
+        if not _ffi._HAS_ROWS_FORMULAS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose the row formula / error "
+                "side channels (requires 0.9.0+); upgrade libzlsx"
+            )
+
+    def formula_strings(self) -> list[str | None]:
+        """Own formula text for each cell of the most recently yielded
+        row — the ``<f>`` body with XML entities decoded — for a
+        stand-alone formula, a shared-formula base or an array-formula
+        base; ``None`` for a value cell, an error cell, or a shared /
+        array slave (see :meth:`formula_refs`). The row's element at
+        the same index is the cached value (``None`` for a formula-only
+        cell). The ``formula`` field of ``zlsx cells``' ``t:"formula"``
+        records. Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[str | None] = []
+        ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        length = ctypes.c_size_t()
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_formula_at(
+                self._handle, col, ctypes.byref(ptr), ctypes.byref(length)
+            )
+            if rc == 0:
+                out.append(
+                    ""
+                    if length.value == 0
+                    else ctypes.string_at(ptr, length.value).decode("utf-8", errors="replace")
+                )
+            else:
+                out.append(None)
+        return out
+
+    def formula_refs(self) -> list[CellRef | None]:
+        """Base cell of each shared- or array-formula slave in the most
+        recently yielded row — a cell with no ``<f>`` body of its own
+        whose formula is the base's text — as a :class:`CellRef`
+        (``col`` 0-based, ``row`` 1-based); ``None`` elsewhere. Exactly
+        one of :meth:`formula_strings` and this is set for a formula
+        cell. The ``formula_ref`` field of ``zlsx cells``' ``t:"formula"``
+        records (as A1 there). Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[CellRef | None] = []
+        col_out = ctypes.c_uint32(0)
+        row_out = ctypes.c_uint32(0)
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_formula_ref_at(
+                self._handle, col, ctypes.byref(col_out), ctypes.byref(row_out)
+            )
+            out.append(CellRef(int(col_out.value), int(row_out.value)) if rc == 0 else None)
+        return out
+
+    def error_strings(self) -> list[str | None]:
+        """The Excel error literal (``"#DIV/0!"``, ``"#N/A"``, ``"#REF!"``,
+        ``"#VALUE!"``, ``"#NUM!"``, ``"#NAME?"``, ``"#NULL!"``,
+        ``"#GETTING_DATA"``) for each ``t="e"`` cell of the most
+        recently yielded row; ``None`` elsewhere — including a formula
+        cell whose cached value is an error, where the formula wins.
+        The row's element at the same index is the same literal as a
+        plain ``str``. The ``v`` of ``zlsx cells``' ``t:"error"``
+        records. Requires libzlsx 0.9.0+."""
+        self._require_rows_formulas()
+        out: list[str | None] = []
+        ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        length = ctypes.c_size_t()
+        for col in range(self._current_len):
+            rc = _ffi.lib.zlsx_rows_error_at(
+                self._handle, col, ctypes.byref(ptr), ctypes.byref(length)
+            )
+            if rc == 0:
+                out.append(
+                    ""
+                    if length.value == 0
+                    else ctypes.string_at(ptr, length.value).decode("utf-8", errors="replace")
+                )
+            else:
+                out.append(None)
+        return out
+
     def skip(self, n: int) -> int:
         """Advance past ``n`` rows without decoding their cells; returns
         how many were actually skipped (fewer than ``n`` only at end of
@@ -1285,6 +1390,11 @@ class Rows:
 
         Falls back to draining ``next()`` against a pre-0.8.0 libzlsx,
         so callers need no version check of their own.
+
+        Afterwards there is no current row: the side-channel accessors
+        (``style_indices``, ``parse_date``, ``formula_strings``, …)
+        answer ``[]`` / ``None`` until the next ``next()``. A
+        ``skip(0)`` is a no-op and keeps the row.
         """
         if n < 0:
             raise ValueError(f"skip count must be non-negative, got {n}")
@@ -1301,18 +1411,23 @@ class Rows:
                 except StopIteration:
                     break
                 skipped += 1
+            # The drained rows were never yielded to the caller: no
+            # current row, as on the library path (in-house r2
+            # S3B-REL-202).
+            self._current_len = 0
             return skipped
 
         out = ctypes.c_size_t(0)
         rc = _ffi.lib.zlsx_rows_skip(
             self._handle, n, ctypes.byref(out), self._err, _ERR_BUF_LEN
         )
+        # The previous row's cells are gone whether or not the skip
+        # landed (the library empties its view before it reads); keep
+        # the side-channel accessors from answering for a row that is
+        # no longer current — or, after a failure, for the torn one.
+        self._current_len = 0
         if rc != 0:
             raise ZlsxError(f"zlsx_rows_skip: {_decode_err(self._err)}")
-        # The previous row's cells are gone; keep the side-channel
-        # accessors (style_indices / parse_date) from reading a stale
-        # length into a cleared buffer.
-        self._current_len = 0
         return int(out.value)
 
     def parse_date(self, col_idx: int) -> "datetime.datetime | None":
@@ -1333,6 +1448,11 @@ class Rows:
                 "loaded libzlsx does not expose rows_parse_date "
                 "(requires 0.2.6+); upgrade libzlsx"
             )
+        # Bound on the current row here, before the index narrows to
+        # c_size_t: the library answers for the row the last `next()`
+        # yielded and nothing else, and a negative index would wrap.
+        if col_idx < 0 or col_idx >= self._current_len:
+            return None
         dt = _ffi.CDateTime()
         rc = _ffi.lib.zlsx_rows_parse_date(
             self._handle, col_idx, ctypes.byref(dt)

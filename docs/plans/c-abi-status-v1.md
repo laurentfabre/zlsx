@@ -978,3 +978,128 @@ with the library version (a ≥ 0.9 dylib without the export fails, not
 skips), and — where a CLI build sits beside the dylib (locally, and CI's
 windows-runtime lane as `zlsx.exe`) — `zlsx list-sheets`'s `state` equal
 to `Book.sheet_state` sheet for sheet.
+
+## 17. S3b slice 11 — formula text and error tags on the row iterator (2026-09-03)
+
+Three exports on the ROWS handle, beside `zlsx_rows_style_at`. The row's
+Zig surface is the reader's three per-row side channels
+(`Rows.formulaStrings` / `Rows.formulaRefs` / `Rows.errorStrings`,
+`src/xlsx.zig`), which exist so the `Cell` union never grew a formula or
+an error arm: a formula cell's slot is its cached `<v>` value and an
+error cell's slot is the literal as a plain string. The C ABI mirrors
+that exactly — `zlsx_cell_t` and `zlsx_cell_tag_t` are untouched (an
+added `ZLSX_CELL_ERROR` tag would have turned every shipped caller's
+error literal into "unknown tag": py-zlsx's `_cell_to_py` folds an
+unknown tag to `None`) — and hands the channels over as per-column
+getters with `zlsx_rows_style_at`'s contract. One macro, one probe, no
+release function, no `zlsx_status_v1`:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_rows_formula_at(rows, col_idx, out_ptr, out_len) → int32_t` | `_HAS_ROWS_FORMULAS` | `ZLSX_HAS_ROWS_FORMULAS` |
+| `zlsx_rows_formula_ref_at(rows, col_idx, out_col, out_row) → int32_t` | (same) | (same) |
+| `zlsx_rows_error_at(rows, col_idx, out_ptr, out_len) → int32_t` | (same) | (same) |
+
+**The contract is `zlsx_rows_style_at`'s**: `0` and the out params
+written when column `col_idx` of the current row is that kind of cell;
+`1` when it is not (the out params untouched); `-1` when `col_idx` is out
+of range for the current row. "The current row" is the one the last
+`zlsx_rows_next` returned `1` for — before the first call, after a `0`
+(end of sheet) or a `-1` (parse error), and after a non-zero
+`zlsx_rows_skip` whether it returned `0` or `-1`, there is none and
+every per-column getter on the handle answers `-1` (`zlsx_rows_style_at`
+and `zlsx_rows_parse_date` included); a zero-length skip is a no-op
+and keeps the row. The pointers have the cells' lifetime (until the
+next `zlsx_rows_next` / a `zlsx_rows_skip` of n >= 1 or a close);
+`out_col` is 0-based (A = 0) and `out_row` 1-based, the
+`zlsx_merge_range_t` convention.
+
+**The values are the CLI's**: `zlsx cells` prints `t:"formula"` with
+`formula` (the `<f>` body, entity-decoded — a stand-alone formula, a
+shared-formula base or an array-formula base) or `formula_ref` (a shared
+/ array slave's base cell) plus `cached` (the cell value), and
+`t:"error"` with `v` (the `t="e"` literal), from the same three fields
+the getters read. Exactly one of `zlsx_rows_formula_at` and
+`zlsx_rows_formula_ref_at` returns `0` for a formula cell and
+`zlsx_rows_error_at` returns `1` for it — a formula whose cached value is
+an error literal is a formula (the reader clears the error slot when
+either formula slot is set: `consumeCell`, the CLI's precedence rule
+`formula > error > date > primitive`); for an error cell only
+`zlsx_rows_error_at` returns `0`; for a value cell — a gap included —
+all three return `1`. A slave whose base the reader never saw (an `si`
+with no base above it) reads as a value cell, the reader's rule. Python
+maps each getter to one list aligned to the row `next()` yielded:
+`Rows.formula_strings() -> list[str | None]`, `Rows.formula_refs() ->
+list[CellRef | None]`, `Rows.error_strings() -> list[str | None]`, each
+checking the closed-iterator `ZlsxError` before the dylib probe's
+`RuntimeError`; `Rows.__next__` now zeroes its current length on `0` /
+`-1` so the accessors (`style_indices` included) return `[]` past the
+end, as the C side answers `-1`.
+
+**Two siblings fixed on the way**: `zlsx_rows_style_at` and
+`zlsx_rows_parse_date` bounded `col_idx` on the reader's parallel lists,
+which a fast-path `zlsx_rows_skip` never clears — after a skip they
+served the last decoded row's style / date for a row the caller never
+saw (py-zlsx shielded `style_indices` by zeroing its length on a
+successful `skip`; `parse_date` passed the index straight through). All
+five getters now bound on the C-side view, which `zlsx_rows_next`
+empties on `0` / `-1` and `zlsx_rows_skip` empties BEFORE it reads (a
+skip that fails on the spreads path has already reset the reader's
+lists and left them partially refilled from the torn row — in-house r1
+S3B-REL-101/102 — so a view kept across the `-1` bounded the getters on
+the old row over the torn one); `Rows.skip` zeroes its length before it
+raises — on its pre-0.8.0 drain fallback too (in-house r2 S3B-REL-202)
+— and `Rows.parse_date` bounds on it before the index narrows. A
+zero-length skip is the no-op the contract reads as on both surfaces:
+no `zlsx_rows_next` is stood in for, so the current row stays current —
+the four header sentences that state the rule (`zlsx_rows_next`,
+`zlsx_rows_skip`, the getters' block, `zlsx_rows_parse_date`) and the
+binding's docstrings each carry the `n >= 1` qualifier or name the
+`n == 0` no-op (in-house r3 S3B-DOC-301).
+The only observable change to the two siblings is `-1` / `None` where
+they used to answer for a row that was not current.
+
+**Not a `zlsx_status_v1` export, deliberately**: nothing here can refuse
+— the reader decided the fields while yielding the row, and a getter on
+a live iterator has no failure the caller did not cause. The §10
+vocabulary is untouched; no refusal name, no `-2`. Not on the bulk
+matrix path either: `zlsx_matrix_data` / `Sheet.read_all` stay
+values-only, as `Book.materialiseSheet` is.
+
+**Tests** (`src/c_abi.zig`, "S3b rows formulas …" ×5): a writer fixture
+with rows 2–6 spliced into the sheet part through the archive (the
+writer authors neither shared formulas nor `t="e"` cells) — a
+stand-alone formula, an entity-bearing body (`"x"&amp;"y"&lt;&gt;A1` →
+`"x"&"y"<>A1`), a formula-only cell (`ZLSX_CELL_EMPTY` + text), a shared
+base and its slave (`(0, 3)`), a `t="e"` literal, a formula whose cached
+value is `#DIV/0!` (formula wins, the cell a string), an array base and
+the slave inside its rectangle (`(0, 4)`), a gap before an error cell,
+an empty `<f></f>` (own text of length 0 behind a written pointer), a
+slave whose base was never seen (a value cell), a `t="dataTable"` body
+— probed with sentinels in every out param, the pointers compared by
+identity, so a `1` / `-1` that wrote anything is caught on every cell
+kind (in-house r1 S3B-MNT-105/106); no current row before the first
+`next`, past each row's end, at `maxInt(usize)`, past the end of the
+sheet, after a skip, after a skip that FAILS on a torn row and after a
+`zlsx_rows_next` that fails on it directly — the `-1` half of the rule
+on both surfaces (in-house r3 S3B-MNT-303) — (one `expectNoRowAt` per
+site: the trio, the style getter and the date
+getter agreeing, the reader's lists shown to hold the torn row's
+remains); the date getter through a fast-path skip over a dated row
+(the reader's `row_cells` still two wide — row 1 — while nothing is
+current) and a zero-length skip keeping the row current; the buffer
+opener reading the same fields; a fresh writer's cells answering `1`
+everywhere. `tests/c_abi_smoke.c`
+`#error`s without the macro and takes the three addresses. Python
+(`test_basic.py`, "rows_formula" / "parse_date_answers"): the six rows'
+four lists, the empty lists before the first row / past the end / after
+`skip` / after a failed `skip` (`parse_date` `None` at each),
+`read_all` unchanged, the closed-iterator error on each accessor,
+`open_bytes` parity, a fresh writer's row, the older-dylib
+`RuntimeError` after the closed check, a probe that must agree with the
+library version, `parse_date` through a fast-path skip and a
+zero-length skip, the pre-0.8.0 drain fallback (`_HAS_ROWS_SKIP` forced
+off) leaving no current row, and — where a CLI build sits beside the
+dylib — `zlsx cells --include-blanks`'s `t` /
+`formula` / `formula_ref` / `v` / `cached` equal to the accessors and
+the row values cell for cell (ten formula cells, three error cells).

@@ -59,6 +59,9 @@
 #if !defined(ZLSX_HAS_SHEET_STATE)
 #error "ZLSX_HAS_SHEET_STATE missing"
 #endif
+#if !defined(ZLSX_HAS_ROWS_FORMULAS)
+#error "ZLSX_HAS_ROWS_FORMULAS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -135,3 +138,12 @@ static const void *const s3b10_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3b10(void);
 const void *zlsx_c_abi_smoke_anchor_s3b10(void) { return s3b10_exports[0]; }
+
+/* S3b slice 11: formula text and error tags on the row iterator. */
+static const void *const s3b11_exports[] = {
+    (const void *)&zlsx_rows_formula_at,
+    (const void *)&zlsx_rows_formula_ref_at,
+    (const void *)&zlsx_rows_error_at,
+};
+const void *zlsx_c_abi_smoke_anchor_s3b11(void);
+const void *zlsx_c_abi_smoke_anchor_s3b11(void) { return s3b11_exports[0]; }

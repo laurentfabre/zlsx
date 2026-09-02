@@ -189,6 +189,41 @@ if _HAS_ROWS_SKIP:
     ]
     lib.zlsx_rows_skip.restype = ctypes.c_int32
 
+# S3b slice 11 (0.9.0+): the row iterator's formula / error side
+# channels — own formula text, the shared / array base ref of a slave,
+# the `t="e"` literal — as per-column getters with zlsx_rows_style_at's
+# 0 / 1 / -1 contract. One probe for the trio (they ship together);
+# `Rows.formula_strings` / `formula_refs` / `error_strings` raise
+# RuntimeError without it. `zlsx_cell_t` is untouched: the row lists
+# still carry the cached value and the error literal as before.
+_HAS_ROWS_FORMULAS = (
+    hasattr(lib, "zlsx_rows_formula_at")
+    and hasattr(lib, "zlsx_rows_formula_ref_at")
+    and hasattr(lib, "zlsx_rows_error_at")
+)
+if _HAS_ROWS_FORMULAS:
+    lib.zlsx_rows_formula_at.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_rows_formula_at.restype = ctypes.c_int32
+    lib.zlsx_rows_formula_ref_at.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.zlsx_rows_formula_ref_at.restype = ctypes.c_int32
+    lib.zlsx_rows_error_at.argtypes = [
+        rows_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.zlsx_rows_error_at.restype = ctypes.c_int32
+
 # ─── Matrix exports (v0.2.8+, bulk-FFI for sheet-at-a-time reads) ─────
 
 _HAS_MATRIX = hasattr(lib, "zlsx_matrix_open")

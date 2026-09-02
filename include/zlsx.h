@@ -479,6 +479,12 @@ void zlsx_rows_close(zlsx_rows_t * rows);
  *        lifetime — copy them if you need to outlive the row.
  *    0 → end of sheet.
  *   -1 → parse error; if err_buf is non-NULL, writes a diagnostic.
+ * The row yielded by the last 1 is "the current row" for every
+ * per-column getter on the handle (zlsx_rows_style_at(),
+ * zlsx_rows_parse_date() and the formula / error getters); after a 0
+ * or a -1, and after a zlsx_rows_skip() of n >= 1 whether it returned
+ * 0 or -1, there is none and every getter returns -1 (a zero-length
+ * skip is a no-op and keeps the row).
  */
 int32_t zlsx_rows_next(zlsx_rows_t         * rows,
                        const zlsx_cell_t ** out_cells,
@@ -499,7 +505,9 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
  * rows belonging to earlier partitions.
  *
  * Invalidates the cells of the most recently yielded row, exactly as
- * zlsx_rows_next() does.
+ * zlsx_rows_next() does — on -1 as well as on 0: there is no current
+ * row afterwards either way. A zero-length skip (n == 0) is a no-op:
+ * it writes 0 to *out_skipped and leaves the current row current.
  */
 int32_t zlsx_rows_skip(zlsx_rows_t * rows,
                        size_t        n,
@@ -517,6 +525,71 @@ int32_t zlsx_rows_skip(zlsx_rows_t * rows,
 int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
                            size_t        col_idx,
                            uint32_t    * out_style_idx);
+
+/*
+ * Formula text and error tags (S3b slice 11, 0.9.0+; probe:
+ * ZLSX_HAS_ROWS_FORMULAS). The reader keeps three per-row side
+ * channels beside the cells, so zlsx_cell_t and its tags are
+ * untouched: a formula cell's zlsx_cell_t is its cached <v> value
+ * (ZLSX_CELL_EMPTY for a formula-only cell) and an error cell's is
+ * an ordinary ZLSX_CELL_STRING holding the literal — exactly what
+ * every caller saw before. The three getters share
+ * zlsx_rows_style_at's contract: 0 and the out params written when
+ * the cell is that kind of cell; 1 when it is not (the out params
+ * untouched); -1 when `col_idx` is out of range for the current row
+ * — before the first zlsx_rows_next(), after its 0 / -1, after a
+ * zlsx_rows_skip() of n >= 1, or past the row's end. Pointers are
+ * valid until the next zlsx_rows_next() / a zlsx_rows_skip() of
+ * n >= 1 or a close, the cells' own lifetime. For a formula cell
+ * exactly one of zlsx_rows_formula_at()
+ * and zlsx_rows_formula_ref_at() returns 0 and zlsx_rows_error_at()
+ * returns 1 — a formula whose cached value is an error literal is a
+ * formula (the CLI's `t:"formula"` with `cached:"#DIV/0!"`); for an
+ * error cell only zlsx_rows_error_at() returns 0; for a value cell
+ * all three return 1. The same rule `zlsx cells` prints as
+ * `t:"formula"` (`formula` / `formula_ref` / `cached`) and
+ * `t:"error"` (`v`), from the same fields.
+ */
+
+/*
+ * Own formula text of column `col_idx` of the most recently yielded
+ * row: the <f> body with XML entities decoded — a stand-alone
+ * formula, a shared-formula base or an array-formula base. 1 for a
+ * value cell, an error cell, or a shared / array slave (see
+ * zlsx_rows_formula_ref_at()). An empty <f></f> returns 0 with
+ * `*out_len = 0`.
+ */
+int32_t zlsx_rows_formula_at(zlsx_rows_t   *   rows,
+                             size_t            col_idx,
+                             const uint8_t * * out_ptr,
+                             size_t *          out_len);
+
+/*
+ * Base cell of the shared- or array-formula slave at column
+ * `col_idx` of the most recently yielded row — a cell with no <f>
+ * body of its own (`<f t="shared" si="N"/>`, or a cell inside an
+ * earlier `<f t="array" ref="…">` rectangle) whose formula is the
+ * base's text. `*out_col` is 0-based (A = 0), `*out_row` 1-based —
+ * the zlsx_merge_range_t convention. 1 when the cell is not a
+ * slave; a slave whose base the reader never saw (an `si` with no
+ * base above it in the sheet) reads as a value cell.
+ */
+int32_t zlsx_rows_formula_ref_at(zlsx_rows_t * rows,
+                                 size_t        col_idx,
+                                 uint32_t    * out_col,
+                                 uint32_t    * out_row);
+
+/*
+ * Error literal of column `col_idx` of the most recently yielded
+ * row: the <v> body of a `t="e"` cell (`#DIV/0!`, `#N/A`, `#REF!`,
+ * `#VALUE!`, `#NUM!`, `#NAME?`, `#NULL!`, `#GETTING_DATA`) — the
+ * bytes the cell array hands over as a ZLSX_CELL_STRING. 1 when the
+ * cell is not an error cell, a formula with a cached error included.
+ */
+int32_t zlsx_rows_error_at(zlsx_rows_t   *   rows,
+                           size_t            col_idx,
+                           const uint8_t * * out_ptr,
+                           size_t *          out_len);
 
 /*
  * Bulk-FFI matrix surface (v0.2.8+). One zlsx_matrix_open() drains the
@@ -572,7 +645,9 @@ typedef struct {
  * Tri-state:
  *    0 → `*out` populated with the decoded DateTime
  *    1 → not a date (wrong type / non-date numFmt / out-of-range serial)
- *   -1 → `col_idx` is past the row width
+ *   -1 → `col_idx` is past the row width, or there is no current row
+ *        (before the first zlsx_rows_next(), after its 0 / -1, after
+ *        a zlsx_rows_skip() of n >= 1) — `*out` untouched
  *
  * Combines the existing `zlsx_rows_style_at` + `zlsx_is_date_format`
  * + `xlsx.fromExcelSerial` chain into one call.
@@ -2005,6 +2080,7 @@ int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
 #define ZLSX_HAS_ANCHORS          1   /* editor anchors_ndjson */
 #define ZLSX_HAS_SHEET_PROPS      1   /* editor sheet_props_ndjson + calc_props_ndjson */
 #define ZLSX_HAS_SHEET_STATE      1   /* reader sheet_state (S3b slice 10) */
+#define ZLSX_HAS_ROWS_FORMULAS    1   /* reader rows_formula_at + rows_formula_ref_at + rows_error_at (S3b slice 11) */
 
 
 #ifdef __cplusplus
