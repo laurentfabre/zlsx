@@ -550,11 +550,13 @@ class Book:
                 "upgrade libzlsx"
             )
         code = _ffi.lib.zlsx_sheet_state(self._handle, idx)
-        if code < 0:
-            # Unreachable through `_sheet_index`'s bound unless `sheets`
-            # was mutated behind the binding; keep the selector contract
-            # even then. That bound is the only guard: ctypes wraps a
-            # negative int silently under a `c_uint32` argtype.
+        if code == -1:
+            # The export's one out-of-range code — unreachable through
+            # `_sheet_index`'s bound unless `sheets` was mutated behind the
+            # binding; keep the selector contract even then. That bound is
+            # the only guard: ctypes wraps a negative int silently under a
+            # `c_uint32` argtype. Any other unknown code falls through to
+            # the "newer library" error below.
             raise IndexError(
                 f"sheet index {idx} out of range (libzlsx reports {code})"
             )

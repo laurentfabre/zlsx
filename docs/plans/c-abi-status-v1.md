@@ -959,10 +959,22 @@ attribute) reads 0 / 1 / 2 / 0 through the path opener and the buffer
 opener, `-1` at the first index past the end and at `UINT32_MAX`, the
 veryHidden sheet found by name, its name intact, its one row read
 through `zlsx_rows_open` / `zlsx_rows_next`, and the count unchanged;
-a fresh writer's sheets read visible. `tests/c_abi_smoke.c`
+a fresh writer's sheets read visible. Since the review (in-house r1,
+S3B-MNT-101): the codes test also pins `@intFromEnum(xlsx.SheetState.*)`
+= 0 / 1 / 2 and `SheetState.toString()` = the three spellings — the
+strings py-zlsx maps the codes back to — under the hard `zig build test`
+gate, a `src/cli.zig` test pins `list-sheets`' literal `"state"`
+strings on the same hidden / veryHidden / bogus fixture, and
+`src/xlsx.zig` pins `SheetState.parse`'s fold at its source; CI's only
+pytest lane (windows-runtime) is best-effort. `tests/c_abi_smoke.c`
 `#error`s without the macro, static-asserts the three codes and takes
 the address. Python (`test_basic.py`, "sheet_state"): the spellings by
 index and by name, `Sheet.state`, the selector errors, the closed-book
-error on both, `open_bytes` parity, the fresh-writer default, and —
-where a local CLI build sits beside the dylib — `zlsx list-sheets`'s
-`state` equal to `Book.sheet_state` sheet for sheet.
+error on both, `open_bytes` parity, the fresh-writer default, the two
+defensive branches (an unknown code → `ZlsxError`, `-1` after a resolved
+index → `IndexError`, an older dylib → `RuntimeError` on the method and
+the property, the selector errors still first), a probe that must agree
+with the library version (a ≥ 0.9 dylib without the export fails, not
+skips), and — where a CLI build sits beside the dylib (locally, and CI's
+windows-runtime lane as `zlsx.exe`) — `zlsx list-sheets`'s `state` equal
+to `Book.sheet_state` sheet for sheet.

@@ -271,6 +271,20 @@ pub const SheetState = enum {
     }
 };
 
+test "SheetState.parse: the three spellings, and the schema default for anything else" {
+    try std.testing.expectEqual(SheetState.visible, SheetState.parse("visible"));
+    try std.testing.expectEqual(SheetState.hidden, SheetState.parse("hidden"));
+    try std.testing.expectEqual(SheetState.very_hidden, SheetState.parse("veryHidden"));
+    // Compared as written: a different case, an entity spelling or an
+    // empty value is unrecognised and folds to visible — the rule every
+    // surface (CLI `list-sheets`, `zlsx_sheet_state`, `Book.sheet_state`)
+    // inherits from this one function.
+    try std.testing.expectEqual(SheetState.visible, SheetState.parse("Hidden"));
+    try std.testing.expectEqual(SheetState.visible, SheetState.parse("very&#72;idden"));
+    try std.testing.expectEqual(SheetState.visible, SheetState.parse(""));
+    try std.testing.expectEqualStrings("veryHidden", SheetState.parse("veryHidden").toString());
+}
+
 /// A1-style cell reference broken into components. Column is 0-based
 /// (A=0, B=1, …, XFD=16383); row is 1-based to match Excel's native
 /// convention (row 1 is the first row). Matches the axis layout used
