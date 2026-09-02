@@ -321,9 +321,10 @@ pub const ParseError = error{
 /// Parse one `xl/worksheets/sheet*.xml` part into a typed overlay.
 ///
 /// The returned `SheetXml` borrows every textual field from an
-/// arena-owned, comment/CDATA/PI-stripped copy of `xml`. The caller
-/// does NOT need to keep the original `xml` alive after `parse`
-/// returns. The `SheetXml` owns one arena (the sanitized buffer +
+/// arena-owned copy of `xml` with comments, CDATA, PIs and
+/// declarations (`<!DOCTYPE …>`, internal subset included) stripped.
+/// The caller does NOT need to keep the original `xml` alive after
+/// `parse` returns. The `SheetXml` owns one arena (the sanitized buffer +
 /// slice spines); call `deinit` on success or error to reclaim it.
 ///
 /// The one-time sanitizer pass is a perf bound: per-tag in-comment
@@ -394,8 +395,10 @@ fn parseInner(allocator: std.mem.Allocator, xml: []const u8, mapped: bool) Parse
 }
 
 /// Produces a copy of `xml` with comments (`<!-- ... -->`), CDATA
-/// (`<![CDATA[ ... ]]>`), and processing instructions (`<? ... ?>`)
-/// elided. CDATA contents are CHARACTER DATA and are entity-escaped
+/// (`<![CDATA[ ... ]]>`), processing instructions (`<? ... ?>`) and
+/// declarations (`<!DOCTYPE …>` with its internal subset — Codex
+/// #216 r5 S3B-REL-903: DTD prose is not markup and must never be
+/// inventoried) elided. CDATA contents are CHARACTER DATA and are entity-escaped
 /// into the copy so a `<![CDATA[<row/>]]>` payload can never be
 /// misread as a real element — the verbatim copy this doc always
 /// promised to prevent actually allowed it (Codex #188 r7). Returns

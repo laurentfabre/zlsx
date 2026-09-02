@@ -5830,31 +5830,30 @@ pub const Workbook = struct {
     /// Insert a blank row at position `before_row` (1-based) in
     /// sheet `sheet_idx`. Every existing row at or below `before_row`
     /// shifts down by 1.  Mutates the workbook's PartStore in
-    /// place: the sheet part is re-emitted with `<row r=>` /
-    /// `<c r="…">` / `<mergeCells>` / `<dimension>` shifted by
-    /// one row.
+    /// place: the sheet part is re-emitted with the coordinate
+    /// carriers shifted (rows, cells, merges, dimension, panes,
+    /// autoFilter, view/sort state, DV/CF `sqref` envelopes,
+    /// `<xm:sqref>`), and the workbook-wide sweeps then move what
+    /// the byte transform cannot: formulas in every dialect, defined
+    /// names, hyperlink locations, DV/CF formula bodies (all three
+    /// CF slots), `<xm:f>` extension formulas, tables, drawings,
+    /// comments, pivot locations and sources.
     ///
     /// **Refusal contract.** Refuses with
     /// `error.RowEditRequiresCleanSheet` if the sheet has any
     /// staged appendRows or setCell deltas — those deltas index
-    /// into the pre-shift refs and would produce stale output.
-    ///
-    /// **Cross-sheet rewrite.** Cross-sheet formula refs / defined
-    /// names / hyperlinks / DV-CF formulas are NOT yet rewritten
-    /// for row inserts. Sheets that carry those constructs anywhere
-    /// in the workbook are refused at the editor layer
-    /// (`Editor.insertRow`); the iter-er-5 row/col-axis lifts
-    /// (blocked on this PR's typed surface, plus the
-    /// rewriter-call wiring) are tracked in
-    /// `docs/plans/refusal-audit.md`.
+    /// into the pre-shift refs and would produce stale output — and
+    /// pre-mutation with the transform's and sweeps' own typed
+    /// verdicts (`docs/plans/c-abi-status-v1.md` §10) when a carrier
+    /// cannot be read or moved whole.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }
 
     /// Delete row `row` (1-based) in sheet `sheet_idx`. Every row
     /// > `row` shifts up by 1; cells in the deleted row are
-    /// dropped. Same refusal contract + cross-sheet-rewrite
-    /// limitations as `insertRow`.
+    /// dropped. Same carrier coverage and refusal contract as
+    /// `insertRow`.
     pub fn deleteRow(self: *Workbook, sheet_idx: u32, row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = row, .kind = .delete }, null);
     }

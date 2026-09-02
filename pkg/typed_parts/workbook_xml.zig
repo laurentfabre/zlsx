@@ -860,6 +860,25 @@ test "parse: skips comments, CDATA, and processing instructions" {
     try std.testing.expectEqualStrings("WithCdata", wb.defined_names[0].name);
 }
 
+test "skipNonElement: declarations scan structurally — subsets, conditional sections, quotes (S3B-TEST-906)" {
+    // Without subset-depth tracking the scan stops at the `>` of the
+    // inner `<!ELEMENT …>` declaration, mid-subset.
+    const dtd = "<!DOCTYPE ws [<!ELEMENT a (b)>]><x/>";
+    try std.testing.expectEqual(dtd.len - "<x/>".len, try skipNonElement(dtd, 0));
+    // A subset comment carrying `] >` closes neither the subset nor
+    // the declaration.
+    const cmt = "<!DOCTYPE ws [<!-- ] > -->]><y/>";
+    try std.testing.expectEqual(cmt.len - "<y/>".len, try skipNonElement(cmt, 0));
+    // A conditional section's brackets balance through `]]>`.
+    const inc = "<![INCLUDE[<x>]]><z/>";
+    try std.testing.expectEqual(inc.len - "<z/>".len, try skipNonElement(inc, 0));
+    // A quoted `>` is data.
+    const q = "<!DOCTYPE a SYSTEM \"b>c\"><w/>";
+    try std.testing.expectEqual(q.len - "<w/>".len, try skipNonElement(q, 0));
+    // An unterminated quote is an error, never a scan past the end.
+    try std.testing.expectError(error.MalformedXml, skipNonElement("<!DOCTYPE a \"unclosed", 0));
+}
+
 test "parse: handles attribute values containing '>'" {
     // Quoted attribute values may contain `>` legally. The scanner
     // must not stop at the bare `>` inside the quotes.

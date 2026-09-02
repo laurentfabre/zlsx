@@ -2866,6 +2866,26 @@ test "shiftSqrefArea boundary table: reversed corners, dangling anchors, maximal
     try testing.expect((try shiftSqrefArea("C3", .col, 3, .delete, &buf)) == null);
 }
 
+test "an unterminated construct swallows the suffix in one step; nothing after it dispatches (S3B-PERF-902)" {
+    const a = testing.allocator;
+    // The mergeCell AFTER the unterminated opener is prose-in-limbo:
+    // emitted verbatim, never dispatched. The one-byte-retry
+    // alternative walked into it and shifted it — this pin fails
+    // under that revert.
+    const src = try wrapSheet(a, "<mergeCell ref=\"B2:B4\"/><!-- unterminated <mergeCell ref=\"C2:C4\"/>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ref=\"B3:B5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<!-- unterminated <mergeCell ref=\"C2:C4\"/>") != null);
+
+    // At offset zero, on the column walker: input comes back whole.
+    const bare = "<?pi with no end";
+    const bout = try applyColEditToWorksheet(a, bare, 1, .insert);
+    defer a.free(bout);
+    try testing.expectEqualStrings(bare, bout);
+}
+
 test "non-elements pass through verbatim: a decoy tag inside a comment is prose (S3B-REL-804)" {
     const a = testing.allocator;
     // The comment carries a garbage sqref AND a shiftable mergeCell —
