@@ -3247,6 +3247,38 @@ test "collect: fixture rules attributed in sheet then document order, entities d
     try testing.expectEqual(@as(?u32, 1), report.priority);
 }
 
+test "collect: repeated reads leave the store's resident bytes flat (S3B-MEM-603)" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "cf_retention.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path);
+
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    // Prime every store-side cache (part bytes, rels) so the loop
+    // below measures only what a repeated read RETAINS.
+    {
+        var primed = try collect(testing.allocator, &wb);
+        primed.deinit();
+    }
+    const before = wb.store.residentBytes();
+    // 1024 reads resolve ~2 sheet targets each; through the store's
+    // lifetime arena that is ~50 KiB of growth — far past any chunk
+    // slack — so this pins that resolution lands in the VIEW's arena
+    // (`resolveOwned`), reclaimed at deinit, and a revert to
+    // `store.resolve` fails here even though the OOM sweep cannot see
+    // the store's own allocator.
+    for (0..1024) |_| {
+        var view = try collect(testing.allocator, &wb);
+        view.deinit();
+    }
+    try testing.expectEqual(before, wb.store.residentBytes());
+}
+
 test "collect: allocation failures surface as OutOfMemory, never a partial view" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();

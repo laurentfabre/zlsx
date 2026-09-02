@@ -603,10 +603,15 @@ S3a. `collect`'s error surface is the closed, compiler-checked
 `CollectError`: those two plus `OutOfMemory` (`-3`),
 `MissingSheetPart` (`-2`, typed but unreachable once the graph probe
 holds), and `ZipBombSuspected` — the S1 decompression-caps verdict,
-which round 1 (S3B-ERR-601) added to `structural_refusals` so it
-crosses `-2` with its name in the diag on EVERY editor read that
-materialises parts (pivots and defined-names included), not as a
-generic `-1`. No new name crosses.
+typed in the set for honesty but effectively open-time: the caps
+admit every entry on the open-time directory walk (`src/cli.zig`,
+`classifyTopLevelError`), so it fires where the ABI has no diag to
+carry it — the pointer-returning path open and `zlsx_open_buffer`,
+whose shipped contract is `-1`. Round 1 (S3B-ERR-601) remapped it to
+`-2`; round 2 (S3B-ERR-702) ruled that an ABI break on the diag-less
+opener and reverted it — it stays a DELIBERATE generic `-1` with its
+name in errbuf, pinned by a `statusOf` test, until a status-bearing
+open ABI exists. No new name crosses.
 
 **Timing**: conditional formats live in the sheet parts, which
 structural edits and their DV/CF sweeps rewrite in place before the
@@ -642,7 +647,8 @@ formula body with nothing handed out and the name in diag + errbuf;
 the whole-refusal pins round 1 added (S3B-TEST-605): a broken SECOND
 sheet behind four servable records refuses whole, a bad entity in a
 sheet-name carrier is `MalformedWorkbookXml`, a flipped payload byte
-folds at the graph probe, and `statusOf(ZipBombSuspected)` is `-2`;
+folds at the graph probe, and `statusOf(ZipBombSuspected)` is the
+deliberate `-1` (r2);
 an allocation-failure sweep over `conditionalFormatsNdjsonOwned`
 (caches primed first, the shared writer's own OOM-test shape); the
 sqref-shift unit tests in `pkg/sheet_edit.zig` (insert above / inside,

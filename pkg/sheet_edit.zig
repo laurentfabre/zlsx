@@ -770,12 +770,11 @@ fn formatColLetters(buf: *[8]u8, col_idx: u32) ![]const u8 {
 }
 
 /// Apply one row edit (insert or delete at `row`) to a worksheet
-/// XML buffer. iter-row-2/3 v1: rewrites `<row r=>` (renumber or
-/// drop), `<c r="A1">` row component, `<mergeCells>` rect bounds,
-/// and `<dimension>`. Other elements pass through verbatim — the
-/// caller's recordRowEdit guard refuses sheets that contain
-/// formulas / hyperlinks / validations / cond-formats / drawings,
-/// so we don't have to handle those here.
+/// XML buffer: `<row r=>` (renumber or drop), `<c r="A1">` row
+/// components, merge rects, `<dimension>`, panes, autoFilter, view
+/// state, sort state, DV/CF `sqref` envelopes and `<xm:sqref>`.
+/// Formula bodies, hyperlinks, drawings and tables move in their own
+/// workbook-layer sweeps around this transform.
 pub const RowEditKind = enum { insert, delete };
 
 pub fn applyRowEditToWorksheet(
@@ -1871,7 +1870,16 @@ fn processSqrefListTag(
         try out.appendSlice(allocator, src[t.start..t.after_open]);
         return;
     }
-    try writeWithReplacedAttr(allocator, out, src, t, open_name_len, "sqref", sq_out.items);
+    // The multi-attribute writer, not `writeWithReplacedAttr`: the
+    // substring writer matches `sqref="` anywhere in the tag, so a
+    // prefixed `x:sqref="…"` decoy earlier in the tag would take the
+    // splice while the real attribute stayed, and a single-quoted or
+    // `sqref = "…"` spelling `getAttr` reads would go unspliced while
+    // the formula sweep still moved the bodies (Codex #216 r2
+    // S3B-REL-701). This one matches the exact name and preserves the
+    // quote style and Eq spacing.
+    const subs = [_]AttrSub{.{ .name = "sqref", .new_value = sq_out.items }};
+    try writeWithReplacedAttrs(allocator, out, src, t, open_name_len, &subs);
 }
 
 /// Rewrite `<pivotSelection activeRow="11" activeCol="1" previousRow="11"
@@ -2570,6 +2578,34 @@ test "conditionalFormatting sqref shifts on the column axis too" {
     const dropped = try applyColEditToWorksheet(a, src, 4, .delete);
     defer a.free(dropped);
     try testing.expect(std.mem.indexOf(u8, dropped, "sqref=\"B1:B4\"") != null);
+}
+
+test "conditionalFormatting sqref splices by exact attribute name, either quote style (S3B-REL-701)" {
+    const a = testing.allocator;
+    // A prefixed `x:sqref` decoy BEFORE the real attribute: the
+    // substring writer matched `sqref="` inside it and overwrote the
+    // wrong value. The exact-name writer leaves it alone.
+    const src = try wrapSheet(a, "<conditionalFormatting x:sqref=\"Z9\" sqref=\"B1:B4\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "x:sqref=\"Z9\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " sqref=\"B2:B5\"") != null);
+
+    // Single quotes and Eq whitespace are legal XML `getAttr` reads —
+    // the writer must move what the reader read, or the envelope goes
+    // stale while the formula sweep moves the bodies.
+    const src2 = try wrapSheet(a, "<conditionalFormatting sqref='B1:B4'><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src2);
+    const out2 = try applyRowEditToWorksheet(a, src2, 1, .insert);
+    defer a.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "sqref='B2:B5'") != null);
+
+    const src3 = try wrapSheet(a, "<dataValidation type=\"list\" sqref = \"B1:B4\"><formula1>\"a\"</formula1></dataValidation>");
+    defer a.free(src3);
+    const out3 = try applyRowEditToWorksheet(a, src3, 1, .insert);
+    defer a.free(out3);
+    try testing.expect(std.mem.indexOf(u8, out3, "sqref = \"B2:B5\"") != null);
 }
 
 test "conditionalFormatting with an unshiftable area keeps the whole element" {

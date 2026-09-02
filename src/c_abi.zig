@@ -5956,13 +5956,16 @@ const structural_refusals = [_]anyerror{
     // path ever surface them unfolded.
     error.LastSheetUndeletable,
     error.SheetNameInUse,
-    // The archive-wide decompression caps (S1, `decompress_limits`) —
-    // a statement about the workbook's shape, not the machine, so it
-    // crosses typed like the other refusals rather than as a generic
-    // -1 with no diag (Codex #216 r1 S3B-ERR-601). Every editor read
-    // that materialises parts can raise it: pivots, defined-names,
-    // conditional-formats, the structural edits.
-    error.ZipBombSuspected,
+    // NOT here, deliberately: `error.ZipBombSuspected`. The S1 caps
+    // admit every entry on the open-time directory walk, so the
+    // verdict fires where the ABI has no diag to carry it — the
+    // pointer-returning path open, and `zlsx_open_buffer`, whose
+    // shipped contract is -1 (Codex #216 r2 S3B-ERR-702 ruled r1's
+    // -2 remap an ABI break; a typed open refusal needs a
+    // status-bearing open ABI, deferred). It stays a generic -1 with
+    // its name in errbuf on every path, the way the CLI keeps its
+    // exit-4 mapping as a defensive posture for a future path that
+    // decompresses without the walk.
 };
 
 fn isStructuralRefusal(e: anyerror) bool {
@@ -8407,9 +8410,12 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.InternalSheetNameTooLong));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedWorkbookXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.IdSpaceExhausted));
-    // The decompression-caps verdict crosses typed, not as generic -1
-    // (Codex #216 r1 S3B-ERR-601).
-    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.ZipBombSuspected));
+    // The decompression-caps verdict is a DELIBERATE -1: it fires at
+    // open, where the ABI has no diag — `zlsx_open_buffer`'s shipped
+    // contract — so remapping it to -2 was an ABI break (Codex #216
+    // r2 S3B-ERR-702, overruling r1 S3B-ERR-601's remap). The name
+    // still crosses in errbuf.
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.ZipBombSuspected));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableColumnNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidTableColumnName));

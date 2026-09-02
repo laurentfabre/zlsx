@@ -1886,9 +1886,9 @@ int32_t zlsx_editor_defined_names_ndjson(zlsx_editor_t * ed,
  * served faithfully refuses whole — a sheet list the strict workbook
  * read cannot prove (MalformedWorkbookXml) or a sheet part the strict
  * walk cannot (MalformedSheetXml), both ZLSX_REFUSED — rather than
- * hand over a record that lies; an archive past the decompression
- * caps is ZLSX_REFUSED as ZipBombSuspected. Release with
- * zlsx_buffer_release. */
+ * hand over a record that lies. (An archive past the decompression
+ * caps fails at open — the caps are checked on the open-time
+ * directory walk.) Release with zlsx_buffer_release. */
 int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
