@@ -1668,7 +1668,7 @@ pub const PartStore = struct {
         allocator: std.mem.Allocator,
         owner_part_name: []const u8,
         target: []const u8,
-    ) !?[]const u8 {
+    ) std.mem.Allocator.Error!?[]const u8 {
         return self.resolveInto(allocator, owner_part_name, target);
     }
 
@@ -1677,7 +1677,7 @@ pub const PartStore = struct {
         out_alloc: std.mem.Allocator,
         owner_part_name: []const u8,
         target: []const u8,
-    ) !?[]const u8 {
+    ) std.mem.Allocator.Error!?[]const u8 {
         if (target.len == 0) return null;
         if (looksExternal(target)) return null;
         // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".

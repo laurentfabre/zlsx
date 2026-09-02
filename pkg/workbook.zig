@@ -5849,7 +5849,8 @@ pub const Workbook = struct {
     /// their `docs/plans/c-abi-status-v1.md` §10 typed verdicts; a
     /// LATER sweep failure, once anything has installed, marks the
     /// workbook torn (`StructuralEditIncomplete` on every subsequent
-    /// edit or save) — discard and reopen rather than ship the tear.
+    /// STRUCTURAL edit or save) — discard and reopen rather than
+    /// ship the tear.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }
@@ -5864,9 +5865,8 @@ pub const Workbook = struct {
 
     /// Insert a blank column at position `before_col` (1-based, A=1)
     /// in sheet `sheet_idx`. Every existing column at or right of
-    /// `before_col` shifts right by 1. Same refusal contract as
-    /// `insertRow`; cross-sheet rewrite is the same iter-er-5
-    /// follow-up.
+    /// `before_col` shifts right by 1. Same carrier coverage and
+    /// refusal contract as `insertRow`.
     pub fn insertColumn(self: *Workbook, sheet_idx: u32, before_col_1based: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .col = before_col_1based, .kind = .insert }, null);
     }

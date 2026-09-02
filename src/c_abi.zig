@@ -6370,8 +6370,17 @@ export fn zlsx_editor_conditional_formats_ndjson(
     };
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
 
-    const bytes = conditionalFormatsNdjsonOwned(gpa, &state.inner.workbook) catch |e| {
-        return failMapped(e, diag, err_buf, err_buf_len);
+    // Exhaustive over the closed `CollectError` — no `else`, so a
+    // future member breaks this compile and forces a status decision
+    // instead of silently crossing as a generic -1 (Codex #216 r8
+    // S3B-MNT-911).
+    const bytes = conditionalFormatsNdjsonOwned(gpa, &state.inner.workbook) catch |e| switch (e) {
+        error.MalformedWorkbookXml,
+        error.MalformedSheetXml,
+        error.MissingSheetPart,
+        error.ZipBombSuspected,
+        error.OutOfMemory,
+        => return failMapped(e, diag, err_buf, err_buf_len),
     };
     if (bytes.len == 0) {
         gpa.free(bytes);
@@ -6388,7 +6397,7 @@ export fn zlsx_editor_conditional_formats_ndjson(
 /// writer reports a failed growth as `WriteFailed`; at this boundary
 /// that is an allocation failure and crosses as `-3`, the pivots
 /// builder's rule.
-fn conditionalFormatsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) ![]u8 {
+fn conditionalFormatsNdjsonOwned(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) zlsx_pkg.conditional_formats_ndjson.CollectError![]u8 {
     var view = try zlsx_pkg.conditional_formats_ndjson.collect(alloc, wb);
     defer view.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
