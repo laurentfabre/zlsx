@@ -538,9 +538,9 @@ int32_t zlsx_rows_style_at(zlsx_rows_t * rows,
  * the cell is that kind of cell; 1 when it is not (the out params
  * untouched); -1 when `col_idx` is out of range for the current row
  * — before the first zlsx_rows_next(), after its 0 / -1, after a
- * zlsx_rows_skip() of n >= 1, or past the row's end. Pointers are valid until the next
- * zlsx_rows_next() / zlsx_rows_skip() or a close, the cells' own
- * lifetime. For a formula cell exactly one of zlsx_rows_formula_at()
+ * zlsx_rows_skip() of n >= 1, or past the row's end. Pointers are
+ * valid until the next zlsx_rows_next() / a zlsx_rows_skip() of
+ * n >= 1 or a close, the cells' own lifetime. For a formula cell exactly one of zlsx_rows_formula_at()
  * and zlsx_rows_formula_ref_at() returns 0 and zlsx_rows_error_at()
  * returns 1 — a formula whose cached value is an error literal is a
  * formula (the CLI's `t:"formula"` with `cached:"#DIV/0!"`); for an

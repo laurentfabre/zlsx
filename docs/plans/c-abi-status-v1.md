@@ -979,7 +979,7 @@ skips), and — where a CLI build sits beside the dylib (locally, and CI's
 windows-runtime lane as `zlsx.exe`) — `zlsx list-sheets`'s `state` equal
 to `Book.sheet_state` sheet for sheet.
 
-## 17. S3b slice 11 — formula text and error tags on the row iterator (2026-09-02)
+## 17. S3b slice 11 — formula text and error tags on the row iterator (2026-09-03)
 
 Three exports on the ROWS handle, beside `zlsx_rows_style_at`. The row's
 Zig surface is the reader's three per-row side channels
@@ -1009,9 +1009,9 @@ of range for the current row. "The current row" is the one the last
 `zlsx_rows_skip` whether it returned `0` or `-1`, there is none and
 every per-column getter on the handle answers `-1` (`zlsx_rows_style_at`
 and `zlsx_rows_parse_date` included); a zero-length skip is a no-op
-and keeps the row. The pointers have the
-cells' lifetime (until the next `zlsx_rows_next` / `zlsx_rows_skip` or a
-close); `out_col` is 0-based (A = 0) and `out_row` 1-based, the
+and keeps the row. The pointers have the cells' lifetime (until the
+next `zlsx_rows_next` / a `zlsx_rows_skip` of n >= 1 or a close);
+`out_col` is 0-based (A = 0) and `out_row` 1-based, the
 `zlsx_merge_range_t` convention.
 
 **The values are the CLI's**: `zlsx cells` prints `t:"formula"` with
@@ -1054,8 +1054,8 @@ zero-length skip is the no-op the contract reads as on both surfaces:
 no `zlsx_rows_next` is stood in for, so the current row stays current —
 the four header sentences that state the rule (`zlsx_rows_next`,
 `zlsx_rows_skip`, the getters' block, `zlsx_rows_parse_date`) and the
-binding's docstrings all carry the `n >= 1` qualifier (in-house r3
-S3B-DOC-301).
+binding's docstrings each carry the `n >= 1` qualifier or name the
+`n == 0` no-op (in-house r3 S3B-DOC-301).
 The only observable change to the two siblings is `-1` / `None` where
 they used to answer for a row that was not current.
 

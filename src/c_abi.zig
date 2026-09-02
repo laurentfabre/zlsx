@@ -1060,7 +1060,7 @@ export fn zlsx_rows_style_at(
 /// shared-formula base or an array-formula base (the CLI's
 /// `t:"formula"` + `formula`). Returns 0 and writes `*out_ptr` /
 /// `*out_len` (the cells' lifetime: until the next `zlsx_rows_next` /
-/// `zlsx_rows_skip` or a close); 1 when the cell carries no `<f>` body
+/// a `zlsx_rows_skip` of n >= 1 or a close); 1 when the cell carries no `<f>` body
 /// of its own — a value cell, an error cell, or a shared / array slave
 /// (see `zlsx_rows_formula_ref_at`); -1 when `col_idx` is out of range
 /// for the current row. The out params are written only on 0.
@@ -9940,8 +9940,8 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     // — every getter on the handle agrees.
     try expectNoRowAt(rows.?, 0);
 
-    // Row 1 — the writer's value cell: every getter says 1; past the
-    // end of the row every getter says -1.
+    // Row 1 — the writer's value cell: the trio says 1; past the end
+    // of the row every getter on the handle says -1.
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 1), cells_len);
     try expectCellInt(cells_ptr[0], 1);
@@ -9988,7 +9988,7 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try S3b11Probe.at(rows.?, 2).expectError("#N/A");
     try expectNoRowAt(rows.?, 3);
 
-    // Row 5 — a gap cell is a value cell to every getter; the error
+    // Row 5 — a gap cell is a value cell to the trio; the error
     // literal keeps its bytes.
     try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try std.testing.expectEqual(@as(usize, 2), cells_len);

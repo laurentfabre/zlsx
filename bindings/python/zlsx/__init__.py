@@ -1262,8 +1262,9 @@ class Rows:
         format). Layout mirrors the last row returned by ``next()`` so
         positional indexing matches; ``[]`` before the first row, after
         a ``skip(n)`` with ``n >= 1`` (``skip(0)`` is a no-op) and once
-        ``next()`` has raised (there is no current row then). Raises :class:`RuntimeError` if the loaded libzlsx
-        predates the 0.2.6+ numFmt ABI."""
+        ``next()`` has raised (there is no current row then). Raises
+        :class:`RuntimeError` if the loaded libzlsx predates the 0.2.6+
+        numFmt ABI."""
         if not self._handle:
             raise ZlsxError("Rows iterator is closed")
         if not _ffi._HAS_NUM_FMT:
@@ -1389,6 +1390,11 @@ class Rows:
 
         Falls back to draining ``next()`` against a pre-0.8.0 libzlsx,
         so callers need no version check of their own.
+
+        Afterwards there is no current row: the side-channel accessors
+        (``style_indices``, ``parse_date``, ``formula_strings``, …)
+        answer ``[]`` / ``None`` until the next ``next()``. A
+        ``skip(0)`` is a no-op and keeps the row.
         """
         if n < 0:
             raise ValueError(f"skip count must be non-negative, got {n}")
