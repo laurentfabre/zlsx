@@ -1005,8 +1005,10 @@ written when column `col_idx` of the current row is that kind of cell;
 `1` when it is not (the out params untouched); `-1` when `col_idx` is out
 of range for the current row. "The current row" is the one the last
 `zlsx_rows_next` returned `1` for — before the first call, after a `0`
-(end of sheet) or a `-1` (parse error), and after `zlsx_rows_skip`,
-there is none and every getter answers `-1`. The pointers have the
+(end of sheet) or a `-1` (parse error), and after `zlsx_rows_skip`
+whether it returned `0` or `-1`, there is none and every per-column
+getter on the handle answers `-1` (`zlsx_rows_style_at` and
+`zlsx_rows_parse_date` included). The pointers have the
 cells' lifetime (until the next `zlsx_rows_next` / `zlsx_rows_skip` or a
 close); `out_col` is 0-based (A = 0) and `out_row` 1-based, the
 `zlsx_merge_range_t` convention.
@@ -1033,13 +1035,20 @@ checking the closed-iterator `ZlsxError` before the dylib probe's
 `-1` so the accessors (`style_indices` included) return `[]` past the
 end, as the C side answers `-1`.
 
-**A sibling fixed on the way**: `zlsx_rows_style_at` bounded `col_idx`
-on the reader's parallel list, which a fast-path `zlsx_rows_skip` never
-clears — after a skip it served the last decoded row's style for a row
-the caller never saw (py-zlsx was shielded by zeroing its length on
-`skip`). All four getters now bound on the C-side view, which
-`zlsx_rows_next` empties on `0` / `-1` and `zlsx_rows_skip` empties too;
-the only observable change to `zlsx_rows_style_at` is `-1` where it
+**Two siblings fixed on the way**: `zlsx_rows_style_at` and
+`zlsx_rows_parse_date` bounded `col_idx` on the reader's parallel lists,
+which a fast-path `zlsx_rows_skip` never clears — after a skip they
+served the last decoded row's style / date for a row the caller never
+saw (py-zlsx shielded `style_indices` by zeroing its length on a
+successful `skip`; `parse_date` passed the index straight through). All
+five getters now bound on the C-side view, which `zlsx_rows_next`
+empties on `0` / `-1` and `zlsx_rows_skip` empties BEFORE it reads (a
+skip that fails on the spreads path has already reset the reader's
+lists and left them partially refilled from the torn row — in-house r1
+S3B-REL-101/102 — so a view kept across the `-1` bounded the getters on
+the old row over the torn one); `Rows.skip` zeroes its length before it
+raises and `Rows.parse_date` bounds on it before the index narrows. The
+only observable change to the two siblings is `-1` / `None` where they
 used to answer for a row that was not current.
 
 **Not a `zlsx_status_v1` export, deliberately**: nothing here can refuse
@@ -1049,26 +1058,33 @@ vocabulary is untouched; no refusal name, no `-2`. Not on the bulk
 matrix path either: `zlsx_matrix_data` / `Sheet.read_all` stay
 values-only, as `Book.materialiseSheet` is.
 
-**Tests** (`src/c_abi.zig`, "S3b rows formulas …"): a writer fixture
-with rows 2–5 spliced into the sheet part through the archive (the
+**Tests** (`src/c_abi.zig`, "S3b rows formulas …" ×5): a writer fixture
+with rows 2–6 spliced into the sheet part through the archive (the
 writer authors neither shared formulas nor `t="e"` cells) — a
 stand-alone formula, an entity-bearing body (`"x"&amp;"y"&lt;&gt;A1` →
 `"x"&"y"<>A1`), a formula-only cell (`ZLSX_CELL_EMPTY` + text), a shared
 base and its slave (`(0, 3)`), a `t="e"` literal, a formula whose cached
 value is `#DIV/0!` (formula wins, the cell a string), an array base and
-the slave inside its rectangle (`(0, 4)`), a gap before an error cell —
-probed with sentinels in every out param so a `1` / `-1` that wrote
-anything is caught; no current row before the first `next`, past each
-row's end, at `maxInt(usize)`, past the end of the sheet and after a
-skip (the style getter agreeing at each); the buffer opener reading the
-same fields; a fresh writer's cells answering `1` everywhere.
-`tests/c_abi_smoke.c` `#error`s without the macro and takes the three
-addresses. Python (`test_basic.py`, "rows_formula"): the five rows'
+the slave inside its rectangle (`(0, 4)`), a gap before an error cell,
+an empty `<f></f>` (own text of length 0 behind a written pointer), a
+slave whose base was never seen (a value cell), a `t="dataTable"` body
+— probed with sentinels in every out param, the pointers compared by
+identity, so a `1` / `-1` that wrote anything is caught on every cell
+kind (in-house r1 S3B-MNT-105/106); no current row before the first
+`next`, past each row's end, at `maxInt(usize)`, past the end of the
+sheet, after a skip and after a skip that FAILS on a torn row (the
+style and date getters agreeing at each, the reader's lists shown to
+hold the torn row's remains); the date getter through a fast-path skip
+over a dated row; the buffer opener reading the same fields; a fresh
+writer's cells answering `1` everywhere. `tests/c_abi_smoke.c`
+`#error`s without the macro and takes the three addresses. Python
+(`test_basic.py`, "rows_formula" / "parse_date_answers"): the six rows'
 four lists, the empty lists before the first row / past the end / after
-`skip`, `read_all` unchanged, the closed-iterator error on each
-accessor, `open_bytes` parity, a fresh writer's row, the older-dylib
+`skip` / after a failed `skip` (`parse_date` `None` at each),
+`read_all` unchanged, the closed-iterator error on each accessor,
+`open_bytes` parity, a fresh writer's row, the older-dylib
 `RuntimeError` after the closed check, a probe that must agree with the
-library version, and — where a CLI build sits beside the dylib —
-`zlsx cells --include-blanks`'s `t` / `formula` / `formula_ref` / `v`
-equal to the accessors cell for cell (eight formula cells, three error
-cells).
+library version, `parse_date` through a fast-path skip, and — where a
+CLI build sits beside the dylib — `zlsx cells --include-blanks`'s `t` /
+`formula` / `formula_ref` / `v` / `cached` equal to the accessors and
+the row values cell for cell (ten formula cells, three error cells).

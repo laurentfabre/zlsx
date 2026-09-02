@@ -1260,8 +1260,10 @@ class Rows:
         """Style index for each cell in the most recently yielded row.
         ``None`` when the source `<c>` had no ``s`` attribute (General
         format). Layout mirrors the last row returned by ``next()`` so
-        positional indexing matches. Raises :class:`RuntimeError` if
-        the loaded libzlsx predates the 0.2.6+ numFmt ABI."""
+        positional indexing matches; ``[]`` before the first row, after
+        ``skip()`` and once ``next()`` has raised (there is no current
+        row then). Raises :class:`RuntimeError` if the loaded libzlsx
+        predates the 0.2.6+ numFmt ABI."""
         if not self._handle:
             raise ZlsxError("Rows iterator is closed")
         if not _ffi._HAS_NUM_FMT:
@@ -1408,12 +1410,13 @@ class Rows:
         rc = _ffi.lib.zlsx_rows_skip(
             self._handle, n, ctypes.byref(out), self._err, _ERR_BUF_LEN
         )
+        # The previous row's cells are gone whether or not the skip
+        # landed (the library empties its view before it reads); keep
+        # the side-channel accessors from answering for a row that is
+        # no longer current — or, after a failure, for the torn one.
+        self._current_len = 0
         if rc != 0:
             raise ZlsxError(f"zlsx_rows_skip: {_decode_err(self._err)}")
-        # The previous row's cells are gone; keep the side-channel
-        # accessors (style_indices / parse_date) from reading a stale
-        # length into a cleared buffer.
-        self._current_len = 0
         return int(out.value)
 
     def parse_date(self, col_idx: int) -> "datetime.datetime | None":
@@ -1434,6 +1437,11 @@ class Rows:
                 "loaded libzlsx does not expose rows_parse_date "
                 "(requires 0.2.6+); upgrade libzlsx"
             )
+        # Bound on the current row here, before the index narrows to
+        # c_size_t: the library answers for the row the last `next()`
+        # yielded and nothing else, and a negative index would wrap.
+        if col_idx < 0 or col_idx >= self._current_len:
+            return None
         dt = _ffi.CDateTime()
         rc = _ffi.lib.zlsx_rows_parse_date(
             self._handle, col_idx, ctypes.byref(dt)

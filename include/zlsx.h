@@ -479,9 +479,10 @@ void zlsx_rows_close(zlsx_rows_t * rows);
  *        lifetime — copy them if you need to outlive the row.
  *    0 → end of sheet.
  *   -1 → parse error; if err_buf is non-NULL, writes a diagnostic.
- * The row yielded by the last 1 is "the current row" for the
- * per-column getters below (zlsx_rows_style_at() and the formula /
- * error getters); after a 0 or a -1, and after zlsx_rows_skip(),
+ * The row yielded by the last 1 is "the current row" for every
+ * per-column getter on the handle (zlsx_rows_style_at(),
+ * zlsx_rows_parse_date() and the formula / error getters); after a 0
+ * or a -1, and after zlsx_rows_skip() whether it returned 0 or -1,
  * there is none and every getter returns -1.
  */
 int32_t zlsx_rows_next(zlsx_rows_t         * rows,
@@ -503,7 +504,8 @@ int32_t zlsx_rows_next(zlsx_rows_t         * rows,
  * rows belonging to earlier partitions.
  *
  * Invalidates the cells of the most recently yielded row, exactly as
- * zlsx_rows_next() does.
+ * zlsx_rows_next() does — on -1 as well as on 0: there is no current
+ * row afterwards either way.
  */
 int32_t zlsx_rows_skip(zlsx_rows_t * rows,
                        size_t        n,
@@ -640,7 +642,9 @@ typedef struct {
  * Tri-state:
  *    0 → `*out` populated with the decoded DateTime
  *    1 → not a date (wrong type / non-date numFmt / out-of-range serial)
- *   -1 → `col_idx` is past the row width
+ *   -1 → `col_idx` is past the row width, or there is no current row
+ *        (before the first zlsx_rows_next(), after its 0 / -1, after
+ *        zlsx_rows_skip()) — `*out` untouched
  *
  * Combines the existing `zlsx_rows_style_at` + `zlsx_is_date_format`
  * + `xlsx.fromExcelSerial` chain into one call.

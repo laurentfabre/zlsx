@@ -3847,20 +3847,31 @@ _FORMULA_ROWS = (
     b'<row r="5">'
     b'<c r="B5" t="e"><v>#REF!</v></c>'
     b'</row>'
+    b'<row r="6">'
+    b'<c r="A6"><f></f><v>5</v></c>'
+    b'<c r="B6"><f t="shared" si="7"/><v>8</v></c>'
+    b'<c r="C6"><f t="dataTable" ref="C6:C7" r1="A1">x</f><v>7</v></c>'
+    b'</row>'
 )
 
+# A row the reader cannot finish (`<c r="B7"` with no `>`): the fixture
+# has formula spreads, so a skip decodes through `next()` and tears here.
+_FORMULA_TORN_TAIL = b'<row r="7"><c r="A7"><f>Z9</f><v>9</v></c><c r="B7"'
 
-def _formula_workbook(path):
+
+def _formula_workbook(path, tail=b""):
     """One row through the writer (A1 = 1), then rows 2–5 spliced into
     the sheet part before `</sheetData>` — the writer authors neither
     shared formulas nor `t="e"` cells: a stand-alone formula, an
     entity-bearing one, a formula-only cell, a shared base + slave, an
     error cell, a formula whose cached value is an error, an array base
-    + slave, a gap before an error cell (the src/c_abi.zig fixture)."""
+    + slave, a gap before an error cell, an empty `<f></f>`, a slave
+    whose base was never seen, a `t="dataTable"` formula (the
+    src/c_abi.zig fixture)."""
     with zlsx.write(path) as w:
         w.add_sheet("Data").write_row([1])
     _patch_parts(path, [
-        ("xl/worksheets/sheet1.xml", b"</sheetData>", _FORMULA_ROWS + b"</sheetData>"),
+        ("xl/worksheets/sheet1.xml", b"</sheetData>", _FORMULA_ROWS + tail + b"</sheetData>"),
     ])
 
 
@@ -3877,6 +3888,9 @@ _FORMULA_EXPECTED = [
     ),
     ([1, 2, "#N/A"], ["A1*{1,2}", None, None], [None, zlsx.CellRef(0, 4), None], [None, None, "#N/A"]),
     ([None, "#REF!"], [None, None], [None, None], [None, "#REF!"]),
+    # An empty body is own text of length 0; a slave with no base is a
+    # value cell; a dataTable body is own text like any other.
+    ([5, 8, 7], ["", None, "x"], [None] * 3, [None] * 3),
 ]
 
 
@@ -3909,6 +3923,7 @@ def test_rows_formula_and_error_side_channels(tmp_path):
             assert rows.formula_refs() == []
             assert rows.error_strings() == []
             assert rows.style_indices() == []
+            assert rows.parse_date(0) is None
         # `skip` clears the current row.
         with book.sheet(0).rows() as rows:
             next(rows)
@@ -3919,6 +3934,26 @@ def test_rows_formula_and_error_side_channels(tmp_path):
             assert rows.error_strings() == []
             assert next(rows) == [3, 4, "#DIV/0!", "#DIV/0!"]
             assert rows.formula_refs() == [None, zlsx.CellRef(0, 3), None, None]
+        # A skip that fails leaves no current row either: the library
+        # empties its view before it reads, and the binding zeroes its
+        # length before it raises — a torn row never shows through the
+        # previous row's shape.
+        torn = tmp_path / "formulas_torn.xlsx"
+        _formula_workbook(torn, tail=_FORMULA_TORN_TAIL)
+        with book.sheet(0).rows() as rows:
+            assert next(rows) == [1]
+        with zlsx.open(torn) as torn_book:
+            with torn_book.sheet(0).rows() as rows:
+                next(rows)
+                assert next(rows) == [2, "xy", None]
+                assert rows.formula_strings() == ["A1*2", '"x"&"y"<>A1', "A1/0"]
+                with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+                    rows.skip(10)
+                assert rows.formula_strings() == []
+                assert rows.formula_refs() == []
+                assert rows.error_strings() == []
+                assert rows.style_indices() == []
+                assert rows.parse_date(0) is None
         # The value list is what it always was: cached values and the
         # error literal as a plain str.
         _, data = book.sheet(0).read_all()
@@ -3989,6 +4024,10 @@ def test_rows_formula_matches_the_cli_records(tmp_path):
             r.get("formula"),
             _a1_to_ref(r["formula_ref"]) if "formula_ref" in r else None,
             r["v"] if r["t"] == "error" else None,
+            # The value beside the tag: `cached` on a formula record
+            # (absent for a formula-only cell), `v` elsewhere — the
+            # row element the binding yields for that cell.
+            r.get("cached") if r["t"] == "formula" else r["v"],
         )
         for r in records
     }
@@ -3996,22 +4035,22 @@ def test_rows_formula_matches_the_cli_records(tmp_path):
     with zlsx.open(path) as book:
         with book.sheet(0).rows() as rows:
             for row_idx, row in enumerate(rows, start=1):
-                for col, (formula, ref, err) in enumerate(
-                    zip(rows.formula_strings(), rows.formula_refs(), rows.error_strings())
+                for col, (value, formula, ref, err) in enumerate(
+                    zip(row, rows.formula_strings(), rows.formula_refs(), rows.error_strings())
                 ):
                     tag = "formula" if (formula is not None or ref is not None) else (
                         "error" if err is not None else "plain"
                     )
-                    py_view[(row_idx, col)] = (tag, formula, ref, err)
+                    py_view[(row_idx, col)] = (tag, formula, ref, err, value)
     assert set(cli_view) == set(py_view)
-    for key, (tag, formula, ref, err) in py_view.items():
-        cli_tag, cli_formula, cli_ref, cli_err = cli_view[key]
+    for key, (tag, formula, ref, err, value) in py_view.items():
+        cli_tag, cli_formula, cli_ref, cli_err, cli_value = cli_view[key]
         if tag == "plain":
             assert cli_tag not in ("formula", "error"), key
         else:
             assert cli_tag == tag, key
-        assert (cli_formula, cli_ref, cli_err) == (formula, ref, err), key
-    assert sum(1 for t, *_ in py_view.values() if t == "formula") == 8
+        assert (cli_formula, cli_ref, cli_err, cli_value) == (formula, ref, err, value), key
+    assert sum(1 for t, *_ in py_view.values() if t == "formula") == 10
     assert sum(1 for t, *_ in py_view.values() if t == "error") == 3
 
 
@@ -4046,3 +4085,36 @@ def test_rows_formulas_probe_agrees_with_the_library_version():
     major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
     if (major, minor) >= (0, 9):
         assert ffi._HAS_ROWS_FORMULAS, "libzlsx >= 0.9.0 must export zlsx_rows_formula_at / _formula_ref_at / _error_at"
+
+
+def test_rows_parse_date_answers_for_the_current_row_only(tmp_path):
+    """`parse_date` is the fifth per-column getter on the handle and
+    shares the trio's rule: nothing before the first `next()`, after
+    `skip()` (the fast path, which leaves the library's own row buffer
+    holding the date) and past the end (in-house r1 S3B-REL-103/104)."""
+    import datetime as _dt
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_PARSE_DATE:
+        pytest.skip("loaded libzlsx predates parse_date ABI (0.2.6+)")
+    path = tmp_path / "parse_date_current_row.xlsx"
+    with zlsx.write(path) as w:
+        date_style = w.add_style(zlsx.Style(number_format="yyyy-mm-dd"))
+        sheet = w.add_sheet("S")
+        sheet.write_row([44927, "one"], styles=[date_style, 0])
+        sheet.write_row(["two", "two", "two"])
+        sheet.write_row(["three"])
+    with zlsx.open(path) as book:
+        with book.sheet(0).rows() as rows:
+            assert rows.parse_date(0) is None
+            next(rows)
+            assert rows.parse_date(0) == _dt.datetime(2023, 1, 1)
+            assert rows.parse_date(1) is None
+            assert rows.parse_date(-1) is None
+            assert rows.skip(1) == 1
+            assert rows.parse_date(0) is None
+            assert next(rows) == ["three"]
+            assert rows.parse_date(0) is None
+            with pytest.raises(StopIteration):
+                next(rows)
+            assert rows.parse_date(0) is None

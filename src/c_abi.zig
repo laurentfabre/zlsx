@@ -943,11 +943,13 @@ export fn zlsx_rows_next(
     const rs: *RowsState = @ptrCast(@alignCast(rows));
 
     // The C-side view is "the current row" for every per-column
-    // getter (`zlsx_rows_style_at` and the S3b slice 11 trio); it is
-    // rebuilt on 1 and emptied on 0 / -1, so after the end of the
-    // sheet or a parse error no getter serves a row the caller no
-    // longer has — the reader's own per-row lists are cleared at the
-    // end of the sheet but not on every failure path.
+    // getter (`zlsx_rows_style_at`, `zlsx_rows_parse_date` and the
+    // S3b slice 11 trio); it is rebuilt on 1 and emptied on 0 / -1,
+    // so after the end of the sheet or a parse error no getter serves
+    // a row the caller no longer has — the reader clears its own
+    // per-row lists at the top of every `next()` and, on a mid-row
+    // failure, leaves them partially refilled from the torn row, which
+    // is why the view and not those lists is the bound.
     rs.c_cells.clearRetainingCapacity();
     const maybe = rs.inner.next() catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
@@ -988,12 +990,17 @@ export fn zlsx_rows_skip(
 ) callconv(.c) i32 {
     const rs: *RowsState = @ptrCast(@alignCast(rows));
 
+    // The C-side cell view belongs to a row that is now behind us —
+    // whether or not the skip lands: on the formula-spreads path the
+    // reader decodes through `next()`, which resets its per-row lists
+    // before a malformed row fails it, so a view kept across a -1
+    // would bound the getters on the old row over the torn one
+    // (in-house r1 S3B-REL-101/102).
+    rs.c_cells.clearRetainingCapacity();
     const skipped = rs.inner.skipRows(n) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
     };
-    // The C-side cell view belongs to a row that is now behind us.
-    rs.c_cells.clearRetainingCapacity();
     if (out_skipped) |o| o.* = skipped;
     return 0;
 }
@@ -1170,6 +1177,12 @@ export fn zlsx_rows_parse_date(
     out: *CDateTime,
 ) callconv(.c) i32 {
     const rs: *RowsState = @ptrCast(@alignCast(rows));
+    // The C-side view is "the current row" here as for every other
+    // per-column getter (see `zlsx_rows_style_at`): the reader's
+    // `row_cells` keep the last decoded row through a fast-path skip,
+    // so bounding on them alone served a skipped-past row's date
+    // (in-house r1 S3B-REL-103/104).
+    if (col_idx >= rs.c_cells.items.len) return -1;
     const dt = rs.inner.parseDate(col_idx) orelse {
         // Distinguish "col_idx out of range" from "cell isn't a date".
         // styleIndices / row_cells share the same bounded length;
@@ -9708,6 +9721,10 @@ test "S3b sheet_state: a fresh writer's sheets carry no attribute and read visib
 ///   row 4: A4 array base `A1*{1,2}` (ref A4:B4) cached 1 · B4 the
 ///          array slave (no `<f>` at all) cached 2 · C4 `t="e"` `#N/A`
 ///   row 5: A5 a gap · B5 `t="e"` `#REF!`
+///   row 6: A6 an empty body (`<f></f>`, own text of length 0) cached 5
+///          · B6 a slave whose base was never seen (`si="7"`) cached 8
+///          — a value cell, the reader's rule · C6 a `t="dataTable"`
+///          formula (`x`, own text like any other body) cached 7
 const s3b11_rows =
     "<row r=\"2\">" ++
     "<c r=\"A2\"><f>A1*2</f><v>2</v></c>" ++
@@ -9727,9 +9744,23 @@ const s3b11_rows =
     "</row>" ++
     "<row r=\"5\">" ++
     "<c r=\"B5\" t=\"e\"><v>#REF!</v></c>" ++
+    "</row>" ++
+    "<row r=\"6\">" ++
+    "<c r=\"A6\"><f></f><v>5</v></c>" ++
+    "<c r=\"B6\"><f t=\"shared\" si=\"7\"/><v>8</v></c>" ++
+    "<c r=\"C6\"><f t=\"dataTable\" ref=\"C6:C7\" r1=\"A1\">x</f><v>7</v></c>" ++
     "</row>";
 
+/// A row the reader cannot finish — `<c r="B7"` with no `>` — for the
+/// failed-skip test: the fixture's spreads make `skipRows` decode
+/// through `next()`, which tears on it.
+const s3b11_torn_tail = "<row r=\"7\"><c r=\"A7\"><f>Z9</f><v>9</v></c><c r=\"B7\"";
+
 fn writeS3bFormulaFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    return writeS3bFormulaFixtureWithTail(io, tt, name, "");
+}
+
+fn writeS3bFormulaFixtureWithTail(io: std.Io, tt: *TestTmp, name: []const u8, tail: []const u8) ![:0]u8 {
     const alloc = std.testing.allocator;
     const path = try tt.path(alloc, io, name);
     errdefer alloc.free(path);
@@ -9742,23 +9773,31 @@ fn writeS3bFormulaFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
     }
     // `</sheetData>` occurs once in a one-sheet writer part; the rows
     // land after the writer's row 1, in order.
-    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "</sheetData>", s3b11_rows ++ "</sheetData>");
+    const rows_xml = try std.mem.concat(alloc, u8, &.{ s3b11_rows, tail, "</sheetData>" });
+    defer alloc.free(rows_xml);
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "</sheetData>", rows_xml);
     return path;
 }
 
 /// The three getters on one column, with sentinels in every out param
-/// so a 1 / -1 that wrote anything is caught.
+/// so a 1 / -1 that wrote anything is caught — the pointers are kept
+/// raw and compared by identity, so a getter that wrote a different
+/// pointer to the same bytes is caught too (in-house r1 S3B-MNT-105 +
+/// a quick win).
 const S3b11Probe = struct {
+    const sentinel: [*]const u8 = @ptrCast("sentinel");
+
     formula: i32,
-    formula_text: []const u8,
+    formula_ptr: [*]const u8,
+    formula_len: usize,
     ref: i32,
     ref_col: u32,
     ref_row: u32,
     err: i32,
-    err_text: []const u8,
+    err_ptr: [*]const u8,
+    err_len: usize,
 
     fn at(rows: *Rows, col: usize) S3b11Probe {
-        const sentinel: [*]const u8 = @ptrCast("sentinel");
         var f_ptr: [*]const u8 = sentinel;
         var f_len: usize = 8;
         var r_col: u32 = 0xDEAD;
@@ -9770,13 +9809,30 @@ const S3b11Probe = struct {
         const e = zlsx_rows_error_at(rows, col, &e_ptr, &e_len);
         return .{
             .formula = f,
-            .formula_text = f_ptr[0..f_len],
+            .formula_ptr = f_ptr,
+            .formula_len = f_len,
             .ref = r,
             .ref_col = r_col,
             .ref_row = r_row,
             .err = e,
-            .err_text = e_ptr[0..e_len],
+            .err_ptr = e_ptr,
+            .err_len = e_len,
         };
+    }
+
+    fn expectFormulaUntouched(self: S3b11Probe) !void {
+        try std.testing.expectEqual(sentinel, self.formula_ptr);
+        try std.testing.expectEqual(@as(usize, 8), self.formula_len);
+    }
+
+    fn expectRefUntouched(self: S3b11Probe) !void {
+        try std.testing.expectEqual(@as(u32, 0xDEAD), self.ref_col);
+        try std.testing.expectEqual(@as(u32, 0xBEEF), self.ref_row);
+    }
+
+    fn expectErrorUntouched(self: S3b11Probe) !void {
+        try std.testing.expectEqual(sentinel, self.err_ptr);
+        try std.testing.expectEqual(@as(usize, 8), self.err_len);
     }
 
     /// Every getter said "not that kind of cell" (or out of range) and
@@ -9785,18 +9841,21 @@ const S3b11Probe = struct {
         try std.testing.expectEqual(code, self.formula);
         try std.testing.expectEqual(code, self.ref);
         try std.testing.expectEqual(code, self.err);
-        try std.testing.expectEqualStrings("sentinel", self.formula_text);
-        try std.testing.expectEqualStrings("sentinel", self.err_text);
-        try std.testing.expectEqual(@as(u32, 0xDEAD), self.ref_col);
-        try std.testing.expectEqual(@as(u32, 0xBEEF), self.ref_row);
+        try self.expectFormulaUntouched();
+        try self.expectRefUntouched();
+        try self.expectErrorUntouched();
     }
 
     fn expectFormula(self: S3b11Probe, text: []const u8) !void {
         try std.testing.expectEqual(@as(i32, 0), self.formula);
-        try std.testing.expectEqualStrings(text, self.formula_text);
+        try std.testing.expectEqualStrings(text, self.formula_ptr[0..self.formula_len]);
+        // Written, not the sentinel — pinned by identity so an empty
+        // body (len 0) still proves the pointer was set.
+        try std.testing.expect(self.formula_ptr != sentinel);
         try std.testing.expectEqual(@as(i32, 1), self.ref);
         try std.testing.expectEqual(@as(i32, 1), self.err);
-        try std.testing.expectEqualStrings("sentinel", self.err_text);
+        try self.expectRefUntouched();
+        try self.expectErrorUntouched();
     }
 
     fn expectSlave(self: S3b11Probe, col: u32, row: u32) !void {
@@ -9805,18 +9864,29 @@ const S3b11Probe = struct {
         try std.testing.expectEqual(col, self.ref_col);
         try std.testing.expectEqual(row, self.ref_row);
         try std.testing.expectEqual(@as(i32, 1), self.err);
-        try std.testing.expectEqualStrings("sentinel", self.formula_text);
-        try std.testing.expectEqualStrings("sentinel", self.err_text);
+        try self.expectFormulaUntouched();
+        try self.expectErrorUntouched();
     }
 
     fn expectError(self: S3b11Probe, literal: []const u8) !void {
         try std.testing.expectEqual(@as(i32, 1), self.formula);
         try std.testing.expectEqual(@as(i32, 1), self.ref);
         try std.testing.expectEqual(@as(i32, 0), self.err);
-        try std.testing.expectEqualStrings(literal, self.err_text);
-        try std.testing.expectEqualStrings("sentinel", self.formula_text);
+        try std.testing.expectEqualStrings(literal, self.err_ptr[0..self.err_len]);
+        try std.testing.expect(self.err_ptr != sentinel);
+        try self.expectFormulaUntouched();
+        try self.expectRefUntouched();
     }
 };
+
+/// `zlsx_rows_parse_date` with a sentinel-filled out struct; `-1`
+/// must leave it alone.
+fn expectNoDateRow(rows: *Rows, col: usize) !void {
+    var dt: CDateTime = .{ .year = 0xDEAD, .month = 1, .day = 2, .hour = 3, .minute = 4, .second = 5, ._pad = 6 };
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_parse_date(rows, col, &dt));
+    try std.testing.expectEqual(@as(u16, 0xDEAD), dt.year);
+    try std.testing.expectEqual(@as(u8, 5), dt.second);
+}
 
 fn expectCellString(cell: CCell, want: []const u8) !void {
     try std.testing.expectEqual(@intFromEnum(CellTag.string), cell.tag);
@@ -9848,11 +9918,12 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     var cells_len: usize = 0;
 
     // Before the first row there is no current row: -1, nothing written
-    // — the style getter agrees.
+    // — the style and date getters agree.
     try S3b11Probe.at(rows.?, 0).expectNone(-1);
     var style: u32 = 0xABCD;
     try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
     try std.testing.expectEqual(@as(u32, 0xABCD), style);
+    try expectNoDateRow(rows.?, 0);
 
     // Row 1 — the writer's value cell: every getter says 1; past the
     // end of the row every getter says -1.
@@ -9910,13 +9981,27 @@ test "S3b rows formulas: the reader's three side channels through the C ABI — 
     try expectCellString(cells_ptr[1], "#REF!");
     try S3b11Probe.at(rows.?, 2).expectNone(-1);
 
+    // Row 6 — the header's edge promises: an empty `<f></f>` is own
+    // text of length 0 behind a written (non-sentinel) pointer; a slave
+    // whose base was never seen is a value cell; `t="dataTable"` is
+    // own text like any other body.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("");
+    try expectCellInt(cells_ptr[0], 5);
+    try S3b11Probe.at(rows.?, 1).expectNone(1);
+    try expectCellInt(cells_ptr[1], 8);
+    try S3b11Probe.at(rows.?, 2).expectFormula("x");
+    try expectCellInt(cells_ptr[2], 7);
+
     // Past the end there is no current row again — for the trio and
-    // for the style getter alike.
+    // for the style and date getters alike.
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try S3b11Probe.at(rows.?, 0).expectNone(-1);
     style = 0xABCD;
     try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
     try std.testing.expectEqual(@as(u32, 0xABCD), style);
+    try expectNoDateRow(rows.?, 0);
 }
 
 test "S3b rows formulas: a skip clears the current row for every side-channel getter, and the buffer opener agrees" {
@@ -9957,6 +10042,7 @@ test "S3b rows formulas: a skip clears the current row for every side-channel ge
     var style: u32 = 0xABCD;
     try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
     try std.testing.expectEqual(@as(u32, 0xABCD), style);
+    try expectNoDateRow(rows.?, 0);
 
     // Row 4 lands next — the array slave still resolves to its base
     // (the spread state survives the skip) and the error literal reads.
@@ -9993,4 +10079,112 @@ test "S3b rows formulas: a fresh writer's value cells answer 1 on every getter" 
         try S3b11Probe.at(rows.?, cells_len).expectNone(-1);
     }
     try std.testing.expect(seen > 0);
+}
+
+test "S3b rows formulas: a skip that fails leaves no current row either (in-house r1 S3B-REL-101/102)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bFormulaFixtureWithTail(io, &tt, "s3b_formulas_torn.xlsx", s3b11_torn_tail);
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+
+    // Row 2 is current (three formula cells); a skip long enough to
+    // reach the torn row 7 decodes through `next()` (the fixture has
+    // spreads), which resets the reader's lists and tears — the view
+    // must not bound the getters on row 2 over row 7's remains.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 3), cells_len);
+    try S3b11Probe.at(rows.?, 0).expectFormula("A1*2");
+    var skipped: usize = 0xAAAA;
+    @memset(&err_buf, 0);
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_skip(rows.?, 10, &skipped, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0xAAAA), skipped);
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+    var style: u32 = 0xABCD;
+    try std.testing.expectEqual(@as(i32, -1), zlsx_rows_style_at(rows.?, 0, &style));
+    try std.testing.expectEqual(@as(u32, 0xABCD), style);
+    try expectNoDateRow(rows.?, 0);
+    // The reader's lists do hold the torn row's remains — the view is
+    // what keeps them off the ABI.
+    try std.testing.expect(rows_inner(rows.?).formulaStrings().len > 0);
+    // And no later call resurrects a row: the tear reports again or
+    // the sheet ends, never a stale 1.
+    try std.testing.expect(zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len) != 1);
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+}
+
+fn rows_inner(rows: *Rows) *const xlsx.Rows {
+    const rs: *RowsState = @ptrCast(@alignCast(rows));
+    return &rs.inner;
+}
+
+test "S3b rows formulas: the date getter answers for the current row only, through a fast-path skip (in-house r1 S3B-REL-103/104)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(std.testing.allocator, io, "s3b_formulas_date_skip.xlsx");
+    defer std.testing.allocator.free(path);
+    {
+        // No formula spreads anywhere, so `zlsx_rows_skip` takes the
+        // fast path that leaves the reader's per-row lists untouched.
+        var w = xlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        const date_style = try w.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        var sheet = try w.addSheet("S");
+        try sheet.writeRowStyled(&.{ .{ .number = 44927 }, .{ .string = "one" } }, &.{ date_style, 0 });
+        try sheet.writeRow(&.{ .{ .string = "two" }, .{ .string = "two" }, .{ .string = "two" } });
+        try sheet.writeRow(&.{.{ .string = "three" }});
+        try w.save(io, path);
+    }
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    const rows = zlsx_rows_open(book.?, 0, &err_buf, err_buf.len);
+    try std.testing.expect(rows != null);
+    defer zlsx_rows_close(rows);
+    var cells_ptr: [*]const CCell = undefined;
+    var cells_len: usize = 0;
+
+    try expectNoDateRow(rows.?, 0);
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    var dt: CDateTime = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_parse_date(rows.?, 0, &dt));
+    try std.testing.expectEqual(@as(u16, 2023), dt.year);
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_parse_date(rows.?, 1, &dt));
+    try expectNoDateRow(rows.?, 2);
+
+    // Skip row 2 on the fast path: the reader's `row_cells` still hold
+    // row 1 (the date), but nothing is current.
+    var skipped: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_skip(rows.?, 1, &skipped, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), skipped);
+    try std.testing.expect(rows_inner(rows.?).row_cells.items.len > 0);
+    try expectNoDateRow(rows.?, 0);
+    try S3b11Probe.at(rows.?, 0).expectNone(-1);
+
+    // Row 3 lands: one string cell, no date; past its end -1.
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), cells_len);
+    try std.testing.expectEqual(@as(i32, 1), zlsx_rows_parse_date(rows.?, 0, &dt));
+    try expectNoDateRow(rows.?, 1);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    try expectNoDateRow(rows.?, 0);
 }
