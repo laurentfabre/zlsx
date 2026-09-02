@@ -860,7 +860,7 @@ the structural edits rewrite in place before the call returns — so a
 rename renames `sheet`, and a row insert on a sheet with a FROZEN pane
 grows `dimension` and moves the pane's `top_left_cell` (and its split,
 when the insertion is above it) with the grid, the sheet sweep's
-existing `processDimensionTagRow` / `processPaneTagRow` work, all
+existing `processDimensionTag` / `processPaneTagRow` work, all
 visible immediately. A row / column edit on a sheet whose pane is
 SPLIT refuses (`SplitPaneNotSupported`, the editor's pre-existing
 contract) and leaves the stream exactly as it was: the split pane the

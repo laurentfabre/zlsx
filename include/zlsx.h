@@ -1945,8 +1945,9 @@ int32_t zlsx_editor_anchors_ndjson(zlsx_editor_t * ed,
  * workbook (a missing or empty <sheets>) is refused, below. An
  * inventory that cannot be served faithfully refuses whole — a sheet
  * list the strict workbook read cannot prove (MalformedWorkbookXml:
- * a ghost or carrier-less entry, an unprovable relationship, two
- * entries reaching one part, an empty list), or a sheet part the strict walk
+ * a carrier-less entry, an unprovable relationship, two entries
+ * reaching one part, an empty list — a ghost under <extLst> is simply
+ * not an entry), or a sheet part the strict walk
  * cannot prove a pane / extent for (MalformedSheetXml: a second
  * <dimension> / <sheetViews> / first-view <pane>, a duplicate
  * attribute on that machinery, an MCE construct at a recognized slot,
