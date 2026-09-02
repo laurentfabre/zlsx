@@ -1944,10 +1944,12 @@ int32_t zlsx_editor_anchors_ndjson(zlsx_editor_t * ed,
  * or the views. The buffer is never empty on ZLSX_OK: a sheetless
  * workbook (a missing or empty <sheets>) is refused, below. An
  * inventory that cannot be served faithfully refuses whole — a sheet
- * list the strict workbook read cannot prove (MalformedWorkbookXml:
- * a carrier-less entry, an unprovable relationship, two entries
- * reaching one part, an empty list — a ghost under <extLst> is simply
- * not an entry), or a sheet part the strict walk
+ * list the strict workbook read cannot prove (MalformedWorkbookXml —
+ * the docs/cli.md "conditional-formats" contract: a carrier-less
+ * entry, an unverifiable or duplicate relationship, two entries
+ * reaching one part, two names decoding to one spelling, an empty
+ * list; a ghost under <extLst> is simply not an entry), or a sheet
+ * part the strict walk
  * cannot prove a pane / extent for (MalformedSheetXml: a second
  * <dimension> / <sheetViews> / first-view <pane>, a duplicate
  * attribute on that machinery, an MCE construct at a recognized slot,

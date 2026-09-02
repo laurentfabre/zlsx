@@ -8999,9 +8999,11 @@ test "S3b sheet_props_ndjson: an inventory the read cannot serve refuses whole, 
     // every sheet part still in the archive. The lenient opener
     // accepts it; the strict inventory refuses the sheetless workbook
     // (CT_Sheets minOccurs=1, the REL-602 rule closed for the
-    // wrapper-present spelling by Codex #219 r1 S3B-REL-101), so
-    // neither export can hand back the empty success its contract
-    // rules out. Both reads share the walk's verdict.
+    // wrapper-present spelling by Codex #219 r1 S3B-REL-101), so the
+    // sheet-props export can no longer hand back the empty success
+    // its contract rules out — and the calc read, which used to serve
+    // its record over the sheetless workbook, shares the walk's
+    // verdict.
     {
         const path = try writeS3bSheetPropsFixture(io, &tt, "s3b_sp_sheetless.xlsx");
         defer alloc.free(path);

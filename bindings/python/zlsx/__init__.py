@@ -3999,8 +3999,8 @@ class Editor:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SHEET_PROPS:
             raise RuntimeError(
-                f"loaded libzlsx does not expose {symbol} "
-                "(requires 0.9.0+); upgrade libzlsx"
+                "loaded libzlsx does not expose the sheet-props / calc-props "
+                f"pair ({symbol}) (requires 0.9.0+); upgrade libzlsx"
             )
         import json
 

@@ -538,9 +538,11 @@ nothing lexical was said), `iterate_delta` an `xsd:double` (or `null`
 decodes its entities first (an undecodable carrier refuses, exit 2),
 then collapses boundary XML whitespace (XSD's `whiteSpace="collapse"`
 — `" 100 "` is `100`), then types lexically. An entity-spelled or non-numeric `calcId` / `iterateCount` /
-`iterateDelta` never reaches this read through the CLI: `Workbook.open`'s
-lenient parse refuses it first, at open (its own contract — the
-strict decode above is the family's, kept for the surfaces to come).
+`iterateDelta` never reaches this read through any surface — the CLI,
+the C ABI and py-zlsx all open through `Workbook.open`, whose lenient
+parse refuses it first, at open (its own contract — the strict decode
+above is the family's, kept as the record's contract and tested below
+the opener).
 The element is the slot only as a main-namespace direct child
 of the `<workbook>` root: a `<calcPr>` under `<extLst>` or inside a
 rebound subtree is not reported; two at the slot refuse — which one

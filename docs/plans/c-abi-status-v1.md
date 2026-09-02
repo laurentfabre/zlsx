@@ -812,14 +812,15 @@ frozen panes, the read does not); later views' panes stay in the part
 `iterate_delta` as authored, every field null when the element or the
 attribute is absent — a workbook without `<calcPr>` is a record of
 nulls, never `(NULL, 0)` (the doc-props convention; the export asserts
-the writer's one line). The sheet-props stream is never empty on
+a non-empty buffer). The sheet-props stream is never empty on
 success either: the strict inventory refuses a sheetless workbook —
 a missing `<sheets>` (REL-602) and, since this slice's review, an
 empty `<sheets/>` (CT_Sheets minOccurs=1; Codex #219 r1 S3B-REL-101:
 the lenient opener accepts the shape as a zero-length inventory, so
-every read over `scanWorkbookSheets` — conditional formats, anchors,
-sheet-props, calc-props — served an empty success for it, contradicting
-this contract; the walk now counts its entries). The export's
+every read over the strict inventory — conditional formats, anchors,
+sheet-props — served an empty success for it, contradicting this
+contract, and the calc read served its record over a sheetless
+workbook; the walk now counts its entries and all four refuse). The export's
 `(NULL, 0)` arm is kept for the buffer contract's uniformity, not as a
 reachable shape. Release with
 `zlsx_buffer_release`. The allocating writer's `WriteFailed` crosses as
