@@ -3288,6 +3288,310 @@ def test_anchors_refusal_is_typed(tmp_path):
         ed.anchors()
 
 
+def _require_sheet_props():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_EDITOR or not ffi._HAS_SHEET_PROPS:
+        pytest.skip("sheet-props / calc-props reads not exposed in loaded libzlsx (requires 0.9.0+)")
+
+
+def _patch_parts(path, patches):
+    """Byte-replace the first `old` in each `part` of the saved workbook
+    at `path`, in place — the pkg fixture's `patchPart`."""
+    import os
+    import zipfile
+
+    tmp = str(path) + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            for part, old, new in patches:
+                if item.filename == part:
+                    assert old in blob, (part, old)
+                    blob = blob.replace(old, new, 1)
+            zout.writestr(item, blob)
+    os.replace(tmp, path)
+
+
+_CALC_PR = b'<calcPr calcId="191029" fullCalcOnLoad="1" iterate="true" iterateCount="100" iterateDelta="0.001"/>'
+
+
+def _sheetless_copy(src, dst):
+    """`src` with its whole `<sheets>…</sheets>` block replaced by an
+    empty `<sheets/>` at `dst`, every sheet part and relationship kept
+    — the sheetless shape the strict inventory refuses."""
+    import re
+    import zipfile
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            blob = zin.read(item.filename)
+            if item.filename == "xl/workbook.xml":
+                new = re.sub(rb"<sheets>.*?</sheets>", b"<sheets/>", blob, count=1, flags=re.S)
+                assert new != blob
+                blob = new
+            zout.writestr(item, blob)
+
+
+def _sheet_props_workbook(path):
+    """The pkg fixture (`sheet_props_ndjson.zig::fixture.write`) rebuilt
+    by hand: Data frozen, Report split with a fractional split, Bare
+    with nothing, a full `<calcPr>`. The writer emits no `<dimension>`
+    and no `<calcPr>` and has no split-pane surface, so those ride in
+    through the archive at their schema slots."""
+    with zlsx.write(path) as w:
+        data = w.add_sheet("Data")
+        data.write_row(["Region", "Qty"])
+        data.write_row(["East", 3])
+        data.write_row(["West", 4])
+        data.freeze_panes(1, 2)
+        report = w.add_sheet("Report")
+        report.write_row(["R&D", 1, 2])
+        report.write_row(["Ops", 3, 4])
+        w.add_sheet("Bare").write_row([1])
+    _patch_parts(path, [
+        ("xl/worksheets/sheet1.xml", b"<sheetViews>", b'<dimension ref="A1:B3"/><sheetViews>'),
+        ("xl/worksheets/sheet2.xml", b"<sheetData>",
+         b'<dimension ref="A1:C2"/><sheetViews><sheetView workbookViewId="0">'
+         b'<pane xSplit="2865" ySplit="1215.5" topLeftCell="C4" activePane="bottomRight" state="split"/>'
+         b"</sheetView></sheetViews><sheetData>"),
+        ("xl/workbook.xml", b"</workbook>", _CALC_PR + b"</workbook>"),
+    ])
+
+
+_SHEET_PROPS_EXPECTED = [
+    {"kind": "sheet_props", "sheet": "Data", "sheet_idx": 0, "dimension": "A1:B3",
+     "pane": {"x_split": 2, "y_split": 1, "top_left_cell": "C2", "active_pane": "bottomRight", "state": "frozen"}},
+    {"kind": "sheet_props", "sheet": "Report", "sheet_idx": 1, "dimension": "A1:C2",
+     "pane": {"x_split": 2865, "y_split": 1215.5, "top_left_cell": "C4", "active_pane": "bottomRight", "state": "split"}},
+    {"kind": "sheet_props", "sheet": "Bare", "sheet_idx": 2, "dimension": None, "pane": None},
+]
+
+_CALC_PROPS_EXPECTED = {
+    "kind": "calc_props", "calc_id": 191029, "full_calc_on_load": True,
+    "iterate": True, "iterate_count": 100, "iterate_delta": 0.001,
+}
+
+_CALC_PROPS_ABSENT = {
+    "kind": "calc_props", "calc_id": None, "full_calc_on_load": None,
+    "iterate": None, "iterate_count": None, "iterate_delta": None,
+}
+
+
+def test_sheet_props_frozen_shape_and_nulls_on_plain_workbook(tmp_path):
+    """`Editor.sheet_props()` / `zlsx.sheet_props(path)` return the
+    `zlsx sheet-props` records as dicts — one per sheet, workbook order,
+    the split pane reported as written; a fresh writer's sheets are
+    records of `None`s (no `<dimension>`, no views without a freeze),
+    never an empty list."""
+    _require_sheet_props()
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    nulls = [
+        {"kind": "sheet_props", "sheet": "Data", "sheet_idx": 0, "dimension": None, "pane": None},
+        {"kind": "sheet_props", "sheet": "Second", "sheet_idx": 1, "dimension": None, "pane": None},
+    ]
+    assert zlsx.sheet_props(plain) == nulls
+    with zlsx.edit(plain) as ed:
+        assert ed.sheet_props() == nulls
+
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+    assert zlsx.sheet_props(src) == _SHEET_PROPS_EXPECTED
+    with zlsx.edit(src) as ed:
+        records = ed.sheet_props()
+    assert records == _SHEET_PROPS_EXPECTED
+    # The wire's number spellings survive the parse: an integral split
+    # is an int, a fractional one a float.
+    assert type(records[0]["pane"]["x_split"]) is int
+    assert type(records[1]["pane"]["y_split"]) is float
+
+
+def test_calc_props_frozen_shape_and_absent_on_plain_workbook(tmp_path):
+    """`Editor.calc_props()` / `zlsx.calc_props(path)` return the one
+    `zlsx calc-props` record as a dict; a workbook without `<calcPr>` is
+    a dict of `None`s, the `doc_props()` convention."""
+    _require_sheet_props()
+
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    assert zlsx.calc_props(plain) == _CALC_PROPS_ABSENT
+    with zlsx.edit(plain) as ed:
+        assert ed.calc_props() == _CALC_PROPS_ABSENT
+
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+    rec = zlsx.calc_props(src)
+    assert rec == _CALC_PROPS_EXPECTED
+    # `True == 1` in Python; pin the JSON type, not just the value.
+    assert rec["full_calc_on_load"] is True
+    assert rec["iterate"] is True
+    with zlsx.edit(src) as ed:
+        assert ed.calc_props() == _CALC_PROPS_EXPECTED
+
+
+def test_sheet_props_read_the_editors_current_state(tmp_path):
+    """A sheet rename is visible immediately in `sheet`; a row insert
+    below the frozen row grows the extent and moves the pane's top-left
+    cell with the grid while the split holds; a split-pane sheet is the
+    one such an edit refuses, and the refusal leaves the records as they
+    were. No save in between."""
+    _require_sheet_props()
+    _require_structural()
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "Facts")
+        renamed = ed.sheet_props()
+        assert [r["sheet"] for r in renamed] == ["Facts", "Report", "Bare"]
+        assert renamed[0]["dimension"] == "A1:B3"
+
+        ed.insert_row(0, 2)
+        moved = ed.sheet_props()
+        assert moved[0] == {
+            "kind": "sheet_props", "sheet": "Facts", "sheet_idx": 0, "dimension": "A1:B4",
+            "pane": {"x_split": 2, "y_split": 1, "top_left_cell": "C3", "active_pane": "bottomRight", "state": "frozen"},
+        }
+        assert moved[1:] == _SHEET_PROPS_EXPECTED[1:]  # the other sheets did not move
+
+        # The split pane the record reports is the one the row edit
+        # refuses: the read and the editor's own contract agree.
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.insert_row(1, 1)
+        assert info.value.error_name == "SplitPaneNotSupported"
+        assert ed.sheet_props() == moved
+
+
+def test_calc_props_read_the_editors_current_state(tmp_path):
+    """The `<calcPr>` slot rides a rename's workbook.xml rewrite
+    untouched, and `mark_recalc_on_load()` lands `full_calc_on_load` in
+    the live part — visible with no save in between."""
+    _require_sheet_props()
+    _require_structural()
+    import zlsx._ffi as ffi
+
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+    with zlsx.edit(src) as ed:
+        ed.rename_sheet(0, "Facts")
+        assert ed.calc_props() == _CALC_PROPS_EXPECTED
+
+    if not ffi._HAS_MARK_RECALC:
+        pytest.skip("loaded libzlsx predates mark_recalc_on_load (0.9.0+)")
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    with zlsx.edit(plain) as ed:
+        assert ed.calc_props() == _CALC_PROPS_ABSENT
+        ed.mark_recalc_on_load()
+        rec = ed.calc_props()
+    assert rec == {
+        "kind": "calc_props", "calc_id": None, "full_calc_on_load": True,
+        "iterate": None, "iterate_count": None, "iterate_delta": None,
+    }
+    assert rec["full_calc_on_load"] is True
+
+
+def test_sheet_props_refusal_is_typed(tmp_path):
+    """An inventory the read cannot serve faithfully raises a typed
+    `ZlsxRefusal` — never a partial list."""
+    _require_sheet_props()
+
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+
+    # Two extents on Data: maxOccurs=1 is a refusal, not a pick.
+    broken = tmp_path / "broken.xlsx"
+    _patched_copy(src, broken, "xl/worksheets/sheet1.xml", b'<dimension ref="A1:B3"/>', b'<dimension ref="A1:B3"/><dimension ref="A1"/>')
+    with zlsx.edit(broken) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.sheet_props()
+        assert info.value.error_name == "MalformedSheetXml"
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+
+    # A duplicate attribute on the SECOND sheet's pane refuses whole —
+    # Data's perfectly servable record is never handed out.
+    broken2 = tmp_path / "broken2.xlsx"
+    _patched_copy(src, broken2, "xl/worksheets/sheet2.xml", b'state="split"', b'state="split" state="frozen"')
+    with zlsx.edit(broken2) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.sheet_props()
+        assert info.value.error_name == "MalformedSheetXml"
+
+    # A bad entity in a sheet-name carrier: the workbook-level read
+    # refuses before any sheet part is walked. The calc read walks the
+    # same workbook.xml but attributes nothing, so it never decodes the
+    # names — it still serves.
+    broken3 = tmp_path / "broken3.xlsx"
+    _patched_copy(src, broken3, "xl/workbook.xml", b'name="Report"', b'name="Rep&bogus;ort"')
+    with zlsx.edit(broken3) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.sheet_props()
+        assert info.value.error_name == "MalformedWorkbookXml"
+        assert ed.calc_props() == _CALC_PROPS_EXPECTED
+
+    # An empty `<sheets/>`: the lenient opener accepts the sheetless
+    # workbook, the strict inventory refuses it (CT_Sheets minOccurs=1)
+    # — never `[]` from a read whose contract is one record per sheet.
+    # Both reads share the walk's verdict.
+    sheetless = tmp_path / "sheetless.xlsx"
+    _sheetless_copy(src, sheetless)
+    with zlsx.edit(sheetless) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.sheet_props()
+        assert info.value.error_name == "MalformedWorkbookXml"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.calc_props()
+        assert info.value.error_name == "MalformedWorkbookXml"
+
+    ed = zlsx.edit(src)
+    ed.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.sheet_props()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        ed.calc_props()
+
+
+def test_calc_props_refusal_is_typed(tmp_path):
+    """A `<calcPr>` slot the read cannot report faithfully raises a
+    typed `ZlsxRefusal` — never a guess at which element Excel honours."""
+    _require_sheet_props()
+
+    src = tmp_path / "props.xlsx"
+    _sheet_props_workbook(src)
+
+    # (name, old, new, whether the SHEET read still serves — it never
+    # looks at the slot, but shares the workbook walk's own verdicts)
+    cases = [
+        # Two at the slot.
+        ("two.xlsx", b"</workbook>", b'<calcPr calcId="1"/></workbook>', True),
+        # One an MCE branch could project into the slot.
+        ("mce.xlsx", _CALC_PR,
+         b'<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+         b'<mc:Choice Requires="x15"><calcPr calcId="1"/></mc:Choice></mc:AlternateContent>', True),
+        # A duplicate attribute; a carrier that does not decode.
+        ("dup.xlsx", _CALC_PR, b'<calcPr calcId="1" calcId="2"/>', True),
+        ("carrier.xlsx", _CALC_PR, b'<calcPr iterate="&bogus;"/>', True),
+        # A `<sheets>` list the strict workbook walk cannot prove: the
+        # calc read runs the same walk, the same verdict — for both.
+        ("sheets.xlsx", b"</sheets>", b"</sheets><sheets/>", False),
+    ]
+    for name, old, new, sheet_read_serves in cases:
+        broken = tmp_path / name
+        _patched_copy(src, broken, "xl/workbook.xml", old, new)
+        with zlsx.edit(broken) as ed:
+            with pytest.raises(zlsx.ZlsxRefusal) as info:
+                ed.calc_props()
+            assert info.value.error_name == "MalformedWorkbookXml", name
+            assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+            if sheet_read_serves:
+                assert ed.sheet_props() == _SHEET_PROPS_EXPECTED, name
+            else:
+                with pytest.raises(zlsx.ZlsxRefusal) as info:
+                    ed.sheet_props()
+                assert info.value.error_name == "MalformedWorkbookXml", name
+
+
 def test_editor_structural_indices_are_bounded_before_ctypes_narrowing(tmp_path):
     """c_uint32 wraps modulo 2**32: without a guard, rename_sheet(2**32, …)
     would rename sheet 0. Every integer-bearing structural method rejects

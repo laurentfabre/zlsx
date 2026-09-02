@@ -780,3 +780,129 @@ smoke gate takes the address and `#error`s without the macro; the
 Python leg builds the fixture through the archive (the writer has no
 drawing surface), pins the parsed records, the rename + insert-row
 moves, four refusal shapes and the closed-editor error.
+
+## 15. S3b slice 9 — the `sheet-props` and `calc-props` reads (2026-09-02)
+
+Two exports, the slice-2 pattern verbatim, under ONE macro and ONE
+probe (a dylib has either both or neither):
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_sheet_props_ndjson` (+ `zlsx_buffer_release`) | `_HAS_SHEET_PROPS` | `ZLSX_HAS_SHEET_PROPS` |
+| `zlsx_editor_calc_props_ndjson` (+ `zlsx_buffer_release`) | `_HAS_SHEET_PROPS` | `ZLSX_HAS_SHEET_PROPS` |
+
+**The bytes are the CLI's**: the S3b gate froze both records in
+`docs/cli.md`, and the records are text. The exports hand over the
+NDJSON bytes of `pkg/sheet_props_ndjson.zig` — the shared collectors +
+record writers `zlsx sheet-props` / `zlsx calc-props` print through —
+built by `c_abi.zig::sheetPropsNdjsonOwned(alloc, wb)` (`collect` +
+`writeAll`: one `{"kind":"sheet_props",…}` line per workbook sheet,
+workbook order, no selector — the CLI's default stream) and
+`c_abi.zig::calcPropsNdjsonOwned(alloc, wb)` (`collectCalc` +
+`writeCalcRecord`: the ONE `{"kind":"calc_props",…}` line) over the
+editor's current parts. A sheet record is the `<dimension ref>` as
+authored (null when the element or the attribute is absent) and the
+FIRST `<sheetView>`'s `<pane>` as authored (null when there is none;
+`x_split` / `y_split` / `top_left_cell` / `active_pane` / `state`, each
+null when the source omits it, no schema default applied, split panes
+reported as written — the lenient `Worksheet.freezePane` narrows to
+frozen panes, the read does not); later views' panes stay in the part
+(slice 8's recorded owner-shape deferral). The calc record is
+`calc_id` / `full_calc_on_load` / `iterate` / `iterate_count` /
+`iterate_delta` as authored, every field null when the element or the
+attribute is absent — a workbook without `<calcPr>` is a record of
+nulls, never `(NULL, 0)` (the doc-props convention; the export asserts
+a non-empty buffer). The sheet-props stream is never empty on
+success either: the strict inventory refuses a sheetless workbook —
+a missing `<sheets>` (REL-602) and, since this slice's review, an
+empty `<sheets/>` (CT_Sheets minOccurs=1; Codex #219 r1 S3B-REL-101:
+the lenient opener accepts the shape as a zero-length inventory, so
+every read over the strict inventory — conditional formats, anchors,
+sheet-props — served an empty success for it, contradicting this
+contract, and the calc read served its record over a sheetless
+workbook; the walk now counts its entries and all four refuse). The export's
+`(NULL, 0)` arm is kept for the buffer contract's uniformity, not as a
+reachable shape. Release with
+`zlsx_buffer_release`. The allocating writer's `WriteFailed` crosses as
+`-3`, the pivots builder's rule. Python parses one JSON object per line
+(`Editor.sheet_props()` / `zlsx.sheet_props(path)` → `list[dict]`;
+`Editor.calc_props()` / `zlsx.calc_props(path)` → the one `dict`, a
+count other than one raising `ZlsxError`), through one shared
+`_ndjson_read(symbol)` helper the pair's probe gates.
+
+**The refusals — no new name**: `collect`'s error surface is the
+closed `CollectError` = `{MalformedWorkbookXml, MalformedSheetXml,
+MissingSheetPart, ZipBombSuspected, OutOfMemory}`, `collectCalc`'s the
+closed `CalcError` = `{MalformedWorkbookXml, ZipBombSuspected,
+OutOfMemory}`; both exports switch exhaustively with no `else`
+(S3B-MNT-911's rule). Every member was already mapped: a sheet list the
+strict workbook read cannot prove is `MalformedWorkbookXml` (§13's
+shared inventory, `conditional_format_ndjson.resolveSheets`; a listed
+part the archive cannot materialise folds there, S3B-ERR-602's shape);
+a sheet part the strict walk cannot prove a pane / extent for is
+`MalformedSheetXml` (the `docs/cli.md` contract: a second `<dimension>`
+/ `<sheetViews>` / first-view `<pane>`, a duplicate attribute on that
+machinery, an MCE construct at a recognized slot, a `ref` / pane
+carrier that does not decode, plus the typed sheet view's own parse
+verdict on worksheet roots, REL-404); a `<calcPr>` slot the read
+cannot report faithfully is `MalformedWorkbookXml` (two at the slot,
+one an MCE branch could project there, a duplicate attribute, a
+carrier that does not decode — and the same `<sheets>` verdict, since
+the calc read runs the same strict workbook walk without resolving
+sheet parts); `MissingSheetPart` is §10's (slice 8's S3B-MNT-101
+ruling kept it in the set for parity with the conditional-formats
+read); `ZipBombSuspected` stays the deliberate open-time `-1` §13
+records; `OutOfMemory` is `-3`. Both refuse whole — a broken SECOND
+sheet hands out nothing for the servable first.
+
+**Timing**: the sheet inventory is a fresh strict read of the current
+`xl/workbook.xml`, and the extent and views live in the sheet parts
+the structural edits rewrite in place before the call returns — so a
+rename renames `sheet`, and a row insert on a sheet with a FROZEN pane
+grows `dimension` and moves the pane's `top_left_cell` (and its split,
+when the insertion is above it) with the grid, the sheet sweep's
+existing `processDimensionTag` / `processPaneTagRow` work, all
+visible immediately. A row / column edit on a sheet whose pane is
+SPLIT refuses (`SplitPaneNotSupported`, the editor's pre-existing
+contract) and leaves the stream exactly as it was: the split pane the
+record reports is the one the edit refuses, so the read and the
+editor agree. The `<calcPr>` slot rides a rename's workbook.xml
+rewrite untouched; `zlsx_editor_mark_recalc_on_load` (and a recalc
+that lands) swap `fullCalcOnLoad="1"` into the live part through the
+§5.7.7 transaction, so the next `calc_props` read reports it with no
+save in between. Staged cell writes never touch the extent, the views
+or `<calcPr>`. Repeated reads stay bounded: `collect` resolves the
+inventory into the view's own arena and walks each part on gpa scratch
+reclaimed per sheet (`residentBytes()` pinned flat in the package
+tests); `collectCalc` allocates only scratch.
+
+**Tests** (`src/c_abi.zig`, "S3b sheet_props_ndjson …" / "S3b
+calc_props_ndjson …"): the buffers equal to the shared writers' frozen
+streams (the CLI tests' literals) over the pkg fixture (a frozen
+record, a split record with a fractional split, a record of nulls; a
+calc record with every field set); the rename AND a row insert below
+the frozen row visible with no save (the exact post-edit stream:
+`A1:B4`, `top_left_cell` `C3`, `y_split` held at 1, the other sheets
+byte-identical), the split-pane refusal leaving the stream as it was,
+the calc record riding the rename untouched; a fresh writer's sheets
+as records of nulls (never an empty stream) and a fresh writer's
+`<calcPr>` as the absent record flipping to `full_calc_on_load: true`
+after `zlsx_editor_mark_recalc_on_load`; `NullOutPointer` /
+`InvalidInput` as call errors on both, the NULL-diag success path;
+poisoned outputs reset on the refusal and undersized-diag paths, the
+rejected diag byte-for-byte untouched; `-2` with the name in diag +
+errbuf and nothing handed out for two extents, a duplicate pane
+attribute on a broken SECOND sheet behind a servable first, a pane
+carrier that does not decode, an MCE branch at the views slot, a bad
+entity in a sheet-name carrier (`MalformedWorkbookXml`, before any
+walk), and a flipped payload byte in a listed sheet part
+(`MalformedWorkbookXml`, the inventory probe); for the calc read, two
+`<calcPr>`, an MCE-projected one, a duplicate attribute, an
+undecodable carrier and a `<sheets>` list the walk cannot prove; an
+allocation-failure sweep over both builders. The smoke gate takes both
+addresses and `#error`s without the macro; the Python leg builds the
+fixture through the archive (the writer emits no `<dimension>` / no
+`<calcPr>` and has no split-pane surface), pins the parsed records
+and the JSON types (`True`, not `1`), the rename + insert-row moves,
+the split-pane refusal, the mark-recalc flip, the refusal shapes on
+both reads and the closed-editor error.

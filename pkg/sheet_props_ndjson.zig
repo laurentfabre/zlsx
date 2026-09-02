@@ -4,8 +4,10 @@
 //! "calc-props"), written once for every surface.
 //!
 //! `zlsx sheet-props` / `zlsx calc-props` emit these through the CLI's
-//! selection and pagination; the C and Python legs of row S3b hand
-//! over the same bytes when they land — the `pivot_ndjson.zig` /
+//! selection and pagination; the C ABI (`zlsx_editor_sheet_props_ndjson`
+//! / `zlsx_editor_calc_props_ndjson`) and py-zlsx (`Editor.sheet_props()`
+//! / `Editor.calc_props()`) hand over the same bytes through `writeAll`
+//! / `writeCalcRecord` — the `pivot_ndjson.zig` /
 //! `conditional_format_ndjson.zig` precedent.
 //!
 //! `sheet_props`: one record per workbook sheet, workbook order — the

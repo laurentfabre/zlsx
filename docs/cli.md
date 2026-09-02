@@ -274,7 +274,9 @@ a record that lies or thin the inventory: an anchor on a worksheet part
 place (its relationship dangling, mistyped or external, its part
 absent from the archive or unreadable), two `<sheet>` entries reaching
 one part (the same anchor would ride out twice under two identities),
-two names decoding to one spelling; a drawing structure the walkers
+two names decoding to one spelling, an empty `<sheets>` list (a
+sheetless workbook is refused, never served as an empty inventory);
+a drawing structure the walkers
 recognise but cannot read whole — a sheet's drawing relationship, a
 pic's image relationship or a frame's chart relationship that dangles,
 is of the wrong relationship type, or names an absent part, a
@@ -339,7 +341,8 @@ is exit 2, and so is any workbook sheet the package layer cannot read
 whole — sheet identities come from a strict namespace- and depth-aware
 read of the workbook's `<sheets>` list (a ghost `<sheet>` under
 `<extLst>` is not an identity, an entry missing a required carrier
-refuses instead of vanishing, and any root-declared
+refuses instead of vanishing, an empty list refuses — a sheetless
+workbook is never served as an empty inventory — and any root-declared
 relationships-namespace prefix spells the id reference — `q:id` under
 `xmlns:q` reads like `r:id`), the sheet graph resolves strictly (the
 relationship under the entry's id — matched by its DECODED spelling —
@@ -440,7 +443,9 @@ part) and keeps that contract; this read reports split panes too, as
 written, from the schema slot only. The records come from a strict,
 namespace- and depth-aware walk of each sheet part
 (`pkg/sheet_props_ndjson.zig`, on the `conditional-formats` scanner's
-lexical layer).
+lexical layer). The C ABI (`zlsx_editor_sheet_props_ndjson`) and
+py-zlsx (`Editor.sheet_props()` / `zlsx.sheet_props(path)`) hand over
+these exact bytes with no selector.
 
 ```jsonl
 {"kind":"sheet_props","sheet":"Data","sheet_idx":0,"dimension":"A1:B3","pane":{"x_split":2,"y_split":1,"top_left_cell":"C2","active_pane":"bottomRight","state":"frozen"}}
@@ -513,7 +518,9 @@ a `<pane/>` without attributes are present-and-empty: `dimension` is
 and reported as authored. The lenient view applies its own defaults
 (`iterate` / `fullCalcOnLoad` false when absent, anything but `true` /
 `1` false) and keeps them; this read reports `null` for what the file
-does not say.
+does not say. The C ABI (`zlsx_editor_calc_props_ndjson`) and py-zlsx
+(`Editor.calc_props()` / `zlsx.calc_props(path)`) hand over this exact
+line.
 
 ```jsonl
 {"kind":"calc_props","calc_id":191029,"full_calc_on_load":true,"iterate":false,"iterate_count":100,"iterate_delta":0.001}
@@ -531,9 +538,11 @@ nothing lexical was said), `iterate_delta` an `xsd:double` (or `null`
 decodes its entities first (an undecodable carrier refuses, exit 2),
 then collapses boundary XML whitespace (XSD's `whiteSpace="collapse"`
 — `" 100 "` is `100`), then types lexically. An entity-spelled or non-numeric `calcId` / `iterateCount` /
-`iterateDelta` never reaches this read through the CLI: `Workbook.open`'s
-lenient parse refuses it first, at open (its own contract — the
-strict decode above is the family's, kept for the surfaces to come).
+`iterateDelta` never reaches this read through any surface — the CLI,
+the C ABI and py-zlsx all open through `Workbook.open`, whose lenient
+parse refuses it first, at open (its own contract — the strict decode
+above is the family's, kept as the record's contract and tested below
+the opener).
 The element is the slot only as a main-namespace direct child
 of the `<workbook>` root: a `<calcPr>` under `<extLst>` or inside a
 rebound subtree is not reported; two at the slot refuse — which one

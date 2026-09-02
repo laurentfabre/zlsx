@@ -53,6 +53,9 @@
 #if !defined(ZLSX_HAS_ANCHORS)
 #error "ZLSX_HAS_ANCHORS missing"
 #endif
+#if !defined(ZLSX_HAS_SHEET_PROPS)
+#error "ZLSX_HAS_SHEET_PROPS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -107,6 +110,9 @@ static const void *const s3a_exports[] = {
     (const void *)&zlsx_editor_conditional_formats_ndjson,
     /* S3b slice 7: the anchors read. */
     (const void *)&zlsx_editor_anchors_ndjson,
+    /* S3b slice 9: the sheet-props and calc-props reads. */
+    (const void *)&zlsx_editor_sheet_props_ndjson,
+    (const void *)&zlsx_editor_calc_props_ndjson,
 };
 
 const void *zlsx_c_abi_smoke_anchor_m9a2(void);

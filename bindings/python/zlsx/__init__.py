@@ -76,6 +76,8 @@ __all__ = [
     "defined_names",
     "conditional_formats",
     "anchors",
+    "sheet_props",
+    "calc_props",
     "FormulaSpec",
     "RecalcOptions",
     "RecalcReport",
@@ -3931,6 +3933,98 @@ class Editor:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
 
+    def sheet_props(self) -> list[dict]:
+        """Every sheet's panes and extent as ``zlsx sheet-props`` reports
+        them: one ``{"kind": "sheet_props", …}`` record per workbook
+        sheet, workbook order, parsed from the same NDJSON bytes the
+        CLI prints (docs/cli.md, "sheet-props"). Each record is the
+        sheet's ``<dimension ref>`` as authored (``None`` when the
+        element or the attribute is absent) and the ``<pane>`` of its
+        FIRST ``<sheetView>`` as authored (``None`` when there is
+        none): ``x_split`` / ``y_split`` / ``top_left_cell`` /
+        ``active_pane`` / ``state``, each ``None`` when the source
+        omits it, no schema default applied, split panes reported as
+        written (the lenient Zig ``Worksheet.freezePane`` narrows to
+        frozen panes; this read does not). Later ``<sheetView>``
+        elements keep their own panes in the part. Read over the
+        editor's current parts: structural edits and the sheet sweeps
+        they carry (a rename renaming ``sheet``, a row insert growing
+        ``dimension`` and moving a frozen pane's split and
+        ``top_left_cell``) are visible immediately; staged cell writes
+        never touch the extent or the views. An inventory that cannot
+        be served faithfully raises :class:`ZlsxRefusal`
+        (``MalformedWorkbookXml`` for a sheet list the strict workbook
+        read cannot prove, ``MalformedSheetXml`` for a sheet part the
+        strict walk cannot prove a pane / extent for — a second
+        ``<dimension>`` / ``<sheetViews>`` / first-view ``<pane>``, a
+        duplicate attribute on that machinery, an MCE construct at a
+        recognized slot, a carrier that does not decode) rather than
+        return a record that lies or a list with a hole. An archive
+        past the decompression caps fails at open."""
+        return self._ndjson_read("zlsx_editor_sheet_props_ndjson")
+
+    def calc_props(self) -> dict:
+        """The workbook's calculation properties as ``zlsx calc-props``
+        reports them: the ONE ``{"kind": "calc_props", …}`` record of
+        ``xl/workbook.xml``'s ``<calcPr>``, parsed from the same NDJSON
+        bytes the CLI prints (docs/cli.md, "calc-props") — ``calc_id``
+        / ``full_calc_on_load`` / ``iterate`` / ``iterate_count`` /
+        ``iterate_delta`` as authored, every field ``None`` when the
+        element or the attribute is absent (a workbook without
+        ``<calcPr>`` is a record of ``None``\\ s, the
+        :meth:`doc_props` convention). Read over the editor's current
+        parts: :meth:`mark_recalc_on_load` and a recalc that lands set
+        ``fullCalcOnLoad="1"`` in place, visible immediately; staged
+        cell writes never touch the element. A slot the read cannot
+        report faithfully raises :class:`ZlsxRefusal`
+        (``MalformedWorkbookXml``: two ``<calcPr>`` at the slot, one an
+        MCE branch could project there, a duplicate attribute, a
+        carrier that does not decode — and a ``<sheets>`` list the
+        same strict walk cannot prove)."""
+        records = self._ndjson_read("zlsx_editor_calc_props_ndjson")
+        # The writer always emits exactly one line; anything else is a
+        # library the binding does not know.
+        if len(records) != 1:
+            raise ZlsxError(
+                f"zlsx_editor_calc_props_ndjson: expected one record, got {len(records)}"
+            )
+        return records[0]
+
+    def _ndjson_read(self, symbol: str) -> list[dict]:
+        """The S3b slice-9 buffer contract for the pair of exports the
+        ``_HAS_SHEET_PROPS`` probe covers: one call, the records parsed
+        one JSON object per line, the buffer and the diag released on
+        every path."""
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_SHEET_PROPS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose the sheet-props / calc-props "
+                f"pair ({symbol}) (requires 0.9.0+); upgrade libzlsx"
+            )
+        import json
+
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = getattr(_ffi.lib, symbol)(
+            self._handle, ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"{symbol}: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
+
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
 
@@ -4341,6 +4435,22 @@ def anchors(path: Union[str, Path]) -> list[dict]:
     returning."""
     with Editor(path) as ed:
         return ed.anchors()
+
+
+def sheet_props(path: Union[str, Path]) -> list[dict]:
+    """Every sheet's panes and extent of the workbook at ``path`` —
+    :meth:`Editor.sheet_props` over a fresh editor, closed before
+    returning."""
+    with Editor(path) as ed:
+        return ed.sheet_props()
+
+
+def calc_props(path: Union[str, Path]) -> dict:
+    """The calculation properties of the workbook at ``path`` —
+    :meth:`Editor.calc_props` over a fresh editor, closed before
+    returning."""
+    with Editor(path) as ed:
+        return ed.calc_props()
 
 
 # ─── Embeddings (E5) ─────────────────────────────────────────────────
