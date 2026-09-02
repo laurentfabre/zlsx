@@ -849,6 +849,34 @@ export fn zlsx_sheet_index_by_name(
     return -1;
 }
 
+/// `<sheet state="…">` codes for `zlsx_sheet_state`, mirroring
+/// `xlsx.SheetState` in declaration order. Stable numeric codes so the
+/// C / Python surface can switch on them; the header spells the same
+/// three and the smoke test pins them.
+pub const ZLSX_SHEET_STATE_VISIBLE: i32 = 0;
+pub const ZLSX_SHEET_STATE_HIDDEN: i32 = 1;
+pub const ZLSX_SHEET_STATE_VERY_HIDDEN: i32 = 2;
+
+/// Sheet visibility — the `<sheet state="…">` attribute of sheet `idx`
+/// as the reader modelled it (`Sheet.state`), or -1 when `idx` is out
+/// of range. A missing or unrecognised `state` reads as visible, the
+/// schema default (`SheetState.parse`'s rule: visibility never fails
+/// an open), so this getter and `zlsx list-sheets` agree by
+/// construction — the CLI prints `SheetState.toString()` of the same
+/// field. Hidden sheets stay in the inventory (`zlsx_sheet_count`,
+/// `zlsx_sheet_name`, the row iterators): a `veryHidden` sheet is
+/// unreachable from Excel's UI, and this is how a caller learns it is
+/// there.
+export fn zlsx_sheet_state(book: *Book, idx: u32) callconv(.c) i32 {
+    const state: *BookState = @ptrCast(@alignCast(book));
+    if (idx >= state.inner.sheets.len) return -1;
+    return switch (state.inner.sheets[idx].state) {
+        .visible => ZLSX_SHEET_STATE_VISIBLE,
+        .hidden => ZLSX_SHEET_STATE_HIDDEN,
+        .very_hidden => ZLSX_SHEET_STATE_VERY_HIDDEN,
+    };
+}
+
 /// Open a row iterator for sheet `idx`. Returns NULL on failure.
 export fn zlsx_rows_open(
     book: *Book,
@@ -9430,4 +9458,110 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetIndexOutOfRange));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidSheetName));
     try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
+
+// ─── S3b slice 10: sheet visibility on the reader handle ─────────────
+
+/// Four sheets through the writer, then `state` attributes spliced into
+/// `xl/workbook.xml` through the archive — the writer authors no sheet
+/// state (`<sheet name=… sheetId=… r:id=…/>`), so the fixture is the
+/// test's: `Ledger` hidden, `Secret` veryHidden, `Odd` an unrecognised
+/// value the reader folds to visible, `Data` untouched (no attribute).
+fn writeS3bSheetStateFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    {
+        var w = xlsx.Writer.init(alloc);
+        defer w.deinit();
+        for ([_][]const u8{ "Data", "Ledger", "Secret", "Odd" }) |sheet_name| {
+            var sheet = try w.addSheet(sheet_name);
+            try sheet.writeRow(&.{.{ .string = sheet_name }});
+        }
+        try w.save(io, path);
+    }
+    const patch = zlsx_pkg.pivots.fixture.patchPart;
+    try patch(alloc, io, path, "xl/workbook.xml", "name=\"Ledger\"", "name=\"Ledger\" state=\"hidden\"");
+    try patch(alloc, io, path, "xl/workbook.xml", "name=\"Secret\"", "name=\"Secret\" state=\"veryHidden\"");
+    try patch(alloc, io, path, "xl/workbook.xml", "name=\"Odd\"", "name=\"Odd\" state=\"bogus\"");
+    return path;
+}
+
+// The three codes are the header's literals (`include/zlsx.h`
+// ZLSX_SHEET_STATE_*), pinned here and static-asserted in
+// tests/c_abi_smoke.c so the two hand-maintained spellings cannot
+// drift apart.
+test "S3b sheet_state: the codes are the header's" {
+    try std.testing.expectEqual(@as(i32, 0), ZLSX_SHEET_STATE_VISIBLE);
+    try std.testing.expectEqual(@as(i32, 1), ZLSX_SHEET_STATE_HIDDEN);
+    try std.testing.expectEqual(@as(i32, 2), ZLSX_SHEET_STATE_VERY_HIDDEN);
+}
+
+test "S3b sheet_state: the reader's <sheet state> through the C ABI — the schema default, out of range, the buffer opener" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3bSheetStateFixture(io, &tt, "s3b_sheet_state.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+
+    // Hidden sheets stay in the inventory — the count and the names
+    // are what they were before the patch.
+    try std.testing.expectEqual(@as(u32, 4), zlsx_sheet_count(book.?));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 0)); // no attribute
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_HIDDEN, zlsx_sheet_state(book.?, 1));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VERY_HIDDEN, zlsx_sheet_state(book.?, 2));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 3)); // `bogus` folds to the default
+    // Out of range is -1, never a code — the first index past the end
+    // and the far end of the u32 range alike.
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, 4));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, std.math.maxInt(u32)));
+    // Composes with the name lookup: the veryHidden sheet is found by
+    // name and its rows still read — nothing about visibility gates
+    // the data.
+    const secret = zlsx_sheet_index_by_name(book.?, "Secret", 6);
+    try std.testing.expectEqual(@as(i32, 2), secret);
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VERY_HIDDEN, zlsx_sheet_state(book.?, @intCast(secret)));
+    var name_buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), zlsx_sheet_name(book.?, 2, &name_buf, name_buf.len));
+    try std.testing.expectEqualStrings("Secret", std.mem.sliceTo(&name_buf, 0));
+
+    // The buffer opener models the same field from the same bytes.
+    var from_bytes: ?*Book = null;
+    {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 24));
+        from_bytes = zlsx_book_open_buffer(bytes.ptr, bytes.len, &err_buf, err_buf.len);
+        std.testing.allocator.free(bytes);
+    }
+    try std.testing.expect(from_bytes != null);
+    defer zlsx_book_close(from_bytes);
+    for ([_]i32{ ZLSX_SHEET_STATE_VISIBLE, ZLSX_SHEET_STATE_HIDDEN, ZLSX_SHEET_STATE_VERY_HIDDEN, ZLSX_SHEET_STATE_VISIBLE }, 0..) |want, i| {
+        try std.testing.expectEqual(want, zlsx_sheet_state(from_bytes.?, @intCast(i)));
+    }
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(from_bytes.?, 4));
+}
+
+test "S3b sheet_state: a fresh writer's sheets carry no attribute and read visible" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3aFixture(io, &tt, "s3b_sheet_state_fresh.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const book = zlsx_book_open(path, &err_buf, err_buf.len);
+    try std.testing.expect(book != null);
+    defer zlsx_book_close(book);
+    try std.testing.expectEqual(@as(u32, 2), zlsx_sheet_count(book.?));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 0));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 1));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, 2));
 }

@@ -3684,3 +3684,96 @@ def test_s3a_capability_probes_require_their_release_symbols():
     if ffi._HAS_PIVOTS:
         assert ffi._HAS_DIAG_RELEASE and ffi._HAS_BUFFER_RELEASE
         assert hasattr(ffi.lib, "zlsx_buffer_release")
+
+
+# ─── S3b slice 10: sheet visibility on the reader handle ─────────────
+
+
+def _sheet_state_workbook(path):
+    """Four sheets through the writer, then `state` attributes spliced
+    into `xl/workbook.xml` through the archive — the writer authors no
+    sheet state: `Ledger` hidden, `Secret` veryHidden, `Odd` an
+    unrecognised value the reader folds to visible, `Data` untouched
+    (no attribute at all)."""
+    with zlsx.write(path) as w:
+        for name in ("Data", "Ledger", "Secret", "Odd"):
+            w.add_sheet(name).write_row([name])
+    _patch_parts(path, [
+        ("xl/workbook.xml", b'name="Ledger"', b'name="Ledger" state="hidden"'),
+        ("xl/workbook.xml", b'name="Secret"', b'name="Secret" state="veryHidden"'),
+        ("xl/workbook.xml", b'name="Odd"', b'name="Odd" state="bogus"'),
+    ])
+
+
+_SHEET_STATE_EXPECTED = ["visible", "hidden", "veryHidden", "visible"]
+
+
+def _require_sheet_state():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_SHEET_STATE:
+        pytest.skip("libzlsx lacks zlsx_sheet_state (0.9.0+)")
+
+
+def test_book_sheet_state_reads_the_workbook_attribute(tmp_path):
+    _require_sheet_state()
+    path = tmp_path / "sheet_state.xlsx"
+    _sheet_state_workbook(path)
+    with zlsx.open(path) as book:
+        # Hidden sheets stay in the inventory and read like any other.
+        assert book.sheets == ["Data", "Ledger", "Secret", "Odd"]
+        assert [book.sheet_state(i) for i in range(4)] == _SHEET_STATE_EXPECTED
+        assert book.sheet_state("Secret") == "veryHidden"
+        assert book.sheet("Ledger").state == "hidden"
+        assert list(book.sheet("Secret").rows()) == [["Secret"]]
+        # The selector rule is `sheet()`'s, error for error.
+        with pytest.raises(IndexError):
+            book.sheet_state(4)
+        with pytest.raises(IndexError):
+            book.sheet_state(-1)
+        with pytest.raises(KeyError):
+            book.sheet_state("Nope")
+        with pytest.raises(TypeError):
+            book.sheet_state(1.5)
+        secret = book.sheet(2)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.sheet_state(0)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        secret.state
+    # The buffer opener models the same field from the same bytes.
+    with zlsx.open_bytes(path.read_bytes()) as book:
+        assert [book.sheet(i).state for i in range(4)] == _SHEET_STATE_EXPECTED
+
+
+def test_book_sheet_state_fresh_writer_is_visible(tmp_path):
+    """The writer authors no `state` attribute; the schema default is
+    what the reader reports for every sheet it wrote."""
+    _require_sheet_state()
+    path = tmp_path / "sheet_state_fresh.xlsx"
+    with zlsx.write(path) as w:
+        w.add_sheet("A").write_row([1])
+        w.add_sheet("B").write_row([2])
+    with zlsx.open(path) as book:
+        assert [book.sheet_state(i) for i in range(2)] == ["visible", "visible"]
+        assert [book.sheet(n).state for n in ("A", "B")] == ["visible", "visible"]
+
+
+def test_book_sheet_state_matches_the_cli_spelling(tmp_path):
+    """`zlsx list-sheets` prints `SheetState.toString()` of the field
+    this getter reports — the same spelling, sheet for sheet. Runs only
+    where a local CLI build sits beside the dylib."""
+    import json
+    import subprocess
+
+    _require_sheet_state()
+    cli = REPO_ROOT / "zig-out" / "bin" / "zlsx"
+    if not cli.exists():
+        pytest.skip("no local zlsx CLI build at zig-out/bin/zlsx")
+    path = tmp_path / "sheet_state_cli.xlsx"
+    _sheet_state_workbook(path)
+    out = subprocess.run([str(cli), "list-sheets", str(path)], check=True, capture_output=True, text=True).stdout
+    records = [json.loads(line) for line in out.splitlines() if line]
+    with zlsx.open(path) as book:
+        assert [(r["sheet_idx"], r["sheet"], r["state"]) for r in records] == [
+            (i, name, book.sheet_state(i)) for i, name in enumerate(book.sheets)
+        ]
+    assert [r["state"] for r in records] == _SHEET_STATE_EXPECTED

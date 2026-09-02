@@ -50,7 +50,7 @@ zlsx meta file.xlsx --output pretty-json
 | `zlsx styles <file>` | `"style"` | `idx, font, fill, border, num_fmt` (workbook-wide) |
 | `zlsx sst <file>` | `"sst"` | `idx, text, runs?` (workbook-wide) |
 | `zlsx meta <file>` | `"workbook"` + `"sheet"` | workbook record first, then per-sheet records |
-| `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx, state` — lighter-weight than `meta` |
+| `zlsx list-sheets <file>` | `"sheet"` | `sheet, sheet_idx, state` — lighter-weight than `meta` — [contract](#list-sheets--names-and-visibility) |
 
 #### `pivots` — the typed pivot read
 
@@ -563,6 +563,27 @@ exit 2. There is no sheet dimension: sheet selectors, `--format` and
 `--output compact-ndjson` are tolerated and ignored (the `doc-props` /
 `meta` wrapper-friendliness), and `--skip` / `--take` do not apply to
 a single-record report.
+
+#### `list-sheets` — names and visibility
+
+`zlsx list-sheets <file>` emits one `{"kind":"sheet",…}` record per
+workbook sheet, in workbook order:
+
+| Field | Meaning |
+|---|---|
+| `sheet` | The sheet's name, entity-decoded. |
+| `sheet_idx` | Its 0-based position in the workbook's `<sheets>` list. |
+| `state` | The `<sheet state="…">` attribute as the reader modelled it: `visible`, `hidden` (Excel's *Hide*) or `veryHidden` (unreachable from Excel's UI — only VBA / the object model reveals such a sheet, so this stream is how a caller scanning a workbook learns it exists). A missing or unrecognised attribute reads as `visible`, the schema default — visibility never fails an open. |
+
+Hidden sheets stay in the inventory: `sheet_idx` counts them, `--sheet` /
+`--name` select them, `rows` reads them. The same field reaches the C ABI
+as `zlsx_sheet_state` (a code — 0 `visible` / 1 `hidden` / 2
+`veryHidden`, `-1` out of range) and py-zlsx as `Book.sheet_state(selector)`
+/ `Sheet.state` (this exact spelling), so the three surfaces agree sheet
+for sheet. `--output pretty-json` collapses the stream into one
+`{"sheets": […]}` object; `meta` carries the same per-sheet records (plus
+`has_comments`) after its workbook record, which tallies them as
+`hidden_sheet_count` / `very_hidden_sheet_count`.
 
 ### Edit (load-modify-save)
 

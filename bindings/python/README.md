@@ -24,6 +24,7 @@ import zlsx
 
 with zlsx.open("workbook.xlsx") as book:
     print(book.sheets)                       # ['Summary', 'Details', ...]
+    print(book.sheet_state("Summary"))      # 'visible' | 'hidden' | 'veryHidden'
 
     for row in book.sheet(0).rows():
         # row is a list; cell types map to Python:
@@ -531,6 +532,10 @@ with zlsx.write("out.xlsx") as w:
   records as dicts (the extent and the first view's pane as authored, split
   panes included) — and `Editor.calc_props()` / `zlsx.calc_props(path)` — the
   one `zlsx calc-props` record as a dict
+- Sheet visibility (0.9.0+): `Book.sheet_state(selector)` / `Sheet.state` —
+  the `<sheet state>` attribute as `zlsx list-sheets` spells it (`visible` /
+  `hidden` / `veryHidden`; a missing or unrecognised value reads `visible`);
+  hidden sheets stay in `Book.sheets` and read like any other
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

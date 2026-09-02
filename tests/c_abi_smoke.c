@@ -56,6 +56,9 @@
 #if !defined(ZLSX_HAS_SHEET_PROPS)
 #error "ZLSX_HAS_SHEET_PROPS missing"
 #endif
+#if !defined(ZLSX_HAS_SHEET_STATE)
+#error "ZLSX_HAS_SHEET_STATE missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -67,6 +70,12 @@ ZLSX_STATIC_ASSERT(sizeof(zlsx_recalc_report_v1) == 168, report_size);
 ZLSX_STATIC_ASSERT(sizeof(zlsx_value_elem_v1) == 32, value_elem_size);
 ZLSX_STATIC_ASSERT(sizeof(zlsx_value_v1) == 56, value_size);
 ZLSX_STATIC_ASSERT(sizeof(zlsx_formula_cell_v1) == 40, formula_cell_size);
+/* S3b slice 10: the sheet-state codes are src/c_abi.zig's literals
+ * (`ZLSX_SHEET_STATE_*`, pinned there too) — two hand-maintained
+ * spellings, one value each. */
+ZLSX_STATIC_ASSERT(ZLSX_SHEET_STATE_VISIBLE == 0, sheet_state_visible_code);
+ZLSX_STATIC_ASSERT(ZLSX_SHEET_STATE_HIDDEN == 1, sheet_state_hidden_code);
+ZLSX_STATIC_ASSERT(ZLSX_SHEET_STATE_VERY_HIDDEN == 2, sheet_state_very_hidden_code);
 
 /* Taking each export's address forces the prototypes to exist and to
  * have function type; the array keeps the compiler from eliding them. */
@@ -119,3 +128,10 @@ const void *zlsx_c_abi_smoke_anchor_m9a2(void);
 const void *zlsx_c_abi_smoke_anchor_m9a2(void) { return m9a2_exports[0]; }
 const void *zlsx_c_abi_smoke_anchor_s3a(void);
 const void *zlsx_c_abi_smoke_anchor_s3a(void) { return s3a_exports[0]; }
+
+/* S3b slice 10: sheet visibility on the reader handle. */
+static const void *const s3b10_exports[] = {
+    (const void *)&zlsx_sheet_state,
+};
+const void *zlsx_c_abi_smoke_anchor_s3b10(void);
+const void *zlsx_c_abi_smoke_anchor_s3b10(void) { return s3b10_exports[0]; }

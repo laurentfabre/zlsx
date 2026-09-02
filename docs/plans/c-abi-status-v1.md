@@ -906,3 +906,61 @@ fixture through the archive (the writer emits no `<dimension>` / no
 and the JSON types (`True`, not `1`), the rename + insert-row moves,
 the split-pane refusal, the mark-recalc flip, the refusal shapes on
 both reads and the closed-editor error.
+
+## 16. S3b slice 10 — the sheet-visibility read (2026-09-02)
+
+One export on the READER handle. The row's Zig surface is the reader's
+`Sheet.state`, and the C reader family (`zlsx_sheet_count` /
+`zlsx_sheet_name` / `zlsx_sheet_index_by_name`) is where per-sheet
+scalars live; the editor's C surface enumerates no sheets at all, so
+an NDJSON handover over `Workbook` (the slice-2/6/7/9 shape) would
+have invented a second inventory for one enum per sheet. One macro,
+one probe, no release function:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_sheet_state(book, idx) → int32_t` | `_HAS_SHEET_STATE` | `ZLSX_HAS_SHEET_STATE` |
+
+**The value is the CLI's**: `zlsx list-sheets` prints
+`SheetState.toString()` of `Book.sheets[idx].state`; the export returns
+that field as a code — `ZLSX_SHEET_STATE_VISIBLE` 0 / `_HIDDEN` 1 /
+`_VERY_HIDDEN` 2, `xlsx.SheetState`'s declaration order, spelled in
+`include/zlsx.h` and `src/c_abi.zig` and pinned to the literals on
+both sides (a Zig test, a smoke-test static assert) — and Python maps
+the code back to the OOXML spelling the CLI prints (`"visible"` /
+`"hidden"` / `"veryHidden"`): `Book.sheet_state(selector)` by index or
+by name under `Book.sheet()`'s selector rule (the two now share
+`Book._sheet_index`, so a bad selector is the same `IndexError` /
+`KeyError` / `TypeError` on both), and `Sheet.state` for a selected
+sheet. The reader's rule carries over unchanged: a missing or
+unrecognised `state` attribute reads as visible, the schema default
+(`SheetState.parse` — visibility never fails an open), and hidden
+sheets stay in the inventory: count, names, lookup and the row
+iterators enumerate them regardless, which is the point — a
+`veryHidden` sheet is unreachable from Excel's UI, and this getter is
+how a caller scanning a workbook learns it exists. Out of range is
+`-1`, never a code (the `zlsx_sheet_index_by_name` convention); there
+is no diag, no errbuf and no allocation — the book owns the field, and
+both openers (`zlsx_book_open`, `zlsx_book_open_buffer`) model it from
+the same parse.
+
+**Not a `zlsx_status_v1` export, deliberately**: nothing here can
+refuse. The lenient reader decided the field at open (an archive it
+cannot open never yields a handle), and a scalar getter on a live
+handle has no failure the caller did not cause. The §10 vocabulary is
+untouched; no refusal name, no `-2`.
+
+**Tests** (`src/c_abi.zig`, "S3b sheet_state …"): the three codes are
+the header's literals; a writer fixture with `state` attributes
+spliced through the archive (the writer authors none — `Ledger`
+hidden, `Secret` veryHidden, `Odd` an unrecognised value, `Data` no
+attribute) reads 0 / 1 / 2 / 0 through the path opener and the buffer
+opener, `-1` at the first index past the end and at `UINT32_MAX`, the
+veryHidden sheet found by name with its rows intact and the count
+unchanged; a fresh writer's sheets read visible. `tests/c_abi_smoke.c`
+`#error`s without the macro, static-asserts the three codes and takes
+the address. Python (`test_basic.py`, "sheet_state"): the spellings by
+index and by name, `Sheet.state`, the selector errors, the closed-book
+error on both, `open_bytes` parity, the fresh-writer default, and —
+where a local CLI build sits beside the dylib — `zlsx list-sheets`'s
+`state` equal to `Book.sheet_state` sheet for sheet.
