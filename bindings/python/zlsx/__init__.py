@@ -3838,7 +3838,9 @@ class Editor:
         served faithfully raises :class:`ZlsxRefusal`
         (``MalformedWorkbookXml`` for a sheet list the strict workbook
         read cannot prove, ``MalformedSheetXml`` for a sheet part the
-        strict walk cannot) rather than return a record that lies."""
+        strict walk cannot, ``ZipBombSuspected`` for an archive past
+        the decompression caps) rather than return a record that
+        lies."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_CONDITIONAL_FORMATS:

@@ -102,13 +102,21 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// What `collect` itself can raise — `Error` plus the two verdicts
+/// that keep their own names across every boundary: the archive-wide
+/// decompression caps, and a sheet part the store lost between the
+/// graph proof and the walk. Closed and explicit so the C boundary's
+/// status mapping is compiler-checked, not assumed (Codex #216 r1
+/// S3B-ERR-602).
+pub const CollectError = Error || error{ ZipBombSuspected, MissingSheetPart };
+
 /// Collect every rule of every workbook sheet. A read this module
 /// cannot serve faithfully refuses whole — even for a sheet the CLI's
 /// selection would exclude: the inventory is proven whole before
 /// selection and pagination apply, the `anchors` rule. A sheet the
 /// workbook itself cannot place (a dangling relationship, a part the
 /// archive does not hold) passes through as `Workbook`'s own error.
-pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
+pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) CollectError!ConditionalFormats {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -125,7 +133,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     defer strict_sheets.deinit(gpa);
     {
         const wb_part = (wb.store.part("xl/workbook.xml") catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedWorkbookXml,
         }) orelse return error.MalformedWorkbookXml;
         try scanWorkbookSheets(gpa, wb_part.bytes, &strict_sheets);
@@ -162,7 +171,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
     // (Codex #215 r6 SEC-601).
     {
         const rels_part = wb.store.part("xl/_rels/workbook.xml.rels") catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedWorkbookXml,
         };
         if (rels_part) |rp| {
@@ -197,9 +207,22 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         for (sheet_rel_leaves) |leaf| typed = typed or drawings.relTypeIs(rel.type, leaf);
         if (!typed) return error.MalformedWorkbookXml;
         if (rel.target_mode == .external) return error.MalformedWorkbookXml;
-        const name = (try wb.store.resolve("xl/workbook.xml", rel.target)) orelse
+        // Resolved into the VIEW arena, not the store's lifetime arena
+        // — a long-lived editor repeats this read per call, and the
+        // store variant would retain every resolved path until close
+        // (Codex #216 r1 S3B-MEM-603).
+        const name = (try wb.store.resolveOwned(a, "xl/workbook.xml", rel.target)) orelse
             return error.MalformedWorkbookXml;
-        if ((try wb.store.part(name)) == null) return error.MalformedWorkbookXml;
+        // This lookup MATERIALISES on first touch — its store failures
+        // fold like every other part read here, or a bad CRC would
+        // escape with the zip layer's own name (Codex #216 r1
+        // S3B-ERR-602). The sheet loop below then only cache-hits.
+        const probed = wb.store.part(name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
+            else => return error.MalformedWorkbookXml,
+        };
+        if (probed == null) return error.MalformedWorkbookXml;
         const g = try seen_targets.getOrPut(gpa, name);
         if (g.found_existing) return error.MalformedWorkbookXml;
         sheet_parts[i] = name;
@@ -211,7 +234,8 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         // and the archive-wide budget keep their names, everything
         // else is "this sheet is not readable".
         const part = (wb.store.part(sheet_parts[idx]) catch |e| switch (e) {
-            error.OutOfMemory, error.ZipBombSuspected => return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ZipBombSuspected => return error.ZipBombSuspected,
             else => return error.MalformedSheetXml,
         }) orelse return error.MissingSheetPart;
 
@@ -235,7 +259,7 @@ pub fn collect(gpa: Allocator, wb: *workbook_mod.Workbook) !ConditionalFormats {
         // typed view; the strict walk's verdict stands alone.
         if (root == .worksheet) {
             var gate = sheet_xml.parse(gpa, part.bytes) catch |e| switch (e) {
-                error.OutOfMemory => return e,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => return error.MalformedSheetXml,
             };
             gate.deinit(gpa);

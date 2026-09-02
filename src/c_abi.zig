@@ -5956,6 +5956,13 @@ const structural_refusals = [_]anyerror{
     // path ever surface them unfolded.
     error.LastSheetUndeletable,
     error.SheetNameInUse,
+    // The archive-wide decompression caps (S1, `decompress_limits`) —
+    // a statement about the workbook's shape, not the machine, so it
+    // crosses typed like the other refusals rather than as a generic
+    // -1 with no diag (Codex #216 r1 S3B-ERR-601). Every editor read
+    // that materialises parts can raise it: pivots, defined-names,
+    // conditional-formats, the structural edits.
+    error.ZipBombSuspected,
 };
 
 fn isStructuralRefusal(e: anyerror) bool {
@@ -7981,6 +7988,21 @@ test "S3b conditional_formats_ndjson: the shared writer's bytes, current after a
         try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"") != null);
         zlsx_buffer_release(out_ptr, out_len);
 
+        // A row insert moves the ENVELOPE with the bodies — sqref and
+        // formula on one grid, no save in between (Codex #216 r1
+        // S3B-REL-301: before the sqref shift, `B1>3` moved to `B2>3`
+        // while `sqref="B1:B4"` stayed).
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const moved = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sqref\":\"A2:A5\",\"rule_type\":\"cellIs\",\"formulas\":[\"2\",\"4\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sqref\":\"B2:B5\",\"rule_type\":\"expression\",\"formulas\":[\"B2>3\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sqref\":\"C2:C5\",\"rule_type\":\"colorScale\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sqref\":\"D2:D5\",\"rule_type\":\"dataBar\"") != null);
+        // The other sheet's rules did not move.
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"sheet\":\"Report\",\"sheet_idx\":1,\"sqref\":\"A1:A2\"") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+
         // NULL out pointers are about the call — either one, with the
         // present one reset from its poison.
         try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_conditional_formats_ndjson(ed, null, &out_len, &diag, &err_buf, err_buf.len));
@@ -8054,6 +8076,85 @@ test "S3b conditional_formats_ndjson: an inventory the read cannot serve refuses
     try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
     try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+test "S3b conditional_formats_ndjson: a broken SECOND sheet refuses whole — no partial stream" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf_broken2.xlsx");
+    defer alloc.free(path);
+    // The FIRST sheet's four records are perfectly servable; the bad
+    // entity sits in the second sheet's formula. An implementation
+    // that streamed per sheet would hand out the first four before
+    // failing — the whole-inventory rule forbids exactly that.
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet2.xml", "$A1=", "$A1&bogus;=");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+test "S3b conditional_formats_ndjson: a sheet list the strict read cannot prove is MalformedWorkbookXml" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf_wb_broken.xlsx");
+    defer alloc.free(path);
+    // A bad entity in a sheet-name carrier: the workbook-level decode
+    // refuses before any sheet part is walked.
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "name=\"Report\"", "name=\"Rep&bogus;ort\"");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+    try std.testing.expectEqualStrings("MalformedWorkbookXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expect(out_ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
+}
+
+test "S3b conditional_formats_ndjson: a part the archive cannot materialise folds at the graph probe" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3bConditionalFormatsFixture(io, &tt, "s3b_cf_crc.xlsx");
+    defer alloc.free(path);
+    // A flipped byte deep in the second sheet's stored payload: the
+    // graph probe materialises it first, so the zip layer's own error
+    // folds to the graph's verdict there rather than escaping as a
+    // generic -1 (Codex #216 r1 S3B-ERR-602).
+    try corruptPartPayload(alloc, io, path, "xl/worksheets/sheet2.xml");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = @ptrFromInt(0x1000);
+    var out_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
     try std.testing.expectEqual(plane_none, diag.plane);
     try std.testing.expect(out_ptr == null);
     try std.testing.expectEqual(@as(usize, 0), out_len);
@@ -8306,6 +8407,9 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.InternalSheetNameTooLong));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedWorkbookXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.IdSpaceExhausted));
+    // The decompression-caps verdict crosses typed, not as generic -1
+    // (Codex #216 r1 S3B-ERR-601).
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.ZipBombSuspected));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.TableColumnNotFound));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidTableColumnName));

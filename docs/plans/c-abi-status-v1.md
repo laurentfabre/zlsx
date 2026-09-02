@@ -591,12 +591,22 @@ crosses as `-3`, the pivots builder's rule. Python parses one JSON
 object per line (`Editor.conditional_formats()` /
 `zlsx.conditional_formats(path)`).
 
-**Two refusals, both already in the vocabulary**: a sheet list the
-strict workbook read cannot prove is `MalformedWorkbookXml`, a sheet
-part the strict walk cannot serve faithfully (the `docs/cli.md`
-contract: nesting, namespace shape, formula arity and markup, carriers
-that do not decode) is `MalformedSheetXml` — both `-2`, members of
-`structural_refusals` since S3a. No new name crosses.
+**The refusals, all already in the vocabulary**: a sheet list the
+strict workbook read cannot prove is `MalformedWorkbookXml` — a part
+the archive cannot materialise at the graph probe folds there too
+(round 1, S3B-ERR-602: a bad CRC no longer escapes with the zip
+layer's own name) — and a sheet part the strict walk cannot serve
+faithfully (the `docs/cli.md` contract: nesting, namespace shape,
+formula arity and markup, carriers that do not decode) is
+`MalformedSheetXml`; both `-2`, members of `structural_refusals` since
+S3a. `collect`'s error surface is the closed, compiler-checked
+`CollectError`: those two plus `OutOfMemory` (`-3`),
+`MissingSheetPart` (`-2`, typed but unreachable once the graph probe
+holds), and `ZipBombSuspected` — the S1 decompression-caps verdict,
+which round 1 (S3B-ERR-601) added to `structural_refusals` so it
+crosses `-2` with its name in the diag on EVERY editor read that
+materialises parts (pivots and defined-names included), not as a
+generic `-1`. No new name crosses.
 
 **Timing**: conditional formats live in the sheet parts, which
 structural edits and their DV/CF sweeps rewrite in place before the
@@ -604,18 +614,40 @@ call returns, and the sheet inventory is a fresh strict read of the
 current `xl/workbook.xml` — so edits (a rename renaming the `sheet`
 field, an insert moving `sqref` and the formula bodies) are visible
 immediately; staged cell writes never touch the rule machinery, so
-nothing about this read waits for save.
+nothing about this read waits for save. The `sqref` half of that
+claim is round 1's own repair (S3B-REL-301): the worksheet transform
+historically moved only the formula bodies — an insert rewrote
+`B1>3` to `B2>3` while `sqref="B1:B4"` stayed, a skew every consumer
+(Excel included, after save) could observe — and
+`pkg/sheet_edit.zig::processSqrefListTag` now shifts
+`conditionalFormatting@sqref` and `dataValidation@sqref` with the
+merge-rect interval semantics (shift / grow / shrink, a collapsed
+area dropped, the element kept as written when every area collapses
+or one does not parse — the `<xm:sqref>` posture). Repeated reads
+stay bounded: sheet targets resolve into the view's own arena
+(`PartStore.resolveOwned`, S3B-MEM-603), not the store's lifetime
+arena.
 
 **Tests** (`src/c_abi.zig`, "S3b conditional_formats_ndjson …"): the
 buffer equal to the shared writer's frozen stream (MNT-2302's literal)
 over the pkg fixture rebuilt through the C writer surface (one dxf,
-four rule kinds, an escaping-heavy expression); the rename visible with
-no save; `(NULL, 0)` on a workbook without rules with the poison reset;
+four rule kinds, an escaping-heavy expression); the rename AND a row
+insert visible with no save — the insert pinning `sqref` and formula
+on one grid (`A2:A5` beside `B2>3`), the other sheet unmoved; `(NULL,
+0)` on a workbook without rules with the poison reset;
 `NullOutPointer` / `InvalidInput` as call errors; poisoned outputs
 reset on the refusal and undersized-diag paths, the rejected diag
 byte-for-byte untouched; `-2` `MalformedSheetXml` on a bad entity in a
-formula body with nothing handed out and the name in diag + errbuf; an
-allocation-failure sweep over `conditionalFormatsNdjsonOwned` (caches
-primed first, the shared writer's own OOM-test shape). The smoke gate
-takes the address and `#error`s without the macro; the Python leg pins
-the parsed records, the refusal type and the closed-editor error.
+formula body with nothing handed out and the name in diag + errbuf;
+the whole-refusal pins round 1 added (S3B-TEST-605): a broken SECOND
+sheet behind four servable records refuses whole, a bad entity in a
+sheet-name carrier is `MalformedWorkbookXml`, a flipped payload byte
+folds at the graph probe, and `statusOf(ZipBombSuspected)` is `-2`;
+an allocation-failure sweep over `conditionalFormatsNdjsonOwned`
+(caches primed first, the shared writer's own OOM-test shape); the
+sqref-shift unit tests in `pkg/sheet_edit.zig` (insert above / inside,
+delete inside, collapse-drop, all-collapse keep, the column axis, the
+`dataValidations` wrapper decoy, the unshiftable whole-column
+posture). The smoke gate takes the address and `#error`s without the
+macro; the Python leg pins the parsed records, the insert-row move,
+both refusal shapes and the closed-editor error.

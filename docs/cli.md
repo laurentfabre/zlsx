@@ -402,7 +402,14 @@ nesting must prove like any other part's), while a `macrosheet`
 conditional formatting (`x14` data bars, icon sets carried under
 `<extLst>`) is a different tree and not part of this read — the edit
 paths move its `<xm:sqref>` / `<xm:f>` carriers with the grid (S2),
-but no read models it yet.
+but no read models it yet. The main-tree rule machinery moves whole
+under row / column edits too (S3b slice 6):
+`conditionalFormatting@sqref` and `dataValidation@sqref` shift with
+the grid — merge-rect interval semantics: shift, grow on an insert
+inside, shrink on a delete inside, a collapsed area dropped from the
+list — in the same edit that the formula sweep moves the `<formula>`
+bodies, so this read reports envelope and bodies on one grid after an
+edit.
 
 ### Edit (load-modify-save)
 

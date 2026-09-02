@@ -2881,8 +2881,9 @@ def test_conditional_formats_frozen_shape_and_empty_on_plain_workbook(tmp_path):
 
 
 def test_conditional_formats_read_the_editors_current_state(tmp_path):
-    """A sheet rename is visible immediately: the sheet inventory is
-    re-read from the current workbook.xml, no save in between."""
+    """A sheet rename is visible immediately, and a row insert moves
+    the ENVELOPE with the bodies — sqref and formula on one grid, no
+    save in between (Codex #216 r1 S3B-REL-301)."""
     _require_conditional_formats()
     _require_structural()
     src = tmp_path / "cf.xlsx"
@@ -2891,9 +2892,19 @@ def test_conditional_formats_read_the_editors_current_state(tmp_path):
     with zlsx.edit(src) as ed:
         ed.rename_sheet(0, "Facts")
         records = ed.conditional_formats()
-    sheets = [r["sheet"] for r in records]
-    assert sheets == ["Facts", "Facts", "Facts", "Facts", "Report"]
-    assert records[0]["sqref"] == "A1:A4"
+        sheets = [r["sheet"] for r in records]
+        assert sheets == ["Facts", "Facts", "Facts", "Facts", "Report"]
+        assert records[0]["sqref"] == "A1:A4"
+
+        ed.insert_row(0, 1)
+        moved = ed.conditional_formats()
+    assert [(r["sqref"], r["formulas"]) for r in moved] == [
+        ("A2:A5", ["2", "4"]),
+        ("B2:B5", ["B2>3"]),
+        ("C2:C5", []),
+        ("D2:D5", []),
+        ("A1:A2", ['$A1="R&D"']),  # the other sheet did not move
+    ]
 
 
 def test_conditional_formats_refusal_is_typed(tmp_path):
@@ -2921,6 +2932,21 @@ def test_conditional_formats_refusal_is_typed(tmp_path):
             ed.conditional_formats()
         assert info.value.error_name == "MalformedSheetXml"
         assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+
+    # A broken SECOND sheet refuses whole — the first sheet's four
+    # perfectly servable records are never handed out.
+    broken2 = tmp_path / "broken2.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(broken2, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/worksheets/sheet2.xml":
+                data = data.replace(b"$A1=", b"$A1&bogus;=")
+            zout.writestr(item, data)
+
+    with zlsx.edit(broken2) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.conditional_formats()
+        assert info.value.error_name == "MalformedSheetXml"
 
     ed = zlsx.edit(src)
     ed.close()

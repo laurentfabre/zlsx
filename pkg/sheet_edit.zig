@@ -9,19 +9,21 @@
 //! `<col min/max>`, `<mergeCell ref>`, `<dimension ref>`,
 //! `<pane xSplit/ySplit/topLeftCell>`, `<autoFilter ref>` +
 //! `<filterColumn colId>`, `<sheetView topLeftCell>`,
-//! `<selection activeCell/sqref>`, `<sortState ref>` and
-//! `<sortCondition ref>`.
+//! `<selection activeCell/sqref>`, `<sortState ref>`,
+//! `<sortCondition ref>`, `<conditionalFormatting sqref>` and
+//! `<dataValidation sqref>`.
 //!
 //! Both `applyRowEditToWorksheet` and `applyColEditToWorksheet`
 //! take the source sheet XML bytes and an edit kind, and return a
 //! freshly-allocated buffer with the row/col attributes shifted in
 //! place. The implementation is byte-walk + tag-recognition; it
-//! does NOT parse formulas, hyperlinks, data validations,
-//! conditional formats, drawings, or tables. Callers are expected
-//! to either refuse sheets that carry those constructs (legacy
-//! Editor's recordRowEdit / recordColEdit) or run the typed-overlay
-//! rewriters first (Workbook.rewriteAllFormulas etc.) and call
-//! these helpers on the resulting bytes.
+//! does NOT parse formulas, hyperlinks, drawings, or tables — and of
+//! a DV/CF block it moves only the `sqref` envelope. Callers run the
+//! typed-overlay rewriters (Workbook.rewriteAllFormulas, the DV/CF
+//! formula sweep, the table/drawing walkers) around these helpers;
+//! historically the legacy Editor refused such sheets instead
+//! (recordRowEdit / recordColEdit), which is why the envelope shift
+//! arrived late (Codex #216 r1 S3B-REL-301).
 
 const std = @import("std");
 const xlsx = @import("zlsx");
@@ -37,12 +39,11 @@ const max_col_1based = xlsx.max_col_1based;
 const getAttr = xlsx.getAttr;
 
 /// Apply one column edit (insert or delete at `col_1based`) to a
-/// worksheet XML buffer. iter-col-3/4 v1: rewrites `<c r="A1">`
-/// column letter, `<col min=N max=M>` bounds, `<mergeCells>` rect
-/// bounds, and `<dimension>`. Other elements pass through —
-/// recordColEdit refuses sheets that contain formulas / hyperlinks
-/// / validations / cond-formats / drawings / tables, so we don't
-/// have to handle those here.
+/// worksheet XML buffer: `<c r="A1">` column letters, `<col min/max>`
+/// bounds, merge rects, `<dimension>`, panes, autoFilter, view state,
+/// sort state, DV/CF `sqref` envelopes and `<xm:sqref>`. Formula
+/// bodies, hyperlinks, drawings and tables move in their own
+/// workbook-layer sweeps around this transform.
 pub fn applyColEditToWorksheet(
     allocator: Allocator,
     src: []const u8,
@@ -90,6 +91,12 @@ pub fn applyColEditToWorksheet(
             try processSortStateTagCol(allocator, &out, src, t, col_1based, kind, &i);
         } else if (matchTagAt(src, i, "sortCondition")) |t| {
             try processSortConditionTagCol(allocator, &out, src, t, col_1based, kind, &i);
+        } else if (matchTagAt(src, i, "conditionalFormatting")) |t| {
+            try processSqrefListTag(allocator, &out, src, t, "<conditionalFormatting".len, .col, col_1based, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "dataValidation")) |t| {
+            try processSqrefListTag(allocator, &out, src, t, "<dataValidation".len, .col, col_1based, kind);
+            i = t.after_open;
         } else if (matchTagAt(src, i, "xm:sqref")) |t| {
             try processXmSqrefTag(allocator, &out, src, t, .col, col_1based, kind, &i);
         } else {
@@ -820,6 +827,12 @@ pub fn applyRowEditToWorksheet(
             try processSortStateTagRow(allocator, &out, src, t, row, kind, &i);
         } else if (matchTagAt(src, i, "sortCondition")) |t| {
             try processSortConditionTagRow(allocator, &out, src, t, row, kind, &i);
+        } else if (matchTagAt(src, i, "conditionalFormatting")) |t| {
+            try processSqrefListTag(allocator, &out, src, t, "<conditionalFormatting".len, .row, row, kind);
+            i = t.after_open;
+        } else if (matchTagAt(src, i, "dataValidation")) |t| {
+            try processSqrefListTag(allocator, &out, src, t, "<dataValidation".len, .row, row, kind);
+            i = t.after_open;
         } else if (matchTagAt(src, i, "xm:sqref")) |t| {
             try processXmSqrefTag(allocator, &out, src, t, .row, row, kind, &i);
         } else {
@@ -1806,6 +1819,61 @@ pub fn processSelectionTagRow(
     return processSelectionTag(allocator, out, src, t, .row, row, kind);
 }
 
+/// Rewrite the `sqref` attribute of `<conditionalFormatting>`
+/// (ECMA-376 §18.3.1.18) and `<dataValidation>` (§18.3.2.32) — the
+/// DATA ranges a rule block or validation applies to, a
+/// space-separated list of A1 areas. Each area shifts by the
+/// merge-rect interval semantics (`shiftRefOrRange`: shift below an
+/// insert, grow on an insert inside, shrink on a delete inside) and a
+/// collapsed area drops from the list — Excel moves these ranges with
+/// the grid exactly like a merge. The FORMULA bodies of the same
+/// rules move separately, in the workbook layer's DV/CF sweep
+/// (`rewriteAllValidationsAndConditionalFormats`); this handler is
+/// what keeps the envelope and those bodies on one grid — before it,
+/// an insert rewrote `B1>3` to `B2>3` while `sqref="B1:B4"` stayed
+/// (Codex #216 r1 S3B-REL-301).
+///
+/// When every area collapses the element is kept as written: an empty
+/// `sqref` is schema-invalid, and excising an element with children
+/// mid-walk is not this walker's shape — the `<xm:sqref>` trade-off.
+/// An unshiftable area (a whole-column `A:A` spelling on the row
+/// axis, an entity-spelled ref) keeps the whole element untouched
+/// rather than a partially-shifted list, the file's failure posture.
+fn processSqrefListTag(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    src: []const u8,
+    t: TagOpen,
+    open_name_len: usize,
+    axis: Axis,
+    idx_1based: u32,
+    kind: RowEditKind,
+) !void {
+    const attrs = src[t.start + open_name_len .. t.after_open - 1];
+    const sq = getAttr(attrs, "sqref") orelse {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    };
+    var sq_out: std.ArrayListUnmanaged(u8) = .empty;
+    defer sq_out.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, sq, " \t\r\n");
+    while (it.next()) |entry| {
+        var ent_buf: [40]u8 = undefined;
+        const shifted = shiftRefOrRange(entry, axis, idx_1based, kind, &ent_buf) catch {
+            try out.appendSlice(allocator, src[t.start..t.after_open]);
+            return;
+        };
+        const keep = shifted orelse continue; // collapsed — drop this area
+        if (sq_out.items.len > 0) try sq_out.append(allocator, ' ');
+        try sq_out.appendSlice(allocator, keep);
+    }
+    if (sq_out.items.len == 0 or std.mem.eql(u8, sq_out.items, sq)) {
+        try out.appendSlice(allocator, src[t.start..t.after_open]);
+        return;
+    }
+    try writeWithReplacedAttr(allocator, out, src, t, open_name_len, "sqref", sq_out.items);
+}
+
 /// Rewrite `<pivotSelection activeRow="11" activeCol="1" previousRow="11"
 /// previousCol="1" …>` (ECMA-376 §18.3.1.62): the selection state of a
 /// pivot on the host sheet. The four are ABSOLUTE 0-based grid
@@ -2437,6 +2505,82 @@ test "selection sqref shifts every entry of a multi-range list" {
     const out = try applyRowEditToWorksheet(a, src, 1, .insert);
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "sqref=\"A3 C5:D7 F9\"") != null);
+}
+
+test "conditionalFormatting sqref shifts with the grid, children untouched (S3B-REL-301)" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<conditionalFormatting sqref=\"B1:B4\"><cfRule type=\"expression\" priority=\"1\"><formula>B1&gt;3</formula></cfRule></conditionalFormatting>");
+    defer a.free(src);
+    // Insert above: the whole range slides down — the same move the
+    // formula sweep gives its `<formula>` bodies, so envelope and body
+    // stay on one grid.
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<conditionalFormatting sqref=\"B2:B5\">") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<formula>B1&gt;3</formula>") != null);
+}
+
+test "conditionalFormatting sqref grows on an insert inside, shrinks on a delete inside" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<conditionalFormatting sqref=\"A2:A5\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src);
+    const grown = try applyRowEditToWorksheet(a, src, 3, .insert);
+    defer a.free(grown);
+    try testing.expect(std.mem.indexOf(u8, grown, "sqref=\"A2:A6\"") != null);
+    const shrunk = try applyRowEditToWorksheet(a, src, 3, .delete);
+    defer a.free(shrunk);
+    try testing.expect(std.mem.indexOf(u8, shrunk, "sqref=\"A2:A4\"") != null);
+}
+
+test "conditionalFormatting sqref drops a collapsed area, keeps the element when all collapse" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<conditionalFormatting sqref=\"A1 C3:D3 F8\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 3, .delete);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"A1 F7\"") != null);
+
+    // Every area collapsed: an empty sqref is schema-invalid, so the
+    // element keeps its bytes — the <xm:sqref> trade-off.
+    const src2 = try wrapSheet(a, "<conditionalFormatting sqref=\"C3:D3\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src2);
+    const out2 = try applyRowEditToWorksheet(a, src2, 3, .delete);
+    defer a.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "sqref=\"C3:D3\"") != null);
+}
+
+test "dataValidation sqref shifts; the dataValidations wrapper and a decoy name do not" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<dataValidations count=\"1\"><dataValidation type=\"list\" sqref=\"B2:B10\"><formula1>\"a,b\"</formula1></dataValidation></dataValidations>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<dataValidation type=\"list\" sqref=\"B3:B11\">") != null);
+    // The plural wrapper's own attributes never carry coordinates.
+    try testing.expect(std.mem.indexOf(u8, out, "<dataValidations count=\"1\">") != null);
+}
+
+test "conditionalFormatting sqref shifts on the column axis too" {
+    const a = testing.allocator;
+    const src = try wrapSheet(a, "<conditionalFormatting sqref=\"B1:B4 D2\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src);
+    const out = try applyColEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"C1:C4 E2\"") != null);
+    const dropped = try applyColEditToWorksheet(a, src, 4, .delete);
+    defer a.free(dropped);
+    try testing.expect(std.mem.indexOf(u8, dropped, "sqref=\"B1:B4\"") != null);
+}
+
+test "conditionalFormatting with an unshiftable area keeps the whole element" {
+    const a = testing.allocator;
+    // A whole-column area has no row on the row axis; a partially
+    // shifted list would lie, so the element keeps its bytes.
+    const src = try wrapSheet(a, "<conditionalFormatting sqref=\"A:A B1:B4\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
+    defer a.free(src);
+    const out = try applyRowEditToWorksheet(a, src, 1, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "sqref=\"A:A B1:B4\"") != null);
 }
 
 test "selection sqref drops only the entry whose range collapses" {
