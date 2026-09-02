@@ -5840,12 +5840,16 @@ pub const Workbook = struct {
     /// comments, pivot locations and sources.
     ///
     /// **Refusal contract.** Refuses with
-    /// `error.RowEditRequiresCleanSheet` if the sheet has any
-    /// staged appendRows or setCell deltas — those deltas index
-    /// into the pre-shift refs and would produce stale output — and
-    /// pre-mutation with the transform's and sweeps' own typed
-    /// verdicts (`docs/plans/c-abi-status-v1.md` §10) when a carrier
-    /// cannot be read or moved whole.
+    /// `error.SheetHasUnsavedMutations` / `error.SheetHasUnsavedAppends`
+    /// if the sheet has staged setCell deltas or appendRows — those
+    /// index into the pre-shift refs and would produce stale output
+    /// (the Editor layer folds both into
+    /// `RowEditRequiresCleanSheet`). The transform, extension, table
+    /// and pivot PREFLIGHTS refuse before the first mutation with
+    /// their `docs/plans/c-abi-status-v1.md` §10 typed verdicts; a
+    /// LATER sweep failure, once anything has installed, marks the
+    /// workbook torn (`StructuralEditIncomplete` on every subsequent
+    /// edit or save) — discard and reopen rather than ship the tear.
     pub fn insertRow(self: *Workbook, sheet_idx: u32, before_row: u32) Error!void {
         try self.applySheetEditTransform(sheet_idx, .{ .row = before_row, .kind = .insert }, null);
     }

@@ -2905,6 +2905,17 @@ test "non-elements pass through verbatim: a decoy tag inside a comment is prose 
     defer a.free(cout);
     try testing.expect(std.mem.indexOf(u8, cout, "<![CDATA[<dataValidation sqref=\"ZZZ\">]]>") != null);
     try testing.expect(std.mem.indexOf(u8, cout, "sqref=\"C2\"") != null);
+
+    // A PI inside a DTD subset whose text spells `] >` and a
+    // rule-shaped decoy: the whole declaration is one opaque
+    // construct — the decoy stays prose, the live sibling shifts
+    // (S3B-REL-908).
+    const dsrc = try wrapSheet(a, "<!DOCTYPE ws [<?pi ] > <mergeCell ref=\"B1:B4\"/> ?>]><mergeCell ref=\"B1:B4\"/>");
+    defer a.free(dsrc);
+    const dout = try applyRowEditToWorksheet(a, dsrc, 1, .insert);
+    defer a.free(dout);
+    try testing.expect(std.mem.indexOf(u8, dout, "<!DOCTYPE ws [<?pi ] > <mergeCell ref=\"B1:B4\"/> ?>]>") != null);
+    try testing.expect(std.mem.indexOf(u8, dout, "<mergeCell ref=\"B2:B5\"/>") != null);
 }
 
 test "dataValidation sqref shifts; the dataValidations wrapper and a decoy name do not" {

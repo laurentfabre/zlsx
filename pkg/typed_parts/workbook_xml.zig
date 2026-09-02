@@ -582,6 +582,16 @@ pub fn skipNonElement(xml: []const u8, at: usize) Error!usize {
                 i = end + 3;
                 continue;
             }
+            if (c == '<' and i + 2 <= xml.len and xml[i + 1] == '?') {
+                // A PI in the subset is opaque like a comment: its
+                // text can spell `]` and `>` that would otherwise
+                // close the subset and the declaration mid-PI (Codex
+                // #216 r7 S3B-REL-908).
+                const end = std.mem.indexOfPos(u8, xml, i + 2, "?>") orelse
+                    return error.MalformedXml;
+                i = end + 2;
+                continue;
+            }
             if (c == '[') {
                 subset_depth += 1;
                 i += 1;
@@ -875,6 +885,11 @@ test "skipNonElement: declarations scan structurally — subsets, conditional se
     // A quoted `>` is data.
     const q = "<!DOCTYPE a SYSTEM \"b>c\"><w/>";
     try std.testing.expectEqual(q.len - "<w/>".len, try skipNonElement(q, 0));
+    // A PI in the subset is opaque: its `]` and `>` close nothing —
+    // without the PI branch, this scan ended inside the PI and the
+    // walkers dispatched its rule-shaped prose (S3B-REL-908).
+    const pi = "<!DOCTYPE ws [<?pi ] > <conditionalFormatting sqref=\"Z9\"> ?>]><v/>";
+    try std.testing.expectEqual(pi.len - "<v/>".len, try skipNonElement(pi, 0));
     // An unterminated quote is an error, never a scan past the end.
     try std.testing.expectError(error.MalformedXml, skipNonElement("<!DOCTYPE a \"unclosed", 0));
 }
