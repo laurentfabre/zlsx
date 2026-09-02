@@ -93,8 +93,9 @@ pub const Record = union(enum) {
 /// strings; `deinit` frees them.
 pub const Anchors = struct {
     arena: std.heap.ArenaAllocator,
-    /// Decoded sheet names, parallel to `WorkbookXml.sheets` — the
-    /// inventory the CLI's selectors and the `sheet` field read from.
+    /// Decoded sheet names in workbook order — the strict inventory
+    /// (`conditional_format_ndjson.resolveSheets`) the CLI's selectors
+    /// and the `sheet` field read from.
     sheet_names: []const []const u8,
     records: []const Record,
 
