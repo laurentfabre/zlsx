@@ -70,14 +70,19 @@ pub fn applyColEditToWorksheet(
         // inside one is prose, not a tag — dispatching on it rewrote
         // (or, under the strict sqref posture, refused on) bytes that
         // are not elements (Codex #216 r4 S3B-REL-804). An
-        // unterminated construct falls through to the ordinary
-        // emit-`<`-and-continue posture.
+        // unterminated construct swallows the rest of the document,
+        // so the rest is emitted verbatim in one step — the
+        // one-byte-retry alternative rescanned the suffix per opener,
+        // O(n²) on attacker-controlled bytes (r5 S3B-PERF-902).
         if (i + 1 < src.len and (src[i + 1] == '!' or src[i + 1] == '?')) {
             if (workbook_xml.skipNonElement(src, i)) |end| {
                 try out.appendSlice(allocator, src[i..end]);
                 i = end;
                 continue;
-            } else |_| {}
+            } else |_| {
+                try out.appendSlice(allocator, src[i..]);
+                return try out.toOwnedSlice(allocator);
+            }
         }
 
         if (matchTagAt(src, i, "c")) |t| {
@@ -814,14 +819,18 @@ pub fn applyRowEditToWorksheet(
         try out.appendSlice(allocator, src[i..next_lt]);
         i = next_lt;
 
-        // Non-elements pass through verbatim — the column walker's
-        // rule (Codex #216 r4 S3B-REL-804).
+        // Non-elements pass through verbatim; an unterminated one
+        // swallows the rest of the document in one step — the column
+        // walker's rules (Codex #216 r4 S3B-REL-804, r5 S3B-PERF-902).
         if (i + 1 < src.len and (src[i + 1] == '!' or src[i + 1] == '?')) {
             if (workbook_xml.skipNonElement(src, i)) |end| {
                 try out.appendSlice(allocator, src[i..end]);
                 i = end;
                 continue;
-            } else |_| {}
+            } else |_| {
+                try out.appendSlice(allocator, src[i..]);
+                return try out.toOwnedSlice(allocator);
+            }
         }
 
         // Identify which tag we're at.
@@ -2831,6 +2840,30 @@ test "sqref validates BOTH axes strictly; the grammar refuses out-of-grid spelli
     const bad4 = try wrapSheet(a, "<conditionalFormatting sqref=\"A\"><cfRule type=\"containsBlanks\" priority=\"1\"/></conditionalFormatting>");
     defer a.free(bad4);
     try testing.expectError(error.MalformedXml, applyRowEditToWorksheet(a, bad4, 1, .insert));
+}
+
+test "shiftSqrefArea boundary table: reversed corners, dangling anchors, maximal spellings, TL deletes (S3B-TEST-905)" {
+    var buf: [40]u8 = undefined;
+    // Reversed corners refuse — Excel writes normalized.
+    try testing.expectError(error.MalformedXml, shiftSqrefArea("B4:A1", .row, 1, .insert, &buf));
+    try testing.expectError(error.MalformedXml, shiftSqrefArea("3:2", .row, 1, .insert, &buf));
+    // Dangling anchors refuse.
+    try testing.expectError(error.MalformedXml, shiftSqrefArea("A$", .row, 1, .insert, &buf));
+    try testing.expectError(error.MalformedXml, shiftSqrefArea("$", .row, 1, .insert, &buf));
+    try testing.expectError(error.MalformedXml, shiftSqrefArea("$A$", .row, 1, .insert, &buf));
+    // The maximal anchored spelling shifts and renders inside the
+    // caller's buffer.
+    const maxed = (try shiftSqrefArea("$XFD$1048575:$XFD$1048575", .row, 1, .insert, &buf)).?;
+    try testing.expectEqualStrings("$XFD$1048576:$XFD$1048576", maxed);
+    // Insert at the grid's last line overflows typed, never wraps.
+    try testing.expectError(error.RowEditExceedsMaxRow, shiftSqrefArea("A1048576", .row, 1, .insert, &buf));
+    try testing.expectError(error.ColEditExceedsMaxCol, shiftSqrefArea("XFD1", .col, 1, .insert, &buf));
+    // Delete at the TL of a multi-line span: TL holds (what slides up
+    // takes its place), BR shrinks.
+    try testing.expectEqualStrings("A2:A4", (try shiftSqrefArea("A2:A5", .row, 2, .delete, &buf)).?);
+    // A single CELL collapses under a delete of its row or column.
+    try testing.expect((try shiftSqrefArea("C3", .row, 3, .delete, &buf)) == null);
+    try testing.expect((try shiftSqrefArea("C3", .col, 3, .delete, &buf)) == null);
 }
 
 test "non-elements pass through verbatim: a decoy tag inside a comment is prose (S3B-REL-804)" {

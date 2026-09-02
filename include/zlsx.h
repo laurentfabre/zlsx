@@ -1757,7 +1757,9 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
  *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
  *     MalformedCommentsXml, MalformedTableXml, the *CoordinateOverflow
- *     trio, PivotEditUnsafe, MissingSheetPart, NoSheetData; a generic
+ *     trio, PivotEditUnsafe, SqrefCollapseUnsafe — a delete collapsing
+ *     EVERY area of a DV/CF sqref, which Excel resolves by deleting the
+ *     rule — MissingSheetPart, NoSheetData; a generic
  *     MalformedXml from a rewriter's consistency guard stays -1) — the
  *     full list is
  *     docs/plans/c-abi-status-v1.md §10; the typed worksheet parser's

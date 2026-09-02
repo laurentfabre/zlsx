@@ -2929,6 +2929,29 @@ def test_conditional_formats_between_moves_both_formulas(tmp_path):
     ]
 
 
+def test_conditional_formats_collapse_delete_refuses_typed(tmp_path):
+    """Deleting the only row a rule targets raises
+    `ZlsxRefusal(SqrefCollapseUnsafe)` and mutates nothing — Excel
+    deletes such a rule outright; zlsx refuses rather than silently
+    retarget it (Codex #216 r4 S3B-REL-805)."""
+    _require_conditional_formats()
+    _require_structural()
+    src = tmp_path / "cf_collapse.xlsx"
+    with zlsx.write(src) as w:
+        dxf = w.add_dxf(zlsx.Dxf(font_bold=True))
+        data = w.add_sheet("Data")
+        data.write_row([1, 2, 3, 4])
+        data.add_conditional_format_expression("A1:D1", "A1>0", dxf)
+
+    with zlsx.edit(src) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_row(0, 1)
+        assert info.value.error_name == "SqrefCollapseUnsafe"
+        assert [(r["sqref"], r["formulas"]) for r in ed.conditional_formats()] == [
+            ("A1:D1", ["A1>0"]),
+        ]
+
+
 def test_conditional_formats_refusal_is_typed(tmp_path):
     """An inventory the read cannot serve faithfully raises
     `ZlsxRefusal(MalformedSheetXml)` — never a partial list."""

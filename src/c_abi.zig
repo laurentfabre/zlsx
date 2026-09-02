@@ -8168,6 +8168,55 @@ test "S3b conditional_formats_ndjson: a part the archive cannot materialise fold
     try std.testing.expectEqual(@as(usize, 0), out_len);
 }
 
+test "S3b conditional_formats_ndjson: a delete collapsing a rule's whole target refuses typed, nothing mutates" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try tt.path(alloc, io, "s3b_cf_collapse.xlsx");
+    defer alloc.free(path);
+    {
+        const w = zlsx_writer_create(&err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_writer_close(w);
+        var dxf = std.mem.zeroes(CDxf);
+        dxf.bold = 1;
+        var dxf_id: u32 = 0;
+        if (zlsx_writer_add_dxf(w, &dxf, &dxf_id, &err_buf, err_buf.len) != 0)
+            return error.TestUnexpectedResult;
+        const s1 = "Data";
+        const sw1 = zlsx_writer_add_sheet(w, s1.ptr, s1.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        const row1 = [_]CCell{ toCCell(.{ .integer = 1 }), toCCell(.{ .integer = 2 }) };
+        if (zlsx_sheet_writer_write_row(sw1, &row1, row1.len, &err_buf, err_buf.len) != 0)
+            return error.TestUnexpectedResult;
+        const r1 = "A1:D1";
+        const fe = "A1>0";
+        if (zlsx_sheet_writer_add_conditional_format_expression(sw1, r1.ptr, r1.len, fe.ptr, fe.len, dxf_id, &err_buf, err_buf.len) != 0)
+            return error.TestUnexpectedResult;
+        if (zlsx_writer_save(w, path.ptr, path.len, &err_buf, err_buf.len) != 0)
+            return error.TestUnexpectedResult;
+    }
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    // The rule's whole target is row 1: the delete refuses typed at
+    // the pre-mutation probe (Excel deletes such a rule; zlsx cannot
+    // excise it mid-walk and refuses rather than retarget it).
+    try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_delete_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SqrefCollapseUnsafe", diagName(&diag));
+    try std.testing.expectEqualStrings("SqrefCollapseUnsafe", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    // Nothing mutated: the read still serves the original envelope.
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_conditional_formats_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    const got = out_ptr.?[0..out_len];
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"sqref\":\"A1:D1\",\"rule_type\":\"expression\",\"formulas\":[\"A1>0\"]") != null);
+    zlsx_buffer_release(out_ptr, out_len);
+}
+
 fn conditionalFormatsNdjsonForFailures(alloc: std.mem.Allocator, wb: *zlsx_pkg.Workbook) !void {
     const bytes = try conditionalFormatsNdjsonOwned(alloc, wb);
     alloc.free(bytes);

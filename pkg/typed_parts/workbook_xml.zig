@@ -558,11 +558,44 @@ pub fn skipNonElement(xml: []const u8, at: usize) Error!usize {
         return end + 2;
     }
     if (at + 2 <= xml.len and xml[at + 1] == '!') {
-        // `<!DOCTYPE …>` and friends. We consume up to the next bare
-        // `>` outside any quoted region. DOCTYPE is rare in xlsx but
-        // handling it keeps the scanner well-defined.
-        const close = try findBareGt(xml, at + 2);
-        return close + 1;
+        // `<!DOCTYPE …>` and friends. The declaration can carry an
+        // internal subset — `[` … `]` holding entity declarations,
+        // comments (whose text may hold `>`), and PIs — so the scan
+        // is structural: quotes, subset depth, and embedded comments
+        // all honoured. A bare-`>` scan stopped inside a subset
+        // comment and handed the walkers the DTD's prose as live
+        // markup (Codex #216 r5 S3B-REL-901). DOCTYPE is rare in
+        // xlsx but handling it keeps the scanner well-defined.
+        var i: usize = at + 2;
+        var subset_depth: usize = 0;
+        while (i < xml.len) {
+            const c = xml[i];
+            if (c == '"' or c == '\'') {
+                const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse
+                    return error.MalformedXml;
+                i = close + 1;
+                continue;
+            }
+            if (c == '<' and i + 4 <= xml.len and std.mem.eql(u8, xml[i .. i + 4], "<!--")) {
+                const end = std.mem.indexOfPos(u8, xml, i + 4, "-->") orelse
+                    return error.MalformedXml;
+                i = end + 3;
+                continue;
+            }
+            if (c == '[') {
+                subset_depth += 1;
+                i += 1;
+                continue;
+            }
+            if (c == ']') {
+                subset_depth -|= 1;
+                i += 1;
+                continue;
+            }
+            if (c == '>' and subset_depth == 0) return i + 1;
+            i += 1;
+        }
+        return error.MalformedXml;
     }
     return at;
 }
@@ -594,22 +627,6 @@ fn findTagEnd(xml: []const u8, attrs_start: usize) Error!?TagEnd {
         i += 1;
     }
     return null;
-}
-
-fn findBareGt(xml: []const u8, from: usize) Error!usize {
-    var i: usize = from;
-    while (i < xml.len) {
-        const c = xml[i];
-        if (c == '"' or c == '\'') {
-            const close = std.mem.indexOfScalarPos(u8, xml, i + 1, c) orelse
-                return error.MalformedXml;
-            i = close + 1;
-            continue;
-        }
-        if (c == '>') return i;
-        i += 1;
-    }
-    return error.MalformedXml;
 }
 
 /// Find the byte index just past `<section>` (the opening element of

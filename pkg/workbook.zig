@@ -16213,7 +16213,7 @@ test "rewrite DV: a dataValidationsX decoy keeps the raw walk in the view's inde
     try std.testing.expectEqualStrings("B8", dvs[1].formula1.?);
 }
 
-test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep (REL-401)" {
+test "rewrite DV/CF: DTD prose is never inventoried; the declaration survives byte-identical (REL-401, S3B-REL-903)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -16235,11 +16235,12 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-    // Prepend a DOCTYPE whose entity literal spells a whole rule. The
-    // sanitizer KEEPS DTD bytes, so the typed view counts the phantom
-    // rule at index 0 and the live rule at index 1 — the raw walk
-    // must count identically: `skipNonElement`, which steps over the
-    // declaration, put the phantom's replacement into the live rule.
+    // Prepend a DOCTYPE whose entity literal spells a whole rule.
+    // The sanitizer now skips declarations whole (Codex #216 r5
+    // S3B-REL-903), so the typed view holds ONLY the live rule and
+    // the whole edit — transform and sweep — leaves the DTD's bytes
+    // identical: the two halves of one edit may not disagree about
+    // the same prose.
     {
         var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
@@ -16267,10 +16268,9 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
             .{ .insert_cols = .{ .at = 4, .count = 1 } },
             ws_name_owned,
         );
-        // Phantom "Z9" → "AA9" (inside the DTD literal, as the view
-        // sees it) and live "D1" → "E1" — two rewrites, each landing
-        // in ITS OWN source occurrence.
-        try std.testing.expectEqual(@as(u32, 2), count);
+        // Only the live "D1" → "E1" — the DTD's rule-shaped entity
+        // literal is prose the view never inventories.
+        try std.testing.expectEqual(@as(u32, 1), count);
         try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
@@ -16279,11 +16279,12 @@ test "rewrite DV/CF: rule-shaped DTD entity literals stay in the view's lockstep
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const cfs = try ws.conditionalFormats();
-    try std.testing.expectEqual(@as(usize, 2), cfs.len);
-    try std.testing.expectEqualStrings("AA9", cfs[0].formula.?);
-    try std.testing.expectEqualStrings("E1", cfs[1].formula.?);
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>AA9</formula>") != null);
+    // The DTD survives byte-identical — sqref, priority and formula
+    // all as authored.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!ENTITY e '<conditionalFormatting sqref=\"Z1:Z2\"><cfRule type=\"expression\" priority=\"9\"><formula>Z9</formula></cfRule></conditionalFormatting>'>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 
@@ -16456,7 +16457,7 @@ test "rewrite DV/CF: the rewrite reads the CURRENT part bytes, cached views notw
     try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
 }
 
-test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync the splice (REL-501)" {
+test "rewrite DV/CF: comment markers nested inside a DTD literal stay prose, skipped whole (REL-501, S3B-REL-903)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -16479,12 +16480,13 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
     defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // The DTD's quoted literal holds a COMMENT-WRAPPED rule and a
-    // plain rule. The sanitizer copies the whole declaration verbatim
-    // (the markers sit inside quotes), so the typed view counts BOTH
-    // phantoms plus the live rule; a raw walk that skipped comment
-    // markers wherever they appeared counted one fewer and spliced a
-    // phantom's replacement into the live formula (Codex #215 r5
-    // REL-501 — the shape one level below r4's).
+    // plain rule — comment markers nested inside quotes, the shape
+    // that desynced the #215 r5 lockstep. Under the r5 slice-6
+    // contract (Codex #216 S3B-REL-903) the whole declaration is
+    // skipped structurally — quotes honoured first, so the nested
+    // markers never even read as comments — and NOTHING inside it is
+    // inventoried or swept: only the live rule moves, and the DTD
+    // survives byte-identical.
     {
         var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
         defer wb.deinit();
@@ -16512,9 +16514,9 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
             .{ .insert_cols = .{ .at = 4, .count = 1 } },
             ws_name_owned,
         );
-        // Comment-phantom Y9→Z9, phantom Z9→AA9, live D1→E1 — three
-        // rewrites, each landing in ITS OWN source occurrence.
-        try std.testing.expectEqual(@as(u32, 3), count);
+        // Only the live D1→E1 — the DTD's two rule-shaped phantoms
+        // are prose the view never inventories.
+        try std.testing.expectEqual(@as(u32, 1), count);
         try wb.save(io, tmp2_path);
     }
     defer std.Io.Dir.cwd().deleteFile(io, tmp2_path) catch {};
@@ -16523,13 +16525,13 @@ test "rewrite DV/CF: comment markers nested inside a DTD literal cannot desync t
     defer wb2.deinit();
     const ws = try wb2.sheet(0);
     const cfs = try ws.conditionalFormats();
-    try std.testing.expectEqual(@as(usize, 3), cfs.len);
-    try std.testing.expectEqualStrings("Z9", cfs[0].formula.?);
-    try std.testing.expectEqualStrings("AA9", cfs[1].formula.?);
-    try std.testing.expectEqualStrings("E1", cfs[2].formula.?);
+    try std.testing.expectEqual(@as(usize, 1), cfs.len);
+    try std.testing.expectEqualStrings("E1", cfs[0].formula.?);
     const part = (try wb2.store.part(ws.resolved_part_name.?)).?;
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <conditionalFormatting sqref=\"Y1\"><cfRule type=\"expression\" priority=\"8\"><formula>Z9</formula>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "priority=\"9\"><formula>AA9</formula>") != null);
+    // The DTD — nested comment markers, both phantoms — survives
+    // byte-identical.
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<!-- <conditionalFormatting sqref=\"Y1\"><cfRule type=\"expression\" priority=\"8\"><formula>Y9</formula>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.bytes, "priority=\"9\"><formula>Z9</formula>") != null);
     try std.testing.expect(std.mem.indexOf(u8, part.bytes, "<formula>E1</formula>") != null);
 }
 

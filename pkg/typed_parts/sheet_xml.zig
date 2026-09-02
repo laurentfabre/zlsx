@@ -454,6 +454,19 @@ fn sanitizeXml(
             i = close + 2;
             continue;
         }
+        if (i + 2 <= xml.len and xml[i + 1] == '!') {
+            // A declaration — `<!DOCTYPE …>` with a possible internal
+            // subset — skipped whole like a comment: DTD prose is not
+            // markup, and treating it as a plain tag let a rule-shaped
+            // entity literal inside it be inventoried as a live DV/CF
+            // rule and swept, while the transform (correctly) passed
+            // the DTD through verbatim — the two halves of one edit
+            // disagreeing about the same bytes (Codex #216 r5
+            // S3B-REL-903). The comment and CDATA prefixes were
+            // consumed above, so this is the declaration branch alone.
+            i = wbxml.skipNonElement(xml, i) catch return error.MalformedXml;
+            continue;
+        }
         // Plain tag — copy through to the matching `>`, respecting
         // quoted attribute values (`>` inside `attr="..."` is data).
         const end = findTagEnd(xml, i) orelse return error.MalformedXml;
