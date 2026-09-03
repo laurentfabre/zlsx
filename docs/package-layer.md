@@ -163,13 +163,20 @@ function pointer to keep the graph a DAG.
   walker silently skips them.
 - **External-workbook chart series refs** (`[Book.xlsx]Sheet1!A1`
   patterns inside `<c:f>`) — surfaced verbatim in `series_refs`;
-  no path-resolution or external-part fetching.
+  no path-resolution or external-part fetching. Local refs, by
+  contrast, ride the formula rewriter under every structural edit
+  (`Workbook.rewriteAllChartFormulas`, over the same carrier walk
+  `chartAnchors` reads with — `ChartFormulaWalk`), so a rename or a
+  row / column edit on the named sheet respells them in the part.
 - **Pivot tables** — read as a typed graph (`Workbook.pivotTables`;
   `zlsx_pkg.pivots.collect` over a `PartStore` plus its parsed
   `typed_parts.workbook_xml` view): tables with host
   sheet and output rectangle, caches with their source resolved to the
-  sheet it reads from, field schema, records part. Never emitted or
-  rewritten; the parts stay byte-preserved through every edit.
+  sheet it reads from, field schema, records part. Moved by the
+  structural edits — a hosted rectangle's `location@ref` (S7a), a
+  source's range with the cache rebuilt and its consumers re-laid
+  (S7b), the provable source-column edits (S7c) — the rest refusing per
+  case; `docs/plans/surface-matrix.md` §1 is the per-surface truth.
 - **Per-part inferred metadata refresh** — `replacePart` /
   `addPart` install fresh bytes for the touched part(s), but
   metadata derived from `[Content_Types].xml` or `_rels/*.rels`

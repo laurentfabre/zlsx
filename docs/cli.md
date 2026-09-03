@@ -257,7 +257,7 @@ bytes with no selector.
 | `absolute` | `{"x","y","cx","cy"}` in EMUs, verbatim, for `"absolute"` anchors; `null` otherwise. |
 | `bytes` | Image records only: the image part's decompressed size in bytes. The payload itself is never on the wire. |
 | `chart_type` | Chart records only: the detected chart-XML element — `bar`, `line`, `pie`, `scatter`, `area`, `bubble`, `radar`, or `other` for unrecognised / compound charts. |
-| `series_refs` | Chart records only: every `<c:f>` formula ref of the chart part, entity-decoded, flattened in document order (series names, categories, values). Empty for a chart of inline literal data. |
+| `series_refs` | Chart records only: every `<c:f>` formula ref of the chart part, entity-decoded, flattened in document order (series names, categories, values); an empty carrier (`<c:f></c:f>`, `<c:f/>`) is an empty string; the walk is element-agnostic, so a linked chart title's `<c:f>` rides in the same list. Empty for a chart of inline literal data. The refs follow structural edits (the chart `<c:f>` sweep), so after a rename or a row / column edit on the sheet they name the record spells the respelled part. |
 
 Sheet selection follows the read family — `--sheet` / `--name` narrow to
 one sheet, `--all-sheets` / `--sheet-glob` widen, the default streams
@@ -413,7 +413,8 @@ nesting must prove like any other part's), while a `macrosheet`
 conditional formatting (`x14` data bars, icon sets carried under
 `<extLst>`) is a different tree and not part of this read — the edit
 paths move its `<xm:sqref>` / `<xm:f>` carriers with the grid (S2),
-but no read models it yet. The main-tree rule machinery moves whole
+but no read models it yet (chart `<c:f>` series formulas move the same
+way — the chart sweep — and `anchors` reports the respelled refs). The main-tree rule machinery moves whole
 under row / column edits too (S3b slice 6):
 `conditionalFormatting@sqref` and `dataValidation@sqref` shift with
 the grid — merge-rect interval semantics: shift, grow on an insert

@@ -6089,6 +6089,11 @@ const structural_refusals = [_]anyerror{
     error.SqrefCollapseUnsafe,
     error.PivotEditUnsafe,
     error.MalformedExtensionXml,
+    // The chart `<c:f>` sweep's own verdict: a chart part the walk
+    // cannot read whole, refused before the first mutation like
+    // `MalformedExtensionXml` (the S2 shape) and folded into the two
+    // `*UnsafeForSheet` names by the editor's row / column pre-flights.
+    error.MalformedChartXml,
     error.MalformedSheetRels,
     error.MalformedWorkbookRels,
     error.MalformedDrawingRels,
@@ -6174,8 +6179,9 @@ fn colOneBased(col: u32, err_buf: ?[*]u8, err_buf_len: usize) ?u32 {
 /// every row at or below it shifts down by one, and every carrier the
 /// rewriters know — formulas, defined names, hyperlinks, DV / CF,
 /// merges, panes, autoFilter, tables, drawings, comments, `<xm:f>`,
-/// a hosted pivot's `location@ref`, a pivot cache's source range —
-/// moves in step. Staged in memory; `zlsx_editor_save` commits.
+/// chart `<c:f>` series formulas, a hosted pivot's `location@ref`, a
+/// pivot cache's source range — moves in step. Staged in memory;
+/// `zlsx_editor_save` commits.
 export fn zlsx_editor_insert_row(
     ed: ?*Editor,
     sheet_idx: u32,
@@ -6278,8 +6284,9 @@ export fn zlsx_editor_add_sheet(
 }
 
 /// Rename sheet `sheet_idx` to `name`. Cross-sheet references
-/// (`'Old'!A1`, defined names, hyperlink locations, DV / CF, `<xm:f>`)
-/// follow the rename; a pivot cache's `worksheetSource@sheet` does NOT
+/// (`'Old'!A1`, defined names, hyperlink locations, DV / CF, `<xm:f>`,
+/// chart `<c:f>` series formulas) follow the rename; a pivot cache's
+/// `worksheetSource@sheet` does NOT
 /// (the Zig editor's hole, stated in the header) and reads back as
 /// `"resolved":null`.
 export fn zlsx_editor_rename_sheet(
@@ -8709,12 +8716,11 @@ test "S3b anchors_ndjson: the shared writer's bytes, current after a rename and 
         const got = out_ptr.?[0..out_len];
         try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"image_anchor\",\"sheet\":\"Facts\",\"sheet_idx\":0,"));
         try std.testing.expect(std.mem.indexOf(u8, got, "\"sheet\":\"Data\"") == null);
-        // Chart parts are byte-preserved through every edit today (the
-        // surface matrix's contract): the chart's refs still spell the
-        // old name and the read reports the bytes faithfully. Routing
-        // chart `<c:f>` carriers through the formula rewriter is the
-        // recorded S3b follow-up — this pin flips when it lands.
-        try std.testing.expect(std.mem.indexOf(u8, got, "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]") != null);
+        // The chart's series formulas rode the rename with the other
+        // carriers (the chart `<c:f>` sweep, `Workbook.rewriteAllChartFormulas`)
+        // and the read reports the respelled part.
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"series_refs\":[\"Facts!$B$1\",\"Facts!$A$2:$A$4\",\"Facts!$B$2:$B$4\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "Data!") == null);
         zlsx_buffer_release(out_ptr, out_len);
 
         // A row insert on the image's sheet moves its anchor with the
@@ -8723,12 +8729,13 @@ test "S3b anchors_ndjson: the shared writer's bytes, current after a rename and 
         try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         const moved = out_ptr.?[0..out_len];
         try std.testing.expect(std.mem.indexOf(u8, moved, "\"sheet\":\"Facts\",\"sheet_idx\":0,\"part\":\"xl/media/image1.png\",\"anchor\":\"two_cell\",\"from\":{\"row\":2,\"col\":1,\"row_off\":0,\"col_off\":0},\"to\":{\"row\":5,\"col\":3,\"row_off\":0,\"col_off\":0}") != null);
-        // The other sheet's anchors did not move, and the chart part
-        // stayed byte-identical (its refs into the edited sheet are
-        // the follow-up above).
+        // The other sheet's anchors did not move; the chart on Report
+        // names the edited sheet, so its series formulas shifted with
+        // the grid while the anchor stayed.
         try std.testing.expect(std.mem.indexOf(u8, moved, "\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/media/image1.png\",\"anchor\":\"two_cell\",\"from\":{\"row\":3,\"col\":2,\"row_off\":0,\"col_off\":9525}") != null);
         try std.testing.expect(std.mem.indexOf(u8, moved, "\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":6,\"row_off\":0,\"col_off\":0}") != null);
-        try std.testing.expect(std.mem.indexOf(u8, moved, "\"series_refs\":[\"Data!$B$1\",\"Data!$A$2:$A$4\",\"Data!$B$2:$B$4\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"series_refs\":[\"Facts!$B$2\",\"Facts!$A$3:$A$5\",\"Facts!$B$3:$B$5\"]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "Data!") == null);
         zlsx_buffer_release(out_ptr, out_len);
 
         // NULL out pointers are about the call — either one, with the
@@ -9559,6 +9566,8 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.ColEditExceedsMaxCol));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.SplitPaneNotSupported));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedDrawingXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedExtensionXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedChartXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.DrawingOnUnlistedSheet));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
     try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingSheetPart));
@@ -10221,4 +10230,54 @@ test "S3b rows formulas: the date getter answers for the current row only, throu
     try expectNoRowAt(rows.?, 1);
     try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows.?, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     try expectNoRowAt(rows.?, 0);
+}
+
+test "chart sweep: a chart part the walk cannot read refuses every structural edit — MalformedChartXml, folded on row / column edits" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    const path = try writeS3bAnchorsFixture(io, &tt, "chart_sweep_bad.xlsx");
+    defer alloc.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.patchPart(alloc, io, path, "xl/charts/chart1.xml", "<c:f>Data!$B$1</c:f>", "<c:f>Data!<!-- x -->$B$1</c:f>");
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    const nm = "Facts";
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedChartXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedChartXml", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_delete_sheet(ed, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedChartXml", diagName(&diag));
+    }
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("RowEditUnsafeForSheet", diagName(&diag));
+    }
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_column(ed, 1, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("ColEditUnsafeForSheet", diagName(&diag));
+    }
+    // The read still serves the inventory it can: the same carrier is
+    // the anchors read's own refusal (`MalformedDrawingXml`), so the
+    // two surfaces agree on what a readable chart formula is.
+    {
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
+    }
 }

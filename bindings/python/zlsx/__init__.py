@@ -3590,9 +3590,10 @@ class Editor:
     byte-preserved. A structural edit carries every cross-part
     rewriter the Zig editor has (formulas in every dialect, defined
     names, hyperlinks, DV / CF, merges, panes, autoFilter, tables,
-    drawings, comments, ``<xm:f>`` extensions, pivot locations and
-    sources), and refuses with a :class:`ZlsxRefusal` where it cannot
-    keep the workbook consistent (libzlsx 0.9.0+).
+    drawings, comments, ``<xm:f>`` extensions, chart ``<c:f>`` series
+    formulas, pivot locations and sources), and refuses with a
+    :class:`ZlsxRefusal` where it cannot keep the workbook consistent
+    (libzlsx 0.9.0+).
 
     Use as a context manager so the underlying handle is dropped
     deterministically::
@@ -3775,7 +3776,10 @@ class Editor:
         * ``RowEditUnsafeForSheet`` — the edit lands inside a hosted
           pivot's footprint or on a host sheet a pivot also reads
           from, would collapse a table or delete its header row, or a
-          carrier the scan cannot read is in the way.
+          carrier the scan cannot read is in the way (an ``<xm:f>``
+          extension formula, a chart ``<c:f>`` series formula — the
+          same carriers refuse a rename or delete with their own
+          names, ``MalformedExtensionXml`` / ``MalformedChartXml``).
 
         * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
           1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
@@ -3851,7 +3855,7 @@ class Editor:
     def rename_sheet(self, sheet_idx: int, name: str) -> None:
         """Rename sheet ``sheet_idx``; cross-sheet references
         (``'Old'!A1``, defined names, hyperlink locations, DV / CF,
-        ``<xm:f>`` extensions) follow. A pivot cache whose source is
+        ``<xm:f>`` extensions, chart ``<c:f>`` series formulas) follow. A pivot cache whose source is
         spelled by sheet name (``worksheetSource@sheet``) does **not**
         — the spelling goes stale and :meth:`pivots` reports it as
         ``"resolved": null`` (a Zig-editor hole this row inherits, listed
@@ -4062,13 +4066,12 @@ class Editor:
         ``series_refs``), never the payload: image bytes and chart XML
         stay in their parts. Read over the editor's current parts:
         structural edits and the drawing sweeps they carry (a row
-        insert moving an anchor, a rename renaming ``sheet``) are
-        visible immediately; staged cell writes never touch a drawing.
-        Chart parts are byte-preserved through every edit today, so a
-        chart's ``series_refs`` keep spelling what the part holds — an
-        old sheet name after a rename, pre-edit rows after an insert;
-        the read reports the bytes faithfully. ``[]`` for a workbook
-        without anchored objects. An inventory that cannot be served
+        insert moving an anchor, a rename renaming ``sheet``, a chart's
+        ``series_refs`` respelled by the chart ``<c:f>`` sweep — a new
+        sheet name after a rename, shifted rows after an insert on the
+        sheet they name) are visible immediately; staged cell writes
+        never touch a drawing. ``[]`` for a workbook without anchored
+        objects. An inventory that cannot be served
         faithfully raises
         :class:`ZlsxRefusal` (``MalformedWorkbookXml`` for a sheet list
         the strict workbook read cannot prove, ``MalformedDrawingXml``

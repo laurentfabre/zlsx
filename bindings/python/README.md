@@ -251,8 +251,9 @@ for p in zlsx.pivots("report.xlsx"):       # the `zlsx pivots` records, as dicts
 A structural edit carries the rewriters the CLI's `insert-row` family
 carries — formulas in every dialect (A1, 3D, R1C1, structured
 references), defined names, hyperlinks, DV / CF, merges, panes,
-autoFilter, tables, drawings, comments, `<xm:f>` extensions, a hosted
-pivot's rectangle and a cache's source range (a source whose content
+autoFilter, tables, drawings, comments, `<xm:f>` extensions, chart
+`<c:f>` series formulas, a hosted pivot's rectangle and a cache's source
+range (a source whose content
 changes is rebuilt during the edit and committed by `save`). One hole
 the row inherits from the Zig editor: `rename_sheet` / `delete_sheet`
 do not rewrite a pivot cache's `worksheetSource@sheet`, so a source
@@ -335,10 +336,10 @@ entity-decoded `series_refs`), never the payload: image bytes and chart
 XML stay in their parts. Structural edits and the drawing sweeps they
 carry are visible immediately — a rename renames `sheet`, a row insert
 moves the edited sheet's anchors with the grid — and staged cell writes
-never touch a drawing. Chart parts are byte-preserved through every
-edit today, so a chart's `series_refs` keep spelling what the part
-holds (an old sheet name after a rename, pre-edit rows after an
-insert); the read reports the bytes faithfully.
+never touch a drawing. A chart's `series_refs` ride the formula
+rewriter with every other carrier (the chart `<c:f>` sweep), so after a
+rename or a row / column edit on the sheet they name the read reports
+the respelled part.
 
 `Editor.sheet_props()` / `zlsx.sheet_props(path)` and
 `Editor.calc_props()` / `zlsx.calc_props(path)` are the same pattern
@@ -520,8 +521,9 @@ with zlsx.write("out.xlsx") as w:
   `delete_column` / `add_sheet` / `rename_sheet` / `delete_sheet` /
   `rename_table_column`, with every cross-part rewriter (formulas in every
   dialect, defined names, hyperlinks, DV / CF, merges, panes, autoFilter,
-  tables, drawings, comments, `<xm:f>` extensions, pivot locations and
-  sources); what cannot be kept consistent refuses with a typed
+  tables, drawings, comments, `<xm:f>` extensions, chart `<c:f>` series
+  formulas, pivot locations and sources); what cannot be kept consistent
+  refuses with a typed
   `ZlsxRefusal` — see *Structural edits & pivots*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts
@@ -559,7 +561,7 @@ with zlsx.write("out.xlsx") as w:
 
 - `.xls` / `.xlsb` / `.ods` — never
 - Formula evaluation on the *read* path — the reader still returns the cached `<v>` value byte-for-byte and never computes. Since 0.8.0 the engine lives behind the explicit `recalculate` / `evaluate` / `save_with_recalc` surface (see *Recalculate & evaluate*); a plain read remains exactly what Excel stored
-- Pictures — image *payloads* and image authoring are Zig-only today (S5; the anchors themselves read through `Editor.anchors()`); charts are byte-preserved through edits and their anchors and series refs read through `Editor.anchors()`, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
+- Pictures — image *payloads* and image authoring are Zig-only today (S5; the anchors themselves read through `Editor.anchors()`); charts follow structural edits (their series formulas ride the formula rewriter — the chart `<c:f>` sweep) and their anchors and series refs read through `Editor.anchors()`, with chart authoring deferred (D2 → S9); pivot *authoring* is S8. The per-surface truth is [`docs/plans/surface-matrix.md`](../../docs/plans/surface-matrix.md)
 
 ## Thread safety
 

@@ -25,14 +25,23 @@
 //!   edited axis equals the deleted row/column. The single anchor
 //!   cell is gone.
 //!
-//! v1 LIMITATION: hard-codes the `xdr:` namespace prefix. Every
-//! Microsoft Excel / LibreOffice / xlsxwriter / openpyxl /
-//! python-calamine fixture in the project's corpus uses this
-//! prefix; non-Microsoft producers with non-canonical prefixes
-//! will surface zero rewrites (and therefore silent corruption
-//! when row/col edits cross drawing anchors). pkg/drawings.zig
-//! grew namespace-aware support post-C2a; the same machinery can
-//! be lifted here in a follow-up iter when needed.
+//! v1 LIMITATION: hard-codes the `xdr:` namespace prefix. Excel,
+//! LibreOffice, XlsxWriter and POI spell it; openpyxl 3.1 does NOT —
+//! it binds the spreadsheetDrawing namespace as its DEFAULT
+//! (`<wsDr xmlns="…/spreadsheetDrawing"><oneCellAnchor><from>`, the
+//! corpus's `openpyxl_chart.xlsx`), so this sweep surfaces zero
+//! rewrites there: a row / column edit that crosses an openpyxl
+//! chart's or image's anchor moves the grid (and, since the chart
+//! `<c:f>` sweep, the chart's series formulas) but not the anchor —
+//! silent corruption of the placement, pinned as the recorded gap by
+//! the workbook test on that fixture (in-house chart-sweep round 5
+//! CF-DOC-501; the earlier claim that every openpyxl fixture used
+//! `xdr:` was false). Any other non-canonical prefix surfaces zero
+//! rewrites the same way. pkg/drawings.zig grew namespace-aware
+//! support post-C2a (`resolveDrawingPrefixes`, the default-namespace
+//! chart part since that sweep); lifting the same machinery here,
+//! together with the anchors read's default-namespace drawing, is
+//! the one namespace-aware drawing follow-up.
 
 const std = @import("std");
 

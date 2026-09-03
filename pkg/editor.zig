@@ -787,9 +787,13 @@ pub const Editor = struct {
 
     /// Rename a sheet (Phase 3e, iter-sheet-2). Delegates to
     /// `Workbook.renameSheet`, which patches `xl/workbook.xml`
-    /// in-memory and runs the formula + defined-name rewriters:
-    /// cross-sheet refs (`'OLD'!A1`) follow the rename instead of
-    /// decaying to `#REF!`.
+    /// in-memory and runs the six carrier sweeps (cell formulas,
+    /// defined names, hyperlink locations, DV / CF, `<xm:f>`
+    /// extensions, chart `<c:f>` series formulas): cross-sheet refs
+    /// (`'OLD'!A1`) follow the rename instead of decaying to
+    /// `#REF!`. A carrier a sweep cannot read whole refuses before
+    /// the first mutation with its own name (`MalformedExtensionXml`,
+    /// `MalformedChartXml`).
     pub fn renameSheet(self: *Editor, sheet_idx: u32, new_name: []const u8) !void {
         if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
         // B2 iter-er-4 (2/N): delegate to Workbook.renameSheet,
@@ -815,8 +819,9 @@ pub const Editor = struct {
     ///     and Content_Types patched in-memory), then drops the
     ///     path from `sheet_paths`.
     ///   - Cross-sheet formula refs to the deleted sheet collapse
-    ///     to `#REF!` via the workbook rewriters; refs to
-    ///     surviving sheets stay intact.
+    ///     to `#REF!` via the workbook rewriters (the same six
+    ///     carrier sweeps a rename runs, chart series formulas
+    ///     included); refs to surviving sheets stay intact.
     /// Sheet indices SHIFT after a delete: the call invalidates
     /// every sheet_idx > deleted_idx.
     pub fn deleteSheet(self: *Editor, sheet_idx: u32) !void {
@@ -875,14 +880,15 @@ pub const Editor = struct {
     ///     row component, <mergeCells> rect bounds, <dimension>.
     ///   - Formulas, defined names, hyperlink locations, DV/CF
     ///     formulas, `<extLst>` `<xm:f>` formulas (sparklines, x14
-    ///     CF / DV), drawings (xdr + VML), panes, autoFilter and
-    ///     table parts are rewritten in step (iter-er-5, dr-1/dr-2,
-    ///     S2); a pivot's `location@ref` on a sheet that only
-    ///     hosts it moves in step (S7a). Still refused: an edit
-    ///     inside a hosted pivot's footprint or on a host sheet a
-    ///     pivot also reads from, unsafe table edits (collapse /
-    ///     header-row delete), and an `<xm:f>` carrier the scan
-    ///     cannot read.
+    ///     CF / DV), chart `<c:f>` series formulas, drawings (xdr +
+    ///     VML), panes, autoFilter and table parts are rewritten in
+    ///     step (iter-er-5, dr-1/dr-2, S2, the chart sweep); a
+    ///     pivot's `location@ref` on a sheet that only hosts it
+    ///     moves in step (S7a). Still refused: an edit inside a
+    ///     hosted pivot's footprint or on a host sheet a pivot also
+    ///     reads from, unsafe table edits (collapse / header-row
+    ///     delete), and an `<xm:f>` or chart `<c:f>` carrier the
+    ///     scan cannot read.
     ///   - The sheet must not have other pending mutations
     ///     (setCell / appendRows / row inserts/deletes); save
     ///     first to apply those.
@@ -1041,6 +1047,15 @@ pub const Editor = struct {
             else => |e| return e,
         };
 
+        // The chart `<c:f>` sweep's gate, the same shape: series
+        // formulas ride the rewriter (`Workbook.rewriteAllChartFormulas`),
+        // and a chart part the walk cannot read whole folds into the
+        // same user-facing error.
+        self.workbook.preflightChartFormulas() catch |err| switch (err) {
+            error.MalformedChartXml => return error.ColEditUnsafeForSheet,
+            else => |e| return e,
+        };
+
         self.workbook.preflightTableEditsForSheet(path, .col, col_1based, tbl_kind) catch |err| switch (err) {
             error.TableCollapseUnsafe,
             error.TableHeaderRowDeleteUnsafe,
@@ -1100,9 +1115,14 @@ pub const Editor = struct {
         };
         defer prepared.deinit(self.allocator);
 
-        // Same `<xm:f>` gate as `recordColEdit` — see the note there.
+        // Same `<xm:f>` and chart gates as `recordColEdit` — see the
+        // notes there.
         self.workbook.preflightExtensionFormulas() catch |err| switch (err) {
             error.MalformedExtensionXml => return error.RowEditUnsafeForSheet,
+            else => |e| return e,
+        };
+        self.workbook.preflightChartFormulas() catch |err| switch (err) {
+            error.MalformedChartXml => return error.RowEditUnsafeForSheet,
             else => |e| return e,
         };
 
@@ -11160,5 +11180,59 @@ test "S7c-2: the widened clear region keeps the guards — a merge or another pi
         var ed = try Editor.open(a, io, src);
         defer ed.deinit();
         try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 3));
+    }
+}
+
+// ─── chart <c:f> series formulas (the chart sweep) ───────────────────
+
+test "Editor: chart series formulas ride every structural edit; a carrier the walk cannot read folds into the sheet-level refusal" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const fixture = @import("anchor_ndjson.zig").fixture;
+    const chart = "xl/charts/chart1.xml";
+
+    // The lift, end to end through the Editor and a save: a rename,
+    // a row insert on the named sheet, a column insert on the host
+    // (a no-op for the carriers), then the saved part.
+    {
+        const src = try tt.path(a, io, "chart_sweep_src.xlsx");
+        defer a.free(src);
+        const dst = try tt.path(a, io, "chart_sweep_dst.xlsx");
+        defer a.free(dst);
+        try fixture.write(a, io, src, .image_and_chart);
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try ed.renameSheet(0, "Facts");
+        try ed.insertRow(0, 2);
+        try ed.insertColumn(1, 1);
+        try ed.save(io, dst);
+        const saved = try readSavedPart(io, dst, chart);
+        defer a.free(saved);
+        try std.testing.expect(std.mem.indexOf(u8, saved, "<c:tx><c:strRef><c:f>Facts!$B$1</c:f></c:strRef></c:tx><c:cat><c:strRef><c:f>Facts!$A$3:$A$5</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Facts!$B$3:$B$5</c:f></c:numRef></c:val>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, saved, "Data!") == null);
+    }
+    // A chart part the walk cannot read whole: the row / column
+    // pre-flights fold `MalformedChartXml` into the two sheet-level
+    // names (the `MalformedExtensionXml` shape); a rename and a delete
+    // surface the precise name. Nothing is staged either way.
+    {
+        const src = try tt.path(a, io, "chart_sweep_bad.xlsx");
+        defer a.free(src);
+        try fixture.write(a, io, src, .image_and_chart);
+        try fixture.patchPart(a, io, src, chart, "<c:f>Data!$B$1</c:f>", "<c:f>Data!$B$1");
+        var ed = try Editor.open(a, io, src);
+        defer ed.deinit();
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.insertRow(0, 1));
+        try std.testing.expectError(error.RowEditUnsafeForSheet, ed.deleteRow(1, 1));
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.insertColumn(1, 1));
+        try std.testing.expectError(error.ColEditUnsafeForSheet, ed.deleteColumn(0, 1));
+        try std.testing.expectError(error.MalformedChartXml, ed.renameSheet(0, "Facts"));
+        try std.testing.expectError(error.MalformedChartXml, ed.deleteSheet(0));
+        try std.testing.expect(!ed.workbook.hasUnsavedChanges());
+        try std.testing.expect(!ed.workbook.torn_edit);
     }
 }

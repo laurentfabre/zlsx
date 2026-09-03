@@ -3191,10 +3191,13 @@ def test_anchors_frozen_shape_and_empty_on_plain_workbook(tmp_path):
 def test_anchors_read_the_editors_current_state(tmp_path):
     """A sheet rename is visible immediately in `sheet`, and a row
     insert moves the edited sheet's anchor with the grid while the
-    other sheet's stay, no save in between. Chart parts are
-    byte-preserved, so their refs do not follow either edit."""
+    other sheet's stay, no save in between. The chart's series
+    formulas name the edited sheet, so they follow both edits (the
+    chart ``<c:f>`` sweep) while the chart's own anchor on Report
+    stays."""
     _require_anchors()
     _require_structural()
+    _require_chart_sweep()
     src = tmp_path / "anchors.xlsx"
     _anchors_workbook(src)
 
@@ -3202,12 +3205,7 @@ def test_anchors_read_the_editors_current_state(tmp_path):
         ed.rename_sheet(0, "Facts")
         records = ed.anchors()
         assert [r["sheet"] for r in records] == ["Facts", "Report", "Report", "Report"]
-        # Chart parts are byte-preserved through every edit today (the
-        # surface matrix's contract): the chart's refs still spell the
-        # old name, and the read reports the bytes faithfully. Routing
-        # chart `<c:f>` carriers through the formula rewriter is the
-        # recorded S3b follow-up — this pin flips when it lands.
-        assert records[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]
+        assert records[3]["series_refs"] == ["Facts!$B$1", "Facts!$A$2:$A$4", "Facts!$B$2:$B$4"]
 
         ed.insert_row(0, 1)
         moved = ed.anchors()
@@ -3217,7 +3215,100 @@ def test_anchors_read_the_editors_current_state(tmp_path):
     )
     assert moved[1]["from"] == {"row": 3, "col": 2, "row_off": 0, "col_off": 9525}  # Report did not move
     assert moved[3]["from"] == {"row": 2, "col": 6, "row_off": 0, "col_off": 0}
-    assert moved[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]
+    assert moved[3]["series_refs"] == ["Facts!$B$2", "Facts!$A$3:$A$5", "Facts!$B$3:$B$5"]
+
+
+def _require_chart_sweep():
+    """The chart ``<c:f>`` sweep is a behaviour of the structural edits
+    and the anchors read, not an export of its own: it landed inside
+    the unreleased 0.9.0, so there is nothing to probe beyond the two
+    surfaces it rides — against a dylib that predates it these tests
+    FAIL rather than skip, as a stale pin should."""
+    _require_structural()
+    _require_anchors()
+
+
+def test_chart_series_formulas_ride_every_structural_edit(tmp_path):
+    """Chart series formulas (``<c:f>``: series name, categories,
+    values) ride the formula rewriter under a sheet rename, a row /
+    column edit on the sheet they name, and a sheet delete — visible
+    through ``Editor.anchors()`` with no save, and in the saved part."""
+    _require_chart_sweep()
+    import zipfile
+
+    src = tmp_path / "anchors.xlsx"
+    _anchors_workbook(src)
+    dst = tmp_path / "moved.xlsx"
+    with zlsx.edit(src) as ed:
+        # An edit on the HOST sheet (Report carries the chart) moves the
+        # anchor, not the carriers.
+        ed.insert_row(1, 1)
+        assert ed.anchors()[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$4", "Data!$B$2:$B$4"]
+        # An insert inside the ranges on Data grows them; the
+        # series-name cell above stays.
+        ed.insert_row(0, 3)
+        assert ed.anchors()[3]["series_refs"] == ["Data!$B$1", "Data!$A$2:$A$5", "Data!$B$2:$B$5"]
+        # A column delete (0-based at the boundary: column A): the
+        # category column collapses to the rewriter's qualified #REF!,
+        # the value column slides left.
+        ed.delete_column(0, 0)
+        assert ed.anchors()[3]["series_refs"] == ["Data!$A$1", "Data!#REF!", "Data!$A$2:$A$5"]
+        # A name needing quotes is quoted.
+        ed.rename_sheet(0, "Raw Data")
+        assert ed.anchors()[3]["series_refs"] == ["'Raw Data'!$A$1", "Data!#REF!", "'Raw Data'!$A$2:$A$5"]
+        ed.save(dst)
+    with zipfile.ZipFile(dst) as z:
+        chart = z.read("xl/charts/chart1.xml").decode()
+    assert "<c:f>'Raw Data'!$A$1</c:f>" in chart
+    assert "<c:f>'Raw Data'!$A$2:$A$5</c:f>" in chart
+    # Deleting the named sheet collapses every carrier into it. (The
+    # deleted sheet's own drawing stays in the archive unreferenced —
+    # `delete_sheet`'s documented orphan — so the strict anchors read
+    # refuses `DrawingOnUnlistedSheet` afterwards; the saved chart part
+    # is the witness.)
+    gone = tmp_path / "gone.xlsx"
+    with zlsx.edit(dst) as ed:
+        ed.delete_sheet(0)
+        ed.save(gone)
+    with zipfile.ZipFile(gone) as z:
+        chart = z.read("xl/charts/chart1.xml").decode()
+    assert "<c:tx><c:strRef><c:f>#REF!</c:f></c:strRef></c:tx>" in chart
+    # The category carrier had already collapsed to `Data!#REF!` under
+    # the column delete; the rewriter leaves an error token as it lies
+    # (its rule on every carrier), so the deleted qualifier stays.
+    assert "<c:cat><c:strRef><c:f>Data!#REF!</c:f></c:strRef></c:cat>" in chart
+    assert "<c:val><c:numRef><c:f>#REF!</c:f></c:numRef></c:val>" in chart
+
+
+def test_chart_refusal_is_typed(tmp_path):
+    """A chart part whose series carrier the walk cannot read whole
+    refuses every structural edit before its first mutation:
+    ``MalformedChartXml`` on a rename / delete, folded into the
+    sheet-level names on a row / column edit — the ``<xm:f>`` shape."""
+    _require_chart_sweep()
+
+    src = tmp_path / "anchors.xlsx"
+    _anchors_workbook(src)
+    broken = tmp_path / "broken_chart.xlsx"
+    _patched_copy(src, broken, "xl/charts/chart1.xml", b"<c:f>Data!$B$1</c:f>", b"<c:f>Data!$B$1")
+    with zlsx.edit(broken) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.rename_sheet(0, "Facts")
+        assert info.value.error_name == "MalformedChartXml"
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal)
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_sheet(0)
+        assert info.value.error_name == "MalformedChartXml"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.insert_row(0, 1)
+        assert info.value.error_name == "RowEditUnsafeForSheet"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_column(1, 0)
+        assert info.value.error_name == "ColEditUnsafeForSheet"
+        # The anchors read's own verdict on the same carrier.
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.anchors()
+        assert info.value.error_name == "MalformedDrawingXml"
 
 
 def test_anchors_refusal_is_typed(tmp_path):

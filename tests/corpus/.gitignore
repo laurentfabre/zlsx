@@ -10,5 +10,6 @@
 !.gitignore
 !frictionless_2sheets.xlsx
 !openpyxl_guess_types.xlsx
+!openpyxl_chart.xlsx
 !phpoi_test1.xlsx
 !worldbank_catalog.xlsx

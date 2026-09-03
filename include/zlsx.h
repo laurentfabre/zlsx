@@ -1848,7 +1848,10 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
  *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
- *     MalformedCommentsXml, MalformedTableXml, the *CoordinateOverflow
+ *     MalformedCommentsXml, MalformedTableXml, MalformedExtensionXml,
+ *     MalformedChartXml — an <xm:f> extension or chart <c:f> series
+ *     carrier the sweep cannot read whole, refused before the first
+ *     mutation — the *CoordinateOverflow
  *     trio, PivotEditUnsafe, SqrefCollapseUnsafe — a delete collapsing
  *     EVERY area of a DV/CF sqref, which Excel resolves by deleting the
  *     rule — MissingSheetPart, NoSheetData; a generic
@@ -1870,8 +1873,9 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  * zlsx_editor_save_to_buffer commit it, with every cross-part
  * rewriter the Zig editor carries (formulas in every dialect, defined
  * names, hyperlinks, DV / CF, merges, panes, autoFilter, tables,
- * drawings, comments, `<xm:f>` extensions, and — under a row / column
- * edit — pivot locations and sources). Rows are 1-based; columns
+ * drawings, comments, `<xm:f>` extensions, chart `<c:f>` series
+ * formulas, and — under a row / column edit — pivot locations and
+ * sources). Rows are 1-based; columns
  * 0-based (A = 0), as zlsx_editor_set_cell spells them; sheet indices
  * 0-based. */
 
@@ -1906,7 +1910,8 @@ int32_t zlsx_editor_add_sheet(zlsx_editor_t * ed,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
 /* Rename sheet `sheet_idx`; cross-sheet references (formulas, defined
- * names, hyperlinks, DV / CF, <xm:f>) follow. A pivot cache's
+ * names, hyperlinks, DV / CF, <xm:f>, chart <c:f> series formulas)
+ * follow. A pivot cache's
  * worksheetSource@sheet does NOT (a Zig-editor hole this row inherits):
  * the spelling goes stale and zlsx_editor_pivots_ndjson reports it as
  * "resolved":null. */
@@ -2000,11 +2005,10 @@ int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
  * never the payload — image bytes and chart XML stay in their parts.
  * Read over the editor's current parts: structural edits and the
  * drawing sweeps they carry (a row insert moving an anchor, a rename
- * renaming `sheet`) are visible immediately; staged cell writes never
- * touch a drawing. Chart parts are byte-preserved through every edit
- * today, so a chart's series_refs keep spelling what the part holds —
- * an old sheet name after a rename, pre-edit rows after an insert;
- * the read reports the bytes faithfully. A workbook without
+ * renaming `sheet`, a chart's series_refs respelled by the chart <c:f>
+ * sweep — the new sheet name after a rename, shifted rows after an
+ * insert on the sheet they name) are visible immediately; staged cell
+ * writes never touch a drawing. A workbook without
  * anchored objects is ZLSX_OK with (*out, *out_len) = (NULL, 0). An
  * inventory that cannot be served faithfully refuses whole — a sheet
  * list the strict workbook read cannot prove (MalformedWorkbookXml),

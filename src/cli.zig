@@ -1185,11 +1185,11 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     `zlsx set-cell in.xlsx --sheet 0 --ref C5
         \\                       --value '"hello"' --out out.xlsx`
         \\  insert-row /       structural row edit. Required: --out PATH,
-        \\  delete-row         --sheet N, --row N (1-based). Refuses on
-        \\                     sheets carrying formulas, hyperlinks, data
-        \\                     validations, conditional formatting, frozen
-        \\                     panes, or other constructs the rewriter
-        \\                     doesn't yet shift.
+        \\  delete-row         --sheet N, --row N (1-based). Formulas,
+        \\                     defined names, hyperlinks, DV / CF, extension
+        \\                     and chart formulas ride the rewriter; refuses
+        \\                     (exit 3) on a construct it cannot shift or
+        \\                     read whole.
         \\  insert-column /    structural column edit. Required: --out PATH,
         \\  delete-column      --sheet N, --col LETTER (A..XFD). Same
         \\                     refusal contract as the row edits.
