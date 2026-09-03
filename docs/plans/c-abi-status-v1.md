@@ -782,8 +782,12 @@ xmlns="…/chart"><f>`) is openpyxl's spelling and is walked under `<f>`
 unwalked, so every openpyxl chart went stale silently); the anchors
 read does not yet resolve openpyxl's default-namespace DRAWING (`<wsDr
 xmlns="…/spreadsheetDrawing">`), so it lists no chart for such a
-workbook while the sweep moves its chart part — a recorded follow-up,
-pinned by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
+workbook while the sweep moves its chart part, and the drawing sweep
+(`drawing_edit`, `xdr:`-literal) does not shift that drawing's anchors
+either — a row insert above an openpyxl chart moves the grid and the
+series formulas but not the chart's `from` (round 5 CF-DOC-501). Both
+halves are the one namespace-aware drawing follow-up, pinned by the
+corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated
 reads stay bounded: the drawing walkers used to resolve every part

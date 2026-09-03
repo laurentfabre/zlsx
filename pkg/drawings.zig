@@ -2121,7 +2121,9 @@ fn defaultNamespaceUri(xml: []const u8) ?[]const u8 {
     return null;
 }
 
-/// One `xmlns:<name>="<uri>"` declaration of the root window.
+/// One `xmlns:<name>="<uri>"` declaration — `name` empty for the
+/// default declaration `xmlns="<uri>"` — as `RootNsBindings` yields
+/// it, over the root window or the whole part.
 const NsBinding = struct { name: []const u8, uri: []const u8 };
 
 /// The live, attribute-shaped `xmlns:` declarations in the first
@@ -2176,7 +2178,12 @@ const RootNsBindings = struct {
                         self.i += 1;
                         break;
                     }
-                    if (c == 'x' and std.mem.startsWith(u8, xml[self.i..], "xmlns") and (self.i == 0 or isXmlWs(xml[self.i - 1]))) {
+                    // A declaration is an attribute: XML whitespace
+                    // precedes it (in the tag state `self.i` is past
+                    // the `<`, so `self.i - 1` is in range). An
+                    // attribute NAME that merely ends in `xmlns:` is
+                    // not one (round-4 agent B).
+                    if (c == 'x' and std.mem.startsWith(u8, xml[self.i..], "xmlns") and isXmlWs(xml[self.i - 1])) {
                         const after_kw = self.i + "xmlns".len;
                         if (after_kw < xml.len and xml[after_kw] == ':') {
                             if (self.declarationAt(after_kw + 1)) |b| return b;

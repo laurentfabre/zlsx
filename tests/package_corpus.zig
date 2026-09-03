@@ -34,6 +34,7 @@ const fixture_list = [_]struct { name: []const u8, verdict: Verdict }{
     // Valid OOXML (committed).
     .{ .name = "frictionless_2sheets.xlsx", .verdict = .must_open_clean },
     .{ .name = "openpyxl_guess_types.xlsx", .verdict = .must_open_clean },
+    .{ .name = "openpyxl_chart.xlsx", .verdict = .must_open_clean },
     .{ .name = "phpoi_test1.xlsx", .verdict = .must_open_clean },
     .{ .name = "calamine_empty_s_attribute.xlsx", .verdict = .must_open_clean },
     .{ .name = "calamine_empty_shared_string.xlsx", .verdict = .must_open_clean },

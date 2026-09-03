@@ -27699,7 +27699,8 @@ test "Workbook chart sweep: openpyxl's default-namespace chart part is walked un
     // `<chartSpace xmlns:a=… xmlns="…/chart">` with the unprefixed
     // carriers `'Data'!B1`, `'Data'!$A$2:$A$4`, `'Data'!$B$2:$B$4` — the
     // shape the sweep had documented as unproduced and left stale
-    // (in-house CF-REL-401).
+    // (in-house CF-REL-401). `insertRow(0, 1)` inserts before the
+    // 1-based row 1, above every cell the chart plots.
     const src_path = "tests/corpus/openpyxl_chart.xlsx";
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
     var out_buf: [256]u8 = undefined;
@@ -27708,16 +27709,31 @@ test "Workbook chart sweep: openpyxl's default-namespace chart part is walked un
     {
         var wb = try Workbook.open(a, io, src_path);
         defer wb.deinit();
+        const drawing_before = try dupePart(&wb, "xl/drawings/drawing1.xml");
+        defer a.free(drawing_before);
         try wb.renameSheet(0, "Facts");
-        try wb.insertRow(0, 3);
+        // A row insert ABOVE the chart (anchored at D2, 0-based row 1):
+        // the carriers shift…
+        try wb.insertRow(0, 1);
         const c1 = try dupePart(&wb, "xl/charts/chart1.xml");
         defer a.free(c1);
         try std.testing.expect(std.mem.indexOf(u8, c1, "'Data'") == null);
         try std.testing.expect(std.mem.indexOf(u8, c1, "Facts") != null);
-        try std.testing.expect(std.mem.indexOf(u8, c1, "!B1</f>") != null);
-        try std.testing.expect(std.mem.indexOf(u8, c1, "!$A$2:$A$5</f>") != null);
-        try std.testing.expect(std.mem.indexOf(u8, c1, "!$B$2:$B$5</f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!B2</f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!$A$3:$A$5</f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!$B$3:$B$5</f>") != null);
         try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, c1, "<f>"));
+        // …but the drawing's anchor does not: the drawing sweep
+        // (`drawing_edit`) spells `xdr:` literally and openpyxl binds
+        // the spreadsheetDrawing namespace as its DEFAULT, so
+        // `<row>1</row>` stays and the chart sits one grid row above
+        // where Excel would put it — the edit-side half of the
+        // recorded namespace-aware drawing follow-up (round 5
+        // CF-DOC-501). This pin flips to `<row>2</row>` when it lands.
+        const drawing_after = try dupePart(&wb, "xl/drawings/drawing1.xml");
+        defer a.free(drawing_after);
+        try std.testing.expectEqualStrings(drawing_before, drawing_after);
+        try std.testing.expect(std.mem.indexOf(u8, drawing_after, "<row>1</row>") != null);
         // The anchors read does not yet resolve openpyxl's
         // default-namespace DRAWING (`<wsDr xmlns="…/spreadsheetDrawing">`),
         // so it lists nothing here — the recorded sibling gap; this pin
@@ -27734,7 +27750,7 @@ test "Workbook chart sweep: openpyxl's default-namespace chart part is walked un
     defer re.deinit();
     const saved = try dupePart(&re, "xl/charts/chart1.xml");
     defer a.free(saved);
-    try std.testing.expect(std.mem.indexOf(u8, saved, "!$B$2:$B$5</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "!$B$3:$B$5</f>") != null);
     try std.testing.expect(std.mem.indexOf(u8, saved, "'Data'") == null);
 }
 
