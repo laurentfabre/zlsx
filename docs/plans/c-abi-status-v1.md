@@ -775,11 +775,17 @@ rectangle (S7a); a re-layout that changes the rectangle's extent
 (S7b-5, S7c-2) is not re-derived into the chart, Excel's refresh-on-load
 rebuilds the series — while `<c:pivotSource><c:name>` (a
 `[book]sheet!pivot` locator, not a formula) keeps its spelling, as the
-cache's `worksheetSource@sheet` does under a rename. Not walked, by
-design: chartex parts (`<cx:f>`), the `c15:` data-label range
-extension, and a part binding the chart namespace as its default
-namespace (`<chartSpace xmlns="…/chart"><f>` — no known producer
-spells one). Repeated
+cache's `worksheetSource@sheet` does under a rename. A part binding
+the chart namespace as its DEFAULT namespace (`<chartSpace
+xmlns="…/chart"><f>`) is openpyxl's spelling and is walked under `<f>`
+(in-house CF-REL-401 — it had been documented as unproduced and left
+unwalked, so every openpyxl chart went stale silently); the anchors
+read does not yet resolve openpyxl's default-namespace DRAWING (`<wsDr
+xmlns="…/spreadsheetDrawing">`), so it lists no chart for such a
+workbook while the sweep moves its chart part — a recorded follow-up,
+pinned by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
+walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
+range extension. Repeated
 reads stay bounded: the drawing walkers used to resolve every part
 name along the relationship chain into the store's lifetime arena —
 the S3B-MEM-603 shape, unbounded growth for a long-lived editor

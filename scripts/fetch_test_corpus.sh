@@ -37,6 +37,8 @@ dir="${1:-tests/corpus}"
 mkdir -p "$dir"
 
 # (1) Small base corpus — committed.
+#     `openpyxl_chart.xlsx` is committed too but generated, not fetched:
+#     scripts/gen_openpyxl_chart_fixture.py (the chart-sweep witness).
 declare -a base_files=(
   "frictionless_2sheets.xlsx|https://raw.githubusercontent.com/frictionlessdata/datasets/main/files/excel/sample-2-sheets.xlsx"
   "openpyxl_guess_types.xlsx|https://github.com/fluidware/openpyxl/raw/master/openpyxl/tests/test_data/genuine/guess_types.xlsx"

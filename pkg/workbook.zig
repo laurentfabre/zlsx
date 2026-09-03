@@ -27690,6 +27690,54 @@ test "Workbook chart sweep: a chart namespace bound under a prefix the walk does
     try std.testing.expect(std.mem.indexOf(u8, got2, "Data!") == null);
 }
 
+test "Workbook chart sweep: openpyxl's default-namespace chart part is walked under <f> — respelled, shifted, persisted (CF-REL-401)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    // Written by openpyxl 3.1.5 (`scripts/gen_openpyxl_chart_fixture.py`):
+    // `<chartSpace xmlns:a=… xmlns="…/chart">` with the unprefixed
+    // carriers `'Data'!B1`, `'Data'!$A$2:$A$4`, `'Data'!$B$2:$B$4` — the
+    // shape the sweep had documented as unproduced and left stale
+    // (in-house CF-REL-401).
+    const src_path = "tests/corpus/openpyxl_chart.xlsx";
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var out_buf: [256]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/test-chart-openpyxl-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+    {
+        var wb = try Workbook.open(a, io, src_path);
+        defer wb.deinit();
+        try wb.renameSheet(0, "Facts");
+        try wb.insertRow(0, 3);
+        const c1 = try dupePart(&wb, "xl/charts/chart1.xml");
+        defer a.free(c1);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "'Data'") == null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "Facts") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!B1</f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!$A$2:$A$5</f>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c1, "!$B$2:$B$5</f>") != null);
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, c1, "<f>"));
+        // The anchors read does not yet resolve openpyxl's
+        // default-namespace DRAWING (`<wsDr xmlns="…/spreadsheetDrawing">`),
+        // so it lists nothing here — the recorded sibling gap; this pin
+        // flips loudly when that lands.
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 0), anchors.len);
+        try wb.save(io, out_path);
+    }
+    var re = try Workbook.open(a, io, out_path);
+    defer re.deinit();
+    const saved = try dupePart(&re, "xl/charts/chart1.xml");
+    defer a.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "!$B$2:$B$5</f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "'Data'") == null);
+}
+
 test "Workbook chart sweep: an error token keeps its qualifier under a rename and a delete — the rewriter's rule on every carrier, pinned" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
