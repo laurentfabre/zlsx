@@ -393,8 +393,10 @@ pub const Error = error{
     /// cannot rewrite wholly, in some chart of the workbook: no
     /// `</c:f>` (a start tag truncated at the end of the part
     /// included), markup inside the body, a carrier start tag inside
-    /// an unterminated comment / CDATA / PI, a chart-namespace prefix
-    /// too long for the walk's needle scratch, a body that does not
+    /// an unterminated comment / CDATA / PI, a chart namespace bound
+    /// under a prefix longer than the resolver's 100-byte limit (the
+    /// part would otherwise be walked under the canonical `c` and
+    /// move nothing), a body that does not
     /// decode or is not UTF-8 (`decodeChartFormulaBody`, the anchors
     /// read's own acceptance) — or a chart part the archive cannot
     /// materialise. Chart series formulas (`<c:tx>`, `<c:cat>`,
@@ -4089,9 +4091,12 @@ pub const Workbook = struct {
     /// Every chart part the sweep walks, deduplicated, in part order
     /// then relationship order: a part of the chart content type, a
     /// part at the canonical `xl/charts/chart<N>.xml`, and every
-    /// chart-typed relationship target of a drawing part — the edge
-    /// the anchors read follows — so a chart the read reaches under a
-    /// foreign name and content type is still swept, and one no
+    /// internal chart-typed relationship target of ANY part — the
+    /// edge the anchors read follows, from a drawing it reached by
+    /// the sheet's own `drawing` relationship and so need not
+    /// recognise by name or content type either (in-house
+    /// CF-REL-201) — so a chart the read reaches under foreign names
+    /// and content types all the way down is still swept, and one no
     /// drawing references (an orphan the read never lists) still
     /// moves (in-house CF-MNT-102: the parity rule is "what the read
     /// serves, the sweep moves", and the enumerations must not
@@ -4109,7 +4114,6 @@ pub const Workbook = struct {
             if (isChartPart(meta)) try appendChartPartName(a, &seen, &names, meta.name);
         }
         for (self.store.parts) |meta| {
-            if (!isDrawingPart(meta)) continue;
             for (self.store.rels(meta.name)) |rel| {
                 if (!drawings.relTypeIs(rel.type, "chart")) continue;
                 // An external chart lives in another package: nothing
@@ -4156,7 +4160,7 @@ pub const Workbook = struct {
     /// spelling the pivot cache's own `worksheetSource@sheet` keeps
     /// under a rename. The parts walked are `chartPartNames`': the
     /// chart content type, the canonical name, and every chart-typed
-    /// relationship target of a drawing.
+    /// relationship target of any part.
     ///
     /// Same contract as `rewriteAllExtensionFormulas`: `target_sheet`
     /// scopes a row / column edit, bodies decode on the way in
@@ -12364,31 +12368,18 @@ fn maybeRewriteDecoded(
 /// both; a part with no resolvable content type is still a chart when
 /// it sits at the canonical `xl/charts/chart<N>.xml` — the whole
 /// substring between `chart` and `.xml` must be digits, the
-/// `drawings.isSheetPart` rule (a `chart1_backup.xml` is not one).
-/// The third signal — a drawing's chart-typed relationship — is
+/// `drawings.isCanonicalNumberedPart` rule the sheet walk's fallback
+/// shares (a `chart1_backup.xml` is not one). The third signal — a
+/// chart-typed relationship from any part — is
 /// `Workbook.chartPartNames`'.
 const ct_chart = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 const ct_drawing = "application/vnd.openxmlformats-officedocument.drawing+xml";
 
 fn isChartPart(part: store_mod.Part) bool {
-    return isPartOfKind(part, ct_chart, "xl/charts/chart");
-}
-
-fn isDrawingPart(part: store_mod.Part) bool {
-    return isPartOfKind(part, ct_drawing, "xl/drawings/drawing");
-}
-
-fn isPartOfKind(part: store_mod.Part, content_type: []const u8, name_prefix: []const u8) bool {
     if (part.content_type) |ct| {
-        if (std.mem.eql(u8, ct, content_type)) return true;
+        if (std.mem.eql(u8, ct, ct_chart)) return true;
     }
-    const suffix = ".xml";
-    if (!std.mem.startsWith(u8, part.name, name_prefix)) return false;
-    if (!std.mem.endsWith(u8, part.name, suffix)) return false;
-    if (part.name.len <= name_prefix.len + suffix.len) return false;
-    const num = part.name[name_prefix.len .. part.name.len - suffix.len];
-    for (num) |c| if (!std.ascii.isDigit(c)) return false;
-    return true;
+    return drawings.isCanonicalNumberedPart(part.name, "xl/charts/chart");
 }
 
 fn appendChartPartName(
@@ -27562,12 +27553,38 @@ test "Workbook chart sweep: every enumeration arm moves a chart — content type
         // None of the three: not a chart by any signal the package
         // gives, left as written.
         try store.addPart("xl/charts/other.xml", "application/xml", body);
+        // The relationship arm one edge up: a chart the read serves
+        // through a drawing that is a drawing by the SHEET's
+        // relationship alone — foreign name and content type on the
+        // drawing and on its chart — which the sweep used to skip
+        // because it gated the arm on the drawing's own signals
+        // (in-house CF-REL-201). Report's drawing relationship is
+        // repointed at the copy below, so the read serves the copy's
+        // chart and nothing else on that sheet.
+        const drawing1 = (try store.part("xl/drawings/drawing1.xml")) orelse return error.TestUnexpectedResult;
+        const gfx_bytes = try a.dupe(u8, drawing1.bytes);
+        defer a.free(gfx_bytes);
+        try store.addPart("xl/drawings/gfx.xml", "application/xml", gfx_bytes);
+        try store.addPart("xl/drawings/_rels/gfx.xml.rels", "application/vnd.openxmlformats-package.relationships+xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdI1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/image1.png\"/><Relationship Id=\"rIdC1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/series3.xml\"/></Relationships>");
+        try store.addPart("xl/charts/series3.xml", "application/xml", body);
         try store.save(io, path);
     }
+    try chart_fixture.patchPart(a, io, path, "xl/worksheets/_rels/sheet2.xml.rels", "../drawings/drawing1.xml", "../drawings/gfx.xml");
     var wb = try Workbook.open(a, io, path);
     defer wb.deinit();
+    // The read serves the foreign chart before the edit…
+    {
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), anchors.len);
+        try std.testing.expectEqualStrings("xl/charts/series3.xml", anchors[0].chart_part_name);
+        try std.testing.expectEqualStrings("Data!$B$2:$B$4", anchors[0].series_refs[0]);
+    }
     try wb.renameSheet(0, "Facts");
-    for ([_][]const u8{ chart_part, "xl/charts/chart2.xml", "xl/charts/series.xml", "xl/charts/series2.xml" }) |name| {
+    for ([_][]const u8{ chart_part, "xl/charts/chart2.xml", "xl/charts/series.xml", "xl/charts/series2.xml", "xl/charts/series3.xml" }) |name| {
         const got = try dupePart(&wb, name);
         defer a.free(got);
         try std.testing.expect(std.mem.indexOf(u8, got, "<c:f>Facts!$B$2:$B$4</c:f>") != null);
@@ -27576,6 +27593,75 @@ test "Workbook chart sweep: every enumeration arm moves a chart — content type
     const other = try dupePart(&wb, "xl/charts/other.xml");
     defer a.free(other);
     try std.testing.expectEqualStrings(body, other);
+    // …and the respelled one after it: what the read serves, the
+    // sweep moved.
+    {
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), anchors.len);
+        try std.testing.expectEqualStrings("xl/charts/series3.xml", anchors[0].chart_part_name);
+        try std.testing.expectEqualStrings("Facts!$B$2:$B$4", anchors[0].series_refs[0]);
+    }
+}
+
+test "Workbook chart sweep: a malformed chart refuses a rename and a delete before the cell-formula sweep installs — the preflight is the gate, not the sweep's own walk (CF-MNT-201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var src_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&src_buf, ".zig-cache/test-chart-preflight-{d}.xlsx", .{prng.random().int(u32)});
+    try writeChartTornFixture(io, path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // Report's `SUM(Data!A1:A2)` makes the cell-formula sweep install
+    // Report's part before the chart sweep runs, so with the carrier
+    // unclosed only the preflight can refuse with nothing installed.
+    // The six-case test's fixture carries no such formula: there the
+    // sweep's own walk refused just as early, and a dropped preflight
+    // on the sheet paths left the suite green (in-house CF-MNT-201).
+    try chart_fixture.patchPart(a, io, path, chart_part, "<c:f>Data!$B$1</c:f>", "<c:f>Data!$B$1");
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    const installs = wb.store.installs;
+    try std.testing.expectError(error.MalformedChartXml, wb.renameSheet(1, "Facts"));
+    try std.testing.expectEqual(installs, wb.store.installs);
+    try std.testing.expect(!wb.torn_edit);
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    try std.testing.expectError(error.MalformedChartXml, wb.deleteSheet(1));
+    try std.testing.expectEqual(installs, wb.store.installs);
+    try std.testing.expect(!wb.torn_edit);
+    try std.testing.expect(!wb.hasUnsavedChanges());
+}
+
+test "Workbook chart sweep: a chart namespace bound under a prefix the resolver rejects refuses every edit pre-mutation and the read alike (CF-DOC-201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = try writeChartFixture(io, &buf, "overlong");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // 101 bytes: one past `max_prefix_len`. The part is well-formed
+    // XML Excel would open; the walk cannot spell its needles, and
+    // walking it under the canonical `c` would move nothing.
+    const over = "p" ** 101;
+    const over_part = "<" ++ over ++ ":chartSpace xmlns:" ++ over ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><" ++ over ++ ":f>Data!$B$1</" ++ over ++ ":f></" ++ over ++ ":chartSpace>";
+    try chart_fixture.patchPart(a, io, path, chart_part, chart_fixture.chart_xml, over_part);
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try std.testing.expectError(error.MalformedChartXml, wb.renameSheet(0, "Facts"));
+    try std.testing.expectError(error.MalformedChartXml, wb.deleteSheet(0));
+    try std.testing.expectError(error.MalformedChartXml, wb.insertRow(0, 1));
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    try std.testing.expect(!wb.torn_edit);
+    const got = try dupePart(&wb, chart_part);
+    defer a.free(got);
+    try std.testing.expectEqualStrings(over_part, got);
+    try std.testing.expectError(error.MalformedDrawingXml, drawings.chartAnchorsIn(&wb.store, a, .strict));
 }
 
 test "Workbook chart sweep: an error token keeps its qualifier under a rename and a delete — the rewriter's rule on every carrier, pinned" {

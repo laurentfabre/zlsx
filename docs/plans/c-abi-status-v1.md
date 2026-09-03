@@ -752,16 +752,20 @@ delete (a qualified reference into it; a carrier already at
 under a rename and a delete, the rewriter's single-qualifier rule on
 every carrier, cell formulas included), and the rest of the chart part
 is byte-identical. The parts walked are every part of the chart
-content type, every `xl/charts/chart<N>.xml`, and every chart-typed
-relationship target of a drawing — the edge this read follows — so the
-two enumerations cannot disagree on a chart the read serves. The
+content type, every `xl/charts/chart<N>.xml`, and every internal
+chart-typed relationship target of any part — the edge this read
+follows, from a drawing it reaches by the sheet's relationship alone
+and need not recognise by name or content type either — so the two
+enumerations cannot disagree on a chart the read serves. The
 carrier walk (`drawings.ChartFormulaWalk`) and the body acceptance
 (`Workbook.decodeChartFormulaBody`) are shared with this read, so what
 the read serves is exactly what the sweep moves; a carrier the walk
 cannot read whole — no close (a start tag truncated at the end of the
 part included), markup in a body, a carrier start tag inside an
-unterminated comment / CDATA / PI, a chart-namespace prefix longer than
-the walk's needle scratch — is this read's `MalformedDrawingXml` and
+unterminated comment / CDATA / PI, a chart namespace bound under a
+prefix longer than the resolver's 100-byte limit (the part would
+otherwise be walked under the canonical `c` and move nothing) — is
+this read's `MalformedDrawingXml` and
 the edit's `MalformedChartXml` (§10). Pivot charts ride too — their
 carriers name the pivot's host cells and shift with the hosted
 rectangle (S7a); a re-layout that changes the rectangle's extent
