@@ -394,9 +394,11 @@ pub const Error = error{
     /// `</c:f>` (a start tag truncated at the end of the part
     /// included), markup inside the body, a carrier start tag inside
     /// an unterminated comment / CDATA / PI, a chart namespace bound
-    /// under a prefix longer than the resolver's 100-byte limit (the
-    /// part would otherwise be walked under the canonical `c` and
-    /// move nothing), a body that does not
+    /// anywhere in the part under a prefix the walk does not follow —
+    /// longer than the resolver's 100-byte limit, a second prefix on a
+    /// chart URI, or declared beyond the resolver's 4 KiB root window
+    /// (the part would otherwise be walked under a prefix it does not
+    /// use and move nothing), a body that does not
     /// decode or is not UTF-8 (`decodeChartFormulaBody`, the anchors
     /// read's own acceptance) — or a chart part the archive cannot
     /// materialise. Chart series formulas (`<c:tx>`, `<c:cat>`,
@@ -27223,8 +27225,10 @@ test "Workbook.renameSheet: chart series formulas follow the rename — quoted s
     // (`spliceFormulas`) — the part stays well-formed XML.
     try wb.renameSheet(0, "R&D");
     try expectChartRefs(&wb, "'R&amp;D'!$B$1", "'R&amp;D'!$A$2:$A$4", "'R&amp;D'!$B$2:$B$4");
-    // …and decodes on the way back in: the anchors read reports the
-    // decoded spelling, and a further rename finds the qualifier.
+    // …and the part now spells `&amp;`: `chartAnchorsIn` reports the
+    // bytes as they lie (the NDJSON layer decodes them —
+    // `anchor_ndjson.decodeSeriesRef`), and the next rename proves the
+    // sweep decodes on the way in.
     {
         const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
         defer {
@@ -27637,31 +27641,53 @@ test "Workbook chart sweep: a malformed chart refuses a rename and a delete befo
     try std.testing.expect(!wb.hasUnsavedChanges());
 }
 
-test "Workbook chart sweep: a chart namespace bound under a prefix the resolver rejects refuses every edit pre-mutation and the read alike (CF-DOC-201)" {
+test "Workbook chart sweep: a chart namespace bound under a prefix the walk does not follow refuses every edit pre-mutation and the read alike (CF-DOC-201, CF-REL-301)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const a = std.testing.allocator;
-    var buf: [256]u8 = undefined;
-    const path = try writeChartFixture(io, &buf, "overlong");
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    // 101 bytes: one past `max_prefix_len`. The part is well-formed
-    // XML Excel would open; the walk cannot spell its needles, and
-    // walking it under the canonical `c` would move nothing.
-    const over = "p" ** 101;
-    const over_part = "<" ++ over ++ ":chartSpace xmlns:" ++ over ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><" ++ over ++ ":f>Data!$B$1</" ++ over ++ ":f></" ++ over ++ ":chartSpace>";
-    try chart_fixture.patchPart(a, io, path, chart_part, chart_fixture.chart_xml, over_part);
-    var wb = try Workbook.open(a, io, path);
-    defer wb.deinit();
-    try std.testing.expectError(error.MalformedChartXml, wb.renameSheet(0, "Facts"));
-    try std.testing.expectError(error.MalformedChartXml, wb.deleteSheet(0));
-    try std.testing.expectError(error.MalformedChartXml, wb.insertRow(0, 1));
-    try std.testing.expect(!wb.hasUnsavedChanges());
-    try std.testing.expect(!wb.torn_edit);
-    const got = try dupePart(&wb, chart_part);
-    defer a.free(got);
-    try std.testing.expectEqualStrings(over_part, got);
-    try std.testing.expectError(error.MalformedDrawingXml, drawings.chartAnchorsIn(&wb.store, a, .strict));
+    // 101 bytes: one past `max_prefix_len`; 4 200 bytes: past the
+    // resolver's root window too, which the first probe stopped at
+    // (in-house CF-REL-301). Both parts are well-formed XML Excel
+    // would open; the walk cannot spell their needles, and walking
+    // them under the canonical `c` would move nothing.
+    inline for (.{ "p" ** 101, "p" ** 4200 }, .{ "overlong", "overlong4k" }) |over, tag| {
+        var buf: [256]u8 = undefined;
+        const path = try writeChartFixture(io, &buf, tag);
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        const over_part = "<" ++ over ++ ":chartSpace xmlns:" ++ over ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><" ++ over ++ ":f>Data!$B$1</" ++ over ++ ":f></" ++ over ++ ":chartSpace>";
+        try chart_fixture.patchPart(a, io, path, chart_part, chart_fixture.chart_xml, over_part);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedChartXml, wb.renameSheet(0, "Facts"));
+        try std.testing.expectError(error.MalformedChartXml, wb.deleteSheet(0));
+        try std.testing.expectError(error.MalformedChartXml, wb.insertRow(0, 1));
+        try std.testing.expect(!wb.hasUnsavedChanges());
+        try std.testing.expect(!wb.torn_edit);
+        const got = try dupePart(&wb, chart_part);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(over_part, got);
+        try std.testing.expectError(error.MalformedDrawingXml, drawings.chartAnchorsIn(&wb.store, a, .strict));
+    }
+    // A commented decoy is text: the same overlong binding inside a
+    // comment before the root refuses nothing, and the pristine
+    // carriers under the root's `c:` follow the rename.
+    var buf2: [256]u8 = undefined;
+    const path2 = try writeChartFixture(io, &buf2, "decoy");
+    defer std.Io.Dir.cwd().deleteFile(io, path2) catch {};
+    try chart_fixture.patchPart(a, io, path2, chart_part, "<c:chartSpace", "<!-- xmlns:" ++ ("p" ** 101) ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" --><c:chartSpace");
+    var wb2 = try Workbook.open(a, io, path2);
+    defer wb2.deinit();
+    try wb2.renameSheet(0, "Facts");
+    // (`expectChartRefs` compares the whole part against the pristine
+    // literal; the comment stays, so the carriers are pinned directly.)
+    const got2 = try dupePart(&wb2, chart_part);
+    defer a.free(got2);
+    try std.testing.expect(std.mem.indexOf(u8, got2, "<!-- xmlns:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got2, "<c:f>Facts!$B$1</c:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got2, "<c:f>Facts!$A$2:$A$4</c:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got2, "<c:f>Facts!$B$2:$B$4</c:f>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got2, "Data!") == null);
 }
 
 test "Workbook chart sweep: an error token keeps its qualifier under a rename and a delete — the rewriter's rule on every carrier, pinned" {

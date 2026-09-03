@@ -762,10 +762,13 @@ carrier walk (`drawings.ChartFormulaWalk`) and the body acceptance
 the read serves is exactly what the sweep moves; a carrier the walk
 cannot read whole — no close (a start tag truncated at the end of the
 part included), markup in a body, a carrier start tag inside an
-unterminated comment / CDATA / PI, a chart namespace bound under a
-prefix longer than the resolver's 100-byte limit (the part would
-otherwise be walked under the canonical `c` and move nothing) — is
-this read's `MalformedDrawingXml` and
+unterminated comment / CDATA / PI, a chart namespace bound anywhere in
+the part under a prefix the walk does not follow — longer than the
+resolver's 100-byte limit, a second prefix on a chart URI, or declared
+beyond the resolver's 4 KiB root window (an `xmlns:` inside a comment,
+a PI or an attribute value is text; the part would otherwise be walked
+under a prefix it does not use and move nothing) — is this read's
+`MalformedDrawingXml` and
 the edit's `MalformedChartXml` (§10). Pivot charts ride too — their
 carriers name the pivot's host cells and shift with the hosted
 rectangle (S7a); a re-layout that changes the rectangle's extent
