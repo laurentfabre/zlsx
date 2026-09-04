@@ -798,15 +798,23 @@ nor shifted — is this read's `MalformedDrawingXml` (strict) and the
 row / column edit's `MalformedDrawingXml` (§10, the dr-1 name; not
 folded by the Editor), run by `Workbook.applySheetEditTransform`
 before the edit's first mutation (the sweep's result is what it
-installs after the sheet). The sweep walks the read's lexical layer
-and reads corners through the read's own parser
-(`drawings.parseCornerIn`), so the two judge a drawing the same way:
-a wrapper and its children may mix two followed spellings
-(`<xdr:twoCellAnchor><from>`), comment / CDATA / PI text is never an
-anchor under either spelling, and what the sweep cannot move — a
+installs after the sheet). The sweep walks the read's lexical layer,
+follows the sheet's drawing edge as the read does (`drawings.findDrawingRef`
++ the typed relationship lookup — a reference the strict read cannot
+follow refuses the edit as it refuses the inventory) and reads corners
+through the read's own parser (`drawings.parseCornerIn`), so on the
+anchors both walk the two judge a drawing the same way: a wrapper and
+its children may mix two followed spellings (`<xdr:twoCellAnchor><from>`),
+comment / CDATA / PI / DTD text is never an anchor under either
+spelling (a live `<!DOCTYPE` refuses both), XSD-collapsed whitespace
+around a scalar parses for both, and what the sweep cannot move — a
 wrapper with no close, a corner block absent or with a scalar that
 does not parse, two blocks that overlap — is the same
-`MalformedDrawingXml` the strict read raises. Pinned on every surface
+`MalformedDrawingXml` the strict read raises. The walks differ only
+where their jobs do: the sweep reads the corners of a shape the read
+never lists, the read validates a one-cell anchor's `<ext>` the sweep
+does not move, a reversed `<to>` / `<from>` pair is listed and moved
+in document order, a self-closing wrapper is stepped over by both. Pinned on every surface
 by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated

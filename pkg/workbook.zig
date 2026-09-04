@@ -311,11 +311,18 @@ pub const Error = error{
     /// dropping the pane element. Surfaces from `pkg/sheet_edit.zig`.
     MalformedPaneSplit,
     /// dr-1: `Workbook.{insertRow, deleteRow, insertColumn, deleteColumn}`
-    /// failed while rewriting the sheet's xdr drawing part because
-    /// the part's structure didn't match the expected
-    /// `<xdr:from>`/`<xdr:to>` shape. Refused rather than emit a
-    /// silently-corrupted drawing. Surfaces from
-    /// `pkg/drawing_edit.zig`.
+    /// cannot move the sheet's drawing anchors whole: the drawing
+    /// reference the strict anchors read cannot follow (a malformed
+    /// or duplicate `<drawing>` element, a dangling or mistyped
+    /// relationship, an unresolvable target, a part absent or one
+    /// the archive cannot decompress), a spreadsheetDrawing binding
+    /// the walk cannot spell, a `<!DOCTYPE`, an anchor wrapper with
+    /// no close, a corner block absent or with a scalar that does not
+    /// parse, two blocks that overlap. Refused before the first
+    /// mutation rather than emit a silently-corrupted drawing —
+    /// the strict read's verdicts on the same bytes. Surfaces from
+    /// `pkg/drawing_edit.zig` and the edge resolution in
+    /// `rewriteDrawingForSheet`.
     MalformedDrawingXml,
     /// dr-1: `Workbook.{insertRow, insertColumn}` would shift an
     /// `<xdr:col>` or `<xdr:row>` value past `std.math.maxInt(u32)`.
@@ -6475,15 +6482,25 @@ pub const Workbook = struct {
         sheet_xml: []const u8,
         spec: SheetEditSpec,
     ) Error!?DrawingRewrite {
-        const rid = findWorksheetDrawingRid(sheet_xml) orelse return null;
-        const rels = self.store.rels(sheet_part_name);
-        const target = relTargetForId(rels, rid) orelse return null;
-        const drawing_part_name = (try self.store.resolveOwned(self.allocator, sheet_part_name, target)) orelse return null;
-        errdefer self.allocator.free(drawing_part_name);
-        const drawing_part = (try self.carrierPart(drawing_part_name, error.MalformedDrawingXml)) orelse {
-            self.allocator.free(drawing_part_name);
-            return null;
+        // The sheet's drawing edge is followed as the anchors read
+        // follows it — any bound prefix on `<drawing>` and on its id,
+        // live elements only, the typed relationship — and a reference
+        // the strict read cannot follow (a malformed or duplicate
+        // element, a dangling or mistyped relationship, an unresolvable
+        // target, an absent part) refuses the edit as it refuses the
+        // inventory: the v1 sweep's raw `<drawing r:id` scan found
+        // nothing behind a prefixed or decoyed element and moved the
+        // grid alone (in-house ND-REL-201).
+        const rid = switch (drawings.findDrawingRef(sheet_xml)) {
+            .absent => return null,
+            .malformed, .multiple => return error.MalformedDrawingXml,
+            .rid => |r| r,
         };
+        const rels = self.store.rels(sheet_part_name);
+        const target = (try drawings.relTargetForIdTyped(self.allocator, rels, rid, "drawing", .strict)) orelse return error.MalformedDrawingXml;
+        const drawing_part_name = (try self.store.resolveOwned(self.allocator, sheet_part_name, target)) orelse return error.MalformedDrawingXml;
+        errdefer self.allocator.free(drawing_part_name);
+        const drawing_part = (try self.carrierPart(drawing_part_name, error.MalformedDrawingXml)) orelse return error.MalformedDrawingXml;
 
         const idx_1based = spec.row orelse spec.col.?;
         if (idx_1based == 0) {
@@ -28047,4 +28064,70 @@ test "Workbook drawing sweep: an anchor spelled under both followed names is lis
     }
     try std.testing.expectEqual(@as(usize, 1), anchors.len);
     try std.testing.expectEqual(@as(u32, 2), anchors[0].from.row);
+}
+
+test "Workbook drawing sweep: the sheet's drawing edge is followed as the read follows it — a prefixed element, a bound id prefix, a commented decoy move the anchor; a dangling or duplicate reference refuses (ND-REL-201)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/test-drawing-edge-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // openpyxl's sheet spells `<drawing xmlns:r=… r:id="rId1" />`.
+    const openpyxl_drawing_el = "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\" />";
+    const Case = struct { name: []const u8, replacement: []const u8, moves: bool };
+    const cases = [_]Case{
+        // A prefixed element under a prefix bound to the main namespace,
+        // with the id under a non-`r` prefix bound to the relationships
+        // namespace: the v1 sweep's raw `<drawing r:id` scan found
+        // nothing and moved the grid alone.
+        .{ .name = "prefixed element + bound id prefix", .replacement = "<x:drawing xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:rel=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" rel:id=\"rId1\" />", .moves = true },
+        // A commented decoy before the real element.
+        .{ .name = "commented decoy", .replacement = "<!-- <drawing r:id=\"rIdX\"/> -->" ++ openpyxl_drawing_el, .moves = true },
+        // A dangling reference: the strict read refuses the inventory,
+        // the sweep refuses the edit — pre-mutation.
+        .{ .name = "dangling", .replacement = "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rIdNone\" />", .moves = false },
+        // Two live drawing elements (schema-invalid).
+        .{ .name = "duplicate", .replacement = openpyxl_drawing_el ++ openpyxl_drawing_el, .moves = false },
+    };
+    for (cases) |case| {
+        {
+            var store = try store_mod.PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+            defer store.deinit();
+            const sheet = (try store.part("xl/worksheets/sheet1.xml")).?;
+            try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, openpyxl_drawing_el) != null);
+            const patched = try std.mem.replaceOwned(u8, a, sheet.bytes, openpyxl_drawing_el, case.replacement);
+            defer a.free(patched);
+            try store.replacePart("xl/worksheets/sheet1.xml", patched);
+            try store.save(io, path);
+        }
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        if (case.moves) {
+            try wb.insertRow(0, 1);
+            const drawing = try dupePart(&wb, "xl/drawings/drawing1.xml");
+            defer a.free(drawing);
+            std.testing.expect(std.mem.indexOf(u8, drawing, "<row>2</row>") != null) catch |e| {
+                std.debug.print("case: {s}\n", .{case.name});
+                return e;
+            };
+            const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+            defer {
+                for (anchors) |c| a.free(c.series_refs);
+                a.free(anchors);
+            }
+            try std.testing.expectEqual(@as(usize, 1), anchors.len);
+            try std.testing.expectEqual(@as(u32, 2), anchors[0].from.row);
+        } else {
+            try std.testing.expectError(error.MalformedDrawingXml, drawings.chartAnchorsIn(&wb.store, a, .strict));
+            std.testing.expectError(error.MalformedDrawingXml, wb.insertRow(0, 1)) catch |e| {
+                std.debug.print("case: {s}\n", .{case.name});
+                return e;
+            };
+            try std.testing.expect(!wb.torn_edit);
+            try std.testing.expect(!wb.hasUnsavedChanges());
+        }
+    }
 }

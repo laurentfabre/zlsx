@@ -1848,10 +1848,13 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
  *     read, materialise or move (MalformedDrawingXml — a drawing part
- *     the store cannot materialise, one binding the spreadsheetDrawing
- *     namespace under a name the anchor walk cannot spell, or an anchor
- *     it cannot read whole (no close, a corner absent or unparseable):
- *     the strict read's verdicts, refused before the first mutation —
+ *     the archive cannot decompress, a sheet drawing reference the
+ *     strict anchors read cannot follow (malformed, duplicate, dangling,
+ *     absent), one binding the spreadsheetDrawing namespace under a name
+ *     the anchor walk cannot spell, a DTD, or an anchor it cannot read
+ *     whole (no close, a corner absent or unparseable): the strict read's
+ *     verdicts on the anchors both walk, refused before the first
+ *     mutation —
  *     MalformedVmlDrawing,
  *     MalformedCommentsXml, MalformedTableXml, MalformedExtensionXml,
  *     MalformedChartXml — an <xm:f> extension or chart <c:f> series

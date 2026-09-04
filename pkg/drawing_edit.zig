@@ -53,21 +53,34 @@
 //! rather than leave an anchor behind: a spreadsheetDrawing binding
 //! the resolver cannot spell (`DrawingPrefixes.xdr_rejected` — a
 //! prefix past its 100-byte limit, or past its eight-alternate cap),
-//! an anchor wrapper with no close or an unterminated start tag, a
-//! corner block absent or with a scalar that does not parse, two
-//! corner blocks that overlap. These are the strict read's refusals on
-//! the same bytes, so the read and the sweep judge a drawing the same
-//! way; `Workbook.applySheetEditTransform` dry-runs the sweep before
-//! the edit's first mutation, so the verdict lands with nothing
-//! installed. A reversed pair — `<to>` written before `<from>` — is
-//! schema-invalid but readable: both blocks move, emitted in document
-//! order (the v1 walker sliced backwards on it — in-house ND-REL-102).
-//! A self-closing wrapper (`<xdr:twoCellAnchor/>`) carries nothing to
-//! move and passes through (the strict read refuses it as unclosed —
-//! the one divergence, in the direction that cannot corrupt). An
-//! unprefixed anchor under a root whose default namespace is NOT a
-//! spreadsheetDrawing one is not an anchor and passes through, as the
-//! read lists nothing for it.
+//! a `<!DOCTYPE` (no producer writes one; an entity could rewrite
+//! the markup), an anchor wrapper with no close or an unterminated
+//! start tag, a corner block absent or with a scalar that does not
+//! parse, two corner blocks that overlap. On the anchors both walk
+//! these are the strict read's refusals on the same bytes, by the
+//! same parser; `Workbook.applySheetEditTransform` runs the sweep
+//! before the edit's first mutation, so the verdict lands with
+//! nothing installed. The two walks differ where their jobs do, and
+//! only there: the sweep must move EVERY anchor, so it reads the
+//! corners of a shape (`<xdr:sp>`) or a frame without a chart, which
+//! the read never lists and never validates; the strict read requires
+//! a one-cell anchor's schema-mandated `<ext>`, which the sweep does
+//! not move and does not check; a self-closing wrapper
+//! (`<xdr:twoCellAnchor/>`) holds no anchor — the read steps over it,
+//! the sweep passes it through; a reversed pair — `<to>` written
+//! before `<from>` — is schema-invalid but readable: the read lists
+//! it and the sweep moves both blocks, emitted in document order (the
+//! v1 walker sliced backwards on it — in-house ND-REL-102). The
+//! sheet's `<drawing>` element is followed by the read's own edge
+//! resolution (`drawings.findDrawingRef` — any bound prefix, live
+//! elements only — and the typed relationship lookup), and a
+//! reference the strict read cannot follow refuses the edit as it
+//! refuses the inventory (the v1 sweep's raw `<drawing r:id` scan
+//! found nothing behind a prefixed or decoyed element and moved the
+//! grid alone — in-house ND-REL-201). An unprefixed anchor under a
+//! root whose default namespace is NOT a spreadsheetDrawing one is
+//! not an anchor and passes through, as the read lists nothing for
+//! it.
 
 const std = @import("std");
 const drawings = @import("drawings.zig");
@@ -99,11 +112,17 @@ pub fn applyEditToDrawing(
 ) Error![]u8 {
     const prefixes = drawings.resolveDrawingPrefixes(src);
     if (prefixes.xdr_rejected) return Error.MalformedDrawingXml;
-    var bufs: [drawings.max_tag_sets]drawings.TagSetBuf = undefined;
-    var set_store: [drawings.max_tag_sets]drawings.DrawingTags = undefined;
+    // A DTD is not content (the strict read's rule): refuse rather
+    // than splice a grid coordinate inside an entity declaration.
+    if (drawings.hasLiveDoctype(src)) return Error.MalformedDrawingXml;
+    const set_count = drawings.tagSetCount(&prefixes);
+    const bufs = try allocator.alloc(drawings.TagSetBuf, set_count);
+    defer allocator.free(bufs);
+    const set_store = try allocator.alloc(drawings.DrawingTags, set_count);
+    defer allocator.free(set_store);
     // Every needle fits under the resolver's prefix limit; a set that
     // cannot be spelled is a part the walk cannot read.
-    const sets = drawings.buildTagSets(&bufs, &set_store, prefixes) catch return Error.MalformedDrawingXml;
+    const sets = drawings.buildTagSets(bufs, set_store, prefixes) catch return Error.MalformedDrawingXml;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -168,17 +187,12 @@ fn matchAnchorOpenAt(src: []const u8, at: usize, sets: []const drawings.DrawingT
             .{ .one_cell, s.close_one }
         else
             continue;
-        const gt = std.mem.indexOfScalarPos(u8, src, at, '>') orelse return Error.MalformedDrawingXml;
-        const after_open = gt + 1;
-
-        // Self-closing form: `<xdr:foo/>` — locate the slash before `>`.
-        var trim_end = gt;
-        while (trim_end > at) : (trim_end -= 1) {
-            const ch = src[trim_end - 1];
-            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') continue;
-            break;
-        }
-        if (trim_end > at and src[trim_end - 1] == '/') {
+        // The open tag's end is quote-aware — `editAs="a/>b"` is not a
+        // self-closing wrapper (in-house ND-REL-202) — and shared with
+        // the read.
+        const open_tag = drawings.selfClosingTagEnd(src, at) orelse return Error.MalformedDrawingXml;
+        const after_open = open_tag.gt + 1;
+        if (open_tag.self_closing) {
             return .{ .kind = kind, .open_start = at, .after_open = after_open, .after_close = after_open, .self_closing = true };
         }
         // XML ties the close tag to the open tag's QName: the wrapper's
@@ -846,10 +860,12 @@ test "what the sweep cannot move it refuses — MalformedDrawingXml, the strict 
         "<xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from></xdr:twoCellAnchor>",
         // A one-cell anchor without `<from>`.
         "<xdr:oneCellAnchor><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic/></xdr:oneCellAnchor>",
-        // A scalar that does not parse (the read's grammar: no
-        // whitespace, no empty body).
-        "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row> 4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from></xdr:oneCellAnchor>",
+        // A scalar that does not parse (the read's grammar: an empty
+        // body, a non-digit).
         "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff></xdr:rowOff></xdr:from></xdr:oneCellAnchor>",
+        "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4x</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from></xdr:oneCellAnchor>",
+        // A DTD.
+        "<!DOCTYPE wsDr [ <!ENTITY g \"<oneCellAnchor><from><col>0</col></from></oneCellAnchor>\"> ]>" ++ sample_one,
         // A scalar missing — the row under a column edit too: the
         // read requires all four.
         "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:rowOff>0</xdr:rowOff></xdr:from></xdr:oneCellAnchor>",
@@ -859,6 +875,43 @@ test "what the sweep cannot move it refuses — MalformedDrawingXml, the strict 
         defer a.free(src);
         try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src, .col, 0, .insert));
         try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src, .row, 100, .delete));
+    }
+    // Whitespace around a scalar is XSD-collapsed, not a refusal: the
+    // value moves, the body is replaced whole (in-house ND-REL-201).
+    {
+        const padded = try wrapDrawing(a, "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row> 4 </xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(padded);
+        const moved = try applyEditToDrawing(a, padded, .row, 0, .insert);
+        defer a.free(moved);
+        const expected = try std.mem.replaceOwned(u8, a, padded, "<xdr:row> 4 </xdr:row>", "<xdr:row>5</xdr:row>");
+        defer a.free(expected);
+        try testing.expectEqualStrings(expected, moved);
+        // …and a column edit leaves the padded row as written.
+        const col = try applyEditToDrawing(a, padded, .col, 0, .insert);
+        defer a.free(col);
+        try testing.expect(std.mem.indexOf(u8, col, "<xdr:row> 4 </xdr:row>") != null);
+        try testing.expect(std.mem.indexOf(u8, col, "<xdr:col>2</xdr:col>") != null);
+    }
+    // A `/>` inside an attribute value does not make the wrapper
+    // self-closing (in-house ND-REL-202).
+    {
+        const quoted = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"a/>b\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(quoted);
+        const moved = try applyEditToDrawing(a, quoted, .row, 0, .insert);
+        defer a.free(moved);
+        try testing.expect(std.mem.indexOf(u8, moved, "editAs=\"a/>b\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row>") != null);
+    }
+    // A self-closing wrapper followed by a real one of the same name:
+    // the real one moves (the read steps over the empty wrapper and
+    // lists the real one — ND-DOC-204).
+    {
+        const pair = try wrapDrawing(a, "<xdr:twoCellAnchor/>" ++ sample_two);
+        defer a.free(pair);
+        const moved = try applyEditToDrawing(a, pair, .col, 0, .insert);
+        defer a.free(moved);
+        try testing.expect(std.mem.startsWith(u8, moved, pair[0..std.mem.indexOf(u8, pair, sample_two).?]));
+        try testing.expect(std.mem.indexOf(u8, moved, "<xdr:col>2</xdr:col>") != null);
+        try testing.expect(std.mem.indexOf(u8, moved, "<xdr:col>4</xdr:col>") != null);
     }
     // An opening tag the part ends inside.
     try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\"><xdr:oneCellAnchor editAs=\"oneCell\"", .col, 0, .insert));
@@ -922,6 +975,9 @@ test "fuzz: applyEditToDrawing never crashes on adversarial XML" {
             "<wsDr xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"><!-- <twoCellAnchor> --><oneCellAnchor><from><col>1</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from></oneCellAnchor><![CDATA[</oneCellAnchor>]]></wsDr>",
             "<wsDr xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"><!-- unterminated <oneCellAnchor>",
             "<wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"><xdr:oneCellAnchor><from><xdr:col>1</xdr:col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from></xdr:oneCellAnchor></wsDr>",
+            // A DTD with an anchor-shaped entity value; a `/>` in a value.
+            "<!DOCTYPE wsDr [ <!ENTITY x \"<oneCellAnchor><from><row>1</row></from>\"> ]><wsDr xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>",
+            "<xdr:twoCellAnchor editAs=\"a/>b\"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to></xdr:twoCellAnchor>",
             // from without to, and the reverse.
             "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col></xdr:from></xdr:twoCellAnchor>",
             "<xdr:twoCellAnchor><xdr:to><xdr:col>2</xdr:col></xdr:to></xdr:twoCellAnchor>",
