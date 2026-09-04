@@ -25,25 +25,31 @@
 //!   edited axis equals the deleted row/column. The single anchor
 //!   cell is gone.
 //!
-//! v1 LIMITATION: hard-codes the `xdr:` namespace prefix. Excel,
-//! LibreOffice, XlsxWriter and POI spell it; openpyxl 3.1 does NOT —
-//! it binds the spreadsheetDrawing namespace as its DEFAULT
-//! (`<wsDr xmlns="…/spreadsheetDrawing"><oneCellAnchor><from>`, the
-//! corpus's `openpyxl_chart.xlsx`), so this sweep surfaces zero
-//! rewrites there: a row / column edit that crosses an openpyxl
-//! chart's or image's anchor moves the grid (and, since the chart
-//! `<c:f>` sweep, the chart's series formulas) but not the anchor —
-//! silent corruption of the placement, pinned as the recorded gap by
-//! the workbook test on that fixture (in-house chart-sweep round 5
-//! CF-DOC-501; the earlier claim that every openpyxl fixture used
-//! `xdr:` was false). Any other non-canonical prefix surfaces zero
-//! rewrites the same way. pkg/drawings.zig grew namespace-aware
-//! support post-C2a (`resolveDrawingPrefixes`, the default-namespace
-//! chart part since that sweep); lifting the same machinery here,
-//! together with the anchors read's default-namespace drawing, is
-//! the one namespace-aware drawing follow-up.
+//! Namespace prefixes: `xdr:` above is the canonical spelling, not a
+//! literal. The anchors are matched under every prefix the anchors
+//! read follows — `drawings.resolveDrawingPrefixes`, ONE resolution
+//! of the same bytes for the read and this sweep: the root element's
+//! prefix, every alternate bound to a spreadsheetDrawing URI anywhere
+//! in the part, and the DEFAULT namespace as the empty prefix
+//! (`<wsDr xmlns="…/spreadsheetDrawing"><oneCellAnchor><from><row>`,
+//! openpyxl 3.1's spelling, whose anchors the `xdr:`-literal v1 of
+//! this sweep left in place while the grid and — since the chart
+//! `<c:f>` sweep — the chart's series formulas moved: in-house
+//! chart-sweep round 5 CF-DOC-501, the edit-side half of the
+//! namespace-aware drawing slice). One pass in document order; an
+//! anchor's inner `from` / `to` / `col` / `row` elements are spelled
+//! under the anchor wrapper's own prefix (the read's rule). A
+//! binding the resolver cannot follow — a prefix longer than its
+//! 100-byte limit, or past its replay cap — refuses
+//! `MalformedDrawingXml`: an anchor under it would be left behind,
+//! the silent corruption this sweep exists to prevent, and
+//! `Workbook.preflightDrawingEditForSheet` raises it before the
+//! edit's first mutation. An unprefixed anchor under a root whose
+//! default namespace is NOT a spreadsheetDrawing one is not an
+//! anchor and passes through, as the read lists nothing for it.
 
 const std = @import("std");
+const drawings = @import("drawings.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -60,7 +66,10 @@ pub const Axis = enum { row, col };
 /// is 0-based to match the wire format of `<xdr:col>` /
 /// `<xdr:row>`. The Editor's row/col-edit surfaces use 1-based
 /// indices and must subtract 1 before calling. Returns a freshly
-/// allocated buffer.
+/// allocated buffer. Refuses `MalformedDrawingXml` for a part that
+/// binds a spreadsheetDrawing namespace under a name the walk cannot
+/// spell (`DrawingPrefixes.xdr_rejected`) — before reading an anchor,
+/// so a dry run is the refusal the apply would raise.
 pub fn applyEditToDrawing(
     allocator: Allocator,
     src: []const u8,
@@ -68,6 +77,10 @@ pub fn applyEditToDrawing(
     index: u32,
     kind: EditKind,
 ) Error![]u8 {
+    const prefixes = drawings.resolveDrawingPrefixes(src);
+    if (prefixes.xdr_rejected) return Error.MalformedDrawingXml;
+    const set = PrefixSet.init(&prefixes);
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -80,9 +93,9 @@ pub fn applyEditToDrawing(
         try out.appendSlice(allocator, src[i..next_lt]);
         i = next_lt;
 
-        if (matchAnchorOpenAt(src, i, "twoCellAnchor")) |a| {
+        if (matchAnchorOpenAt(src, i, set.items(), "twoCellAnchor")) |a| {
             try processTwoCellAnchor(allocator, &out, src, a, axis, index, kind, &i);
-        } else if (matchAnchorOpenAt(src, i, "oneCellAnchor")) |a| {
+        } else if (matchAnchorOpenAt(src, i, set.items(), "oneCellAnchor")) |a| {
             try processOneCellAnchor(allocator, &out, src, a, axis, index, kind, &i);
         } else {
             try out.append(allocator, '<');
@@ -92,7 +105,32 @@ pub fn applyEditToDrawing(
     return try out.toOwnedSlice(allocator);
 }
 
-const xdr_prefix = "xdr:";
+/// The spreadsheetDrawing prefixes one walk spells: the resolver's
+/// primary first, then its alternates — the read's replay set, in
+/// one pass here because a rewrite must keep document order.
+const PrefixSet = struct {
+    buf: [1 + drawings.max_xdr_alts][]const u8 = undefined,
+    len: usize = 0,
+
+    fn init(p: *const drawings.DrawingPrefixes) PrefixSet {
+        var s: PrefixSet = .{};
+        s.buf[0] = p.xdr;
+        s.len = 1;
+        for (p.xdr_alts()) |alt| {
+            s.buf[s.len] = alt;
+            s.len += 1;
+        }
+        return s;
+    }
+
+    fn items(self: *const PrefixSet) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Scratch for one spelled needle: `</PREFIX:twoCellAnchor>` under
+/// the resolver's 100-byte prefix limit is 117 bytes.
+const needle_buf_len: usize = 128;
 
 const AnchorMatch = struct {
     /// Absolute byte offset of the opening `<xdr:NAME` token.
@@ -109,17 +147,27 @@ const AnchorMatch = struct {
     /// anchor MUST contain a `<xdr:from>` etc) — but we tolerate
     /// it by emitting and skipping the empty anchor verbatim.
     self_closing: bool,
+    /// The prefix the wrapper was matched under — empty for the
+    /// default namespace; its inner elements are spelled under it.
+    prefix: []const u8,
 };
 
-/// Match `<xdr:NAME` at `i` and locate the matching closing tag.
-/// `name` is the bare element name (e.g. `twoCellAnchor`).
-fn matchAnchorOpenAt(src: []const u8, i: usize, name: []const u8) ?AnchorMatch {
+/// Match `<{p}:NAME` at `i` for the first `p` in `prefixes` that
+/// spells it and locate the matching closing tag. `name` is the bare
+/// element name (e.g. `twoCellAnchor`).
+fn matchAnchorOpenAt(src: []const u8, i: usize, prefixes: []const []const u8, name: []const u8) ?AnchorMatch {
     if (i >= src.len or src[i] != '<') return null;
-    const open_token_len = 1 + xdr_prefix.len + name.len;
-    if (i + open_token_len > src.len) return null;
-    if (!std.mem.eql(u8, src[i + 1 .. i + 1 + xdr_prefix.len], xdr_prefix)) return null;
-    if (!std.mem.eql(u8, src[i + 1 + xdr_prefix.len .. i + open_token_len], name)) return null;
-    const after_name = i + open_token_len;
+    for (prefixes) |prefix| {
+        if (matchAnchorOpenUnder(src, i, prefix, name)) |m| return m;
+    }
+    return null;
+}
+
+fn matchAnchorOpenUnder(src: []const u8, i: usize, prefix: []const u8, name: []const u8) ?AnchorMatch {
+    var open_buf: [needle_buf_len]u8 = undefined;
+    const open = drawings.spellQName(&open_buf, "<", prefix, name, "") catch return null;
+    if (!std.mem.startsWith(u8, src[i..], open)) return null;
+    const after_name = i + open.len;
     if (after_name >= src.len) return null;
     const c = src[after_name];
     // Disambiguate from longer element names sharing a prefix
@@ -146,25 +194,13 @@ fn matchAnchorOpenAt(src: []const u8, i: usize, name: []const u8) ?AnchorMatch {
             .close_start = after_open,
             .after_close = after_open,
             .self_closing = true,
+            .prefix = prefix,
         };
     }
 
     // Locate `</xdr:NAME>` close.
-    var close_buf: [64]u8 = undefined;
-    if (xdr_prefix.len + name.len + 3 > close_buf.len) return null;
-    var n: usize = 0;
-    close_buf[n] = '<';
-    n += 1;
-    close_buf[n] = '/';
-    n += 1;
-    @memcpy(close_buf[n .. n + xdr_prefix.len], xdr_prefix);
-    n += xdr_prefix.len;
-    @memcpy(close_buf[n .. n + name.len], name);
-    n += name.len;
-    close_buf[n] = '>';
-    n += 1;
-    const close_needle = close_buf[0..n];
-
+    var close_buf: [needle_buf_len]u8 = undefined;
+    const close_needle = drawings.spellQName(&close_buf, "</", prefix, name, ">") catch return null;
     const close = std.mem.indexOfPos(u8, src, after_open, close_needle) orelse return null;
     return .{
         .open_start = i,
@@ -172,6 +208,7 @@ fn matchAnchorOpenAt(src: []const u8, i: usize, name: []const u8) ?AnchorMatch {
         .close_start = close,
         .after_close = close + close_needle.len,
         .self_closing = false,
+        .prefix = prefix,
     };
 }
 
@@ -187,35 +224,11 @@ const InnerSpan = struct {
     after_close: usize,
 };
 
-fn findInnerInt(src: []const u8, lo: usize, hi: usize, name: []const u8) ?InnerSpan {
-    var open_buf: [64]u8 = undefined;
-    var close_buf: [64]u8 = undefined;
-    if (1 + xdr_prefix.len + name.len + 1 > open_buf.len) return null;
-    if (2 + xdr_prefix.len + name.len + 1 > close_buf.len) return null;
-
-    var n: usize = 0;
-    open_buf[n] = '<';
-    n += 1;
-    @memcpy(open_buf[n .. n + xdr_prefix.len], xdr_prefix);
-    n += xdr_prefix.len;
-    @memcpy(open_buf[n .. n + name.len], name);
-    n += name.len;
-    open_buf[n] = '>';
-    n += 1;
-    const open_needle = open_buf[0..n];
-
-    var m: usize = 0;
-    close_buf[m] = '<';
-    m += 1;
-    close_buf[m] = '/';
-    m += 1;
-    @memcpy(close_buf[m .. m + xdr_prefix.len], xdr_prefix);
-    m += xdr_prefix.len;
-    @memcpy(close_buf[m .. m + name.len], name);
-    m += name.len;
-    close_buf[m] = '>';
-    m += 1;
-    const close_needle = close_buf[0..m];
+fn findInnerInt(src: []const u8, lo: usize, hi: usize, prefix: []const u8, name: []const u8) ?InnerSpan {
+    var open_buf: [needle_buf_len]u8 = undefined;
+    var close_buf: [needle_buf_len]u8 = undefined;
+    const open_needle = drawings.spellQName(&open_buf, "<", prefix, name, ">") catch return null;
+    const close_needle = drawings.spellQName(&close_buf, "</", prefix, name, ">") catch return null;
 
     const open_pos = std.mem.indexOfPos(u8, src, lo, open_needle) orelse return null;
     if (open_pos >= hi) return null;
@@ -283,8 +296,8 @@ const CornerCoord = struct {
 /// find the axis sub-element and parse it. Returns null if the
 /// element is missing or unparseable; callers fall back to
 /// passing the corner through verbatim in that case.
-fn readCorner(src: []const u8, corner_lo: usize, corner_hi: usize, axis: Axis) ?CornerCoord {
-    const span = findInnerInt(src, corner_lo, corner_hi, axisInnerName(axis)) orelse return null;
+fn readCorner(src: []const u8, corner_lo: usize, corner_hi: usize, prefix: []const u8, axis: Axis) ?CornerCoord {
+    const span = findInnerInt(src, corner_lo, corner_hi, prefix, axisInnerName(axis)) orelse return null;
     const text = src[span.text_start..span.text_end];
     const value = parseUInt(text) orelse return null;
     return .{ .span = span, .value = value };
@@ -301,41 +314,22 @@ const BlockBounds = struct {
     lo: usize,
     /// Byte offset of the `<` of the closing tag.
     hi: usize,
+    /// Byte offset just past the `>` of the closing tag.
+    after_close: usize,
 };
 
-fn findCornerBlock(src: []const u8, lo: usize, hi: usize, name: []const u8) ?BlockBounds {
-    var open_buf: [16]u8 = undefined;
-    var close_buf: [16]u8 = undefined;
-    var n: usize = 0;
-    open_buf[n] = '<';
-    n += 1;
-    @memcpy(open_buf[n .. n + xdr_prefix.len], xdr_prefix);
-    n += xdr_prefix.len;
-    @memcpy(open_buf[n .. n + name.len], name);
-    n += name.len;
-    open_buf[n] = '>';
-    n += 1;
-    const open_needle = open_buf[0..n];
-
-    var m: usize = 0;
-    close_buf[m] = '<';
-    m += 1;
-    close_buf[m] = '/';
-    m += 1;
-    @memcpy(close_buf[m .. m + xdr_prefix.len], xdr_prefix);
-    m += xdr_prefix.len;
-    @memcpy(close_buf[m .. m + name.len], name);
-    m += name.len;
-    close_buf[m] = '>';
-    m += 1;
-    const close_needle = close_buf[0..m];
+fn findCornerBlock(src: []const u8, lo: usize, hi: usize, prefix: []const u8, name: []const u8) ?BlockBounds {
+    var open_buf: [needle_buf_len]u8 = undefined;
+    var close_buf: [needle_buf_len]u8 = undefined;
+    const open_needle = drawings.spellQName(&open_buf, "<", prefix, name, ">") catch return null;
+    const close_needle = drawings.spellQName(&close_buf, "</", prefix, name, ">") catch return null;
 
     const open_pos = std.mem.indexOfPos(u8, src, lo, open_needle) orelse return null;
     if (open_pos >= hi) return null;
     const inner_lo = open_pos + open_needle.len;
     const close_pos = std.mem.indexOfPos(u8, src, inner_lo, close_needle) orelse return null;
     if (close_pos >= hi) return null;
-    return .{ .open_start = open_pos, .lo = inner_lo, .hi = close_pos };
+    return .{ .open_start = open_pos, .lo = inner_lo, .hi = close_pos, .after_close = close_pos + close_needle.len };
 }
 
 fn processTwoCellAnchor(
@@ -360,19 +354,19 @@ fn processTwoCellAnchor(
     // Locate from + to corner blocks. If either is missing the
     // anchor is malformed; pass through verbatim and let downstream
     // readers tolerate it.
-    const from_block = findCornerBlock(src, body_lo, body_hi, "from") orelse {
+    const from_block = findCornerBlock(src, body_lo, body_hi, a.prefix, "from") orelse {
         try out.appendSlice(allocator, src[a.open_start..a.after_close]);
         cursor.* = a.after_close;
         return;
     };
-    const to_block = findCornerBlock(src, body_lo, body_hi, "to") orelse {
+    const to_block = findCornerBlock(src, body_lo, body_hi, a.prefix, "to") orelse {
         try out.appendSlice(allocator, src[a.open_start..a.after_close]);
         cursor.* = a.after_close;
         return;
     };
 
-    const from_corner = readCorner(src, from_block.lo, from_block.hi, axis);
-    const to_corner = readCorner(src, to_block.lo, to_block.hi, axis);
+    const from_corner = readCorner(src, from_block.lo, from_block.hi, a.prefix, axis);
+    const to_corner = readCorner(src, to_block.lo, to_block.hi, a.prefix, axis);
 
     // Drop-on-collapse: delete that wipes both corners' value on
     // the edited axis.
@@ -411,10 +405,10 @@ fn processTwoCellAnchor(
     //   <xdr:to>...spliced...</xdr:to>              to-block (incl. tags)
     //   src[to_close_end .. a.after_close]          tail (e.g. <xdr:pic>...</xdr:twoCellAnchor>)
     try out.appendSlice(allocator, src[body_lo..from_block.open_start]);
-    try emitCornerBlock(allocator, out, src, from_block, "from", from_corner, new_from);
-    try out.appendSlice(allocator, src[closeAfter(from_block, "from")..to_block.open_start]);
-    try emitCornerBlock(allocator, out, src, to_block, "to", to_corner, new_to);
-    try out.appendSlice(allocator, src[closeAfter(to_block, "to")..a.after_close]);
+    try emitCornerBlock(allocator, out, src, from_block, from_corner, new_from);
+    try out.appendSlice(allocator, src[from_block.after_close..to_block.open_start]);
+    try emitCornerBlock(allocator, out, src, to_block, to_corner, new_to);
+    try out.appendSlice(allocator, src[to_block.after_close..a.after_close]);
     cursor.* = a.after_close;
 }
 
@@ -437,12 +431,12 @@ fn processOneCellAnchor(
     const body_lo = a.after_open;
     const body_hi = a.close_start;
 
-    const from_block = findCornerBlock(src, body_lo, body_hi, "from") orelse {
+    const from_block = findCornerBlock(src, body_lo, body_hi, a.prefix, "from") orelse {
         try out.appendSlice(allocator, src[a.open_start..a.after_close]);
         cursor.* = a.after_close;
         return;
     };
-    const from_corner = readCorner(src, from_block.lo, from_block.hi, axis);
+    const from_corner = readCorner(src, from_block.lo, from_block.hi, a.prefix, axis);
 
     // Drop-on-collapse: delete-match on the from coord. The
     // single anchor cell is gone.
@@ -461,8 +455,8 @@ fn processOneCellAnchor(
 
     try out.appendSlice(allocator, src[a.open_start..a.after_open]);
     try out.appendSlice(allocator, src[body_lo..from_block.open_start]);
-    try emitCornerBlock(allocator, out, src, from_block, "from", from_corner, new_from);
-    try out.appendSlice(allocator, src[closeAfter(from_block, "from")..a.after_close]);
+    try emitCornerBlock(allocator, out, src, from_block, from_corner, new_from);
+    try out.appendSlice(allocator, src[from_block.after_close..a.after_close]);
     cursor.* = a.after_close;
 }
 
@@ -475,7 +469,6 @@ fn emitCornerBlock(
     out: *std.ArrayListUnmanaged(u8),
     src: []const u8,
     block: BlockBounds,
-    name: []const u8,
     corner: ?CornerCoord,
     new_value: ?u32,
 ) Error!void {
@@ -498,17 +491,9 @@ fn emitCornerBlock(
         try out.appendSlice(allocator, src[c.span.text_end..block.hi]);
     }
 
-    // Close tag: `src[hi .. closeAfter(block, name)]` is
-    // `</xdr:NAME>`.
-    try out.appendSlice(allocator, src[block.hi..closeAfter(block, name)]);
-}
-
-/// Byte offset just past the `>` of the corner block's closing
-/// `</xdr:NAME>` tag. `findCornerBlock` already validated that
-/// the closing tag is well-formed in the input, so we compute
-/// the offset arithmetically rather than rescanning.
-fn closeAfter(block: BlockBounds, name: []const u8) usize {
-    return block.hi + "</".len + xdr_prefix.len + name.len + 1; // 1 for '>'
+    // Close tag: `src[hi .. after_close]` is `</xdr:NAME>` —
+    // `findCornerBlock` located it, so the bounds are its own.
+    try out.appendSlice(allocator, src[block.hi..block.after_close]);
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +707,210 @@ test "two adjacent twoCellAnchors both rewrite correctly" {
     }
     try testing.expectEqual(@as(usize, 2), count_col2);
     try testing.expectEqual(@as(usize, 2), count_col4);
+}
+
+// ─── namespace-aware: the default namespace, custom + mixed prefixes ──
+//
+// The anchors read and this sweep share `drawings.resolveDrawingPrefixes`;
+// these pin the sweep's half — every prefix the read lists under, the
+// sweep shifts under, in one document-order pass.
+
+const ns_xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+const ns_xdr_strict = "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing";
+const ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+/// openpyxl 3.1.5's drawing for `tests/corpus/openpyxl_chart.xlsx`,
+/// byte for byte: the spreadsheetDrawing namespace bound as the
+/// DEFAULT one, every anchor element unprefixed, `<c:chart>` bound
+/// on the root.
+const openpyxl_drawing =
+    "<wsDr xmlns:a=\"" ++ ns_a ++ "\" xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ ns_xdr ++ "\">" ++
+    "<oneCellAnchor><from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from><ext cx=\"5400000\" cy=\"2700000\" />" ++
+    "<graphicFrame><nvGraphicFramePr><cNvPr id=\"1\" name=\"Chart 1\" /><cNvGraphicFramePr /></nvGraphicFramePr><xfrm />" ++
+    "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"rId1\" /></a:graphicData></a:graphic></graphicFrame><clientData /></oneCellAnchor></wsDr>";
+
+/// `sample_two` with no prefix at all — the default-namespace
+/// spelling of the same two-cell anchor.
+const sample_two_default = "<twoCellAnchor>" ++
+    "<from><col>1</col><colOff>0</colOff><row>4</row><rowOff>0</rowOff></from>" ++
+    "<to><col>3</col><colOff>0</colOff><row>10</row><rowOff>0</rowOff></to>" ++
+    "<pic><nvPicPr/><blipFill/></pic>" ++
+    "<clientData/>" ++
+    "</twoCellAnchor>";
+
+fn wrapWithRoot(allocator: Allocator, root_open: []const u8, body: []const u8, root_close: []const u8) ![]u8 {
+    return std.mem.concat(allocator, u8, &.{ root_open, body, root_close });
+}
+
+test "default namespace (openpyxl): a row insert above the anchor shifts <row> and nothing else — the CF-DOC-501 gap closed" {
+    const a = testing.allocator;
+    const out = try applyEditToDrawing(a, openpyxl_drawing, .row, 0, .insert);
+    defer a.free(out);
+    // The one splice: `<row>1</row>` → `<row>2</row>`; every other
+    // byte, the `<c:chart r:id>` stub and the `/>`-spaced empties
+    // included, is as openpyxl wrote it.
+    const expected = try std.mem.replaceOwned(u8, a, openpyxl_drawing, "<row>1</row>", "<row>2</row>");
+    defer a.free(expected);
+    try testing.expectEqualStrings(expected, out);
+    // A column insert past the anchor is byte-identical; one at the
+    // anchor's column moves it right.
+    const same = try applyEditToDrawing(a, openpyxl_drawing, .col, 4, .insert);
+    defer a.free(same);
+    try testing.expectEqualStrings(openpyxl_drawing, same);
+    const col = try applyEditToDrawing(a, openpyxl_drawing, .col, 3, .insert);
+    defer a.free(col);
+    try testing.expect(std.mem.indexOf(u8, col, "<col>4</col>") != null);
+    try testing.expect(std.mem.indexOf(u8, col, "<row>1</row>") != null);
+    // A delete of the anchor's own row drops the one-cell anchor
+    // whole — the root's open tag and close are all that remain.
+    const dropped = try applyEditToDrawing(a, openpyxl_drawing, .row, 1, .delete);
+    defer a.free(dropped);
+    const anchor_at = std.mem.indexOf(u8, openpyxl_drawing, "<oneCellAnchor>").?;
+    const expected_dropped = try std.mem.concat(a, u8, &.{ openpyxl_drawing[0..anchor_at], "</wsDr>" });
+    defer a.free(expected_dropped);
+    try testing.expectEqualStrings(expected_dropped, dropped);
+}
+
+test "default namespace: a two-cell anchor shifts, shrinks and collapses under both URIs" {
+    const a = testing.allocator;
+    for ([_][]const u8{ ns_xdr, ns_xdr_strict }) |uri| {
+        const root = try std.mem.concat(a, u8, &.{ "<wsDr xmlns=\"", uri, "\" xmlns:a=\"", ns_a, "\">" });
+        defer a.free(root);
+        const src = try wrapWithRoot(a, root, sample_two_default, "</wsDr>");
+        defer a.free(src);
+        const ins = try applyEditToDrawing(a, src, .col, 0, .insert);
+        defer a.free(ins);
+        try testing.expect(std.mem.indexOf(u8, ins, "<col>2</col>") != null);
+        try testing.expect(std.mem.indexOf(u8, ins, "<col>4</col>") != null);
+        try testing.expect(std.mem.indexOf(u8, ins, "<row>4</row>") != null);
+        const del = try applyEditToDrawing(a, src, .row, 6, .delete);
+        defer a.free(del);
+        try testing.expect(std.mem.indexOf(u8, del, "<row>4</row>") != null);
+        try testing.expect(std.mem.indexOf(u8, del, "<row>9</row>") != null);
+        // Collapse: an anchor spanning one column, that column deleted.
+        const narrow = try std.mem.replaceOwned(u8, a, sample_two_default, "<to><col>3</col>", "<to><col>1</col>");
+        defer a.free(narrow);
+        const src_narrow = try wrapWithRoot(a, root, narrow, "</wsDr>");
+        defer a.free(src_narrow);
+        const gone = try applyEditToDrawing(a, src_narrow, .col, 1, .delete);
+        defer a.free(gone);
+        try testing.expect(std.mem.indexOf(u8, gone, "<twoCellAnchor") == null);
+    }
+}
+
+test "a non-canonical prefix bound to the xdr URI shifts — `dr:` where v1 saw nothing" {
+    const a = testing.allocator;
+    const canonical = try wrapDrawing(a, sample_two);
+    defer a.free(canonical);
+    // `xmlns:xdr` → `xmlns:dr`, every tag with it.
+    const src = try std.mem.replaceOwned(u8, a, canonical, "xdr", "dr");
+    defer a.free(src);
+    const out = try applyEditToDrawing(a, src, .row, 5, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<dr:row>4</dr:row>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<dr:row>11</dr:row>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "xdr") == null);
+}
+
+test "mixed prefixes in one part shift in one document-order pass — the root's, a declared alternate, the default namespace" {
+    const a = testing.allocator;
+    const root = "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\" xmlns:dr=\"" ++ ns_xdr ++ "\" xmlns:a=\"" ++ ns_a ++ "\">";
+    const alt = try std.mem.replaceOwned(u8, a, sample_two, "xdr:", "dr:");
+    defer a.free(alt);
+    // The default namespace declared mid-document, on the anchor.
+    const default_anchor = try std.mem.replaceOwned(u8, a, sample_two_default, "<twoCellAnchor>", "<twoCellAnchor xmlns=\"" ++ ns_xdr ++ "\">");
+    defer a.free(default_anchor);
+    const src = try std.mem.concat(a, u8, &.{ root, sample_two, alt, default_anchor, "</xdr:wsDr>" });
+    defer a.free(src);
+    const out = try applyEditToDrawing(a, src, .col, 0, .insert);
+    defer a.free(out);
+    const x = std.mem.indexOf(u8, out, "<xdr:col>2</xdr:col>").?;
+    const d = std.mem.indexOf(u8, out, "<dr:col>2</dr:col>").?;
+    const n = std.mem.indexOf(u8, out, "<col>2</col>").?;
+    try testing.expect(x < d and d < n);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "<xdr:col>4</xdr:col>"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "<dr:col>4</dr:col>"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "<col>4</col>"));
+    try testing.expect(std.mem.indexOf(u8, out, "<col>1</col>") == null);
+    // The same input with a no-op edit is byte-identical.
+    const same = try applyEditToDrawing(a, src, .col, 50, .insert);
+    defer a.free(same);
+    try testing.expectEqualStrings(src, same);
+}
+
+test "a prefixed root over default-namespace anchors shifts them — the default declaration is an alternate" {
+    const a = testing.allocator;
+    const root = "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\" xmlns=\"" ++ ns_xdr ++ "\">";
+    const src = try wrapWithRoot(a, root, sample_two_default, "</xdr:wsDr>");
+    defer a.free(src);
+    const out = try applyEditToDrawing(a, src, .row, 0, .insert);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<row>5</row>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<row>11</row>") != null);
+}
+
+test "an unprefixed anchor under a foreign default namespace is not an anchor — byte-identical" {
+    const a = testing.allocator;
+    // The root's default namespace is not a spreadsheetDrawing one;
+    // `xdr:` is bound but unused. `<twoCellAnchor>` here is a
+    // foreign element the read lists nothing for, so the sweep
+    // leaves it as written.
+    const root = "<wsDr xmlns=\"urn:not-a-drawing\" xmlns:xdr=\"" ++ ns_xdr ++ "\">";
+    const src = try wrapWithRoot(a, root, sample_two_default, "</wsDr>");
+    defer a.free(src);
+    const out = try applyEditToDrawing(a, src, .col, 0, .insert);
+    defer a.free(out);
+    try testing.expectEqualStrings(src, out);
+}
+
+test "a spreadsheetDrawing binding the walk cannot spell refuses MalformedDrawingXml; the 100-byte limit itself is followed" {
+    const a = testing.allocator;
+    const at_limit = "p" ** 100;
+    const past_limit = "p" ** 101;
+    // Under the limit: the anchor under the long prefix shifts.
+    {
+        const root = "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\" xmlns:" ++ at_limit ++ "=\"" ++ ns_xdr ++ "\">";
+        const body = try std.mem.replaceOwned(u8, a, sample_two, "xdr:", at_limit ++ ":");
+        defer a.free(body);
+        const src = try wrapWithRoot(a, root, body, "</xdr:wsDr>");
+        defer a.free(src);
+        const out = try applyEditToDrawing(a, src, .col, 0, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "<" ++ at_limit ++ ":col>2</" ++ at_limit ++ ":col>") != null);
+    }
+    // Past it: the binding is unfollowed, so the edit refuses rather
+    // than leave that anchor behind — whether or not any anchor uses
+    // the name (the read refuses the same bytes under strict).
+    {
+        const root = "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\" xmlns:" ++ past_limit ++ "=\"" ++ ns_xdr ++ "\">";
+        const src = try wrapWithRoot(a, root, sample_two, "</xdr:wsDr>");
+        defer a.free(src);
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src, .col, 0, .insert));
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src, .row, 100, .delete));
+    }
+    // A ninth alternate is past the replay cap: refused too. A
+    // commented decoy past the limit is text, not a binding.
+    {
+        var root: std.ArrayListUnmanaged(u8) = .empty;
+        defer root.deinit(a);
+        try root.appendSlice(a, "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\"");
+        for (0..drawings.max_xdr_alts + 1) |k| {
+            var decl_buf: [128]u8 = undefined;
+            try root.appendSlice(a, try std.fmt.bufPrint(&decl_buf, " xmlns:p{d}=\"{s}\"", .{ k, ns_xdr }));
+        }
+        try root.appendSlice(a, ">");
+        const src = try wrapWithRoot(a, root.items, sample_two, "</xdr:wsDr>");
+        defer a.free(src);
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src, .col, 0, .insert));
+    }
+    {
+        const root = "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\"><!-- xmlns:" ++ past_limit ++ "=\"" ++ ns_xdr ++ "\" -->";
+        const src = try wrapWithRoot(a, root, sample_two, "</xdr:wsDr>");
+        defer a.free(src);
+        const out = try applyEditToDrawing(a, src, .col, 0, .insert);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "<xdr:col>2</xdr:col>") != null);
+    }
 }
 
 // ─── fuzz target ────────────────────────────────────────────────────

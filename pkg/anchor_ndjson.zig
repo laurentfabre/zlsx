@@ -379,7 +379,13 @@ fn chartOffsetLess(charts: []const drawings.ChartAnchor, lhs: usize, rhs: usize)
 /// genuine parts and refreshed relationship caches. `src/cli.zig`
 /// and the tests below share it.
 pub const fixture = struct {
-    pub const Kind = enum { image_and_chart, with_absolute };
+    /// `.default_namespace`: Report's drawing as openpyxl 3.1 spells
+    /// one — the spreadsheetDrawing namespace bound as the DEFAULT
+    /// namespace, every anchor element unprefixed — over the same
+    /// anchors as `.image_and_chart`; Data's drawing keeps `xdr:`, so
+    /// the workbook carries both spellings (the namespace-aware
+    /// drawing slice).
+    pub const Kind = enum { image_and_chart, with_absolute, default_namespace };
 
     pub const png_bytes = "\x89PNG\r\n\x1a\n01234567";
 
@@ -416,14 +422,24 @@ pub const fixture = struct {
             chart_xml,
         );
         const absolute_block: []const u8 = switch (kind) {
-            .image_and_chart => "",
+            .image_and_chart, .default_namespace => "",
             .with_absolute => "<xdr:absoluteAnchor><xdr:pos x=\"1000\" y=\"2000\"/><xdr:ext cx=\"914400\" cy=\"457200\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"4\" name=\"Picture 2\"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed=\"rIdI1\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:absoluteAnchor>",
         };
         // Report's drawing: chart FIRST in document order.
-        const drawing = try std.fmt.allocPrint(allocator,
+        const drawing_prefixed = try std.fmt.allocPrint(allocator,
             \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
             \\<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="3048000" cy="2286000"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>19050</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rIdI1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>{s}</xdr:wsDr>
         , .{absolute_block});
+        defer allocator.free(drawing_prefixed);
+        // `.default_namespace`: every `xdr:` dropped from the tags and
+        // the root's `xmlns:xdr` made the default declaration — the
+        // `<c:chart>` stub keeps its local binding, as openpyxl's does
+        // on the root.
+        const drawing = if (kind == .default_namespace) blk: {
+            const bare = try std.mem.replaceOwned(u8, allocator, drawing_prefixed, "xdr:", "");
+            defer allocator.free(bare);
+            break :blk try std.mem.replaceOwned(u8, allocator, bare, "xmlns:xdr=", "xmlns=");
+        } else try allocator.dupe(u8, drawing_prefixed);
         defer allocator.free(drawing);
         try store.addPart(
             "xl/drawings/drawing1.xml",
@@ -1063,5 +1079,94 @@ test "collect: an anchor on a worksheet part xl/workbook.xml does not list refus
     try testing.expectError(
         error.DrawingOnUnlistedSheet,
         collect(testing.allocator, &wb),
+    );
+}
+
+// ─── the namespace-aware drawing slice: the default namespace ────────
+
+/// The view's NDJSON for the workbook at `path`, in the caller's
+/// buffer.
+fn ndjsonOf(allocator: Allocator, io: std.Io, path: []const u8, buf: []u8) ![]const u8 {
+    var wb = try workbook_mod.Workbook.open(allocator, io, path);
+    defer wb.deinit();
+    var view = try collect(allocator, &wb);
+    defer view.deinit();
+    var w = std.Io.Writer.fixed(buf);
+    try writeAll(&w, &view);
+    return w.buffered();
+}
+
+test "collect: a default-namespace drawing (openpyxl's spelling) lists what the prefixed one lists — the NDJSON is byte-identical" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const prefixed_path = try tt.path(testing.allocator, io, "anchors_prefixed.xlsx");
+    defer testing.allocator.free(prefixed_path);
+    const default_path = try tt.path(testing.allocator, io, "anchors_default_ns.xlsx");
+    defer testing.allocator.free(default_path);
+    try fixture.write(testing.allocator, io, prefixed_path, .image_and_chart);
+    try fixture.write(testing.allocator, io, default_path, .default_namespace);
+    // The premise: the two drawings differ only in their spelling.
+    {
+        var store = try PartStore.open(testing.allocator, io, default_path);
+        defer store.deinit();
+        const d = (try store.part("xl/drawings/drawing1.xml")).?;
+        try testing.expect(std.mem.startsWith(u8, d.bytes, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<wsDr xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\""));
+        try testing.expect(std.mem.indexOf(u8, d.bytes, "xdr:") == null);
+        try testing.expect(std.mem.indexOf(u8, d.bytes, "<oneCellAnchor><from><col>5</col>") != null);
+        try testing.expect(std.mem.indexOf(u8, d.bytes, "<twoCellAnchor editAs=\"oneCell\"><from>") != null);
+    }
+    var buf_p: [4096]u8 = undefined;
+    var buf_d: [4096]u8 = undefined;
+    const prefixed = try ndjsonOf(testing.allocator, io, prefixed_path, &buf_p);
+    const default_ns = try ndjsonOf(testing.allocator, io, default_path, &buf_d);
+    try testing.expectEqualStrings(prefixed, default_ns);
+    // Three records: Data's `xdr:` image, Report's unprefixed image
+    // and unprefixed chart — one workbook, both spellings.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, default_ns, "\n"));
+    try testing.expect(std.mem.indexOf(u8, default_ns, "{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/charts/chart1.xml\",\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":6,") != null);
+}
+
+test "collect: a spreadsheetDrawing binding the walk cannot spell refuses MalformedDrawingXml whole — nothing listed" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try tt.path(testing.allocator, io, "anchors_ns_reject.xlsx");
+    defer testing.allocator.free(path);
+    try fixture.write(testing.allocator, io, path, .default_namespace);
+    // A second binding on the URI, one byte past the resolver's limit:
+    // an anchor under it would be neither listed nor moved.
+    try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<wsDr ", "<wsDr xmlns:" ++ ("p" ** 101) ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" ");
+    var wb = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb.deinit();
+    try testing.expectError(error.MalformedDrawingXml, collect(testing.allocator, &wb));
+    // At the limit the binding is followed and the view is whole.
+    try fixture.write(testing.allocator, io, path, .default_namespace);
+    try fixture.patchPart(testing.allocator, io, path, "xl/drawings/drawing1.xml", "<wsDr ", "<wsDr xmlns:" ++ ("p" ** 100) ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" ");
+    var wb2 = try workbook_mod.Workbook.open(testing.allocator, io, path);
+    defer wb2.deinit();
+    var view = try collect(testing.allocator, &wb2);
+    defer view.deinit();
+    try testing.expectEqual(@as(usize, 3), view.records.len);
+}
+
+test "collect: the openpyxl corpus workbook lists its one chart — what `zlsx anchors tests/corpus/openpyxl_chart.xlsx` prints" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Committed (`scripts/gen_openpyxl_chart_fixture.py`): a bar chart
+    // at D2 over `Data`, in a default-namespace drawing the read used
+    // to list nothing for. `from` is 1-based on the wire (D2).
+    var buf: [1024]u8 = undefined;
+    const got = try ndjsonOf(testing.allocator, io, "tests/corpus/openpyxl_chart.xlsx", &buf);
+    try testing.expectEqualStrings(
+        "{\"kind\":\"chart_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,\"part\":\"xl/charts/chart1.xml\"," ++
+            "\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":4,\"row_off\":0,\"col_off\":0},\"to\":null," ++
+            "\"absolute\":null,\"chart_type\":\"bar\",\"series_refs\":[\"'Data'!B1\",\"'Data'!$A$2:$A$4\",\"'Data'!$B$2:$B$4\"]}\n",
+        got,
     );
 }

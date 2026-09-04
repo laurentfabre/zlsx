@@ -3379,6 +3379,87 @@ def test_anchors_refusal_is_typed(tmp_path):
         ed.anchors()
 
 
+def test_anchors_list_openpyxls_default_namespace_drawing_and_shift_it(tmp_path):
+    """openpyxl 3.1 binds the spreadsheetDrawing namespace as its
+    DEFAULT namespace (``<wsDr xmlns="…/spreadsheetDrawing">
+    <oneCellAnchor><from><row>``): the read used to list nothing for
+    such a workbook, and a row insert moved the grid and the chart's
+    series formulas but not the anchor. The namespace-aware drawing
+    slice resolves the prefix once for the read and the sweep — the
+    committed openpyxl corpus workbook through both."""
+    _require_anchors()
+    _require_structural()
+    path = _skip_if_missing("openpyxl_chart.xlsx")
+    assert zlsx.anchors(path) == [
+        {
+            "kind": "chart_anchor",
+            "sheet": "Data",
+            "sheet_idx": 0,
+            "part": "xl/charts/chart1.xml",
+            "anchor": "one_cell",
+            "from": {"row": 2, "col": 4, "row_off": 0, "col_off": 0},
+            "to": None,
+            "absolute": None,
+            "chart_type": "bar",
+            "series_refs": ["'Data'!B1", "'Data'!$A$2:$A$4", "'Data'!$B$2:$B$4"],
+        }
+    ]
+    out = tmp_path / "openpyxl_moved.xlsx"
+    with zlsx.edit(path) as ed:
+        ed.insert_row(0, 1)
+        moved = ed.anchors()
+        assert moved[0]["from"] == {"row": 3, "col": 4, "row_off": 0, "col_off": 0}
+        assert moved[0]["series_refs"] == ["'Data'!B2", "'Data'!$A$3:$A$5", "'Data'!$B$3:$B$5"]
+        ed.save(out)
+    assert zlsx.anchors(out)[0]["from"]["row"] == 3
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        drawing = z.read("xl/drawings/drawing1.xml").decode()
+    # The row is the one splice; the part stays as openpyxl spelled it.
+    assert "<row>2</row>" in drawing and "<row>1</row>" not in drawing
+    assert "xdr:" not in drawing
+
+
+def test_anchors_unfollowable_drawing_binding_refuses_read_and_edit(tmp_path):
+    """A spreadsheetDrawing binding under a name the anchor walk cannot
+    spell (past the resolver's 100-byte prefix limit) would leave an
+    anchor neither listed nor moved: the read refuses ``MalformedDrawingXml``
+    and so does every row / column edit, before anything changes."""
+    _require_anchors()
+    _require_structural()
+    import shutil
+    import zipfile
+
+    src = _skip_if_missing("openpyxl_chart.xlsx")
+    path = tmp_path / "openpyxl_nsbind.xlsx"
+    long_prefix = "p" * 101
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/drawings/drawing1.xml":
+                data = data.replace(
+                    b"<wsDr ",
+                    b'<wsDr xmlns:' + long_prefix.encode() + b'="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" ',
+                    1,
+                )
+            zout.writestr(item, data)
+    with pytest.raises(zlsx.ZlsxRefusal) as info:
+        zlsx.anchors(path)
+    assert info.value.error_name == "MalformedDrawingXml"
+    with zlsx.edit(path) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.insert_row(0, 1)
+        assert info.value.error_name == "MalformedDrawingXml"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_column(0, 0)
+        assert info.value.error_name == "MalformedDrawingXml"
+        # Pre-mutation: a rename, which runs no drawing sweep, still lands.
+        ed.rename_sheet(0, "Facts")
+        ed.save(tmp_path / "renamed.xlsx")
+    del shutil
+
+
 def _require_sheet_props():
     import zlsx._ffi as ffi
     if not ffi._HAS_EDITOR or not ffi._HAS_SHEET_PROPS:

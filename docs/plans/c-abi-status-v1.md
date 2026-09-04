@@ -779,14 +779,25 @@ cache's `worksheetSource@sheet` does under a rename. A part binding
 the chart namespace as its DEFAULT namespace (`<chartSpace
 xmlns="…/chart"><f>`) is openpyxl's spelling and is walked under `<f>`
 (in-house CF-REL-401 — it had been documented as unproduced and left
-unwalked, so every openpyxl chart went stale silently); the anchors
-read does not yet resolve openpyxl's default-namespace DRAWING (`<wsDr
-xmlns="…/spreadsheetDrawing">`), so it lists no chart for such a
-workbook while the sweep moves its chart part, and the drawing sweep
-(`drawing_edit`, `xdr:`-literal) does not shift that drawing's anchors
-either — a row insert above an openpyxl chart moves the grid and the
-series formulas but not the chart's `from` (round 5 CF-DOC-501). Both
-halves are the one namespace-aware drawing follow-up, pinned by the
+unwalked, so every openpyxl chart went stale silently). **The
+namespace-aware drawing slice (2026-09-05)** closed the sibling gap
+that round recorded (CF-DOC-501): the anchors read and the drawing
+sweep (`drawing_edit`, the dr-1 row / column rewrite) share one prefix
+resolution — `drawings.resolveDrawingPrefixes`: the root element's
+prefix, every alternate bound to a spreadsheetDrawing URI anywhere in
+the part, and the DEFAULT namespace as the empty prefix (`<wsDr
+xmlns="…/spreadsheetDrawing"><oneCellAnchor><from><row>`, openpyxl
+3.1's drawings, which the read listed as nothing and the
+`xdr:`-literal sweep left in place while the grid and the series
+formulas moved) — so a row insert above an openpyxl chart moves its
+`from` with the grid, and this export hands over the record `zlsx
+anchors` prints. A spreadsheetDrawing binding under a name the walk
+cannot spell — longer than the resolver's 100-byte limit, or past its
+eight-alternate replay cap; an anchor under it would be neither listed
+nor shifted — is this read's `MalformedDrawingXml` (strict) and the
+row / column edit's `MalformedDrawingXml` (§10, the dr-1 name; not
+folded by the Editor), dry-run by `Workbook.preflightDrawingEditForSheet`
+before the edit's first mutation. Pinned on every surface by the
 corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated

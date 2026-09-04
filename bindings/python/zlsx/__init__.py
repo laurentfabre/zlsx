@@ -3784,7 +3784,10 @@ class Editor:
         * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
           1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
           — a split pane the rewriter does not shift; the carrier
-          verdicts ``MalformedSheetXml``, ``MalformedDrawingXml``,
+          verdicts ``MalformedSheetXml``, ``MalformedDrawingXml`` (a
+          drawing part the store cannot materialise, or one binding the
+          spreadsheetDrawing namespace under a name the anchor walk
+          cannot spell — refused before the first mutation),
           ``MalformedVmlDrawing``, ``MalformedCommentsXml``,
           ``MalformedTableXml``, ``DrawingCoordinateOverflow``,
           ``VmlCoordinateOverflow``, ``TableCoordinateOverflow`` — a part
@@ -4070,16 +4073,21 @@ class Editor:
         ``series_refs`` respelled by the chart ``<c:f>`` sweep — a new
         sheet name after a rename, shifted rows after an insert on the
         sheet they name) are visible immediately; staged cell writes
-        never touch a drawing. ``[]`` for a workbook without anchored
-        objects. An inventory that cannot be served
-        faithfully raises
+        never touch a drawing. Drawings are walked under every prefix
+        bound to the spreadsheetDrawing namespace — the canonical
+        ``xdr:``, any other, and the DEFAULT namespace (openpyxl's
+        ``<wsDr xmlns="…"><oneCellAnchor>`` spelling) — the same
+        resolution the row / column sweep moves anchors under. ``[]``
+        for a workbook without anchored objects. An inventory that
+        cannot be served faithfully raises
         :class:`ZlsxRefusal` (``MalformedWorkbookXml`` for a sheet list
         the strict workbook read cannot prove, ``MalformedDrawingXml``
-        for a drawing graph the strict walk cannot read whole,
-        ``DrawingOnUnlistedSheet`` for an anchor on a worksheet part the
-        workbook does not list) rather than return a record that lies
-        or a list with a hole. An archive past the decompression caps
-        fails at open."""
+        for a drawing graph the strict walk cannot read whole — a
+        spreadsheetDrawing binding under a name it cannot spell
+        included — ``DrawingOnUnlistedSheet`` for an anchor on a
+        worksheet part the workbook does not list) rather than return a
+        record that lies or a list with a hole. An archive past the
+        decompression caps fails at open."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_ANCHORS:

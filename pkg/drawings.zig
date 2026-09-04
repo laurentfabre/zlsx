@@ -27,15 +27,23 @@
 //! shape doesn't fit the cell-grid contract; callers needing it can
 //! reach for the raw drawing XML via PartStore.part().
 //!
-//! ⚠️ Namespace-prefix assumption: this v1 parser hard-codes the
-//! `xdr:` prefix for the spreadsheetDrawing namespace and `a:` for
-//! drawingml. Every Microsoft Excel + LibreOffice + xlsxwriter +
-//! openpyxl + python-calamine fixture in the project's corpus uses
-//! these prefixes, but OOXML producers are technically free to pick
-//! any prefix. Workbooks with non-standard prefixes will surface
-//! zero anchors instead of erroring. A namespace-aware parser is
-//! queued as a future iter; until then the assumption is documented
-//! here as a known limitation.
+//! Namespace prefixes are resolved per part (`resolveDrawingPrefixes`):
+//! `xdr:` / `a:` / `c:` are the canonical spellings the sketch above
+//! uses, but every prefix bound to the spreadsheetDrawing URI is
+//! followed — the root element's, every alternate declared anywhere
+//! in the part (replayed, capped at `max_xdr_alts`), and the DEFAULT
+//! namespace (an empty prefix: `<wsDr xmlns="…/spreadsheetDrawing">
+//! <oneCellAnchor><from><col>`, openpyxl 3.1's spelling, whose
+//! anchors this read listed as nothing until the namespace-aware
+//! drawing slice). A binding to the URI under a name the walk cannot
+//! follow — longer than `max_prefix_len`, or past the alternate cap —
+//! is `xdr_rejected`: the strict read refuses the drawing rather than
+//! serve a partial inventory, and the drawing sweep (`drawing_edit`,
+//! which resolves the same prefixes) refuses the edit rather than
+//! leave an anchor behind. The chart stub inside a graphic frame is
+//! matched as `<{p}:chart` for a prefix bound to a chart URI — an
+//! unprefixed `<chart xmlns="…/chart">` stub is not followed (no
+//! producer spells one; openpyxl binds `c:` on its drawing root).
 
 const std = @import("std");
 const store_mod = @import("store.zig");
@@ -314,6 +322,12 @@ fn collectFromSheet(
     // element so non-Microsoft producers (libreoffice, custom
     // tooling) don't silently surface zero anchors.
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
+    // A spreadsheetDrawing binding under a name the walk will not
+    // spell is an inventory the read cannot serve whole: strict
+    // refuses rather than list the anchors under the other names as
+    // the drawing's (the chart walk's `c_rejected` rule); lenient
+    // lists what it can, as before.
+    if (mode == .strict and prefixes.xdr_rejected) return error.MalformedDrawingXml;
     // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
     // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
     // namespace prefixes have no upper bound in the spec — Codex
@@ -487,6 +501,9 @@ fn collectChartsFromSheet(
 
     const drawing_rels = store.rels(drawing_part_name);
     const prefixes = resolveDrawingPrefixes(drawing_part.bytes);
+    // The image walk's rule: an unfollowed spreadsheetDrawing binding
+    // refuses under strict.
+    if (mode == .strict and prefixes.xdr_rejected) return error.MalformedDrawingXml;
     // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
     // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
     // namespace prefixes have no upper bound in the spec — Codex
@@ -845,9 +862,7 @@ pub const ChartFormulaWalk = struct {
 /// CF-REL-401); the exact-QName terminator rule on the match keeps
 /// `<formatCode>`, `<firstSliceAng>` and `<fmtId>` out either way.
 fn spellCarrierNeedle(buf: *[128]u8, prefix: []const u8, which: enum { open, close }) error{NoSpaceLeft}![]const u8 {
-    const lt: []const u8 = if (which == .open) "<" else "</";
-    if (prefix.len == 0) return std.fmt.bufPrint(buf, "{s}f", .{lt});
-    return std.fmt.bufPrint(buf, "{s}{s}:f", .{ lt, prefix });
+    return spellQName(buf, if (which == .open) "<" else "</", prefix, "f", "");
 }
 
 /// Does a comment / CDATA / PI opened at or after `from` never close,
@@ -1047,7 +1062,7 @@ fn detectChartTypeWithAlt(
             const p = maybe_p orelse continue;
             // The empty prefix is the default-namespace part (openpyxl):
             // `<barChart`, not `<:barChart` (in-house CF-REL-401).
-            const needle = (if (p.len == 0) std.fmt.bufPrint(&buf, "<{s}", .{c.suffix}) else std.fmt.bufPrint(&buf, "<{s}:{s}", .{ p, c.suffix })) catch continue;
+            const needle = spellQName(&buf, "<", p, c.suffix, "") catch continue;
             if (findLiveExactTag(chart_xml, 0, needle) != null) present = true;
         }
         if (!present) continue;
@@ -1352,7 +1367,7 @@ fn findBlipEmbedWithAlt(
 }
 
 fn tryBlipEmbedAt(pic_xml: []const u8, buf: []u8, prefix: []const u8) ?[]const u8 {
-    const blip_open = std.fmt.bufPrint(buf, "<{s}:blip", .{prefix}) catch return null;
+    const blip_open = spellQName(buf, "<", prefix, "blip", "") catch return null;
     var search_at: usize = 0;
     // Live, QName-exact matches only — a commented blip is text (r5
     // REL-501), and a `<a:blipExtension r:embed=…>` is not a blip
@@ -1384,9 +1399,16 @@ const ns_c_strict = "http://purl.oclc.org/ooxml/drawingml/chart";
 /// fields hold the alternate-conformance binding when both
 /// Transitional and Strict URIs are declared so downstream
 /// lookups can probe either prefix.
-const max_xdr_alts: usize = 8;
+pub const max_xdr_alts: usize = 8;
 
-const DrawingPrefixes = struct {
+pub const DrawingPrefixes = struct {
+    /// The spreadsheetDrawing prefix the walk spells first: the root
+    /// element's own, else the first bound one, else the canonical
+    /// fallback. EMPTY for a part whose unprefixed root sits in the
+    /// spreadsheetDrawing namespace bound as the DEFAULT one
+    /// (`<wsDr xmlns="…/spreadsheetDrawing">`, openpyxl's drawings) —
+    /// every tag needle is then spelled bare (`<twoCellAnchor`,
+    /// `<from>`, `<row>`), the chart walk's `<f>` rule.
     xdr: []const u8 = "xdr",
     a: []const u8 = "a",
     c: []const u8 = "c",
@@ -1399,18 +1421,35 @@ const DrawingPrefixes = struct {
     /// The chart walk's strict mode refuses on it (CF-DOC-201 /
     /// CF-REL-301).
     c_rejected: bool = false,
+    /// The part binds a spreadsheetDrawing namespace (either URI),
+    /// anywhere in it, under a name the anchor walk will not follow
+    /// — longer than `max_prefix_len`, or past the `max_xdr_alts`
+    /// replay cap — so an anchor under that name would be neither
+    /// listed nor shifted. The strict read refuses the drawing and
+    /// the drawing sweep refuses the edit on it (`MalformedDrawingXml`
+    /// both), the chart walk's `c_rejected` rule on this namespace.
+    xdr_rejected: bool = false,
     /// All prefixes (other than `xdr`) bound to either xdr URI in
-    /// the same document. The scanner replays once per prefix so
-    /// anchors using ANY bound prefix are surfaced. Capped at
-    /// `max_xdr_alts` — real OOXML producers declare 1-2; more is
-    /// pathological. Tracked as fixed-array + count rather than a
-    /// stdlib bounded helper because Zig 0.15 dropped
-    /// `std.BoundedArray`.
+    /// the same document — the DEFAULT declaration counted as the
+    /// empty name (a prefixed root over unprefixed anchors is walked
+    /// too). The scanner replays once per prefix so anchors using ANY
+    /// bound prefix are surfaced. Capped at `max_xdr_alts` — real
+    /// OOXML producers declare 1-2; more is pathological. Tracked as
+    /// fixed-array + count rather than a stdlib bounded helper because
+    /// Zig 0.15 dropped `std.BoundedArray`.
     xdr_alts_buf: [max_xdr_alts][]const u8 = undefined,
     xdr_alts_len: usize = 0,
 
-    fn xdr_alts(self: *const DrawingPrefixes) []const []const u8 {
+    pub fn xdr_alts(self: *const DrawingPrefixes) []const []const u8 {
         return self.xdr_alts_buf[0..self.xdr_alts_len];
+    }
+
+    /// Is `name` a spreadsheetDrawing prefix the walk spells — the
+    /// primary or one of the alternates?
+    pub fn followsXdr(self: *const DrawingPrefixes, name: []const u8) bool {
+        if (std.mem.eql(u8, name, self.xdr)) return true;
+        for (self.xdr_alts()) |alt| if (std.mem.eql(u8, alt, name)) return true;
+        return false;
     }
 };
 
@@ -1418,7 +1457,9 @@ const DrawingPrefixes = struct {
 /// prefix for each canonical OOXML namespace. Falls back to the
 /// canonical prefix when a namespace isn't declared (some chart
 /// parts only declare the chart namespace inline on `<c:chart>`).
-fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
+/// Shared with `drawing_edit`, so the read and the sweep follow one
+/// resolution of the same bytes.
+pub fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     var p: DrawingPrefixes = .{};
     // The xdr / a / c namespaces are independently scoped: a
     // document can bind one to its Strict URI and another to its
@@ -1429,6 +1470,13 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
     const root_xdr = rootElementPrefix(xml);
     if (root_xdr) |pref| {
         p.xdr = pref;
+    } else if (rootElementIsUnprefixed(xml) and isXdrUri(defaultNamespaceUri(xml))) {
+        // An unprefixed root whose DEFAULT namespace is the
+        // spreadsheetDrawing one — `<wsDr xmlns="…/spreadsheetDrawing">`,
+        // openpyxl 3.1's drawings: the anchors are `<oneCellAnchor>
+        // <from><col>`, unprefixed, and the walk spells them so. A
+        // prefixed binding declared beside it is an alternate below.
+        p.xdr = "";
     } else if (findNamespacePrefix(xml, ns_xdr_transitional) orelse
         findNamespacePrefix(xml, ns_xdr_strict)) |pref|
     {
@@ -1479,17 +1527,62 @@ fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
         }
     }
     p.c_rejected = hasUnfollowedChartBinding(xml, p.c, p.c_alt);
+    p.xdr_rejected = hasUnfollowedXdrBinding(xml, &p);
     return p;
 }
 
-/// Find the prefix on the root XML element. Skips the XML
-/// declaration (`<?xml ... ?>`) and any leading whitespace, then
-/// reads the first `<NAME:` token's NAME. Returns null if the
-/// root element is unprefixed or absent. Bounded scan (4 KiB).
+fn isXdrUri(uri: ?[]const u8) bool {
+    const u = uri orelse return false;
+    return std.mem.eql(u8, u, ns_xdr_transitional) or std.mem.eql(u8, u, ns_xdr_strict);
+}
+
+/// Does the part bind a spreadsheetDrawing namespace (either URI)
+/// under a name the anchor walk will not spell — one longer than
+/// `max_prefix_len` (skipped by the collectors), or past the
+/// `max_xdr_alts` replay cap? Every live, attribute-shaped
+/// declaration of the whole part, the alternate collection's own
+/// scope: an anchor under such a name would be neither listed by the
+/// read nor shifted by the sweep, so both refuse on it
+/// (`MalformedDrawingXml`) — the chart walk's `hasUnfollowedChartBinding`
+/// rule on this namespace. The DEFAULT declaration is the empty name,
+/// followed when it is the primary or an alternate.
+fn hasUnfollowedXdrBinding(xml: []const u8, p: *const DrawingPrefixes) bool {
+    var it = RootNsBindings.init(xml, xml.len);
+    while (it.next()) |b| {
+        if (!isXdrUri(b.uri)) continue;
+        if (!p.followsXdr(b.name)) return true;
+    }
+    return false;
+}
+
+/// Find the prefix on the root XML element — the NAME of the first
+/// `<NAME:LOCAL` token (`rootElementQName`). Returns null if the root
+/// element is unprefixed or absent, or its prefix is longer than
+/// `max_prefix_len` (the binding is then `xdr_rejected`).
 fn rootElementPrefix(xml: []const u8) ?[]const u8 {
+    const qname = rootElementQName(xml) orelse return null;
+    const colon = std.mem.indexOfScalar(u8, qname, ':') orelse return null;
+    if (colon > max_prefix_len) return null;
+    return qname[0..colon];
+}
+
+/// Is there a root element, and does its QName carry no prefix
+/// (`<wsDr …>`)? False for an absent root and for a prefixed one,
+/// overlong prefixes included — the default-namespace resolution is
+/// for a root that lives in the default namespace, nothing else.
+fn rootElementIsUnprefixed(xml: []const u8) bool {
+    const qname = rootElementQName(xml) orelse return false;
+    return std.mem.indexOfScalar(u8, qname, ':') == null;
+}
+
+/// The root element's QName. Skips the XML declaration
+/// (`<?xml ... ?>`), a DOCTYPE / comment and any leading whitespace,
+/// then reads the first element's name up to XML whitespace, `/` or
+/// `>`. Null when no element starts in the root window (4 KiB) or the
+/// name runs past it.
+fn rootElementQName(xml: []const u8) ?[]const u8 {
     const limit = @min(xml.len, 4096);
     var i: usize = 0;
-    // Skip the optional XML declaration.
     while (i < limit) {
         const lt = std.mem.indexOfScalarPos(u8, xml[0..limit], i, '<') orelse return null;
         if (lt + 1 >= limit) return null;
@@ -1510,12 +1603,8 @@ fn rootElementPrefix(xml: []const u8) ?[]const u8 {
         var j = lt + 1;
         while (j < limit) : (j += 1) {
             const c = xml[j];
-            if (c == ':') {
-                if (j - (lt + 1) > max_prefix_len) return null;
-                return xml[lt + 1 .. j];
-            }
             if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '/' or c == '>') {
-                return null; // unprefixed
+                return xml[lt + 1 .. j];
             }
         }
         return null;
@@ -2022,7 +2111,10 @@ fn collectAllNamespacePrefixes(
 ) void {
     var it = RootNsBindings.init(xml, xml.len);
     while (it.next()) |b| {
-        if (b.name.len == 0 or !std.mem.eql(u8, b.uri, target_uri) or std.mem.eql(u8, b.name, skip) or b.name.len > max_prefix_len) continue;
+        // The DEFAULT declaration (an empty name) is an alternate like
+        // any other: a `<xdr:wsDr>` root over `<twoCellAnchor xmlns=
+        // "…/spreadsheetDrawing">` anchors is walked under both.
+        if (!std.mem.eql(u8, b.uri, target_uri) or std.mem.eql(u8, b.name, skip) or b.name.len > max_prefix_len) continue;
         // Dedup: don't append the same prefix twice (would
         // happen when same prefix is declared on two elements
         // with the same URI).
@@ -2045,7 +2137,8 @@ fn collectAllNamespacePrefixes(
 /// (`RootNsBindings`), the ceiling prefix resolution uses so
 /// behaviour stays consistent across helpers.
 fn uriOfPrefix(xml: []const u8, prefix: []const u8) ?[]const u8 {
-    if (prefix.len == 0) return null;
+    // The empty prefix is the DEFAULT declaration, the iterator's
+    // empty name — the primary of an unprefixed drawing root.
     // Root-window scan: this is only used to look up the URI of the
     // ROOT element's prefix, which by definition is declared on the
     // root.
@@ -2281,26 +2374,31 @@ const DrawingTags = struct {
 
     fn build(buf: []u8, p: DrawingPrefixes) !DrawingTags {
         var w = std.Io.Writer.fixed(buf);
-        const xdr_prefix_open = try writeAndAdvance(&w, "<{s}:", .{p.xdr});
-        const open_two = try writeAndAdvance(&w, "<{s}:twoCellAnchor", .{p.xdr});
-        const close_two = try writeAndAdvance(&w, "</{s}:twoCellAnchor>", .{p.xdr});
-        const open_one = try writeAndAdvance(&w, "<{s}:oneCellAnchor", .{p.xdr});
-        const close_one = try writeAndAdvance(&w, "</{s}:oneCellAnchor>", .{p.xdr});
-        const open_absolute = try writeAndAdvance(&w, "<{s}:absoluteAnchor", .{p.xdr});
-        const close_absolute = try writeAndAdvance(&w, "</{s}:absoluteAnchor>", .{p.xdr});
+        // Every needle is spelled by `writeQName`, so the DEFAULT
+        // namespace (an empty prefix — openpyxl's drawings) reads
+        // `<twoCellAnchor` / `<from>` / `<row>` and the scan's tag
+        // opener is the bare `<` (every live tag is then a candidate;
+        // the anchor names decide, as they do under a prefix).
+        const xdr_prefix_open = try writeQName(&w, "<", p.xdr, "", "");
+        const open_two = try writeQName(&w, "<", p.xdr, "twoCellAnchor", "");
+        const close_two = try writeQName(&w, "</", p.xdr, "twoCellAnchor", ">");
+        const open_one = try writeQName(&w, "<", p.xdr, "oneCellAnchor", "");
+        const close_one = try writeQName(&w, "</", p.xdr, "oneCellAnchor", ">");
+        const open_absolute = try writeQName(&w, "<", p.xdr, "absoluteAnchor", "");
+        const close_absolute = try writeQName(&w, "</", p.xdr, "absoluteAnchor", ">");
         // `<{s}:pic` without the closing `>`: the element may carry
         // attributes (`macro`, `fPublished`); the exact-live-tag
         // lookup supplies the name terminator (r5 REL-501).
-        const open_pic = try writeAndAdvance(&w, "<{s}:pic", .{p.xdr});
-        const close_pic = try writeAndAdvance(&w, "</{s}:pic>", .{p.xdr});
-        const open_from = try writeAndAdvance(&w, "<{s}:from>", .{p.xdr});
-        const close_from = try writeAndAdvance(&w, "</{s}:from>", .{p.xdr});
-        const open_to = try writeAndAdvance(&w, "<{s}:to>", .{p.xdr});
-        const close_to = try writeAndAdvance(&w, "</{s}:to>", .{p.xdr});
-        const open_pos = try writeAndAdvance(&w, "<{s}:pos", .{p.xdr});
-        const open_ext = try writeAndAdvance(&w, "<{s}:ext", .{p.xdr});
-        const open_graphic_frame = try writeAndAdvance(&w, "<{s}:graphicFrame", .{p.xdr});
-        const open_chart = try writeAndAdvance(&w, "<{s}:chart", .{p.c});
+        const open_pic = try writeQName(&w, "<", p.xdr, "pic", "");
+        const close_pic = try writeQName(&w, "</", p.xdr, "pic", ">");
+        const open_from = try writeQName(&w, "<", p.xdr, "from", ">");
+        const close_from = try writeQName(&w, "</", p.xdr, "from", ">");
+        const open_to = try writeQName(&w, "<", p.xdr, "to", ">");
+        const close_to = try writeQName(&w, "</", p.xdr, "to", ">");
+        const open_pos = try writeQName(&w, "<", p.xdr, "pos", "");
+        const open_ext = try writeQName(&w, "<", p.xdr, "ext", "");
+        const open_graphic_frame = try writeQName(&w, "<", p.xdr, "graphicFrame", "");
+        const open_chart = try writeQName(&w, "<", p.c, "chart", "");
         return .{
             .xdr_prefix_open = xdr_prefix_open,
             .open_two = open_two,
@@ -2323,13 +2421,29 @@ const DrawingTags = struct {
     }
 };
 
-/// Format `fmt` into the writer-fixed buffer and return the slice
-/// of bytes that were just written (offset into the underlying
-/// buffer, fixed for the writer's lifetime).
-fn writeAndAdvance(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) ![]const u8 {
+/// One tag needle under a resolved prefix — `{lead}{prefix}:{local}{tail}`
+/// for a bound prefix, `{lead}{local}{tail}` for the DEFAULT namespace
+/// (an empty prefix: openpyxl's drawings and chart parts). `lead` is
+/// `<` or `</`; `tail` is `>` for a whole tag and empty for an opener
+/// whose attributes the exact-QName match terminates. The ONE spelling
+/// of every needle the drawing and chart walks match, so no site can
+/// spell `<:from>` for the empty prefix.
+fn writeQName(w: *std.Io.Writer, lead: []const u8, prefix: []const u8, local: []const u8, tail: []const u8) ![]const u8 {
     const before = w.end;
-    try w.print(fmt, args);
+    try w.writeAll(lead);
+    if (prefix.len != 0) {
+        try w.writeAll(prefix);
+        try w.writeByte(':');
+    }
+    try w.writeAll(local);
+    try w.writeAll(tail);
     return w.buffer[before..w.end];
+}
+
+/// `writeQName` into a caller's scratch buffer.
+pub fn spellQName(buf: []u8, lead: []const u8, prefix: []const u8, local: []const u8, tail: []const u8) error{NoSpaceLeft}![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    return writeQName(&w, lead, prefix, local, tail) catch return error.NoSpaceLeft;
 }
 
 fn relForId(
@@ -2576,14 +2690,14 @@ fn parseCellAnchor(
     var row_close_buf: [128]u8 = undefined;
     var row_off_open_buf: [128]u8 = undefined;
     var row_off_close_buf: [128]u8 = undefined;
-    const col_open = std.fmt.bufPrint(&col_open_buf, "<{s}:col>", .{xdr_prefix}) catch return null;
-    const col_close = std.fmt.bufPrint(&col_close_buf, "</{s}:col>", .{xdr_prefix}) catch return null;
-    const col_off_open = std.fmt.bufPrint(&col_off_open_buf, "<{s}:colOff>", .{xdr_prefix}) catch return null;
-    const col_off_close = std.fmt.bufPrint(&col_off_close_buf, "</{s}:colOff>", .{xdr_prefix}) catch return null;
-    const row_open = std.fmt.bufPrint(&row_open_buf, "<{s}:row>", .{xdr_prefix}) catch return null;
-    const row_close = std.fmt.bufPrint(&row_close_buf, "</{s}:row>", .{xdr_prefix}) catch return null;
-    const row_off_open = std.fmt.bufPrint(&row_off_open_buf, "<{s}:rowOff>", .{xdr_prefix}) catch return null;
-    const row_off_close = std.fmt.bufPrint(&row_off_close_buf, "</{s}:rowOff>", .{xdr_prefix}) catch return null;
+    const col_open = spellQName(&col_open_buf, "<", xdr_prefix, "col", ">") catch return null;
+    const col_close = spellQName(&col_close_buf, "</", xdr_prefix, "col", ">") catch return null;
+    const col_off_open = spellQName(&col_off_open_buf, "<", xdr_prefix, "colOff", ">") catch return null;
+    const col_off_close = spellQName(&col_off_close_buf, "</", xdr_prefix, "colOff", ">") catch return null;
+    const row_open = spellQName(&row_open_buf, "<", xdr_prefix, "row", ">") catch return null;
+    const row_close = spellQName(&row_close_buf, "</", xdr_prefix, "row", ">") catch return null;
+    const row_off_open = spellQName(&row_off_open_buf, "<", xdr_prefix, "rowOff", ">") catch return null;
+    const row_off_close = spellQName(&row_off_close_buf, "</", xdr_prefix, "rowOff", ">") catch return null;
 
     return .{
         .col = parseElementU32(inner, col_open, col_close) orelse return null,
@@ -3902,4 +4016,190 @@ test "RootNsBindings: a whole-part pass over 100 000 decoy declarations is linea
     const elapsed_ns = std.Io.Clock.now(.awake, io).nanoseconds - started;
     try std.testing.expectEqualStrings("R!A1", xml.items[f.body_start..f.body_end]);
     try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
+}
+
+test "resolveDrawingPrefixes: the default namespace is a prefix — empty primary for an unprefixed root, an alternate beside a prefixed one, foreign when not an xdr URI" {
+    // openpyxl 3.1's drawing root: unprefixed, the spreadsheetDrawing
+    // namespace bound as the default one, `a` / `c` / `r` prefixed.
+    {
+        const xml =
+            \\<wsDr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><oneCellAnchor/></wsDr>
+        ;
+        const p = resolveDrawingPrefixes(xml);
+        try std.testing.expectEqualStrings("", p.xdr);
+        try std.testing.expectEqual(@as(usize, 0), p.xdr_alts().len);
+        try std.testing.expectEqualStrings("a", p.a);
+        try std.testing.expectEqualStrings("c", p.c);
+        try std.testing.expect(!p.xdr_rejected);
+        try std.testing.expect(!p.c_rejected);
+        // The needles are spelled bare.
+        var buf: [4096]u8 = undefined;
+        const tags = try DrawingTags.build(&buf, p);
+        try std.testing.expectEqualStrings("<", tags.xdr_prefix_open);
+        try std.testing.expectEqualStrings("<twoCellAnchor", tags.open_two);
+        try std.testing.expectEqualStrings("</oneCellAnchor>", tags.close_one);
+        try std.testing.expectEqualStrings("<from>", tags.open_from);
+        try std.testing.expectEqualStrings("</to>", tags.close_to);
+        try std.testing.expectEqualStrings("<ext", tags.open_ext);
+        try std.testing.expectEqualStrings("<graphicFrame", tags.open_graphic_frame);
+        try std.testing.expectEqualStrings("<c:chart", tags.open_chart);
+        // …and the corner parser reads them.
+        const from = parseCellAnchor("<from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from>", "<from>", "</from>", "").?;
+        try std.testing.expectEqual(@as(u32, 3), from.col);
+        try std.testing.expectEqual(@as(u32, 1), from.row);
+    }
+    // The Strict URI as the default namespace resolves the same way.
+    {
+        const p = resolveDrawingPrefixes("<wsDr xmlns=\"http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing\"/>");
+        try std.testing.expectEqualStrings("", p.xdr);
+        try std.testing.expect(!p.xdr_rejected);
+    }
+    // A prefixed root beside a default declaration on the xdr URI: the
+    // root's prefix is primary, the default namespace an alternate —
+    // unprefixed anchors are replayed.
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqual(@as(usize, 1), p.xdr_alts().len);
+        try std.testing.expectEqualStrings("", p.xdr_alts()[0]);
+        try std.testing.expect(p.followsXdr(""));
+        try std.testing.expect(!p.xdr_rejected);
+    }
+    // An unprefixed root with a default declaration bound elsewhere
+    // and `xdr:` bound beside it: `xdr` is primary, the empty prefix
+    // is not an xdr prefix — an unprefixed `<twoCellAnchor>` there is
+    // a foreign element.
+    {
+        const p = resolveDrawingPrefixes("<wsDr xmlns=\"urn:not-a-drawing\" xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expectEqual(@as(usize, 0), p.xdr_alts().len);
+        try std.testing.expect(!p.followsXdr(""));
+        try std.testing.expect(!p.xdr_rejected);
+    }
+    // A default declaration below the root, on the anchor: collected
+    // as an alternate (the whole-part rule for xdr alternates).
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"><twoCellAnchor xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/></xdr:wsDr>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.followsXdr(""));
+        try std.testing.expect(!p.xdr_rejected);
+    }
+}
+
+test "resolveDrawingPrefixes: a spreadsheetDrawing binding the walk cannot spell is xdr_rejected — overlong, past the replay cap; a decoy is text; the limit is followed" {
+    const uri = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+    const at_limit = "p" ** 100;
+    const past_limit = "p" ** 101;
+    // Overlong beside a followed primary.
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"" ++ uri ++ "\" xmlns:" ++ past_limit ++ "=\"" ++ uri ++ "\"/>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_rejected);
+    }
+    // At the limit: followed as an alternate.
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"" ++ uri ++ "\" xmlns:" ++ at_limit ++ "=\"" ++ uri ++ "\"/>");
+        try std.testing.expect(p.followsXdr(at_limit));
+        try std.testing.expect(!p.xdr_rejected);
+    }
+    // An overlong ROOT prefix: the root's own name is unfollowed —
+    // the primary falls back to the canonical spelling the part does
+    // not use, so the part is rejected, not silently empty.
+    {
+        const p = resolveDrawingPrefixes("<" ++ past_limit ++ ":wsDr xmlns:" ++ past_limit ++ "=\"" ++ uri ++ "\"/>");
+        try std.testing.expectEqualStrings("xdr", p.xdr);
+        try std.testing.expect(p.xdr_rejected);
+    }
+    // A ninth alternate is past `max_xdr_alts`: rejected; eight are
+    // followed.
+    {
+        var xml: std.ArrayListUnmanaged(u8) = .empty;
+        defer xml.deinit(std.testing.allocator);
+        try xml.appendSlice(std.testing.allocator, "<xdr:wsDr xmlns:xdr=\"" ++ uri ++ "\"");
+        for (0..max_xdr_alts) |k| {
+            var decl_buf: [128]u8 = undefined;
+            try xml.appendSlice(std.testing.allocator, try std.fmt.bufPrint(&decl_buf, " xmlns:p{d}=\"{s}\"", .{ k, uri }));
+        }
+        try xml.appendSlice(std.testing.allocator, "/>");
+        const eight = resolveDrawingPrefixes(xml.items);
+        try std.testing.expectEqual(max_xdr_alts, eight.xdr_alts().len);
+        try std.testing.expect(!eight.xdr_rejected);
+        // One more.
+        xml.items.len -= "/>".len;
+        try xml.appendSlice(std.testing.allocator, " xmlns:p8=\"" ++ uri ++ "\"/>");
+        const nine = resolveDrawingPrefixes(xml.items);
+        try std.testing.expectEqual(max_xdr_alts, nine.xdr_alts().len);
+        try std.testing.expect(nine.xdr_rejected);
+    }
+    // Declaration-shaped text in a comment, a PI or an attribute value
+    // is not a binding: nothing rejected.
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"" ++ uri ++ "\" title=\"xmlns:" ++ past_limit ++ "='" ++ uri ++ "'\"><!-- xmlns:" ++ past_limit ++ "=\"" ++ uri ++ "\" --><?pi xmlns:" ++ past_limit ++ "=\"" ++ uri ++ "\"?></xdr:wsDr>");
+        try std.testing.expect(!p.xdr_rejected);
+    }
+    // A binding on another URI, however long, is not this walk's.
+    {
+        const p = resolveDrawingPrefixes("<xdr:wsDr xmlns:xdr=\"" ++ uri ++ "\" xmlns:" ++ past_limit ++ "=\"urn:other\"/>");
+        try std.testing.expect(!p.xdr_rejected);
+    }
+}
+
+test "anchors read: an openpyxl-shaped default-namespace drawing lists its image and its chart; an unfollowed binding refuses under strict, lists under lenient" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/test-drawings-default-ns-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const uri = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+    const drawing_default =
+        "<wsDr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ uri ++ "\">" ++
+        "<oneCellAnchor><from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from><ext cx=\"5400000\" cy=\"2700000\" /><graphicFrame><nvGraphicFramePr><cNvPr id=\"1\" name=\"Chart 1\" /><cNvGraphicFramePr /></nvGraphicFramePr><xfrm /><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\" /></a:graphicData></a:graphic></graphicFrame><clientData /></oneCellAnchor>" ++
+        "<twoCellAnchor><from><col>0</col><colOff>0</colOff><row>6</row><rowOff>0</rowOff></from><to><col>2</col><colOff>0</colOff><row>9</row><rowOff>0</rowOff></to><pic><nvPicPr><cNvPr id=\"2\" name=\"Image 1\" /><cNvPicPr /></nvPicPr><blipFill><a:blip r:embed=\"rId2\" /><a:stretch><a:fillRect /></a:stretch></blipFill><spPr><a:prstGeom prst=\"rect\"><a:avLst /></a:prstGeom></spPr></pic><clientData /></twoCellAnchor>" ++
+        "</wsDr>";
+    for ([_]bool{ false, true }) |reject| {
+        var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+        defer store.deinit();
+        const drawing = if (reject)
+            try std.mem.replaceOwned(u8, a, drawing_default, "<wsDr ", "<wsDr xmlns:" ++ ("p" ** 101) ++ "=\"" ++ uri ++ "\" ")
+        else
+            try a.dupe(u8, drawing_default);
+        defer a.free(drawing);
+        try store.replacePart("xl/drawings/drawing1.xml", drawing);
+        try store.addPart("xl/media/image1.png", "image/png", "\x89PNG\r\n\x1a\n01234567");
+        try store.replacePart("xl/drawings/_rels/drawing1.xml.rels",
+            \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="/xl/charts/chart1.xml" Id="rId1" /><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="/xl/media/image1.png" Id="rId2" /></Relationships>
+        );
+        try store.save(io, path);
+        var s = try PartStore.open(a, io, path);
+        defer s.deinit();
+        if (reject) {
+            try std.testing.expectError(error.MalformedDrawingXml, imageAnchorsIn(&s, a, .strict));
+            try std.testing.expectError(error.MalformedDrawingXml, chartAnchorsIn(&s, a, .strict));
+        }
+        const mode: WalkMode = if (reject) .lenient else .strict;
+        const images = try imageAnchorsIn(&s, a, mode);
+        defer a.free(images);
+        try std.testing.expectEqual(@as(usize, 1), images.len);
+        try std.testing.expectEqual(AnchorKind.two_cell, images[0].kind);
+        try std.testing.expectEqual(@as(u32, 0), images[0].from.col);
+        try std.testing.expectEqual(@as(u32, 6), images[0].from.row);
+        try std.testing.expectEqual(@as(u32, 2), images[0].to.?.col);
+        try std.testing.expectEqual(@as(u32, 9), images[0].to.?.row);
+        try std.testing.expectEqualStrings("xl/media/image1.png", images[0].image_part_name);
+        const charts = try chartAnchorsIn(&s, a, mode);
+        defer {
+            for (charts) |c| a.free(c.series_refs);
+            a.free(charts);
+        }
+        try std.testing.expectEqual(@as(usize, 1), charts.len);
+        try std.testing.expectEqual(AnchorKind.one_cell, charts[0].kind);
+        try std.testing.expectEqual(@as(u32, 3), charts[0].from.col);
+        try std.testing.expectEqual(@as(u32, 1), charts[0].from.row);
+        try std.testing.expectEqual(ChartType.bar, charts[0].chart_type);
+        try std.testing.expectEqual(@as(usize, 3), charts[0].series_refs.len);
+        try std.testing.expectEqualStrings("'Data'!B1", charts[0].series_refs[0]);
+    }
 }
