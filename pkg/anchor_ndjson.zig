@@ -382,9 +382,9 @@ pub const fixture = struct {
     /// `.default_namespace`: Report's drawing as openpyxl 3.1 spells
     /// one — the spreadsheetDrawing namespace bound as the DEFAULT
     /// namespace, every anchor element unprefixed — over the same
-    /// anchors as `.image_and_chart`; Data's drawing keeps `xdr:`, so
-    /// the workbook carries both spellings (the namespace-aware
-    /// drawing slice).
+    /// anchors as `.with_absolute` (all three kinds); Data's drawing
+    /// keeps `xdr:`, so the workbook carries both spellings (the
+    /// namespace-aware drawing slice).
     pub const Kind = enum { image_and_chart, with_absolute, default_namespace };
 
     pub const png_bytes = "\x89PNG\r\n\x1a\n01234567";
@@ -422,8 +422,8 @@ pub const fixture = struct {
             chart_xml,
         );
         const absolute_block: []const u8 = switch (kind) {
-            .image_and_chart, .default_namespace => "",
-            .with_absolute => "<xdr:absoluteAnchor><xdr:pos x=\"1000\" y=\"2000\"/><xdr:ext cx=\"914400\" cy=\"457200\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"4\" name=\"Picture 2\"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed=\"rIdI1\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:absoluteAnchor>",
+            .image_and_chart => "",
+            .with_absolute, .default_namespace => "<xdr:absoluteAnchor><xdr:pos x=\"1000\" y=\"2000\"/><xdr:ext cx=\"914400\" cy=\"457200\"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"4\" name=\"Picture 2\"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed=\"rIdI1\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:absoluteAnchor>",
         };
         // Report's drawing: chart FIRST in document order.
         const drawing_prefixed = try std.fmt.allocPrint(allocator,
@@ -1106,7 +1106,7 @@ test "collect: a default-namespace drawing (openpyxl's spelling) lists what the 
     defer testing.allocator.free(prefixed_path);
     const default_path = try tt.path(testing.allocator, io, "anchors_default_ns.xlsx");
     defer testing.allocator.free(default_path);
-    try fixture.write(testing.allocator, io, prefixed_path, .image_and_chart);
+    try fixture.write(testing.allocator, io, prefixed_path, .with_absolute);
     try fixture.write(testing.allocator, io, default_path, .default_namespace);
     // The premise: the two drawings differ only in their spelling.
     {
@@ -1117,15 +1117,18 @@ test "collect: a default-namespace drawing (openpyxl's spelling) lists what the 
         try testing.expect(std.mem.indexOf(u8, d.bytes, "xdr:") == null);
         try testing.expect(std.mem.indexOf(u8, d.bytes, "<oneCellAnchor><from><col>5</col>") != null);
         try testing.expect(std.mem.indexOf(u8, d.bytes, "<twoCellAnchor editAs=\"oneCell\"><from>") != null);
+        try testing.expect(std.mem.indexOf(u8, d.bytes, "<absoluteAnchor><pos x=\"1000\"") != null);
     }
     var buf_p: [4096]u8 = undefined;
     var buf_d: [4096]u8 = undefined;
     const prefixed = try ndjsonOf(testing.allocator, io, prefixed_path, &buf_p);
     const default_ns = try ndjsonOf(testing.allocator, io, default_path, &buf_d);
     try testing.expectEqualStrings(prefixed, default_ns);
-    // Three records: Data's `xdr:` image, Report's unprefixed image
-    // and unprefixed chart — one workbook, both spellings.
-    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, default_ns, "\n"));
+    // Four records: Data's `xdr:` image, Report's unprefixed two-cell
+    // image, absolute image and one-cell chart — every anchor kind,
+    // one workbook, both spellings.
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, default_ns, "\n"));
+    try testing.expect(std.mem.indexOf(u8, default_ns, "\"anchor\":\"absolute\",\"from\":null,\"to\":null,\"absolute\":{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}") != null);
     try testing.expect(std.mem.indexOf(u8, default_ns, "{\"kind\":\"chart_anchor\",\"sheet\":\"Report\",\"sheet_idx\":1,\"part\":\"xl/charts/chart1.xml\",\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":6,") != null);
 }
 
@@ -1151,7 +1154,7 @@ test "collect: a spreadsheetDrawing binding the walk cannot spell refuses Malfor
     defer wb2.deinit();
     var view = try collect(testing.allocator, &wb2);
     defer view.deinit();
-    try testing.expectEqual(@as(usize, 3), view.records.len);
+    try testing.expectEqual(@as(usize, 4), view.records.len);
 }
 
 test "collect: the openpyxl corpus workbook lists its one chart — what `zlsx anchors tests/corpus/openpyxl_chart.xlsx` prints" {

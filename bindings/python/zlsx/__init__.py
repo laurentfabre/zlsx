@@ -3785,9 +3785,11 @@ class Editor:
           1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
           — a split pane the rewriter does not shift; the carrier
           verdicts ``MalformedSheetXml``, ``MalformedDrawingXml`` (a
-          drawing part the store cannot materialise, or one binding the
+          drawing part the store cannot materialise, one binding the
           spreadsheetDrawing namespace under a name the anchor walk
-          cannot spell — refused before the first mutation),
+          cannot spell, or an anchor it cannot read whole — no close, a
+          corner absent or unparseable: the strict read's verdicts,
+          refused before the first mutation),
           ``MalformedVmlDrawing``, ``MalformedCommentsXml``,
           ``MalformedTableXml``, ``DrawingCoordinateOverflow``,
           ``VmlCoordinateOverflow``, ``TableCoordinateOverflow`` — a part

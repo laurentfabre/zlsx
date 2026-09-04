@@ -328,27 +328,30 @@ fn collectFromSheet(
     // the drawing's (the chart walk's `c_rejected` rule); lenient
     // lists what it can, as before.
     if (mode == .strict and prefixes.xdr_rejected) return error.MalformedDrawingXml;
-    // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
-    // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
-    // namespace prefixes have no upper bound in the spec — Codex
-    // flagged the previous 512 B buffer as a hard-fail surface for
-    // valid-but-long custom prefixes.
-    var primary_buf: [4096]u8 = undefined;
-    const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
-    try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, mode, out);
-
-    // Mixed-prefix bindings: descendant anchors may use a different
-    // prefix bound to the same spreadsheetDrawing URI. Replay the
-    // scan once per alt prefix; primary-prefixed anchors won't
-    // match, so no duplicates surface. Replay order is NOT document
-    // order — consumers needing that sort on `doc_offset`.
-    for (prefixes.xdr_alts()) |alt| {
-        var alt_prefixes = prefixes;
-        alt_prefixes.xdr = alt;
-        var alt_buf: [4096]u8 = undefined;
-        const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
-        try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, mode, out);
+    // One tag set per followed prefix (`buildTagSets`): the wrapper
+    // scan replays once per set — anchors under the other names do
+    // not match, so no duplicates surface; replay order is NOT
+    // document order, consumers needing that sort on `doc_offset` —
+    // and every wrapper's children are read under any set.
+    var bufs: [max_tag_sets]TagSetBuf = undefined;
+    var set_store: [max_tag_sets]DrawingTags = undefined;
+    const sets = try buildTagSets(&bufs, &set_store, prefixes);
+    for (sets) |*tags| {
+        try scanImagesWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, tags, sets, mode, out);
     }
+}
+
+/// Where the wrapper scan continues after a `<` that opens no anchor.
+/// The empty prefix's opener is the bare `<`, which matches a comment
+/// / CDATA / PI delimiter itself: stepping one byte past it would leave
+/// the cursor INSIDE the region and blind every later `findLiveMarkup`,
+/// whose region state starts at the cursor — a commented decoy became
+/// a phantom anchor and a trailing comment a refusal (in-house
+/// ND-REL-101). `skipRegionEndFrom` answers `at + 1` for a `<` that
+/// opens no region (the prefixed opener never does), so the prefixed
+/// path keeps its needle-length advance.
+fn advancePastNonAnchor(xml: []const u8, at: usize, opener_len: usize) usize {
+    return @max(at + opener_len, skipRegionEndFrom(xml, at));
 }
 
 fn scanImagesWithTags(
@@ -359,7 +362,8 @@ fn scanImagesWithTags(
     drawing_rels: []const store_mod.Relationship,
     sheet_part: store_mod.Part,
     prefixes: DrawingPrefixes,
-    tags: DrawingTags,
+    tags: *const DrawingTags,
+    sets: []const DrawingTags,
     mode: WalkMode,
     out: *std.ArrayListUnmanaged(ImageAnchor),
 ) !void {
@@ -378,7 +382,7 @@ fn scanImagesWithTags(
         const is_one = matchesOpenTag(drawing_part.bytes, i, tags.open_one);
         const is_absolute = matchesOpenTag(drawing_part.bytes, i, tags.open_absolute);
         if (!is_two and !is_one and !is_absolute) {
-            i += tags.xdr_prefix_open.len;
+            i = advancePastNonAnchor(drawing_part.bytes, i, tags.xdr_prefix_open.len);
             continue;
         }
         // Find close tag. An opened anchor that never closes is a
@@ -399,13 +403,14 @@ fn scanImagesWithTags(
         // Only image-bearing anchors are surfaced. An anchor with no
         // `<xdr:pic>` (a shape, a chart frame) is legitimately not an
         // image in either mode; from the unclosed pic onward the block
-        // holds an image the walk cannot read whole.
-        const pic_idx = findLiveExactTag(block, 0, tags.open_pic) orelse continue;
-        const pic_close = findLiveMarkup(block, pic_idx, tags.close_pic) orelse {
+        // holds an image the walk cannot read whole. The pic, like
+        // every child, may be spelled under any followed prefix.
+        const pic = anyLiveExactTag(block, 0, sets, "open_pic") orelse continue;
+        const pic_close = findLiveMarkup(block, pic.at, pic.set.close_pic) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
-        const pic_block = block[pic_idx .. pic_close + tags.close_pic.len];
+        const pic_block = block[pic.at .. pic_close + pic.set.close_pic.len];
 
         const embed_rid = findBlipEmbedWithAlt(pic_block, prefixes.a, prefixes.a_alt) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
@@ -425,43 +430,55 @@ fn scanImagesWithTags(
             continue;
         };
 
-        var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
-        var to_anchor: ?CellAnchor = null;
-        var absolute: ?AbsoluteAnchor = null;
-        if (is_absolute) {
-            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse {
+        const geometry = readAnchorGeometry(block, sets, is_two, is_absolute, mode) catch |e| switch (e) {
+            error.MalformedDrawingXml => {
                 if (mode == .strict) return error.MalformedDrawingXml;
                 continue;
-            };
-        } else {
-            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse {
-                if (mode == .strict) return error.MalformedDrawingXml;
-                continue;
-            };
-            if (is_two) {
-                to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
-                // A two-cell anchor without a readable `<to>` must not
-                // ride out looking like a one-cell anchor (REL-101).
-                if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
-            } else if (mode == .strict) {
-                // A one-cell anchor's `<xdr:ext>` is schema-required;
-                // strict validates it even though the extent stays
-                // off the wire (REL-201).
-                if (parseExtAttrs(block, 0, tags.open_ext) == null) return error.MalformedDrawingXml;
-            }
-        }
+            },
+        };
 
         try out.append(allocator, .{
             .image_part_name = image_part.name,
             .sheet_part_name = sheet_part.name,
-            .from = from,
-            .to = to_anchor,
-            .absolute = absolute,
+            .from = geometry.from,
+            .to = geometry.to,
+            .absolute = geometry.absolute,
             .bytes = image_part.bytes,
             .kind = if (is_absolute) .absolute else if (is_two) .two_cell else .one_cell,
             .doc_offset = block_start,
         });
     }
+}
+
+const AnchorGeometry = struct {
+    from: CellAnchor,
+    to: ?CellAnchor,
+    absolute: ?AbsoluteAnchor,
+};
+
+/// The cell-grid or pixel geometry of one anchor block, every child
+/// under any followed prefix. `MalformedDrawingXml` when the walk
+/// cannot read it whole — the caller refuses under strict and skips
+/// the anchor under lenient: a two-cell anchor without a readable
+/// `<to>` must not ride out looking like a one-cell anchor (Codex #214
+/// r1 REL-101); a one-cell anchor's `<xdr:ext>` is schema-required, so
+/// strict validates it even though the extent stays off the wire (r2
+/// REL-201); an absolute anchor needs both `<pos>` and `<ext>`.
+fn readAnchorGeometry(block: []const u8, sets: []const DrawingTags, is_two: bool, is_absolute: bool, mode: WalkMode) error{MalformedDrawingXml}!AnchorGeometry {
+    if (is_absolute) {
+        const absolute = parseAbsoluteAnchorIn(block, sets) orelse return error.MalformedDrawingXml;
+        return .{ .from = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 }, .to = null, .absolute = absolute };
+    }
+    const from = parseCornerIn(block, sets, .from) orelse return error.MalformedDrawingXml;
+    var to: ?CellAnchor = null;
+    if (is_two) {
+        const to_block = parseCornerIn(block, sets, .to);
+        if (mode == .strict and to_block == null) return error.MalformedDrawingXml;
+        if (to_block) |t| to = t.anchor;
+    } else if (mode == .strict) {
+        if (parseExtAttrsIn(block, 0, sets) == null) return error.MalformedDrawingXml;
+    }
+    return .{ .from = from.anchor, .to = to, .absolute = null };
 }
 
 fn collectChartsFromSheet(
@@ -504,21 +521,12 @@ fn collectChartsFromSheet(
     // The image walk's rule: an unfollowed spreadsheetDrawing binding
     // refuses under strict.
     if (mode == .strict and prefixes.xdr_rejected) return error.MalformedDrawingXml;
-    // 4 KiB tag-needle scratch covers prefixes up to ~250 chars
-    // per needle (12 needles × ~max-prefix-len ≈ 4 KiB total). XML
-    // namespace prefixes have no upper bound in the spec — Codex
-    // flagged the previous 512 B buffer as a hard-fail surface for
-    // valid-but-long custom prefixes.
-    var primary_buf: [4096]u8 = undefined;
-    const primary_tags = try DrawingTags.build(&primary_buf, prefixes);
-    try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, primary_tags, mode, out);
-
-    for (prefixes.xdr_alts()) |alt| {
-        var alt_prefixes = prefixes;
-        alt_prefixes.xdr = alt;
-        var alt_buf: [4096]u8 = undefined;
-        const alt_tags = try DrawingTags.build(&alt_buf, alt_prefixes);
-        try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, alt_prefixes, alt_tags, mode, out);
+    // The image walk's replay: one tag set per followed prefix.
+    var bufs: [max_tag_sets]TagSetBuf = undefined;
+    var set_store: [max_tag_sets]DrawingTags = undefined;
+    const sets = try buildTagSets(&bufs, &set_store, prefixes);
+    for (sets) |*tags| {
+        try scanChartsWithTags(store, allocator, drawing_part, drawing_part_name, drawing_rels, sheet_part, prefixes, tags, sets, mode, out);
     }
 }
 
@@ -530,7 +538,8 @@ fn scanChartsWithTags(
     drawing_rels: []const store_mod.Relationship,
     sheet_part: store_mod.Part,
     prefixes: DrawingPrefixes,
-    tags: DrawingTags,
+    tags: *const DrawingTags,
+    sets: []const DrawingTags,
     mode: WalkMode,
     out: *std.ArrayListUnmanaged(ChartAnchor),
 ) !void {
@@ -545,7 +554,7 @@ fn scanChartsWithTags(
         const is_one = matchesOpenTag(drawing_part.bytes, i, tags.open_one);
         const is_absolute = matchesOpenTag(drawing_part.bytes, i, tags.open_absolute);
         if (!is_two and !is_one and !is_absolute) {
-            i += tags.xdr_prefix_open.len;
+            i = advancePastNonAnchor(drawing_part.bytes, i, tags.xdr_prefix_open.len);
             continue;
         }
         const close_marker = if (is_two)
@@ -565,13 +574,13 @@ fn scanChartsWithTags(
         // A frame without a chart element (a diagram, a table) is
         // legitimately not a chart in either mode; a chart element
         // the walk cannot follow to its part is a refusal in strict.
-        const gf_idx = findLiveExactTag(block, 0, tags.open_graphic_frame) orelse continue;
+        const gf = anyLiveExactTag(block, 0, sets, "open_graphic_frame") orelse continue;
         // Scan for any `<*:chart` element whose prefix is bound to
         // either chart URI (block-local OR drawing-root). Walking by
         // tag rather than by prefix avoids the "multiple local
         // bindings to the same chart URI" failure mode where
         // collect-first-prefix would pick an unused declaration.
-        const chart_idx = findLocalChartElement(block, gf_idx, prefixes) orelse continue;
+        const chart_idx = findLocalChartElement(block, gf.at, prefixes) orelse continue;
         const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
@@ -596,31 +605,12 @@ fn scanChartsWithTags(
             continue;
         };
 
-        var from: CellAnchor = .{ .col = 0, .col_off = 0, .row = 0, .row_off = 0 };
-        var to_anchor: ?CellAnchor = null;
-        var absolute: ?AbsoluteAnchor = null;
-        if (is_absolute) {
-            absolute = parseAbsoluteAnchor(block, tags.open_pos, tags.open_ext) orelse {
+        const geometry = readAnchorGeometry(block, sets, is_two, is_absolute, mode) catch |e| switch (e) {
+            error.MalformedDrawingXml => {
                 if (mode == .strict) return error.MalformedDrawingXml;
                 continue;
-            };
-        } else {
-            from = parseCellAnchor(block, tags.open_from, tags.close_from, prefixes.xdr) orelse {
-                if (mode == .strict) return error.MalformedDrawingXml;
-                continue;
-            };
-            if (is_two) {
-                to_anchor = parseCellAnchor(block, tags.open_to, tags.close_to, prefixes.xdr);
-                // A two-cell anchor without a readable `<to>` must not
-                // ride out looking like a one-cell anchor (REL-101).
-                if (mode == .strict and to_anchor == null) return error.MalformedDrawingXml;
-            } else if (mode == .strict) {
-                // A one-cell anchor's `<xdr:ext>` is schema-required;
-                // strict validates it even though the extent stays
-                // off the wire (REL-201).
-                if (parseExtAttrs(block, 0, tags.open_ext) == null) return error.MalformedDrawingXml;
-            }
-        }
+            },
+        };
 
         // Each chart's own XML may declare a different `c:` prefix
         // — resolve per-chart to be safe. A chart namespace bound
@@ -638,9 +628,9 @@ fn scanChartsWithTags(
         try out.append(allocator, .{
             .chart_part_name = chart_part.name,
             .sheet_part_name = sheet_part.name,
-            .from = from,
-            .to = to_anchor,
-            .absolute = absolute,
+            .from = geometry.from,
+            .to = geometry.to,
+            .absolute = geometry.absolute,
             .chart_type = detectChartTypeWithAlt(chart_part.bytes, chart_prefixes.c, chart_prefixes.c_alt),
             .series_refs = refs,
             .raw_xml = chart_part.bytes,
@@ -958,7 +948,7 @@ fn nextCarrierClose(xml: []const u8, start: usize, close_needle: []const u8) ?Ca
 /// stops at the first region rather than scanning to the candidate,
 /// so a run of regions that do NOT spell the needle costs its length
 /// once, not once per region (in-house CF-PERF-201).
-fn findLiveMarkup(xml: []const u8, start: usize, needle: []const u8) ?usize {
+pub fn findLiveMarkup(xml: []const u8, start: usize, needle: []const u8) ?usize {
     var i = start;
     var m = std.mem.indexOfPos(u8, xml, i, needle) orelse return null;
     while (true) {
@@ -975,7 +965,7 @@ fn findLiveMarkup(xml: []const u8, start: usize, needle: []const u8) ?usize {
 /// QName must terminate the name (whitespace, `/` or `>`), so
 /// `<xdr:ext` cannot match `<xdr:extLst` and satisfy a validation the
 /// real element would fail (Codex #214 r3 REL-301).
-fn findLiveExactTag(xml: []const u8, start: usize, open_needle: []const u8) ?usize {
+pub fn findLiveExactTag(xml: []const u8, start: usize, open_needle: []const u8) ?usize {
     var i = start;
     while (findLiveMarkup(xml, i, open_needle)) |at| {
         const after = at + open_needle.len;
@@ -990,7 +980,7 @@ fn findLiveExactTag(xml: []const u8, start: usize, open_needle: []const u8) ?usi
 /// Does the opening tag at `at` spell exactly `open` (the byte after
 /// the QName terminates the name)? `<xdr:twoCellAnchorFake>` must not
 /// register as a two-cell anchor (Codex #214 r5 REL-501).
-fn matchesOpenTag(xml: []const u8, at: usize, open: []const u8) bool {
+pub fn matchesOpenTag(xml: []const u8, at: usize, open: []const u8) bool {
     if (!std.mem.startsWith(u8, xml[at..], open)) return false;
     const after = at + open.len;
     if (after >= xml.len) return false;
@@ -1001,13 +991,13 @@ fn matchesOpenTag(xml: []const u8, at: usize, open: []const u8) bool {
 /// Byte index just past the close of the skip region OPENING at `at`
 /// (`<!--`, `<![CDATA[` or `<?`). An unterminated region swallows the
 /// rest of the document, matching `skipRegionContaining`.
-fn skipRegionEndFrom(xml: []const u8, at: usize) usize {
+pub fn skipRegionEndFrom(xml: []const u8, at: usize) usize {
     return skipRegionCloseFrom(xml, at) orelse xml.len;
 }
 
 /// `skipRegionEndFrom` that tells an unterminated region (`null`)
 /// from one whose close is the document's last bytes.
-fn skipRegionCloseFrom(xml: []const u8, at: usize) ?usize {
+pub fn skipRegionCloseFrom(xml: []const u8, at: usize) ?usize {
     if (at + 4 <= xml.len and std.mem.startsWith(u8, xml[at..], "<!--")) {
         const close = std.mem.indexOfPos(u8, xml, at + 4, "-->") orelse return null;
         return close + 3;
@@ -1526,9 +1516,33 @@ pub fn resolveDrawingPrefixes(xml: []const u8) DrawingPrefixes {
             if (std.mem.eql(u8, uri, ns_c_transitional) or std.mem.eql(u8, uri, ns_c_strict)) p.c = "";
         }
     }
-    p.c_rejected = hasUnfollowedChartBinding(xml, p.c, p.c_alt);
-    p.xdr_rejected = hasUnfollowedXdrBinding(xml, &p);
+    markUnfollowedBindings(xml, &p);
     return p;
+}
+
+/// One whole-part pass over the live declarations marking BOTH
+/// namespaces' unfollowed bindings: `c_rejected` (the rule
+/// `hasUnfollowedChartBinding` states) and `xdr_rejected` — a
+/// spreadsheetDrawing binding (either URI) under a name the anchor walk
+/// will not spell, longer than `max_prefix_len` (skipped by the
+/// collectors) or past the `max_xdr_alts` replay cap; the DEFAULT
+/// declaration is the empty name, followed when it is the primary or
+/// an alternate. An anchor under such a name would be neither listed
+/// by the read nor shifted by the sweep, so both refuse on it
+/// (`MalformedDrawingXml`). One scan for the two flags, so a chart
+/// part, which the chart walk resolves on every structural edit, pays
+/// for what it never reads once (in-house ND-PERF-105).
+fn markUnfollowedBindings(xml: []const u8, p: *DrawingPrefixes) void {
+    var it = RootNsBindings.init(xml, xml.len);
+    while (it.next()) |b| {
+        if (std.mem.eql(u8, b.uri, ns_c_transitional) or std.mem.eql(u8, b.uri, ns_c_strict)) {
+            if (std.mem.eql(u8, b.name, p.c)) continue;
+            if (p.c_alt) |alt| if (std.mem.eql(u8, b.name, alt)) continue;
+            p.c_rejected = true;
+        } else if (isXdrUri(b.uri)) {
+            if (!p.followsXdr(b.name)) p.xdr_rejected = true;
+        }
+    }
 }
 
 fn isXdrUri(uri: ?[]const u8) bool {
@@ -1536,29 +1550,13 @@ fn isXdrUri(uri: ?[]const u8) bool {
     return std.mem.eql(u8, u, ns_xdr_transitional) or std.mem.eql(u8, u, ns_xdr_strict);
 }
 
-/// Does the part bind a spreadsheetDrawing namespace (either URI)
-/// under a name the anchor walk will not spell — one longer than
-/// `max_prefix_len` (skipped by the collectors), or past the
-/// `max_xdr_alts` replay cap? Every live, attribute-shaped
-/// declaration of the whole part, the alternate collection's own
-/// scope: an anchor under such a name would be neither listed by the
-/// read nor shifted by the sweep, so both refuse on it
-/// (`MalformedDrawingXml`) — the chart walk's `hasUnfollowedChartBinding`
-/// rule on this namespace. The DEFAULT declaration is the empty name,
-/// followed when it is the primary or an alternate.
-fn hasUnfollowedXdrBinding(xml: []const u8, p: *const DrawingPrefixes) bool {
-    var it = RootNsBindings.init(xml, xml.len);
-    while (it.next()) |b| {
-        if (!isXdrUri(b.uri)) continue;
-        if (!p.followsXdr(b.name)) return true;
-    }
-    return false;
-}
-
 /// Find the prefix on the root XML element — the NAME of the first
 /// `<NAME:LOCAL` token (`rootElementQName`). Returns null if the root
 /// element is unprefixed or absent, or its prefix is longer than
-/// `max_prefix_len` (the binding is then `xdr_rejected`).
+/// `max_prefix_len` (a spreadsheetDrawing binding under such a name is
+/// separately `xdr_rejected`; an overlong root prefix bound elsewhere
+/// or nowhere falls through to the canonical fallback, as any foreign
+/// root does).
 fn rootElementPrefix(xml: []const u8) ?[]const u8 {
     const qname = rootElementQName(xml) orelse return null;
     const colon = std.mem.indexOfScalar(u8, qname, ':') orelse return null;
@@ -2353,7 +2351,10 @@ const RootNsBindings = struct {
 /// Pre-built tag needles keyed off the resolved prefixes. Built
 /// into a single caller-supplied buffer so the per-part lookup
 /// loop doesn't re-format on every iteration.
-const DrawingTags = struct {
+pub const DrawingTags = struct {
+    /// The spreadsheetDrawing prefix this set spells — empty for the
+    /// default namespace.
+    prefix: []const u8,
     xdr_prefix_open: []const u8, // "<xdr:"
     open_two: []const u8, // "<xdr:twoCellAnchor"
     close_two: []const u8, // "</xdr:twoCellAnchor>"
@@ -2371,8 +2372,17 @@ const DrawingTags = struct {
     open_ext: []const u8, // "<xdr:ext"
     open_graphic_frame: []const u8, // "<xdr:graphicFrame"
     open_chart: []const u8, // "<c:chart"
+    // The four scalars of a corner block, whole tags.
+    open_col: []const u8, // "<xdr:col>"
+    close_col: []const u8, // "</xdr:col>"
+    open_col_off: []const u8,
+    close_col_off: []const u8,
+    open_row: []const u8,
+    close_row: []const u8,
+    open_row_off: []const u8,
+    close_row_off: []const u8,
 
-    fn build(buf: []u8, p: DrawingPrefixes) !DrawingTags {
+    pub fn build(buf: []u8, p: DrawingPrefixes) !DrawingTags {
         var w = std.Io.Writer.fixed(buf);
         // Every needle is spelled by `writeQName`, so the DEFAULT
         // namespace (an empty prefix — openpyxl's drawings) reads
@@ -2386,7 +2396,7 @@ const DrawingTags = struct {
         const close_one = try writeQName(&w, "</", p.xdr, "oneCellAnchor", ">");
         const open_absolute = try writeQName(&w, "<", p.xdr, "absoluteAnchor", "");
         const close_absolute = try writeQName(&w, "</", p.xdr, "absoluteAnchor", ">");
-        // `<{s}:pic` without the closing `>`: the element may carry
+        // `<{p}:pic` without the closing `>`: the element may carry
         // attributes (`macro`, `fPublished`); the exact-live-tag
         // lookup supplies the name terminator (r5 REL-501).
         const open_pic = try writeQName(&w, "<", p.xdr, "pic", "");
@@ -2399,7 +2409,24 @@ const DrawingTags = struct {
         const open_ext = try writeQName(&w, "<", p.xdr, "ext", "");
         const open_graphic_frame = try writeQName(&w, "<", p.xdr, "graphicFrame", "");
         const open_chart = try writeQName(&w, "<", p.c, "chart", "");
+        const open_col = try writeQName(&w, "<", p.xdr, "col", ">");
+        const close_col = try writeQName(&w, "</", p.xdr, "col", ">");
+        const open_col_off = try writeQName(&w, "<", p.xdr, "colOff", ">");
+        const close_col_off = try writeQName(&w, "</", p.xdr, "colOff", ">");
+        const open_row = try writeQName(&w, "<", p.xdr, "row", ">");
+        const close_row = try writeQName(&w, "</", p.xdr, "row", ">");
+        const open_row_off = try writeQName(&w, "<", p.xdr, "rowOff", ">");
+        const close_row_off = try writeQName(&w, "</", p.xdr, "rowOff", ">");
         return .{
+            .prefix = p.xdr,
+            .open_col = open_col,
+            .close_col = close_col,
+            .open_col_off = open_col_off,
+            .close_col_off = close_col_off,
+            .open_row = open_row,
+            .close_row = close_row,
+            .open_row_off = open_row_off,
+            .close_row_off = close_row_off,
             .xdr_prefix_open = xdr_prefix_open,
             .open_two = open_two,
             .close_two = close_two,
@@ -2420,6 +2447,48 @@ const DrawingTags = struct {
         };
     }
 };
+
+/// One tag set per followed spreadsheetDrawing prefix — the primary
+/// first, then the alternates. The walks match an anchor WRAPPER
+/// under each set in turn (the read replays per set, the sweep tries
+/// each set at every tag) and the wrapper's children under ANY set:
+/// a part that binds the namespace twice may legally spell a wrapper
+/// under one name and its `from` / `col` under the other, and XML
+/// well-formedness only ties an element's close tag to its own open
+/// tag (in-house ND-REL-103; the wrapper-prefix rule left such an
+/// anchor neither listed nor shifted). `bufs` holds the needles, one
+/// scratch per set — 4 KiB covers 25 needles under the 100-byte
+/// prefix limit.
+pub const max_tag_sets: usize = 1 + max_xdr_alts;
+pub const TagSetBuf = [4096]u8;
+
+pub fn buildTagSets(bufs: *[max_tag_sets]TagSetBuf, sets: *[max_tag_sets]DrawingTags, p: DrawingPrefixes) ![]const DrawingTags {
+    var n: usize = 0;
+    sets[n] = try DrawingTags.build(&bufs[n], p);
+    n += 1;
+    for (p.xdr_alts()) |alt| {
+        var q = p;
+        q.xdr = alt;
+        sets[n] = try DrawingTags.build(&bufs[n], q);
+        n += 1;
+    }
+    return sets[0..n];
+}
+
+/// The first live, exact-QName opening tag spelled by any set's
+/// `field` at or after `start` — the earliest in DOCUMENT order across
+/// the sets, so a mixed-spelling part is read in the order it is
+/// written.
+pub const TagHit = struct { at: usize, set: *const DrawingTags };
+
+pub fn anyLiveExactTag(block: []const u8, start: usize, sets: []const DrawingTags, comptime field: []const u8) ?TagHit {
+    var best: ?TagHit = null;
+    for (sets) |*s| {
+        const at = findLiveExactTag(block, start, @field(s, field)) orelse continue;
+        if (best == null or at < best.?.at) best = .{ .at = at, .set = s };
+    }
+    return best;
+}
 
 /// One tag needle under a resolved prefix — `{lead}{prefix}:{local}{tail}`
 /// for a bound prefix, `{lead}{local}{tail}` for the DEFAULT namespace
@@ -2634,16 +2703,32 @@ fn decodeIdInto(buf: []u8, src: []const u8) ?[]const u8 {
 /// causes the caller to skip the anchor as malformed.
 fn parseAbsoluteAnchor(xml: []const u8, open_pos: []const u8, open_ext: []const u8) ?AbsoluteAnchor {
     const pos_idx = findLiveExactTag(xml, 0, open_pos) orelse return null;
+    const pos = posAttrsAt(xml, pos_idx) orelse return null;
+    const ext = parseExtAttrs(xml, pos.end, open_ext) orelse return null;
+    return .{ .x = pos.x, .y = pos.y, .cx = ext.cx, .cy = ext.cy };
+}
+
+/// `parseAbsoluteAnchor` with `<pos>` and `<ext>` under any followed
+/// prefix.
+fn parseAbsoluteAnchorIn(xml: []const u8, sets: []const DrawingTags) ?AbsoluteAnchor {
+    const pos_tag = anyLiveExactTag(xml, 0, sets, "open_pos") orelse return null;
+    const pos = posAttrsAt(xml, pos_tag.at) orelse return null;
+    const ext = parseExtAttrsIn(xml, pos.end, sets) orelse return null;
+    return .{ .x = pos.x, .y = pos.y, .cx = ext.cx, .cy = ext.cy };
+}
+
+/// The `x` / `y` of the `<{p}:pos>` tag at `pos_idx`, and the index of
+/// its `>`.
+fn posAttrsAt(xml: []const u8, pos_idx: usize) ?struct { x: i64, y: i64, end: usize } {
     const pos_end = std.mem.indexOfScalarPos(u8, xml, pos_idx, '>') orelse return null;
     const pos_attrs = xml[pos_idx .. pos_end + 1];
     const x_str = attrValue(pos_attrs, "x") orelse return null;
     const y_str = attrValue(pos_attrs, "y") orelse return null;
-    const x = std.fmt.parseInt(i64, x_str, 10) catch return null;
-    const y = std.fmt.parseInt(i64, y_str, 10) catch return null;
-
-    const ext = parseExtAttrs(xml, pos_end, open_ext) orelse return null;
-
-    return .{ .x = x, .y = y, .cx = ext.cx, .cy = ext.cy };
+    return .{
+        .x = std.fmt.parseInt(i64, x_str, 10) catch return null,
+        .y = std.fmt.parseInt(i64, y_str, 10) catch return null,
+        .end = pos_end,
+    };
 }
 
 /// Parse the `<{xdr}:ext cx="N" cy="N"/>` child starting the search
@@ -2655,8 +2740,20 @@ fn parseAbsoluteAnchor(xml: []const u8, open_pos: []const u8, open_ext: []const 
 /// `<xdr:extLst>` or a commented fake cannot satisfy the validation
 /// the real element would fail (r3 REL-301). The value stays off the
 /// wire either way.
-fn parseExtAttrs(xml: []const u8, from_idx: usize, open_ext: []const u8) ?struct { cx: i64, cy: i64 } {
+fn parseExtAttrs(xml: []const u8, from_idx: usize, open_ext: []const u8) ?Extent {
     const ext_idx = findLiveExactTag(xml, from_idx, open_ext) orelse return null;
+    return extAttrsAt(xml, ext_idx);
+}
+
+const Extent = struct { cx: i64, cy: i64 };
+
+/// `parseExtAttrs` with `<ext>` under any followed prefix.
+fn parseExtAttrsIn(xml: []const u8, from_idx: usize, sets: []const DrawingTags) ?Extent {
+    const ext = anyLiveExactTag(xml, from_idx, sets, "open_ext") orelse return null;
+    return extAttrsAt(xml, ext.at);
+}
+
+fn extAttrsAt(xml: []const u8, ext_idx: usize) ?Extent {
     const ext_end = std.mem.indexOfScalarPos(u8, xml, ext_idx, '>') orelse return null;
     const ext_attrs = xml[ext_idx .. ext_end + 1];
     const cx_str = attrValue(ext_attrs, "cx") orelse return null;
@@ -2666,59 +2763,82 @@ fn parseExtAttrs(xml: []const u8, from_idx: usize, open_ext: []const u8) ?struct
     return .{ .cx = cx, .cy = cy };
 }
 
-fn parseCellAnchor(
-    xml: []const u8,
-    open: []const u8,
-    close: []const u8,
-    xdr_prefix: []const u8,
-) ?CellAnchor {
-    // Live matches: a commented `<xdr:from>` fake in the block is not
-    // the anchor's geometry (Codex #214 r5 REL-501).
-    const o = findLiveMarkup(xml, 0, open) orelse return null;
-    const c = findLiveMarkup(xml, o, close) orelse return null;
-    const inner = xml[o + open.len .. c];
+pub const Corner = enum { from, to };
 
-    // 128-byte scratch per needle covers prefixes up to ~110 chars
-    // (`</PREFIX:rowOff>` ≈ prefix.len + 11), well past anything
-    // realistic. The previous 32-byte budget bottomed out at
-    // ~20-char prefixes.
-    var col_open_buf: [128]u8 = undefined;
-    var col_close_buf: [128]u8 = undefined;
-    var col_off_open_buf: [128]u8 = undefined;
-    var col_off_close_buf: [128]u8 = undefined;
-    var row_open_buf: [128]u8 = undefined;
-    var row_close_buf: [128]u8 = undefined;
-    var row_off_open_buf: [128]u8 = undefined;
-    var row_off_close_buf: [128]u8 = undefined;
-    const col_open = spellQName(&col_open_buf, "<", xdr_prefix, "col", ">") catch return null;
-    const col_close = spellQName(&col_close_buf, "</", xdr_prefix, "col", ">") catch return null;
-    const col_off_open = spellQName(&col_off_open_buf, "<", xdr_prefix, "colOff", ">") catch return null;
-    const col_off_close = spellQName(&col_off_close_buf, "</", xdr_prefix, "colOff", ">") catch return null;
-    const row_open = spellQName(&row_open_buf, "<", xdr_prefix, "row", ">") catch return null;
-    const row_close = spellQName(&row_close_buf, "</", xdr_prefix, "row", ">") catch return null;
-    const row_off_open = spellQName(&row_off_open_buf, "<", xdr_prefix, "rowOff", ">") catch return null;
-    const row_off_close = spellQName(&row_off_close_buf, "</", xdr_prefix, "rowOff", ">") catch return null;
+/// A byte range of a block: `[start, end)`.
+pub const Span = struct { start: usize, end: usize };
 
-    return .{
-        .col = parseElementU32(inner, col_open, col_close) orelse return null,
-        .col_off = parseElementI64(inner, col_off_open, col_off_close) orelse return null,
-        .row = parseElementU32(inner, row_open, row_close) orelse return null,
-        .row_off = parseElementI64(inner, row_off_open, row_off_close) orelse return null,
-    };
+/// A corner block (`<{p}:from>` / `<{p}:to>`) read whole — the four
+/// coordinates AND where the block and each of the two grid scalars
+/// sit in the anchor, so the read takes the values and the sweep
+/// splices one scalar's text: ONE parser, one acceptance
+/// (`std.fmt.parseInt`: no whitespace, a leading `+` allowed) for both, where the
+/// sweep used to carry its own more lenient grammar (in-house
+/// ND-REL-103 — the read and the sweep must judge the same bytes the
+/// same way). Offsets are relative to the block handed in.
+pub const CornerBlock = struct {
+    anchor: CellAnchor,
+    /// The `<` of the block's open tag.
+    open_start: usize,
+    /// The byte past the block's close tag.
+    after_close: usize,
+    /// The text of `<col>` / `<row>` — the sweep's splice sites.
+    col_text: Span,
+    row_text: Span,
+};
+
+/// Parse the anchor's `from` or `to` block: the block under the first
+/// set that spells a live open tag (its close tag is then that set's —
+/// XML ties them), each scalar under ANY set. Live matches: a commented
+/// `<xdr:from>` fake in the block is not the anchor's geometry (Codex
+/// #214 r5 REL-501). Null when the block or any scalar is absent or
+/// does not parse — the strict read's and the sweep's refusal.
+pub fn parseCornerIn(block: []const u8, sets: []const DrawingTags, which: Corner) ?CornerBlock {
+    for (sets) |s| {
+        const open = if (which == .from) s.open_from else s.open_to;
+        const close = if (which == .from) s.close_from else s.close_to;
+        const o = findLiveMarkup(block, 0, open) orelse continue;
+        const c = findLiveMarkup(block, o + open.len, close) orelse return null;
+        const inner_start = o + open.len;
+        const inner = block[inner_start..c];
+        const col = scalarIn(inner, sets, .col) orelse return null;
+        const col_off = scalarIn(inner, sets, .col_off) orelse return null;
+        const row = scalarIn(inner, sets, .row) orelse return null;
+        const row_off = scalarIn(inner, sets, .row_off) orelse return null;
+        return .{
+            .anchor = .{
+                .col = std.fmt.parseInt(u32, inner[col.start..col.end], 10) catch return null,
+                .col_off = std.fmt.parseInt(i64, inner[col_off.start..col_off.end], 10) catch return null,
+                .row = std.fmt.parseInt(u32, inner[row.start..row.end], 10) catch return null,
+                .row_off = std.fmt.parseInt(i64, inner[row_off.start..row_off.end], 10) catch return null,
+            },
+            .open_start = o,
+            .after_close = c + close.len,
+            .col_text = .{ .start = inner_start + col.start, .end = inner_start + col.end },
+            .row_text = .{ .start = inner_start + row.start, .end = inner_start + row.end },
+        };
+    }
+    return null;
 }
 
-fn parseElementU32(xml: []const u8, open: []const u8, close: []const u8) ?u32 {
-    const start = std.mem.indexOf(u8, xml, open) orelse return null;
-    const value_start = start + open.len;
-    const value_end = std.mem.indexOfPos(u8, xml, value_start, close) orelse return null;
-    return std.fmt.parseInt(u32, xml[value_start..value_end], 10) catch null;
-}
+const Scalar = enum { col, col_off, row, row_off };
 
-fn parseElementI64(xml: []const u8, open: []const u8, close: []const u8) ?i64 {
-    const start = std.mem.indexOf(u8, xml, open) orelse return null;
-    const value_start = start + open.len;
-    const value_end = std.mem.indexOfPos(u8, xml, value_start, close) orelse return null;
-    return std.fmt.parseInt(i64, xml[value_start..value_end], 10) catch null;
+/// The text span of the first live `<{p}:col>`-style scalar under any
+/// set, relative to `inner`.
+fn scalarIn(inner: []const u8, sets: []const DrawingTags, which: Scalar) ?Span {
+    for (sets) |s| {
+        const open, const close = switch (which) {
+            .col => .{ s.open_col, s.close_col },
+            .col_off => .{ s.open_col_off, s.close_col_off },
+            .row => .{ s.open_row, s.close_row },
+            .row_off => .{ s.open_row_off, s.close_row_off },
+        };
+        const o = findLiveMarkup(inner, 0, open) orelse continue;
+        const value_start = o + open.len;
+        const c = findLiveMarkup(inner, value_start, close) orelse return null;
+        return .{ .start = value_start, .end = c };
+    }
+    return null;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -3003,23 +3123,56 @@ test "relTypeIs: exact known roots only; extractSeriesRefs stays linear under co
     try std.testing.expectEqualStrings("Alt!B1", mixed[2]);
 }
 
-test "parseCellAnchor unit test" {
+/// The tag sets of a part, for the tests that parse a block directly.
+fn testTagSets(bufs: *[max_tag_sets]TagSetBuf, sets: *[max_tag_sets]DrawingTags, root_xml: []const u8) []const DrawingTags {
+    return buildTagSets(bufs, sets, resolveDrawingPrefixes(root_xml)) catch unreachable;
+}
+
+test "parseCornerIn: one corner parser — the values, the block and the scalar spans, under any followed prefix" {
+    var bufs: [max_tag_sets]TagSetBuf = undefined;
+    var set_store: [max_tag_sets]DrawingTags = undefined;
     const xml =
         \\<xdr:from><xdr:col>3</xdr:col><xdr:colOff>16119</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>47624</xdr:rowOff></xdr:from>
     ;
-    const a = parseCellAnchor(xml, "<xdr:from>", "</xdr:from>", "xdr").?;
-    try std.testing.expectEqual(@as(u32, 3), a.col);
-    try std.testing.expectEqual(@as(i64, 16119), a.col_off);
-    try std.testing.expectEqual(@as(u32, 1), a.row);
-    try std.testing.expectEqual(@as(i64, 47624), a.row_off);
+    const sets = testTagSets(&bufs, &set_store, "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\"/>");
+    const a = parseCornerIn(xml, sets, .from).?;
+    try std.testing.expectEqual(@as(u32, 3), a.anchor.col);
+    try std.testing.expectEqual(@as(i64, 16119), a.anchor.col_off);
+    try std.testing.expectEqual(@as(u32, 1), a.anchor.row);
+    try std.testing.expectEqual(@as(i64, 47624), a.anchor.row_off);
+    try std.testing.expectEqual(@as(usize, 0), a.open_start);
+    try std.testing.expectEqual(xml.len, a.after_close);
+    try std.testing.expectEqualStrings("3", xml[a.col_text.start..a.col_text.end]);
+    try std.testing.expectEqualStrings("1", xml[a.row_text.start..a.row_text.end]);
     // Non-canonical drawing prefix: identical structure with `dr:`
-    // instead of `xdr:` — same parser run with a different prefix.
+    // instead of `xdr:` — same parser, the part's own resolution.
     const xml2 =
         \\<dr:from><dr:col>3</dr:col><dr:colOff>0</dr:colOff><dr:row>1</dr:row><dr:rowOff>0</dr:rowOff></dr:from>
     ;
-    const b = parseCellAnchor(xml2, "<dr:from>", "</dr:from>", "dr").?;
-    try std.testing.expectEqual(@as(u32, 3), b.col);
-    try std.testing.expectEqual(@as(u32, 1), b.row);
+    const sets2 = testTagSets(&bufs, &set_store, "<dr:wsDr xmlns:dr=\"" ++ ns_xdr_transitional ++ "\"/>");
+    const b = parseCornerIn(xml2, sets2, .from).?;
+    try std.testing.expectEqual(@as(u32, 3), b.anchor.col);
+    try std.testing.expectEqual(@as(u32, 1), b.anchor.row);
+    // A part binding the namespace twice may spell the block under one
+    // name and its scalars under the other (in-house ND-REL-103).
+    const mixed = "<from><xdr:col>7</xdr:col><colOff>0</colOff><xdr:row>2</xdr:row><rowOff>5</rowOff></from>";
+    const sets3 = testTagSets(&bufs, &set_store, "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr_transitional ++ "\" xmlns=\"" ++ ns_xdr_transitional ++ "\"/>");
+    const m = parseCornerIn(mixed, sets3, .from).?;
+    try std.testing.expectEqual(@as(u32, 7), m.anchor.col);
+    try std.testing.expectEqual(@as(u32, 2), m.anchor.row);
+    try std.testing.expectEqual(@as(i64, 5), m.anchor.row_off);
+    try std.testing.expectEqualStrings("7", mixed[m.col_text.start..m.col_text.end]);
+    // The grammar is `parseInt`: whitespace and an empty body do not
+    // parse, a leading `+` does — one acceptance for the read and the
+    // sweep (the sweep used to trim whitespace on its own).
+    try std.testing.expect(parseCornerIn("<from><col> 3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from>", sets3, .from) == null);
+    try std.testing.expectEqual(@as(u32, 3), parseCornerIn("<from><col>+3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from>", sets3, .from).?.anchor.col);
+    try std.testing.expect(parseCornerIn("<from><col>3</col><colOff>0</colOff><row></row><rowOff>0</rowOff></from>", sets3, .from) == null);
+    // A commented block is text: the live one after it is the corner.
+    const decoy = "<!-- <from><col>9</col><colOff>0</colOff><row>9</row><rowOff>0</rowOff></from> --><from><col>1</col><colOff>0</colOff><row>2</row><rowOff>0</rowOff></from>";
+    const d = parseCornerIn(decoy, sets3, .from).?;
+    try std.testing.expectEqual(@as(u32, 1), d.anchor.col);
+    try std.testing.expect(d.open_start > 0);
 }
 
 test "attrValue tolerates whitespace around =" {
@@ -4044,9 +4197,13 @@ test "resolveDrawingPrefixes: the default namespace is a prefix — empty primar
         try std.testing.expectEqualStrings("<graphicFrame", tags.open_graphic_frame);
         try std.testing.expectEqualStrings("<c:chart", tags.open_chart);
         // …and the corner parser reads them.
-        const from = parseCellAnchor("<from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from>", "<from>", "</from>", "").?;
-        try std.testing.expectEqual(@as(u32, 3), from.col);
-        try std.testing.expectEqual(@as(u32, 1), from.row);
+        var bufs: [max_tag_sets]TagSetBuf = undefined;
+        var set_store: [max_tag_sets]DrawingTags = undefined;
+        const sets = try buildTagSets(&bufs, &set_store, p);
+        try std.testing.expectEqual(@as(usize, 1), sets.len);
+        const from = parseCornerIn("<from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from>", sets, .from).?;
+        try std.testing.expectEqual(@as(u32, 3), from.anchor.col);
+        try std.testing.expectEqual(@as(u32, 1), from.anchor.row);
     }
     // The Strict URI as the default namespace resolves the same way.
     {
@@ -4202,4 +4359,72 @@ test "anchors read: an openpyxl-shaped default-namespace drawing lists its image
         try std.testing.expectEqual(@as(usize, 3), charts[0].series_refs.len);
         try std.testing.expectEqualStrings("'Data'!B1", charts[0].series_refs[0]);
     }
+}
+
+test "anchors read: markup-shaped text in a comment / CDATA / PI of a default-namespace drawing is text; a mixed-spelling anchor is listed (ND-REL-101, ND-REL-103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/test-drawings-decoys-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const uri = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+    const chart_anchor = "<oneCellAnchor><from><col>3</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from><ext cx=\"5400000\" cy=\"2700000\" /><graphicFrame><nvGraphicFramePr><cNvPr id=\"1\" name=\"Chart 1\" /><cNvGraphicFramePr /></nvGraphicFramePr><xfrm /><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\" /></a:graphicData></a:graphic></graphicFrame><clientData /></oneCellAnchor>";
+    const Case = struct { name: []const u8, root: []const u8, body: []const u8, listed: usize };
+    const cases = [_]Case{
+        // The bare `<` opener stepping one byte into `<!--` made the
+        // commented copy a phantom anchor (row 100 on the wire) and a
+        // trailing comment a refusal.
+        .{ .name = "commented decoy + trailing comment", .root = "<wsDr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ uri ++ "\">", .body = "<!-- <oneCellAnchor><from><col>3</col><colOff>0</colOff><row>99</row><rowOff>0</rowOff></from> -->" ++ chart_anchor ++ "<!-- TODO: a second <oneCellAnchor> goes here -->", .listed = 1 },
+        .{ .name = "CDATA + PI decoys", .root = "<wsDr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ uri ++ "\">", .body = "<![CDATA[<oneCellAnchor><from><row>42</row></from>]]><?note <oneCellAnchor> ?>" ++ chart_anchor, .listed = 1 },
+        // An unterminated comment swallows the rest of the part —
+        // nothing listed, no refusal, as for the prefixed spelling.
+        .{ .name = "unterminated comment", .root = "<wsDr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ uri ++ "\">", .body = "<!-- unterminated " ++ chart_anchor, .listed = 0 },
+        // Both names followed: a prefixed wrapper over bare children,
+        // with the `from` block's scalars mixed too.
+        .{ .name = "mixed spelling", .root = "<wsDr xmlns:xdr=\"" ++ uri ++ "\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns=\"" ++ uri ++ "\">", .body = "<xdr:oneCellAnchor><from><xdr:col>3</xdr:col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from><xdr:ext cx=\"5400000\" cy=\"2700000\" /><graphicFrame><nvGraphicFramePr><cNvPr id=\"1\" name=\"Chart 1\" /><cNvGraphicFramePr /></nvGraphicFramePr><xfrm /><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\" /></a:graphicData></a:graphic></graphicFrame><clientData /></xdr:oneCellAnchor>", .listed = 1 },
+    };
+    for (cases) |case| {
+        var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+        defer store.deinit();
+        const drawing = try std.mem.concat(a, u8, &.{ case.root, case.body, "</wsDr>" });
+        defer a.free(drawing);
+        try store.replacePart("xl/drawings/drawing1.xml", drawing);
+        try store.save(io, path);
+        var s = try PartStore.open(a, io, path);
+        defer s.deinit();
+        const charts = try chartAnchorsIn(&s, a, .strict);
+        defer {
+            for (charts) |c| a.free(c.series_refs);
+            a.free(charts);
+        }
+        std.testing.expectEqual(case.listed, charts.len) catch |e| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return e;
+        };
+        for (charts) |c| {
+            try std.testing.expectEqual(@as(u32, 1), c.from.row);
+            try std.testing.expectEqual(@as(u32, 3), c.from.col);
+        }
+    }
+}
+
+test "anchors read: an absoluteAnchor under the default namespace parses its <pos> and <ext> bare" {
+    var bufs: [max_tag_sets]TagSetBuf = undefined;
+    var set_store: [max_tag_sets]DrawingTags = undefined;
+    const sets = testTagSets(&bufs, &set_store, "<wsDr xmlns=\"" ++ ns_xdr_transitional ++ "\"/>");
+    const xml =
+        \\<absoluteAnchor><pos x="1000" y="2000" /><ext cx="914400" cy="457200" /><pic/><clientData /></absoluteAnchor>
+    ;
+    const abs = parseAbsoluteAnchorIn(xml, sets).?;
+    try std.testing.expectEqual(@as(i64, 1000), abs.x);
+    try std.testing.expectEqual(@as(i64, 2000), abs.y);
+    try std.testing.expectEqual(@as(i64, 914400), abs.cx);
+    try std.testing.expectEqual(@as(i64, 457200), abs.cy);
+    // The strict one-cell validation reads the bare `<ext` too, and
+    // `<extLst` does not satisfy it.
+    try std.testing.expect(parseExtAttrsIn("<oneCellAnchor><from/><ext cx=\"1\" cy=\"2\"/></oneCellAnchor>", 0, sets) != null);
+    try std.testing.expect(parseExtAttrsIn("<oneCellAnchor><from/><extLst cx=\"1\" cy=\"2\"/></oneCellAnchor>", 0, sets) == null);
 }

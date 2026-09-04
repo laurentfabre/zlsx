@@ -10371,3 +10371,36 @@ test "namespace-aware drawings: openpyxl's default-namespace drawing is listed a
         try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
     }
 }
+
+test "namespace-aware drawings: the default-namespace fixture hands over the prefixed fixture's bytes — every anchor kind, through the C ABI" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    // Report's drawing in openpyxl's spelling (a two-cell image, an
+    // absolute image, a one-cell chart, all unprefixed) beside Data's
+    // `xdr:` one: the frozen `.with_absolute` bytes, byte for byte.
+    const path = try tt.path(alloc, io, "s3b_anchors_default_ns.xlsx");
+    defer alloc.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(alloc, io, path, .default_namespace);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings(s3b_anchors_frozen, out_ptr.?[0..out_len]);
+    zlsx_buffer_release(out_ptr, out_len);
+    // A row insert on Report moves its cell-anchored image and chart
+    // and leaves the absolute image where it is.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 1, 1, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    const moved = out_ptr.?[0..out_len];
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"from\":{\"row\":4,\"col\":2,\"row_off\":0,\"col_off\":9525},\"to\":{\"row\":9,\"col\":5,\"row_off\":19050,\"col_off\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"absolute\":{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"anchor\":\"one_cell\",\"from\":{\"row\":3,\"col\":6,") != null);
+    zlsx_buffer_release(out_ptr, out_len);
+}

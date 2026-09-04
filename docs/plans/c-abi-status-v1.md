@@ -796,9 +796,18 @@ cannot spell — longer than the resolver's 100-byte limit, or past its
 eight-alternate replay cap; an anchor under it would be neither listed
 nor shifted — is this read's `MalformedDrawingXml` (strict) and the
 row / column edit's `MalformedDrawingXml` (§10, the dr-1 name; not
-folded by the Editor), dry-run by `Workbook.preflightDrawingEditForSheet`
-before the edit's first mutation. Pinned on every surface by the
-corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
+folded by the Editor), run by `Workbook.applySheetEditTransform`
+before the edit's first mutation (the sweep's result is what it
+installs after the sheet). The sweep walks the read's lexical layer
+and reads corners through the read's own parser
+(`drawings.parseCornerIn`), so the two judge a drawing the same way:
+a wrapper and its children may mix two followed spellings
+(`<xdr:twoCellAnchor><from>`), comment / CDATA / PI text is never an
+anchor under either spelling, and what the sweep cannot move — a
+wrapper with no close, a corner block absent or with a scalar that
+does not parse, two blocks that overlap — is the same
+`MalformedDrawingXml` the strict read raises. Pinned on every surface
+by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated
 reads stay bounded: the drawing walkers used to resolve every part

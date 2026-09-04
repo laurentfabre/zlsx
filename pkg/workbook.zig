@@ -6290,12 +6290,6 @@ pub const Workbook = struct {
             else
                 try sheet_edit.applyColEditToWorksheet(self.allocator, pre.bytes, spec.col.?, spec.kind);
             self.allocator.free(probe);
-            // The drawing sweep (dr-1) runs AFTER the sheet install
-            // below and can refuse — a drawing part the store cannot
-            // materialise, a spreadsheetDrawing binding the anchor walk
-            // cannot spell — so its refusal is dry-run here, after the
-            // transform's own so the more specific verdict wins.
-            try self.preflightDrawingEditForSheet(part_name, pre.bytes, spec);
         }
 
         // S7a + S7b: the pivot sweep goes FIRST among the mutations. It
@@ -6337,6 +6331,22 @@ pub const Workbook = struct {
             local = try self.preflightPivotEditsForSheet(part_name, pivot_axis, spec.row orelse spec.col.?, pivot_kind);
             break :blk &local.?;
         };
+        // The drawing sweep (dr-1) installs AFTER the sheet below and
+        // can refuse — a drawing part the store cannot materialise, an
+        // anchor the walk cannot read whole, a spreadsheetDrawing
+        // binding it cannot spell (`drawing_edit`) — so it is run here,
+        // before the first mutation and after the transform's, the
+        // table's and the pivot's own verdicts (the more specific one
+        // wins), and its result is what the install writes: no sweep
+        // in between touches the drawing part, and running the rewrite
+        // twice doubled the work and the resolved-name retention
+        // (in-house ND-PERF-104).
+        var drawing_rewrite: ?DrawingRewrite = null;
+        defer if (drawing_rewrite) |*r| r.deinit(self.allocator);
+        {
+            const pre = (try self.store.part(part_name)) orelse return error.MissingSheetPart;
+            drawing_rewrite = try self.rewriteDrawingForSheet(part_name, pre.bytes, spec);
+        }
         try self.applyPivotEditsForSheet(part_name, spec, prepared);
 
         // The FORMULA sweep runs BEFORE the byte transform (Codex
@@ -6374,12 +6384,14 @@ pub const Workbook = struct {
         defer self.allocator.free(new_xml);
         try self.store.replacePart(part_name, new_xml);
 
-        // dr-1: rewrite modern xdr drawing anchors in the sheet's
-        // referenced `xl/drawings/drawingN.xml` part. Sheets without
-        // a `<drawing r:id>` element skip silently; no-op rewrites
-        // are byte-identical and skip `replacePart` so SHA256
-        // passthrough holds.
-        try self.applyDrawingEditForSheet(part_name, part.bytes, spec);
+        // dr-1: install the drawing rewrite dry-run above — the
+        // sheet's referenced `xl/drawings/drawingN.xml` with its
+        // anchors shifted. Sheets without a `<drawing r:id>` element
+        // skipped silently; a no-op rewrite is byte-identical and skips
+        // `replacePart` so SHA256 passthrough holds.
+        if (drawing_rewrite) |r| {
+            if (r.changed) try self.store.replacePart(r.part_name, r.bytes);
+        }
 
         // dr-2: rewrite legacy VML drawing + paired comments part
         // (anchor cell + display rect + paired `<comment ref>`).
@@ -6425,56 +6437,38 @@ pub const Workbook = struct {
         try self.applyPivotHostWrites(prepared.host_writes.items);
     }
 
-    /// dr-1: rewrite the modern xdr drawing part referenced by the
-    /// sheet (if any). `<xdr:from>` / `<xdr:to>` `<xdr:col>` /
-    /// `<xdr:row>` 0-based coordinates inside `<xdr:twoCellAnchor>`
-    /// and `<xdr:oneCellAnchor>` shift in step with the worksheet
-    /// row/col edit — under every spreadsheetDrawing prefix the
+    /// dr-1: the sheet's referenced `xl/drawings/drawingN.xml` part
+    /// rewritten for one row / column edit — `<xdr:from>` / `<xdr:to>`
+    /// `<xdr:col>` / `<xdr:row>` 0-based coordinates inside
+    /// `<xdr:twoCellAnchor>` and `<xdr:oneCellAnchor>` shifted in step
+    /// with the worksheet, under every spreadsheetDrawing prefix the
     /// anchors read follows, the default namespace included
     /// (`drawing_edit` resolves them as the read does); full-collapse
-    /// anchors drop. Sheets without a `<drawing r:id>` element skip
-    /// silently. `preflightDrawingEditForSheet` dry-ran this exact
-    /// call before the first install, so it cannot newly refuse here.
-    fn applyDrawingEditForSheet(
-        self: *Workbook,
-        sheet_part_name: []const u8,
-        sheet_xml: []const u8,
-        spec: SheetEditSpec,
-    ) Error!void {
-        const rewrite = (try self.rewriteDrawingForSheet(sheet_part_name, sheet_xml, spec)) orelse return;
-        defer self.allocator.free(rewrite.bytes);
-        if (rewrite.changed) try self.store.replacePart(rewrite.part_name, rewrite.bytes);
-    }
-
-    /// The drawing sweep's all-or-nothing gate: resolve the edited
-    /// sheet's drawing part as the sweep will and dry-run the rewrite,
-    /// so every refusal it can raise — a part the store cannot
-    /// materialise, a spreadsheetDrawing binding under a name the
-    /// anchor walk cannot spell (`MalformedDrawingXml`), a coordinate
-    /// past `u32` (`DrawingCoordinateOverflow`) — lands BEFORE the
-    /// transform's first install rather than after it, where it would
-    /// mark the edit torn (the `<xm:f>` and chart gates' shape, for the
-    /// one sheet's part). A drawing part is small; the apply repeats
-    /// the call on the same bytes.
-    fn preflightDrawingEditForSheet(
-        self: *Workbook,
-        sheet_part_name: []const u8,
-        sheet_xml: []const u8,
-        spec: SheetEditSpec,
-    ) Error!void {
-        const rewrite = (try self.rewriteDrawingForSheet(sheet_part_name, sheet_xml, spec)) orelse return;
-        self.allocator.free(rewrite.bytes);
-    }
-
+    /// anchors dropped. Both owned by the caller. Null for a sheet
+    /// without a `<drawing r:id>` element (nothing to sweep).
     const DrawingRewrite = struct {
         part_name: []const u8,
-        /// Owned by the caller.
         bytes: []u8,
         changed: bool,
+
+        fn deinit(self: *DrawingRewrite, a: std.mem.Allocator) void {
+            a.free(self.bytes);
+            a.free(self.part_name);
+        }
     };
 
-    /// The drawing part the sheet references, rewritten for `spec`;
-    /// null when the sheet has no drawing to sweep.
+    /// The drawing sweep's all-or-nothing gate AND its result: resolve
+    /// the edited sheet's drawing part and rewrite it, so every refusal
+    /// the sweep can raise — a part the store cannot materialise, an
+    /// anchor the walk cannot read whole, a spreadsheetDrawing binding
+    /// it cannot spell (`MalformedDrawingXml`), a coordinate past `u32`
+    /// (`DrawingCoordinateOverflow`) — lands BEFORE the transform's
+    /// first install rather than after it, where it would mark the
+    /// edit torn (the `<xm:f>` and chart gates' shape, for the one
+    /// sheet's part); `applySheetEditTransform` installs the bytes
+    /// after the sheet. The resolved name is scratch, freed with the
+    /// result (the arena variant retained it per edit — the S3B-MEM-603
+    /// shape).
     fn rewriteDrawingForSheet(
         self: *Workbook,
         sheet_part_name: []const u8,
@@ -6484,11 +6478,18 @@ pub const Workbook = struct {
         const rid = findWorksheetDrawingRid(sheet_xml) orelse return null;
         const rels = self.store.rels(sheet_part_name);
         const target = relTargetForId(rels, rid) orelse return null;
-        const drawing_part_name = (try self.store.resolve(sheet_part_name, target)) orelse return null;
-        const drawing_part = (try self.carrierPart(drawing_part_name, error.MalformedDrawingXml)) orelse return null;
+        const drawing_part_name = (try self.store.resolveOwned(self.allocator, sheet_part_name, target)) orelse return null;
+        errdefer self.allocator.free(drawing_part_name);
+        const drawing_part = (try self.carrierPart(drawing_part_name, error.MalformedDrawingXml)) orelse {
+            self.allocator.free(drawing_part_name);
+            return null;
+        };
 
         const idx_1based = spec.row orelse spec.col.?;
-        if (idx_1based == 0) return null;
+        if (idx_1based == 0) {
+            self.allocator.free(drawing_part_name);
+            return null;
+        }
         const axis: drawing_edit.Axis = if (spec.row != null) .row else .col;
         const kind: drawing_edit.EditKind = switch (spec.kind) {
             .insert => .insert,
@@ -28006,4 +28007,44 @@ test "checkAllAllocationFailures: the chart sweep leaks nothing under OOM" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, H.run, .{ io, path });
+}
+
+test "Workbook drawing sweep: an anchor spelled under both followed names is listed by the read and shifted by the sweep — the two agree (ND-REL-103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/test-drawing-mixed-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // The openpyxl drawing with `xdr:` bound beside its default
+    // declaration and the anchor's `from` block respelled `xdr:` —
+    // legal, both names on the URI. The read used to refuse it and the
+    // sweep to pass it through unshifted.
+    try writeOpenpyxlDrawingWithBinding(a, io, path, "xdr");
+    try chart_fixture.patchPart(a, io, path, "xl/drawings/drawing1.xml", "<from><col>3</col>", "<xdr:from><col>3</col>");
+    try chart_fixture.patchPart(a, io, path, "xl/drawings/drawing1.xml", "</from>", "</xdr:from>");
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    {
+        const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+        defer {
+            for (anchors) |c| a.free(c.series_refs);
+            a.free(anchors);
+        }
+        try std.testing.expectEqual(@as(usize, 1), anchors.len);
+        try std.testing.expectEqual(@as(u32, 1), anchors[0].from.row);
+    }
+    try wb.insertRow(0, 1);
+    const drawing = try dupePart(&wb, "xl/drawings/drawing1.xml");
+    defer a.free(drawing);
+    try std.testing.expect(std.mem.indexOf(u8, drawing, "<xdr:from><col>3</col><colOff>0</colOff><row>2</row>") != null);
+    const anchors = try drawings.chartAnchorsIn(&wb.store, a, .strict);
+    defer {
+        for (anchors) |c| a.free(c.series_refs);
+        a.free(anchors);
+    }
+    try std.testing.expectEqual(@as(usize, 1), anchors.len);
+    try std.testing.expectEqual(@as(u32, 2), anchors[0].from.row);
 }
