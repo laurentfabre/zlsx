@@ -4433,11 +4433,19 @@ class Editor:
         the first write), ``MissingRelationship`` (a sheet whose part
         the workbook does not reach), ``EmbeddingExceedsArchiveLimit``
         (a part past the 512 MiB read cap — sized from the inputs before
-        a vector is read — or the recovery record past its ceiling). A
-        refusal that fires after the first part is written (an
-        allocation failure, an index past the cap, a content-types or
-        workbook part the carriers cannot patch) leaves the staged set
-        partially replaced: close the editor without saving. The recalc transactions —
+        a vector is read — or the recovery record past its ceiling),
+        ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the open admits
+        but the strip of the previous record's chunk names cannot walk;
+        judged before the first write). A refusal that fires after the
+        first part is written (an allocation failure, an index past the
+        cap, a content-types or docProps part the carriers cannot patch)
+        leaves the staged set partially replaced: close the editor
+        without saving. A save after this write re-emits the workbook's
+        ``<definedNames>`` block: every existing name keeps ``name``,
+        ``localSheetId`` and ``hidden`` only — its other attributes
+        (``comment``, ``description``, ``function``, ``vbProcedure``, …)
+        are dropped, as after any staged defined-name edit
+        (pre-existing, recorded). The recalc transactions —
         :meth:`mark_recalc_on_load` then :meth:`save`,
         :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
         candidate from the archive as opened and do NOT carry this

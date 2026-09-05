@@ -61,6 +61,11 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+// The typed parser's scanner, for the ONE acceptance of what is not an
+// element (comment / CDATA / PI / DOCTYPE): the lexical reader below
+// must skip exactly what the parser and the strip skip. The module
+// imports nothing but std, so this leaf stays a leaf.
+const workbook_xml_mod = @import("typed_parts/workbook_xml.zig");
 
 pub const Error = error{
     MalformedRecord,
@@ -440,18 +445,25 @@ pub fn findDefinedNameValue(
     buf: []u8,
 ) ?[]const u8 {
     var search: usize = 0;
-    while (std.mem.indexOfPos(u8, workbook_xml, search, "<definedName")) |open| {
-        // A `<definedName` inside a comment is text, not an element:
-        // the whole comment is skipped, as the typed parser skips it
-        // (a decoy chunk in a comment used to be read as the record —
-        // in-house r4 S3C-REL-401's shape on the reader).
-        if (std.mem.indexOfPos(u8, workbook_xml, search, "<!--")) |c_open| {
-            if (c_open < open) {
-                const c_close = std.mem.indexOfPos(u8, workbook_xml, c_open + "<!--".len, "-->") orelse return null;
-                search = c_close + "-->".len;
-                continue;
-            }
+    while (std.mem.indexOfScalarPos(u8, workbook_xml, search, '<')) |lt| {
+        // A `<definedName` inside a comment, a CDATA section, a
+        // processing instruction or a DOCTYPE is text, not an element:
+        // the construct is skipped whole, with the typed parser's own
+        // scanner, so this reader cannot see the part differently from
+        // the parser and the strip (a decoy chunk in a comment used to
+        // be read as the record — in-house r4 S3C-REL-401; the other
+        // constructs, r5 S3C-REL-502). An unterminated construct is not
+        // a part to read a record from.
+        const past = workbook_xml_mod.skipNonElement(workbook_xml, lt) catch return null;
+        if (past != lt) {
+            search = past;
+            continue;
         }
+        if (!std.mem.startsWith(u8, workbook_xml[lt..], "<definedName")) {
+            search = lt + 1;
+            continue;
+        }
+        const open = lt;
         const gt = std.mem.indexOfScalarPos(u8, workbook_xml, open, '>') orelse return null;
         const attrs = workbook_xml[open..gt];
         search = gt + 1;
@@ -778,16 +790,33 @@ test "cell carrier is a distinct Carrier variant" {
     try testing.expect(Carrier.cell_data != Carrier.defined_name);
 }
 
-test "findDefinedNameValue: a chunk inside a comment is text — the live element after it is the record" {
+test "findDefinedNameValue: a chunk inside a comment, a CDATA section, a PI or a DOCTYPE is text — the live element after it is the record" {
     var buf: [64]u8 = undefined;
-    const xml =
-        "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName> -->" ++
-        "<definedNames><definedName name=\"_zlsxRecovery0\" hidden=\"1\">\"real\"</definedName></definedNames></workbook>";
-    try testing.expectEqualStrings("real", findDefinedNameValue(xml, "_zlsxRecovery0", &buf).?);
-    // Only the decoy: no record.
-    const only_decoy = "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName> --><definedNames/></workbook>";
-    try testing.expect(findDefinedNameValue(only_decoy, "_zlsxRecovery0", &buf) == null);
-    // An unterminated comment is not a part to read a record from.
-    const torn = "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName>";
-    try testing.expect(findDefinedNameValue(torn, "_zlsxRecovery0", &buf) == null);
+    const real = "<definedNames><definedName name=\"_zlsxRecovery0\" hidden=\"1\">\"real\"</definedName></definedNames></workbook>";
+    const decoy = "<definedName name=\"_zlsxRecovery0\">decoy</definedName>";
+    // Every construct the typed parser (and the strip) skips: the
+    // comment (r4), and the three r5 S3C-REL-502 named — a decoy in a
+    // CDATA section or a PI survived every re-embed and was read as the
+    // record, so a stripped read answered the PREVIOUS generation.
+    const openers = [_][]const u8{
+        "<workbook><!-- " ++ decoy ++ " -->",
+        "<workbook><![CDATA[ " ++ decoy ++ " ]]>",
+        "<workbook><?zlsx " ++ decoy ++ " ?>",
+        "<!DOCTYPE workbook [ <!-- " ++ decoy ++ " --> ]><workbook>",
+    };
+    inline for (openers) |opener| {
+        const xml = opener ++ real;
+        try testing.expectEqualStrings("real", findDefinedNameValue(xml, "_zlsxRecovery0", &buf).?);
+        // Only the decoy: no record.
+        try testing.expect(findDefinedNameValue(opener ++ "<definedNames/></workbook>", "_zlsxRecovery0", &buf) == null);
+    }
+    // An unterminated construct is not a part to read a record from.
+    const torn = [_][]const u8{
+        "<workbook><!-- " ++ decoy,
+        "<workbook><![CDATA[ " ++ decoy,
+        "<workbook><?zlsx " ++ decoy,
+    };
+    inline for (torn) |xml| {
+        try testing.expect(findDefinedNameValue(xml, "_zlsxRecovery0", &buf) == null);
+    }
 }

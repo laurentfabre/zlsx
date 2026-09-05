@@ -256,6 +256,39 @@ def test_set_embeddings_refuses_a_workbook_the_relationship_cannot_land_in(tmp_p
         assert ed.save_to_buffer() == bad.read_bytes()
 
 
+def test_set_embeddings_refuses_a_workbook_part_the_previous_records_strip_cannot_walk(tmp_path):
+    """A ``<definedName`` with an unterminated quote OUTSIDE
+    ``<definedNames>`` beside a saved record: the open admits the part
+    (the typed view bounds the element inside the block only), the strip
+    of the previous record's chunk names refuses it — the workbook's
+    fault, before the first part. It used to surface after every part
+    as a plain ``MalformedXml`` error, and a save then shipped an index
+    at the new model beside a record at the old one."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    gen1 = tmp_path / "gen1.xlsx"
+    bad = tmp_path / "bad.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m1", 3, [TITLE])
+        ed.save(gen1)
+    zin = zipfile.ZipFile(gen1)
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in zin.namelist():
+            data = zin.read(item)
+            if item == "xl/workbook.xml":
+                assert data.count(b"</workbook>") == 1
+                data = data.replace(b"</workbook>", b'<definedName name="x>oops</definedName></workbook>')
+            zo.writestr(item, data)
+    with zlsx.embeddings(bad) as emb:
+        assert emb.state == "present" and emb.model == "m1"
+    with zlsx.Editor(bad) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.set_embeddings("m9", 3, [TITLE])
+        assert info.value.error_name == "MalformedWorkbookXml"
+        assert ed.save_to_buffer() == bad.read_bytes()
+
+
 def test_set_embeddings_refuses_a_recovery_record_past_its_ceiling_before_writing(tmp_path):
     """The record's 16 × 200-byte ceiling is a pure function of the
     inputs: a ~3 KB model name refuses with nothing staged (it used to

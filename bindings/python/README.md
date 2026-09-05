@@ -399,13 +399,19 @@ first part is written; a workbook the set cannot land in refuses with a
 `ZlsxRefusal` (`MissingWorkbookRels` / `MalformedWorkbookRels`,
 `IdSpaceExhausted`, `MissingRelationship`, `EmbeddingExceedsArchiveLimit` — a part past the
 512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
-eighty coverages, or a ~3 KB model name). A NumPy array crosses as one
+eighty coverages, or a ~3 KB model name — and `MalformedWorkbookXml`, an
+`xl/workbook.xml` the previous record's strip cannot walk; each judged before
+the first write). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
 (a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
 and a masked array's masked slots are "no value". A refusal after the first
 part is written (an allocation failure, an index past the cap, a package
 part the carriers cannot patch) leaves the staged set partially replaced:
-close the editor without saving. The recalc transactions
+close the editor without saving. A save after the write re-emits the
+workbook's `<definedNames>` block: every existing name keeps `name`,
+`localSheetId` and `hidden` only — its other attributes (`comment`,
+`description`, `function`, `vbProcedure`, …) are dropped, as after any staged
+defined-name edit (pre-existing, recorded). The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
 rebuild from the archive as opened and do not carry a staged embedding
 write — call them before it, or save and re-open. The per-row content

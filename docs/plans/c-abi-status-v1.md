@@ -1265,7 +1265,10 @@ for the recovery record — both pre-flighted in pass 1) /
 space, or an existing `docProps/custom.xml`'s `pid` space, already at
 `UINT32_MAX` — pre-flighted in pass 1, round 2) / `MissingContentTypes`
 / `MalformedContentTypes` / `MalformedWorkbookXml` (already in
-`structural_refusals`) and `EmbeddingExceedsArchiveLimit` — new in the
+`structural_refusals`; since round 5 also the strip's verdict on an
+`xl/workbook.xml` the open admits but the scanner refuses — a
+`<definedName` outside `<definedNames>` — judged in pass 2c) and
+`EmbeddingExceedsArchiveLimit` — new in the
 list — a part past the
 512 MiB read cap (`embedding_part.PART_MAX_BYTES`, the S1 per-part
 limit spelled once; sized from the inputs in the C layer before a
@@ -1311,9 +1314,10 @@ never a Python float per value.
   encoding (`encodeRecoveryRecord`, pass 2c; `installRecoveryRecord`
   last) now run before the first write. Residue, documented on every
   surface: an allocation failure, an index XML past the cap, or a
-  `[Content_Types].xml` or `xl/workbook.xml` the carriers cannot patch
-  can still leave the set partially replaced — discard the editor
-  without saving. The three docProps `allocPrint` folds no
+  `[Content_Types].xml` or `docProps/custom.xml` the carriers cannot
+  patch can still leave the set partially replaced — discard the editor
+  without saving (the `xl/workbook.xml` strip left the list in round 5:
+  prepared in pass 2c, committed after the relationship). The three docProps `allocPrint` folds no
   longer turn an allocation failure into a `-1 WriteFailed`; the
   remaining `WriteFailed` folds are `bufPrint`s the id and rId bounds
   cannot overflow.
@@ -1384,7 +1388,7 @@ quote-aware `findTagEnd` and the comment-aware `findClosingTag` — a chunk
 with a quoted `>` in an attribute before `name`, or a decoy inside a
 comment, was seen differently by the strip and the view. The strip now
 walks with the parser's own `findTagOpen` / `findClosingTag` (a chunk
-with no close is `MalformedWorkbookXml` before any store write) and
+with no close is `MalformedWorkbookXml`) and
 judges the DECODED name (`store_mod.decodeXmlEntities`, the splice's own
 reading — a character reference such as `&#95;zlsxRecovery0` was the one
 way the chunk form could hide; the early return considers `&#` too). The
@@ -1406,6 +1410,47 @@ with the suite. Carried: the record reader accepts `name='…'` / `name="…"`
 but not `name =` spacing and does not decode entities in the name — a
 foreign strip that also re-spells attributes would read as `absent`
 (pre-existing, the reader's own scope).
+
+**Round 5** (two agents, every round-4 fix verified through the built
+dylib; A ship-ready with four LOWs, B blocking on one MEDIUM — the same
+shape): the round-4 strip walks the WHOLE part with the parser's scanner
+while the view bounds `<definedName` inside `<definedNames>` only, so a
+`<definedName` with an unterminated quote outside the block — a part the
+open admits — tripped the scanner's own `MalformedXml` from the install,
+a `-1` AFTER every part, the index and the relationship (a save then
+shipped an index at the new model beside a record at the old one; the
+`&#` early-return clause sent record-free workbooks down the same walk).
+The strip is now two halves: `prepareRecoveryNameStrip` in pass 2c —
+the stripped bytes and the view parsed over them, a pure function of a
+part no later pass touches, every scanner or parser verdict mapped to
+`MalformedWorkbookXml` — and `commitRecoveryNameStrip` from the install
+(`replacePart` + the view swap). Pinned in Zig (the junk beside a saved
+record and on a record-free part spelling `&#`: the refusal, no new part,
+the index still the old model), C (`ZLSX_REFUSED` + `MalformedWorkbookXml`,
+`save_to_buffer == source`) and Python (the same, through a
+zipfile-patched second generation). The recovery-record READER's round-4
+skip covered comments only; a decoy chunk inside a CDATA section or a PI
+— which the parser and the strip rightly skip, so it survived every
+re-embed — was read as the record and a stripped read answered the
+PREVIOUS generation. The reader now skips with the parser's own
+`skipNonElement` (the module imports nothing but std, so
+`pkg/recovery_record.zig` stays a leaf; its root now runs the parser's
+tests too) — comments, CDATA, PIs and DOCTYPE, one acceptance; pinned
+on all four plus the unterminated forms. The `&#` clause of the early
+return gained its own pin (a saved chunk spelled `&#95;zlsxRecovery0`
+with the prefix nowhere else). **Recorded follow-up (round 5,
+S3C-REL-504 B — pre-existing, outside this slice)**: a save after any
+staged defined-name edit — `set_embeddings` stages the record's hidden
+names, so every one of its saves — re-emits `<definedNames>` from the
+view plus the plan (`applyWorkbookXmlPlanDefinedNames` /
+`spliceDefinedNamesBlock`) keeping `name` / `localSheetId` / `hidden`
+only: `comment`, `description`, `help`, `statusBar`, `customMenu`,
+`shortcutKey`, `function`, `vbProcedure`, `workbookParameter`,
+`publishToServer`, `xlm`, `functionGroupId` are dropped from every
+existing name (an `insert_row` save keeps them — the byte-preserving
+`rewriteAllDefinedNames` shape). Fix = re-emit unchanged entries
+byte-for-byte and regenerate only the staged ones; until then the
+sentence is on every surface.
 
 **Recorded follow-up (round 2, S3C-REL-201 B — pre-existing, outside
 this slice, an owner decision)**: the recalc transactions rebuild their
@@ -1467,18 +1512,25 @@ in the view and the file, three user names kept once with their flags
 through the plan drop AND the strip, a foreign case-variant and a
 spaced single-quoted chunk stripped, the same workbook's `embeddings()`
 answering the new model, a stripped read reporting the LAST
-generation); `pkg/recovery_record.zig` pins `isChunkName` and the reader's
-comment skip. Each fix of rounds 1–4 was mutation-checked: reverted,
-its Zig, C or Python tests fail.
+generation), the strip's scanner verdict beside a saved record and on a
+record-free part spelling `&#` (`MalformedWorkbookXml`, no new part, the
+index still the old model), and a saved chunk spelled only as a
+character reference stripped on the re-embed; `pkg/recovery_record.zig`
+pins `isChunkName` and the reader's non-element skip (a decoy in a
+comment, a CDATA section, a PI and a DOCTYPE subset, plus the
+unterminated forms). Each fix of rounds 1–5 was mutation-checked:
+reverted, its Zig, C or Python tests fail.
 `tests/c_abi_smoke.c` `#error`s without the macro, takes the address
-and pins the struct. Python (`test_embedding_write.py`, 44): the goal
+and pins the struct. Python (`test_embedding_write.py`, 45): the goal
 line — `embeddings()` `present` after the write with the provenance,
 the cells untouched, both carriers; vectors / hashes / `valid_mask`
 read back and re-embedded on the read side's own arrays; int8-sym;
 replacement across a save with one hidden name and a stripped read
 reporting the last model; fourteen named `ZlsxError`s writing nothing;
-the `MalformedWorkbookRels` `ZlsxRefusal` on either rels file and the
-record-ceiling refusal, nothing written; NumPy crossing without
+the `MalformedWorkbookRels` `ZlsxRefusal` on either rels file, the
+`MalformedWorkbookXml` refusal on a second generation whose part the
+strip cannot walk, and the record-ceiling refusal, nothing written;
+NumPy crossing without
 `tolist` (an ndarray subclass whose `tolist` raises), signed / float /
 object / bool arrays judged, `2**64 - 1` as the tombstone; a
 misaligned view (the mechanism: an aligned buffer, an aligned array

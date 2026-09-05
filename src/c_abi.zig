@@ -10509,12 +10509,20 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// sized here from the inputs before anything is read, OR a recovery
 /// record past its 16 × 200-byte ceiling — roughly eighty coverages,
 /// or a ~3 KB model — encoded before the first write), and the
-/// package's own `MissingContentTypes` / `MalformedContentTypes` /
-/// `MalformedWorkbookXml`. A -2 or -3 that fires AFTER the first part
+/// package's own `MissingContentTypes` / `MalformedContentTypes`, and
+/// `MalformedWorkbookXml` (an `xl/workbook.xml` the open admits but the
+/// strip of the previous record's chunk names cannot walk — a
+/// `<definedName` outside `<definedNames>` the scanner refuses; judged
+/// before the first write). A -2 or -3 that fires AFTER the first part
 /// write (an allocation failure, an index past the cap, a content
-/// types or workbook part the carriers cannot patch) leaves the
+/// types or docProps part the carriers cannot patch) leaves the
 /// staged part set partially replaced: discard the editor without
-/// saving. The recalc transactions (`zlsx_editor_mark_recalc_on_load`
+/// saving. A save after this write re-emits the workbook's
+/// `<definedNames>` block: every existing name keeps `name`,
+/// `localSheetId` and `hidden` only — its other attributes (`comment`,
+/// `description`, `function`, `vbProcedure`, …) are dropped, as after
+/// any staged defined-name edit (pre-existing, recorded).
+/// The recalc transactions (`zlsx_editor_mark_recalc_on_load`
 /// + save, `zlsx_editor_save_with_recalc`, `zlsx_editor_recalculate`)
 /// rebuild their candidate from the archive as opened and do NOT
 /// carry this write — call them before it, or save and re-open (a
@@ -10889,6 +10897,39 @@ test "S3c set_embeddings refusals that used to fire after the parts: the package
         var diag = freshDiag();
         try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 3, "f32", &covs, 0, &diag, &err_buf));
         try std.testing.expectEqualStrings("MalformedWorkbookRels", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+    // Beside a saved record, a `<definedName` with an unterminated quote
+    // outside the `<definedNames>` block — a part the open admits, since
+    // the view bounds the element inside the block only — is the strip's
+    // to refuse. Its verdict used to cross from the install as the
+    // scanner's own `MalformedXml`, a -1 AFTER every part, the index and
+    // the relationship (in-house r5 S3C-REL-501); now the workbook's
+    // refusal, before the first write.
+    {
+        const src_path = try writeS3cFixture(io, &tt, "s3c_strip_src.xlsx");
+        defer alloc.free(src_path);
+        const path = try tt.path(alloc, io, "s3c_strip.xlsx");
+        defer alloc.free(path);
+        {
+            const ed = zlsx_editor_open(src_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+            defer zlsx_editor_close(ed);
+            try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &covs, 0, null, &err_buf));
+            try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, path.ptr, path.len, &err_buf, err_buf.len));
+        }
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "</workbook>", "<definedName name=\"x>oops</definedName></workbook>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m9", 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
         try std.testing.expectEqual(plane_none, diag.plane);
         var out_ptr: ?[*]u8 = null;
         var out_len: usize = 0;

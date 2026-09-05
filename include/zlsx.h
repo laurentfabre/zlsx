@@ -2148,13 +2148,21 @@ typedef struct zlsx_emb_coverage_v1 {
  * part past the 512 MiB read cap (sized here from the inputs, before
  * a vector byte is read), OR the recovery record past its ceiling of
  * 16 × 200 bytes — roughly eighty coverages at typical ids, or a
- * ~3 KB model name (encoded before the first write); and the
- * package's own MissingContentTypes / MalformedContentTypes /
- * MalformedWorkbookXml. A -2 or -3 that fires AFTER the first part
+ * ~3 KB model name (encoded before the first write); the package's
+ * own MissingContentTypes / MalformedContentTypes; and
+ * MalformedWorkbookXml — an xl/workbook.xml the open admits but the
+ * strip of the previous record's chunk names cannot walk (a
+ * <definedName outside <definedNames> the scanner refuses; judged
+ * before the first write). A -2 or -3 that fires AFTER the first part
  * write — an allocation failure, an index past the cap, a content
- * types or workbook part the carriers cannot patch — leaves the
+ * types or docProps part the carriers cannot patch — leaves the
  * staged part set partially replaced: discard the editor without
- * saving. The recalc transactions — zlsx_editor_mark_recalc_on_load
+ * saving. A save after this write re-emits the workbook's
+ * <definedNames> block: every existing name keeps name, localSheetId
+ * and hidden only — its other attributes (comment, description,
+ * function, vbProcedure, ...) are dropped, as after any staged
+ * defined-name edit (pre-existing, recorded).
+ * The recalc transactions — zlsx_editor_mark_recalc_on_load
  * then save, zlsx_editor_save_with_recalc, zlsx_editor_recalculate —
  * rebuild their candidate from the archive as opened and do NOT carry
  * this write: call them before it, or save and re-open (a recorded,

@@ -2480,6 +2480,22 @@ pub const Workbook = struct {
     ///   existing `docProps/custom.xml`'s `pid` space, is already at
     ///   `UINT32_MAX` (a hostile part; checked arithmetic, never a
     ///   trap). Checked in pass 1.
+    /// - `MalformedWorkbookXml` — `xl/workbook.xml` carries a
+    ///   `<definedName` the typed parser's scanner refuses (an
+    ///   unterminated attribute quote, a chunk with no close) where the
+    ///   open never looked: outside `<definedNames>`. The previous
+    ///   generation's chunk names are stripped from the saved part and
+    ///   its view re-parsed — prepared in pass 2c, a pure function of
+    ///   the part, and committed after the relationship — so the verdict
+    ///   lands before the first part write.
+    ///
+    /// A save after this write re-emits the `<definedNames>` block from
+    /// the parsed view plus the plan (`applyWorkbookXmlPlanDefinedNames`):
+    /// every existing name keeps `name`, `localSheetId` and `hidden`
+    /// only — `comment`, `description`, `function`, `vbProcedure` and
+    /// the other optional attributes are dropped — exactly as after any
+    /// `addDefinedName` (pre-existing, the splice's to fix; recorded,
+    /// in-house r5 S3C-REL-504).
     ///
     /// The view a previous `embeddings()` returned is invalidated: it
     /// described the previous set (valid until the next write, prune
@@ -2490,11 +2506,12 @@ pub const Workbook = struct {
     /// rule of the transaction's generation model that also reverts a
     /// `renameSheet` and trips on an `addSheet`).
     ///
-    /// Every input refusal above lands before the first part is
-    /// written. A failure after it — an allocation failure, an index
-    /// XML past the cap, a `[Content_Types].xml` or `xl/workbook.xml`
-    /// the package layer cannot patch — leaves the staged part set
-    /// partially replaced: discard the workbook without saving.
+    /// Every refusal above lands before the first part is written. A
+    /// failure after it — an allocation failure, an index XML past the
+    /// cap, a `[Content_Types].xml` or `docProps/custom.xml` the package
+    /// layer cannot patch, the hidden sheet's install under
+    /// `recovery_in_cells` — leaves the staged part set partially
+    /// replaced: discard the workbook without saving.
     /// The remaining `WriteFailed` folds are `bufPrint`s into buffers
     /// the id and rId bounds cannot overflow.
     pub fn setEmbeddings(
@@ -2628,6 +2645,16 @@ pub const Workbook = struct {
         // first part write; installed last, after the relationship.
         const rec = try self.encodeRecoveryRecord(model, dim, dtype, specs, inputs);
         defer self.allocator.free(rec);
+        // The previous generation's chunk names in the SAVED
+        // `xl/workbook.xml`: the stripped bytes and the view parsed over
+        // them, a pure function of a part no pass between here and the
+        // install touches. Computed here so the strip's verdict on a
+        // part the open admitted but the scanner refuses lands before
+        // the first part write — it used to cross from the install,
+        // after every part, as the scanner's own `MalformedXml`
+        // (in-house r5 S3C-REL-501). The install commits it.
+        var strip = try self.prepareRecoveryNameStrip();
+        defer if (strip) |*s| s.deinit(self.allocator);
 
         // Pass 3: encode + upsert per coverage's binaries.
         for (inputs, specs) |inp, s| {
@@ -2750,7 +2777,7 @@ pub const Workbook = struct {
         // by Numbers or LibreOffice *detectable* — those tools drop
         // every part above, and without the record the result is
         // indistinguishable from a workbook that never had vectors.
-        try self.installRecoveryRecord(rec);
+        try self.installRecoveryRecord(rec, &strip);
         // The lazily-parsed `embeddings()` view described the previous
         // set (in-house r2 S3C-REL-207); the next read re-resolves.
         self.invalidateEmbeddingCache();
@@ -3262,16 +3289,17 @@ pub const Workbook = struct {
     /// Inspector ▸ Document Properties and Personal Information strips
     /// `docProps` and does not touch defined names. ~200 bytes of
     /// redundancy against a vector set measured in megabytes.
-    fn installRecoveryRecord(self: *Workbook, rec: []const u8) Error!void {
+    fn installRecoveryRecord(self: *Workbook, rec: []const u8, strip: *?RecoveryNameStrip) Error!void {
         const n = recovery_record.chunkCount(rec.len);
         assert(n <= recovery_record.MAX_CHUNKS);
 
         // Upsert, not append: a second setEmbeddings on the same
         // workbook must replace the record, not accumulate stale
         // copies alongside it. Clear both the staged plan and any
-        // names already in the saved bytes before writing.
+        // names already in the saved bytes before writing — the strip
+        // was prepared (and judged) in pass 2c; only its commit is here.
         self.dropStagedRecoveryNames();
-        try self.stripRecoveryNamesFromWorkbookXml();
+        try self.commitRecoveryNameStrip(strip);
 
         var name_buf: [32]u8 = undefined;
         var lit_buf: [recovery_record.MAX_CHUNK + 2]u8 = undefined;
@@ -3331,12 +3359,51 @@ pub const Workbook = struct {
     /// record's chunks beside the new ones, and a reader concatenating
     /// by index would splice two generations together.
     fn stripRecoveryNamesFromWorkbookXml(self: *Workbook) Error!void {
-        const part = (try self.store.part("xl/workbook.xml")) orelse return;
+        var strip = try self.prepareRecoveryNameStrip();
+        defer if (strip) |*s| s.deinit(self.allocator);
+        try self.commitRecoveryNameStrip(&strip);
+    }
+
+    /// The strip before its commit: the stripped `xl/workbook.xml` bytes
+    /// and the view parsed over them. `prepareRecoveryNameStrip` builds
+    /// it, `commitRecoveryNameStrip` installs it; between the two it is
+    /// the caller's to free.
+    const RecoveryNameStrip = struct {
+        bytes: []u8,
+        view: workbook_xml_mod.WorkbookXml,
+
+        fn deinit(self: *RecoveryNameStrip, allocator: std.mem.Allocator) void {
+            allocator.free(self.bytes);
+            self.view.deinit(allocator);
+        }
+    };
+
+    /// The typed parser's verdict on `xl/workbook.xml`, spelled as the
+    /// write's contract spells it: a part the scanner or the parser
+    /// refuses is a statement about the workbook (`MalformedWorkbookXml`,
+    /// a refusal), never the scanner's own `MalformedXml` (a -1 on the C
+    /// surface, whose contract promises nothing was written).
+    fn workbookXmlVerdict(e: workbook_xml_mod.Error) Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.MalformedWorkbookXml,
+        };
+    }
+
+    /// First half of the strip — nothing is written. Null when the part
+    /// spells nothing to strip. Every verdict the strip can give lands
+    /// here, so `setEmbeddingsOpts` raises it before the first part
+    /// write (in-house r5 S3C-REL-501: the scanner's `MalformedXml` on a
+    /// `<definedName` outside the block — a part the open admits, since
+    /// the view bounds `<definedName` inside `<definedNames>` only — used
+    /// to cross from the install, after every part).
+    fn prepareRecoveryNameStrip(self: *Workbook) Error!?RecoveryNameStrip {
+        const part = (try self.store.part("xl/workbook.xml")) orelse return null;
         const src = part.bytes;
         // Nothing to strip unless the prefix is spelled — or could be
         // hidden behind a character reference.
         if (std.ascii.indexOfIgnoreCase(src, recovery_record.NAME_PREFIX) == null and
-            std.mem.indexOf(u8, src, "&#") == null) return;
+            std.mem.indexOf(u8, src, "&#") == null) return null;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -3350,7 +3417,7 @@ pub const Workbook = struct {
         // reference is the one way the chunk form can hide (r4 B-REL-401).
         var i: usize = 0;
         while (i < src.len) {
-            const hit = (try workbook_xml_mod.findTagOpen(src, i, "definedName")) orelse {
+            const hit = (workbook_xml_mod.findTagOpen(src, i, "definedName") catch |e| return workbookXmlVerdict(e)) orelse {
                 try out.appendSlice(self.allocator, src[i..]);
                 break;
             };
@@ -3370,9 +3437,8 @@ pub const Workbook = struct {
                 i = hit.after_tag_close;
                 continue;
             }
-            // A chunk with no close is not a part the view would parse:
-            // refused here, before any store write, the verdict below.
-            const close = (try workbook_xml_mod.findClosingTag(src, hit.after_tag_close, "</definedName>")) orelse
+            // A chunk with no close is not a part the view would parse.
+            const close = (workbook_xml_mod.findClosingTag(src, hit.after_tag_close, "</definedName>") catch |e| return workbookXmlVerdict(e)) orelse
                 return error.MalformedWorkbookXml;
             i = close + "</definedName>".len;
         }
@@ -3384,12 +3450,24 @@ pub const Workbook = struct {
         // model — in-house r1 S3C-REL-101). Parsed over its own copy
         // BEFORE the store write, the add-sheet pattern: a view that does
         // not parse leaves both untouched.
-        var fresh = try workbook_xml_mod.parseOwning(self.allocator, out.items);
+        var fresh = workbook_xml_mod.parseOwning(self.allocator, out.items) catch |e| return workbookXmlVerdict(e);
         errdefer fresh.deinit(self.allocator);
         if (fresh.sheets.len != self.workbook.sheets.len) return error.SheetCountMismatch;
-        try self.store.replacePart("xl/workbook.xml", out.items);
-        self.workbook.deinit(self.allocator);
-        self.workbook = fresh;
+        const bytes = try out.toOwnedSlice(self.allocator);
+        return .{ .bytes = bytes, .view = fresh };
+    }
+
+    /// Second half of the strip: the part replaced and the view swapped
+    /// in one step. Consumes `strip` on success (a no-op on null); on
+    /// failure it stays the caller's to free.
+    fn commitRecoveryNameStrip(self: *Workbook, strip: *?RecoveryNameStrip) Error!void {
+        if (strip.*) |*s| {
+            try self.store.replacePart("xl/workbook.xml", s.bytes);
+            self.workbook.deinit(self.allocator);
+            self.workbook = s.view;
+            self.allocator.free(s.bytes);
+            strip.* = null;
+        }
     }
 
     /// Write the record into `docProps/custom.xml`, creating the part
@@ -22441,6 +22519,140 @@ test "Workbook.setEmbeddings: a rels file the relationship cannot land in refuse
     try wb.store.removePart(rels_name);
     try std.testing.expectError(error.MissingWorkbookRels, wb.setEmbeddings("m", 2, .f32, &.{input}));
     try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
+}
+
+test "Workbook.setEmbeddings: a <definedName> the strip's scanner refuses is MalformedWorkbookXml before the first part write" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-stripverdict-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0x1};
+    const input: EmbeddingCoverageInput = .{
+        .id = "t",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    const other: EmbeddingCoverageInput = .{
+        .id = "u",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A3:A3",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    {
+        var wb = try Workbook.empty(std.testing.allocator, io);
+        defer wb.deinit();
+        try wb.setEmbeddings("m1", 2, .f32, &.{input});
+        try wb.save(io, tmp_path);
+    }
+    // Beside a saved record, a `<definedName` with an unterminated quote
+    // OUTSIDE the block: the view bounds `<definedName` inside
+    // `<definedNames>` only, so the open admits the part, and the strip's
+    // whole-part walk refuses it. The verdict is the workbook's
+    // (`MalformedWorkbookXml`, never the scanner's `MalformedXml`) and it
+    // lands before the first part write — it used to cross from the
+    // install, after every part, the index and the relationship, so a
+    // save shipped an index at the new model beside a record at the old
+    // one (in-house r5 S3C-REL-501).
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const src = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        const junk = try std.mem.replaceOwned(u8, std.testing.allocator, src.bytes, "</workbook>", "<definedName name=\"x>oops</definedName></workbook>");
+        defer std.testing.allocator.free(junk);
+        try wb.store.replacePart("xl/workbook.xml", junk);
+        try std.testing.expectEqualStrings("m1", (try wb.embeddings()).present.index.model);
+        try std.testing.expectError(error.MalformedWorkbookXml, wb.setEmbeddings("m9", 2, .f32, &.{other}));
+        try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/u/vec.bin")) == null);
+        try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/u/hashes.bin")) == null);
+        const index = (try wb.store.part(embedding_part.INDEX_PART_NAME)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, index.bytes, "model=\"m1\"") != null);
+        const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "|m1|") != null);
+    }
+    // A record-free workbook whose part spells `&#` anywhere walks too
+    // (the round-4 early return): the same verdict, nothing written.
+    {
+        var wb = try Workbook.empty(std.testing.allocator, io);
+        defer wb.deinit();
+        const src = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        const junk = try std.mem.replaceOwned(u8, std.testing.allocator, src.bytes, "</workbook>", "<!-- &#65; --><definedName name=\"x>oops</definedName></workbook>");
+        defer std.testing.allocator.free(junk);
+        try wb.store.replacePart("xl/workbook.xml", junk);
+        try std.testing.expectError(error.MalformedWorkbookXml, wb.setEmbeddings("m1", 2, .f32, &.{input}));
+        try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
+        try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/t/vec.bin")) == null);
+    }
+}
+
+test "Workbook.setEmbeddings: a saved chunk spelled only as a character reference is stripped on the re-embed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp_buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.now(.awake, io).nanoseconds))));
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, ".zig-cache/test-wb-charref-{d}.xlsx", .{prng.random().int(u32)});
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0x1};
+    const input: EmbeddingCoverageInput = .{
+        .id = "t",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    {
+        var wb = try Workbook.empty(std.testing.allocator, io);
+        defer wb.deinit();
+        try wb.setEmbeddings("m1", 2, .f32, &.{input});
+        try wb.save(io, tmp_path);
+    }
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+        defer wb.deinit();
+        const src = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src.bytes, "name=\"_zlsxRecovery0\""));
+        const spelled = try std.mem.replaceOwned(u8, std.testing.allocator, src.bytes, "name=\"_zlsxRecovery0\"", "name=\"&#95;zlsxRecovery0\"");
+        defer std.testing.allocator.free(spelled);
+        // The part spells the prefix NOWHERE else: the early return's
+        // `&#` clause is the only reason the strip walks at all (the
+        // third-generation pin spells it in a user's name and a decoy,
+        // so it could not tell — in-house r5 S3C-TEST-503).
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(spelled, recovery_record.NAME_PREFIX) == null);
+        try wb.store.replacePart("xl/workbook.xml", spelled);
+        try wb.setEmbeddings("m2", 2, .f32, &.{input});
+        try wb.save(io, tmp_path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, tmp_path);
+    defer wb.deinit();
+    const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+    // Without the clause the walk never runs: the view keeps the raw
+    // name, the splice re-emits it DECODED beside ours — two chunks, and
+    // the stripped read below answers `m1`.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"_zlsxRecovery0\""));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, wbxml.bytes, "&#95;"));
+    try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "|m1|") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "|m2|") != null);
+    try wb.store.removePart(embedding_part.INDEX_PART_NAME);
+    try std.testing.expectEqualStrings("m2", (try wb.embeddings()).stripped.model);
 }
 
 test "Workbook.setEmbeddings: a re-embed across a save replaces the recovery names; a stripped read reports the last generation" {
