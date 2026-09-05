@@ -2137,19 +2137,28 @@ typedef struct zlsx_emb_coverage_v1 {
  * enforces). -2 (ZLSX_REFUSED, a statement about the workbook, the
  * name in the diag with plane NONE): MissingWorkbookRels /
  * MalformedWorkbookRels — no xl/_rels/workbook.xml.rels, or one
- * without the </Relationships> the relationship lands before
- * (checked before the first write); MissingRelationship — a sheet
- * whose part the workbook's rels do not reach;
- * EmbeddingExceedsArchiveLimit — a part past the 512 MiB read cap
- * (the binary parts are sized before the first write); and the
+ * without the </Relationships> the workbook→index relationship
+ * lands before, or a _rels/.rels without it when docProps/custom.xml
+ * has to be created for the recovery record (both checked before the
+ * first write); MissingRelationship — a sheet whose part the
+ * workbook's rels do not reach; EmbeddingExceedsArchiveLimit — a
+ * part past the 512 MiB read cap (sized here from the inputs, before
+ * a vector byte is read), OR the recovery record past its ceiling of
+ * 16 × 200 bytes — roughly eighty coverages at typical ids, or a
+ * ~3 KB model name (encoded before the first write); and the
  * package's own MissingContentTypes / MalformedContentTypes /
  * MalformedWorkbookXml. A -2 or -3 that fires AFTER the first part
- * write — an allocation failure, an oversized index or recovery
- * record, a docProps/custom.xml the carrier cannot patch — leaves the
+ * write — an allocation failure, an index past the cap, a content
+ * types or workbook part the carriers cannot patch — leaves the
  * staged part set partially replaced: discard the editor without
- * saving. Inherited from the Zig surface and unchanged here: the
- * index read hands model / id / target attributes back raw, so a
- * model name carrying `&`, `<` or `"` reads back entity-escaped. */
+ * saving. The record's hidden _zlsxRecoveryN defined names are
+ * staged with the workbook plan and appear in
+ * zlsx_editor_defined_names_ndjson only after a save. Inherited from
+ * the Zig surface and unchanged here: the index read hands model /
+ * id / target attributes back raw, so a model name carrying `&`, `<`
+ * or `"` reads back entity-escaped, and a tab / LF / CR in it reads
+ * back as written here while a conforming XML parser normalizes them
+ * to spaces (attribute values) — use plain spaces. */
 int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
         const uint8_t * model, size_t model_len,
         uint32_t dim,

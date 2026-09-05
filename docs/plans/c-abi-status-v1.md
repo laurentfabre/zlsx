@@ -1257,14 +1257,27 @@ about the call, every one raised before the first part write:
 `DuplicateCoverageId`, `CoverageOverlap`, `InvalidXmlByte`,
 `StructSizeTooSmall`. `-2`, statements about the workbook, the name in
 the diag with `plane = NONE`: `MissingWorkbookRels` /
-`MalformedWorkbookRels` / `MissingRelationship` / `MissingContentTypes`
-/ `MalformedContentTypes` / `MalformedWorkbookXml` (already in
-`structural_refusals`) and `EmbeddingExceedsArchiveLimit` — new in the
-list — a part past the 512 MiB read cap: a limit, so a refusal (§2, the
-`FormulaLimitExceeded` rule). The Python leg mirrors S3a: `ZlsxError` /
-`ZlsxRefusal(error_name)`, with the shapes (`TypeError` / `ValueError`)
-checked before ctypes could truncate, through the same
-`_structural_call` helper.
+`MalformedWorkbookRels` (`xl/_rels/workbook.xml.rels` without the
+`</Relationships>` the workbook→index relationship lands before, or
+`_rels/.rels` without it when `docProps/custom.xml` has to be created
+for the recovery record — both pre-flighted in pass 1) /
+`MissingRelationship` / `MissingContentTypes` / `MalformedContentTypes`
+/ `MalformedWorkbookXml` (already in `structural_refusals`) and
+`EmbeddingExceedsArchiveLimit` — new in the list — a part past the
+512 MiB read cap (`embedding_part.PART_MAX_BYTES`, the S1 per-part
+limit spelled once; sized from the inputs in the C layer before a
+vector byte is read, and again in the Zig write's pass 1) OR the
+recovery record past the defined-name carrier's ceiling of 16 × 200
+bytes (roughly eighty coverages at typical ids, or a ~3 KB model name;
+encoded in pass 2c, installed last): a limit either way, so a refusal
+(§2, the `FormulaLimitExceeded` rule), the one name kept rather than a
+second spelling of "too big for the carrier". The Python leg mirrors
+S3a: `ZlsxError` / `ZlsxRefusal(error_name)`, with the shapes
+(`TypeError` / `ValueError`) checked before ctypes could truncate,
+through the same `_structural_call` helper; a NumPy matrix or hash
+array crosses as one contiguous float32 / uint64 buffer
+(`np.ascontiguousarray`, the array itself when it already is one),
+never a Python float per value.
 
 **Three Zig-layer fixes the export exposed** (the
 `Workbook.setEmbeddings` contract, every surface at once):
@@ -1283,46 +1296,87 @@ checked before ctypes could truncate, through the same
   `model` and `worksheet_target` in pass 1, and the encoder refuses
   again (`InvalidXmlByte`, a new `embedding_part.Error` member). Tab /
   LF / CR / DEL are XML characters and pass, as on every other channel.
-- Two refusals fired AFTER the parts were installed —
+- Refusals fired AFTER the parts were installed —
   `MissingWorkbookRels` / `MalformedWorkbookRels` in pass 5 (the
-  relationship's splice target) and `EmbeddingExceedsArchiveLimit` per
-  coverage in pass 3 (a second oversized coverage left the first one's
-  parts) — leaving a torn staged set. `preflightEmbeddingsRels` and
-  exact part sizing (header + body, what the encoders emit) now run in
-  pass 1. Residue, documented on every surface: an allocation failure,
-  an oversized index XML or recovery record, or a `docProps/custom.xml`
-  / `[Content_Types].xml` the carrier cannot patch can still leave the
-  set partially replaced — discard the editor without saving.
+  relationship's splice target) and from the docProps carrier's
+  `_rels/.rels` (round 1), `EmbeddingExceedsArchiveLimit` per coverage
+  in pass 3 (a second oversized coverage left the first one's parts)
+  and from the recovery record's chunk ceiling in the install (round
+  1: a set with a new index and no record at all) — leaving a torn
+  staged set. `preflightEmbeddingsRels` (both rels files), exact part
+  sizing (header + body, what the encoders emit) and the record's
+  encoding (`encodeRecoveryRecord`, pass 2c; `installRecoveryRecord`
+  last) now run before the first write. Residue, documented on every
+  surface: an allocation failure, an index XML past the cap, a
+  `[Content_Types].xml` or `xl/workbook.xml` the carriers cannot patch,
+  or (Zig-only) a staged defined name colliding with a `_zlsxRecoveryN`
+  chunk can still leave the set partially replaced — discard the
+  editor without saving. The three docProps `allocPrint` folds no
+  longer turn an allocation failure into a `-1 WriteFailed`; the
+  remaining `WriteFailed` folds are `bufPrint`s the id and rId bounds
+  cannot overflow.
+- **Round 1's HIGH (S3C-REL-101)**, pre-existing on the Zig and CLI
+  surfaces and shipped here under "replaces any previous set": a
+  re-embed across a save resurrected the previous recovery generation.
+  `stripRecoveryNamesFromWorkbookXml` replaced `xl/workbook.xml` in the
+  store but never refreshed the parsed view, and the save-time splice
+  (`applyWorkbookXmlPlanDefinedNames`) rebuilds `<definedNames>` from
+  the VIEW plus the plan — so the saved chunk came back beside the new
+  one (two `_zlsxRecovery0`, Excel's repair prompt) and a stripped read
+  reported the OLD model. The strip now parses the fresh view over its
+  own copy before the store write and swaps it, the add-sheet pattern;
+  both replacement tests count the name carrier (S3C-TEST-107).
 
 **Recorded, not lifted**: the index read hands `model` / `id` /
 `worksheet_target` attributes back raw (no entity decoding), so a model
 name carrying `&`, `<` or `"` reads back as `&amp;` … on every surface —
 the defined-names ST_Xstring shape (#190), a read-side slice of its own;
-the `recovery_in_cells` flag (above); embeddable rows, prune, strip →
-C + Py (the rest of S3c).
+a tab / LF / CR in `model` passes the byte rule (an XML 1.0 character,
+as on every other channel) into an ATTRIBUTE value, which a conforming
+parser normalizes to a space while zlsx's lexical read returns it raw
+— documented on every surface, plain spaces recommended; the hidden
+`_zlsxRecoveryN` names are staged with the workbook plan and appear in
+`defined_names()` only after a save (the S3b read walks the parsed
+view); "the one encoder" is the one PRODUCTION encoder — the emb-4 /
+emb-4b fixture generators keep an independent spelling of the int8-sym
+record as the layout oracle; the `recovery_in_cells` flag (above);
+embeddable rows, prune, strip → C + Py (the rest of S3c).
 
-**Tests** (`src/c_abi.zig`, "S3c set_embeddings …" ×6): the f32 round
+**Tests** (`src/c_abi.zig`, "S3c set_embeddings …" ×7): the f32 round
 trip on two sheets with a tombstone and `include_formulas`, read back
 through `zlsx_emb_*` and the Zig read (the column, the flag, ONE
 relationship, both carriers, no hidden sheet); int8-sym within one step
 of the per-row scale and the compact part size; a second write replacing
-the set in one editor and across a save (one relationship, one property);
-thirty `-1` cases with the name in errbuf, the diag as prep left it, the
-NULL-with-length-0 rule, `StructSizeTooSmall` byte-for-byte, and
-`save_to_buffer` equal to the source (nothing written); the `-2`
-`MalformedWorkbookRels` with a poisoned diag reset and nothing written,
-plus `statusOf` pinned on both vocabularies; the body encoder under
-`checkAllAllocationFailures`. `pkg/embedding_part.zig`: the encoders
-read back through `decodeAllF32`, shape checks before any byte moves,
-the column rule, the byte rule over every value 0x00–0x7F and through
-`encodeIndexXml`. `pkg/workbook.zig`: the column and control-byte
-refusals leaving no part, the rels pre-flight leaving no part.
+the set in one editor and across a save (one relationship, one property,
+ONE `_zlsxRecovery0` carrying the last model); thirty `-1` cases with the
+name in errbuf, the diag as prep left it, the NULL-with-length-0 rule,
+`StructSizeTooSmall` byte-for-byte, and `save_to_buffer` equal to the
+source (nothing written); the `-2` `MalformedWorkbookRels` with a
+poisoned diag reset and nothing written, plus `statusOf` pinned on both
+vocabularies; the three refusals that used to fire after the parts —
+`_rels/.rels` without its close tag, a 3300-byte model, a one-row
+2^27-wide f32 coverage and a full-grid 2^20-wide one refused from the
+inputs before a vector byte is read — each with `save_to_buffer` equal
+to the source; the body encoder under `checkAllAllocationFailures`.
+`pkg/embedding_part.zig`: the encoders read back through
+`decodeAllF32`, shape checks before any byte moves, the column rule, the
+byte rule over every value 0x00–0x7F and through `encodeIndexXml`.
+`pkg/workbook.zig`: the column and control-byte refusals leaving no
+part, both rels pre-flights leaving no part, the record ceiling (120
+one-row coverages, a 3300-byte model) leaving no part while forty
+coverages land, and the re-embed across a save (one name in the view
+and the file, a stripped read reporting the LAST generation). Each
+round-1 fix was mutation-checked: reverted, its Zig and C tests fail.
 `tests/c_abi_smoke.c` `#error`s without the macro, takes the address
-and pins the struct. Python (`test_embedding_write.py`): the goal line —
-`embeddings()` `present` after the write with the provenance, the cells
-untouched, both carriers; vectors / hashes / `valid_mask` read back and
-re-embedded on the read side's own arrays; int8-sym; replacement;
-fourteen named `ZlsxError`s writing nothing; the `MalformedWorkbookRels`
-`ZlsxRefusal`; seventeen Python-side shape errors; NumPy width against
-`dim`; the closed editor and the older-dylib `RuntimeError`; the probe
-against the version.
+and pins the struct. Python (`test_embedding_write.py`, 42): the goal
+line — `embeddings()` `present` after the write with the provenance,
+the cells untouched, both carriers; vectors / hashes / `valid_mask`
+read back and re-embedded on the read side's own arrays; int8-sym;
+replacement across a save with one hidden name and a stripped read
+reporting the last model; fourteen named `ZlsxError`s writing nothing;
+the `MalformedWorkbookRels` `ZlsxRefusal` on either rels file and the
+record-ceiling refusal, nothing written; NumPy crossing without
+`tolist` (an ndarray subclass whose `tolist` raises), signed / float /
+object / bool arrays judged, `2**64 - 1` as the tombstone; seventeen
+Python-side shape errors; NumPy width against `dim`; the closed editor
+and the older-dylib `RuntimeError`; the probe against the version.

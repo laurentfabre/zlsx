@@ -178,6 +178,21 @@ def test_set_embeddings_second_write_replaces_the_set(tmp_path):
     z = zipfile.ZipFile(out)
     assert z.read("xl/_rels/workbook.xml.rels").count(b"zlsxEmbeddings/index.xml") == 1
     assert z.read("docProps/custom.xml").count(b"<property ") == 1
+    # The primary carrier: ONE hidden name, the last generation's (a
+    # re-embed across a save used to keep the saved chunk beside the
+    # new one, and a stripped read then reported the OLD model).
+    wbxml = z.read("xl/workbook.xml")
+    assert wbxml.count(b'name="_zlsxRecovery0"') == 1
+    assert wbxml.count(b"_zlsxRecovery") == 1
+    assert b"|m3|" in wbxml and b"|m2|" not in wbxml
+    stripped = tmp_path / "stripped.xlsx"
+    with zipfile.ZipFile(stripped, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in z.namelist():
+            if not item.startswith("xl/zlsxEmbeddings/"):
+                zo.writestr(item, z.read(item))
+    with zlsx.embeddings(stripped) as emb:
+        assert emb.stripped and emb.model == "m3"
+        assert [c.id for c in emb.coverages] == ["title"]
 
 
 # ── refusals and call errors ─────────────────────────────────────────
@@ -216,19 +231,22 @@ def test_set_embeddings_call_errors_are_named_and_write_nothing(tmp_path, name, 
         assert ed.save_to_buffer() == src.read_bytes()
 
 
-def test_set_embeddings_refuses_a_workbook_the_relationship_cannot_land_in(tmp_path):
-    """A rels file without ``</Relationships>`` is the workbook's
-    fault: a typed refusal, and nothing written — the pre-flight fires
-    before the first part."""
+@pytest.mark.parametrize("rels", ["xl/_rels/workbook.xml.rels", "_rels/.rels"])
+def test_set_embeddings_refuses_a_workbook_the_relationship_cannot_land_in(tmp_path, rels):
+    """A rels file without ``</Relationships>`` — the workbook's, or
+    the package's when the docProps carrier has to be created — is the
+    workbook's fault: a typed refusal, and nothing written (both
+    pre-flights fire before the first part)."""
     _needs_write()
     src = tmp_path / "src.xlsx"
     bad = tmp_path / "bad.xlsx"
     _write_fixture(src)
     zin = zipfile.ZipFile(src)
+    assert "docProps/custom.xml" not in zin.namelist()
     with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zo:
         for item in zin.namelist():
             data = zin.read(item)
-            if item == "xl/_rels/workbook.xml.rels":
+            if item == rels:
                 data = data.replace(b"</Relationships>", b"")
             zo.writestr(item, data)
     with zlsx.Editor(bad) as ed:
@@ -236,6 +254,69 @@ def test_set_embeddings_refuses_a_workbook_the_relationship_cannot_land_in(tmp_p
             ed.set_embeddings("m", 3, [TITLE])
         assert info.value.error_name == "MalformedWorkbookRels"
         assert ed.save_to_buffer() == bad.read_bytes()
+
+
+def test_set_embeddings_refuses_a_recovery_record_past_its_ceiling_before_writing(tmp_path):
+    """The record's 16 × 200-byte ceiling is a pure function of the
+    inputs: a ~3 KB model name refuses with nothing staged (it used to
+    refuse after every part, the index and the relationship)."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.set_embeddings("m" * 3300, 3, [TITLE])
+        assert info.value.error_name == "EmbeddingExceedsArchiveLimit"
+        assert ed.save_to_buffer() == src.read_bytes()
+        # The same name under the ceiling lands.
+        ed.set_embeddings("m" * 100, 3, [TITLE])
+
+
+def test_set_embeddings_numpy_arrays_cross_without_a_python_float_in_between(tmp_path):
+    """A NumPy matrix is handed over as one contiguous float32 buffer
+    (a typed copy for float64, the array itself for float32) and a
+    NumPy hash array as one uint64 buffer — ``tolist`` is never
+    called; a signed array is range-checked, a float array refused."""
+    np = pytest.importorskip("numpy")
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    _write_fixture(src)
+
+    class NoList(np.ndarray):
+        def tolist(self):
+            raise AssertionError("tolist must not be called on the zero-copy path")
+
+    vecs = np.array(VECS, dtype=np.float64).view(NoList)
+    hashes = np.array([1, 2, 3], dtype=np.int64).view(NoList)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [_cov(vectors=vecs, hashes=hashes)])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert np.array_equal(emb.vectors("title"), np.array(VECS, dtype=np.float32))
+        assert emb.hashes("title").tolist() == [1, 2, 3]
+    with zlsx.Editor(src) as ed:
+        with pytest.raises(ValueError):
+            ed.set_embeddings("m", 3, [_cov(hashes=np.array([-1, 2, 3], dtype=np.int64))])
+        with pytest.raises(TypeError):
+            ed.set_embeddings("m", 3, [_cov(hashes=np.array([1.0, 2.0, 3.0]))])
+        with pytest.raises(TypeError):
+            ed.set_embeddings("m", 3, [_cov(vectors=np.array(VECS, dtype=object))])
+        with pytest.raises(TypeError):
+            ed.set_embeddings("m", 3, [_cov(vectors=np.array(VECS) > 0)])
+        with pytest.raises(ValueError):
+            ed.set_embeddings("m", 3, [_cov(hashes=np.array([[1, 2, 3]], dtype=np.uint64))])
+        # An object array keeps the None-is-tombstone rule.
+        ed.set_embeddings("m", 3, [_cov(hashes=np.array([1, None, 3], dtype=object))])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert emb.valid_mask("title").tolist() == [True, False, True]
+        # And 2**64 - 1 IS the tombstone, written as such.
+        with zlsx.Editor(out) as ed:
+            ed.set_embeddings("m", 3, [_cov(hashes=[2**64 - 1, 5, 6])])
+            ed.save(src)
+    with zlsx.embeddings(src) as emb:
+        assert emb.valid_mask("title").tolist() == [False, True, True]
 
 
 @pytest.mark.parametrize(

@@ -397,10 +397,15 @@ a column outside it), `DuplicateCoverageId`, `CoverageOverlap`,
 `InvalidXmlByte` (a control byte in the model name) — each before the
 first part is written; a workbook the set cannot land in refuses with a
 `ZlsxRefusal` (`MissingWorkbookRels` / `MalformedWorkbookRels`,
-`MissingRelationship`, `EmbeddingExceedsArchiveLimit`). The per-row content
-hashes are the caller's to compute today (the embeddable-rows read is the
-next S3c slice); `recovery_in_cells` (the Numbers-durable carrier) is
-Zig-only until the editor grows a path for its hidden sheet.
+`MissingRelationship`, `EmbeddingExceedsArchiveLimit` — a part past the
+512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
+eighty coverages, or a ~3 KB model name). A NumPy array crosses as one
+contiguous float32 / uint64 buffer; values narrow to float32 as they are
+(a float64 past its range lands as `inf`), and `2**64 - 1` is the
+tombstone. The per-row content hashes are the caller's to compute today
+(the embeddable-rows read is the next S3c slice); `recovery_in_cells` (the
+Numbers-durable carrier) is Zig-only until the editor grows a path for its
+hidden sheet.
 
 ## Spark (PySpark Data Source)
 
