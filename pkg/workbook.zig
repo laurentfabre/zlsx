@@ -2506,10 +2506,12 @@ pub const Workbook = struct {
     /// rule of the transaction's generation model that also reverts a
     /// `renameSheet` and trips on an `addSheet`).
     ///
-    /// Every refusal above lands before the first part is written. A
-    /// failure after it — an allocation failure, an index XML past the
-    /// cap, a `[Content_Types].xml` or `docProps/custom.xml` the package
-    /// layer cannot patch, the hidden sheet's install under
+    /// Every refusal above lands before the first part is written, save
+    /// the index XML's own cap in pass 4 — which cannot fire: the record
+    /// ceiling checked in pass 2c bounds the same fields to a few KB. A
+    /// failure after the first write — an allocation failure, a
+    /// `[Content_Types].xml` or `docProps/custom.xml` the package layer
+    /// cannot patch, the hidden sheet's install under
     /// `recovery_in_cells` — leaves the staged part set partially
     /// replaced: discard the workbook without saving.
     /// The remaining `WriteFailed` folds are `bufPrint`s into buffers

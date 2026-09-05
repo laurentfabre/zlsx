@@ -1452,6 +1452,17 @@ existing name (an `insert_row` save keeps them — the byte-preserving
 byte-for-byte and regenerate only the staged ones; until then the
 sentence is on every surface.
 
+**Round 6** (two agents, both ship-ready — converged): every round-5 fix
+verified in the code, in a pin that fails with its fix reverted, and
+through the built library (the c15 junk on every surface, every
+non-element decoy before, after and inside a chunk body, the
+character-reference-only chunk, three generations with the round-2–5
+spellings, the CLI's `--strip` / `--vectors` on the junk). One LOW: the
+Zig setter doc and the Python README said every refusal lands before the
+first write while listing the index XML's cap (pass 4) as a residue — the
+cap cannot fire (the record ceiling checked in pass 2c bounds the same
+fields to a few KB); both now say so.
+
 **Recorded follow-up (round 2, S3C-REL-201 B — pre-existing, outside
 this slice, an owner decision)**: the recalc transactions rebuild their
 candidate from the archive AS OPENED (`PartStore.nextGeneration`:

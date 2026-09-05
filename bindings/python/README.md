@@ -401,7 +401,8 @@ first part is written; a workbook the set cannot land in refuses with a
 512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
 eighty coverages, or a ~3 KB model name — and `MalformedWorkbookXml`, an
 `xl/workbook.xml` the previous record's strip cannot walk; each judged before
-the first write). A NumPy array crosses as one
+the first write, the index part's own cap excepted — it cannot fire, the
+record ceiling bounds the same fields). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
 (a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
 and a masked array's masked slots are "no value". A refusal after the first
