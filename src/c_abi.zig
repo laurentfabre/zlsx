@@ -8812,6 +8812,12 @@ test "S3b anchors_ndjson: an inventory the read cannot serve refuses whole, type
         // A series ref whose carrier does not decode: the record
         // would lie, so the walk refuses it.
         .{ .name = "s3b_anchors_ref.xlsx", .part = "xl/charts/chart1.xml", .old = "<c:f>Data!$B$1</c:f>", .new = "<c:f>Data!$B&bogus;$1</c:f>", .verdict = "MalformedDrawingXml" },
+        // A spreadsheetDrawing binding under a name the anchor walk
+        // cannot spell (one byte past the resolver's 100-byte limit):
+        // an anchor under it would be neither listed nor moved, so the
+        // strict read refuses the drawing (the namespace-aware drawing
+        // slice).
+        .{ .name = "s3b_anchors_nsbind.xlsx", .part = "xl/drawings/drawing1.xml", .old = "<xdr:wsDr ", .new = "<xdr:wsDr xmlns:" ++ ("p" ** 101) ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" ", .verdict = "MalformedDrawingXml" },
     };
     for (cases) |case| {
         const path = try writeS3bAnchorsFixture(io, &tt, case.name);
@@ -10280,4 +10286,121 @@ test "chart sweep: a chart part the walk cannot read refuses every structural ed
         try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
         try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
     }
+}
+
+test "namespace-aware drawings: openpyxl's default-namespace drawing is listed and its anchor moves with a row insert; an unfollowable binding refuses the read and the edit" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    // Committed (`scripts/gen_openpyxl_chart_fixture.py`): `<wsDr
+    // xmlns="…/spreadsheetDrawing"><oneCellAnchor><from>` — the drawing
+    // the read used to list nothing for and the `xdr:`-literal sweep
+    // left in place. `from` is 1-based on the wire (D2).
+    const listed = "{\"kind\":\"chart_anchor\",\"sheet\":\"Data\",\"sheet_idx\":0,\"part\":\"xl/charts/chart1.xml\"," ++
+        "\"anchor\":\"one_cell\",\"from\":{\"row\":2,\"col\":4,\"row_off\":0,\"col_off\":0},\"to\":null," ++
+        "\"absolute\":null,\"chart_type\":\"bar\",\"series_refs\":[\"'Data'!B1\",\"'Data'!$A$2:$A$4\",\"'Data'!$B$2:$B$4\"]}\n";
+    const moved_path = try tt.path(alloc, io, "openpyxl_moved.xlsx");
+    defer alloc.free(moved_path);
+    {
+        const src: [*:0]const u8 = "tests/corpus/openpyxl_chart.xlsx";
+        const ed = zlsx_editor_open(src, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings(listed, out_ptr.?[0..out_len]);
+        zlsx_buffer_release(out_ptr, out_len);
+        // A row insert above the chart: the anchor AND the series
+        // formulas move (the drawing sweep and the chart sweep), in
+        // the same read, no save between.
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        const moved = out_ptr.?[0..out_len];
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"from\":{\"row\":3,\"col\":4,\"row_off\":0,\"col_off\":0}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, moved, "\"series_refs\":[\"'Data'!B2\",\"'Data'!$A$3:$A$5\",\"'Data'!$B$3:$B$5\"]") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, moved_path.ptr, moved_path.len, &err_buf, err_buf.len));
+    }
+    // The saved drawing carries the moved row, still unprefixed.
+    {
+        var store = try zlsx_pkg.PartStore.open(alloc, io, moved_path);
+        defer store.deinit();
+        const drawing = (try store.part("xl/drawings/drawing1.xml")).?;
+        try std.testing.expect(std.mem.indexOf(u8, drawing.bytes, "<row>2</row>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, drawing.bytes, "xdr:") == null);
+        const ed = zlsx_editor_open(moved_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expect(std.mem.indexOf(u8, out_ptr.?[0..out_len], "\"from\":{\"row\":3,\"col\":4,") != null);
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+    // A second spreadsheetDrawing binding past the resolver's limit:
+    // the read refuses under strict and every row / column edit refuses
+    // whole, typed MalformedDrawingXml (the dr-1 name, not folded) —
+    // pre-mutation, so a rename is still admitted after it.
+    {
+        const rejected_path = try tt.path(alloc, io, "openpyxl_nsbind.xlsx");
+        defer alloc.free(rejected_path);
+        {
+            var store = try zlsx_pkg.PartStore.open(alloc, io, "tests/corpus/openpyxl_chart.xlsx");
+            defer store.deinit();
+            try store.save(io, rejected_path);
+        }
+        try zlsx_pkg.anchors_ndjson.fixture.patchPart(alloc, io, rejected_path, "xl/drawings/drawing1.xml", "<wsDr ", "<wsDr xmlns:" ++ ("p" ** 101) ++ "=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" ");
+        const ed = zlsx_editor_open(rejected_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_row(ed, 0, 1, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_insert_column(ed, 0, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("MalformedDrawingXml", diagName(&diag));
+        const nm = "Facts";
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_rename_sheet(ed, 0, nm.ptr, nm.len, &diag, &err_buf, err_buf.len));
+    }
+}
+
+test "namespace-aware drawings: the default-namespace fixture hands over the prefixed fixture's bytes — every anchor kind, through the C ABI" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    // Report's drawing in openpyxl's spelling (a two-cell image, an
+    // absolute image, a one-cell chart, all unprefixed) beside Data's
+    // `xdr:` one: the frozen `.with_absolute` bytes, byte for byte.
+    const path = try tt.path(alloc, io, "s3b_anchors_default_ns.xlsx");
+    defer alloc.free(path);
+    try zlsx_pkg.anchors_ndjson.fixture.write(alloc, io, path, .default_namespace);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings(s3b_anchors_frozen, out_ptr.?[0..out_len]);
+    zlsx_buffer_release(out_ptr, out_len);
+    // A row insert on Report moves its cell-anchored image and chart
+    // and leaves the absolute image where it is.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_insert_row(ed, 1, 1, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_anchors_ndjson(ed, &out_ptr, &out_len, &diag, &err_buf, err_buf.len));
+    const moved = out_ptr.?[0..out_len];
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"from\":{\"row\":4,\"col\":2,\"row_off\":0,\"col_off\":9525},\"to\":{\"row\":9,\"col\":5,\"row_off\":19050,\"col_off\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"absolute\":{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "\"anchor\":\"one_cell\",\"from\":{\"row\":3,\"col\":6,") != null);
+    zlsx_buffer_release(out_ptr, out_len);
 }

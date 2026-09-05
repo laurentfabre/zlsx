@@ -779,15 +779,52 @@ cache's `worksheetSource@sheet` does under a rename. A part binding
 the chart namespace as its DEFAULT namespace (`<chartSpace
 xmlns="…/chart"><f>`) is openpyxl's spelling and is walked under `<f>`
 (in-house CF-REL-401 — it had been documented as unproduced and left
-unwalked, so every openpyxl chart went stale silently); the anchors
-read does not yet resolve openpyxl's default-namespace DRAWING (`<wsDr
-xmlns="…/spreadsheetDrawing">`), so it lists no chart for such a
-workbook while the sweep moves its chart part, and the drawing sweep
-(`drawing_edit`, `xdr:`-literal) does not shift that drawing's anchors
-either — a row insert above an openpyxl chart moves the grid and the
-series formulas but not the chart's `from` (round 5 CF-DOC-501). Both
-halves are the one namespace-aware drawing follow-up, pinned by the
-corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
+unwalked, so every openpyxl chart went stale silently). **The
+namespace-aware drawing slice (2026-09-05)** closed the sibling gap
+that round recorded (CF-DOC-501): the anchors read and the drawing
+sweep (`drawing_edit`, the dr-1 row / column rewrite) share one prefix
+resolution — `drawings.resolveDrawingPrefixes`: the root element's
+prefix, every alternate bound to a spreadsheetDrawing URI anywhere in
+the part, and the DEFAULT namespace as the empty prefix (`<wsDr
+xmlns="…/spreadsheetDrawing"><oneCellAnchor><from><row>`, openpyxl
+3.1's drawings, which the read listed as nothing and the
+`xdr:`-literal sweep left in place while the grid and the series
+formulas moved) — so a row insert above an openpyxl chart moves its
+`from` with the grid, and this export hands over the record `zlsx
+anchors` prints. A spreadsheetDrawing binding under a name the walk
+cannot spell — longer than the resolver's 100-byte limit, or past its
+eight-alternate replay cap; an anchor under it would be neither listed
+nor shifted — is this read's `MalformedDrawingXml` (strict) and the
+row / column edit's `MalformedDrawingXml` (§10, the dr-1 name; not
+folded by the Editor), run by `Workbook.applySheetEditTransform`
+before the edit's first mutation (the sweep's result is what it
+installs after the sheet). The sweep walks the read's lexical layer,
+follows the sheet's drawing edge as the read does (`drawings.findDrawingRef`
++ the typed relationship lookup — a reference the strict read cannot
+follow refuses the edit as it refuses the inventory) and reads corners
+through the read's own parser (`drawings.parseCornerIn`), so on the
+anchors both walk the two judge a drawing the same way: a wrapper and
+its children may mix two followed spellings (`<xdr:twoCellAnchor><from>`),
+comment / CDATA / PI / DTD text is never an anchor under either
+spelling (a live `<!DOCTYPE` refuses both — and the strict chart walk,
+so the chart sweep's preflight refuses a chart part carrying one,
+`MalformedChartXml`), a `<` inside an attribute value — not well-formed XML,
+the one decoy surface no exact-QName rule covers — refuses both (and
+the strict chart walk), XSD-collapsed whitespace around a scalar parses
+for both (digits only otherwise — `1_0` is not 10), and what the sweep
+cannot move — a wrapper with no close, a corner block absent or with a
+scalar that does not parse, two blocks that overlap (a `<to>` nested in
+`<from>`) — is the same `MalformedDrawingXml` the strict read raises. The walks differ only
+where their jobs do: the sweep reads the corners of a shape the read
+never lists, the read validates a one-cell anchor's `<ext>` the sweep
+does not move, a reversed `<to>` / `<from>` pair is listed and moved
+in document order, a self-closing wrapper is stepped over by both. Pinned on every surface
+by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. One
+consequence the listing makes reachable: `deleteSheet` leaves the
+doomed sheet's drawing and charts in the archive (the recorded
+orphan-part follow-up), and this read then refuses that workbook
+whole — `DrawingOnUnlistedSheet` — openpyxl workbooks included now
+that their drawings are listed (round 6, ND-REL-602). Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated
 reads stay bounded: the drawing walkers used to resolve every part

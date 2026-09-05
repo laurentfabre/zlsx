@@ -4687,9 +4687,10 @@ test "Editor: drawing rewrite tolerates XML whitespace around `=` in worksheet r
         try ed.insertColumn(0, 2);
         try ed.save(io, dst_path);
     }
-    // The drawing's xdr:col MUST shift; if findAttrValue mishandled
-    // the whitespace, applyDrawingEditForSheet would silently skip
-    // and the col would still be 2.
+    // The drawing's xdr:col MUST shift: the sheet's `<drawing>` element
+    // is followed by the anchors read's own lookup (`drawings.findDrawingRef`,
+    // which tolerates the whitespace); were it missed, the drawing
+    // sweep would find nothing and the col would still be 2.
     try std.testing.expect(try drawingPartContains(io, dst_path, "<xdr:col>3</xdr:col>"));
 }
 

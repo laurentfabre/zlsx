@@ -3094,10 +3094,14 @@ def _rels_xml(*rels):
     )
 
 
-def _anchors_workbook(path):
+def _anchors_workbook(path, default_namespace=False):
     """A real two-sheet workbook with anchors on BOTH sheets, the pkg
     fixture rebuilt by hand: the writer has no drawing surface, so the
-    parts ride in through the archive."""
+    parts ride in through the archive. ``default_namespace`` spells
+    Report's drawing as openpyxl 3.1 does — the spreadsheetDrawing
+    namespace bound as the DEFAULT namespace, every anchor element
+    unprefixed — while Data's keeps ``xdr:`` (the pkg fixture's
+    ``.default_namespace`` kind)."""
     import os
     import zipfile
 
@@ -3129,7 +3133,10 @@ def _anchors_workbook(path):
             zout.writestr(item, blob)
         zout.writestr("xl/media/image1.png", _ANCHORS_PNG)
         zout.writestr("xl/charts/chart1.xml", _ANCHORS_CHART_XML)
-        zout.writestr("xl/drawings/drawing1.xml", _ANCHORS_DRAWING1)
+        drawing1 = _ANCHORS_DRAWING1
+        if default_namespace:
+            drawing1 = drawing1.replace("xdr:", "").replace("xmlns:xdr=", "xmlns=")
+        zout.writestr("xl/drawings/drawing1.xml", drawing1)
         zout.writestr("xl/drawings/_rels/drawing1.xml.rels", _rels_xml(("rIdI1", "image", "../media/image1.png"), ("rIdC1", "chart", "../charts/chart1.xml")))
         zout.writestr("xl/drawings/drawing2.xml", _ANCHORS_DRAWING2)
         zout.writestr("xl/drawings/_rels/drawing2.xml.rels", _rels_xml(("rIdI1", "image", "../media/image1.png")))
@@ -3377,6 +3384,120 @@ def test_anchors_refusal_is_typed(tmp_path):
     ed.close()
     with pytest.raises(zlsx.ZlsxError, match="closed"):
         ed.anchors()
+
+
+def test_anchors_list_openpyxls_default_namespace_drawing_and_shift_it(tmp_path):
+    """openpyxl 3.1 binds the spreadsheetDrawing namespace as its
+    DEFAULT namespace (``<wsDr xmlns="…/spreadsheetDrawing">
+    <oneCellAnchor><from><row>``): the read used to list nothing for
+    such a workbook, and a row insert moved the grid and the chart's
+    series formulas but not the anchor. The namespace-aware drawing
+    slice resolves the prefix once for the read and the sweep — the
+    committed openpyxl corpus workbook through both."""
+    _require_anchors()
+    _require_structural()
+    path = _skip_if_missing("openpyxl_chart.xlsx")
+    assert zlsx.anchors(path) == [
+        {
+            "kind": "chart_anchor",
+            "sheet": "Data",
+            "sheet_idx": 0,
+            "part": "xl/charts/chart1.xml",
+            "anchor": "one_cell",
+            "from": {"row": 2, "col": 4, "row_off": 0, "col_off": 0},
+            "to": None,
+            "absolute": None,
+            "chart_type": "bar",
+            "series_refs": ["'Data'!B1", "'Data'!$A$2:$A$4", "'Data'!$B$2:$B$4"],
+        }
+    ]
+    out = tmp_path / "openpyxl_moved.xlsx"
+    with zlsx.edit(path) as ed:
+        ed.insert_row(0, 1)
+        moved = ed.anchors()
+        assert moved[0]["from"] == {"row": 3, "col": 4, "row_off": 0, "col_off": 0}
+        assert moved[0]["series_refs"] == ["'Data'!B2", "'Data'!$A$3:$A$5", "'Data'!$B$3:$B$5"]
+        ed.save(out)
+    assert zlsx.anchors(out)[0]["from"]["row"] == 3
+    import zipfile
+
+    with zipfile.ZipFile(out) as z:
+        drawing = z.read("xl/drawings/drawing1.xml").decode()
+    # The row is the one splice; the part stays as openpyxl spelled it.
+    assert "<row>2</row>" in drawing and "<row>1</row>" not in drawing
+    assert "xdr:" not in drawing
+
+
+def test_anchors_unfollowable_drawing_binding_refuses_read_and_edit(tmp_path):
+    """A spreadsheetDrawing binding under a name the anchor walk cannot
+    spell (past the resolver's 100-byte prefix limit) would leave an
+    anchor neither listed nor moved: the read refuses ``MalformedDrawingXml``
+    and so does every row / column edit, before anything changes."""
+    _require_anchors()
+    _require_structural()
+    import zipfile
+
+    src = _skip_if_missing("openpyxl_chart.xlsx")
+    path = tmp_path / "openpyxl_nsbind.xlsx"
+    long_prefix = "p" * 101
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/drawings/drawing1.xml":
+                data = data.replace(
+                    b"<wsDr ",
+                    b'<wsDr xmlns:' + long_prefix.encode() + b'="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" ',
+                    1,
+                )
+            zout.writestr(item, data)
+    with pytest.raises(zlsx.ZlsxRefusal) as info:
+        zlsx.anchors(path)
+    assert info.value.error_name == "MalformedDrawingXml"
+    with zlsx.edit(path) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.insert_row(0, 1)
+        assert info.value.error_name == "MalformedDrawingXml"
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.delete_column(0, 0)
+        assert info.value.error_name == "MalformedDrawingXml"
+        # Pre-mutation: a rename, which runs no drawing sweep, still lands.
+        ed.rename_sheet(0, "Facts")
+        ed.save(tmp_path / "renamed.xlsx")
+
+
+def test_anchors_default_namespace_drawing_is_the_prefixed_one_on_every_kind(tmp_path):
+    """Report's drawing in openpyxl's default-namespace spelling beside
+    Data's ``xdr:`` one: the records are the prefixed fixture's, every
+    anchor kind (two-cell image, absolute image, one-cell chart); a row
+    insert on Report moves its cell-anchored image AND chart and leaves
+    the absolute one; a comment naming an anchor is text — the walk's
+    comment / CDATA / PI awareness holds under the bare ``<`` opener
+    (in-house ND-REL-101: a trailing comment used to refuse the read
+    and a commented decoy to serve a phantom record)."""
+    _require_anchors()
+    _require_structural()
+    src = tmp_path / "anchors_default_ns.xlsx"
+    _anchors_workbook(src, default_namespace=True)
+    assert zlsx.anchors(src) == _ANCHORS_EXPECTED
+    with zlsx.edit(src) as ed:
+        ed.insert_row(1, 1)
+        moved = ed.anchors()
+    assert moved[1]["from"] == {"row": 4, "col": 2, "row_off": 0, "col_off": 9525}
+    assert moved[1]["to"] == {"row": 9, "col": 5, "row_off": 19050, "col_off": 0}
+    assert moved[2]["absolute"] == _ANCHORS_EXPECTED[2]["absolute"]
+    assert moved[3]["from"] == {"row": 3, "col": 6, "row_off": 0, "col_off": 0}
+    # A decoy in a comment before the anchors and a comment after them.
+    decoyed = tmp_path / "anchors_default_ns_comment.xlsx"
+    _patched_copy(
+        src,
+        decoyed,
+        "xl/drawings/drawing1.xml",
+        b"<oneCellAnchor>",
+        b"<!-- restore the <oneCellAnchor><from><row>99</row></from> --><oneCellAnchor>",
+    )
+    trailing = tmp_path / "anchors_default_ns_trailing.xlsx"
+    _patched_copy(decoyed, trailing, "xl/drawings/drawing1.xml", b"</wsDr>", b"<!-- TODO: a second <oneCellAnchor> goes here --></wsDr>")
+    assert zlsx.anchors(trailing) == _ANCHORS_EXPECTED
 
 
 def _require_sheet_props():

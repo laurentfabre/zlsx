@@ -1847,10 +1847,20 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *   with their precise names, the worksheet transform's own verdicts
  *     (RowEditExceedsMaxRow, ColEditExceedsMaxCol, SplitPaneNotSupported,
  *     MalformedPaneSplit, MalformedSheetXml) and a carrier a sweep cannot
- *     read, materialise or move (MalformedDrawingXml, MalformedVmlDrawing,
+ *     read, materialise or move (MalformedDrawingXml — a drawing part
+ *     the archive cannot decompress, a sheet drawing reference the
+ *     strict anchors read cannot follow (malformed, duplicate, dangling,
+ *     absent), one binding the spreadsheetDrawing namespace under a name
+ *     the anchor walk cannot spell, a DTD, a `<` inside an attribute
+ *     value (not well-formed XML), or an anchor it cannot read whole (no
+ *     close, a corner absent or unparseable, two corner blocks that
+ *     overlap): the strict read's verdicts on the anchors both walk,
+ *     refused before the first mutation —
+ *     MalformedVmlDrawing,
  *     MalformedCommentsXml, MalformedTableXml, MalformedExtensionXml,
  *     MalformedChartXml — an <xm:f> extension or chart <c:f> series
- *     carrier the sweep cannot read whole, refused before the first
+ *     carrier the sweep cannot read whole, or a chart part carrying a
+ *     DTD or a `<` inside an attribute value, refused before the first
  *     mutation — the *CoordinateOverflow
  *     trio, PivotEditUnsafe, SqrefCollapseUnsafe — a delete collapsing
  *     EVERY area of a DV/CF sqref, which Excel resolves by deleting the
@@ -2008,12 +2018,19 @@ int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
  * renaming `sheet`, a chart's series_refs respelled by the chart <c:f>
  * sweep — the new sheet name after a rename, shifted rows after an
  * insert on the sheet they name) are visible immediately; staged cell
- * writes never touch a drawing. A workbook without
+ * writes never touch a drawing. Drawings are walked under every prefix
+ * bound to the spreadsheetDrawing namespace — the canonical xdr:, any
+ * other, and the DEFAULT namespace (openpyxl's `<wsDr xmlns="…">
+ * <oneCellAnchor>` spelling) — the same resolution the row / column
+ * sweep moves anchors under. A workbook without
  * anchored objects is ZLSX_OK with (*out, *out_len) = (NULL, 0). An
  * inventory that cannot be served faithfully refuses whole — a sheet
  * list the strict workbook read cannot prove (MalformedWorkbookXml),
- * a drawing graph the strict walk cannot read whole
- * (MalformedDrawingXml), or an anchor on a worksheet part the workbook
+ * a drawing graph the strict walk cannot read whole — a
+ * spreadsheetDrawing binding under a name it cannot spell, a part
+ * carrying a <!DOCTYPE or a `<` inside an attribute value included —
+ * (MalformedDrawingXml), or an anchor
+ * on a worksheet part the workbook
  * does not list (DrawingOnUnlistedSheet), all ZLSX_REFUSED — rather
  * than hand over a record that lies or a list with a hole. (An
  * archive past the decompression caps fails at open.) Release with
