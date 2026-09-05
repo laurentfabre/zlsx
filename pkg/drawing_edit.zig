@@ -265,7 +265,8 @@ fn processAnchor(
     // The corners are read by the read's parser — a block absent or a
     // scalar that does not parse is the strict read's refusal, and the
     // sweep's: it cannot move what it cannot read.
-    const from = drawings.parseCornerIn(block, sets, .from) orelse return Error.MalformedDrawingXml;
+    const content_start = a.after_open - a.open_start;
+    const from = drawings.parseCornerIn(block, content_start, sets, .from) orelse return Error.MalformedDrawingXml;
     const from_value = axisValue(from.anchor, axis);
 
     if (a.kind == .one_cell) {
@@ -277,7 +278,7 @@ fn processAnchor(
         return;
     }
 
-    const to = drawings.parseCornerIn(block, sets, .to) orelse return Error.MalformedDrawingXml;
+    const to = drawings.parseCornerIn(block, content_start, sets, .to) orelse return Error.MalformedDrawingXml;
     const to_value = axisValue(to.anchor, axis);
     // Drop-on-collapse: delete that wipes both corners' value on
     // the edited axis.
@@ -290,7 +291,7 @@ fn processAnchor(
     // in-house ND-REL-102). Two blocks that overlap are not two
     // corners.
     const ordered = if (from.open_start <= to.open_start) [_]Splice{ from_splice, to_splice } else [_]Splice{ to_splice, from_splice };
-    if (ordered[1].corner.open_start < ordered[0].corner.after_close) return Error.MalformedDrawingXml;
+    if (drawings.cornersOverlap(from, to)) return Error.MalformedDrawingXml;
     try emitAnchor(allocator, out, block, &ordered, axis);
 }
 
@@ -891,6 +892,28 @@ test "what the sweep cannot move it refuses — MalformedDrawingXml, the strict 
         defer a.free(col);
         try testing.expect(std.mem.indexOf(u8, col, "<xdr:row> 4 </xdr:row>") != null);
         try testing.expect(std.mem.indexOf(u8, col, "<xdr:col>2</xdr:col>") != null);
+    }
+    // A close spelled inside the wrapper's attribute value is not the
+    // close (the read's rule too — ND-REL-302); a digit separator is
+    // not a digit (`1_0` is not 10 — ND-REL-306).
+    {
+        const attr_close = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"</xdr:oneCellAnchor>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(attr_close);
+        const moved = try applyEditToDrawing(a, attr_close, .row, 0, .insert);
+        defer a.free(moved);
+        try testing.expect(std.mem.indexOf(u8, moved, "editAs=\"</xdr:oneCellAnchor>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row>") != null);
+        // A corner spelled inside the attribute value is not the corner:
+        // the real one moves.
+        const attr_corner = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"<xdr:from><xdr:col>7</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>99</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(attr_corner);
+        const moved2 = try applyEditToDrawing(a, attr_corner, .row, 0, .insert);
+        defer a.free(moved2);
+        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>99</xdr:row>") != null);
+        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>5</xdr:row>") != null);
+        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>100</xdr:row>") == null);
+        const sep = try wrapDrawing(a, "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1_0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(sep);
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, sep, .row, 0, .insert));
     }
     // A `/>` inside an attribute value does not make the wrapper
     // self-closing (in-house ND-REL-202).

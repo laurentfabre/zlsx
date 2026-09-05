@@ -2024,9 +2024,10 @@ int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
  * anchored objects is ZLSX_OK with (*out, *out_len) = (NULL, 0). An
  * inventory that cannot be served faithfully refuses whole — a sheet
  * list the strict workbook read cannot prove (MalformedWorkbookXml),
- * a drawing graph the strict walk cannot read whole, a
- * spreadsheetDrawing binding under a name it cannot spell included
- * (MalformedDrawingXml), or an anchor on a worksheet part the workbook
+ * a drawing graph the strict walk cannot read whole — a
+ * spreadsheetDrawing binding under a name it cannot spell and a part
+ * carrying a <!DOCTYPE included — (MalformedDrawingXml), or an anchor
+ * on a worksheet part the workbook
  * does not list (DrawingOnUnlistedSheet), all ZLSX_REFUSED — rather
  * than hand over a record that lies or a list with a hole. (An
  * archive past the decompression caps fails at open.) Release with

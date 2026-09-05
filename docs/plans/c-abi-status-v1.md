@@ -806,11 +806,14 @@ through the read's own parser (`drawings.parseCornerIn`), so on the
 anchors both walk the two judge a drawing the same way: a wrapper and
 its children may mix two followed spellings (`<xdr:twoCellAnchor><from>`),
 comment / CDATA / PI / DTD text is never an anchor under either
-spelling (a live `<!DOCTYPE` refuses both), XSD-collapsed whitespace
-around a scalar parses for both, and what the sweep cannot move — a
-wrapper with no close, a corner block absent or with a scalar that
-does not parse, two blocks that overlap — is the same
-`MalformedDrawingXml` the strict read raises. The walks differ only
+spelling (a live `<!DOCTYPE` refuses both — and the strict chart walk,
+so the chart sweep's preflight refuses a chart part carrying one,
+`MalformedChartXml`), a wrapper's own attribute values are neither its
+close nor its corners, XSD-collapsed whitespace around a scalar parses
+for both (digits only otherwise — `1_0` is not 10), and what the sweep
+cannot move — a wrapper with no close, a corner block absent or with a
+scalar that does not parse, two blocks that overlap (a `<to>` nested in
+`<from>`) — is the same `MalformedDrawingXml` the strict read raises. The walks differ only
 where their jobs do: the sweep reads the corners of a shape the read
 never lists, the read validates a one-cell anchor's `<ext>` the sweep
 does not move, a reversed `<to>` / `<from>` pair is listed and moved

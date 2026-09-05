@@ -9595,33 +9595,6 @@ fn findWorksheetLegacyDrawingRid(sheet_xml: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Find the value of `r:id` on the worksheet's CT_Worksheet
-/// `<drawing>` element (always self-closing, at most one per
-/// sheet). Disambiguates from `<legacyDrawing>` and namespace-
-/// prefixed siblings. Returns null when absent.
-fn findWorksheetDrawingRid(sheet_xml: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < sheet_xml.len) {
-        const lt = std.mem.indexOfScalarPos(u8, sheet_xml, i, '<') orelse return null;
-        const need = "<drawing".len;
-        // `>=`: when sheet_xml ends exactly at `<drawing` we'd
-        // otherwise read one byte past the slice. Found by Codex
-        // review (REL-601 P2).
-        if (lt + need >= sheet_xml.len) return null;
-        if (std.mem.eql(u8, sheet_xml[lt .. lt + need], "<drawing")) {
-            const after_byte = sheet_xml[lt + need];
-            if (after_byte == ' ' or after_byte == '\t' or after_byte == '\r' or
-                after_byte == '\n' or after_byte == '/' or after_byte == '>')
-            {
-                const tag_end = std.mem.indexOfScalarPos(u8, sheet_xml, lt, '>') orelse return null;
-                return findAttrValue(sheet_xml[lt .. tag_end + 1], "r:id");
-            }
-        }
-        i = lt + 1;
-    }
-    return null;
-}
-
 /// Look up the `target` of a Relationship by `id`. Returns null
 /// if no relationship matches.
 fn relTargetForId(rels: []const store_mod.Relationship, id: []const u8) ?[]const u8 {

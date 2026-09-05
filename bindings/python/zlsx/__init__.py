@@ -4087,8 +4087,9 @@ class Editor:
         :class:`ZlsxRefusal` (``MalformedWorkbookXml`` for a sheet list
         the strict workbook read cannot prove, ``MalformedDrawingXml``
         for a drawing graph the strict walk cannot read whole — a
-        spreadsheetDrawing binding under a name it cannot spell
-        included — ``DrawingOnUnlistedSheet`` for an anchor on a
+        spreadsheetDrawing binding under a name it cannot spell and a
+        part carrying a ``<!DOCTYPE`` included — ``DrawingOnUnlistedSheet``
+        for an anchor on a
         worksheet part the workbook does not list) rather than return a
         record that lies or a list with a hole. An archive past the
         decompression caps fails at open."""
