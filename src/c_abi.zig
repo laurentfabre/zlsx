@@ -6123,6 +6123,11 @@ const structural_refusals = [_]anyerror{
     // path ever surface them unfolded.
     error.LastSheetUndeletable,
     error.SheetNameInUse,
+    // S3c slice 1: the embedding write's one limit — a part past the
+    // 512 MiB read cap, refused rather than writing a workbook zlsx
+    // could not reopen (§2's rule: limits are Plane-2 refusals at
+    // every layer, the `FormulaLimitExceeded` precedent).
+    error.EmbeddingExceedsArchiveLimit,
     // NOT here, deliberately: `error.ZipBombSuspected`. The S1 caps
     // admit every entry on the open-time directory walk, so the
     // verdict fires where the ABI has no diag to carry it — the
@@ -10403,4 +10408,760 @@ test "namespace-aware drawings: the default-namespace fixture hands over the pre
     try std.testing.expect(std.mem.indexOf(u8, moved, "\"absolute\":{\"x\":1000,\"y\":2000,\"cx\":914400,\"cy\":457200}") != null);
     try std.testing.expect(std.mem.indexOf(u8, moved, "\"anchor\":\"one_cell\",\"from\":{\"row\":3,\"col\":6,") != null);
     zlsx_buffer_release(out_ptr, out_len);
+}
+
+// ─── S3c slice 1: the embedding write (zlsx_status_v1) ────────────────
+//
+// `Workbook.setEmbeddings` crosses the boundary on the editor handle:
+// one call writes the whole coverage set — the index, a vec / hashes
+// part per coverage, the workbook→index relationship, the recovery
+// record in its two invisible carriers — and replaces any previous
+// set, the Zig surface's contract. Vectors cross as the f32
+// `[rows][dim]` matrix `zlsx_emb_vectors` hands back and hashes as the
+// u64 per-row list `zlsx_emb_hashes` hands back, so read → re-embed →
+// write is symmetric on one shape; the on-disk encoding (int8-sym's
+// per-row scale + codes) is `embedding_part.encodeVectorRecord`, the
+// one encoder `zlsx embed --vectors` writes through.
+
+/// `zlsx_emb_coverage_v1` (§18). An array element — no `struct_size`
+/// (the `zlsx_formula_cell_v1` precedent); the v1 layout is frozen at
+/// 88 bytes.
+const CEmbCoverage = extern struct {
+    id: ?[*]const u8,
+    id_len: usize,
+    range: ?[*]const u8,
+    range_len: usize,
+    column: ?[*]const u8,
+    column_len: usize,
+    /// `rows * dim` f32, row-major, range order.
+    vectors: ?[*]const f32,
+    vectors_len: usize,
+    /// `rows` u64; `zlsx_emb_tombstone()` marks a row with no vector.
+    hashes: ?[*]const u64,
+    hashes_len: usize,
+    /// 0-based, the `zlsx_editor_*` convention.
+    sheet_idx: u32,
+    /// 0 or 1.
+    include_formulas: u32,
+};
+
+comptime {
+    const assert = std.debug.assert;
+    assert(@offsetOf(CEmbCoverage, "id") == 0);
+    assert(@offsetOf(CEmbCoverage, "id_len") == 8);
+    assert(@offsetOf(CEmbCoverage, "range") == 16);
+    assert(@offsetOf(CEmbCoverage, "range_len") == 24);
+    assert(@offsetOf(CEmbCoverage, "column") == 32);
+    assert(@offsetOf(CEmbCoverage, "column_len") == 40);
+    assert(@offsetOf(CEmbCoverage, "vectors") == 48);
+    assert(@offsetOf(CEmbCoverage, "vectors_len") == 56);
+    assert(@offsetOf(CEmbCoverage, "hashes") == 64);
+    assert(@offsetOf(CEmbCoverage, "hashes_len") == 72);
+    assert(@offsetOf(CEmbCoverage, "sheet_idx") == 80);
+    assert(@offsetOf(CEmbCoverage, "include_formulas") == 84);
+    assert(@sizeOf(CEmbCoverage) == 88);
+}
+
+/// `zlsx_editor_set_embeddings`'s flags word. v1 defines no bit, so 0
+/// is the only accepted value (a set bit is `InvalidInput`); reserved
+/// so `recovery_in_cells` can cross later without a second export.
+const emb_write_flags_known: u32 = 0;
+
+/// A `(ptr, len)` array at the boundary, `bytesArg`'s rule on a typed
+/// element: NULL with a non-zero length is `InvalidInput`; NULL with
+/// length 0 is the empty array.
+fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err_buf_len: usize) ?[]const T {
+    if (ptr) |p| return p[0..len];
+    if (len == 0) return &[_]T{};
+    writeError(err_buf, err_buf_len, "InvalidInput");
+    return null;
+}
+
+/// Write the workbook's embedding set — `Workbook.setEmbeddings` on
+/// the editor handle: `model` / `dim` / `dtype` and `coverages_len`
+/// coverages, each a sheet index, an A1 `range`, the `column` inside
+/// it, `rows * dim` f32 vectors and `rows` u64 hashes (rows being the
+/// range's row count; a row with no vector carries
+/// `zlsx_emb_tombstone()`). Replaces any previous set (a vanished
+/// coverage id's parts stay in the archive as orphans, the Zig
+/// contract). Staged in memory; `zlsx_editor_save` commits. `dtype`
+/// is spelled as `zlsx_emb_dtype` spells it — `"f32"` or
+/// `"int8-sym-per-vec"`; the three other names the read knows have
+/// no writer (`UnsupportedDtype`). `flags` is reserved and must be 0.
+///
+/// -1, a statement about the call, each before the first part write:
+/// `InvalidInput` (NULL handle, NULL bytes or arrays with a non-zero
+/// length, a set flag, `include_formulas` past 1),
+/// `InvalidEmbeddingInput` (no coverage, `dim == 0`, a `vectors_len`
+/// or `hashes_len` that disagrees with the range), `InvalidDtype`,
+/// `UnsupportedDtype`, `SheetIndexOutOfRange`, and the index's own
+/// rules — `InvalidCoverageId`, `InvalidRange` (the range, or a column
+/// outside it), `DuplicateCoverageId`, `CoverageOverlap`,
+/// `InvalidXmlByte` (a C0 control byte in the model). -2, a statement
+/// about the workbook: `MissingWorkbookRels` / `MalformedWorkbookRels`
+/// (the workbook→index relationship, or the docProps carrier's package
+/// relationship, has nowhere to land — checked before the first
+/// write), `IdSpaceExhausted` (the rels file's `rId` space, or an
+/// existing `docProps/custom.xml`'s `pid` space, already at
+/// `UINT32_MAX` — checked before the first write),
+/// `MissingRelationship` (the sheet's part is unreachable),
+/// `EmbeddingExceedsArchiveLimit` (a part past the 512 MiB read cap,
+/// sized here from the inputs before anything is read, OR a recovery
+/// record past its 16 × 200-byte ceiling — roughly eighty coverages,
+/// or a ~3 KB model — encoded before the first write), and the
+/// package's own `MissingContentTypes` / `MalformedContentTypes`, and
+/// `MalformedWorkbookXml` (an `xl/workbook.xml` the open admits but the
+/// strip of the previous record's chunk names cannot walk — a
+/// `<definedName` outside `<definedNames>` the scanner refuses; judged
+/// before the first write). A -2 or -3 that fires AFTER the first part
+/// write (an allocation failure, an index past the cap, a content
+/// types or docProps part the carriers cannot patch) leaves the
+/// staged part set partially replaced: discard the editor without
+/// saving. A save after this write re-emits the workbook's
+/// `<definedNames>` block: every existing name keeps `name`,
+/// `localSheetId` and `hidden` only — its other attributes (`comment`,
+/// `description`, `function`, `vbProcedure`, …) are dropped, as after
+/// any staged defined-name edit (pre-existing, recorded).
+/// The recalc transactions (`zlsx_editor_mark_recalc_on_load`
+/// + save, `zlsx_editor_save_with_recalc`, `zlsx_editor_recalculate`)
+/// rebuild their candidate from the archive as opened and do NOT
+/// carry this write — call them before it, or save and re-open (a
+/// recorded, pre-existing rule of the transaction's generation model).
+export fn zlsx_editor_set_embeddings(
+    ed: ?*Editor,
+    model: ?[*]const u8,
+    model_len: usize,
+    dim: u32,
+    dtype: ?[*]const u8,
+    dtype_len: usize,
+    coverages: ?[*]const CEmbCoverage,
+    coverages_len: usize,
+    flags: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (flags & ~emb_write_flags_known != 0) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    const model_s = bytesArg(model, model_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const dtype_s = bytesArg(dtype, dtype_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const covs = arrayArg(CEmbCoverage, coverages, coverages_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const dt = zlsx_pkg.embedding_part.Dtype.fromString(dtype_s) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    // The Zig write's own first checks, ahead of encoding a body for
+    // a call that cannot land (the Zig layer re-checks: one rule, two
+    // callers).
+    if (covs.len == 0 or dim == 0) {
+        writeError(err_buf, err_buf_len, "InvalidEmbeddingInput");
+        return ZLSX_ERROR;
+    }
+    const wb = &state.inner.workbook;
+    const inputs = gpa.alloc(zlsx_pkg.EmbeddingCoverageInput, covs.len) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    defer gpa.free(inputs);
+    var encoded: usize = 0;
+    defer {
+        for (inputs[0..encoded]) |in| gpa.free(in.vec_body);
+    }
+    for (covs, 0..) |c, i| {
+        if (c.include_formulas > 1) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return ZLSX_ERROR;
+        }
+        const id = bytesArg(c.id, c.id_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+        const range = bytesArg(c.range, c.range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+        const column = bytesArg(c.column, c.column_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+        const vectors = arrayArg(f32, c.vectors, c.vectors_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+        const hashes = arrayArg(u64, c.hashes, c.hashes_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+        const ws = wb.sheet(c.sheet_idx) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+        const target = ws.embeddingTarget() catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+        const parsed = zlsx_pkg.embedding_part.parseA1Range(range) catch |e| {
+            return failMapped(e, diag, err_buf, err_buf_len);
+        };
+        const rows: usize = parsed.rowCount();
+        // The call's own lengths first (-1), then the workbook's cap
+        // (-2): both O(1), nothing read (in-house r2 S3C-REL-202).
+        if (vectors.len != rows * @as(usize, dim) or hashes.len != rows) {
+            writeError(err_buf, err_buf_len, "InvalidEmbeddingInput");
+            return ZLSX_ERROR;
+        }
+        // The Zig write's own pass-1 part sizing, from the inputs alone
+        // and before anything is read or encoded — a coverage past the
+        // cap used to be encoded in full (a second 512 MiB+ allocation)
+        // to be refused (in-house r1 S3C-PERF-106). Checked arithmetic:
+        // an unrepresentable size is past the cap, never a trap
+        // (`recordBytes` itself multiplies in usize — 64-bit on every
+        // shipped target).
+        const cap = zlsx_pkg.embedding_part.PART_MAX_BYTES;
+        const vec_bytes = std.math.mul(usize, rows, dt.recordBytes(dim)) catch std.math.maxInt(usize);
+        if (vec_bytes > cap - zlsx_pkg.embedding_part.VEC_HEADER_BYTES or
+            rows * @sizeOf(u64) > cap - zlsx_pkg.embedding_part.HASH_HEADER_BYTES)
+        {
+            return failMapped(error.EmbeddingExceedsArchiveLimit, diag, err_buf, err_buf_len);
+        }
+        const body = zlsx_pkg.embedding_part.encodeVectorBody(gpa, dt, dim, vectors) catch |e| {
+            return failMapped(e, diag, err_buf, err_buf_len);
+        };
+        inputs[i] = .{
+            .id = id,
+            .worksheet_target = target,
+            .range = range,
+            .column = column,
+            .include_formulas = c.include_formulas == 1,
+            .vec_body = body,
+            .hashes = hashes,
+        };
+        encoded = i + 1;
+    }
+    wb.setEmbeddings(model_s, dim, dt, inputs) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    return ZLSX_OK;
+}
+
+// ── S3c slice 1 tests ─────────────────────────────────────────────────
+
+/// Two sheets — three text rows under a header on `Docs`, one row on
+/// `Second` — the workbook every S3c test embeds into.
+fn writeS3cFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = xlsx.Writer.init(alloc);
+    defer w.deinit();
+    var docs = try w.addSheet("Docs");
+    try docs.writeRow(&.{ .{ .string = "title" }, .{ .string = "body" } });
+    try docs.writeRow(&.{ .{ .string = "alpha" }, .{ .string = "first body" } });
+    try docs.writeRow(&.{ .{ .string = "beta" }, .{ .string = "second body" } });
+    try docs.writeRow(&.{ .{ .string = "gamma" }, .{ .string = "third body" } });
+    var second = try w.addSheet("Second");
+    try second.writeRow(&.{.{ .string = "two" }});
+    try w.save(io, path);
+    return path;
+}
+
+fn s3cCoverage(id: []const u8, sheet_idx: u32, range: []const u8, column: []const u8, vectors: []const f32, hashes: []const u64) CEmbCoverage {
+    return .{
+        .id = id.ptr,
+        .id_len = id.len,
+        .range = range.ptr,
+        .range_len = range.len,
+        .column = column.ptr,
+        .column_len = column.len,
+        .vectors = vectors.ptr,
+        .vectors_len = vectors.len,
+        .hashes = hashes.ptr,
+        .hashes_len = hashes.len,
+        .sheet_idx = sheet_idx,
+        .include_formulas = 0,
+    };
+}
+
+fn s3cSet(ed: ?*Editor, model: []const u8, dim: u32, dtype: []const u8, covs: []const CEmbCoverage, flags: u32, diag: ?*CDiag, err_buf: []u8) i32 {
+    return zlsx_editor_set_embeddings(ed, model.ptr, model.len, dim, dtype.ptr, dtype.len, covs.ptr, covs.len, flags, diag, err_buf.ptr, err_buf.len);
+}
+
+fn s3cEmbString(h: *Emb, comptime getter: anytype, args: anytype, buf: []u8) []const u8 {
+    const n = @call(.auto, getter, .{h} ++ args ++ .{ buf.ptr, buf.len });
+    return buf[0..@min(n, buf.len - 1)];
+}
+
+test "S3c set_embeddings: f32 coverages on two sheets cross the boundary, land in the file and read back through zlsx_emb_*" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c_src.xlsx");
+    defer alloc.free(path);
+    const out_path = try tt.path(alloc, io, "s3c_out.xlsx");
+    defer alloc.free(out_path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    // Docs!A2:A4 (dim 3) with the middle row tombstoned, Second!A1:A1.
+    const tomb = zlsx_emb_tombstone();
+    const title_vecs = [_]f32{ 0.5, -1.25, 2.0, 0, 0, 0, 3.5, 4.0, -0.75 };
+    const title_hashes = [_]u64{ 0x1111, tomb, 0x3333 };
+    const two_vecs = [_]f32{ 9, 8, 7 };
+    const two_hashes = [_]u64{0xABCD};
+    var covs = [_]CEmbCoverage{
+        s3cCoverage("title", 0, "A2:A4", "A", &title_vecs, &title_hashes),
+        s3cCoverage("second", 1, "A1:A1", "A", &two_vecs, &two_hashes),
+    };
+    covs[1].include_formulas = 1;
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "test-model/v1", 3, "f32", &covs, 0, &diag, &err_buf));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+    zlsx_diag_release(&diag);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+
+    // The read side, through the same boundary a binding uses.
+    const emb = zlsx_emb_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+    var sbuf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("test-model/v1", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    try std.testing.expectEqual(@as(u32, 3), zlsx_emb_dim(emb));
+    try std.testing.expectEqualStrings("f32", s3cEmbString(emb, zlsx_emb_dtype, .{}, &sbuf));
+    try std.testing.expectEqual(@as(usize, 2), zlsx_emb_coverage_count(emb));
+    try std.testing.expectEqualStrings("title", s3cEmbString(emb, zlsx_emb_coverage_id, .{@as(usize, 0)}, &sbuf));
+    try std.testing.expectEqualStrings("worksheets/sheet1.xml", s3cEmbString(emb, zlsx_emb_coverage_sheet, .{@as(usize, 0)}, &sbuf));
+    try std.testing.expectEqualStrings("A2:A4", s3cEmbString(emb, zlsx_emb_coverage_range, .{@as(usize, 0)}, &sbuf));
+    try std.testing.expectEqual(@as(u32, 3), zlsx_emb_coverage_rows(emb, 0));
+    try std.testing.expectEqualStrings("second", s3cEmbString(emb, zlsx_emb_coverage_id, .{@as(usize, 1)}, &sbuf));
+    try std.testing.expectEqualStrings("worksheets/sheet2.xml", s3cEmbString(emb, zlsx_emb_coverage_sheet, .{@as(usize, 1)}, &sbuf));
+    try std.testing.expectEqualStrings("A1:A1", s3cEmbString(emb, zlsx_emb_coverage_range, .{@as(usize, 1)}, &sbuf));
+    try std.testing.expectEqual(@as(u32, 1), zlsx_emb_coverage_rows(emb, 1));
+    var got_vecs: [9]f32 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_emb_vectors(emb, 0, &got_vecs, got_vecs.len));
+    try std.testing.expectEqualSlices(f32, &title_vecs, &got_vecs);
+    var got_hashes: [3]u64 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_emb_hashes(emb, 0, &got_hashes, got_hashes.len));
+    try std.testing.expectEqualSlices(u64, &title_hashes, &got_hashes);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_emb_vectors(emb, 1, got_vecs[0..3], 3));
+    try std.testing.expectEqualSlices(f32, &two_vecs, got_vecs[0..3]);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_emb_hashes(emb, 1, got_hashes[0..1], 1));
+    try std.testing.expectEqual(@as(u64, 0xABCD), got_hashes[0]);
+    try std.testing.expectEqual(@as(u64, 0), zlsx_emb_digest(emb));
+
+    // The Zig surface agrees on the fields the C read does not spell:
+    // the column and include_formulas per coverage, both carriers of
+    // the recovery record, ONE workbook→index relationship.
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, out_path);
+    defer wb.deinit();
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqualStrings("A", view.coverages[0].coverage.column);
+    try std.testing.expect(!view.coverages[0].coverage.include_formulas);
+    try std.testing.expect(view.coverages[1].coverage.include_formulas);
+    const rels = (try wb.store.part("xl/_rels/workbook.xml.rels")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels.bytes, zlsx_pkg.embedding_part.REL_TYPE_EMBEDDINGS));
+    try std.testing.expect((try wb.store.part("docProps/custom.xml")) != null);
+    const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, zlsx_pkg.recovery_record.NAME_PREFIX) != null);
+    // The cells are untouched: no hidden recovery sheet (flags = 0).
+    try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+}
+
+test "S3c set_embeddings: int8-sym quantizes in the library and reads back within one step of the per-row scale" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c_i8_src.xlsx");
+    defer alloc.free(path);
+    const out_path = try tt.path(alloc, io, "s3c_i8_out.xlsx");
+    defer alloc.free(out_path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    const vecs = [_]f32{ 1.0, -2.5, 0.25, 4.0, 0, 0, 0, 0, 100, -100, 50, 0.5 };
+    const hashes = [_]u64{ 1, 2, 3 };
+    const covs = [_]CEmbCoverage{s3cCoverage("q", 0, "A2:A4", "A", &vecs, &hashes)};
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m", 4, "int8-sym-per-vec", &covs, 0, &diag, &err_buf));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+
+    const emb = zlsx_emb_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+    var sbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("int8-sym-per-vec", s3cEmbString(emb, zlsx_emb_dtype, .{}, &sbuf));
+    var got: [12]f32 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_emb_vectors(emb, 0, &got, got.len));
+    for (vecs, got, 0..) |want, have, i| {
+        const row_max: f32 = switch (i / 4) {
+            0 => 4.0,
+            1 => 0.0,
+            else => 100.0,
+        };
+        try std.testing.expect(@abs(want - have) <= row_max / 127.0 + 1e-6);
+    }
+    // The part is the compact layout, not f32: 24-byte header + 3 × (4 + 4).
+    const vec_part = try savedPartBytes(alloc, io, out_path, "xl/zlsxEmbeddings/q/vec.bin");
+    defer alloc.free(vec_part);
+    try std.testing.expectEqual(@as(usize, 24 + 3 * 8), vec_part.len);
+}
+
+test "S3c set_embeddings: a second write replaces the set — in one editor and across a save" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c_re_src.xlsx");
+    defer alloc.free(path);
+    const mid_path = try tt.path(alloc, io, "s3c_re_mid.xlsx");
+    defer alloc.free(mid_path);
+    const out_path = try tt.path(alloc, io, "s3c_re_out.xlsx");
+    defer alloc.free(out_path);
+
+    var err_buf: [128]u8 = undefined;
+    const v3 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const h3 = [_]u64{ 1, 2, 3 };
+    const v1 = [_]f32{ 1, 2, 3 };
+    const h1 = [_]u64{7};
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        const first = [_]CEmbCoverage{
+            s3cCoverage("title", 0, "A2:A4", "A", &v3, &h3),
+            s3cCoverage("body", 0, "B2:B4", "B", &v3, &h3),
+        };
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &first, 0, null, &err_buf));
+        // Replaced before the save: the set is what the LAST call said.
+        const second = [_]CEmbCoverage{s3cCoverage("body", 0, "B2:B2", "B", &v1, &h1)};
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m2", 3, "f32", &second, 0, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, mid_path.ptr, mid_path.len, &err_buf, err_buf.len));
+    }
+    {
+        const emb = zlsx_emb_open(mid_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+        var sbuf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("m2", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+        try std.testing.expectEqual(@as(usize, 1), zlsx_emb_coverage_count(emb));
+        try std.testing.expectEqualStrings("body", s3cEmbString(emb, zlsx_emb_coverage_id, .{@as(usize, 0)}, &sbuf));
+        try std.testing.expectEqual(@as(u32, 1), zlsx_emb_coverage_rows(emb, 0));
+    }
+    // A fresh editor on the saved file re-embeds: the relationship and
+    // the recovery record are replaced, never duplicated.
+    {
+        const ed = zlsx_editor_open(mid_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        const third = [_]CEmbCoverage{s3cCoverage("title", 1, "A1:A1", "A", &v1, &h1)};
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m3", 3, "f32", &third, 0, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+    }
+    const emb = zlsx_emb_open(out_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+    var sbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("m3", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    try std.testing.expectEqual(@as(usize, 1), zlsx_emb_coverage_count(emb));
+    try std.testing.expectEqualStrings("worksheets/sheet2.xml", s3cEmbString(emb, zlsx_emb_coverage_sheet, .{@as(usize, 0)}, &sbuf));
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, out_path);
+    defer wb.deinit();
+    const rels = (try wb.store.part("xl/_rels/workbook.xml.rels")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels.bytes, zlsx_pkg.embedding_part.REL_TYPE_EMBEDDINGS));
+    const custom = (try wb.store.part("docProps/custom.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom.bytes, zlsx_pkg.recovery_record.DOC_PROP_NAME));
+    // The primary carrier too: ONE `_zlsxRecovery0`, the last
+    // generation's (a re-embed across a save used to splice the saved
+    // chunk back beside the new one — in-house r1 S3C-REL-101 /
+    // S3C-TEST-107).
+    const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"_zlsxRecovery0\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, zlsx_pkg.recovery_record.NAME_PREFIX));
+    try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "|m3|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "|m2|") == null);
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqual(@as(usize, 1), view.coverages.len);
+}
+
+test "S3c set_embeddings refusals that used to fire after the parts: the package rels file, the record ceiling and the part cap, each before the first write" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const v3 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const h3 = [_]u64{ 1, 2, 3 };
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A4", "A", &v3, &h3)};
+
+    // `_rels/.rels` without its close tag: the docProps carrier's
+    // package relationship has nowhere to land.
+    {
+        const path = try writeS3cFixture(io, &tt, "s3c_pkgrels.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "_rels/.rels", "</Relationships>", "");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedWorkbookRels", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+    // Beside a saved record, a `<definedName` with an unterminated quote
+    // outside the `<definedNames>` block — a part the open admits, since
+    // the view bounds the element inside the block only — is the strip's
+    // to refuse. Its verdict used to cross from the install as the
+    // scanner's own `MalformedXml`, a -1 AFTER every part, the index and
+    // the relationship (in-house r5 S3C-REL-501); now the workbook's
+    // refusal, before the first write.
+    {
+        const src_path = try writeS3cFixture(io, &tt, "s3c_strip_src.xlsx");
+        defer alloc.free(src_path);
+        const path = try tt.path(alloc, io, "s3c_strip.xlsx");
+        defer alloc.free(path);
+        {
+            const ed = zlsx_editor_open(src_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+            defer zlsx_editor_close(ed);
+            try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &covs, 0, null, &err_buf));
+            try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, path.ptr, path.len, &err_buf, err_buf.len));
+        }
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", "</workbook>", "<definedName name=\"x>oops</definedName></workbook>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m9", 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+    // A rels file already at the last rId: the relationship has no id
+    // to take (used to trap or wrap in pass 5, after every part).
+    {
+        const path = try writeS3cFixture(io, &tt, "s3c_rid.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/_rels/workbook.xml.rels", "</Relationships>", "<Relationship Id=\"rId4294967295\" Type=\"http://example.com/x\" Target=\"x.bin\"/></Relationships>");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("IdSpaceExhausted", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+    // A ~3 KB model: the recovery record past its 16-chunk ceiling.
+    {
+        const path = try writeS3cFixture(io, &tt, "s3c_record.xlsx");
+        defer alloc.free(path);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        const long_model = [_]u8{'m'} ** 3300;
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, &long_model, 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("EmbeddingExceedsArchiveLimit", diagName(&diag));
+        try std.testing.expectEqualStrings("EmbeddingExceedsArchiveLimit", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        // A coverage past the part cap, refused from the inputs before
+        // any vector byte is read: a one-row, 2^27-wide f32 record is
+        // 512 MiB + the header. The buffer behind the claimed length is
+        // never dereferenced.
+        var wide = s3cCoverage("wide", 0, "A2:A2", "A", &v3, h3[0..1]);
+        wide.vectors_len = 1 << 27;
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 1 << 27, "f32", &.{wide}, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("EmbeddingExceedsArchiveLimit", diagName(&diag));
+        // Every row of the grid times a 2^20-wide record: checked
+        // arithmetic, refused, never a trap.
+        var huge = s3cCoverage("huge", 0, "A1:A1048576", "A", &v3, &h3);
+        huge.vectors_len = 1 << 40;
+        huge.hashes_len = 1 << 20;
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 1 << 20, "f32", &.{huge}, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("EmbeddingExceedsArchiveLimit", diagName(&diag));
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        const src_bytes = try readFileBytes(io, path);
+        defer alloc.free(src_bytes);
+        try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    }
+}
+
+test "S3c set_embeddings contract violations: -1 with the name in errbuf, the diag left as prep left it, nothing written" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c_bad.xlsx");
+    defer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    const v3 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const h3 = [_]u64{ 1, 2, 3 };
+    const ok_cov = s3cCoverage("title", 0, "A2:A4", "A", &v3, &h3);
+    const Case = struct { name: []const u8, model: []const u8 = "m", dim: u32 = 3, dtype: []const u8 = "f32", covs: []const CEmbCoverage, flags: u32 = 0, ed: bool = true };
+    var bad_len = ok_cov;
+    bad_len.vectors_len = 8;
+    var bad_hlen = ok_cov;
+    bad_hlen.hashes_len = 2;
+    var null_vec = ok_cov;
+    null_vec.vectors = null;
+    var null_hash = ok_cov;
+    null_hash.hashes = null;
+    var null_id = ok_cov;
+    null_id.id = null;
+    var null_range = ok_cov;
+    null_range.range = null;
+    var null_col = ok_cov;
+    null_col.column = null;
+    var formulas2 = ok_cov;
+    formulas2.include_formulas = 2;
+    const cases = [_]Case{
+        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .ed = false },
+        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 1 },
+        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 0x8000_0000 },
+        .{ .name = "InvalidInput", .covs = &.{formulas2} },
+        .{ .name = "InvalidInput", .covs = &.{null_vec} },
+        .{ .name = "InvalidInput", .covs = &.{null_hash} },
+        .{ .name = "InvalidInput", .covs = &.{null_id} },
+        .{ .name = "InvalidInput", .covs = &.{null_range} },
+        .{ .name = "InvalidInput", .covs = &.{null_col} },
+        .{ .name = "InvalidEmbeddingInput", .covs = &.{} },
+        .{ .name = "InvalidEmbeddingInput", .covs = &.{ok_cov}, .dim = 0 },
+        .{ .name = "InvalidEmbeddingInput", .covs = &.{ok_cov}, .dim = 4 },
+        .{ .name = "InvalidEmbeddingInput", .covs = &.{bad_len} },
+        .{ .name = "InvalidEmbeddingInput", .covs = &.{bad_hlen} },
+        .{ .name = "InvalidDtype", .covs = &.{ok_cov}, .dtype = "float32" },
+        .{ .name = "InvalidDtype", .covs = &.{ok_cov}, .dtype = "" },
+        .{ .name = "UnsupportedDtype", .covs = &.{ok_cov}, .dtype = "binary16" },
+        .{ .name = "UnsupportedDtype", .covs = &.{ok_cov}, .dtype = "bfloat16" },
+        .{ .name = "UnsupportedDtype", .covs = &.{ok_cov}, .dtype = "int8-asym-per-vec" },
+        .{ .name = "SheetIndexOutOfRange", .covs = &.{s3cCoverage("title", 2, "A2:A4", "A", &v3, &h3)} },
+        .{ .name = "SheetIndexOutOfRange", .covs = &.{s3cCoverage("title", std.math.maxInt(u32), "A2:A4", "A", &v3, &h3)} },
+        .{ .name = "InvalidRange", .covs = &.{s3cCoverage("title", 0, "A0:A2", "A", &v3, &h3)} },
+        .{ .name = "InvalidRange", .covs = &.{s3cCoverage("title", 0, "A2:A4", "Z", &v3, &h3)} },
+        .{ .name = "InvalidRange", .covs = &.{s3cCoverage("title", 0, "A2:A4", "", &v3, &h3)} },
+        .{ .name = "InvalidCoverageId", .covs = &.{s3cCoverage("bad id", 0, "A2:A4", "A", &v3, &h3)} },
+        .{ .name = "InvalidCoverageId", .covs = &.{s3cCoverage("", 0, "A2:A4", "A", &v3, &h3)} },
+        .{ .name = "DuplicateCoverageId", .covs = &.{ ok_cov, s3cCoverage("title", 0, "B2:B4", "B", &v3, &h3) } },
+        .{ .name = "CoverageOverlap", .covs = &.{ ok_cov, s3cCoverage("other", 0, "A3:A5", "A", &v3, &h3) } },
+        .{ .name = "InvalidXmlByte", .covs = &.{ok_cov}, .model = "m\x00" },
+        .{ .name = "InvalidXmlByte", .covs = &.{ok_cov}, .model = "\x1fm" },
+    };
+    for (cases) |case| {
+        var diag = freshDiag();
+        @memset(&err_buf, 0xAA);
+        const rc = s3cSet(if (case.ed) ed else null, case.model, case.dim, case.dtype, case.covs, case.flags, &diag, &err_buf);
+        try std.testing.expectEqual(ZLSX_ERROR, rc);
+        try std.testing.expectEqualStrings(case.name, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        try std.testing.expectEqual(plane_none, diag.plane);
+    }
+    // NULL bytes with a non-zero length, on the two scalar strings.
+    {
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_set_embeddings(ed, null, 1, 3, "f32", 3, &.{ok_cov}, 1, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_set_embeddings(ed, "m", 1, 3, null, 3, &.{ok_cov}, 1, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_set_embeddings(ed, "m", 1, 3, "f32", 3, null, 1, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        // NULL with length 0 is the empty string / array: judged by
+        // the write, never a boundary violation.
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_set_embeddings(ed, "m", 1, 3, "f32", 3, null, 0, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidEmbeddingInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_set_embeddings(ed, "m", 1, 3, null, 0, &.{ok_cov}, 1, 0, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidDtype", std.mem.sliceTo(&err_buf, 0));
+    }
+    // A diag below the v1 size: -1 StructSizeTooSmall, the diag byte-for-byte.
+    {
+        var small = freshDiag();
+        small.struct_size = @sizeOf(CDiag) - 1;
+        const before = std.mem.toBytes(small);
+        try std.testing.expectEqual(ZLSX_ERROR, s3cSet(ed, "m", 3, "f32", &.{ok_cov}, 0, &small, &err_buf));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqualSlices(u8, &before, &std.mem.toBytes(small));
+    }
+    // Nothing was written: the editor still saves the source bytes.
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+    defer zlsx_buffer_release(out_ptr, out_len);
+    const src_bytes = try readFileBytes(io, path);
+    defer alloc.free(src_bytes);
+    try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    // And the empty model is the write's to judge: it lands.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_embeddings(ed, null, 0, 3, "f32", 3, &.{ok_cov}, 1, 0, null, &err_buf, err_buf.len));
+}
+
+test "S3c set_embeddings refusals: a rels file the relationship cannot land in is -2 with the name in the diag, nothing written" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c_rels.xlsx");
+    defer alloc.free(path);
+    try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/_rels/workbook.xml.rels", "</Relationships>", "");
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    const v3 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const h3 = [_]u64{ 1, 2, 3 };
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A4", "A", &v3, &h3)};
+    // Poisoned on entry: the refusal path itself must reset the pair.
+    var diag = freshDiag();
+    diag.plane = 3;
+    @memcpy(diag.error_name[0..5], "stale");
+    try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 3, "f32", &covs, 0, &diag, &err_buf));
+    try std.testing.expectEqualStrings("MalformedWorkbookRels", diagName(&diag));
+    try std.testing.expectEqualStrings("MalformedWorkbookRels", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    zlsx_diag_release(&diag);
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_to_buffer(ed, &out_ptr, &out_len, &err_buf, err_buf.len));
+    defer zlsx_buffer_release(out_ptr, out_len);
+    const src_bytes = try readFileBytes(io, path);
+    defer alloc.free(src_bytes);
+    try std.testing.expectEqualSlices(u8, src_bytes, out_ptr.?[0..out_len]);
+    // The vocabulary is pinned on the mapping itself, refusals and
+    // call errors alike.
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingWorkbookRels));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.EmbeddingExceedsArchiveLimit));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MissingRelationship));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidEmbeddingInput));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidDtype));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.UnsupportedDtype));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidRange));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidCoverageId));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.DuplicateCoverageId));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.CoverageOverlap));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidXmlByte));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetIndexOutOfRange));
+}
+
+fn encodeVectorBodyForFailures(alloc: std.mem.Allocator) !void {
+    const vectors = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const body = try zlsx_pkg.embedding_part.encodeVectorBody(alloc, .int8_sym_per_vec, 3, &vectors);
+    alloc.free(body);
+}
+
+test "S3c set_embeddings: the body encoder's allocation failure is OutOfMemory, the boundary's -3" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeVectorBodyForFailures, .{});
+    try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
 }

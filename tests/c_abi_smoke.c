@@ -62,6 +62,9 @@
 #if !defined(ZLSX_HAS_ROWS_FORMULAS)
 #error "ZLSX_HAS_ROWS_FORMULAS missing"
 #endif
+#if !defined(ZLSX_HAS_EMBEDDING_WRITE)
+#error "ZLSX_HAS_EMBEDDING_WRITE missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -147,3 +150,17 @@ static const void *const s3b11_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3b11(void);
 const void *zlsx_c_abi_smoke_anchor_s3b11(void) { return s3b11_exports[0]; }
+
+/* S3c slice 1: the embedding write on the editor handle. The coverage
+ * descriptor is an array element with a frozen layout: pinned here on
+ * the C side as the Zig side pins it. */
+_Static_assert(sizeof(zlsx_emb_coverage_v1) == 88, "zlsx_emb_coverage_v1 is 88 bytes");
+_Static_assert(offsetof(zlsx_emb_coverage_v1, vectors) == 48, "vectors at 48");
+_Static_assert(offsetof(zlsx_emb_coverage_v1, hashes) == 64, "hashes at 64");
+_Static_assert(offsetof(zlsx_emb_coverage_v1, sheet_idx) == 80, "sheet_idx at 80");
+_Static_assert(offsetof(zlsx_emb_coverage_v1, include_formulas) == 84, "include_formulas at 84");
+static const void *const s3c1_exports[] = {
+    (const void *)&zlsx_editor_set_embeddings,
+};
+const void *zlsx_c_abi_smoke_anchor_s3c1(void);
+const void *zlsx_c_abi_smoke_anchor_s3c1(void) { return s3c1_exports[0]; }

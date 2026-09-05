@@ -36,7 +36,7 @@ import threading
 import time
 from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import _ffi
 
@@ -3579,6 +3579,145 @@ def _path_as_ubyte(pbytes):
     return ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)), buf
 
 
+def _numpy_of(x):
+    """NumPy, when ``x`` is one of its arrays (or anything exposing the
+    array interface); ``None`` otherwise — NumPy stays optional, and a
+    plain sequence never imports it."""
+    if hasattr(x, "__array_interface__") or hasattr(x, "__array_struct__"):
+        import numpy as np
+
+        return np
+    return None
+
+
+def _vector_buffer(name: str, vectors, dim: int, keep: list):
+    """``vectors`` as ``(pointer, count)`` for the descriptor, the buffer
+    parked in ``keep`` until the call returns. A NumPy array crosses
+    without a Python float in between: ``np.require(…, float32, ("C",
+    "A"))`` is the array itself when it already is contiguous and
+    aligned, else one typed copy (in-house r1 S3C-PERF-103 — ``tolist``
+    + a per-float loop cost +2 s / +400 MB on 20 000 × 384). Anything
+    else goes through :func:`_flatten_vectors`."""
+    np = _numpy_of(vectors)
+    if np is None:
+        flat = _flatten_vectors(name, vectors, dim)
+        buf = (ctypes.c_float * max(len(flat), 1))(*flat)
+        keep.append(buf)
+        return ctypes.cast(buf, ctypes.POINTER(ctypes.c_float)), len(flat)
+    # A masked slot is NumPy's spelling of "no value": it lands as 0,
+    # a tombstoned row's bytes (in-house r2 S3C-REL-202).
+    if np.ma.isMaskedArray(vectors):
+        vectors = np.ma.filled(vectors, 0)
+    arr = np.asarray(vectors)
+    if arr.dtype.kind not in "iuf":
+        raise TypeError(f"{name}: vector values must be numbers, not dtype {arr.dtype}")
+    if arr.ndim not in (1, 2):
+        raise ValueError(f"{name}: expected a 1-D or 2-D array, got shape {tuple(arr.shape)}")
+    if arr.ndim == 2 and dim and arr.shape[1] != dim:
+        raise ValueError(f"{name}: expected {dim} columns, got {arr.shape[1]}")
+    # C-contiguous AND aligned (`ascontiguousarray` hands a misaligned
+    # view back unchanged — in-house r2 S3C-REL-208); the array itself
+    # when it already is, one typed copy otherwise. Values narrow as
+    # they are: an overflow is `inf`, not a warning (S3C-DOC-204).
+    # The cast's own IEEE flags are nobody's business: an overflow is
+    # `inf`, an sNaN a NaN, a subnormal a subnormal — not a warning, not
+    # a `FloatingPointError` under a caller's `np.seterr` (r4 B-REL-402).
+    with np.errstate(all="ignore"):
+        contiguous = np.require(arr, dtype=np.float32, requirements=("C", "A"))
+    keep.append(contiguous)
+    return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(contiguous.size)
+
+
+def _hash_buffer(name: str, hashes, tomb: int, keep: list):
+    """``hashes`` as ``(pointer, count)``; a NumPy integer array crosses
+    as one contiguous ``uint64`` view or copy (a signed array is
+    range-checked first), an object array or any sequence through
+    :func:`_hash_values` (which maps ``None`` to the tombstone)."""
+    np = _numpy_of(hashes)
+    if np is not None:
+        if np.ma.isMaskedArray(hashes):
+            # A masked hash IS the tombstone: through the sequence path,
+            # where None spells it (in-house r2 S3C-REL-202) — after the
+            # plain path's shape and dtype rules, which the branch used
+            # to skip (in-house r3 S3C-REL-301).
+            data = np.ma.getdata(hashes)
+            if data.ndim != 1:
+                raise ValueError(f"{name}: expected a 1-D array, got shape {tuple(data.shape)}")
+            if data.dtype.kind not in "iuO":
+                raise TypeError(f"{name}: hashes must be integers or None, not dtype {data.dtype}")
+            mask = np.ma.getmaskarray(hashes).tolist()
+            hashes = [None if m else v for v, m in zip(data.tolist(), mask)]
+        else:
+            arr = np.asarray(hashes)
+            if arr.ndim != 1:
+                raise ValueError(f"{name}: expected a 1-D array, got shape {tuple(arr.shape)}")
+            if arr.dtype.kind in "iu":
+                if arr.dtype.kind == "i" and arr.size and int(arr.min()) < 0:
+                    raise ValueError(f"{name}: every hash must be in [0, 2**64)")
+                contiguous = np.require(arr, dtype=np.uint64, requirements=("C", "A"))
+                keep.append(contiguous)
+                return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)), int(contiguous.size)
+            if arr.dtype.kind != "O":
+                raise TypeError(f"{name}: hashes must be integers or None, not dtype {arr.dtype}")
+            hashes = arr.tolist()
+    values = _hash_values(name, hashes, tomb)
+    buf = (ctypes.c_uint64 * max(len(values), 1))(*values)
+    keep.append(buf)
+    return ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint64)), len(values)
+
+
+def _flatten_vectors(name: str, vectors, dim: int) -> list[float]:
+    """``vectors`` as one row-major float list: a sequence of rows or a
+    flat sequence of numbers (a NumPy array takes the zero-copy path in
+    :func:`_vector_buffer`). A ragged row, a wrong width or a bool is
+    refused here, where the message can name the coverage; the row
+    COUNT is the C side's to judge against the range
+    (``InvalidEmbeddingInput``)."""
+    import numbers
+
+    if isinstance(vectors, (str, bytes)):
+        raise TypeError(f"{name}: expected a sequence of numbers, not {type(vectors).__name__}")
+    items = list(vectors)
+    rows = items
+    if items and not isinstance(items[0], numbers.Real):
+        rows = []
+        for r, row in enumerate(items):
+            if isinstance(row, (str, bytes)):
+                raise TypeError(f"{name}: row {r} is not a sequence of numbers")
+            row_l = list(row)
+            # dim 0 is the C side's to refuse (InvalidEmbeddingInput),
+            # not a width to check rows against.
+            if dim and len(row_l) != dim:
+                raise ValueError(f"{name}: row {r} has {len(row_l)} values, expected {dim}")
+            rows.extend(row_l)
+    out: list[float] = []
+    for x in rows:
+        if isinstance(x, bool) or not isinstance(x, numbers.Real):
+            raise TypeError(f"{name}: vector values must be numbers, not {type(x).__name__}")
+        out.append(float(x))
+    return out
+
+
+def _hash_values(name: str, hashes, tomb: int) -> list[int]:
+    """``hashes`` as one uint64 per row; ``None`` is the tombstone."""
+    import operator
+
+    if isinstance(hashes, (str, bytes)):
+        raise TypeError(f"{name}: expected a sequence of ints, not {type(hashes).__name__}")
+    out: list[int] = []
+    for r, h in enumerate(hashes):
+        if h is None:
+            out.append(tomb)
+            continue
+        if isinstance(h, bool):
+            raise TypeError(f"{name}: row {r} must be an int or None, not bool")
+        v = operator.index(h)
+        if v < 0 or v > 0xFFFF_FFFF_FFFF_FFFF:
+            raise ValueError(f"{name}: row {r} must be in [0, 2**64), got {h!r}")
+        out.append(v)
+    return out
+
+
 class Editor:
     """Open an existing xlsx; append rows, set cells, insert / delete
     rows and columns, add / rename / delete sheets, rename table
@@ -4219,6 +4358,167 @@ class Editor:
             _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
+
+    _EMB_COVERAGE_KEYS = frozenset(
+        {"id", "sheet", "range", "column", "vectors", "hashes", "include_formulas"}
+    )
+
+    def set_embeddings(
+        self,
+        model: str,
+        dim: int,
+        coverages: Sequence[dict],
+        *,
+        dtype: str = "f32",
+    ) -> None:
+        """Write the workbook's embedding set — ``Workbook.setEmbeddings``
+        on the editor handle: the index, a vec / hashes part per
+        coverage, the workbook→index relationship and the recovery
+        record in its two invisible carriers (a hidden defined name and
+        ``docProps/custom.xml``). Replaces any previous set; staged in
+        memory, committed by :meth:`save` / :meth:`save_to_buffer`; read
+        back with :func:`embeddings` (``present``).
+
+        Each coverage is a dict::
+
+            {"id": "title",           # 1–63 of [A-Za-z0-9_-]
+             "sheet": 0,              # sheet index, 0-based
+             "range": "A2:A100",      # the covered rows, A1 form
+             "column": "A",           # the embedded column, inside the range
+             "vectors": rows_x_dim,   # float32: a NumPy array (2-D or flat),
+                                      #   a sequence of rows, or a flat sequence
+             "hashes": [...],         # one int in [0, 2**64) per row;
+                                      #   None = no vector (tombstone)
+             "include_formulas": False}   # optional
+
+        ``vectors`` is the ``(rows, dim)`` float32 matrix
+        :meth:`Embeddings.vectors` returns and ``hashes`` the per-row
+        content hashes :meth:`Embeddings.hashes` returns (``None`` is
+        the tombstone :meth:`Embeddings.valid_mask` reads), so
+        read → re-embed → write round-trips on one shape. A NumPy
+        array crosses as one contiguous, aligned float32 / uint64 buffer
+        (the array itself when it already is one, else a typed copy —
+        never a Python float per value); a sequence is converted value
+        by value. Values narrow to float32 as they are — a float64 past
+        its range lands as ``inf`` without a warning, and ``NaN``
+        quantizes to 0 under int8 — and ``2**64 - 1`` IS the tombstone,
+        written as such. A masked array's masked slots are "no value":
+        a masked hash is the tombstone, a masked vector value is 0.
+        ``dtype`` is ``"f32"`` or ``"int8-sym-per-vec"`` (quantized in
+        the library, one float32 scale per row); the other names
+        :attr:`Embeddings.dtype` can report have no writer
+        (``UnsupportedDtype``). The recovery record rides in a hidden
+        defined name and ``docProps/custom.xml``: the ``_zlsxRecoveryN``
+        names are staged with the plan and appear in
+        :meth:`defined_names` (hidden) only after a save; the record's
+        ceiling of 16 × 200 bytes bounds the set — roughly eighty
+        coverages at typical ids, or a ~3 KB model name
+        (``EmbeddingExceedsArchiveLimit``, before anything is written).
+
+        Statements about the call raise a plain :class:`ZlsxError`
+        named after the cause, each before the first part is written:
+        ``InvalidEmbeddingInput`` (no coverage, ``dim`` 0, a vector or
+        hash count that disagrees with the range), ``InvalidDtype`` /
+        ``UnsupportedDtype``, ``SheetIndexOutOfRange``,
+        ``InvalidCoverageId``, ``InvalidRange`` (the range, or a column
+        outside it), ``DuplicateCoverageId``, ``CoverageOverlap``,
+        ``InvalidXmlByte`` (a C0 control byte in ``model``). A workbook
+        the set cannot land in refuses with a :class:`ZlsxRefusal`
+        (``error_name``): ``MissingWorkbookRels`` /
+        ``MalformedWorkbookRels`` (no ``xl/_rels/workbook.xml.rels`` — or
+        no ``_rels/.rels`` close tag when ``docProps/custom.xml`` has to
+        be created — to register a relationship in; checked before the
+        first write), ``IdSpaceExhausted`` (a rels ``rId`` or custom
+        property ``pid`` space already at ``2**32 - 1``; checked before
+        the first write), ``MissingRelationship`` (a sheet whose part
+        the workbook does not reach), ``EmbeddingExceedsArchiveLimit``
+        (a part past the 512 MiB read cap — sized from the inputs before
+        a vector is read — or the recovery record past its ceiling),
+        ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the open admits
+        but the strip of the previous record's chunk names cannot walk;
+        judged before the first write). A refusal that fires after the
+        first part is written (an allocation failure, an index past the
+        cap, a content-types or docProps part the carriers cannot patch)
+        leaves the staged set partially replaced: close the editor
+        without saving. A save after this write re-emits the workbook's
+        ``<definedNames>`` block: every existing name keeps ``name``,
+        ``localSheetId`` and ``hidden`` only — its other attributes
+        (``comment``, ``description``, ``function``, ``vbProcedure``, …)
+        are dropped, as after any staged defined-name edit
+        (pre-existing, recorded). The recalc transactions —
+        :meth:`mark_recalc_on_load` then :meth:`save`,
+        :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
+        candidate from the archive as opened and do NOT carry this
+        write: call them before it, or save and re-open (a recorded,
+        pre-existing rule of the transaction's generation model). Shapes are checked here first
+        — a ``TypeError`` for a non-dict coverage, a non-string id /
+        range / column, a bool where a number belongs, a non-numeric
+        array; a ``ValueError`` for an unknown or missing key, a ragged
+        matrix, a hash outside ``[0, 2**64)`` — before ctypes could
+        truncate. Inherited from the Zig surface: the index read hands
+        the model name back raw, so one carrying ``&``, ``<`` or ``"``
+        reads back entity-escaped, and a tab, LF or CR in it reads back
+        as written here while a conforming XML parser normalizes them
+        to spaces (attribute values) — use plain spaces.
+
+        Requires libzlsx 0.9.0+ (``zlsx_editor_set_embeddings``).
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EMBEDDING_WRITE:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_set_embeddings "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        if not isinstance(model, str):
+            raise TypeError(f"model must be a str, not {type(model).__name__}")
+        if not isinstance(dtype, str):
+            raise TypeError(f"dtype must be a str, not {type(dtype).__name__}")
+        dim_v = self._u32("dim", dim)
+        if isinstance(coverages, (str, bytes, dict)):
+            raise TypeError("coverages must be a sequence of coverage dicts")
+        covs = list(coverages)
+        tomb = int(_ffi.lib.zlsx_emb_tombstone())
+        # Every buffer the descriptors point into lives in `keep` until
+        # the call returns; ctypes does not own what it points at.
+        keep: list = []
+        arr = (_ffi.EmbCoverageV1 * max(len(covs), 1))()
+        for i, c in enumerate(covs):
+            if not isinstance(c, dict):
+                raise TypeError(f"coverage {i} must be a dict, not {type(c).__name__}")
+            unknown = set(c) - self._EMB_COVERAGE_KEYS
+            if unknown:
+                raise ValueError(f"coverage {i}: unknown key(s) {sorted(unknown)}")
+            missing = (self._EMB_COVERAGE_KEYS - {"include_formulas"}) - set(c)
+            if missing:
+                raise ValueError(f"coverage {i}: missing key(s) {sorted(missing)}")
+            e = arr[i]
+            for key in ("id", "range", "column"):
+                val = c[key]
+                if not isinstance(val, str):
+                    raise TypeError(f"coverage {i}: {key} must be a str, not {type(val).__name__}")
+                raw = val.encode("utf-8")
+                buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
+                keep.append(buf)
+                setattr(e, key, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+                setattr(e, f"{key}_len", len(raw))
+            e.sheet_idx = self._u32(f"coverage {i}: sheet", c["sheet"])
+            inc = c.get("include_formulas", False)
+            if not isinstance(inc, bool):
+                raise TypeError(f"coverage {i}: include_formulas must be a bool")
+            e.include_formulas = 1 if inc else 0
+            e.vectors, e.vectors_len = _vector_buffer(f"coverage {i}: vectors", c["vectors"], dim_v, keep)
+            e.hashes, e.hashes_len = _hash_buffer(f"coverage {i}: hashes", c["hashes"], tomb, keep)
+        model_raw = model.encode("utf-8")
+        model_buf = (ctypes.c_ubyte * max(len(model_raw), 1)).from_buffer_copy(model_raw or b"\0")
+        dtype_raw = dtype.encode("utf-8")
+        dtype_buf = (ctypes.c_ubyte * max(len(dtype_raw), 1)).from_buffer_copy(dtype_raw or b"\0")
+        self._structural_call(
+            "zlsx_editor_set_embeddings", _ffi.lib.zlsx_editor_set_embeddings,
+            self._handle, model_buf, len(model_raw), dim_v,
+            dtype_buf, len(dtype_raw), arr, len(covs), 0,
+        )
+        del keep
 
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.

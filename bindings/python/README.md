@@ -363,6 +363,63 @@ the grid (a split pane is the one such an edit refuses,
 `full_calc_on_load` in place; staged cell writes never touch the
 extent, the views or `<calcPr>`.
 
+## Embeddings
+
+libzlsx 0.9.0+ writes the embedding set the E5 read surface reports:
+`Editor.set_embeddings` is `Workbook.setEmbeddings` on the editor handle —
+one call writes the index, a vector / hash part per coverage, the
+workbook→index relationship and the recovery record in its two invisible
+carriers, and replaces any previous set. The shape is the read side's, so
+read → re-embed → write round-trips on the same arrays:
+
+```python
+import numpy as np
+import zlsx
+
+vectors = np.asarray(embed(texts), dtype=np.float32)   # (rows, dim), your model's output
+with zlsx.edit("report.xlsx") as ed:
+    ed.set_embeddings("text-embedding-3-small", vectors.shape[1], [
+        {"id": "body", "sheet": 0, "range": "B2:B101", "column": "B",
+         "vectors": vectors,                    # a NumPy array, a list of rows, or flat
+         "hashes": hashes},                     # one uint64 per row; None = no vector (tombstone)
+    ], dtype="f32")                             # or "int8-sym-per-vec": quantized in the library
+    ed.save("report.xlsx")
+
+with zlsx.embeddings("report.xlsx") as emb:
+    assert emb.present
+    emb.vectors("body"), emb.hashes("body"), emb.valid_mask("body")
+```
+
+Statements about the call raise a plain `ZlsxError` named after the cause
+— `InvalidEmbeddingInput`, `InvalidDtype` / `UnsupportedDtype`,
+`SheetIndexOutOfRange`, `InvalidCoverageId`, `InvalidRange` (the range, or
+a column outside it), `DuplicateCoverageId`, `CoverageOverlap`,
+`InvalidXmlByte` (a control byte in the model name) — each before the
+first part is written; a workbook the set cannot land in refuses with a
+`ZlsxRefusal` (`MissingWorkbookRels` / `MalformedWorkbookRels`,
+`IdSpaceExhausted`, `MissingRelationship`, `EmbeddingExceedsArchiveLimit` — a part past the
+512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
+eighty coverages, or a ~3 KB model name — and `MalformedWorkbookXml`, an
+`xl/workbook.xml` the previous record's strip cannot walk; each judged before
+the first write, the index part's own cap excepted — it cannot fire, the
+record ceiling bounds the same fields). A NumPy array crosses as one
+contiguous float32 / uint64 buffer; values narrow to float32 as they are
+(a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
+and a masked array's masked slots are "no value". A refusal after the first
+part is written (an allocation failure, an index past the cap, a package
+part the carriers cannot patch) leaves the staged set partially replaced:
+close the editor without saving. A save after the write re-emits the
+workbook's `<definedNames>` block: every existing name keeps `name`,
+`localSheetId` and `hidden` only — its other attributes (`comment`,
+`description`, `function`, `vbProcedure`, …) are dropped, as after any staged
+defined-name edit (pre-existing, recorded). The recalc transactions
+(`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
+rebuild from the archive as opened and do not carry a staged embedding
+write — call them before it, or save and re-open. The per-row content
+hashes are the caller's to compute today (the embeddable-rows read is the
+next S3c slice); `recovery_in_cells` (the Numbers-durable carrier) is
+Zig-only until the editor grows a path for its hidden sheet.
+
 ## Spark (PySpark Data Source)
 
 Spark 4.0+ / DBR 15.4+ (including serverless). `pip install py-zlsx[spark]`
@@ -551,6 +608,10 @@ with zlsx.write("out.xlsx") as w:
   `formula` / `formula_ref` / `v` of `zlsx cells`); the row itself keeps the
   cached value and the literal string, so nothing that read before reads
   differently. A formula whose cached value is an error is a formula
+- Embeddings on write (0.9.0+): `Editor.set_embeddings(model, dim, coverages,
+  dtype=...)` — the vector set `zlsx.embeddings(path)` reads, on the same
+  `(rows, dim)` float32 / uint64 shape, replacing any previous set; see
+  *Embeddings*
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

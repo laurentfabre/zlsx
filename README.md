@@ -484,8 +484,8 @@ whole-archive budget, all checked against the central directory before
 anything is inflated — `error.ZipBombSuspected`, CLI exit 4; Zip64 / split /
 encrypted refused on the package and editor paths; the three numbers live in
 `pkg/control.zig`), control-byte rejection on every cell-text, sheet-name, comment,
-defined-name and hyperlink channel (a stray NUL never produces an unreadable
-workbook; embedding metadata is the one channel not yet checked — S3c), Unicode-aware sheet-name dedup (NFC +
+defined-name, hyperlink and embedding-metadata channel (a stray NUL never produces an
+unreadable workbook), Unicode-aware sheet-name dedup (NFC +
 casefold — `café`/`CAFÉ` collapse, cap is 31 scalars not bytes), and the
 `zlsx_pkg` OPC package layer for raw part access.
 

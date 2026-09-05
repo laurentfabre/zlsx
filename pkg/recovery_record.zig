@@ -61,6 +61,11 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+// The typed parser's scanner, for the ONE acceptance of what is not an
+// element (comment / CDATA / PI / DOCTYPE): the lexical reader below
+// must skip exactly what the parser and the strip skip. The module
+// imports nothing but std, so this leaf stays a leaf.
+const workbook_xml_mod = @import("typed_parts/workbook_xml.zig");
 
 pub const Error = error{
     MalformedRecord,
@@ -97,6 +102,31 @@ pub const MAX_CHUNKS: usize = 16;
 
 /// Custom document property name for the secondary carrier.
 pub const DOC_PROP_NAME: []const u8 = "ZlsxEmbeddingRecovery";
+
+/// Whether `name` is one of the record's chunk names: the exact
+/// `_zlsxRecovery<digits>` form, compared case-insensitively because a
+/// defined name's identity is (Excel folds case). A user's
+/// `_zlsxRecoveryMine` is NOT ours — the strip used to delete any name
+/// carrying the prefix, and a foreign tool's `_ZLSXRECOVERY0` used to
+/// survive beside ours (in-house r2 S3C-REL-203).
+pub fn isChunkName(name: []const u8) bool {
+    if (name.len <= NAME_PREFIX.len) return false;
+    if (!std.ascii.eqlIgnoreCase(name[0..NAME_PREFIX.len], NAME_PREFIX)) return false;
+    for (name[NAME_PREFIX.len..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "isChunkName: the exact chunk form, case-insensitive; a user's prefixed name is not ours" {
+    try testing.expect(isChunkName("_zlsxRecovery0"));
+    try testing.expect(isChunkName("_zlsxRecovery15"));
+    try testing.expect(isChunkName("_ZLSXRECOVERY0"));
+    try testing.expect(isChunkName("_ZlsxRecovery7"));
+    try testing.expect(!isChunkName("_zlsxRecovery"));
+    try testing.expect(!isChunkName("_zlsxRecoveryMine"));
+    try testing.expect(!isChunkName("_zlsxRecovery0x"));
+    try testing.expect(!isChunkName("zlsxRecovery0"));
+    try testing.expect(!isChunkName(""));
+}
 
 /// Sheet that carries the record when the cell carrier is enabled.
 ///
@@ -415,7 +445,25 @@ pub fn findDefinedNameValue(
     buf: []u8,
 ) ?[]const u8 {
     var search: usize = 0;
-    while (std.mem.indexOfPos(u8, workbook_xml, search, "<definedName")) |open| {
+    while (std.mem.indexOfScalarPos(u8, workbook_xml, search, '<')) |lt| {
+        // A `<definedName` inside a comment, a CDATA section, a
+        // processing instruction or a DOCTYPE is text, not an element:
+        // the construct is skipped whole, with the typed parser's own
+        // scanner, so this reader cannot see the part differently from
+        // the parser and the strip (a decoy chunk in a comment used to
+        // be read as the record — in-house r4 S3C-REL-401; the other
+        // constructs, r5 S3C-REL-502). An unterminated construct is not
+        // a part to read a record from.
+        const past = workbook_xml_mod.skipNonElement(workbook_xml, lt) catch return null;
+        if (past != lt) {
+            search = past;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, workbook_xml[lt..], "<definedName")) {
+            search = lt + 1;
+            continue;
+        }
+        const open = lt;
         const gt = std.mem.indexOfScalarPos(u8, workbook_xml, open, '>') orelse return null;
         const attrs = workbook_xml[open..gt];
         search = gt + 1;
@@ -740,4 +788,35 @@ test "cell carrier is a distinct Carrier variant" {
     // answering means something different from the other two.
     try testing.expect(Carrier.cell_data != Carrier.doc_props);
     try testing.expect(Carrier.cell_data != Carrier.defined_name);
+}
+
+test "findDefinedNameValue: a chunk inside a comment, a CDATA section, a PI or a DOCTYPE is text — the live element after it is the record" {
+    var buf: [64]u8 = undefined;
+    const real = "<definedNames><definedName name=\"_zlsxRecovery0\" hidden=\"1\">\"real\"</definedName></definedNames></workbook>";
+    const decoy = "<definedName name=\"_zlsxRecovery0\">decoy</definedName>";
+    // Every construct the typed parser (and the strip) skips: the
+    // comment (r4), and the three r5 S3C-REL-502 named — a decoy in a
+    // CDATA section or a PI survived every re-embed and was read as the
+    // record, so a stripped read answered the PREVIOUS generation.
+    const openers = [_][]const u8{
+        "<workbook><!-- " ++ decoy ++ " -->",
+        "<workbook><![CDATA[ " ++ decoy ++ " ]]>",
+        "<workbook><?zlsx " ++ decoy ++ " ?>",
+        "<!DOCTYPE workbook [ <!-- " ++ decoy ++ " --> ]><workbook>",
+    };
+    inline for (openers) |opener| {
+        const xml = opener ++ real;
+        try testing.expectEqualStrings("real", findDefinedNameValue(xml, "_zlsxRecovery0", &buf).?);
+        // Only the decoy: no record.
+        try testing.expect(findDefinedNameValue(opener ++ "<definedNames/></workbook>", "_zlsxRecovery0", &buf) == null);
+    }
+    // An unterminated construct is not a part to read a record from.
+    const torn = [_][]const u8{
+        "<workbook><!-- " ++ decoy,
+        "<workbook><![CDATA[ " ++ decoy,
+        "<workbook><?zlsx " ++ decoy,
+    };
+    inline for (torn) |xml| {
+        try testing.expect(findDefinedNameValue(xml, "_zlsxRecovery0", &buf) == null);
+    }
 }
