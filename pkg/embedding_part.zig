@@ -45,6 +45,10 @@ const coords = @import("zlsx_refs");
 // The writer's XML byte rule, so embedding metadata refuses exactly the
 // bytes every other text channel refuses (one definition).
 const sheet_plan = @import("zlsx_sheet_plan");
+// The reader's per-part decompression ceiling — the one number every
+// embedding part is sized against, so the writer never emits a part
+// the reader refuses.
+const control = @import("zlsx_control");
 
 pub const Error = error{
     BadMagic,
@@ -116,6 +120,12 @@ pub const REL_TYPE_HASH: []const u8 = "http://schemas.fabre.me/zlsx/2026/relatio
 /// record at the same slot index is zeroed but its float
 /// interpretation is undefined behavior for similarity scoring).
 pub const TOMBSTONE_HASH: u64 = std.math.maxInt(u64);
+
+/// The cap on any embedding part (`vec.bin`, `hashes.bin`, `index.xml`):
+/// PartStore's read-side per-part decompression ceiling
+/// (`control.decompress_limits.max_part_size`, 512 MiB), spelled once for
+/// the writer's pass-1 sizing and the C boundary's pre-check.
+pub const PART_MAX_BYTES: usize = control.decompress_limits.max_part_size;
 
 /// Hash seed for `std.hash.XxHash3`. Pinned in v1 so that
 /// independent reimplementations of the format produce the same
