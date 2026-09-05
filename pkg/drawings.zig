@@ -1149,8 +1149,10 @@ pub fn hasLiveDoctype(xml: []const u8) bool {
 /// be served as the blip or end the anchor. One linear pass; the
 /// strict read, the sweep and the strict chart walk refuse on it
 /// (in-house ND-REL-411 — the per-site content-start rules stay for
-/// the lenient read). A part that ends inside a tag or a quote is
-/// judged by the other probes.
+/// the lenient read). A `<` between attributes and a part that ends
+/// inside a quoted value are violations too (ND-REL-501 / 502); a part
+/// that ends inside a tag outside any quote is judged by the other
+/// probes.
 pub fn hasMarkupInAttributeValue(xml: []const u8) bool {
     var i: usize = 0;
     while (i < xml.len) {
@@ -1160,16 +1162,21 @@ pub fn hasMarkupInAttributeValue(xml: []const u8) bool {
             continue;
         }
         // Inside a tag: quoted values are stepped over; a `<` in one is
-        // the violation; `>` leaves the tag.
+        // the violation, and so is a `<` between attributes (a region
+        // opener there ended this scan at its own `>` and let the next
+        // attribute's `<` read as a tag start — in-house ND-REL-501) or
+        // a part that ends inside a value (ND-REL-502); `>` leaves the
+        // tag.
         var k = lt + 1;
         while (k < xml.len) : (k += 1) {
             const c = xml[k];
             if (c == '"' or c == '\'') {
-                const close = std.mem.indexOfScalarPos(u8, xml, k + 1, c) orelse return false;
+                const close = std.mem.indexOfScalarPos(u8, xml, k + 1, c) orelse return true;
                 if (std.mem.indexOfScalarPos(u8, xml[0..close], k + 1, '<') != null) return true;
                 k = close;
                 continue;
             }
+            if (c == '<') return true;
             if (c == '>') break;
         }
         i = k + 1;
@@ -1913,7 +1920,9 @@ fn findLocalChartElement(block: []const u8, start: usize, prefixes: DrawingPrefi
         // declaration IS in scope for the chart element itself.
         // Find the closing `>` of the candidate tag so the
         // self-declaration is included in the scan window.
-        const tag_end = std.mem.indexOfScalarPos(u8, block, colon, '>') orelse {
+        // Quote-aware: a raw `>` in a value before a stub-local `xmlns:`
+        // emptied the strict inventory (in-house ND-REL-501).
+        const tag_end = findUnquotedTagEnd(block, colon) orelse {
             i = colon + 1;
             continue;
         };
@@ -4832,6 +4841,32 @@ test "anchors read: a `<` inside an attribute value is not well-formed — stric
         try std.testing.expectEqual(@as(u32, 3), charts[0].from.col);
         try std.testing.expectEqualStrings("xl/charts/chart1.xml", charts[0].chart_part_name);
     }
+    // A legal raw `>` in the chart stub's own attribute value — before
+    // its local `xmlns:` too — is not the tag's end (ND-REL-501 / MNT-502).
+    for ([_][]const u8{
+        "<c:chart desc=\"a>b\" r:id=\"rId1\" />",
+        "<c:chart desc=\"a>b\" xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\" />",
+    }) |stub| {
+        var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+        defer store.deinit();
+        const drawing = (try store.part("xl/drawings/drawing1.xml")).?;
+        const patched = try std.mem.replaceOwned(u8, a, drawing.bytes, "<c:chart r:id=\"rId1\" />", stub);
+        defer a.free(patched);
+        try std.testing.expect(!hasMarkupInAttributeValue(patched));
+        try store.replacePart("xl/drawings/drawing1.xml", patched);
+        try store.save(io, path);
+        var s = try PartStore.open(a, io, path);
+        defer s.deinit();
+        const charts = try chartAnchorsIn(&s, a, .strict);
+        defer {
+            for (charts) |c| a.free(c.series_refs);
+            a.free(charts);
+        }
+        try std.testing.expectEqual(@as(usize, 1), charts.len);
+        try std.testing.expectEqualStrings("xl/charts/chart1.xml", charts[0].chart_part_name);
+    }
+    var blip_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("rId7", tryBlipEmbedAt("<a:blip desc=\"a>b\" r:embed=\"rId7\"/>", &blip_buf, "a").?);
     // The probe itself: escaped markup, a `>` in a value, quotes of
     // either kind, and regions are not violations; a `<` is, in either
     // quote; a part ending inside a quote is judged elsewhere.
@@ -4840,7 +4875,13 @@ test "anchors read: a `<` inside an attribute value is not well-formed — stric
     try std.testing.expect(hasMarkupInAttributeValue("<a b=\"<x/>\"/>"));
     try std.testing.expect(hasMarkupInAttributeValue("<a b='</a>'/>"));
     try std.testing.expect(hasMarkupInAttributeValue("<root><a b=\"x\" c=\"<\"/></root>"));
-    try std.testing.expect(!hasMarkupInAttributeValue("<a b=\"<x"));
+    try std.testing.expect(hasMarkupInAttributeValue("<a b=\"<x"));
+    try std.testing.expect(hasMarkupInAttributeValue("<a b=\"x"));
+    try std.testing.expect(!hasMarkupInAttributeValue("<a b=\"x\""));
+    // A region opener between attributes is a `<` inside the tag: a
+    // violation, not a region (round 5, ND-REL-501).
+    try std.testing.expect(hasMarkupInAttributeValue("<a <!-- c --> b=\"<x\"/>"));
+    try std.testing.expect(hasMarkupInAttributeValue("<a <?pi?> b=\"y\"/>"));
     try std.testing.expect(!hasMarkupInAttributeValue(""));
 }
 

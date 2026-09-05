@@ -954,13 +954,11 @@ test "what the sweep cannot move it refuses — MalformedDrawingXml, the strict 
     }
     // An opening tag the part ends inside.
     try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, "<xdr:wsDr xmlns:xdr=\"" ++ ns_xdr ++ "\"><xdr:oneCellAnchor editAs=\"oneCell\"", .col, 0, .insert));
-    // `<xdr:oneCellAnchor<` is not an anchor tag (the QName is not
-    // terminated) and passes through as text, as the read skips it.
+    // `<xdr:oneCellAnchor</xdr:wsDr>` — a `<` inside a tag — is not
+    // well-formed: refused, as the strict read refuses it (round 5).
     const glued = try wrapDrawing(a, "<xdr:oneCellAnchor");
     defer a.free(glued);
-    const glued_out = try applyEditToDrawing(a, glued, .col, 0, .insert);
-    defer a.free(glued_out);
-    try testing.expectEqualStrings(glued, glued_out);
+    try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, glued, .col, 0, .insert));
     // A self-closing wrapper carries nothing to move.
     const src = try wrapDrawing(a, "<xdr:twoCellAnchor/><xdr:oneCellAnchor />" ++ sample_two);
     defer a.free(src);
