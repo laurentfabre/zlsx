@@ -332,6 +332,9 @@ fn collectFromSheet(
     // the part rather than walk what an entity could rewrite; lenient
     // steps over the declaration as a region (in-house ND-REL-203).
     if (mode == .strict and hasLiveDoctype(drawing_part.bytes)) return error.MalformedDrawingXml;
+    // A `<` inside an attribute value is not well-formed XML and every
+    // decoy surface at once: strict refuses (in-house ND-REL-411).
+    if (mode == .strict and hasMarkupInAttributeValue(drawing_part.bytes)) return error.MalformedDrawingXml;
     // One tag set per followed prefix (`buildTagSets`): the wrapper
     // scan replays once per set — anchors under the other names do
     // not match, so no duplicates surface; replay order is NOT
@@ -551,6 +554,7 @@ fn collectChartsFromSheet(
     // refuses under strict.
     if (mode == .strict and prefixes.xdr_rejected) return error.MalformedDrawingXml;
     if (mode == .strict and hasLiveDoctype(drawing_part.bytes)) return error.MalformedDrawingXml;
+    if (mode == .strict and hasMarkupInAttributeValue(drawing_part.bytes)) return error.MalformedDrawingXml;
     // The image walk's replay: one tag set per followed prefix.
     const set_count = tagSetCount(&prefixes);
     const bufs = try allocator.alloc(TagSetBuf, set_count);
@@ -632,7 +636,9 @@ fn scanChartsWithTags(
         // bindings to the same chart URI" failure mode where
         // collect-first-prefix would pick an unused declaration.
         const chart_idx = findLocalChartElement(block, gf.at, prefixes) orelse continue;
-        const chart_end = std.mem.indexOfScalarPos(u8, block, chart_idx, '>') orelse {
+        // Quote-aware: an unescaped `>` in an attribute value is legal
+        // (in-house ND-REL-405).
+        const chart_end = findUnquotedTagEnd(block, chart_idx) orelse {
             if (mode == .strict) return error.MalformedDrawingXml;
             continue;
         };
@@ -796,10 +802,13 @@ pub const ChartFormulaWalk = struct {
     /// rejected (`max_prefix_len`): strict refuses rather than walk
     /// the part under a fallback prefix it does not use.
     prefix_rejected: bool = false,
-    /// The part carries a live `<!DOCTYPE`: the strict walk refuses it
-    /// as the drawing walks do (OPC forbids a DTD; an entity could
-    /// rewrite a carrier — in-house ND-REL-302).
-    has_doctype: bool = false,
+    /// The part carries a live `<!DOCTYPE` (OPC forbids a DTD; an
+    /// entity could rewrite a carrier — in-house ND-REL-302) or a `<`
+    /// inside an attribute value (not well-formed; a carrier spelled
+    /// there would be walked — ND-REL-411): the strict walk refuses it
+    /// as the drawing walks do. Probed on the first strict `next` only
+    /// — a lenient read never pays the whole-part pass (ND-PERF-403).
+    unwalkable: ?bool = null,
 
     /// Resolve the chart prefix from the part's own declarations
     /// (`resolveDrawingPrefixes`: the root's binding of the
@@ -815,14 +824,17 @@ pub const ChartFormulaWalk = struct {
 
     pub fn initWithPrefixes(xml: []const u8, c_prefix: []const u8, c_prefix_alt: ?[]const u8) ChartFormulaWalk {
         const alt: ?[]const u8 = if (c_prefix_alt) |a| (if (std.mem.eql(u8, a, c_prefix)) null else a) else null;
-        return .{ .xml = xml, .c_prefix = c_prefix, .c_prefix_alt = alt, .has_doctype = hasLiveDoctype(xml) };
+        return .{ .xml = xml, .c_prefix = c_prefix, .c_prefix_alt = alt };
     }
 
     /// The next carrier at or after the scan position, or `null` when
     /// the rest of the part carries none.
     pub fn next(self: *ChartFormulaWalk, mode: WalkMode) error{MalformedChartXml}!?ChartFormula {
         if (mode == .strict and self.prefix_rejected) return error.MalformedChartXml;
-        if (mode == .strict and self.has_doctype) return error.MalformedChartXml;
+        if (mode == .strict) {
+            if (self.unwalkable == null) self.unwalkable = hasLiveDoctype(self.xml) or hasMarkupInAttributeValue(self.xml);
+            if (self.unwalkable.?) return error.MalformedChartXml;
+        }
         const xml = self.xml;
         // Needles are spelled per call into stack scratch: the walk is
         // a value (the read returns it by value), so it cannot hold
@@ -1127,6 +1139,42 @@ fn markupDeclarationEnd(xml: []const u8, at: usize) ?usize {
 /// lenient read steps over the declaration as a region.
 pub fn hasLiveDoctype(xml: []const u8) bool {
     return findLiveMarkup(xml, 0, "<!DOCTYPE") != null;
+}
+
+/// Does a `<` sit inside a quoted attribute value — outside comments,
+/// CDATA sections, PIs and markup declarations? XML 1.0 forbids it
+/// (AttValue excludes `<`; a producer writes `&lt;`), so the part is
+/// not well-formed and no walk can tell its markup from its text: an
+/// attribute holding `<a:blip r:embed=…/>` or `</oneCellAnchor>` would
+/// be served as the blip or end the anchor. One linear pass; the
+/// strict read, the sweep and the strict chart walk refuse on it
+/// (in-house ND-REL-411 — the per-site content-start rules stay for
+/// the lenient read). A part that ends inside a tag or a quote is
+/// judged by the other probes.
+pub fn hasMarkupInAttributeValue(xml: []const u8) bool {
+    var i: usize = 0;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return false;
+        if (isRegionOpener(xml[lt..])) {
+            i = skipRegionEndFrom(xml, lt);
+            continue;
+        }
+        // Inside a tag: quoted values are stepped over; a `<` in one is
+        // the violation; `>` leaves the tag.
+        var k = lt + 1;
+        while (k < xml.len) : (k += 1) {
+            const c = xml[k];
+            if (c == '"' or c == '\'') {
+                const close = std.mem.indexOfScalarPos(u8, xml, k + 1, c) orelse return false;
+                if (std.mem.indexOfScalarPos(u8, xml[0..close], k + 1, '<') != null) return true;
+                k = close;
+                continue;
+            }
+            if (c == '>') break;
+        }
+        i = k + 1;
+    }
+    return false;
 }
 
 pub const OpenTagEnd = struct { gt: usize, self_closing: bool };
@@ -1500,7 +1548,7 @@ fn tryBlipEmbedAt(pic_xml: []const u8, buf: []u8, prefix: []const u8) ?[]const u
     // (Codex #214 r6 REL-601). `<a:blipFill>` fails the terminator
     // and the loop walks on to the real `<a:blip>` inside it.
     while (findLiveExactTag(pic_xml, search_at, blip_open)) |blip| {
-        const blip_end = std.mem.indexOfScalarPos(u8, pic_xml, blip, '>') orelse return null;
+        const blip_end = findUnquotedTagEnd(pic_xml, blip) orelse return null;
         if (attrValue(pic_xml[blip .. blip_end + 1], "r:embed")) |rid| return rid;
         search_at = blip_end + 1;
     }
@@ -2877,7 +2925,7 @@ fn parseAbsoluteAnchorIn(xml: []const u8, content_start: usize, sets: []const Dr
 /// The `x` / `y` of the `<{p}:pos>` tag at `pos_idx`, and the index of
 /// its `>`.
 fn posAttrsAt(xml: []const u8, pos_idx: usize) ?struct { x: i64, y: i64, end: usize } {
-    const pos_end = std.mem.indexOfScalarPos(u8, xml, pos_idx, '>') orelse return null;
+    const pos_end = findUnquotedTagEnd(xml, pos_idx) orelse return null;
     const pos_attrs = xml[pos_idx .. pos_end + 1];
     const x_str = attrValue(pos_attrs, "x") orelse return null;
     const y_str = attrValue(pos_attrs, "y") orelse return null;
@@ -2911,7 +2959,7 @@ fn parseExtAttrsIn(xml: []const u8, from_idx: usize, sets: []const DrawingTags) 
 }
 
 fn extAttrsAt(xml: []const u8, ext_idx: usize) ?Extent {
-    const ext_end = std.mem.indexOfScalarPos(u8, xml, ext_idx, '>') orelse return null;
+    const ext_end = findUnquotedTagEnd(xml, ext_idx) orelse return null;
     const ext_attrs = xml[ext_idx .. ext_end + 1];
     const cx_str = attrValue(ext_attrs, "cx") orelse return null;
     const cy_str = attrValue(ext_attrs, "cy") orelse return null;
@@ -4622,8 +4670,11 @@ test "anchors read: an absoluteAnchor under the default namespace parses its <po
     try std.testing.expectEqual(@as(i64, 914400), abs.cx);
     try std.testing.expectEqual(@as(i64, 457200), abs.cy);
     // The strict one-cell validation reads the bare `<ext` too, and
-    // `<extLst` does not satisfy it.
+    // `<extLst` does not satisfy it; an unescaped `>` in an attribute
+    // value does not end the tag (ND-REL-405).
     try std.testing.expect(parseExtAttrsIn("<oneCellAnchor><from/><ext cx=\"1\" cy=\"2\"/></oneCellAnchor>", 0, sets) != null);
+    try std.testing.expectEqual(@as(i64, 2), parseExtAttrsIn("<oneCellAnchor><from/><ext desc=\"a>b\" cx=\"1\" cy=\"2\"/></oneCellAnchor>", 0, sets).?.cy);
+    try std.testing.expectEqual(@as(i64, 2000), parseAbsoluteAnchorIn("<absoluteAnchor><pos desc=\"a>b\" x=\"1000\" y=\"2000\" /><ext cx=\"1\" cy=\"2\" /></absoluteAnchor>", 0, sets).?.y);
     try std.testing.expect(parseExtAttrsIn("<oneCellAnchor><from/><extLst cx=\"1\" cy=\"2\"/></oneCellAnchor>", 0, sets) == null);
 }
 
@@ -4740,7 +4791,7 @@ test "anchors read: a nested corner block refuses under strict; a close spelled 
     try std.testing.expectEqualStrings("urn:r", rootDefaultNamespaceUri("<?xml version=\"1.0\"?><!-- c --><wsDr xmlns:a=\"urn:a\" xmlns=\"urn:r\"><x xmlns=\"urn:x\"/></wsDr>").?);
 }
 
-test "anchors read: a close tag spelled inside the anchor's attribute value does not end the anchor (ND-REL-302)" {
+test "anchors read: a `<` inside an attribute value is not well-formed — strict refuses, lenient neither ends the anchor nor takes the corner from it (ND-REL-302/411)" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -4749,39 +4800,48 @@ test "anchors read: a close tag spelled inside the anchor's attribute value does
     var buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/test-drawings-attrclose-{d}.xlsx", .{prng.random().int(u32)});
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
-    defer store.deinit();
-    const drawing = (try store.part("xl/drawings/drawing1.xml")).?;
-    const patched = try std.mem.replaceOwned(u8, a, drawing.bytes, "<oneCellAnchor>", "<oneCellAnchor editAs=\"</oneCellAnchor>\">");
-    defer a.free(patched);
-    try store.replacePart("xl/drawings/drawing1.xml", patched);
-    try store.save(io, path);
-    var s = try PartStore.open(a, io, path);
-    defer s.deinit();
-    const charts = try chartAnchorsIn(&s, a, .strict);
-    defer {
-        for (charts) |c| a.free(c.series_refs);
-        a.free(charts);
+    const decoys = [_][]const u8{
+        // A close in the wrapper's attribute value (the read used to
+        // serve an EMPTY inventory for an anchor the sweep shifted).
+        "<oneCellAnchor editAs=\"</oneCellAnchor>\">",
+        // A corner there (the read used to serve it as the corner).
+        "<oneCellAnchor editAs=\"<from><col>7</col><colOff>0</colOff><row>99</row><rowOff>0</rowOff></from>\">",
+        // A chart stub in the graphic frame's own attribute.
+        "<oneCellAnchor editAs=\"<graphicFrame macro='<c:chart r:id=`rId9`/>'>\">",
+    };
+    for (decoys) |decoy| {
+        var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+        defer store.deinit();
+        const drawing = (try store.part("xl/drawings/drawing1.xml")).?;
+        const patched = try std.mem.replaceOwned(u8, a, drawing.bytes, "<oneCellAnchor>", decoy);
+        defer a.free(patched);
+        try std.testing.expect(hasMarkupInAttributeValue(patched));
+        try store.replacePart("xl/drawings/drawing1.xml", patched);
+        try store.save(io, path);
+        var s = try PartStore.open(a, io, path);
+        defer s.deinit();
+        try std.testing.expectError(error.MalformedDrawingXml, chartAnchorsIn(&s, a, .strict));
+        try std.testing.expectError(error.MalformedDrawingXml, imageAnchorsIn(&s, a, .strict));
+        const charts = try chartAnchorsIn(&s, a, .lenient);
+        defer {
+            for (charts) |c| a.free(c.series_refs);
+            a.free(charts);
+        }
+        try std.testing.expectEqual(@as(usize, 1), charts.len);
+        try std.testing.expectEqual(@as(u32, 1), charts[0].from.row);
+        try std.testing.expectEqual(@as(u32, 3), charts[0].from.col);
+        try std.testing.expectEqualStrings("xl/charts/chart1.xml", charts[0].chart_part_name);
     }
-    try std.testing.expectEqual(@as(usize, 1), charts.len);
-    try std.testing.expectEqual(@as(u32, 1), charts[0].from.row);
-    // The mirror: a corner spelled inside the wrapper's attribute value
-    // is not the corner — the block is searched from the wrapper's
-    // content (ND-REL-301's second half).
-    const decoy = try std.mem.replaceOwned(u8, a, drawing.bytes, "<oneCellAnchor>", "<oneCellAnchor editAs=\"<from><col>7</col><colOff>0</colOff><row>99</row><rowOff>0</rowOff></from>\">");
-    defer a.free(decoy);
-    try store.replacePart("xl/drawings/drawing1.xml", decoy);
-    try store.save(io, path);
-    var s2 = try PartStore.open(a, io, path);
-    defer s2.deinit();
-    const charts2 = try chartAnchorsIn(&s2, a, .strict);
-    defer {
-        for (charts2) |c| a.free(c.series_refs);
-        a.free(charts2);
-    }
-    try std.testing.expectEqual(@as(usize, 1), charts2.len);
-    try std.testing.expectEqual(@as(u32, 1), charts2[0].from.row);
-    try std.testing.expectEqual(@as(u32, 3), charts2[0].from.col);
+    // The probe itself: escaped markup, a `>` in a value, quotes of
+    // either kind, and regions are not violations; a `<` is, in either
+    // quote; a part ending inside a quote is judged elsewhere.
+    try std.testing.expect(!hasMarkupInAttributeValue("<a b=\"&lt;x&gt;\" c='a>b'/>"));
+    try std.testing.expect(!hasMarkupInAttributeValue("<!-- <a b=\"<x>\"/> --><![CDATA[<a b=\"<\">]]><?pi <a b=\"<\"> ?><!DOCTYPE a [ <!ENTITY e \"<x>\"> ]><a/>"));
+    try std.testing.expect(hasMarkupInAttributeValue("<a b=\"<x/>\"/>"));
+    try std.testing.expect(hasMarkupInAttributeValue("<a b='</a>'/>"));
+    try std.testing.expect(hasMarkupInAttributeValue("<root><a b=\"x\" c=\"<\"/></root>"));
+    try std.testing.expect(!hasMarkupInAttributeValue("<a b=\"<x"));
+    try std.testing.expect(!hasMarkupInAttributeValue(""));
 }
 
 test "ChartFormulaWalk: a live DTD refuses the strict walk and is a region under lenient (ND-REL-302)" {
@@ -4795,4 +4855,8 @@ test "ChartFormulaWalk: a live DTD refuses the strict walk and is a region under
     // A DOCTYPE inside a comment is text.
     var commented = ChartFormulaWalk.init("<!-- <!DOCTYPE x> --><c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:f>A!$A$1</c:f></c:chartSpace>");
     try std.testing.expect((try commented.next(.strict)) != null);
+    // A carrier spelled inside an attribute value: not well-formed —
+    // strict refuses (ND-REL-411); lenient walks what it finds.
+    var attr = ChartFormulaWalk.init("<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart title=\"<c:f>Ghost!$A$1</c:f>\"><c:f>A!$A$1</c:f></c:chart></c:chartSpace>");
+    try std.testing.expectError(error.MalformedChartXml, attr.next(.strict));
 }

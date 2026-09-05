@@ -3777,9 +3777,11 @@ class Editor:
           pivot's footprint or on a host sheet a pivot also reads
           from, would collapse a table or delete its header row, or a
           carrier the scan cannot read is in the way (an ``<xm:f>``
-          extension formula, a chart ``<c:f>`` series formula — the
-          same carriers refuse a rename or delete with their own
-          names, ``MalformedExtensionXml`` / ``MalformedChartXml``).
+          extension formula, a chart ``<c:f>`` series formula, a chart
+          part carrying a DTD or a ``<`` inside an attribute value — the
+          same carriers refuse a rename or
+          delete with their own names, ``MalformedExtensionXml`` /
+          ``MalformedChartXml``).
 
         * ``RowEditExceedsMaxRow`` — a cell would be pushed past row
           1048576; ``SplitPaneNotSupported`` / ``MalformedPaneSplit``
@@ -3788,10 +3790,12 @@ class Editor:
           drawing part the archive cannot decompress, a sheet drawing
           reference the strict anchors read cannot follow — malformed,
           duplicate, dangling, absent — one binding the spreadsheetDrawing
-          namespace under a name the anchor walk cannot spell, a DTD,
-          or an anchor it cannot read whole — no close, a corner absent
-          or unparseable: the strict read's verdicts on the anchors both
-          walk, refused before the first mutation),
+          namespace under a name the anchor walk cannot spell, a DTD, a
+          ``<`` inside an attribute value (not well-formed XML), or an
+          anchor it cannot read whole — no close, a corner absent or
+          unparseable, two corner blocks that overlap: the strict read's
+          verdicts on the anchors both walk, refused before the first
+          mutation),
           ``MalformedVmlDrawing``, ``MalformedCommentsXml``,
           ``MalformedTableXml``, ``DrawingCoordinateOverflow``,
           ``VmlCoordinateOverflow``, ``TableCoordinateOverflow`` — a part
@@ -4087,8 +4091,9 @@ class Editor:
         :class:`ZlsxRefusal` (``MalformedWorkbookXml`` for a sheet list
         the strict workbook read cannot prove, ``MalformedDrawingXml``
         for a drawing graph the strict walk cannot read whole — a
-        spreadsheetDrawing binding under a name it cannot spell and a
-        part carrying a ``<!DOCTYPE`` included — ``DrawingOnUnlistedSheet``
+        spreadsheetDrawing binding under a name it cannot spell, a part
+        carrying a ``<!DOCTYPE`` or a ``<`` inside an attribute value
+        included — ``DrawingOnUnlistedSheet``
         for an anchor on a
         worksheet part the workbook does not list) rather than return a
         record that lies or a list with a hole. An archive past the

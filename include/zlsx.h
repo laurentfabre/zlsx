@@ -1851,14 +1851,16 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  *     the archive cannot decompress, a sheet drawing reference the
  *     strict anchors read cannot follow (malformed, duplicate, dangling,
  *     absent), one binding the spreadsheetDrawing namespace under a name
- *     the anchor walk cannot spell, a DTD, or an anchor it cannot read
- *     whole (no close, a corner absent or unparseable): the strict read's
- *     verdicts on the anchors both walk, refused before the first
- *     mutation —
+ *     the anchor walk cannot spell, a DTD, a `<` inside an attribute
+ *     value (not well-formed XML), or an anchor it cannot read whole (no
+ *     close, a corner absent or unparseable, two corner blocks that
+ *     overlap): the strict read's verdicts on the anchors both walk,
+ *     refused before the first mutation —
  *     MalformedVmlDrawing,
  *     MalformedCommentsXml, MalformedTableXml, MalformedExtensionXml,
  *     MalformedChartXml — an <xm:f> extension or chart <c:f> series
- *     carrier the sweep cannot read whole, refused before the first
+ *     carrier the sweep cannot read whole, or a chart part carrying a
+ *     DTD or a `<` inside an attribute value, refused before the first
  *     mutation — the *CoordinateOverflow
  *     trio, PivotEditUnsafe, SqrefCollapseUnsafe — a delete collapsing
  *     EVERY area of a DV/CF sqref, which Excel resolves by deleting the
@@ -2025,8 +2027,9 @@ int32_t zlsx_editor_conditional_formats_ndjson(zlsx_editor_t * ed,
  * inventory that cannot be served faithfully refuses whole — a sheet
  * list the strict workbook read cannot prove (MalformedWorkbookXml),
  * a drawing graph the strict walk cannot read whole — a
- * spreadsheetDrawing binding under a name it cannot spell and a part
- * carrying a <!DOCTYPE included — (MalformedDrawingXml), or an anchor
+ * spreadsheetDrawing binding under a name it cannot spell, a part
+ * carrying a <!DOCTYPE or a `<` inside an attribute value included —
+ * (MalformedDrawingXml), or an anchor
  * on a worksheet part the workbook
  * does not list (DrawingOnUnlistedSheet), all ZLSX_REFUSED — rather
  * than hand over a record that lies or a list with a hole. (An

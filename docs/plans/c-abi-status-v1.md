@@ -808,8 +808,9 @@ its children may mix two followed spellings (`<xdr:twoCellAnchor><from>`),
 comment / CDATA / PI / DTD text is never an anchor under either
 spelling (a live `<!DOCTYPE` refuses both — and the strict chart walk,
 so the chart sweep's preflight refuses a chart part carrying one,
-`MalformedChartXml`), a wrapper's own attribute values are neither its
-close nor its corners, XSD-collapsed whitespace around a scalar parses
+`MalformedChartXml`), a `<` inside an attribute value — not well-formed XML,
+the one decoy surface no exact-QName rule covers — refuses both (and
+the strict chart walk), XSD-collapsed whitespace around a scalar parses
 for both (digits only otherwise — `1_0` is not 10), and what the sweep
 cannot move — a wrapper with no close, a corner block absent or with a
 scalar that does not parse, two blocks that overlap (a `<to>` nested in

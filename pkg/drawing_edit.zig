@@ -46,15 +46,17 @@
 //! for an anchor and spliced the real ones after it, in-house
 //! ND-REL-101), tag names are exact QNames, and a corner is read by
 //! the read's own parser (`drawings.parseCornerIn` — the values AND the
-//! scalar spans this sweep splices; one acceptance, `parseInt`, where
-//! the v1 walker trimmed whitespace the read refused).
+//! scalar spans this sweep splices; one acceptance, `parseXsdInteger`:
+//! XSD-collapsed, an optional sign, digits only).
 //!
 //! What the sweep cannot move it refuses (`MalformedDrawingXml`),
 //! rather than leave an anchor behind: a spreadsheetDrawing binding
 //! the resolver cannot spell (`DrawingPrefixes.xdr_rejected` — a
 //! prefix past its 100-byte limit, or past its eight-alternate cap),
 //! a `<!DOCTYPE` (no producer writes one; an entity could rewrite
-//! the markup), an anchor wrapper with no close or an unterminated
+//! the markup), a `<` inside an attribute value (not well-formed XML —
+//! a close or a corner spelled there would be taken for the real one),
+//! an anchor wrapper with no close or an unterminated
 //! start tag, a corner block absent or with a scalar that does not
 //! parse, two corner blocks that overlap. On the anchors both walk
 //! these are the strict read's refusals on the same bytes, by the
@@ -115,6 +117,9 @@ pub fn applyEditToDrawing(
     // A DTD is not content (the strict read's rule): refuse rather
     // than splice a grid coordinate inside an entity declaration.
     if (drawings.hasLiveDoctype(src)) return Error.MalformedDrawingXml;
+    // A `<` inside an attribute value is not well-formed XML: no walk
+    // can tell its markup from its text (the strict read's rule).
+    if (drawings.hasMarkupInAttributeValue(src)) return Error.MalformedDrawingXml;
     const set_count = drawings.tagSetCount(&prefixes);
     const bufs = try allocator.alloc(drawings.TagSetBuf, set_count);
     defer allocator.free(bufs);
@@ -280,6 +285,10 @@ fn processAnchor(
 
     const to = drawings.parseCornerIn(block, content_start, sets, .to) orelse return Error.MalformedDrawingXml;
     const to_value = axisValue(to.anchor, axis);
+    // Two blocks that overlap are not two corners — judged BEFORE the
+    // collapse rule, or a nested pair at the deleted index would be
+    // dropped whole instead of refused (in-house ND-REL-401).
+    if (drawings.cornersOverlap(from, to)) return Error.MalformedDrawingXml;
     // Drop-on-collapse: delete that wipes both corners' value on
     // the edited axis.
     if (kind == .delete and from_value == index and to_value == index) return;
@@ -288,10 +297,8 @@ fn processAnchor(
     // Document order decides the emit order: the schema says `from`
     // then `to`, but the read is order-agnostic and lists a reversed
     // pair, so the sweep moves it (the v1 walker sliced backwards —
-    // in-house ND-REL-102). Two blocks that overlap are not two
-    // corners.
+    // in-house ND-REL-102).
     const ordered = if (from.open_start <= to.open_start) [_]Splice{ from_splice, to_splice } else [_]Splice{ to_splice, from_splice };
-    if (drawings.cornersOverlap(from, to)) return Error.MalformedDrawingXml;
     try emitAnchor(allocator, out, block, &ordered, axis);
 }
 
@@ -778,6 +785,12 @@ test "a <to> before <from> moves both corners in document order; nested blocks r
     const src_nested = try wrapDrawing(a, nested);
     defer a.free(src_nested);
     try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src_nested, .row, 5, .insert));
+    // …under every edit, the delete that would collapse it included:
+    // the overlap is judged before the drop rule (ND-REL-401).
+    const collapsing = try std.mem.replaceOwned(u8, a, src_nested, "<xdr:row>10</xdr:row>", "<xdr:row>4</xdr:row>");
+    defer a.free(collapsing);
+    try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, collapsing, .row, 4, .delete));
+    try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, src_nested, .col, 7, .delete));
 }
 
 test "a wrapper under one followed spelling with its children under the other shifts — both directions (ND-REL-103)" {
@@ -893,24 +906,27 @@ test "what the sweep cannot move it refuses — MalformedDrawingXml, the strict 
         try testing.expect(std.mem.indexOf(u8, col, "<xdr:row> 4 </xdr:row>") != null);
         try testing.expect(std.mem.indexOf(u8, col, "<xdr:col>2</xdr:col>") != null);
     }
-    // A close spelled inside the wrapper's attribute value is not the
-    // close (the read's rule too — ND-REL-302); a digit separator is
-    // not a digit (`1_0` is not 10 — ND-REL-306).
+    // A `<` inside an attribute value is not well-formed XML — a close
+    // or a corner spelled there would be taken for the real one — so
+    // the part refuses, as the strict read refuses it (ND-REL-302 /
+    // ND-REL-411); a digit separator is not a digit (`1_0` is not 10 —
+    // ND-REL-306).
     {
         const attr_close = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"</xdr:oneCellAnchor>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx=\"1\" cy=\"1\"/><xdr:pic/></xdr:oneCellAnchor>");
         defer a.free(attr_close);
-        const moved = try applyEditToDrawing(a, attr_close, .row, 0, .insert);
-        defer a.free(moved);
-        try testing.expect(std.mem.indexOf(u8, moved, "editAs=\"</xdr:oneCellAnchor>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row>") != null);
-        // A corner spelled inside the attribute value is not the corner:
-        // the real one moves.
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, attr_close, .row, 0, .insert));
         const attr_corner = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"<xdr:from><xdr:col>7</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>99</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic/></xdr:oneCellAnchor>");
         defer a.free(attr_corner);
-        const moved2 = try applyEditToDrawing(a, attr_corner, .row, 0, .insert);
-        defer a.free(moved2);
-        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>99</xdr:row>") != null);
-        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>5</xdr:row>") != null);
-        try testing.expect(std.mem.indexOf(u8, moved2, "<xdr:row>100</xdr:row>") == null);
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, attr_corner, .col, 0, .insert));
+        const attr_pic = try wrapDrawing(a, "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic macro=\"<a:blip r:embed='rId9'/>\"/></xdr:oneCellAnchor>");
+        defer a.free(attr_pic);
+        try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, attr_pic, .row, 0, .insert));
+        // An escaped one is text, and moves.
+        const escaped = try wrapDrawing(a, "<xdr:oneCellAnchor editAs=\"&lt;xdr:from&gt;\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic/></xdr:oneCellAnchor>");
+        defer a.free(escaped);
+        const moved = try applyEditToDrawing(a, escaped, .row, 0, .insert);
+        defer a.free(moved);
+        try testing.expect(std.mem.indexOf(u8, moved, "editAs=\"&lt;xdr:from&gt;\"><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row>") != null);
         const sep = try wrapDrawing(a, "<xdr:oneCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1_0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:pic/></xdr:oneCellAnchor>");
         defer a.free(sep);
         try testing.expectError(error.MalformedDrawingXml, applyEditToDrawing(a, sep, .row, 0, .insert));
