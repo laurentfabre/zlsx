@@ -3333,47 +3333,48 @@ pub const Workbook = struct {
     fn stripRecoveryNamesFromWorkbookXml(self: *Workbook) Error!void {
         const part = (try self.store.part("xl/workbook.xml")) orelse return;
         const src = part.bytes;
-        if (std.ascii.indexOfIgnoreCase(src, recovery_record.NAME_PREFIX) == null) return;
+        // Nothing to strip unless the prefix is spelled — or could be
+        // hidden behind a character reference.
+        if (std.ascii.indexOfIgnoreCase(src, recovery_record.NAME_PREFIX) == null and
+            std.mem.indexOf(u8, src, "&#") == null) return;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.allocator);
 
+        // The strip walks the part with the typed parser's own scanner —
+        // `findTagOpen` (the exact tag name, a quote-aware attribute
+        // region, comments / CDATA / PIs skipped) and `findClosingTag` —
+        // so it cannot see an element differently from the fresh view it
+        // is about to become (in-house r4 S3C-REL-401), and it judges the
+        // DECODED `name` the save-time splice re-emits: a character
+        // reference is the one way the chunk form can hide (r4 B-REL-401).
         var i: usize = 0;
         while (i < src.len) {
-            const tag_open = std.mem.indexOfPos(u8, src, i, "<definedName") orelse {
+            const hit = (try workbook_xml_mod.findTagOpen(src, i, "definedName")) orelse {
                 try out.appendSlice(self.allocator, src[i..]);
                 break;
             };
-            const gt = std.mem.indexOfScalarPos(u8, src, tag_open, '>') orelse {
-                try out.appendSlice(self.allocator, src[i..]);
-                break;
-            };
-            // The `name` attribute's value through the typed parser's one
-            // acceptance (`getAttr`: either quote, XML whitespace around
-            // `=`, attributes walked in order — the same reading the
-            // fresh view gets, so no spelling the view lists can survive
-            // the strip; in-house r3 S3C-REL-301), judged by the exact
-            // chunk form: a user's `_zlsxRecoveryMine` stays, a foreign
-            // tool's `_ZLSXRECOVERY0` goes.
             const is_ours = blk: {
-                const name = workbook_xml_mod.getAttr(src[tag_open + "<definedName".len .. gt], "name") orelse break :blk false;
+                const raw = workbook_xml_mod.getAttr(src[hit.attrs_start..hit.attrs_end], "name") orelse break :blk false;
+                const name = try store_mod.decodeXmlEntities(self.allocator, raw);
+                defer self.allocator.free(name);
                 break :blk recovery_record.isChunkName(name);
             };
             if (!is_ours) {
-                try out.appendSlice(self.allocator, src[i .. gt + 1]);
-                i = gt + 1;
+                try out.appendSlice(self.allocator, src[i..hit.after_tag_close]);
+                i = hit.after_tag_close;
                 continue;
             }
-            try out.appendSlice(self.allocator, src[i..tag_open]);
-            if (src[gt - 1] == '/') {
-                i = gt + 1;
-            } else {
-                const close = std.mem.indexOfPos(u8, src, gt + 1, "</definedName>") orelse {
-                    i = gt + 1;
-                    continue;
-                };
-                i = close + "</definedName>".len;
+            try out.appendSlice(self.allocator, src[i..hit.open_lt]);
+            if (hit.self_closing) {
+                i = hit.after_tag_close;
+                continue;
             }
+            // A chunk with no close is not a part the view would parse:
+            // refused here, before any store write, the verdict below.
+            const close = (try workbook_xml_mod.findClosingTag(src, hit.after_tag_close, "</definedName>")) orelse
+                return error.MalformedWorkbookXml;
+            i = close + "</definedName>".len;
         }
         // The parsed view must follow the part: `applyWorkbookXmlPlanDefinedNames`
         // rebuilds the <definedNames> block at save from the VIEW plus the
@@ -22527,10 +22528,18 @@ test "Workbook.setEmbeddings: a re-embed across a save replaces the recovery nam
         // them (in-house r3 S3C-TEST-302) — with the saved chunk in the
         // two spellings the typed parser accepts and zlsx never writes:
         // single-quoted, and whitespace around `=` (S3C-REL-301).
+        // ... and a quoted `>` in an attribute before `name`, a character
+        // reference inside the name (the splice re-emits names DECODED),
+        // and a decoy chunk inside a comment before the block — every
+        // spelling the typed parser reads and a lexical scan misjudges
+        // (S3C-REL-401, both reviewers' r4 shapes).
         const src2 = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
-        const spaced = try std.mem.replaceOwned(u8, std.testing.allocator, src2.bytes, "name=\"_zlsxRecovery0\"", "name = '_zlsxRecovery0'");
+        const spaced = try std.mem.replaceOwned(u8, std.testing.allocator, src2.bytes, "name=\"_zlsxRecovery0\"", "comment=\"a>b\" name = '&#95;zlsxRecovery0'");
         defer std.testing.allocator.free(spaced);
-        try wb.store.replacePart("xl/workbook.xml", spaced);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, spaced, "<definedNames>"));
+        const decoyed = try std.mem.replaceOwned(u8, std.testing.allocator, spaced, "<definedNames>", "<!-- <definedName name='_zlsxRecovery0'>decoy</definedName> --><definedNames>");
+        defer std.testing.allocator.free(decoyed);
+        try wb.store.replacePart("xl/workbook.xml", decoyed);
         try wb.setEmbeddings("m3", 2, .f32, &.{input});
         try wb.save(io, tmp_path);
     }
@@ -22539,11 +22548,16 @@ test "Workbook.setEmbeddings: a re-embed across a save replaces the recovery nam
         defer wb.deinit();
         const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"_zlsxRecovery0\""));
-        // ONE chunk name in any case or quoting: the spaced single-quoted
-        // foreign one is gone, ours is the only `_zlsxRecovery0`.
+        // ONE live chunk name in any case, quoting or entity spelling:
+        // the foreign one is gone, ours is the only `name="_zlsxRecovery0"`;
+        // the decoy comment (single-quoted) is untouched, so the
+        // case-insensitive count is two.
         const lowered = try std.ascii.allocLowerString(std.testing.allocator, wbxml.bytes);
         defer std.testing.allocator.free(lowered);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, lowered, "_zlsxrecovery0"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, lowered, "_zlsxrecovery0"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "decoy</definedName> -->"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, wbxml.bytes, "&#95;"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, wbxml.bytes, "a>b"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"_zlsxRecoveryMine\""));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"Visible\""));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wbxml.bytes, "name=\"HiddenOne\""));

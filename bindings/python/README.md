@@ -402,7 +402,10 @@ first part is written; a workbook the set cannot land in refuses with a
 eighty coverages, or a ~3 KB model name). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
 (a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
-and a masked array's masked slots are "no value". The recalc transactions
+and a masked array's masked slots are "no value". A refusal after the first
+part is written (an allocation failure, an index past the cap, a package
+part the carriers cannot patch) leaves the staged set partially replaced:
+close the editor without saving. The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
 rebuild from the archive as opened and do not carry a staged embedding
 write — call them before it, or save and re-open. The per-row content

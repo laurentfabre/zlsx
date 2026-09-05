@@ -441,6 +441,17 @@ pub fn findDefinedNameValue(
 ) ?[]const u8 {
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, workbook_xml, search, "<definedName")) |open| {
+        // A `<definedName` inside a comment is text, not an element:
+        // the whole comment is skipped, as the typed parser skips it
+        // (a decoy chunk in a comment used to be read as the record —
+        // in-house r4 S3C-REL-401's shape on the reader).
+        if (std.mem.indexOfPos(u8, workbook_xml, search, "<!--")) |c_open| {
+            if (c_open < open) {
+                const c_close = std.mem.indexOfPos(u8, workbook_xml, c_open + "<!--".len, "-->") orelse return null;
+                search = c_close + "-->".len;
+                continue;
+            }
+        }
         const gt = std.mem.indexOfScalarPos(u8, workbook_xml, open, '>') orelse return null;
         const attrs = workbook_xml[open..gt];
         search = gt + 1;
@@ -765,4 +776,18 @@ test "cell carrier is a distinct Carrier variant" {
     // answering means something different from the other two.
     try testing.expect(Carrier.cell_data != Carrier.doc_props);
     try testing.expect(Carrier.cell_data != Carrier.defined_name);
+}
+
+test "findDefinedNameValue: a chunk inside a comment is text — the live element after it is the record" {
+    var buf: [64]u8 = undefined;
+    const xml =
+        "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName> -->" ++
+        "<definedNames><definedName name=\"_zlsxRecovery0\" hidden=\"1\">\"real\"</definedName></definedNames></workbook>";
+    try testing.expectEqualStrings("real", findDefinedNameValue(xml, "_zlsxRecovery0", &buf).?);
+    // Only the decoy: no record.
+    const only_decoy = "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName> --><definedNames/></workbook>";
+    try testing.expect(findDefinedNameValue(only_decoy, "_zlsxRecovery0", &buf) == null);
+    // An unterminated comment is not a part to read a record from.
+    const torn = "<workbook><!-- <definedName name=\"_zlsxRecovery0\">decoy</definedName>";
+    try testing.expect(findDefinedNameValue(torn, "_zlsxRecovery0", &buf) == null);
 }

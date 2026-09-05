@@ -427,6 +427,18 @@ def test_set_embeddings_numpy_edges_alignment_masks_and_overflow(tmp_path):
     with zlsx.embeddings(out) as emb:
         row = emb.vectors("title")[0]
         assert np.isinf(row[0]) and np.isinf(row[1]) and abs(row[2] - 0.1) < 1e-6
+    # The cast's own IEEE flags never surface: a signalling NaN under
+    # warnings-as-errors, a subnormal under a caller's `under="raise"`.
+    snan = np.array([0x7FF0000000000001], dtype=np.uint64).view(np.float64)[0]
+    with zlsx.Editor(src) as ed:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ed.set_embeddings("m", 3, [_cov(vectors=np.array([[snan, 0.0, 0.0]] + VECS[1:], dtype=np.float64))])
+        with np.errstate(under="raise"):
+            ed.set_embeddings("m", 3, [_cov(vectors=np.array([[1e-50, 0.0, 0.0]] + VECS[1:], dtype=np.float64))])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert emb.vectors("title")[0].tolist()[1:] == [0.0, 0.0]
 
 
 def test_set_embeddings_and_the_recalc_transactions_in_the_documented_order(tmp_path):

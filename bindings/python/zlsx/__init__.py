@@ -3619,7 +3619,10 @@ def _vector_buffer(name: str, vectors, dim: int, keep: list):
     # view back unchanged — in-house r2 S3C-REL-208); the array itself
     # when it already is, one typed copy otherwise. Values narrow as
     # they are: an overflow is `inf`, not a warning (S3C-DOC-204).
-    with np.errstate(over="ignore"):
+    # The cast's own IEEE flags are nobody's business: an overflow is
+    # `inf`, an sNaN a NaN, a subnormal a subnormal — not a warning, not
+    # a `FloatingPointError` under a caller's `np.seterr` (r4 B-REL-402).
+    with np.errstate(all="ignore"):
         contiguous = np.require(arr, dtype=np.float32, requirements=("C", "A"))
     keep.append(contiguous)
     return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(contiguous.size)
@@ -4432,9 +4435,9 @@ class Editor:
         (a part past the 512 MiB read cap — sized from the inputs before
         a vector is read — or the recovery record past its ceiling). A
         refusal that fires after the first part is written (an
-        allocation failure, a content-types or workbook part the
-        carriers cannot patch) leaves the staged set partially replaced:
-        close the editor without saving. The recalc transactions —
+        allocation failure, an index past the cap, a content-types or
+        workbook part the carriers cannot patch) leaves the staged set
+        partially replaced: close the editor without saving. The recalc transactions —
         :meth:`mark_recalc_on_load` then :meth:`save`,
         :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
         candidate from the archive as opened and do NOT carry this

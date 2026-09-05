@@ -1376,6 +1376,37 @@ shipped targets load a misaligned float without a fault; the stale
 are corrected, and the unreachable "staged name collides with a chunk"
 residue clause is gone.
 
+**Round 4** (two agents, every round-3 fix verified, both ship-ready;
+the edges closed in-round): the strip's element, attribute-region and
+close scans were still lexical (a bare `indexOf` on `<definedName`, the
+first `>`, a bare `indexOf` on the close) while the fresh view uses the
+quote-aware `findTagEnd` and the comment-aware `findClosingTag` — a chunk
+with a quoted `>` in an attribute before `name`, or a decoy inside a
+comment, was seen differently by the strip and the view. The strip now
+walks with the parser's own `findTagOpen` / `findClosingTag` (a chunk
+with no close is `MalformedWorkbookXml` before any store write) and
+judges the DECODED name (`store_mod.decodeXmlEntities`, the splice's own
+reading — a character reference such as `&#95;zlsxRecovery0` was the one
+way the chunk form could hide; the early return considers `&#` too). The
+recovery-record READER, lexical by design over bytes a foreign tool may
+have rewritten, gained the same comment skip: a decoy chunk inside a
+comment used to be read as the record and the stripped read answered
+`absent`. Pinned in the third generation: the saved chunk re-spelled
+`comment="a>b" name = '&#95;zlsxRecovery0'` plus a single-quoted decoy
+inside a comment before the block — one live `_zlsxRecovery0` after, the
+decoy comment intact, the user's three names once, the stripped read the
+last model; `pkg/recovery_record.zig` pins the reader on the decoy, on a
+decoy-only part and on an unterminated comment. Python: the float32 cast
+runs under `np.errstate(all="ignore")` — round 3's "no cast in this
+direction raises `invalid`" was false (a signalling NaN does, and a
+caller's `np.seterr(under="raise")` fires on a subnormal); both pinned.
+The residue sentence is now on every surface (the docstring names the
+index past the cap, the README carries it), the PR body's counts agree
+with the suite. Carried: the record reader accepts `name='…'` / `name="…"`
+but not `name =` spacing and does not decode entities in the name — a
+foreign strip that also re-spells attributes would read as `absent`
+(pre-existing, the reader's own scope).
+
 **Recorded follow-up (round 2, S3C-REL-201 B — pre-existing, outside
 this slice, an owner decision)**: the recalc transactions rebuild their
 candidate from the archive AS OPENED (`PartStore.nextGeneration`:
@@ -1436,9 +1467,9 @@ in the view and the file, three user names kept once with their flags
 through the plan drop AND the strip, a foreign case-variant and a
 spaced single-quoted chunk stripped, the same workbook's `embeddings()`
 answering the new model, a stripped read reporting the LAST
-generation); `pkg/recovery_record.zig` pins `isChunkName`. Each
-round-1, round-2 and round-3 fix was mutation-checked: reverted, its
-Zig and C tests fail.
+generation); `pkg/recovery_record.zig` pins `isChunkName` and the reader's
+comment skip. Each fix of rounds 1–4 was mutation-checked: reverted,
+its Zig, C or Python tests fail.
 `tests/c_abi_smoke.c` `#error`s without the macro, takes the address
 and pins the struct. Python (`test_embedding_write.py`, 44): the goal
 line — `embeddings()` `present` after the write with the provenance,
@@ -1452,7 +1483,8 @@ record-ceiling refusal, nothing written; NumPy crossing without
 object / bool arrays judged, `2**64 - 1` as the tombstone; a
 misaligned view (the mechanism: an aligned buffer, an aligned array
 crossing as itself), masked hashes and a masked non-zero vector row, a
-masked array's shape and dtype rules, a float64 overflow under
-warnings-as-errors; the two documented recalc orders landing; seventeen
+masked array's shape and dtype rules, a float64 overflow, a signalling
+NaN under warnings-as-errors and a subnormal under a caller's
+`under="raise"`; the two documented recalc orders landing; seventeen
 Python-side shape errors; NumPy width against `dim`; the closed editor
 and the older-dylib `RuntimeError`; the probe against the version.
