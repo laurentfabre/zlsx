@@ -819,7 +819,12 @@ where their jobs do: the sweep reads the corners of a shape the read
 never lists, the read validates a one-cell anchor's `<ext>` the sweep
 does not move, a reversed `<to>` / `<from>` pair is listed and moved
 in document order, a self-closing wrapper is stepped over by both. Pinned on every surface
-by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. Not
+by the corpus test on `tests/corpus/openpyxl_chart.xlsx`. One
+consequence the listing makes reachable: `deleteSheet` leaves the
+doomed sheet's drawing and charts in the archive (the recorded
+orphan-part follow-up), and this read then refuses that workbook
+whole — `DrawingOnUnlistedSheet` — openpyxl workbooks included now
+that their drawings are listed (round 6, ND-REL-602). Not
 walked, by design: chartex parts (`<cx:f>`) and the `c15:` data-label
 range extension. Repeated
 reads stay bounded: the drawing walkers used to resolve every part

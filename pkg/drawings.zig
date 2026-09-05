@@ -4867,6 +4867,25 @@ test "anchors read: a `<` inside an attribute value is not well-formed — stric
     }
     var blip_buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("rId7", tryBlipEmbedAt("<a:blip desc=\"a>b\" r:embed=\"rId7\"/>", &blip_buf, "a").?);
+    // The discriminating shape for the local-binding window (in-house
+    // ND-MNT-601): a stub whose LOCAL `xmlns:c` rebinds to a non-chart
+    // URI behind a raw `>` in a value is not a chart — a quote-blind
+    // window ended at that `>`, missed the rebinding and served the
+    // root's `c` as a chart record.
+    {
+        var store = try PartStore.open(a, io, "tests/corpus/openpyxl_chart.xlsx");
+        defer store.deinit();
+        const drawing = (try store.part("xl/drawings/drawing1.xml")).?;
+        const patched = try std.mem.replaceOwned(u8, a, drawing.bytes, "<c:chart r:id=\"rId1\" />", "<c:chart desc=\"a>b\" xmlns:c=\"urn:not-a-chart\" r:id=\"rId1\" />");
+        defer a.free(patched);
+        try store.replacePart("xl/drawings/drawing1.xml", patched);
+        try store.save(io, path);
+        var s = try PartStore.open(a, io, path);
+        defer s.deinit();
+        const charts = try chartAnchorsIn(&s, a, .strict);
+        defer a.free(charts);
+        try std.testing.expectEqual(@as(usize, 0), charts.len);
+    }
     // The probe itself: escaped markup, a `>` in a value, quotes of
     // either kind, and regions are not violations; a `<` is, in either
     // quote; a part ending inside a quote is judged elsewhere.
