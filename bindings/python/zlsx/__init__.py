@@ -3593,11 +3593,11 @@ def _numpy_of(x):
 def _vector_buffer(name: str, vectors, dim: int, keep: list):
     """``vectors`` as ``(pointer, count)`` for the descriptor, the buffer
     parked in ``keep`` until the call returns. A NumPy array crosses
-    without a Python float in between: ``np.ascontiguousarray(…,
-    float32)`` is the array itself when it already is one, else one
-    typed copy (in-house r1 S3C-PERF-103 — ``tolist`` + a per-float
-    loop cost +2 s / +400 MB on 20 000 × 384). Anything else goes
-    through :func:`_flatten_vectors`."""
+    without a Python float in between: ``np.require(…, float32, ("C",
+    "A"))`` is the array itself when it already is contiguous and
+    aligned, else one typed copy (in-house r1 S3C-PERF-103 — ``tolist``
+    + a per-float loop cost +2 s / +400 MB on 20 000 × 384). Anything
+    else goes through :func:`_flatten_vectors`."""
     np = _numpy_of(vectors)
     if np is None:
         flat = _flatten_vectors(name, vectors, dim)
@@ -3619,7 +3619,7 @@ def _vector_buffer(name: str, vectors, dim: int, keep: list):
     # view back unchanged — in-house r2 S3C-REL-208); the array itself
     # when it already is, one typed copy otherwise. Values narrow as
     # they are: an overflow is `inf`, not a warning (S3C-DOC-204).
-    with np.errstate(over="ignore", invalid="ignore"):
+    with np.errstate(over="ignore"):
         contiguous = np.require(arr, dtype=np.float32, requirements=("C", "A"))
     keep.append(contiguous)
     return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(contiguous.size)
@@ -3634,9 +3634,16 @@ def _hash_buffer(name: str, hashes, tomb: int, keep: list):
     if np is not None:
         if np.ma.isMaskedArray(hashes):
             # A masked hash IS the tombstone: through the sequence path,
-            # where None spells it (in-house r2 S3C-REL-202).
+            # where None spells it (in-house r2 S3C-REL-202) — after the
+            # plain path's shape and dtype rules, which the branch used
+            # to skip (in-house r3 S3C-REL-301).
+            data = np.ma.getdata(hashes)
+            if data.ndim != 1:
+                raise ValueError(f"{name}: expected a 1-D array, got shape {tuple(data.shape)}")
+            if data.dtype.kind not in "iuO":
+                raise TypeError(f"{name}: hashes must be integers or None, not dtype {data.dtype}")
             mask = np.ma.getmaskarray(hashes).tolist()
-            hashes = [None if m else v for v, m in zip(np.ma.getdata(hashes).tolist(), mask)]
+            hashes = [None if m else v for v, m in zip(data.tolist(), mask)]
         else:
             arr = np.asarray(hashes)
             if arr.ndim != 1:

@@ -397,7 +397,7 @@ a column outside it), `DuplicateCoverageId`, `CoverageOverlap`,
 `InvalidXmlByte` (a control byte in the model name) — each before the
 first part is written; a workbook the set cannot land in refuses with a
 `ZlsxRefusal` (`MissingWorkbookRels` / `MalformedWorkbookRels`,
-`MissingRelationship`, `EmbeddingExceedsArchiveLimit` — a part past the
+`IdSpaceExhausted`, `MissingRelationship`, `EmbeddingExceedsArchiveLimit` — a part past the
 512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
 eighty coverages, or a ~3 KB model name). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are

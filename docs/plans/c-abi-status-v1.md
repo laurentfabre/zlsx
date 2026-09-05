@@ -1261,9 +1261,12 @@ the diag with `plane = NONE`: `MissingWorkbookRels` /
 `</Relationships>` the workbook→index relationship lands before, or
 `_rels/.rels` without it when `docProps/custom.xml` has to be created
 for the recovery record — both pre-flighted in pass 1) /
-`MissingRelationship` / `MissingContentTypes` / `MalformedContentTypes`
-/ `MalformedWorkbookXml` (already in `structural_refusals`) and
-`EmbeddingExceedsArchiveLimit` — new in the list — a part past the
+`MissingRelationship` / `IdSpaceExhausted` (the rels file's `rId`
+space, or an existing `docProps/custom.xml`'s `pid` space, already at
+`UINT32_MAX` — pre-flighted in pass 1, round 2) / `MissingContentTypes`
+/ `MalformedContentTypes` / `MalformedWorkbookXml` (already in
+`structural_refusals`) and `EmbeddingExceedsArchiveLimit` — new in the
+list — a part past the
 512 MiB read cap (`embedding_part.PART_MAX_BYTES`, the S1 per-part
 limit spelled once; sized from the inputs in the C layer before a
 vector byte is read, and again in the Zig write's pass 1) OR the
@@ -1275,8 +1278,8 @@ second spelling of "too big for the carrier". The Python leg mirrors
 S3a: `ZlsxError` / `ZlsxRefusal(error_name)`, with the shapes
 (`TypeError` / `ValueError`) checked before ctypes could truncate,
 through the same `_structural_call` helper; a NumPy matrix or hash
-array crosses as one contiguous float32 / uint64 buffer
-(`np.ascontiguousarray`, the array itself when it already is one),
+array crosses as one contiguous, aligned float32 / uint64 buffer
+(`np.require(…, ("C", "A"))`, the array itself when it already is one),
 never a Python float per value.
 
 **Three Zig-layer fixes the export exposed** (the
@@ -1307,11 +1310,10 @@ never a Python float per value.
   sizing (header + body, what the encoders emit) and the record's
   encoding (`encodeRecoveryRecord`, pass 2c; `installRecoveryRecord`
   last) now run before the first write. Residue, documented on every
-  surface: an allocation failure, an index XML past the cap, a
-  `[Content_Types].xml` or `xl/workbook.xml` the carriers cannot patch,
-  or (Zig-only) a staged defined name colliding with a `_zlsxRecoveryN`
-  chunk can still leave the set partially replaced — discard the
-  editor without saving. The three docProps `allocPrint` folds no
+  surface: an allocation failure, an index XML past the cap, or a
+  `[Content_Types].xml` or `xl/workbook.xml` the carriers cannot patch
+  can still leave the set partially replaced — discard the editor
+  without saving. The three docProps `allocPrint` folds no
   longer turn an allocation failure into a `-1 WriteFailed`; the
   remaining `WriteFailed` folds are `bufPrint`s the id and rId bounds
   cannot overflow.
@@ -1354,6 +1356,25 @@ float32 cast runs under `np.errstate(over="ignore")` (NumPy's overflow
 `Workbook.definedNames()`'s lifetime is stated (until the next view
 swap). `Dtype.recordBytes` multiplies in `usize` unchecked — 64-bit on
 every shipped target.
+
+**Round 3** (two agents, every round-2 fix verified): the strip judged
+`name` only in its `name="…"` spelling while the typed parser (and so
+the fresh view the save-time splice reads) accepts either quote and XML
+whitespace around `=` — a single-quoted or spaced chunk from a foreign
+serializer survived the strip and the round-1 shape returned for that
+spelling. The strip now reads the attribute through
+`workbook_xml.getAttr`, the parser's one acceptance (the S3B-REL-1201
+rule); a third generation over saved bytes pins the strip itself (the
+user's three names kept once, a `name = '_zlsxRecovery0'` chunk
+stripped, the new record alone). Python: `_hash_buffer`'s masked branch
+skipped the plain path's shape and dtype rules (a masked `(n, 1)` array
+landed as tombstones) — judged first now; the masked-vector pin masks a
+non-zero row; the alignment pin asserts the mechanism (an aligned,
+C-contiguous buffer; an aligned array crossing as itself), since the
+shipped targets load a misaligned float without a fault; the stale
+`np.ascontiguousarray` wording and the `embeddings()` getter's lifetime
+are corrected, and the unreachable "staged name collides with a chunk"
+residue clause is gone.
 
 **Recorded follow-up (round 2, S3C-REL-201 B — pre-existing, outside
 this slice, an owner decision)**: the recalc transactions rebuild their
@@ -1410,13 +1431,14 @@ byte rule over every value 0x00–0x7F and through `encodeIndexXml`.
 part, both rels pre-flights leaving no part, an exhausted `rId` and
 `pid` space leaving no part, the record ceiling (120 one-row
 coverages, a 3300-byte model) leaving no part while forty coverages
-land, and the re-embed across a save (one name in the view and the
-file, three user names kept once with their flags, a foreign
-case-variant chunk stripped, the same workbook's `embeddings()`
+land, and the re-embed across a save over three generations (one name
+in the view and the file, three user names kept once with their flags
+through the plan drop AND the strip, a foreign case-variant and a
+spaced single-quoted chunk stripped, the same workbook's `embeddings()`
 answering the new model, a stripped read reporting the LAST
 generation); `pkg/recovery_record.zig` pins `isChunkName`. Each
-round-1 and round-2 fix was mutation-checked: reverted, its Zig and C
-tests fail.
+round-1, round-2 and round-3 fix was mutation-checked: reverted, its
+Zig and C tests fail.
 `tests/c_abi_smoke.c` `#error`s without the macro, takes the address
 and pins the struct. Python (`test_embedding_write.py`, 44): the goal
 line — `embeddings()` `present` after the write with the provenance,
@@ -1428,7 +1450,9 @@ the `MalformedWorkbookRels` `ZlsxRefusal` on either rels file and the
 record-ceiling refusal, nothing written; NumPy crossing without
 `tolist` (an ndarray subclass whose `tolist` raises), signed / float /
 object / bool arrays judged, `2**64 - 1` as the tombstone; a
-misaligned view, masked hashes and vectors, a float64 overflow under
+misaligned view (the mechanism: an aligned buffer, an aligned array
+crossing as itself), masked hashes and a masked non-zero vector row, a
+masked array's shape and dtype rules, a float64 overflow under
 warnings-as-errors; the two documented recalc orders landing; seventeen
 Python-side shape errors; NumPy width against `dim`; the closed editor
 and the older-dylib `RuntimeError`; the probe against the version.

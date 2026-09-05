@@ -383,7 +383,10 @@ def test_set_embeddings_numpy_edges_alignment_masks_and_overflow(tmp_path):
     misaligned = np.frombuffer(payload, dtype=np.float32, offset=1).reshape(3, 3)
     assert misaligned.ctypes.data % 4 == 1
     hashes = np.ma.masked_array([1, 2, 3], mask=[False, True, False])
-    masked_vecs = np.ma.masked_array(np.array(VECS, dtype=np.float32), mask=[[False] * 3, [True] * 3, [False] * 3])
+    # Row 2 carries non-zero data under its mask: only the fill proves
+    # the mask was honoured (a masked row of zeros would prove nothing).
+    masked_vecs = np.ma.masked_array(np.array(VECS, dtype=np.float32), mask=[[False] * 3, [False] * 3, [True] * 3])
+    assert masked_vecs.data[2].tolist() == VECS[2] and any(VECS[2])
     with zlsx.Editor(src) as ed:
         ed.set_embeddings("m", 3, [_cov(vectors=misaligned, hashes=hashes)])
         ed.save(out)
@@ -391,12 +394,31 @@ def test_set_embeddings_numpy_edges_alignment_masks_and_overflow(tmp_path):
         assert np.array_equal(emb.vectors("title"), np.array(VECS, dtype=np.float32))
         assert emb.valid_mask("title").tolist() == [True, False, True]
         assert emb.hashes("title").tolist()[0] == 1 and emb.hashes("title").tolist()[2] == 3
+    # The mechanism itself, since the shipped targets load a misaligned
+    # float without a fault: the buffer handed over is aligned and
+    # C-contiguous, and an already-aligned array crosses as itself.
+    import ctypes
+
+    keep: list = []
+    ptr, n = zlsx._vector_buffer("v", misaligned, 3, keep)
+    assert n == 9 and ctypes.addressof(ptr.contents) % 4 == 0
+    assert keep[-1].flags.aligned and keep[-1].flags.c_contiguous
+    aligned = np.array(VECS, dtype=np.float32)
+    ptr, n = zlsx._vector_buffer("v", aligned, 3, keep)
+    assert ctypes.addressof(ptr.contents) == aligned.ctypes.data and keep[-1] is aligned
     with zlsx.Editor(src) as ed:
         ed.set_embeddings("m", 3, [_cov(vectors=masked_vecs, hashes=[1, None, 3])])
         ed.save(out)
     with zlsx.embeddings(out) as emb:
         got = emb.vectors("title")
-        assert got[1].tolist() == [0.0, 0.0, 0.0] and got[0].tolist() == VECS[0]
+        assert got[2].tolist() == [0.0, 0.0, 0.0] and got[0].tolist() == VECS[0]
+    # A masked hash array is judged like a plain one: shape and dtype.
+    with zlsx.Editor(src) as ed:
+        with pytest.raises(ValueError):
+            ed.set_embeddings("m", 3, [_cov(hashes=np.ma.masked_array([[1], [2], [3]], mask=[[False], [True], [False]]))])
+        with pytest.raises(TypeError):
+            ed.set_embeddings("m", 3, [_cov(hashes=np.ma.masked_array([1.0, 2.0, 3.0], mask=[False, True, False]))])
+        assert ed.save_to_buffer() == src.read_bytes()
     with zlsx.Editor(src) as ed:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
