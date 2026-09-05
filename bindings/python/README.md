@@ -401,11 +401,14 @@ first part is written; a workbook the set cannot land in refuses with a
 512 MiB cap, or the recovery record past its 16 × 200-byte ceiling: roughly
 eighty coverages, or a ~3 KB model name). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
-(a float64 past its range lands as `inf`), and `2**64 - 1` is the
-tombstone. The per-row content hashes are the caller's to compute today
-(the embeddable-rows read is the next S3c slice); `recovery_in_cells` (the
-Numbers-durable carrier) is Zig-only until the editor grows a path for its
-hidden sheet.
+(a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
+and a masked array's masked slots are "no value". The recalc transactions
+(`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
+rebuild from the archive as opened and do not carry a staged embedding
+write — call them before it, or save and re-open. The per-row content
+hashes are the caller's to compute today (the embeddable-rows read is the
+next S3c slice); `recovery_in_cells` (the Numbers-durable carrier) is
+Zig-only until the editor grows a path for its hidden sheet.
 
 ## Spark (PySpark Data Source)
 

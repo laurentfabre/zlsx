@@ -1327,6 +1327,50 @@ never a Python float per value.
   own copy before the store write and swaps it, the add-sheet pattern;
   both replacement tests count the name carrier (S3C-TEST-107).
 
+**Round 2** (two agents, every round-1 fix verified, no HIGH): the one
+register-time failure the pre-flight did not mirror — `nextMaxNumericAttr(…)
++ 1` unchecked in `registerWorkbookEmbeddingsRel` (`rId`) and
+`upsertRecoveryDocProp` (`pid`), a hostile `rId4294967295` /
+`pid="4294967295"` trapping in Debug or wrapping in ReleaseFast after
+every part — is checked arithmetic now (`IdSpaceExhausted`, `addSheet`'s
+spelling, already `-2`) and pre-flighted in pass 1 on both files. The
+strip judged "ours" by a substring over the attribute region and
+case-sensitively: a user's `_zlsxRecoveryMine` was deleted (final since
+the round-1 view refresh) and a foreign tool's `_ZLSXRECOVERY0` survived
+beside ours; `recovery_record.isChunkName` — the exact
+`_zlsxRecovery<digits>` form, case-insensitive — now governs the plan
+drop and the strip, pinned with three user names (one hidden, one
+prefixed) surviving a re-embed across a save once, flags intact, and the
+case variant stripped. `Workbook.setEmbeddings` invalidates the cached
+`embeddings()` view (Zig-only: the same workbook read the previous set
+back). The docProps upsert writes through an `ArrayListUnmanaged` (the
+`Allocating` writer spelled an allocation failure `WriteFailed`, a `-1`
+after the parts). The C layer judges the call's lengths (`-1`) before the
+cap (`-2`). Python: `np.require(…, ("C", "A"))` — a misaligned
+`frombuffer(offset=1)` view is copied, an aligned array still crosses as
+itself; a masked hash is the tombstone and a masked vector value 0; the
+float32 cast runs under `np.errstate(over="ignore")` (NumPy's overflow
+`RuntimeWarning` was an exception under warnings-as-errors).
+`Workbook.definedNames()`'s lifetime is stated (until the next view
+swap). `Dtype.recordBytes` multiplies in `usize` unchecked — 64-bit on
+every shipped target.
+
+**Recorded follow-up (round 2, S3C-REL-201 B — pre-existing, outside
+this slice, an owner decision)**: the recalc transactions rebuild their
+candidate from the archive AS OPENED (`PartStore.nextGeneration`:
+"overrides are NOT inherited") and `recalc_txn.prepare` re-applies only
+the Editor's cell parts — so `mark_recalc_on_load` + `save` after
+`set_embeddings` persists a STRIPPED file (the record spliced, the parts
+gone), `save_with_recalc` writes the parts but drops the hidden-name
+carrier, `rename_sheet` + `mark_recalc_on_load` silently reverts the
+rename, and `insert_row` / `add_sheet` + `mark_recalc_on_load` + `save`
+ABORTS the process on the `sheetCount` assert. The fix belongs to the
+transactions (refuse while the live generation has installs — the
+`requireCompleteStructuralState` precedent — or build the candidate
+over the live generation). This slice states the ordering rule on the
+three surfaces ("call the recalc transactions before the write, or
+save and re-open") and pins both safe orders in Python.
+
 **Recorded, not lifted**: the index read hands `model` / `id` /
 `worksheet_target` attributes back raw (no entity decoding), so a model
 name carrying `&`, `<` or `"` reads back as `&amp;` … on every surface —
@@ -1353,22 +1397,28 @@ name in errbuf, the diag as prep left it, the NULL-with-length-0 rule,
 `StructSizeTooSmall` byte-for-byte, and `save_to_buffer` equal to the
 source (nothing written); the `-2` `MalformedWorkbookRels` with a
 poisoned diag reset and nothing written, plus `statusOf` pinned on both
-vocabularies; the three refusals that used to fire after the parts —
-`_rels/.rels` without its close tag, a 3300-byte model, a one-row
-2^27-wide f32 coverage and a full-grid 2^20-wide one refused from the
-inputs before a vector byte is read — each with `save_to_buffer` equal
-to the source; the body encoder under `checkAllAllocationFailures`.
+vocabularies; the refusals that used to fire after the parts —
+`_rels/.rels` without its close tag, a rels file at `rId4294967295`,
+a 3300-byte model, a one-row 2^27-wide f32 coverage and a full-grid
+2^20-wide one refused from the inputs before a vector byte is read —
+each with `save_to_buffer` equal to the source; the body encoder under
+`checkAllAllocationFailures`.
 `pkg/embedding_part.zig`: the encoders read back through
 `decodeAllF32`, shape checks before any byte moves, the column rule, the
 byte rule over every value 0x00–0x7F and through `encodeIndexXml`.
 `pkg/workbook.zig`: the column and control-byte refusals leaving no
-part, both rels pre-flights leaving no part, the record ceiling (120
-one-row coverages, a 3300-byte model) leaving no part while forty
-coverages land, and the re-embed across a save (one name in the view
-and the file, a stripped read reporting the LAST generation). Each
-round-1 fix was mutation-checked: reverted, its Zig and C tests fail.
+part, both rels pre-flights leaving no part, an exhausted `rId` and
+`pid` space leaving no part, the record ceiling (120 one-row
+coverages, a 3300-byte model) leaving no part while forty coverages
+land, and the re-embed across a save (one name in the view and the
+file, three user names kept once with their flags, a foreign
+case-variant chunk stripped, the same workbook's `embeddings()`
+answering the new model, a stripped read reporting the LAST
+generation); `pkg/recovery_record.zig` pins `isChunkName`. Each
+round-1 and round-2 fix was mutation-checked: reverted, its Zig and C
+tests fail.
 `tests/c_abi_smoke.c` `#error`s without the macro, takes the address
-and pins the struct. Python (`test_embedding_write.py`, 42): the goal
+and pins the struct. Python (`test_embedding_write.py`, 44): the goal
 line — `embeddings()` `present` after the write with the provenance,
 the cells untouched, both carriers; vectors / hashes / `valid_mask`
 read back and re-embedded on the read side's own arrays; int8-sym;
@@ -1377,6 +1427,8 @@ reporting the last model; fourteen named `ZlsxError`s writing nothing;
 the `MalformedWorkbookRels` `ZlsxRefusal` on either rels file and the
 record-ceiling refusal, nothing written; NumPy crossing without
 `tolist` (an ndarray subclass whose `tolist` raises), signed / float /
-object / bool arrays judged, `2**64 - 1` as the tombstone; seventeen
+object / bool arrays judged, `2**64 - 1` as the tombstone; a
+misaligned view, masked hashes and vectors, a float64 overflow under
+warnings-as-errors; the two documented recalc orders landing; seventeen
 Python-side shape errors; NumPy width against `dim`; the closed editor
 and the older-dylib `RuntimeError`; the probe against the version.

@@ -2140,8 +2140,11 @@ typedef struct zlsx_emb_coverage_v1 {
  * without the </Relationships> the workbook→index relationship
  * lands before, or a _rels/.rels without it when docProps/custom.xml
  * has to be created for the recovery record (both checked before the
- * first write); MissingRelationship — a sheet whose part the
- * workbook's rels do not reach; EmbeddingExceedsArchiveLimit — a
+ * first write); IdSpaceExhausted — the rels file's rId space, or an
+ * existing docProps/custom.xml's pid space, already at UINT32_MAX (a
+ * hostile part; checked before the first write); MissingRelationship
+ * — a sheet whose part the workbook's rels do not reach;
+ * EmbeddingExceedsArchiveLimit — a
  * part past the 512 MiB read cap (sized here from the inputs, before
  * a vector byte is read), OR the recovery record past its ceiling of
  * 16 × 200 bytes — roughly eighty coverages at typical ids, or a
@@ -2151,9 +2154,14 @@ typedef struct zlsx_emb_coverage_v1 {
  * write — an allocation failure, an index past the cap, a content
  * types or workbook part the carriers cannot patch — leaves the
  * staged part set partially replaced: discard the editor without
- * saving. The record's hidden _zlsxRecoveryN defined names are
- * staged with the workbook plan and appear in
- * zlsx_editor_defined_names_ndjson only after a save. Inherited from
+ * saving. The recalc transactions — zlsx_editor_mark_recalc_on_load
+ * then save, zlsx_editor_save_with_recalc, zlsx_editor_recalculate —
+ * rebuild their candidate from the archive as opened and do NOT carry
+ * this write: call them before it, or save and re-open (a recorded,
+ * pre-existing rule of the transaction's generation model). The
+ * record's hidden _zlsxRecoveryN defined names are staged with the
+ * workbook plan and appear in zlsx_editor_defined_names_ndjson only
+ * after a save. Inherited from
  * the Zig surface and unchanged here: the index read hands model /
  * id / target attributes back raw, so a model name carrying `&`, `<`
  * or `"` reads back entity-escaped, and a tab / LF / CR in it reads

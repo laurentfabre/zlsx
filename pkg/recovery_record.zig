@@ -98,6 +98,31 @@ pub const MAX_CHUNKS: usize = 16;
 /// Custom document property name for the secondary carrier.
 pub const DOC_PROP_NAME: []const u8 = "ZlsxEmbeddingRecovery";
 
+/// Whether `name` is one of the record's chunk names: the exact
+/// `_zlsxRecovery<digits>` form, compared case-insensitively because a
+/// defined name's identity is (Excel folds case). A user's
+/// `_zlsxRecoveryMine` is NOT ours — the strip used to delete any name
+/// carrying the prefix, and a foreign tool's `_ZLSXRECOVERY0` used to
+/// survive beside ours (in-house r2 S3C-REL-203).
+pub fn isChunkName(name: []const u8) bool {
+    if (name.len <= NAME_PREFIX.len) return false;
+    if (!std.ascii.eqlIgnoreCase(name[0..NAME_PREFIX.len], NAME_PREFIX)) return false;
+    for (name[NAME_PREFIX.len..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "isChunkName: the exact chunk form, case-insensitive; a user's prefixed name is not ours" {
+    try testing.expect(isChunkName("_zlsxRecovery0"));
+    try testing.expect(isChunkName("_zlsxRecovery15"));
+    try testing.expect(isChunkName("_ZLSXRECOVERY0"));
+    try testing.expect(isChunkName("_ZlsxRecovery7"));
+    try testing.expect(!isChunkName("_zlsxRecovery"));
+    try testing.expect(!isChunkName("_zlsxRecoveryMine"));
+    try testing.expect(!isChunkName("_zlsxRecovery0x"));
+    try testing.expect(!isChunkName("zlsxRecovery0"));
+    try testing.expect(!isChunkName(""));
+}
+
 /// Sheet that carries the record when the cell carrier is enabled.
 ///
 /// Opt-in, because it is the one carrier a user can see: Sheet ▸ Unhide

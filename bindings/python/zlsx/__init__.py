@@ -3604,6 +3604,10 @@ def _vector_buffer(name: str, vectors, dim: int, keep: list):
         buf = (ctypes.c_float * max(len(flat), 1))(*flat)
         keep.append(buf)
         return ctypes.cast(buf, ctypes.POINTER(ctypes.c_float)), len(flat)
+    # A masked slot is NumPy's spelling of "no value": it lands as 0,
+    # a tombstoned row's bytes (in-house r2 S3C-REL-202).
+    if np.ma.isMaskedArray(vectors):
+        vectors = np.ma.filled(vectors, 0)
     arr = np.asarray(vectors)
     if arr.dtype.kind not in "iuf":
         raise TypeError(f"{name}: vector values must be numbers, not dtype {arr.dtype}")
@@ -3611,7 +3615,12 @@ def _vector_buffer(name: str, vectors, dim: int, keep: list):
         raise ValueError(f"{name}: expected a 1-D or 2-D array, got shape {tuple(arr.shape)}")
     if arr.ndim == 2 and dim and arr.shape[1] != dim:
         raise ValueError(f"{name}: expected {dim} columns, got {arr.shape[1]}")
-    contiguous = np.ascontiguousarray(arr, dtype=np.float32)
+    # C-contiguous AND aligned (`ascontiguousarray` hands a misaligned
+    # view back unchanged — in-house r2 S3C-REL-208); the array itself
+    # when it already is, one typed copy otherwise. Values narrow as
+    # they are: an overflow is `inf`, not a warning (S3C-DOC-204).
+    with np.errstate(over="ignore", invalid="ignore"):
+        contiguous = np.require(arr, dtype=np.float32, requirements=("C", "A"))
     keep.append(contiguous)
     return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(contiguous.size)
 
@@ -3623,18 +3632,24 @@ def _hash_buffer(name: str, hashes, tomb: int, keep: list):
     :func:`_hash_values` (which maps ``None`` to the tombstone)."""
     np = _numpy_of(hashes)
     if np is not None:
-        arr = np.asarray(hashes)
-        if arr.ndim != 1:
-            raise ValueError(f"{name}: expected a 1-D array, got shape {tuple(arr.shape)}")
-        if arr.dtype.kind in "iu":
-            if arr.dtype.kind == "i" and arr.size and int(arr.min()) < 0:
-                raise ValueError(f"{name}: every hash must be in [0, 2**64)")
-            contiguous = np.ascontiguousarray(arr, dtype=np.uint64)
-            keep.append(contiguous)
-            return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)), int(contiguous.size)
-        if arr.dtype.kind != "O":
-            raise TypeError(f"{name}: hashes must be integers or None, not dtype {arr.dtype}")
-        hashes = arr.tolist()
+        if np.ma.isMaskedArray(hashes):
+            # A masked hash IS the tombstone: through the sequence path,
+            # where None spells it (in-house r2 S3C-REL-202).
+            mask = np.ma.getmaskarray(hashes).tolist()
+            hashes = [None if m else v for v, m in zip(np.ma.getdata(hashes).tolist(), mask)]
+        else:
+            arr = np.asarray(hashes)
+            if arr.ndim != 1:
+                raise ValueError(f"{name}: expected a 1-D array, got shape {tuple(arr.shape)}")
+            if arr.dtype.kind in "iu":
+                if arr.dtype.kind == "i" and arr.size and int(arr.min()) < 0:
+                    raise ValueError(f"{name}: every hash must be in [0, 2**64)")
+                contiguous = np.require(arr, dtype=np.uint64, requirements=("C", "A"))
+                keep.append(contiguous)
+                return contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)), int(contiguous.size)
+            if arr.dtype.kind != "O":
+                raise TypeError(f"{name}: hashes must be integers or None, not dtype {arr.dtype}")
+            hashes = arr.tolist()
     values = _hash_values(name, hashes, tomb)
     buf = (ctypes.c_uint64 * max(len(values), 1))(*values)
     keep.append(buf)
@@ -4371,12 +4386,14 @@ class Editor:
         content hashes :meth:`Embeddings.hashes` returns (``None`` is
         the tombstone :meth:`Embeddings.valid_mask` reads), so
         read → re-embed → write round-trips on one shape. A NumPy
-        array crosses as one contiguous float32 / uint64 buffer (the
-        array itself when it already is one, else a typed copy — never
-        a Python float per value); a sequence is converted value by
-        value. Values narrow to float32 as they are — a float64 past
-        its range lands as ``inf``, and ``NaN`` quantizes to 0 under
-        int8 — and ``2**64 - 1`` IS the tombstone, written as such.
+        array crosses as one contiguous, aligned float32 / uint64 buffer
+        (the array itself when it already is one, else a typed copy —
+        never a Python float per value); a sequence is converted value
+        by value. Values narrow to float32 as they are — a float64 past
+        its range lands as ``inf`` without a warning, and ``NaN``
+        quantizes to 0 under int8 — and ``2**64 - 1`` IS the tombstone,
+        written as such. A masked array's masked slots are "no value":
+        a masked hash is the tombstone, a masked vector value is 0.
         ``dtype`` is ``"f32"`` or ``"int8-sym-per-vec"`` (quantized in
         the library, one float32 scale per row); the other names
         :attr:`Embeddings.dtype` can report have no writer
@@ -4401,14 +4418,21 @@ class Editor:
         ``MalformedWorkbookRels`` (no ``xl/_rels/workbook.xml.rels`` — or
         no ``_rels/.rels`` close tag when ``docProps/custom.xml`` has to
         be created — to register a relationship in; checked before the
-        first write), ``MissingRelationship`` (a sheet whose part the
-        workbook does not reach), ``EmbeddingExceedsArchiveLimit`` (a
-        part past the 512 MiB read cap — sized from the inputs before a
-        vector is read — or the recovery record past its ceiling). A
+        first write), ``IdSpaceExhausted`` (a rels ``rId`` or custom
+        property ``pid`` space already at ``2**32 - 1``; checked before
+        the first write), ``MissingRelationship`` (a sheet whose part
+        the workbook does not reach), ``EmbeddingExceedsArchiveLimit``
+        (a part past the 512 MiB read cap — sized from the inputs before
+        a vector is read — or the recovery record past its ceiling). A
         refusal that fires after the first part is written (an
         allocation failure, a content-types or workbook part the
         carriers cannot patch) leaves the staged set partially replaced:
-        close the editor without saving. Shapes are checked here first
+        close the editor without saving. The recalc transactions —
+        :meth:`mark_recalc_on_load` then :meth:`save`,
+        :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
+        candidate from the archive as opened and do NOT carry this
+        write: call them before it, or save and re-open (a recorded,
+        pre-existing rule of the transaction's generation model). Shapes are checked here first
         — a ``TypeError`` for a non-dict coverage, a non-string id /
         range / column, a bool where a number belongs, a non-numeric
         array; a ``ValueError`` for an unknown or missing key, a ragged

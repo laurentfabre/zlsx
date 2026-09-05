@@ -367,6 +367,78 @@ def test_set_embeddings_numpy_width_is_checked_against_dim(tmp_path):
         ed.set_embeddings("m", 3, [_cov(vectors=np.zeros(9, dtype=np.float32))])
 
 
+def test_set_embeddings_numpy_edges_alignment_masks_and_overflow(tmp_path):
+    """A misaligned view (``frombuffer`` at an odd offset) is copied to
+    an aligned buffer; a masked hash is the tombstone and a masked
+    vector value is 0; a float64 overflow narrows to ``inf`` without a
+    warning (warnings-as-errors stays silent)."""
+    np = pytest.importorskip("numpy")
+    import warnings
+
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    _write_fixture(src)
+    payload = b"\x00" + np.array(VECS, dtype=np.float32).tobytes()
+    misaligned = np.frombuffer(payload, dtype=np.float32, offset=1).reshape(3, 3)
+    assert misaligned.ctypes.data % 4 == 1
+    hashes = np.ma.masked_array([1, 2, 3], mask=[False, True, False])
+    masked_vecs = np.ma.masked_array(np.array(VECS, dtype=np.float32), mask=[[False] * 3, [True] * 3, [False] * 3])
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [_cov(vectors=misaligned, hashes=hashes)])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert np.array_equal(emb.vectors("title"), np.array(VECS, dtype=np.float32))
+        assert emb.valid_mask("title").tolist() == [True, False, True]
+        assert emb.hashes("title").tolist()[0] == 1 and emb.hashes("title").tolist()[2] == 3
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [_cov(vectors=masked_vecs, hashes=[1, None, 3])])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        got = emb.vectors("title")
+        assert got[1].tolist() == [0.0, 0.0, 0.0] and got[0].tolist() == VECS[0]
+    with zlsx.Editor(src) as ed:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ed.set_embeddings("m", 3, [_cov(vectors=np.array([[1e39, -1e39, 0.1]] + VECS[1:], dtype=np.float64))])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        row = emb.vectors("title")[0]
+        assert np.isinf(row[0]) and np.isinf(row[1]) and abs(row[2] - 0.1) < 1e-6
+
+
+def test_set_embeddings_and_the_recalc_transactions_in_the_documented_order(tmp_path):
+    """The recalc transactions rebuild from the archive as opened and
+    do not carry a staged embedding write (a recorded, pre-existing
+    rule of the generation model): marking BEFORE the write lands, and
+    so does saving, re-opening, then marking."""
+    _needs_write()
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_MARK_RECALC:
+        pytest.skip("loaded libzlsx predates mark_recalc_on_load")
+    src = tmp_path / "src.xlsx"
+    mid = tmp_path / "mid.xlsx"
+    out = tmp_path / "out.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.mark_recalc_on_load()
+        ed.set_embeddings("m", 3, [TITLE])
+        ed.save(mid)
+    with zlsx.embeddings(mid) as emb:
+        assert emb.present and emb.model == "m"
+    assert b'fullCalcOnLoad="1"' in zipfile.ZipFile(mid).read("xl/workbook.xml")
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m2", 3, [TITLE])
+        ed.save(mid)
+    with zlsx.Editor(mid) as ed:
+        ed.mark_recalc_on_load()
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert emb.present and emb.model == "m2"
+    assert b'fullCalcOnLoad="1"' in zipfile.ZipFile(out).read("xl/workbook.xml")
+
+
 def test_set_embeddings_closed_editor_and_older_dylib(tmp_path, monkeypatch):
     import zlsx._ffi as ffi
 
