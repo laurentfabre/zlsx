@@ -36,7 +36,7 @@ import threading
 import time
 from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import _ffi
 
@@ -3579,6 +3579,66 @@ def _path_as_ubyte(pbytes):
     return ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)), buf
 
 
+def _flatten_vectors(name: str, vectors, dim: int) -> list[float]:
+    """``vectors`` as one row-major float list: a NumPy array (2-D
+    ``(rows, dim)`` or flat), a sequence of rows or a flat sequence of
+    numbers. A ragged row, a wrong width or a bool is refused here,
+    where the message can name the coverage; the row COUNT is the C
+    side's to judge against the range (``InvalidEmbeddingInput``)."""
+    import numbers
+
+    if hasattr(vectors, "tolist") and hasattr(vectors, "shape"):
+        shape = tuple(vectors.shape)
+        if len(shape) == 2 and dim and shape[1] != dim:
+            raise ValueError(f"{name}: expected {dim} columns, got {shape[1]}")
+        if len(shape) > 2:
+            raise ValueError(f"{name}: expected a 1-D or 2-D array, got shape {shape}")
+        vectors = vectors.tolist()
+    if isinstance(vectors, (str, bytes)):
+        raise TypeError(f"{name}: expected a sequence of numbers, not {type(vectors).__name__}")
+    items = list(vectors)
+    rows = items
+    if items and not isinstance(items[0], numbers.Real):
+        rows = []
+        for r, row in enumerate(items):
+            if isinstance(row, (str, bytes)):
+                raise TypeError(f"{name}: row {r} is not a sequence of numbers")
+            row_l = list(row)
+            # dim 0 is the C side's to refuse (InvalidEmbeddingInput),
+            # not a width to check rows against.
+            if dim and len(row_l) != dim:
+                raise ValueError(f"{name}: row {r} has {len(row_l)} values, expected {dim}")
+            rows.extend(row_l)
+    out: list[float] = []
+    for x in rows:
+        if isinstance(x, bool) or not isinstance(x, numbers.Real):
+            raise TypeError(f"{name}: vector values must be numbers, not {type(x).__name__}")
+        out.append(float(x))
+    return out
+
+
+def _hash_values(name: str, hashes, tomb: int) -> list[int]:
+    """``hashes`` as one uint64 per row; ``None`` is the tombstone."""
+    import operator
+
+    if hasattr(hashes, "tolist"):
+        hashes = hashes.tolist()
+    if isinstance(hashes, (str, bytes)):
+        raise TypeError(f"{name}: expected a sequence of ints, not {type(hashes).__name__}")
+    out: list[int] = []
+    for r, h in enumerate(hashes):
+        if h is None:
+            out.append(tomb)
+            continue
+        if isinstance(h, bool):
+            raise TypeError(f"{name}: row {r} must be an int or None, not bool")
+        v = operator.index(h)
+        if v < 0 or v > 0xFFFF_FFFF_FFFF_FFFF:
+            raise ValueError(f"{name}: row {r} must be in [0, 2**64), got {h!r}")
+        out.append(v)
+    return out
+
+
 class Editor:
     """Open an existing xlsx; append rows, set cells, insert / delete
     rows and columns, add / rename / delete sheets, rename table
@@ -4219,6 +4279,137 @@ class Editor:
             _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
+
+    _EMB_COVERAGE_KEYS = frozenset(
+        {"id", "sheet", "range", "column", "vectors", "hashes", "include_formulas"}
+    )
+
+    def set_embeddings(
+        self,
+        model: str,
+        dim: int,
+        coverages: Sequence[dict],
+        *,
+        dtype: str = "f32",
+    ) -> None:
+        """Write the workbook's embedding set — ``Workbook.setEmbeddings``
+        on the editor handle: the index, a vec / hashes part per
+        coverage, the workbook→index relationship and the recovery
+        record in its two invisible carriers (a hidden defined name and
+        ``docProps/custom.xml``). Replaces any previous set; staged in
+        memory, committed by :meth:`save` / :meth:`save_to_buffer`; read
+        back with :func:`embeddings` (``present``).
+
+        Each coverage is a dict::
+
+            {"id": "title",           # 1–63 of [A-Za-z0-9_-]
+             "sheet": 0,              # sheet index, 0-based
+             "range": "A2:A100",      # the covered rows, A1 form
+             "column": "A",           # the embedded column, inside the range
+             "vectors": rows_x_dim,   # float32: a NumPy array (2-D or flat),
+                                      #   a sequence of rows, or a flat sequence
+             "hashes": [...],         # one int in [0, 2**64) per row;
+                                      #   None = no vector (tombstone)
+             "include_formulas": False}   # optional
+
+        ``vectors`` is the ``(rows, dim)`` float32 matrix
+        :meth:`Embeddings.vectors` returns and ``hashes`` the per-row
+        content hashes :meth:`Embeddings.hashes` returns (``None`` is
+        the tombstone :meth:`Embeddings.valid_mask` reads), so
+        read → re-embed → write round-trips on one shape. ``dtype`` is
+        ``"f32"`` or ``"int8-sym-per-vec"`` (quantized in the library,
+        one float32 scale per row); the other names
+        :attr:`Embeddings.dtype` can report have no writer
+        (``UnsupportedDtype``).
+
+        Statements about the call raise a plain :class:`ZlsxError`
+        named after the cause, each before the first part is written:
+        ``InvalidEmbeddingInput`` (no coverage, ``dim`` 0, a vector or
+        hash count that disagrees with the range), ``InvalidDtype`` /
+        ``UnsupportedDtype``, ``SheetIndexOutOfRange``,
+        ``InvalidCoverageId``, ``InvalidRange`` (the range, or a column
+        outside it), ``DuplicateCoverageId``, ``CoverageOverlap``,
+        ``InvalidXmlByte`` (a C0 control byte in ``model``). A workbook
+        the set cannot land in refuses with a :class:`ZlsxRefusal`
+        (``error_name``): ``MissingWorkbookRels`` /
+        ``MalformedWorkbookRels`` (no ``xl/_rels/workbook.xml.rels`` to
+        register the relationship in — checked before the first write),
+        ``MissingRelationship`` (a sheet whose part the workbook does
+        not reach), ``EmbeddingExceedsArchiveLimit`` (a part past the
+        512 MiB read cap). Shapes are checked here first — a
+        ``TypeError`` for a non-dict coverage, a non-string id / range /
+        column, a bool where a number belongs; a ``ValueError`` for an
+        unknown or missing key, a ragged matrix, a hash outside
+        ``[0, 2**64)`` — before ctypes could truncate. Inherited from the
+        Zig surface: the index read hands the model name back raw, so
+        one carrying ``&``, ``<`` or ``"`` reads back entity-escaped.
+
+        Requires libzlsx 0.9.0+ (``zlsx_editor_set_embeddings``).
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EMBEDDING_WRITE:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_set_embeddings "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        if not isinstance(model, str):
+            raise TypeError(f"model must be a str, not {type(model).__name__}")
+        if not isinstance(dtype, str):
+            raise TypeError(f"dtype must be a str, not {type(dtype).__name__}")
+        dim_v = self._u32("dim", dim)
+        if isinstance(coverages, (str, bytes, dict)):
+            raise TypeError("coverages must be a sequence of coverage dicts")
+        covs = list(coverages)
+        tomb = int(_ffi.lib.zlsx_emb_tombstone())
+        # Every buffer the descriptors point into lives in `keep` until
+        # the call returns; ctypes does not own what it points at.
+        keep: list = []
+        arr = (_ffi.EmbCoverageV1 * max(len(covs), 1))()
+        for i, c in enumerate(covs):
+            if not isinstance(c, dict):
+                raise TypeError(f"coverage {i} must be a dict, not {type(c).__name__}")
+            unknown = set(c) - self._EMB_COVERAGE_KEYS
+            if unknown:
+                raise ValueError(f"coverage {i}: unknown key(s) {sorted(unknown)}")
+            missing = (self._EMB_COVERAGE_KEYS - {"include_formulas"}) - set(c)
+            if missing:
+                raise ValueError(f"coverage {i}: missing key(s) {sorted(missing)}")
+            e = arr[i]
+            for key in ("id", "range", "column"):
+                val = c[key]
+                if not isinstance(val, str):
+                    raise TypeError(f"coverage {i}: {key} must be a str, not {type(val).__name__}")
+                raw = val.encode("utf-8")
+                buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\0")
+                keep.append(buf)
+                setattr(e, key, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+                setattr(e, f"{key}_len", len(raw))
+            e.sheet_idx = self._u32(f"coverage {i}: sheet", c["sheet"])
+            inc = c.get("include_formulas", False)
+            if not isinstance(inc, bool):
+                raise TypeError(f"coverage {i}: include_formulas must be a bool")
+            e.include_formulas = 1 if inc else 0
+            flat = _flatten_vectors(f"coverage {i}: vectors", c["vectors"], dim_v)
+            vbuf = (ctypes.c_float * max(len(flat), 1))(*flat)
+            keep.append(vbuf)
+            e.vectors = ctypes.cast(vbuf, ctypes.POINTER(ctypes.c_float))
+            e.vectors_len = len(flat)
+            hashes = _hash_values(f"coverage {i}: hashes", c["hashes"], tomb)
+            hbuf = (ctypes.c_uint64 * max(len(hashes), 1))(*hashes)
+            keep.append(hbuf)
+            e.hashes = ctypes.cast(hbuf, ctypes.POINTER(ctypes.c_uint64))
+            e.hashes_len = len(hashes)
+        model_raw = model.encode("utf-8")
+        model_buf = (ctypes.c_ubyte * max(len(model_raw), 1)).from_buffer_copy(model_raw or b"\0")
+        dtype_raw = dtype.encode("utf-8")
+        dtype_buf = (ctypes.c_ubyte * max(len(dtype_raw), 1)).from_buffer_copy(dtype_raw or b"\0")
+        self._structural_call(
+            "zlsx_editor_set_embeddings", _ffi.lib.zlsx_editor_set_embeddings,
+            self._handle, model_buf, len(model_raw), dim_v,
+            dtype_buf, len(dtype_raw), arr, len(covs), 0,
+        )
+        del keep
 
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.

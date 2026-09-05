@@ -1690,6 +1690,8 @@ pub fn build(b: *std.Build) void {
     embedding_part_tests_mod.addImport("zlsx_control", control_mod);
     embedding_part_tests_mod.addImport("zlsx_nfc", nfc_mod);
     embedding_part_tests_mod.addImport("zlsx_refs", refs_mod);
+    // The metadata byte rule is the writer's (`sheet_plan.isForbiddenXmlByte`).
+    embedding_part_tests_mod.addImport("zlsx_sheet_plan", sheet_plan_mod);
     const embedding_part_tests = b.addTest(.{ .root_module = embedding_part_tests_mod });
     test_step.dependOn(&b.addRunArtifact(embedding_part_tests).step);
 

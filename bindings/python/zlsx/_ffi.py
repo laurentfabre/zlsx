@@ -1857,3 +1857,46 @@ if _HAS_SHEET_PROPS:
         ]
         _fn.restype = ctypes.c_int32
     del _fn
+
+
+# S3c slice 1: the embedding write on the editor handle. One probe —
+# the header's ZLSX_HAS_EMBEDDING_WRITE — plus the diag release the
+# wrapper calls unconditionally.
+class EmbCoverageV1(ctypes.Structure):
+    """zlsx_emb_coverage_v1 — an array element (no struct_size); the v1
+    layout is frozen at 88 bytes and pinned below."""
+
+    _fields_ = [
+        ("id", ctypes.POINTER(ctypes.c_ubyte)),
+        ("id_len", ctypes.c_size_t),
+        ("range", ctypes.POINTER(ctypes.c_ubyte)),
+        ("range_len", ctypes.c_size_t),
+        ("column", ctypes.POINTER(ctypes.c_ubyte)),
+        ("column_len", ctypes.c_size_t),
+        ("vectors", ctypes.POINTER(ctypes.c_float)),
+        ("vectors_len", ctypes.c_size_t),
+        ("hashes", ctypes.POINTER(ctypes.c_uint64)),
+        ("hashes_len", ctypes.c_size_t),
+        ("sheet_idx", ctypes.c_uint32),
+        ("include_formulas", ctypes.c_uint32),
+    ]
+
+
+assert ctypes.sizeof(EmbCoverageV1) == 88
+assert EmbCoverageV1.vectors.offset == 48 and EmbCoverageV1.hashes.offset == 64
+assert EmbCoverageV1.sheet_idx.offset == 80 and EmbCoverageV1.include_formulas.offset == 84
+
+_HAS_EMBEDDING_WRITE = hasattr(lib, "zlsx_editor_set_embeddings") and _HAS_DIAG_RELEASE
+if _HAS_EMBEDDING_WRITE:
+    lib.zlsx_editor_set_embeddings.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # model
+        ctypes.c_uint32,                                  # dim
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # dtype
+        ctypes.POINTER(EmbCoverageV1), ctypes.c_size_t,   # coverages
+        ctypes.c_uint32,                                  # flags (reserved: 0)
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_set_embeddings.restype = ctypes.c_int32

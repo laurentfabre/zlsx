@@ -3462,13 +3462,6 @@ fn runScrubMetadataCommand(
     return 0;
 }
 
-/// The coverage's worksheet target, relative to `xl/` — the form
-/// `<coverage worksheet_target>` stores.
-fn embedWorksheetTarget(ws: *zlsx_pkg.Worksheet) ![]const u8 {
-    const part = try ws.resolvePartName();
-    return if (std.mem.startsWith(u8, part, "xl/")) part["xl/".len..] else part;
-}
-
 /// emb-6c phase one: `zlsx embed <file> --extract --column A --coverage A2:A100`.
 ///
 /// Emits one NDJSON record per row that has something worth embedding.
@@ -3504,7 +3497,7 @@ fn runEmbedExtract(
         try err.flush();
         return 3;
     };
-    const target = embedWorksheetTarget(ws) catch |e| {
+    const target = ws.embeddingTarget() catch |e| {
         try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
@@ -3581,7 +3574,7 @@ fn runEmbedApply(
         try err.flush();
         return 3;
     };
-    const target = embedWorksheetTarget(ws) catch |e| {
+    const target = ws.embeddingTarget() catch |e| {
         try err.print("zlsx: sheet: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
@@ -3654,21 +3647,12 @@ fn runEmbedApply(
         const vec = vecs.get(r.row) orelse continue;
         const slot = r.row - first_row;
         const dst = vec_body[@as(usize, slot) * rec_len ..][0..rec_len];
-        switch (dtype) {
-            .f32 => {
-                for (vec, 0..) |f, i| {
-                    std.mem.writeInt(u32, dst[i * 4 ..][0..4], @bitCast(f), .little);
-                }
-            },
-            .int8_sym_per_vec => {
-                const codes = alloc.alloc(i8, dim) catch return 4;
-                defer alloc.free(codes);
-                const res = zlsx_pkg.embedding_part.quantizeF32ToI8Sym(vec, codes);
-                std.mem.writeInt(u32, dst[0..4], @bitCast(res.scale), .little);
-                for (codes, 0..) |c, i| dst[4 + i] = @bitCast(c);
-            },
-            else => unreachable,
-        }
+        // The one encoder the C ABI's set_embeddings writes through.
+        zlsx_pkg.embedding_part.encodeVectorRecord(dtype, dim, vec, dst) catch |e| {
+            try err.print("zlsx: --vectors: {s}\n", .{@errorName(e)});
+            try err.flush();
+            return 3;
+        };
         hashes[slot] = r.hash;
         written += 1;
     }

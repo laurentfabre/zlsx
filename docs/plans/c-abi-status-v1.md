@@ -1184,3 +1184,145 @@ off) leaving no current row, and — where a CLI build sits beside the
 dylib — `zlsx cells --include-blanks`'s `t` /
 `formula` / `formula_ref` / `v` / `cached` equal to the accessors and
 the row values cell for cell (ten formula cells, three error cells).
+
+## 18. S3c slice 1 — the embedding write (2026-09-05)
+
+`Workbook.setEmbeddings` crosses the boundary on the editor handle — the
+first S3c export, under the §2 contract. One export, one header macro,
+one probe, one new struct (an array element):
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_set_embeddings(ed, model, model_len, dim, dtype, dtype_len, coverages, coverages_len, flags, diag, errbuf, errbuf_len) → int32_t` | `_HAS_EMBEDDING_WRITE` (+ `zlsx_diag_release`) | `ZLSX_HAS_EMBEDDING_WRITE` |
+
+**The shape is the read side's** (decision S3c-1). Vectors cross as the
+f32 `[rows][dim]` matrix `zlsx_emb_vectors` hands back and hashes as the
+u64 per-row list `zlsx_emb_hashes` hands back, `zlsx_emb_tombstone()`
+marking a row with no vector (Python: `None`); `dtype` is the string
+`zlsx_emb_dtype` returns (`"f32"`, `"int8-sym-per-vec"`); the sheet is
+an index, `zlsx_editor_*`'s convention, resolved to the coverage's
+`worksheet_target` by `Worksheet.embeddingTarget` — the CLI's private
+helper, moved so `embed --vectors` and the export spell it once. So
+read → re-embed → write is ONE shape on every surface, and the on-disk
+encoding lives in the library: `embedding_part.encodeVectorRecord` (the
+f32 wire bytes, or the symmetric int8 quantizer's per-row
+`f32 scale; i8[dim]`) is the one encoder, and `zlsx embed --vectors`
+now writes through it too (its inline loop is gone). The Zig surface's
+raw `vec_body` bytes stay Zig-only: a C or Python caller never
+assembles an on-disk record. The three dtypes the read knows but the
+writer cannot encode (`binary16`, `bfloat16`, `int8-asym-per-vec`) are
+`UnsupportedDtype`, a new `embedding_part.Error` member, refused before
+any byte moves.
+
+**`zlsx_emb_coverage_v1`** (decision S3c-2): an array element with a
+frozen 88-byte layout and no `struct_size` — the `zlsx_formula_cell_v1`
+precedent (§3's prefix rule governs a caller-allocated struct the
+library reads whole; an element inside the caller's array has no
+per-element size to honour). Offsets pinned by a comptime block in
+`src/c_abi.zig`, `_Static_assert`s in `tests/c_abi_smoke.c` and asserts
+in `_ffi.py`:
+
+| off | type | field |
+|---|---|---|
+| 0 / 8 | `const uint8_t *` / `size_t` | `id`, `id_len` (1–63 of `[A-Za-z0-9_-]`) |
+| 16 / 24 | `const uint8_t *` / `size_t` | `range`, `range_len` (A1) |
+| 32 / 40 | `const uint8_t *` / `size_t` | `column`, `column_len` (inside the range) |
+| 48 / 56 | `const float *` / `size_t` | `vectors`, `vectors_len` (`== rows * dim`, row-major) |
+| 64 / 72 | `const uint64_t *` / `size_t` | `hashes`, `hashes_len` (`== rows`) |
+| 80 | `uint32_t` | `sheet_idx` (0-based) |
+| 84 | `uint32_t` | `include_formulas` (0 / 1) |
+
+Both lengths are explicit and checked against the range's row count
+(`InvalidEmbeddingInput`) — the read side's `out_len` rule mirrored, so
+a mis-sized caller buffer is a named error, never an out-of-bounds
+read. NULL with length 0 is the empty string / array, judged by the
+write (an empty model lands; an empty coverage set is
+`InvalidEmbeddingInput`; an empty dtype is `InvalidDtype`); NULL with a
+non-zero length is `InvalidInput`, the `bytesArg` rule.
+
+**`flags`** (decision S3c-3) is reserved: v1 defines no bit and refuses
+a set one (`InvalidInput`), so `recovery_in_cells` can cross later
+without a `_v2`. It does NOT cross in this slice:
+`Workbook.setEmbeddingsOpts(.recovery_in_cells)` adds its hidden sheet
+through `Workbook.addSheet`, beneath the `Editor`'s sheet mirror — the
+mirror would not know the sheet (the S3a all-or-nothing
+`Editor.addSheet` exists precisely because the two must agree), so the
+flag waits for an Editor-level path.
+
+**The refusal split** (decision S3c-4) is §10's rule. `-1`, statements
+about the call, every one raised before the first part write:
+`InvalidInput`, `InvalidEmbeddingInput`, `InvalidDtype`,
+`UnsupportedDtype`, `SheetIndexOutOfRange`, `InvalidCoverageId`,
+`InvalidRange` (the range, or a column outside it),
+`DuplicateCoverageId`, `CoverageOverlap`, `InvalidXmlByte`,
+`StructSizeTooSmall`. `-2`, statements about the workbook, the name in
+the diag with `plane = NONE`: `MissingWorkbookRels` /
+`MalformedWorkbookRels` / `MissingRelationship` / `MissingContentTypes`
+/ `MalformedContentTypes` / `MalformedWorkbookXml` (already in
+`structural_refusals`) and `EmbeddingExceedsArchiveLimit` — new in the
+list — a part past the 512 MiB read cap: a limit, so a refusal (§2, the
+`FormulaLimitExceeded` rule). The Python leg mirrors S3a: `ZlsxError` /
+`ZlsxRefusal(error_name)`, with the shapes (`TypeError` / `ValueError`)
+checked before ctypes could truncate, through the same
+`_structural_call` helper.
+
+**Three Zig-layer fixes the export exposed** (the
+`Workbook.setEmbeddings` contract, every surface at once):
+
+- The write never validated `column`; the index read does
+  (`parseCoverage`: a column name inside the range) — so `column = "Z"`
+  on `A2:A4` saved cleanly and `Workbook.embeddings()` refused the
+  index it had just written (`InvalidRange`). One rule now,
+  `embedding_part.validateCoverageColumn`, called by both.
+- The S0 audit's one unchecked text channel (surface matrix §6):
+  `appendXmlEscaped` in `pkg/embedding_part.zig` escaped `& < > "` only,
+  so a C0 control byte in `model` reached `index.xml`.
+  `embedding_part.validateMetadataText` — the writer's own
+  `sheet_plan.isForbiddenXmlByte`, one definition; `pkg/embedding_part.zig`
+  imports `zlsx_sheet_plan` and its test root now declares it — refuses
+  `model` and `worksheet_target` in pass 1, and the encoder refuses
+  again (`InvalidXmlByte`, a new `embedding_part.Error` member). Tab /
+  LF / CR / DEL are XML characters and pass, as on every other channel.
+- Two refusals fired AFTER the parts were installed —
+  `MissingWorkbookRels` / `MalformedWorkbookRels` in pass 5 (the
+  relationship's splice target) and `EmbeddingExceedsArchiveLimit` per
+  coverage in pass 3 (a second oversized coverage left the first one's
+  parts) — leaving a torn staged set. `preflightEmbeddingsRels` and
+  exact part sizing (header + body, what the encoders emit) now run in
+  pass 1. Residue, documented on every surface: an allocation failure,
+  an oversized index XML or recovery record, or a `docProps/custom.xml`
+  / `[Content_Types].xml` the carrier cannot patch can still leave the
+  set partially replaced — discard the editor without saving.
+
+**Recorded, not lifted**: the index read hands `model` / `id` /
+`worksheet_target` attributes back raw (no entity decoding), so a model
+name carrying `&`, `<` or `"` reads back as `&amp;` … on every surface —
+the defined-names ST_Xstring shape (#190), a read-side slice of its own;
+the `recovery_in_cells` flag (above); embeddable rows, prune, strip →
+C + Py (the rest of S3c).
+
+**Tests** (`src/c_abi.zig`, "S3c set_embeddings …" ×6): the f32 round
+trip on two sheets with a tombstone and `include_formulas`, read back
+through `zlsx_emb_*` and the Zig read (the column, the flag, ONE
+relationship, both carriers, no hidden sheet); int8-sym within one step
+of the per-row scale and the compact part size; a second write replacing
+the set in one editor and across a save (one relationship, one property);
+thirty `-1` cases with the name in errbuf, the diag as prep left it, the
+NULL-with-length-0 rule, `StructSizeTooSmall` byte-for-byte, and
+`save_to_buffer` equal to the source (nothing written); the `-2`
+`MalformedWorkbookRels` with a poisoned diag reset and nothing written,
+plus `statusOf` pinned on both vocabularies; the body encoder under
+`checkAllAllocationFailures`. `pkg/embedding_part.zig`: the encoders
+read back through `decodeAllF32`, shape checks before any byte moves,
+the column rule, the byte rule over every value 0x00–0x7F and through
+`encodeIndexXml`. `pkg/workbook.zig`: the column and control-byte
+refusals leaving no part, the rels pre-flight leaving no part.
+`tests/c_abi_smoke.c` `#error`s without the macro, takes the address
+and pins the struct. Python (`test_embedding_write.py`): the goal line —
+`embeddings()` `present` after the write with the provenance, the cells
+untouched, both carriers; vectors / hashes / `valid_mask` read back and
+re-embedded on the read side's own arrays; int8-sym; replacement;
+fourteen named `ZlsxError`s writing nothing; the `MalformedWorkbookRels`
+`ZlsxRefusal`; seventeen Python-side shape errors; NumPy width against
+`dim`; the closed editor and the older-dylib `RuntimeError`; the probe
+against the version.

@@ -2093,6 +2093,71 @@ int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* ── S3c slice 1: the embedding write (zlsx_status_v1) ─────────────
+ *
+ * Workbook.setEmbeddings on the editor handle. One call writes the
+ * whole embedding set — xl/zlsxEmbeddings/index.xml, a vec.bin +
+ * hashes.bin pair per coverage, the workbook→index relationship and
+ * the recovery record in its two invisible carriers (a hidden defined
+ * name, docProps/custom.xml) — and REPLACES any previous set (the
+ * parts of a coverage id that disappears stay in the archive as
+ * orphans, the Zig contract). Staged in memory; zlsx_editor_save
+ * commits. Read it back with the zlsx_emb_* handle above: vectors
+ * cross here as the f32 [rows][dim] matrix zlsx_emb_vectors hands
+ * back and hashes as the uint64 per-row list zlsx_emb_hashes hands
+ * back, so read → re-embed → write is one shape. */
+
+/* One coverage. An array element (no struct_size, the
+ * zlsx_formula_cell_v1 precedent); the v1 layout is frozen at 88
+ * bytes. `rows` below is the range's row count (A2:A100 → 99). */
+typedef struct zlsx_emb_coverage_v1 {
+    const uint8_t  * id;         size_t id_len;       /* 1–63 of [A-Za-z0-9_-] */
+    const uint8_t  * range;      size_t range_len;    /* A1 range, "A2:A100" */
+    const uint8_t  * column;     size_t column_len;   /* the embedded column, inside the range */
+    const float    * vectors;    size_t vectors_len;  /* == rows * dim, row-major, range order */
+    const uint64_t * hashes;     size_t hashes_len;   /* == rows; zlsx_emb_tombstone() = no vector */
+    uint32_t         sheet_idx;                       /* 0-based */
+    uint32_t         include_formulas;                /* 0 or 1 */
+} zlsx_emb_coverage_v1;
+
+/* dtype is spelled as zlsx_emb_dtype spells it: "f32" or
+ * "int8-sym-per-vec" (quantized here, one f32 scale per row); the
+ * three other names the read knows have no writer (UnsupportedDtype).
+ * flags is reserved and must be 0.
+ *
+ * -1 (a statement about the call, each raised BEFORE the first part
+ * is written): InvalidInput — NULL handle, NULL bytes or arrays with
+ * a non-zero length, a set flag, include_formulas past 1;
+ * InvalidEmbeddingInput — no coverage, dim 0, a vectors_len or
+ * hashes_len that disagrees with the range; InvalidDtype;
+ * UnsupportedDtype; SheetIndexOutOfRange; the index's own rules
+ * InvalidCoverageId, InvalidRange (the range, or a column outside
+ * it), DuplicateCoverageId, CoverageOverlap; InvalidXmlByte (a C0
+ * control byte in model — the rule every other text channel
+ * enforces). -2 (ZLSX_REFUSED, a statement about the workbook, the
+ * name in the diag with plane NONE): MissingWorkbookRels /
+ * MalformedWorkbookRels — no xl/_rels/workbook.xml.rels, or one
+ * without the </Relationships> the relationship lands before
+ * (checked before the first write); MissingRelationship — a sheet
+ * whose part the workbook's rels do not reach;
+ * EmbeddingExceedsArchiveLimit — a part past the 512 MiB read cap
+ * (the binary parts are sized before the first write); and the
+ * package's own MissingContentTypes / MalformedContentTypes /
+ * MalformedWorkbookXml. A -2 or -3 that fires AFTER the first part
+ * write — an allocation failure, an oversized index or recovery
+ * record, a docProps/custom.xml the carrier cannot patch — leaves the
+ * staged part set partially replaced: discard the editor without
+ * saving. Inherited from the Zig surface and unchanged here: the
+ * index read hands model / id / target attributes back raw, so a
+ * model name carrying `&`, `<` or `"` reads back entity-escaped. */
+int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
+        const uint8_t * model, size_t model_len,
+        uint32_t dim,
+        const uint8_t * dtype, size_t dtype_len,
+        const zlsx_emb_coverage_v1 * coverages, size_t coverages_len,
+        uint32_t flags,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
@@ -2102,6 +2167,7 @@ int32_t zlsx_editor_calc_props_ndjson(zlsx_editor_t * ed,
 #define ZLSX_HAS_SHEET_PROPS      1   /* editor sheet_props_ndjson + calc_props_ndjson */
 #define ZLSX_HAS_SHEET_STATE      1   /* reader sheet_state (S3b slice 10) */
 #define ZLSX_HAS_ROWS_FORMULAS    1   /* reader rows_formula_at + rows_formula_ref_at + rows_error_at (S3b slice 11) */
+#define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 (S3c slice 1) */
 
 
 #ifdef __cplusplus

@@ -42,6 +42,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const nfc = @import("zlsx_nfc");
 const coords = @import("zlsx_refs");
+// The writer's XML byte rule, so embedding metadata refuses exactly the
+// bytes every other text channel refuses (one definition).
+const sheet_plan = @import("zlsx_sheet_plan");
 
 pub const Error = error{
     BadMagic,
@@ -70,6 +73,13 @@ pub const Error = error{
     InvalidRange,
     CoverageCountMismatch,
     CoverageOverlap,
+    /// A dtype with a decoder but no writer — binary16 / bfloat16 /
+    /// the asymmetric int8 layout. Surfaces from `encodeVectorRecord`.
+    UnsupportedDtype,
+    /// A C0 control byte XML 1.0 forbids in a metadata string (`model`,
+    /// `worksheet_target`) — the rule every other text channel of the
+    /// writer enforces (`sheet_plan.isForbiddenXmlByte`).
+    InvalidXmlByte,
     InvalidUtf8,
     UnicodeNormalizationFailed,
     BufferTooSmall,
@@ -376,8 +386,7 @@ fn parseCoverage(tag_body: []const u8) Error!Coverage {
     const range_raw = try attrValueRequired(tag_body, "range");
     const parsed_range = try parseA1Range(range_raw);
     const column = try attrValueRequired(tag_body, "column");
-    const column_idx = try parseColumnName(column);
-    if (column_idx < parsed_range.first.col or column_idx > parsed_range.last.col) return Error.InvalidRange;
+    const column_idx = try validateCoverageColumn(column, parsed_range);
     const count = try parseU32Decimal(try attrValueRequired(tag_body, "count"));
     if (count != parsed_range.rowCount()) return Error.CoverageCountMismatch;
     const include_formulas = if (try attrValue(tag_body, "include_formulas")) |raw|
@@ -485,6 +494,31 @@ pub fn parseA1Corner(s: []const u8) Error!A1Corner {
 pub fn parseColumnName(s: []const u8) Error!u32 {
     const col = coords.parseCol(s, .{ .case = .insensitive }) catch return Error.InvalidRange;
     return col.zeroBased();
+}
+
+/// The coverage-column rule, ONE for the index read (`parseCoverage`)
+/// and the write (`Workbook.setEmbeddings`): a bare column name whose
+/// index lies inside the coverage's range. Returns the 0-based index.
+/// The writer used to skip it, so a coverage with `column = "Z"` on
+/// `A2:A4` saved cleanly and `Workbook.embeddings()` then refused the
+/// index it had just written (`InvalidRange`).
+pub fn validateCoverageColumn(column: []const u8, range: A1Range) Error!u32 {
+    const column_idx = try parseColumnName(column);
+    if (column_idx < range.first.col or column_idx > range.last.col) return Error.InvalidRange;
+    return column_idx;
+}
+
+/// The metadata byte rule: a `model` / `worksheet_target` string is an
+/// XML attribute value, and XML 1.0 forbids most C0 control bytes in
+/// one (0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F; tab / LF / CR and DEL are
+/// legal). The cell-text, sheet-name, comment, defined-name and
+/// hyperlink writers refuse the same bytes through
+/// `sheet_plan.isForbiddenXmlByte`; this is that rule on the one text
+/// channel that escaped it (S0's surface audit). Checked by the writer
+/// BEFORE its first part write and again by `appendXmlEscaped` when
+/// the index is encoded.
+pub fn validateMetadataText(s: []const u8) Error!void {
+    for (s) |c| if (sheet_plan.isForbiddenXmlByte(c)) return Error.InvalidXmlByte;
 }
 
 const XmlTag = struct {
@@ -1265,6 +1299,53 @@ pub fn encodeHashesPart(allocator: Allocator, hashes: []const u64) Error![]u8 {
     return buf;
 }
 
+/// Encode ONE vector into its on-disk record for `dtype` — the f32
+/// wire bytes, or the symmetric int8 quantizer's per-row
+/// `f32 scale; i8[dim]` — into `dst`, which must be exactly
+/// `dtype.recordBytes(dim)` bytes. The one encoder behind
+/// `zlsx embed --vectors` and `zlsx_editor_set_embeddings`, so the
+/// two surfaces cannot drift on the layout `decodeAllF32` reads back.
+/// binary16 / bfloat16 / the asymmetric int8 layout have decoders but
+/// no writer yet: `UnsupportedDtype`, before any byte of `dst` moves.
+pub fn encodeVectorRecord(dtype: Dtype, dim: u32, vec: []const f32, dst: []u8) Error!void {
+    if (dim == 0) return Error.DimensionOutOfRange;
+    if (vec.len != dim) return Error.DimensionMismatch;
+    if (dst.len != dtype.recordBytes(dim)) return Error.BodySizeMismatch;
+    switch (dtype) {
+        .f32 => for (vec, 0..) |f, i| {
+            std.mem.writeInt(u32, dst[i * 4 ..][0..4], @bitCast(f), .little);
+        },
+        .int8_sym_per_vec => {
+            const codes: []i8 = @ptrCast(dst[4..][0..dim]);
+            const q = quantizeF32ToI8Sym(vec, codes);
+            std.mem.writeInt(u32, dst[0..4], @bitCast(q.scale), .little);
+        },
+        .binary16, .bfloat16, .int8_asym_per_vec => return Error.UnsupportedDtype,
+    }
+}
+
+/// Encode a row-major `[count][dim]` f32 matrix into a complete
+/// vec.bin body (`count * dtype.recordBytes(dim)` bytes) for
+/// `Workbook.setEmbeddings`. `vectors.len` must be a whole number of
+/// rows (`DimensionMismatch` otherwise); an empty matrix is an empty
+/// body. Caller frees.
+pub fn encodeVectorBody(allocator: Allocator, dtype: Dtype, dim: u32, vectors: []const f32) Error![]u8 {
+    if (dim == 0) return Error.DimensionOutOfRange;
+    if (vectors.len % dim != 0) return Error.DimensionMismatch;
+    switch (dtype) {
+        .f32, .int8_sym_per_vec => {},
+        .binary16, .bfloat16, .int8_asym_per_vec => return Error.UnsupportedDtype,
+    }
+    const count = vectors.len / dim;
+    const rec = dtype.recordBytes(dim);
+    const body = try allocator.alloc(u8, count * rec);
+    errdefer allocator.free(body);
+    for (0..count) |r| {
+        try encodeVectorRecord(dtype, dim, vectors[r * dim ..][0..dim], body[r * rec ..][0..rec]);
+    }
+    return body;
+}
+
 /// Build the index.xml manifest from `spec`. XML-escapes user-
 /// provided text fields (`model` and the per-coverage `id`,
 /// `worksheet_target`, `range`, `column`).
@@ -1348,8 +1429,11 @@ fn appendDecimal(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: 
 
 fn appendXmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, s: []const u8) Error!void {
     // OOXML attribute-value escaping: & < > " (single quote left
-    // alone since we use double-quoted attributes throughout).
+    // alone since we use double-quoted attributes throughout). A C0
+    // control byte has no escape — XML 1.0 forbids it outright — so
+    // it refuses here as it does on every other writer channel.
     for (s) |c| switch (c) {
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => return Error.InvalidXmlByte,
         '&' => try buf.appendSlice(allocator, "&amp;"),
         '<' => try buf.appendSlice(allocator, "&lt;"),
         '>' => try buf.appendSlice(allocator, "&gt;"),
@@ -2156,4 +2240,98 @@ test "decodeAllF32 rejects a mis-sized output buffer" {
     };
     var too_small: [1]f32 = undefined;
     try testing.expectError(Error.InvalidRange, decodeAllF32(vec, &too_small));
+}
+
+test "encodeVectorRecord / encodeVectorBody: f32 and int8-sym bodies read back through decodeAllF32" {
+    const a = testing.allocator;
+    // 3 rows × 4: a plain row, the zero row (scale 0), a wide row.
+    const vectors = [_]f32{ 1.0, -2.5, 0.25, 4.0, 0, 0, 0, 0, 100, -100, 50, 0.5 };
+
+    const f32_body = try encodeVectorBody(a, .f32, 4, &vectors);
+    defer a.free(f32_body);
+    try testing.expectEqual(@as(usize, 48), f32_body.len);
+    const f32_part = try encodeVecPart(a, .{ .version = WIRE_VERSION, .dim = 4, .count = 3, .dtype = .f32 }, f32_body);
+    defer a.free(f32_part);
+    var out: [12]f32 = undefined;
+    try decodeAllF32(try parseVecPart(f32_part), &out);
+    try testing.expectEqualSlices(f32, &vectors, &out);
+
+    const i8_body = try encodeVectorBody(a, .int8_sym_per_vec, 4, &vectors);
+    defer a.free(i8_body);
+    try testing.expectEqual(@as(usize, 3 * (4 + 4)), i8_body.len);
+    const i8_part = try encodeVecPart(a, .{ .version = WIRE_VERSION, .dim = 4, .count = 3, .dtype = .int8_sym_per_vec }, i8_body);
+    defer a.free(i8_part);
+    try decodeAllF32(try parseVecPart(i8_part), &out);
+    for (vectors, out, 0..) |want, got, i| {
+        const row_max: f32 = switch (i / 4) {
+            0 => 4.0,
+            1 => 0.0,
+            else => 100.0,
+        };
+        try testing.expect(@abs(want - got) <= row_max / 127.0 + 1e-6);
+    }
+    try testing.expectEqual(@as(f32, 0), out[4]);
+    // The on-disk record: the per-row f32 scale, then the codes.
+    try testing.expectEqual(@as(f32, 4.0), @as(f32, @bitCast(std.mem.readInt(u32, i8_body[0..4], .little))));
+    try testing.expectEqual(@as(i8, 127), @as(i8, @bitCast(i8_body[4 + 3])));
+    try testing.expectEqual(@as(f32, 0), @as(f32, @bitCast(std.mem.readInt(u32, i8_body[8..12], .little))));
+}
+
+test "encodeVectorRecord / encodeVectorBody: the call's shape is checked before any byte moves" {
+    const a = testing.allocator;
+    const v = [_]f32{ 1, 2, 3 };
+    var dst: [12]u8 = [_]u8{0xAA} ** 12;
+    try testing.expectError(Error.DimensionOutOfRange, encodeVectorRecord(.f32, 0, &v, &dst));
+    try testing.expectError(Error.DimensionMismatch, encodeVectorRecord(.f32, 2, &v, dst[0..8]));
+    try testing.expectError(Error.BodySizeMismatch, encodeVectorRecord(.f32, 3, &v, dst[0..8]));
+    try testing.expectError(Error.UnsupportedDtype, encodeVectorRecord(.binary16, 3, &v, dst[0..6]));
+    try testing.expectError(Error.UnsupportedDtype, encodeVectorRecord(.bfloat16, 3, &v, dst[0..6]));
+    try testing.expectError(Error.UnsupportedDtype, encodeVectorRecord(.int8_asym_per_vec, 3, &v, dst[0..8]));
+    try testing.expectEqualSlices(u8, &([_]u8{0xAA} ** 12), &dst);
+    try testing.expectError(Error.DimensionOutOfRange, encodeVectorBody(a, .f32, 0, &v));
+    try testing.expectError(Error.DimensionMismatch, encodeVectorBody(a, .f32, 2, &v));
+    try testing.expectError(Error.UnsupportedDtype, encodeVectorBody(a, .binary16, 3, &v));
+    const empty = try encodeVectorBody(a, .f32, 3, &.{});
+    defer a.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "validateCoverageColumn: the index read's rule, one definition" {
+    const range = try parseA1Range("B2:D9");
+    try testing.expectEqual(@as(u32, 1), try validateCoverageColumn("B", range));
+    try testing.expectEqual(@as(u32, 3), try validateCoverageColumn("d", range));
+    try testing.expectError(Error.InvalidRange, validateCoverageColumn("A", range));
+    try testing.expectError(Error.InvalidRange, validateCoverageColumn("E", range));
+    try testing.expectError(Error.InvalidRange, validateCoverageColumn("B2", range));
+    try testing.expectError(Error.InvalidRange, validateCoverageColumn("", range));
+}
+
+test "validateMetadataText + appendXmlEscaped: XML 1.0's forbidden bytes refuse, its characters pass" {
+    const a = testing.allocator;
+    try validateMetadataText("model-v1 \t\n\r\x7f <&>\"'");
+    var c: u8 = 0;
+    while (true) : (c += 1) {
+        const s = [_]u8{c};
+        if (sheet_plan.isForbiddenXmlByte(c)) {
+            try testing.expectError(Error.InvalidXmlByte, validateMetadataText(&s));
+        } else {
+            try validateMetadataText(&s);
+        }
+        if (c == 0x7f) break;
+    }
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try testing.expectError(Error.InvalidXmlByte, appendXmlEscaped(&buf, a, "m\x00"));
+    buf.clearRetainingCapacity();
+    try appendXmlEscaped(&buf, a, "a<b>&\"\t\x7f");
+    try testing.expectEqualStrings("a&lt;b&gt;&amp;&quot;\t\x7f", buf.items);
+    // The index encoder is the one carrier: a control byte in the
+    // model refuses the whole part, so no index ever holds one.
+    try testing.expectError(Error.InvalidXmlByte, encodeIndexXml(a, .{
+        .model = "m\x01",
+        .dim = 1,
+        .dtype = .f32,
+        .hash_algo = HASH_ALGO_XXH3_64,
+        .coverages = &.{},
+    }));
 }

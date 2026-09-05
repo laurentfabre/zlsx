@@ -2437,7 +2437,12 @@ pub const Workbook = struct {
     ///   `vec_body` / `hashes` length mismatch against the range-
     ///   derived count.
     /// - `embedding_part.Error.InvalidRange` — range is not a valid
-    ///   A1 form.
+    ///   A1 form, or `column` is not a bare column name inside it
+    ///   (the index read's rule, `embedding_part.validateCoverageColumn`).
+    /// - `embedding_part.Error.InvalidXmlByte` — `model` or a
+    ///   `worksheet_target` carries a C0 control byte XML 1.0 forbids
+    ///   (`embedding_part.validateMetadataText`, the rule every other
+    ///   writer text channel enforces).
     /// - `embedding_part.Error.InvalidCoverageId` — id is empty,
     ///   too long, or has a forbidden character.
     /// - `embedding_part.Error.DuplicateCoverageId` — two inputs
@@ -2445,15 +2450,24 @@ pub const Workbook = struct {
     /// - `embedding_part.Error.CoverageOverlap` — two inputs name
     ///   the same `worksheet_target` and their A1 ranges intersect.
     /// - `EmbeddingExceedsArchiveLimit` — any part would exceed
-    ///   PartStore's 512 MiB read cap.
+    ///   PartStore's 512 MiB read cap. The binary parts are sized in
+    ///   pass 1, before the first write; the index XML and the
+    ///   recovery record are checked as they are built.
     /// - `embedding_part.Error.BodySizeMismatch` — `vec_body.len`
     ///   does not equal `count * dtype.recordBytes(dim)`.
     /// - `MissingWorkbookRels` — `xl/_rels/workbook.xml.rels` is
     ///   absent. emb-3b registers a workbook→index relationship,
     ///   so the file must exist (every conforming workbook carries
-    ///   one; absence indicates malformed input).
+    ///   one; absence indicates malformed input). Checked in pass 1.
     /// - `MalformedWorkbookRels` — the rels file is missing the
-    ///   closing `</Relationships>` tag.
+    ///   closing `</Relationships>` tag. Checked in pass 1.
+    ///
+    /// Every input refusal above lands before the first part is
+    /// written. A failure after it — an allocation failure, an
+    /// oversized index or recovery record, a `docProps/custom.xml`
+    /// or `[Content_Types].xml` the package layer cannot patch —
+    /// leaves the staged part set partially replaced: discard the
+    /// workbook without saving.
     pub fn setEmbeddings(
         self: *Workbook,
         model: []const u8,
@@ -2481,6 +2495,14 @@ pub const Workbook = struct {
     ) Error!void {
         if (inputs.len == 0) return error.InvalidEmbeddingInput;
         if (dim == 0) return error.InvalidEmbeddingInput;
+        // The metadata byte rule (S0's one unchecked text channel):
+        // refused here, before the first part write, so a control
+        // byte never reaches `index.xml` and never tears the part set.
+        try embedding_part.validateMetadataText(model);
+        // The workbook→index relationship (pass 5) needs a rels file
+        // with a `</Relationships>` to splice into; refused here so a
+        // broken rels file never tears the part set pass 3 writes.
+        try self.preflightEmbeddingsRels();
         self.recovery_opts = opts;
 
         // Pass 1: per-input semantic validation + spec assembly.
@@ -2509,10 +2531,23 @@ pub const Workbook = struct {
             if (!isValidEmbeddingCoverageId(inp.id))
                 return error.InvalidCoverageId;
             const range = try embedding_part.parseA1Range(inp.range);
+            // The index read's own column rule, applied before the
+            // write: a column outside the range used to save cleanly
+            // and make `embeddings()` refuse the index it had written.
+            _ = try embedding_part.validateCoverageColumn(inp.column, range);
+            try embedding_part.validateMetadataText(inp.worksheet_target);
             const count: u32 = range.last.row - range.first.row + 1;
             const expected_body: usize = @as(usize, count) * dtype.recordBytes(dim);
             if (inp.vec_body.len != expected_body) return error.InvalidEmbeddingInput;
             if (inp.hashes.len != count) return error.InvalidEmbeddingInput;
+            // Exactly what pass 3's encoders emit (header + body): the
+            // cap used to be checked after the part was built, one
+            // coverage at a time, so a second oversized coverage left
+            // the first one's parts installed.
+            if (embedding_part.VEC_HEADER_BYTES + inp.vec_body.len > EMBEDDING_PART_MAX_BYTES)
+                return error.EmbeddingExceedsArchiveLimit;
+            if (embedding_part.HASH_HEADER_BYTES + @as(usize, count) * @sizeOf(u64) > EMBEDDING_PART_MAX_BYTES)
+                return error.EmbeddingExceedsArchiveLimit;
             parsed_ranges[i] = range;
 
             // Allocate rIds; +1 to make them 1-based.
@@ -3441,6 +3476,18 @@ pub const Workbook = struct {
         }
         w.writeAll(src[pos..]) catch return error.WriteFailed;
         try self.store.replacePart("xl/_rels/workbook.xml.rels", out.written());
+    }
+
+    /// Pass-1 mirror of `registerWorkbookEmbeddingsRel`'s two
+    /// refusals: the rels file must exist and, unless it already
+    /// carries the embeddings relationship, hold the `</Relationships>`
+    /// the splice lands before.
+    fn preflightEmbeddingsRels(self: *Workbook) Error!void {
+        const rels_part = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse
+            return error.MissingWorkbookRels;
+        if (std.mem.indexOf(u8, rels_part.bytes, embedding_part.REL_TYPE_EMBEDDINGS) != null) return;
+        if (std.mem.indexOf(u8, rels_part.bytes, "</Relationships>") == null)
+            return error.MalformedWorkbookRels;
     }
 
     fn registerWorkbookEmbeddingsRel(self: *Workbook) Error!void {
@@ -11567,6 +11614,18 @@ pub const Worksheet = struct {
     /// Sheet name from the workbook's sheets list. Borrowed.
     pub fn name(self: *const Worksheet) []const u8 {
         return self.workbook.workbook.sheets[self.sheet_idx].name;
+    }
+
+    /// This sheet as an embedding coverage's `worksheet_target`: the
+    /// part name relative to `xl/`, the form `<coverage
+    /// worksheet_target>` stores and `embeddableRows` resolves. One
+    /// spelling for `zlsx embed --vectors` and
+    /// `zlsx_editor_set_embeddings`, which both take a sheet index.
+    /// `MissingRelationship` when the workbook's rels do not reach the
+    /// sheet's part (the `resolvePartName` contract).
+    pub fn embeddingTarget(self: *Worksheet) Error![]const u8 {
+        const part = try self.resolvePartName();
+        return if (std.mem.startsWith(u8, part, "xl/")) part["xl/".len..] else part;
     }
 
     /// Workbook-assigned sheet ID (NOT the same as sheet_idx).
@@ -22158,6 +22217,120 @@ test "Workbook.setEmbeddings: rejects empty inputs" {
         error.InvalidEmbeddingInput,
         wb.setEmbeddings("m", 4, .f32, &.{}),
     );
+}
+
+test "Workbook.setEmbeddings: a column outside the range refuses before the first part write" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{ 0x1, 0x2, 0x3 };
+    var input: EmbeddingCoverageInput = .{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A4",
+        .column = "Z",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    // The index read's rule (`parseCoverage`): the column must lie
+    // inside the range. Before the fix this saved and `embeddings()`
+    // refused the index the write had just produced.
+    try std.testing.expectError(error.InvalidRange, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    input.column = "A1";
+    try std.testing.expectError(error.InvalidRange, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    input.column = "";
+    try std.testing.expectError(error.InvalidRange, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    // Refused in pass 1: no embedding part was written.
+    try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
+    try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/title/vec.bin")) == null);
+    // The read admits what the write admits — the same rule.
+    input.column = "a";
+    try wb.setEmbeddings("m", 2, .f32, &.{input});
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqualStrings("a", view.coverages[0].coverage.column);
+    try std.testing.expectEqual(@as(u32, 0), view.coverages[0].coverage.column_idx);
+}
+
+test "Workbook.setEmbeddings: a control byte in the model or the target refuses before the first part write" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0x1};
+    var input: EmbeddingCoverageInput = .{
+        .id = "t",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    // Every forbidden C0 byte in the model, the NUL the S0 audit
+    // named first; tab / LF / CR / DEL are XML 1.0 characters and pass.
+    try std.testing.expectError(error.InvalidXmlByte, wb.setEmbeddings("m\x00", 2, .f32, &.{input}));
+    try std.testing.expectError(error.InvalidXmlByte, wb.setEmbeddings("\x1fm", 2, .f32, &.{input}));
+    try std.testing.expectError(error.InvalidXmlByte, wb.setEmbeddings("m\x0b", 2, .f32, &.{input}));
+    input.worksheet_target = "worksheets/\x01sheet1.xml";
+    try std.testing.expectError(error.InvalidXmlByte, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
+    try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/t/vec.bin")) == null);
+    input.worksheet_target = "worksheets/sheet1.xml";
+    // DEL and a quote are XML characters (the entity-bearing `< & "`
+    // are escaped on the way in and read back raw — the index read's
+    // pre-existing lexical contract, recorded, not this slice's).
+    try wb.setEmbeddings("m 1.0\x7f'", 2, .f32, &.{input});
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqualStrings("m 1.0\x7f'", view.index.model);
+}
+
+test "Workbook.setEmbeddings: a rels file the relationship cannot land in refuses before the first part write" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb = try Workbook.empty(std.testing.allocator, io);
+    defer wb.deinit();
+
+    const vectors = [_]f32{ 1, 2 };
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_buf.deinit(std.testing.allocator);
+    try buildF32Body(&body_buf, std.testing.allocator, &vectors);
+    const hashes = [_]u64{0x1};
+    const input: EmbeddingCoverageInput = .{
+        .id = "t",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .vec_body = body_buf.items,
+        .hashes = &hashes,
+    };
+    const rels_name = "xl/_rels/workbook.xml.rels";
+    const rels = (try wb.store.part(rels_name)) orelse return error.TestUnexpectedResult;
+    const close = std.mem.indexOf(u8, rels.bytes, "</Relationships>") orelse return error.TestUnexpectedResult;
+    const truncated = try std.testing.allocator.dupe(u8, rels.bytes[0..close]);
+    defer std.testing.allocator.free(truncated);
+    try wb.store.replacePart(rels_name, truncated);
+    // Used to fire in pass 5, after every binary part and the index
+    // were installed — a torn set the caller had to discard.
+    try std.testing.expectError(error.MalformedWorkbookRels, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
+    try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/t/vec.bin")) == null);
+    try std.testing.expect((try wb.store.part("xl/zlsxEmbeddings/t/hashes.bin")) == null);
+    try wb.store.removePart(rels_name);
+    try std.testing.expectError(error.MissingWorkbookRels, wb.setEmbeddings("m", 2, .f32, &.{input}));
+    try std.testing.expect((try wb.store.part(embedding_part.INDEX_PART_NAME)) == null);
 }
 
 test "Workbook.setEmbeddings: vec_body / hashes length mismatch rejected" {
