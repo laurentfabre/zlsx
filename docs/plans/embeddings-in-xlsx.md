@@ -241,7 +241,7 @@ implementation, by construction.
 
 ```zig
 try wb.setEmbeddingsOpts(model, dim, dtype, inputs,
-    .{ .recovery_in_cells = true });   // survives Numbers; costs a visible sheet
+    .{ .recovery_in_cells = true });   // survives Numbers; costs a hidden sheet (Sheet ▸ Unhide)
 ```
 
 Default off, so Goal 3 holds unless a caller deliberately trades it.

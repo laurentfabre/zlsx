@@ -2120,30 +2120,60 @@ typedef struct zlsx_emb_coverage_v1 {
     uint32_t         include_formulas;                /* 0 or 1 */
 } zlsx_emb_coverage_v1;
 
+/* zlsx_editor_set_embeddings' flags word (S3c slice 4). Bit 0 also
+ * writes the recovery record into a hidden sheet named zlsxRecovery
+ * (<sheet state="hidden">, the record in its A1) — the one carrier an
+ * Apple Numbers export keeps, at the cost of a sheet the user can
+ * reveal (Workbook.setEmbeddingsOpts' recovery_in_cells). The sheet
+ * is appended after the last one and the editor's indices count it
+ * (zlsx_editor_add_sheet's next index, zlsx_editor_set_cell's). The
+ * bit governs the sheet's CREATION: a workbook already carrying it
+ * has its cell refreshed by every later write, bit or no bit — the
+ * previous record scrubbed from the shared-string table and the
+ * worksheet parts first — so the record is one generation in every
+ * carrier; zlsx_editor_strip_embeddings removes the sheet. The name
+ * is reserved: a sheet spelled so, however cased, IS the carrier and
+ * its A1 is written. Every other bit is reserved (InvalidInput). */
+#define ZLSX_EMB_WRITE_RECOVERY_IN_CELLS 1u
+
 /* dtype is spelled as zlsx_emb_dtype spells it: "f32" or
  * "int8-sym-per-vec" (quantized here, one f32 scale per row); the
  * three other names the read knows have no writer (UnsupportedDtype).
- * flags is reserved and must be 0.
+ * flags is a bit set of ZLSX_EMB_WRITE_* (0 = the record in its two
+ * invisible carriers only).
  *
  * -1 (a statement about the call, each raised BEFORE the first part
  * is written): InvalidInput — NULL handle, NULL bytes or arrays with
- * a non-zero length, a set flag, include_formulas past 1;
+ * a non-zero length, a reserved flag bit, include_formulas past 1;
  * InvalidEmbeddingInput — no coverage, dim 0, a vectors_len or
  * hashes_len that disagrees with the range; InvalidDtype;
  * UnsupportedDtype; SheetIndexOutOfRange; the index's own rules
  * InvalidCoverageId, InvalidRange (the range, or a column outside
  * it), DuplicateCoverageId, CoverageOverlap; InvalidXmlByte (a C0
  * control byte in model — the rule every other text channel
- * enforces). -2 (ZLSX_REFUSED, a statement about the workbook, the
- * name in the diag with plane NONE): MissingWorkbookRels /
- * MalformedWorkbookRels — no xl/_rels/workbook.xml.rels, or one
- * without the </Relationships> the workbook→index relationship
- * lands before, or a _rels/.rels without it when docProps/custom.xml
- * has to be created for the recovery record (both checked before the
- * first write); IdSpaceExhausted — the rels file's rId space, or an
- * existing docProps/custom.xml's pid space, already at UINT32_MAX (a
- * hostile part; checked before the first write); MissingRelationship
- * — a sheet whose part the workbook's rels do not reach;
+ * enforces); when the cells carrier is written, SheetHasUnsavedAppends
+ * (the zlsxRecovery sheet holds staged appended rows — save first) and
+ * StructuralEditIncomplete (the editor holds a torn structural edit and
+ * the sheet would have to be created — discard it). -2 (ZLSX_REFUSED,
+ * a statement about the workbook, the name in the diag with plane
+ * NONE): MissingWorkbookRels / MalformedWorkbookRels — no
+ * xl/_rels/workbook.xml.rels, or one without the </Relationships> the
+ * workbook→index relationship (or the hidden sheet's) lands before, or
+ * a _rels/.rels without it when docProps/custom.xml has to be created
+ * for the recovery record (checked before the first write);
+ * IdSpaceExhausted — the rels file's rId space (for the hidden sheet,
+ * the rId after the one the write's own relationship takes), an
+ * existing docProps/custom.xml's pid space, or — when the sheet is
+ * created — the sheetId or worksheet part-number space, already at
+ * UINT32_MAX (a hostile part; checked before the first write);
+ * MissingRelationship — a sheet whose part the workbook's rels do not
+ * reach; MissingWorkbookPart / SheetCountMismatch — no xl/workbook.xml,
+ * or one whose </sheets> the typed parser reads elsewhere than the
+ * splice, so the hidden sheet's add could not land (checked before the
+ * first write); MalformedSharedStringsXml / MalformedSheetXml — a
+ * shared-string table or, with the sheet present, a worksheet part the
+ * scrub would read and the store cannot serve (checked before the
+ * first write);
  * EmbeddingExceedsArchiveLimit — a
  * part past the 512 MiB read cap (sized here from the inputs, before
  * a vector byte is read), OR the recovery record past its ceiling of
@@ -2346,7 +2376,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
 #define ZLSX_HAS_SHEET_PROPS      1   /* editor sheet_props_ndjson + calc_props_ndjson */
 #define ZLSX_HAS_SHEET_STATE      1   /* reader sheet_state (S3b slice 10) */
 #define ZLSX_HAS_ROWS_FORMULAS    1   /* reader rows_formula_at + rows_formula_ref_at + rows_error_at (S3b slice 11) */
-#define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 (S3c slice 1) */
+#define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 + ZLSX_EMB_WRITE_RECOVERY_IN_CELLS (S3c slices 1 + 4; 0.9.0 ships both — no release exposes the export without the bit) */
 #define ZLSX_HAS_EMBEDDABLE_ROWS  1   /* editor embeddable_rows_ndjson (S3c slice 2) */
 #define ZLSX_HAS_EMBEDDING_SWEEPS 1   /* editor prune_embeddings + strip_embeddings + zlsx_prune_report_v1 (S3c slice 3) */
 

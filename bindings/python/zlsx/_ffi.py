@@ -1297,6 +1297,11 @@ ZLSX_EMB_CARRIER_DEFINED_NAME = 0
 ZLSX_EMB_CARRIER_DOC_PROPS = 1
 ZLSX_EMB_CARRIER_CELL_DATA = 2
 
+# zlsx_editor_set_embeddings' flags word (the header's ZLSX_EMB_WRITE_*):
+# bit 0 also writes the recovery record into the hidden `zlsxRecovery`
+# sheet — the one carrier an Apple Numbers export keeps (S3c slice 4).
+ZLSX_EMB_WRITE_RECOVERY_IN_CELLS = 1
+
 # Feature-gated like the editor surface: a wheel built against an older
 # libzlsx must still import, with the embedding API simply absent.
 _HAS_EMB = hasattr(lib, "zlsx_emb_open")
@@ -1894,7 +1899,7 @@ if _HAS_EMBEDDING_WRITE:
         ctypes.c_uint32,                                  # dim
         ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # dtype
         ctypes.POINTER(EmbCoverageV1), ctypes.c_size_t,   # coverages
-        ctypes.c_uint32,                                  # flags (reserved: 0)
+        ctypes.c_uint32,                                  # flags (ZLSX_EMB_WRITE_*)
         ctypes.POINTER(DiagV1),
         ctypes.c_char_p,
         ctypes.c_size_t,

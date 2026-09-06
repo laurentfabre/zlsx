@@ -450,9 +450,32 @@ workbook's `<definedNames>` block: every existing name keeps `name`,
 defined-name edit (pre-existing, recorded). The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
 rebuild from the archive as opened and do not carry a staged embedding
-write — call them before it, or save and re-open. `recovery_in_cells` (the
-Numbers-durable carrier) is Zig-only until the editor grows a path for its
-hidden sheet (its strip side shipped with the sweeps below).
+write — call them before it, or save and re-open.
+
+`recovery=` picks where the recovery record rides. The default,
+`"invisible"`, is the two carriers no user sees — and an Apple Numbers
+export erases them, so that export reads `absent`. `recovery="in_cells"`
+also writes the record into a hidden sheet named `zlsxRecovery` (Excel's
+*Hide*; `Book.sheet_state` reads `"hidden"`), the one carrier Numbers keeps,
+so a Numbers export reads `stripped` with `carrier == "cell_data"` and the
+model, dimension and ranges intact — at the cost of a sheet the user can
+reveal; the two cannot be had together. The sheet is appended after the
+last one and the editor's indices count it (`add_sheet` returns one more,
+`set_cell` addresses it). `"in_cells"` governs the sheet's creation: a
+workbook already carrying it has its cell refreshed by every later write,
+whatever `recovery` says, so the record is one generation in every carrier;
+`strip_embeddings()` removes the sheet. Its own refusals land before the
+first part write too: `IdSpaceExhausted` (the `sheetId`, part-number or
+`rId` space), `MissingWorkbookPart` / `SheetCountMismatch`,
+`MalformedSharedStringsXml` / `MalformedSheetXml` as a `ZlsxRefusal`;
+`SheetHasUnsavedAppends` (staged `append_rows` on the sheet) and
+`StructuralEditIncomplete` as a `ZlsxError`.
+
+```python
+with zlsx.edit("report.xlsx") as ed:
+    ed.set_embeddings(model, dim, coverages, recovery="in_cells")   # survives a Numbers export
+    ed.save("report.xlsx")
+```
 
 `prune_embeddings()` and `strip_embeddings()` are the two sweeps `zlsx embed
 --prune` / `--strip` run, on the editor handle (0.9.0+). Prune tombstones
