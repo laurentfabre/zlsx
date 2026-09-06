@@ -1255,14 +1255,15 @@ write (an empty model lands; an empty coverage set is
 `InvalidEmbeddingInput`; an empty dtype is `InvalidDtype`); NULL with a
 non-zero length is `InvalidInput`, the `bytesArg` rule.
 
-**`flags`** (decision S3c-3) is reserved: v1 defines no bit and refuses
-a set one (`InvalidInput`), so `recovery_in_cells` can cross later
-without a `_v2`. It does NOT cross in this slice:
+**`flags`** (decision S3c-3) was reserved in this slice: v1 defined no
+bit and refused a set one (`InvalidInput`), so `recovery_in_cells` could
+cross later without a `_v2`. It did NOT cross here:
 `Workbook.setEmbeddingsOpts(.recovery_in_cells)` adds its hidden sheet
 through `Workbook.addSheet`, beneath the `Editor`'s sheet mirror — the
 mirror would not know the sheet (the S3a all-or-nothing
 `Editor.addSheet` exists precisely because the two must agree), so the
-flag waits for an Editor-level path.
+flag waited for an Editor-level path. **Slice 4 (§21) is that path**:
+bit 0, `ZLSX_EMB_WRITE_RECOVERY_IN_CELLS`, under the same macro.
 
 **The refusal split** (decision S3c-4) is §10's rule. `-1`, statements
 about the call, every one raised before the first part write:
@@ -2150,3 +2151,167 @@ zipfile-patched copies with the passthrough after each and the read
 keeping the parser's name; the strip's carriers in the archive, idempotent,
 a no-op without a set; the `MalformedWorkbookXml` pre-flight; the closed
 editor, the older-dylib `RuntimeError`, the probe against the version.
+
+## 21. S3c slice 4 — `recovery_in_cells` on the write (2026-09-06)
+
+`RecoveryOptions.recovery_in_cells` crosses the boundary on the export
+slice 1 shipped — no new export, no new struct, the bit slice 1 reserved:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_set_embeddings(…, flags = ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, …)` | `_HAS_EMBEDDING_WRITE` (unchanged) | `ZLSX_HAS_EMBEDDING_WRITE` (unchanged), `ZLSX_EMB_WRITE_RECOVERY_IN_CELLS` |
+
+**The bit, not a `_v2`** (decision S3c-10). `flags` bit 0 is
+`Workbook.setEmbeddingsOpts(.{ .recovery_in_cells = true })`; every other
+bit stays reserved (`InvalidInput`). The macro and the probe are slice
+1's: 0.9.0 is unreleased, so no released library exposes the export
+without the bit — a caller who sees `zlsx_editor_set_embeddings` may set
+it. py-zlsx spells the mode: `Editor.set_embeddings(…, recovery="invisible"
+| "in_cells")`, a `ValueError` for any other string and a `TypeError` for
+a non-string, both before ctypes (the shape rule); the two invisible
+carriers are the default, as on the Zig surface.
+
+**The Editor-level path** (decision S3c-11): `Editor.setEmbeddings` /
+`Editor.setEmbeddingsOpts` (new), the C export's one path flag or no
+flag. The cells carrier is a hidden sheet the workbook adds beneath the
+Editor's `sheet_paths` mirror (the strip's hole of slice 3, on the write
+side), so the Editor allocates the mirror's entry BEFORE the workbook
+mutates — the part name from the same store walk `Workbook.addSheet`
+takes, nothing between the two adding a worksheet part (the S3a
+`Editor.addSheet` rule) — and installs it after, whatever the verdict: a
+failure past the add (an allocation staging the cell) leaves the sheet in
+the workbook, and the mirror says so. A refusal before the first write
+leaves the mirror as it was. The sheet is appended last; the editor's
+indices count it (`zlsx_editor_add_sheet`'s next index,
+`zlsx_editor_set_cell`'s), and `zlsx_editor_strip_embeddings` removes it
+through the same mirror (slice 3).
+
+**Four Zig-layer gaps the export exposed** (the
+`Workbook.setEmbeddingsOpts` contract, every surface at once):
+
+- **The sheet was visible.** `RecoveryOptions` promised "a hidden sheet a
+  user can reveal", the emb-4b carrier leg measured `state="hidden"`
+  surviving every consumer Numbers included, and `writeRecoveryCell`
+  added the sheet through `Workbook.addSheet` with no `state` — a
+  visible `zlsxRecovery` tab. `Workbook.addSheetOpts(name, .{ .state })`
+  (new; `addSheet` is the `.visible` default) spells `<sheet name
+  sheetId state r:id>` in Excel's attribute order, and the carrier is
+  `state="hidden"` — what `zlsx_sheet_state` / `Book.sheet_state` read
+  back, what `zlsx list-sheets` prints.
+- **A second write in one session tore the set.** The first write staged
+  the record with `appendRows`; the second found the sheet and
+  `setCell`'s guard refused it `SheetHasUnsavedAppends` — after every
+  part. The record is now ONE `shared_string` delta on `A1`, new sheet
+  or not (the save lifts it into `xl/sharedStrings.xml` as the append did
+  — the shape the strip's scrub and the record reader were pinned on),
+  and a sheet holding staged appended rows of its own is refused in pass
+  0c.
+- **A re-embed left the previous record ahead of the new one.** The save
+  never collects a dead shared-string entry and the record reader takes
+  the FIRST record it finds in the table or a worksheet part, so a
+  re-embed across a save (or a re-embed of a workbook whose sheet a
+  foreign tool wrote inline) read the OLD model after a Numbers-shaped
+  strip — the cells sibling of slice 1's round-1 HIGH. The write now runs
+  the strip's scrub (`scrubRecoveryCellText`, under the strip's scope
+  rule: the table always, the worksheet parts when the cells sheet or an
+  orphaned worksheet part is there) before staging the new cell; every
+  part the scrub would read is materialized in pass 0c under
+  `carrierPart`'s rule (`MalformedSharedStringsXml` / `MalformedSheetXml`
+  — the carrier's verdict, never the store's), so the install's scrub can
+  fail on allocation only.
+- **Every verdict of the sheet's creation fired after the parts.**
+  `Workbook.addSheet` ran last in the install: `StructuralEditIncomplete`,
+  `MissingWorkbookPart`, `MalformedWorkbookXml`, `SheetCountMismatch`,
+  `MissingWorkbookRels` / `MalformedWorkbookRels`, `IdSpaceExhausted`
+  (the `sheetId`, the part number, the `rId`) — each a torn set. The add
+  is now `prepareAddSheet` (every verdict, both patched parts, the fresh
+  view — nothing written; `reserved_rids` counts the `rId` the write's
+  own relationship takes first when it is new, so the sheet's is never
+  the one that does not fit) + `commitAddSheet` (the install), and pass 0c
+  (`preflightRecoveryCell`) prepares and discards when the sheet will be
+  created. The dry run is the closed form for `SheetCountMismatch`: a
+  `</sheets>` the lexical splice finds inside a comment the typed parser
+  skips (a workbook the open admits).
+
+**The option governs creation** (decision S3c-12): a workbook already
+carrying the sheet — by its reserved name, matched as the workbook
+matches sheet names (`sheetNameMatchesDecoded`: ASCII case-insensitive,
+entities decoded — ONE locator, `recoveryCellSheetIndex`, for the write,
+the strip and the Editor; the byte-exact lookup beside `addSheet`'s rule
+let a user sheet spelled `ZLSXRECOVERY` hide from the write and refuse
+its add after the parts) — has its cell refreshed by every write, bit or
+no bit, so the record is one generation in every carrier; the strip
+removes the sheet. The alternative (delete the sheet when the bit is
+clear) would put the delete's `SheetDeleteRequiresCleanState` on a plain
+re-embed; the other alternative (leave it) is the stale record the third
+gap above describes. The name is reserved: a sheet spelled so, however
+cased, IS the carrier and its `A1` is written.
+
+**The refusal split** is §18's, plus: `-1` `SheetHasUnsavedAppends` (the
+cells sheet holds staged appended rows) and `StructuralEditIncomplete`
+(a torn editor and the sheet would have to be created — the
+`zlsx_editor_delete_sheet` classification), `TooManySheets` (the mirror
+at `UINT32_MAX` sheets — unreachable in practice); `-2`
+`MissingWorkbookPart`, `SheetCountMismatch`, `MalformedSharedStringsXml`,
+`MalformedSheetXml`, and `IdSpaceExhausted` / `MalformedWorkbookXml` /
+`MissingWorkbookRels` / `MalformedWorkbookRels` for the sheet's own
+reasons — all already in `structural_refusals`, no new name. Every one
+lands before the first part write.
+
+**Recorded, outside the slice**: the recalc transactions
+(`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
+`zlsx_editor_recalculate`) rebuild their candidate from the archive as
+opened (slice 1's owner follow-up, r2 B-REL-201): under the default the
+wrong order saves a STRIPPED file; under the bit the write adds a sheet,
+and the wrong order ends as after `zlsx_editor_add_sheet` + mark + save —
+the `sheetCount` assert, a process abort (verified from Python: rc -6).
+The rule is on every surface's documentation of the write; the fix the
+follow-up names is one guard at `recalc_txn.prepare` (refuse while
+`store.installs > 0`), an owner decision. Still Zig-only: nothing — the
+§4 row is all-three (the CLI's `embed --vectors` has no cells flag; the
+CLI leg and the vector / state dump remain S3c). The recovery sheet a
+consumer RENAMES is not found by the locator (its text is still scrubbed
+by the strip) — slice 3's note stands.
+
+**Tests** (`src/c_abi.zig`, "S3c slice 4 set_embeddings …" ×3): the bit
+adding the hidden sheet through the mirror (`add_sheet` at 3, a
+`set_cell` there landing on `sheet4.xml`, the reader's `zlsx_sheet_state`
+hidden at 2 and the name, ONE record in the table, the Numbers-shaped
+strip — the parts, the docProps carrier and the `<definedNames>` block
+gone — reading `STRIPPED` from `CELL_DATA` with the model and range); two
+cells writes in one editor and a third without the bit across a save
+keeping one sheet and one record (the last model's, the previous gone
+from the table), the Numbers-shaped strip reading it, the strip removing
+the sheet with `add_sheet` at 2 again; the verdicts before the first
+write as `-2` with the name in the diag and plane NONE (the `sheetId`
+space, an appended relationship at `rId4294967294` — the write's own
+relationship takes the last id, the sheet's would not fit, and the same
+file without the bit takes the set — a `</sheets>` inside a comment
+before the real one), the passthrough save reading `ABSENT` with two
+sheets; staged appends on the cells sheet `-1` with and without the bit,
+the set untouched; two reserved bits `InvalidInput`; the plane of every
+name. `pkg/workbook.zig` ("S3c slice 4 …" ×4): `state="hidden"` on the
+view and in the saved bytes with the record in the table and the
+Numbers-shaped strip reading `.stripped` / `cell_data`; the refresh chain
+(one session, across a save, without the option) with one record and
+`|m2|` gone; the reserved name however cased as the carrier for the write
+and the strip; the verdicts before the first write with the store's
+mutation counter unchanged (the `sheetId` space, the reserved `rId`, the
+commented `</sheets>` → `SheetCountMismatch`, `torn_edit` →
+`StructuralEditIncomplete`, appended rows on the sheet →
+`SheetHasUnsavedAppends` with and without the option) and the `rId`
+patch taking the set without the sheet. `pkg/editor.zig` ("S3c slice 4
+…" ×1): the mirror's third entry `xl/worksheets/sheet3.xml`, hidden on the
+view, `addSheet` at 3 with a `setCell` landing on `sheet4.xml`, the
+second write leaving the mirror alone, the refusal leaving it as it was
+and the default options never touching it. `tests/c_abi_smoke.c`: the
+macro present and `== 1u`. `test_embedding_write.py` +6 (+5
+parametrized cases), 56: the hidden sheet through `Book.sheets` /
+`Book.sheet_state`, the record row (percent-encoded), `add_sheet` at 3
+and a `set_cell` there, the Numbers-shaped zipfile strip reading
+`stripped` / `cell_data` with the coverages; the default spelled or not
+byte-identical and reading `absent` after the strip; the refresh chain
+with one record; the strip through the mirror; the `recovery` shapes
+before ctypes with the passthrough; the `sheetId` refusal with the same
+workbook taking the set without the bit, and the staged appends `-1`
+under both spellings.

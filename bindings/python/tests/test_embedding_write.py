@@ -506,6 +506,224 @@ def test_set_embeddings_and_the_recalc_transactions_in_the_documented_order(tmp_
     assert b'fullCalcOnLoad="1"' in zipfile.ZipFile(out).read("xl/workbook.xml")
 
 
+# ── recovery in cells (S3c slice 4) ──────────────────────────────────
+
+RECOVERY_SHEET = "zlsxRecovery"
+
+
+def _numbers_shaped(src: Path, dst: Path) -> Path:
+    """What an Apple Numbers export leaves (the emb-4b measurement): the
+    cells. Every part under ``xl/zlsxEmbeddings/``, ``docProps/custom.xml``
+    and the ``<definedNames>`` block gone, the workbook→index relationship
+    with them."""
+    import re
+
+    zin = zipfile.ZipFile(src)
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in zin.namelist():
+            if item.startswith("xl/zlsxEmbeddings/") or item == "docProps/custom.xml":
+                continue
+            data = zin.read(item)
+            if item == "xl/workbook.xml" and b"<definedNames>" in data:
+                a = data.index(b"<definedNames>")
+                b = data.index(b"</definedNames>") + len(b"</definedNames>")
+                data = data[:a] + data[b:]
+            if item == "xl/_rels/workbook.xml.rels":
+                data = re.sub(rb"<Relationship [^>]*zlsx/2026/relationships/embeddings[^>]*/>", b"", data)
+            zo.writestr(item, data)
+    return dst
+
+
+def _record_count(path: Path) -> int:
+    """Records in the shared-string table — the carrier's on-disk shape."""
+    return zipfile.ZipFile(path).read("xl/sharedStrings.xml").count(b"zlsxER1")
+
+
+def test_set_embeddings_recovery_in_cells_adds_a_hidden_sheet_the_indices_count(tmp_path):
+    """``recovery="in_cells"``: a hidden ``zlsxRecovery`` sheet after the
+    last one, holding the record; the editor's next index counts it and
+    a write to that index lands there; a Numbers-shaped strip reads
+    ``stripped`` from ``cell_data`` with the provenance intact."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    numbers = tmp_path / "numbers.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("test-model/v1", 3, [TITLE], recovery="in_cells")
+        assert ed.add_sheet("New") == 3
+        ed.set_cell(3, 1, 0, "x")
+        ed.save(out)
+
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second", RECOVERY_SHEET, "New"]
+        assert book.sheet_state(RECOVERY_SHEET) == "hidden"
+        assert [book.sheet_state(i) for i in (0, 1, 3)] == ["visible"] * 3
+        assert [r[0] for r in book.sheet("New").rows()] == ["x"]
+        [record_row] = list(book.sheet(RECOVERY_SHEET).rows())
+        assert record_row[0].startswith("zlsxER1") and "|test-model%2Fv1|" in record_row[0]   # percent-encoded
+    assert _record_count(out) == 1
+    assert b'name="zlsxRecovery" sheetId="3" state="hidden"' in zipfile.ZipFile(out).read("xl/workbook.xml")
+    with zlsx.embeddings(out) as emb:
+        assert emb.present and emb.model == "test-model/v1"
+
+    _numbers_shaped(out, numbers)
+    with zlsx.embeddings(numbers) as emb:
+        assert emb.stripped
+        assert emb.carrier == "cell_data"
+        assert emb.model == "test-model/v1" and emb.dim == 3
+        assert [(c.id, c.range, c.rows) for c in emb.coverages] == [("title", "A2:A4", 3)]
+
+
+def test_set_embeddings_recovery_invisible_is_the_default_and_a_numbers_export_reads_absent(tmp_path):
+    """The default (spelled or not) writes no sheet — and the measured
+    Numbers outcome: ``absent``, the vectors and the evidence gone."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    spelled = tmp_path / "spelled.xlsx"
+    numbers = tmp_path / "numbers.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [TITLE])
+        ed.save(out)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [TITLE], recovery="invisible")
+        ed.save(spelled)
+    assert out.read_bytes() == spelled.read_bytes()
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second"]
+    _numbers_shaped(out, numbers)
+    with zlsx.embeddings(numbers) as emb:
+        assert emb.absent
+
+
+def test_set_embeddings_recovery_in_cells_is_created_once_and_refreshed_by_every_write(tmp_path):
+    """Two ``in_cells`` writes in one editor, a third without across a
+    save: one hidden sheet, one record — the last generation's — in the
+    table (the reader takes the first record it finds, so a dead entry
+    would be the previous model)."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    mid = tmp_path / "mid.xlsx"
+    out = tmp_path / "out.xlsx"
+    numbers = tmp_path / "numbers.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m1", 3, [TITLE], recovery="in_cells")
+        ed.set_embeddings("m2", 3, [TITLE], recovery="in_cells")
+        ed.save(mid)
+    with zlsx.open(mid) as book:
+        assert book.sheets == ["Docs", "Second", RECOVERY_SHEET]
+    assert _record_count(mid) == 1
+    assert b"|m2|" in zipfile.ZipFile(mid).read("xl/sharedStrings.xml")
+    with zlsx.Editor(mid) as ed:
+        ed.set_embeddings("m3", 3, [TITLE])          # no `recovery=`: refreshed all the same
+        ed.save(out)
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second", RECOVERY_SHEET]
+        assert book.sheet_state(RECOVERY_SHEET) == "hidden"
+    sst = zipfile.ZipFile(out).read("xl/sharedStrings.xml")
+    assert _record_count(out) == 1 and b"|m3|" in sst and b"|m2|" not in sst
+    _numbers_shaped(out, numbers)
+    with zlsx.embeddings(numbers) as emb:
+        assert emb.stripped and emb.carrier == "cell_data" and emb.model == "m3"
+
+
+def test_strip_embeddings_removes_the_cells_sheet_the_write_created(tmp_path):
+    """The strip through the same mirror: the sheet goes, the next index
+    is 2 again, the file reads ``absent``."""
+    _needs_write()
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_EMBEDDING_SWEEPS:
+        pytest.skip("loaded libzlsx predates the embedding sweeps")
+    src = tmp_path / "src.xlsx"
+    cells = tmp_path / "cells.xlsx"
+    out = tmp_path / "out.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [TITLE], recovery="in_cells")
+        ed.save(cells)
+    with zlsx.Editor(cells) as ed:
+        ed.strip_embeddings()
+        assert ed.add_sheet("New") == 2
+        ed.save(out)
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second", "New"]
+    with zlsx.embeddings(out) as emb:
+        assert emb.absent
+    assert _record_count(out) == 0
+
+
+@pytest.mark.parametrize(
+    "exc, recovery",
+    [
+        (ValueError, "cells"),
+        (ValueError, "hidden"),
+        (ValueError, ""),
+        (TypeError, True),
+        (TypeError, 1),
+        (TypeError, None),
+    ],
+)
+def test_set_embeddings_recovery_is_checked_in_python_first(tmp_path, exc, recovery):
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        with pytest.raises(exc, match="recovery"):
+            ed.set_embeddings("m", 3, [TITLE], recovery=recovery)
+        assert ed.save_to_buffer() == src.read_bytes()
+
+
+def test_set_embeddings_recovery_in_cells_refuses_before_the_first_write(tmp_path):
+    """The hidden sheet's own verdicts, ahead of every part: a
+    ``sheetId`` space at its ceiling refuses ``IdSpaceExhausted`` with
+    the passthrough save byte for byte; staged appended rows on the
+    sheet are the call's ``SheetHasUnsavedAppends``, the set untouched."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    bad = tmp_path / "bad.xlsx"
+    out = tmp_path / "out.xlsx"
+    cells = tmp_path / "cells.xlsx"
+    dirty_out = tmp_path / "dirty_out.xlsx"
+    _write_fixture(src)
+    zin = zipfile.ZipFile(src)
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in zin.namelist():
+            data = zin.read(item)
+            if item == "xl/workbook.xml":
+                assert b'sheetId="1"' in data
+                data = data.replace(b'sheetId="1"', b'sheetId="4294967295"', 1)
+            zo.writestr(item, data)
+    with zlsx.Editor(bad) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.set_embeddings("m", 3, [TITLE], recovery="in_cells")
+        assert info.value.error_name == "IdSpaceExhausted"
+        # Without the sheet the same workbook takes the set.
+        ed.set_embeddings("m", 3, [TITLE])
+        ed.save(out)
+    with zlsx.embeddings(out) as emb:
+        assert emb.present
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second"]
+
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m1", 3, [TITLE], recovery="in_cells")
+        ed.save(cells)
+    with zlsx.Editor(cells) as ed:
+        ed.append_rows(2, [["z"]])
+        for recovery in ("in_cells", "invisible"):
+            with pytest.raises(zlsx.ZlsxError) as info:
+                ed.set_embeddings("m2", 3, [TITLE], recovery=recovery)
+            assert not isinstance(info.value, zlsx.ZlsxRefusal)
+            assert ": SheetHasUnsavedAppends" in str(info.value)
+        ed.save(dirty_out)
+    with zlsx.embeddings(dirty_out) as emb:
+        assert emb.present and emb.model == "m1"
+
+
 def test_set_embeddings_closed_editor_and_older_dylib(tmp_path, monkeypatch):
     import zlsx._ffi as ffi
 

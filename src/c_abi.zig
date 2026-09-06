@@ -10509,10 +10509,13 @@ comptime {
     assert(@sizeOf(CPruneReport) == 40);
 }
 
-/// `zlsx_editor_set_embeddings`'s flags word. v1 defines no bit, so 0
-/// is the only accepted value (a set bit is `InvalidInput`); reserved
-/// so `recovery_in_cells` can cross later without a second export.
-const emb_write_flags_known: u32 = 0;
+/// `zlsx_editor_set_embeddings`'s flags word, bit 0:
+/// `RecoveryOptions.recovery_in_cells` — the record also in a hidden
+/// `zlsxRecovery` sheet, the one carrier Apple Numbers keeps (S3c slice
+/// 4; the bit slice 1 reserved). Every other bit is reserved and refused
+/// (`InvalidInput`).
+pub const ZLSX_EMB_WRITE_RECOVERY_IN_CELLS: u32 = 1;
+const emb_write_flags_known: u32 = ZLSX_EMB_WRITE_RECOVERY_IN_CELLS;
 
 /// A `(ptr, len)` array at the boundary, `bytesArg`'s rule on a typed
 /// element: NULL with a non-zero length is `InvalidInput`; NULL with
@@ -10534,24 +10537,52 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// contract). Staged in memory; `zlsx_editor_save` commits. `dtype`
 /// is spelled as `zlsx_emb_dtype` spells it — `"f32"` or
 /// `"int8-sym-per-vec"`; the three other names the read knows have
-/// no writer (`UnsupportedDtype`). `flags` is reserved and must be 0.
+/// no writer (`UnsupportedDtype`). `flags` is a bit set:
+/// `ZLSX_EMB_WRITE_RECOVERY_IN_CELLS` (bit 0) also writes the record
+/// into a hidden sheet named `zlsxRecovery` (`<sheet state="hidden">`,
+/// the record in its A1 — `RecoveryOptions.recovery_in_cells`), the
+/// one carrier an Apple Numbers export keeps, at the cost of a sheet
+/// the user can reveal; it is appended after the last sheet, and the
+/// editor's sheet indices (`zlsx_editor_add_sheet`'s next index,
+/// `zlsx_editor_set_cell`'s) count it. The bit governs the sheet's
+/// CREATION: a workbook already carrying it (an earlier write with the
+/// bit) has its cell refreshed by every later write, bit or no bit —
+/// the previous record scrubbed from the shared-string table and the
+/// worksheet parts first — so the record is one generation in every
+/// carrier; `zlsx_editor_strip_embeddings` removes the sheet. The name
+/// is reserved: a sheet spelled so, however cased, IS the carrier, and
+/// its A1 is written. Every other bit is `InvalidInput`.
 ///
 /// -1, a statement about the call, each before the first part write:
 /// `InvalidInput` (NULL handle, NULL bytes or arrays with a non-zero
-/// length, a set flag, `include_formulas` past 1),
+/// length, a reserved flag bit, `include_formulas` past 1),
 /// `InvalidEmbeddingInput` (no coverage, `dim == 0`, a `vectors_len`
 /// or `hashes_len` that disagrees with the range), `InvalidDtype`,
 /// `UnsupportedDtype`, `SheetIndexOutOfRange`, and the index's own
 /// rules — `InvalidCoverageId`, `InvalidRange` (the range, or a column
 /// outside it), `DuplicateCoverageId`, `CoverageOverlap`,
-/// `InvalidXmlByte` (a C0 control byte in the model). -2, a statement
-/// about the workbook: `MissingWorkbookRels` / `MalformedWorkbookRels`
-/// (the workbook→index relationship, or the docProps carrier's package
+/// `InvalidXmlByte` (a C0 control byte in the model);
+/// `SheetHasUnsavedAppends` (the `zlsxRecovery` sheet holds staged
+/// appended rows — save first) and `StructuralEditIncomplete` (the
+/// editor holds a torn structural edit and the sheet would have to be
+/// created — discard it), both when the cells carrier is written. -2,
+/// a statement about the workbook: `MissingWorkbookRels` /
+/// `MalformedWorkbookRels` (the workbook→index relationship, or the
+/// docProps carrier's package relationship, or the hidden sheet's
 /// relationship, has nowhere to land — checked before the first
-/// write), `IdSpaceExhausted` (the rels file's `rId` space, or an
-/// existing `docProps/custom.xml`'s `pid` space, already at
-/// `UINT32_MAX` — checked before the first write),
+/// write), `IdSpaceExhausted` (the rels file's `rId` space — for the
+/// hidden sheet's `rId` after the one the write's own relationship
+/// takes — or an existing `docProps/custom.xml`'s `pid` space, or the
+/// `sheetId` / worksheet part-number space when the sheet is created,
+/// already at `UINT32_MAX` — checked before the first write),
 /// `MissingRelationship` (the sheet's part is unreachable),
+/// `MissingWorkbookPart` / `SheetCountMismatch` (no `xl/workbook.xml`,
+/// or one whose `</sheets>` the typed parser reads elsewhere than the
+/// splice — the sheet's add could not land; checked before the first
+/// write), `MalformedSharedStringsXml` / `MalformedSheetXml` (a
+/// shared-string table or, with the sheet present, a worksheet part
+/// the scrub would read and the store cannot serve — checked before
+/// the first write),
 /// `EmbeddingExceedsArchiveLimit` (a part past the 512 MiB read cap,
 /// sized here from the inputs before anything is read, OR a recovery
 /// record past its 16 × 200-byte ceiling — roughly eighty coverages,
@@ -10667,7 +10698,11 @@ export fn zlsx_editor_set_embeddings(
         };
         encoded = i + 1;
     }
-    wb.setEmbeddings(model_s, dim, dt, inputs) catch |e| {
+    // The Editor's path, flag or no flag: the cells carrier's hidden
+    // sheet must reach the editor's sheet mirror (S3c slice 4).
+    state.inner.setEmbeddingsOpts(model_s, dim, dt, inputs, .{
+        .recovery_in_cells = flags & ZLSX_EMB_WRITE_RECOVERY_IN_CELLS != 0,
+    }) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
     };
     return ZLSX_OK;
@@ -11050,6 +11085,332 @@ test "S3c set_embeddings: f32 coverages on two sheets cross the boundary, land i
     try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
 }
 
+/// A Numbers-shaped strip of a saved workbook: every part under
+/// `xl/zlsxEmbeddings/`, `docProps/custom.xml` and the `<definedNames>`
+/// block gone — what an Apple Numbers export leaves (emb-4b): cell data
+/// only. Saved to `dst`.
+fn s3c4NumbersStrip(io: std.Io, src: []const u8, dst: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, src);
+    defer wb.deinit();
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    for (wb.store.parts) |p| {
+        if (std.mem.startsWith(u8, p.name, "xl/zlsxEmbeddings/")) try names.append(alloc, try alloc.dupe(u8, p.name));
+    }
+    for (names.items) |n| try wb.store.removePart(n);
+    try wb.store.removePart("docProps/custom.xml");
+    const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+    const open = std.mem.indexOf(u8, wbx.bytes, "<definedNames>") orelse return error.TestUnexpectedResult;
+    const close_tag = "</definedNames>";
+    const close = std.mem.indexOfPos(u8, wbx.bytes, open, close_tag) orelse return error.TestUnexpectedResult;
+    const patched = try std.mem.concat(alloc, u8, &.{ wbx.bytes[0..open], wbx.bytes[close + close_tag.len ..] });
+    defer alloc.free(patched);
+    try wb.store.replacePart("xl/workbook.xml", patched);
+    try wb.save(io, dst);
+}
+
+/// `src` with `old` → `new` in `part`, saved as `name`.
+fn s3c4PatchedCopy(io: std.Io, tt: *TestTmp, src: []const u8, name: []const u8, part: []const u8, old: []const u8, new: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, src);
+    defer wb.deinit();
+    const p = (try wb.store.part(part)) orelse return error.TestUnexpectedResult;
+    if (std.mem.indexOf(u8, p.bytes, old) == null) return error.TestUnexpectedResult;
+    const patched = try std.mem.replaceOwned(u8, alloc, p.bytes, old, new);
+    defer alloc.free(patched);
+    try wb.store.replacePart(part, patched);
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    try wb.save(io, path);
+    return path;
+}
+
+fn s3c4CountRecords(text: []const u8) usize {
+    var n: usize = 0;
+    var rest = text;
+    while (zlsx_pkg.recovery_record.recordSpanInText(rest)) |sp| {
+        n += 1;
+        rest = rest[sp.end..];
+    }
+    return n;
+}
+
+test "S3c slice 4 set_embeddings: ZLSX_EMB_WRITE_RECOVERY_IN_CELLS adds the hidden zlsxRecovery sheet through the mirror — add_sheet's next index agrees, a set_cell lands where the mirror says, the saved sheet reads hidden, a Numbers-shaped strip reads STRIPPED from CELL_DATA" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c4_src.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3c4_out.xlsx");
+    defer alloc.free(out);
+    const numbers = try tt.path(alloc, io, "s3c4_numbers.xlsx");
+    defer alloc.free(numbers);
+
+    var err_buf: [128]u8 = undefined;
+    const v3 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const h3 = [_]u64{ 1, 2, 3 };
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A4", "A", &v3, &h3)};
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "cells-model", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, &diag, &err_buf));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        zlsx_diag_release(&diag);
+        // The mirror knows the sheet: Docs 0, Second 1, zlsxRecovery 2,
+        // so the next sheet is 3 — and a write to it lands there.
+        var idx: u32 = no_sheet_idx;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_sheet(ed, "New", 3, &idx, null, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(u32, 3), idx);
+        const x = s3cStringCell("x");
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 3, 1, 0, &x, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    }
+    {
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+        var sbuf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("cells-model", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    }
+    {
+        // The reader's view: four sheets, the third hidden and named.
+        const book = zlsx_book_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_book_close(book);
+        try std.testing.expectEqual(@as(u32, 4), zlsx_sheet_count(book));
+        try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book, 0));
+        try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book, 1));
+        try std.testing.expectEqual(ZLSX_SHEET_STATE_HIDDEN, zlsx_sheet_state(book, 2));
+        try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book, 3));
+        var nbuf: [64]u8 = undefined;
+        const n = zlsx_sheet_name(book, 2, &nbuf, nbuf.len);
+        try std.testing.expectEqualStrings("zlsxRecovery", nbuf[0..n]);
+        const n3 = zlsx_sheet_name(book, 3, &nbuf, nbuf.len);
+        try std.testing.expectEqualStrings("New", nbuf[0..n3]);
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
+        const new = (try wb.sheetByName("New")) orelse return error.TestUnexpectedResult;
+        const part = try new.resolvePartName();
+        try std.testing.expectEqualStrings("xl/worksheets/sheet4.xml", part);
+        var rows = try wb.embeddableRows(alloc, part["xl/".len..], "A1:A1", "A", false);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqualStrings("x", rows.rows[0].text);
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c4CountRecords(sst.bytes));
+    }
+    // What Numbers leaves: the cells. The read says STRIPPED, and where
+    // the record came from.
+    try s3c4NumbersStrip(io, out, numbers);
+    const emb = zlsx_emb_open(numbers.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_STRIPPED, zlsx_emb_state(emb));
+    try std.testing.expectEqual(ZLSX_EMB_CARRIER_CELL_DATA, zlsx_emb_carrier(emb));
+    var sbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("cells-model", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    try std.testing.expectEqual(@as(usize, 1), zlsx_emb_coverage_count(emb));
+    try std.testing.expectEqualStrings("A2:A4", s3cEmbString(emb, zlsx_emb_coverage_range, .{@as(usize, 0)}, &sbuf));
+}
+
+test "S3c slice 4 set_embeddings: a second cells write in one editor and a third without the flag across a save keep ONE hidden sheet with the last record; strip_embeddings removes it and the mirror follows" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c4_re_src.xlsx");
+    defer alloc.free(path);
+    const mid = try tt.path(alloc, io, "s3c4_re_mid.xlsx");
+    defer alloc.free(mid);
+    const out = try tt.path(alloc, io, "s3c4_re_out.xlsx");
+    defer alloc.free(out);
+    const numbers = try tt.path(alloc, io, "s3c4_re_numbers.xlsx");
+    defer alloc.free(numbers);
+    const stripped = try tt.path(alloc, io, "s3c4_re_stripped.xlsx");
+    defer alloc.free(stripped);
+
+    var err_buf: [128]u8 = undefined;
+    const v1 = [_]f32{ 1, 2, 3 };
+    const h1 = [_]u64{7};
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A2", "A", &v1, &h1)};
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, null, &err_buf));
+        // A second write in the same editor: refreshed, not doubled.
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m2", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, mid.ptr, mid.len, &err_buf, err_buf.len));
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, mid);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c4CountRecords(sst.bytes));
+        try std.testing.expect(std.mem.indexOf(u8, sst.bytes, "|m2|") != null);
+    }
+    // Across a save, WITHOUT the flag: the sheet is there, so it is
+    // refreshed — and the previous record scrubbed first (a dead table
+    // entry would be the record the reader finds first).
+    {
+        const ed = zlsx_editor_open(mid.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m3", 3, "f32", &covs, 0, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c4CountRecords(sst.bytes));
+        try std.testing.expect(std.mem.indexOf(u8, sst.bytes, "|m3|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sst.bytes, "|m2|") == null);
+    }
+    try s3c4NumbersStrip(io, out, numbers);
+    {
+        const emb = zlsx_emb_open(numbers.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_STRIPPED, zlsx_emb_state(emb));
+        try std.testing.expectEqual(ZLSX_EMB_CARRIER_CELL_DATA, zlsx_emb_carrier(emb));
+        var sbuf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("m3", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    }
+    // The strip removes the sheet the write created, through the same
+    // mirror: the next index is 2 again.
+    {
+        const ed = zlsx_editor_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cStrip(ed, &diag, &err_buf));
+        zlsx_diag_release(&diag);
+        var idx: u32 = no_sheet_idx;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_sheet(ed, "New", 3, &idx, null, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(u32, 2), idx);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, stripped.ptr, stripped.len, &err_buf, err_buf.len));
+    }
+    const emb = zlsx_emb_open(stripped.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_ABSENT, zlsx_emb_state(emb));
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, stripped);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
+    try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+    try std.testing.expect((try wb.sheetByName("New")) != null);
+}
+
+test "S3c slice 4 set_embeddings: the cells sheet's verdicts are -2 before the first write with the name in the diag — the sheetId space, the rId after the write's own relationship, a </sheets> the typed parser reads elsewhere; staged appends on the sheet -1; a reserved bit InvalidInput; the plane of each" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c4_v_src.xlsx");
+    defer alloc.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    const v1 = [_]f32{ 1, 2, 3 };
+    const h1 = [_]u64{7};
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A2", "A", &v1, &h1)};
+
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "s3c4_v_sheetid.xlsx", .part = "xl/workbook.xml", .old = "sheetId=\"1\"", .new = "sheetId=\"4294967295\"", .expected = "IdSpaceExhausted" },
+        .{ .name = "s3c4_v_rid.xlsx", .part = "xl/_rels/workbook.xml.rels", .old = "</Relationships>", .new = "<Relationship Id=\"rId4294967294\" Type=\"http://example.com/x\" Target=\"x.xml\"/></Relationships>", .expected = "IdSpaceExhausted" },
+        .{ .name = "s3c4_v_sheets.xlsx", .part = "xl/workbook.xml", .old = "<sheets>", .new = "<sheets><!-- </sheets> -->", .expected = "SheetCountMismatch" },
+    };
+    for (cases) |case| {
+        const bad = try s3c4PatchedCopy(io, &tt, path, case.name, case.part, case.old, case.new);
+        defer alloc.free(bad);
+        const out = try tt.path(alloc, io, "s3c4_v_out.xlsx");
+        defer alloc.free(out);
+        {
+            const ed = zlsx_editor_open(bad.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+            defer zlsx_editor_close(ed);
+            var diag = freshDiag();
+            try std.testing.expectEqual(ZLSX_REFUSED, s3cSet(ed, "m", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, &diag, &err_buf));
+            try std.testing.expectEqualStrings(case.expected, diagName(&diag));
+            try std.testing.expectEqual(plane_none, diag.plane);
+            zlsx_diag_release(&diag);
+            try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        }
+        // Nothing written: no set, no sheet.
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_ABSENT, zlsx_emb_state(emb));
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+    }
+    // The rId patch is no refusal without the sheet: the write's own
+    // relationship takes the last id — the verdict was the sheet's.
+    {
+        const bad = try s3c4PatchedCopy(io, &tt, path, "s3c4_v_rid_ok.xlsx", "xl/_rels/workbook.xml.rels", "</Relationships>", "<Relationship Id=\"rId4294967294\" Type=\"http://example.com/x\" Target=\"x.xml\"/></Relationships>");
+        defer alloc.free(bad);
+        const ed = zlsx_editor_open(bad.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m", 3, "f32", &covs, 0, null, &err_buf));
+    }
+    // Staged appended rows on the cells sheet: -1, the set untouched.
+    {
+        const cells = try tt.path(alloc, io, "s3c4_v_cells.xlsx");
+        defer alloc.free(cells);
+        const dirty_out = try tt.path(alloc, io, "s3c4_v_dirty.xlsx");
+        defer alloc.free(dirty_out);
+        {
+            const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+            defer zlsx_editor_close(ed);
+            try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, null, &err_buf));
+            try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, cells.ptr, cells.len, &err_buf, err_buf.len));
+        }
+        const ed = zlsx_editor_open(cells.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        const z = [_]CCell{s3cStringCell("z")};
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_append_row(ed, 2, &z, z.len, &err_buf, err_buf.len));
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cSet(ed, "m2", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, &diag, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedAppends", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(ZLSX_ERROR, s3cSet(ed, "m2", 3, "f32", &covs, 0, &diag, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedAppends", std.mem.sliceTo(&err_buf, 0));
+        zlsx_diag_release(&diag);
+        // Reserved bits: the call's own -1, before anything is looked at.
+        try std.testing.expectEqual(ZLSX_ERROR, s3cSet(ed, "m2", 3, "f32", &covs, 2, null, &err_buf));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, s3cSet(ed, "m2", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS | 0x8000_0000, null, &err_buf));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, dirty_out.ptr, dirty_out.len, &err_buf, err_buf.len));
+        const emb = zlsx_emb_open(dirty_out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+        var sbuf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("m1", s3cEmbString(emb, zlsx_emb_model, .{}, &sbuf));
+    }
+    // The plane of every verdict the cells carrier adds to the write.
+    for ([_]anyerror{ error.IdSpaceExhausted, error.SheetCountMismatch, error.MissingWorkbookPart, error.MalformedWorkbookXml, error.MalformedSharedStringsXml, error.MalformedSheetXml }) |e| {
+        try std.testing.expectEqual(ZLSX_REFUSED, statusOf(e));
+    }
+    for ([_]anyerror{ error.SheetHasUnsavedAppends, error.StructuralEditIncomplete, error.TooManySheets }) |e| {
+        try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    }
+}
+
 test "S3c set_embeddings: int8-sym quantizes in the library and reads back within one step of the per-row scale" {
     const alloc = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(alloc, .{});
@@ -11327,7 +11688,7 @@ test "S3c set_embeddings contract violations: -1 with the name in errbuf, the di
     formulas2.include_formulas = 2;
     const cases = [_]Case{
         .{ .name = "InvalidInput", .covs = &.{ok_cov}, .ed = false },
-        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 1 },
+        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 2 },
         .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 0x8000_0000 },
         .{ .name = "InvalidInput", .covs = &.{formulas2} },
         .{ .name = "InvalidInput", .covs = &.{null_vec} },
@@ -12201,7 +12562,7 @@ test "S3c strip_embeddings: the recovery_in_cells sheet goes through the editor'
         var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
         defer wb.deinit();
         try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
-        try std.testing.expectEqual(@as(?u32, 2), wb.recoveryCellSheetIndex());
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
     }
     const out = try tt.path(alloc, io, "s3c3_cells_out.xlsx");
     defer alloc.free(out);
@@ -12227,7 +12588,7 @@ test "S3c strip_embeddings: the recovery_in_cells sheet goes through the editor'
         var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
         defer wb.deinit();
         try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
-        try std.testing.expectEqual(@as(?u32, null), wb.recoveryCellSheetIndex());
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
         try std.testing.expect((try wb.sheetByName("New")) != null);
         const ed = zlsx_editor_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
         defer zlsx_editor_close(ed);
@@ -12257,7 +12618,7 @@ test "S3c strip_embeddings: the recovery_in_cells sheet goes through the editor'
         try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
         var wb = try zlsx_pkg.Workbook.open(alloc, io, dirty_out);
         defer wb.deinit();
-        try std.testing.expectEqual(@as(?u32, 2), wb.recoveryCellSheetIndex());
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
     }
 }
 

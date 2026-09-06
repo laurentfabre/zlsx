@@ -171,6 +171,13 @@ static const void *const s3c1_exports[] = {
 const void *zlsx_c_abi_smoke_anchor_s3c1(void);
 const void *zlsx_c_abi_smoke_anchor_s3c1(void) { return s3c1_exports[0]; }
 
+/* S3c slice 4: recovery_in_cells on the write — bit 0 of the same
+ * export's flags word, under the same macro (0.9.0 ships both). */
+#if !defined(ZLSX_EMB_WRITE_RECOVERY_IN_CELLS)
+#error "ZLSX_EMB_WRITE_RECOVERY_IN_CELLS missing"
+#endif
+_Static_assert(ZLSX_EMB_WRITE_RECOVERY_IN_CELLS == 1u, "recovery_in_cells is flags bit 0");
+
 /* S3c slice 2: the embeddable-rows read on the editor handle. */
 static const void *const s3c2_exports[] = {
     (const void *)&zlsx_editor_embeddable_rows_ndjson,
