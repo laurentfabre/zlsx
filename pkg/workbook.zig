@@ -2536,6 +2536,11 @@ pub const Workbook = struct {
     ///   existing `docProps/custom.xml`'s `pid` space, is already at
     ///   `UINT32_MAX` (a hostile part; checked arithmetic, never a
     ///   trap). Checked in pass 1.
+    /// - `MissingContentTypes` / `MalformedContentTypes` — no
+    ///   `[Content_Types].xml`, or one without `</Types>`, when this
+    ///   write adds a part (a coverage new to the archive, a first
+    ///   index, an absent `docProps/custom.xml`, the hidden sheet).
+    ///   Judged in pass 2d, before the first part write.
     /// - `MalformedWorkbookXml` — `xl/workbook.xml` carries a
     ///   `<definedName` the typed parser's scanner refuses (an
     ///   unterminated attribute quote, a chunk with no close) where the

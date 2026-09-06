@@ -2189,8 +2189,11 @@ typedef struct zlsx_emb_coverage_v1 {
  * part past the 512 MiB read cap (sized here from the inputs, before
  * a vector byte is read), OR the recovery record past its ceiling of
  * 16 × 200 bytes — roughly eighty coverages at typical ids, or a
- * ~3 KB model name (encoded before the first write); the package's
- * own MissingContentTypes / MalformedContentTypes; and
+ * ~3 KB model name (encoded before the first write);
+ * MissingContentTypes / MalformedContentTypes — no [Content_Types].xml,
+ * or one without </Types>, when this write adds a part (a coverage new
+ * to the archive, a first index, an absent docProps/custom.xml, the
+ * hidden sheet; checked before the first write); and
  * MalformedWorkbookXml — an xl/workbook.xml the open admits but the
  * strip of the previous record's chunk names cannot walk (a
  * <definedName outside <definedNames> the scanner refuses; judged

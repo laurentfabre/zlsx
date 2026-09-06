@@ -10596,8 +10596,11 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// `EmbeddingExceedsArchiveLimit` (a part past the 512 MiB read cap,
 /// sized here from the inputs before anything is read, OR a recovery
 /// record past its 16 × 200-byte ceiling — roughly eighty coverages,
-/// or a ~3 KB model — encoded before the first write), and the
-/// package's own `MissingContentTypes` / `MalformedContentTypes`, and
+/// or a ~3 KB model — encoded before the first write),
+/// `MissingContentTypes` / `MalformedContentTypes` (no `[Content_Types].xml`,
+/// or one without `</Types>`, when this write adds a part — a coverage
+/// new to the archive, a first index, an absent `docProps/custom.xml`,
+/// the hidden sheet; checked before the first write), and
 /// `MalformedWorkbookXml` (an `xl/workbook.xml` the open admits but the
 /// strip of the previous record's chunk names cannot walk — a
 /// `<definedName` outside `<definedNames>` the scanner refuses; judged

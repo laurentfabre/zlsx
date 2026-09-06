@@ -2342,7 +2342,10 @@ unresolvable"), REL-203 (the content-types pre-flight generalized as
 above; pinned: an absent docProps carrier with the bit clear, and a
 coverage new to the archive behind an existing one — the first coverage's
 `replacePart` would have moved the store before the second's `addPart`
-refused).
+refused). **Round 3 (convergence)**: both agents ship-ready with ONE
+shared LOW — DOC-301, the content-types pair named without its trigger
+and timing on the header and the Zig export doc, and absent from
+`Workbook.setEmbeddings`' error list — fixed, docs only.
 
 **Tests** (`src/c_abi.zig`, "S3c slice 4 set_embeddings …" ×3, "S3c slice
 4 r1 set_embeddings …" ×1 — the `delete_sheet` orphan's record scrubbed by
