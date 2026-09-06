@@ -6128,6 +6128,17 @@ const structural_refusals = [_]anyerror{
     // could not reopen (§2's rule: limits are Plane-2 refusals at
     // every layer, the `FormulaLimitExceeded` precedent).
     error.EmbeddingExceedsArchiveLimit,
+    // S3c slice 2: the embeddable-rows read's verdicts on a cell value
+    // it cannot carry — a boolean `<v>` that is not 0 / 1, a
+    // shared-string index that is not a number or past the table, an
+    // entity the decoder does not know, text that is not UTF-8 or
+    // that NFC cannot normalize. Statements about the workbook's
+    // content (the `MalformedSheetXml` shape), refused whole rather
+    // than a record that lies. Raised by no other status_v1 export.
+    error.UnsupportedCellValue,
+    error.SstIndexOutOfRange,
+    error.InvalidUtf8,
+    error.UnicodeNormalizationFailed,
     // NOT here, deliberately: `error.ZipBombSuspected`. The S1 caps
     // admit every entry on the open-time directory walk, so the
     // verdict fires where the ABI has no diag to carry it — the
@@ -10626,6 +10637,113 @@ export fn zlsx_editor_set_embeddings(
     return ZLSX_OK;
 }
 
+/// The S3c `embed --extract` records — one `{"kind":"embed_row",…}`
+/// line per row of `column` over `range` on `sheet_idx` that carries
+/// embeddable content, range order — as a library-allocated UTF-8
+/// buffer, byte-for-byte what `zlsx embed --extract` prints
+/// (docs/cli.md, "embed --extract"): the 1-based `row`, `text` as a
+/// reader sees the cell (a shared or inline string's runs joined,
+/// entities resolved; a number's `<v>` as written; a boolean as `1` /
+/// `0`) and `hash`, the canonical xxh3-64 content hash
+/// `zlsx_editor_set_embeddings` stores beside the vector, as an
+/// unsigned 64-bit decimal. `include_formulas` (0 / 1) admits formula
+/// cells with a cached value — the coverage flag's reading, so the
+/// read matches the coverage it feeds. Rows with nothing embeddable
+/// are omitted (a covered row missing here is a `zlsx_emb_tombstone()`
+/// slot on the write); a range with none is ZLSX_OK with `(NULL, 0)`.
+/// Read over the editor's current parts. A sheet the editor holds
+/// staged cell writes or appended rows for refuses — the parsed view
+/// this read walks does not carry them, so a row would answer with
+/// its saved content and a hash the staged value turns stale the
+/// moment it lands: -1 `SheetHasUnsavedMutations` /
+/// `SheetHasUnsavedAppends`; save and re-open, or read before the
+/// writes. -1 otherwise: `InvalidInput` (NULL handle, NULL bytes with
+/// a non-zero length, `include_formulas` past 1), `NullOutPointer`,
+/// `InvalidRange` (the range, or a column outside it),
+/// `SheetIndexOutOfRange`, `StructSizeTooSmall`. -2, the name in the
+/// diag with plane NONE: `MissingRelationship` / `MissingSheetPart`
+/// (the sheet's part is unreachable), `MalformedSheetXml`, and a cell
+/// value the read cannot carry — `UnsupportedCellValue` (a boolean
+/// `<v>` that is not `0` / `1`, a shared-string index that is not a
+/// number, an entity the decoder does not know),
+/// `SstIndexOutOfRange`, `InvalidUtf8`, `UnicodeNormalizationFailed` —
+/// refused whole rather than hand over a record that lies. Release
+/// with `zlsx_buffer_release`.
+export fn zlsx_editor_embeddable_rows_ndjson(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range: ?[*]const u8,
+    range_len: usize,
+    column: ?[*]const u8,
+    column_len: usize,
+    include_formulas: u32,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail: a rejected sibling
+    // leaves the accepted ones releasable.
+    if (out_ptr) |op| op.* = null;
+    if (out_len) |ol| ol.* = 0;
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const op = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const ol = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (include_formulas > 1) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    const range_s = bytesArg(range, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const column_s = bytesArg(column, column_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const wb = &state.inner.workbook;
+    // The write's own resolution of a sheet index to the coverage's
+    // `worksheet_target` (`zlsx_editor_set_embeddings`): one spelling.
+    const ws = wb.sheet(sheet_idx) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    const target = ws.embeddingTarget() catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    const bytes = embeddableRowsNdjsonOwned(gpa, wb, target, range_s, column_s, include_formulas == 1) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return ZLSX_OK;
+    }
+    op.* = bytes.ptr;
+    ol.* = bytes.len;
+    return ZLSX_OK;
+}
+
+/// The embeddable-row records as one owned buffer in `alloc` — the
+/// shared writer (`pkg/embeddable_row_ndjson.zig`) over
+/// `Workbook.embeddableRows`, so the bytes are the CLI's. The
+/// allocating writer reports a failed growth as `WriteFailed`; at this
+/// boundary that is an allocation failure and crosses as `-3`, the
+/// pivots builder's rule.
+fn embeddableRowsNdjsonOwned(
+    alloc: std.mem.Allocator,
+    wb: *zlsx_pkg.Workbook,
+    target: []const u8,
+    range: []const u8,
+    column: []const u8,
+    include_formulas: bool,
+) ![]u8 {
+    var rows = try wb.embeddableRows(alloc, target, range, column, include_formulas);
+    defer rows.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    zlsx_pkg.embeddable_rows_ndjson.writeAll(&out.writer, rows.rows) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return out.toOwnedSlice();
+}
+
 // ── S3c slice 1 tests ─────────────────────────────────────────────────
 
 /// Two sheets — three text rows under a header on `Docs`, one row on
@@ -11164,4 +11282,299 @@ fn encodeVectorBodyForFailures(alloc: std.mem.Allocator) !void {
 test "S3c set_embeddings: the body encoder's allocation failure is OutOfMemory, the boundary's -3" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeVectorBodyForFailures, .{});
     try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
+
+// ── S3c slice 2 tests ─────────────────────────────────────────────────
+
+fn s3cRows(ed: ?*Editor, sheet_idx: u32, range: []const u8, column: []const u8, include_formulas: u32, out_ptr: ?*?[*]u8, out_len: ?*usize, diag: ?*CDiag, err_buf: []u8) i32 {
+    return zlsx_editor_embeddable_rows_ndjson(ed, sheet_idx, range.ptr, range.len, column.ptr, column.len, include_formulas, out_ptr, out_len, diag, err_buf.ptr, err_buf.len);
+}
+
+/// The canonical hash of `cell` at `row` on the first sheet — what the
+/// read must hand over, spelled by the library's own hasher.
+fn s3cHash(row: u32, cell: zlsx_pkg.embedding_part.CanonicalCell) !u64 {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    return zlsx_pkg.embedding_part.xxh3Canonical(std.testing.allocator, "worksheets/sheet1.xml", row, cell, &scratch);
+}
+
+/// One `embed_row` line as the shared writer spells it.
+fn s3cRecord(alloc: std.mem.Allocator, row: u32, text: []const u8, hash: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{{\"kind\":\"embed_row\",\"row\":{d},\"text\":\"{s}\",\"hash\":{d}}}\n", .{ row, text, hash });
+}
+
+test "S3c embeddable_rows: the records cross the boundary byte-for-byte, and fed back to set_embeddings the hashes read fresh" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c2_src.xlsx");
+    defer alloc.free(path);
+    const out_path = try tt.path(alloc, io, "s3c2_out.xlsx");
+    defer alloc.free(out_path);
+
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, &diag, &err_buf));
+    defer zlsx_buffer_release(out_ptr, out_len);
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+    zlsx_diag_release(&diag);
+
+    // The bytes are the shared writer's, over the canonical hashes.
+    const h2 = try s3cHash(2, .{ .string = "alpha" });
+    const h3 = try s3cHash(3, .{ .string = "beta" });
+    const h4 = try s3cHash(4, .{ .string = "gamma" });
+    var want: std.ArrayListUnmanaged(u8) = .empty;
+    defer want.deinit(alloc);
+    for ([_]struct { r: u32, t: []const u8, h: u64 }{ .{ .r = 2, .t = "alpha", .h = h2 }, .{ .r = 3, .t = "beta", .h = h3 }, .{ .r = 4, .t = "gamma", .h = h4 } }) |e| {
+        const line = try s3cRecord(alloc, e.r, e.t, e.h);
+        defer alloc.free(line);
+        try want.appendSlice(alloc, line);
+    }
+    try std.testing.expectEqualStrings(want.items, out_ptr.?[0..out_len]);
+    // Pinned across surfaces: the Python leg asserts the same literal
+    // on the same fixture (`test_embeddable_rows.py`), under this
+    // suite because CI's pytest lane is advisory.
+    try std.testing.expectEqual(@as(u64, 6830279115424181645), h2);
+
+    // Fed straight back to the write, every slot reads fresh under the
+    // sweep: the read's hash IS the write's.
+    const vecs = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const hashes = [_]u64{ h2, h3, h4 };
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A4", "A", &vecs, &hashes)};
+    try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m", 3, "f32", &covs, 0, null, &err_buf));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out_path.ptr, out_path.len, &err_buf, err_buf.len));
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, out_path);
+    defer wb.deinit();
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 3), report.fresh);
+    try std.testing.expectEqual(@as(usize, 0), report.stale);
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+
+    // The second sheet by index, the write's own resolution.
+    var second_ptr: ?[*]u8 = null;
+    var second_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 1, "A1:A1", "A", 0, &second_ptr, &second_len, null, &err_buf));
+    defer zlsx_buffer_release(second_ptr, second_len);
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(alloc);
+    const two = try zlsx_pkg.embedding_part.xxh3Canonical(alloc, "worksheets/sheet2.xml", 1, .{ .string = "two" }, &scratch);
+    const two_line = try s3cRecord(alloc, 1, "two", two);
+    defer alloc.free(two_line);
+    try std.testing.expectEqualStrings(two_line, second_ptr.?[0..second_len]);
+
+    // A range with nothing embeddable: OK, the outputs reset to (NULL, 0).
+    var empty_ptr: ?[*]u8 = out_ptr;
+    var empty_len: usize = 99;
+    try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "C2:C4", "C", 0, &empty_ptr, &empty_len, null, &err_buf));
+    try std.testing.expectEqual(@as(?[*]u8, null), empty_ptr);
+    try std.testing.expectEqual(@as(usize, 0), empty_len);
+}
+
+/// Every cell kind under one column: an entity-bearing shared string,
+/// a number, a blank, a boolean, a formula with a cached string, a
+/// rich shared string (written last — the writer numbers a rich cell
+/// as it is written but emits rich entries after every plain one, a
+/// pre-existing defect recorded outside this slice).
+fn writeS3c2KindsFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = xlsx.Writer.init(alloc);
+    defer w.deinit();
+    var kinds = try w.addSheet("Kinds");
+    try kinds.writeRow(&.{.{ .string = "title" }});
+    try kinds.writeRow(&.{.{ .string = "a & b <c>" }});
+    try kinds.writeRow(&.{.{ .number = 1.5 }});
+    try kinds.writeRow(&.{.empty});
+    try kinds.writeRow(&.{.{ .boolean = true }});
+    try kinds.writeRowWithFormulas(&.{.{ .string = "cached" }}, &.{"A2"});
+    try kinds.writeRichRow(&.{.{ .rich = &.{ .{ .text = "Hello", .bold = true }, .{ .text = " world" } } }});
+    try w.save(io, path);
+    return path;
+}
+
+test "S3c embeddable_rows: every kind as a reader sees it — entities resolved, runs joined, a blank omitted, formulas only on request" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3c2KindsFixture(io, &tt, "s3c2_kinds.xlsx");
+    defer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    const Line = struct { r: u32, t: []const u8, h: u64 };
+    const l2: Line = .{ .r = 2, .t = "a & b <c>", .h = try s3cHash(2, .{ .string = "a & b <c>" }) };
+    const l3: Line = .{ .r = 3, .t = "1.5", .h = try s3cHash(3, .{ .number = "1.5" }) };
+    const l5: Line = .{ .r = 5, .t = "1", .h = try s3cHash(5, .{ .boolean = true }) };
+    const l6: Line = .{ .r = 6, .t = "cached", .h = try s3cHash(6, .{ .string = "cached" }) };
+    const l7: Line = .{ .r = 7, .t = "Hello world", .h = try s3cHash(7, .{ .string = "Hello world" }) };
+    const cases = [_]struct { inc: u32, lines: []const Line }{
+        .{ .inc = 0, .lines = &.{ l2, l3, l5, l7 } },
+        .{ .inc = 1, .lines = &.{ l2, l3, l5, l6, l7 } },
+    };
+    for (cases) |case| {
+        var want: std.ArrayListUnmanaged(u8) = .empty;
+        defer want.deinit(alloc);
+        for (case.lines) |e| {
+            const line = try s3cRecord(alloc, e.r, e.t, e.h);
+            defer alloc.free(line);
+            try want.appendSlice(alloc, line);
+        }
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "A2:A7", "A", case.inc, &out_ptr, &out_len, null, &err_buf));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        try std.testing.expectEqualStrings(want.items, out_ptr.?[0..out_len]);
+    }
+}
+
+test "S3c embeddable_rows contract violations: -1 with the name in errbuf, the diag as prep left it, the outputs reset" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c2_bad.xlsx");
+    defer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    const Case = struct { name: []const u8, ed: bool = true, sheet: u32 = 0, range: []const u8 = "A2:A4", column: []const u8 = "A", inc: u32 = 0 };
+    const cases = [_]Case{
+        .{ .name = "InvalidInput", .ed = false },
+        .{ .name = "InvalidInput", .inc = 2 },
+        .{ .name = "InvalidInput", .inc = std.math.maxInt(u32) },
+        .{ .name = "InvalidRange", .range = "A0:A2" },
+        .{ .name = "InvalidRange", .range = "" },
+        .{ .name = "InvalidRange", .range = "A2:A4", .column = "Z" },
+        .{ .name = "InvalidRange", .column = "" },
+        .{ .name = "SheetIndexOutOfRange", .sheet = 2 },
+        .{ .name = "SheetIndexOutOfRange", .sheet = std.math.maxInt(u32) },
+    };
+    // A poisoned output pair: every -1 resets it before judging.
+    var poison: [1]u8 = .{0};
+    for (cases) |case| {
+        var diag = freshDiag();
+        @memset(&err_buf, 0xAA);
+        var out_ptr: ?[*]u8 = &poison;
+        var out_len: usize = 7;
+        const rc = s3cRows(if (case.ed) ed else null, case.sheet, case.range, case.column, case.inc, &out_ptr, &out_len, &diag, &err_buf);
+        try std.testing.expectEqual(ZLSX_ERROR, rc);
+        try std.testing.expectEqualStrings(case.name, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+    }
+    // NULL bytes with a non-zero length; NULL with length 0 is the
+    // empty string, the read's to judge (InvalidRange).
+    {
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_embeddable_rows_ndjson(ed, 0, null, 5, "A", 1, 0, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_embeddable_rows_ndjson(ed, 0, "A2:A4", 5, null, 1, 0, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_embeddable_rows_ndjson(ed, 0, null, 0, "A", 1, 0, &out_ptr, &out_len, null, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("InvalidRange", std.mem.sliceTo(&err_buf, 0));
+        // NULL out pointers.
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A2:A4", "A", 0, null, &out_len, null, &err_buf));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, null, null, &err_buf));
+        try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
+    }
+    // A diag below the v1 size: -1 StructSizeTooSmall, the diag byte-for-byte.
+    {
+        var small = freshDiag();
+        small.struct_size = @sizeOf(CDiag) - 1;
+        const before = std.mem.toBytes(small);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, &small, &err_buf));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqualSlices(u8, &before, &std.mem.toBytes(small));
+    }
+    // A staged cell write — outside the range, even — makes the sheet
+    // unreadable for this read: a sequencing statement, -1, never a
+    // refusal. The other sheet still answers.
+    {
+        const cell = toCCell(.{ .integer = 42 });
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 9, 3, &cell, &err_buf, err_buf.len));
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, &diag, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedMutations", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 1, "A1:A1", "A", 0, &out_ptr, &out_len, &diag, &err_buf));
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3c embeddable_rows refusals: -2 with the name in the diag — a sheet part the view cannot parse, a value the read cannot carry" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+
+    const Case = struct { file: []const u8, part: []const u8, old: []const u8, new: []const u8, name: []const u8 };
+    const cases = [_]Case{
+        .{ .file = "s3c2_sheet.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "</sheetData>", .new = "", .name = "MalformedSheetXml" },
+        .{ .file = "s3c2_sst.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"s\"><v>99</v>", .name = "SstIndexOutOfRange" },
+        .{ .file = "s3c2_bool.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"b\"><v>TRUE</v>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_entity.xlsx", .part = "xl/sharedStrings.xml", .old = ">alpha</t>", .new = ">&bogus;</t>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_utf8.xlsx", .part = "xl/sharedStrings.xml", .old = ">alpha</t>", .new = ">\xff</t>", .name = "InvalidUtf8" },
+    };
+    for (cases) |case| {
+        const path = try writeS3cFixture(io, &tt, case.file);
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, case.part, case.old, case.new);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var poison: [1]u8 = .{0};
+        var out_ptr: ?[*]u8 = &poison;
+        var out_len: usize = 7;
+        var diag = freshDiag();
+        diag.plane = 3;
+        @memset(&err_buf, 0xAA);
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, &diag, &err_buf));
+        try std.testing.expectEqualStrings(case.name, diagName(&diag));
+        try std.testing.expectEqualStrings(case.name, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
+        zlsx_diag_release(&diag);
+        // The verdict is on the workbook: the other sheet still answers.
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 1, "A1:A1", "A", 0, &out_ptr, &out_len, null, &err_buf));
+        zlsx_buffer_release(out_ptr, out_len);
+    }
+}
+
+test "S3c embeddable_rows: the plane of every verdict the read can raise" {
+    for ([_]anyerror{ error.UnsupportedCellValue, error.SstIndexOutOfRange, error.InvalidUtf8, error.UnicodeNormalizationFailed, error.MalformedSheetXml, error.MissingSheetPart, error.MissingRelationship }) |e| {
+        try std.testing.expectEqual(ZLSX_REFUSED, statusOf(e));
+    }
+    for ([_]anyerror{ error.SheetHasUnsavedMutations, error.SheetHasUnsavedAppends, error.InvalidRange, error.SheetIndexOutOfRange }) |e| {
+        try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    }
 }

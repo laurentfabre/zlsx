@@ -136,6 +136,9 @@ pub const conditional_formats_ndjson = @import("conditional_format_ndjson.zig");
 /// `<dimension>` and `<calcPr>` read strictly, attributed to workbook
 /// sheets, written once for every surface.
 pub const sheet_props_ndjson = @import("sheet_props_ndjson.zig");
+/// S3c: the `embed --extract` NDJSON records — `Workbook.embeddableRows`
+/// with the canonical content hashes, written once for every surface.
+pub const embeddable_rows_ndjson = @import("embeddable_row_ndjson.zig");
 pub const Pivots = pivots.Pivots;
 pub const PivotTable = pivots.PivotTable;
 pub const PivotCache = pivots.PivotCache;
@@ -158,6 +161,8 @@ pub const EmbeddingView = workbook_mod.EmbeddingView;
 pub const EmbeddingState = workbook_mod.EmbeddingState;
 pub const EmbeddingCoverageView = workbook_mod.EmbeddingCoverageView;
 pub const EmbeddingCoverageInput = workbook_mod.EmbeddingCoverageInput;
+pub const EmbeddableRow = workbook_mod.EmbeddableRow;
+pub const EmbeddableRows = workbook_mod.EmbeddableRows;
 
 /// Shared-strings extension-plan substrate (B3 iter-wr-1). Re-exported
 /// so `xlsx.Writer` (in `src/`) can stage strings + rich-text runs

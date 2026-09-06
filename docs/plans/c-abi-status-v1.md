@@ -1551,3 +1551,145 @@ NaN under warnings-as-errors and a subnormal under a caller's
 `under="raise"`; the two documented recalc orders landing; seventeen
 Python-side shape errors; NumPy width against `dim`; the closed editor
 and the older-dylib `RuntimeError`; the probe against the version.
+
+## 19. S3c slice 2 — the embeddable-rows read (2026-09-06)
+
+`Workbook.embeddableRows` crosses the boundary on the editor handle — the
+second S3c export, under the §2 contract. One export, one header macro,
+one probe, no new struct:
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_embeddable_rows_ndjson(ed, sheet_idx, range, range_len, column, column_len, include_formulas, out, out_len, diag, errbuf, errbuf_len) → int32_t` | `_HAS_EMBEDDABLE_ROWS` (+ `zlsx_buffer_release`, `zlsx_diag_release`) | `ZLSX_HAS_EMBEDDABLE_ROWS` |
+
+**The shape is the CLI's** (decision S3c-5): the S3b buffer contract —
+the `{"kind":"embed_row","row":N,"text":"…","hash":H}` records `zlsx
+embed --extract` prints, one line per embeddable row in range order,
+written once for every surface by `pkg/embeddable_row_ndjson.zig` (the
+`defined_name_ndjson.zig` precedent; the CLI writes through it too, its
+inline loop is gone). The record gains `hash` on every surface: the
+CLI's used to carry `row` and `text` only — `embed --vectors`
+recomputes the hash from the workbook itself — but a C or Python caller
+feeding `zlsx_editor_set_embeddings` cannot, and the goal of the slice
+is precisely the canonical hash. It is spelled as an unsigned 64-bit
+decimal, the value `zlsx_emb_hashes` reads back (a JSON reader that
+narrows integers to doubles — `jq` before 1.7 — rounds it; Python's
+`json` does not; documented on the CLI and the header). The arguments
+are the write's coverage fields — the sheet as an index (resolved by
+`Worksheet.embeddingTarget`, the write's one spelling), the A1 range,
+the column inside it, `include_formulas` as 0 / 1 — so the read matches
+the coverage it feeds. Rows with nothing embeddable are omitted, the
+Zig contract: a covered row missing from the read is a
+`zlsx_emb_tombstone()` slot (Python `None`) on the write; the Python
+docstring carries the mapping. A range with none is `ZLSX_OK` with
+`(NULL, 0)`.
+
+**The refusal split** (decision S3c-6) is §10's rule. `-1`, statements
+about the call: `InvalidInput` (NULL handle, NULL bytes with a non-zero
+length, `include_formulas` past 1), `NullOutPointer`, `InvalidRange`
+(the range, or a column outside it), `SheetIndexOutOfRange`,
+`StructSizeTooSmall`, and `SheetHasUnsavedMutations` /
+`SheetHasUnsavedAppends` — a sequencing statement (the caller staged
+writes on the sheet it is reading), the plane `applySheetEdit`'s own
+refusal of the same state already has (`statusOf` pins it `-1`). `-2`,
+statements about the workbook, the name in the diag with `plane =
+NONE`: `MissingRelationship` / `MissingSheetPart` (the sheet's part is
+unreachable) and `MalformedSheetXml` (a sheet part the view cannot
+parse), all already in `structural_refusals`, plus four new entries —
+`UnsupportedCellValue` (a boolean `<v>` that is not `0` / `1`, a
+shared-string index that is not a number, an entity the decoder does
+not know), `SstIndexOutOfRange` (an index past the table),
+`InvalidUtf8`, `UnicodeNormalizationFailed` — a cell value the read
+cannot carry, refused whole rather than a record that lies (the
+`MalformedSheetXml` shape). None of the four is raised by any other
+status_v1 export (`InvalidUtf8` / `UnicodeNormalizationFailed` come
+from the canonicalizer alone, the other two from this read's own cell
+rule), so the global classifier changes no shipped verdict. The Python
+leg mirrors the S3b reads: `ZlsxError` named after the cause,
+`ZlsxRefusal(error_name)`, the shapes (`TypeError` / `ValueError`)
+checked before ctypes, the buffer released on every path.
+
+**Three Zig-layer fixes the export exposed** (the
+`Workbook.embeddableRows` contract, every surface at once — `zlsx embed
+--extract` and `--vectors` included):
+
+- The read handed over cell text RAW. `sheet_xml.Cell.raw_value` is
+  undecoded by contract ("caller decodes if needed") and so is the SST
+  view's `.plain`, so a cell spelling `a &amp; b &lt;c&gt;` went to the
+  embedder as the entities and was hashed as such; a rich shared string
+  refused the whole read (`SstEntryIsRich` — one bold word in the
+  column and `--extract` failed); a rich inline string was its first
+  run alone. `canonicalCellFor` now reads a cell the way `readHostGrid`
+  (the S7b pivot rebuild) reads one — a shared string plain or its runs
+  joined, an inline string's runs joined through `inlineStringText`, a
+  formula's cached `t="str"` value decoded — through
+  `sst_xml.decodeText`, the ONE strict decoder every cell reader uses;
+  an entity it does not know is `UnsupportedCellValue`. The hash is
+  taken over that text — the design's "visible text" — and
+  `pruneEmbeddings` derives its verdict through the same function, so
+  a rich or entity-bearing row reads fresh after a re-embed rather
+  than permanently stale. Hash compatibility: a stored hash computed
+  over an entity-bearing raw `<t>` by the previous code reads `stale`
+  once (the old hash was over bytes no reader sees); every other row's
+  hash is unchanged.
+- `embeddableRows` returned borrowed text and folded EVERY hasher
+  error into `WriteFailed` — an allocation failure crossed as a `-1`
+  and invalid UTF-8 as a nonsense name. It now returns an arena-owned
+  `EmbeddableRows` (the `DefinedNames` shape; `deinit` frees the
+  decoded texts) and propagates the hasher's own names; a text that is
+  not UTF-8 is `InvalidUtf8` for every cell kind, judged before the
+  hash, because the NDJSON writer passes bytes through.
+- Staged cell writes were invisible to the read: `cellByRef` walks the
+  parsed view, and `Worksheet.deltas` / `appended_rows` are not in it,
+  so `setCell` then `embeddableRows` answered with the SAVED content and
+  a hash the staged value turns stale the moment it lands.
+  `classifySlot` already refused to call a staged value fresh
+  ("re-deriving its canonical hash would mean reproducing the
+  save-time encoding"); the read now refuses the sheet whole
+  (`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends`, the
+  `applySheetEdit` rule) — save and re-open, or read before the
+  writes. The CLI opens fresh and never meets it.
+
+**Recorded, outside the slice**: the xlsx WRITER numbers a rich cell
+as it is written (`sstInternRich`, "rich entries are indexed after
+plain new") but emits every plain SST entry before the rich ones, so a
+plain string written AFTER a rich row takes the rich cell's index — the
+rich cell then shows the later plain string in Excel (found by this
+slice's fixture: `writeRow("a & b")`, `writeRichRow(…)`,
+`writeRow("placeholder")` → the rich cell read "placeholder"). A
+writer fix of its own with a regression pin on all three surfaces
+(`write_rich_row`); the fixtures here write the rich row last. Also
+carried: prune / strip → C + Py, `recovery_in_cells`, the CLI vector
+dump (the rest of S3c).
+
+**Tests** (`src/c_abi.zig`, "S3c embeddable_rows …" ×5): the records
+on the S3c fixture byte-for-byte against the shared writer over the
+library's own hasher, the row-2 literal pinned, the hashes fed back to
+`set_embeddings` and `pruneEmbeddings` calling every slot fresh, the
+second sheet by index, an empty range resetting the outputs; every cell
+kind (an entity-bearing string, a number, a blank omitted, a boolean, a
+formula's cached string on request, a rich string's runs joined); nine
+`-1` cases with the name in errbuf, the diag as prep left it and the
+outputs reset, the NULL-with-length rules, `NullOutPointer` on either
+output, `StructSizeTooSmall` byte-for-byte, the staged write on one
+sheet leaving the other readable; five `-2` patches (`</sheetData>`
+gone, an index past the table, `<v>TRUE</v>`, `&bogus;`, a `0xFF`
+byte) with the name in the diag, plane NONE, and the other sheet still
+served; the plane of every verdict. `pkg/workbook.zig` ("embeddableRows
+…" ×7): the three existing pins on the arena shape; the decoded text
+and its hash on an entity-bearing shared string, a rich shared string
+and an entity-bearing inline string, fed back and pruned fresh;
+numbers, booleans and a cached formula string with and without
+`include_formulas`; the staged-write and append refusals (a write
+outside the range refuses too); the four cell verdicts on patched parts
+plus the inline run walker's. `pkg/embeddable_row_ndjson.zig` ×2 (the
+wire shape, no rows no bytes). `tests/c_abi_smoke.c` `#error`s without
+the macro and takes the address. Python (`test_embeddable_rows.py`, 23):
+the goal line — the read's hashes written by `set_embeddings` read back
+with `valid_mask` all true and equal; the CLI shape with the pinned
+literal, the second sheet, the empty range; every kind; omitted rows
+mapped to tombstones; six named `ZlsxError`s; the staged write and
+append with the other sheet and the saved file still answering; five
+`ZlsxRefusal`s through zipfile-patched copies; six shape errors; the
+closed editor and the older-dylib `RuntimeError`; the probe against the
+version.

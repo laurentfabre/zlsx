@@ -744,7 +744,11 @@ pub const SlotState = enum {
 /// One row that has something worth embedding.
 pub const EmbeddableRow = struct {
     row: u32,
-    /// Borrows from the shared-string table or the sheet XML.
+    /// The cell's text as a reader sees it: a shared string (plain, or
+    /// its runs joined), an inline string (its runs joined) or a
+    /// formula's cached string, entities resolved; a number's or an
+    /// error's `<v>` as written; a boolean as `1` / `0`. Owned by the
+    /// `EmbeddableRows` arena.
     text: []const u8,
     /// The canonical content hash to store alongside the vector.
     ///
@@ -755,6 +759,18 @@ pub const EmbeddableRow = struct {
     /// the hash. Getting that wrong would make every freshly-written
     /// row read back as drifted.
     hash: u64,
+};
+
+/// What `embeddableRows` returns: the rows, and the arena their
+/// decoded texts live in. `deinit` frees both.
+pub const EmbeddableRows = struct {
+    arena: std.heap.ArenaAllocator,
+    rows: []const EmbeddableRow,
+
+    pub fn deinit(self: *EmbeddableRows) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 /// What `pruneEmbeddings` did, and what it deliberately left alone.
@@ -2867,6 +2883,11 @@ pub const Workbook = struct {
         var report: PruneReport = .{};
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
         defer scratch.deinit(self.allocator);
+        // One cell's decoded text at a time (a shared string's runs
+        // joined, an entity-bearing inline string) — reset per slot, so
+        // a long coverage never holds every row's text at once.
+        var text_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer text_arena.deinit();
 
         // Patched bytes are staged per coverage and written before
         // moving on, but the cache is only invalidated at the end —
@@ -2909,7 +2930,8 @@ pub const Workbook = struct {
             while (slot < cov.count) : (slot += 1) {
                 const row = cov.parsed_range.first.row + slot;
                 const stored = try cv.hashes.value(slot);
-                const state = try self.classifySlot(ws, cov, row, stored, &scratch);
+                _ = text_arena.reset(.retain_capacity);
+                const state = try self.classifySlot(ws, cov, row, stored, &scratch, text_arena.allocator());
                 switch (state) {
                     .fresh => report.fresh += 1,
                     .stale => report.stale += 1,
@@ -2955,7 +2977,9 @@ pub const Workbook = struct {
         }) catch return error.WriteFailed;
     }
 
-    /// Classify one slot against the live cell at `row`.
+    /// Classify one slot against the live cell at `row`. `text_arena`
+    /// holds the cell's decoded text while it is hashed; the caller
+    /// resets it between slots.
     fn classifySlot(
         self: *Workbook,
         ws: *Worksheet,
@@ -2963,6 +2987,7 @@ pub const Workbook = struct {
         row: u32,
         stored: u64,
         scratch: *std.ArrayListUnmanaged(u8),
+        text_arena: Allocator,
     ) Error!SlotState {
         var ref_buf: [16]u8 = undefined;
         const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ cov.column, row }) catch
@@ -2995,7 +3020,7 @@ pub const Workbook = struct {
             return .stale;
         }
 
-        const canonical = try self.canonicalCellFor(ws, ref, cov.include_formulas);
+        const canonical = try self.canonicalCellFor(ws, ref, cov.include_formulas, text_arena);
 
         const cell = canonical orelse {
             // Nothing embeddable here now.
@@ -3006,20 +3031,18 @@ pub const Workbook = struct {
         // since the last embed — stale, but there is nothing to redact.
         if (was_tombstone) return .stale;
 
-        const now = embedding_part.xxh3Canonical(
+        const now = try embedding_part.xxh3Canonical(
             self.allocator,
             cov.worksheet_target,
             row,
             cell,
             scratch,
-        ) catch return error.WriteFailed;
+        );
         return if (now == stored) .fresh else .stale;
     }
 
-    /// Live cell → the canonical form the hash is taken over, or null
-    /// when the row is not embeddable (blank, or a formula while
-    /// `include_formulas="false"`).
-    /// Rows in `column` over `range` that carry embeddable content.
+    /// Rows in `column` over `range` that carry embeddable content —
+    /// the text a model should see, and the hash the write stores.
     ///
     /// Non-embeddable rows are **omitted**, not emitted with empty
     /// text. The caller is about to pay one model invocation per row,
@@ -3028,8 +3051,29 @@ pub const Workbook = struct {
     /// this list gets `TOMBSTONE_HASH` when the vectors come back,
     /// which is the same state `--prune` would leave it in.
     ///
-    /// `text` borrows from the shared-string table or the sheet XML —
-    /// valid for as long as the `Workbook` is.
+    /// `text` is the cell as a reader sees it (`canonicalCellFor`):
+    /// a shared string plain or its runs joined, an inline string's
+    /// runs joined, a formula's cached string — entities resolved by
+    /// the one strict decoder every cell reader uses. The hash is
+    /// taken over that text (the design's "visible text"), and
+    /// `pruneEmbeddings` derives its verdict from the same reading.
+    ///
+    /// A sheet with staged `setCell` writes or appended rows refuses
+    /// (`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends`): the
+    /// parsed view this read walks does not carry them, so a row would
+    /// answer with its saved content and a hash the staged value turns
+    /// stale the moment it lands (`classifySlot` never calls a staged
+    /// value fresh for the same reason). Save and re-open, or read
+    /// before the writes.
+    ///
+    /// Refuses whole rather than hand over a row that lies: a value
+    /// this reader cannot carry (`UnsupportedCellValue` — a boolean
+    /// `<v>` that is not `0` / `1`, a shared-string index that is not
+    /// a number, an entity the decoder does not know), an index past
+    /// the table (`SstIndexOutOfRange`), text that is not UTF-8
+    /// (`InvalidUtf8`) or that NFC cannot normalize
+    /// (`UnicodeNormalizationFailed`), a sheet part the view cannot
+    /// parse (`MalformedSheetXml`).
     pub fn embeddableRows(
         self: *Workbook,
         allocator: Allocator,
@@ -3037,7 +3081,7 @@ pub const Workbook = struct {
         range: []const u8,
         column: []const u8,
         include_formulas: bool,
-    ) Error![]EmbeddableRow {
+    ) Error!EmbeddableRows {
         const parsed = try embedding_part.parseA1Range(range);
         const col_idx = try embedding_part.parseColumnName(column);
         if (col_idx < parsed.first.col or col_idx > parsed.last.col)
@@ -3045,9 +3089,13 @@ pub const Workbook = struct {
 
         const ws = (try self.worksheetForTarget(worksheet_target)) orelse
             return error.MissingSheetPart;
+        if (ws.deltas.count() > 0) return error.SheetHasUnsavedMutations;
+        if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
 
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
         var out: std.ArrayListUnmanaged(EmbeddableRow) = .empty;
-        errdefer out.deinit(allocator);
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
         defer scratch.deinit(self.allocator);
 
@@ -3056,42 +3104,75 @@ pub const Workbook = struct {
             var ref_buf: [16]u8 = undefined;
             const ref = std.fmt.bufPrint(&ref_buf, "{s}{d}", .{ column, row }) catch
                 return error.WriteFailed;
-            const cell = (try self.canonicalCellFor(ws, ref, include_formulas)) orelse continue;
+            const cell = (try self.canonicalCellFor(ws, ref, include_formulas, a)) orelse continue;
             const text: []const u8 = switch (cell) {
                 .string, .number, .error_value => |s| s,
                 .boolean => |b| if (b) "1" else "0",
                 .blank => continue,
             };
-            const hash = embedding_part.xxh3Canonical(
+            // A string is validated by the hash's own trim; a number's
+            // or an error's `<v>` is not, and the NDJSON writers pass
+            // bytes through — a row never carries text that is not
+            // UTF-8.
+            if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+            const hash = try embedding_part.xxh3Canonical(
                 self.allocator,
                 worksheet_target,
                 row,
                 cell,
                 &scratch,
-            ) catch return error.WriteFailed;
-            try out.append(allocator, .{ .row = row, .text = text, .hash = hash });
+            );
+            try out.append(a, .{ .row = row, .text = text, .hash = hash });
         }
-        return out.toOwnedSlice(allocator);
+        return .{ .arena = arena, .rows = out.items };
     }
 
+    /// Live cell → the canonical form the hash is taken over, or null
+    /// when the row is not embeddable (blank, or a formula while
+    /// `include_formulas="false"`). Text is decoded into `arena` the
+    /// way `readHostGrid` reads a cell: a shared string plain or its
+    /// runs joined, an inline string's runs joined
+    /// (`inlineStringText`), a formula's cached string — through the
+    /// SST decoder, the one strict decoder every cell reader uses. A
+    /// raw `<t>` used to be hashed and handed over as written, so a
+    /// cell spelling `a &amp; b` embedded the entity and a rich shared
+    /// string refused the whole read (S3c slice 2).
     fn canonicalCellFor(
         self: *Workbook,
         ws: *Worksheet,
         ref: []const u8,
         include_formulas: bool,
+        arena: Allocator,
     ) Error!?embedding_part.CanonicalCell {
         const cell = (try ws.cellByRef(ref)) orelse return null;
         if (cell.formula != null and !include_formulas) return null;
+        if (cell.cell_type == .inline_string) {
+            // An `<is>` that is not the cell's one direct child is not
+            // a string this reader carries (the host-grid rule).
+            if (cell.inline_invalid) return error.MalformedSheetXml;
+            if (cell.inline_body) |body| {
+                // The run walker's decoder is the SST decoder: its
+                // verdicts land under the cell rule's one name here.
+                const text = inlineStringText(arena, body) catch |e| switch (e) {
+                    error.UnknownEntity, error.UnterminatedEntity, error.BadNumericRef => return error.UnsupportedCellValue,
+                    else => return e,
+                };
+                return if (text.len == 0) null else .{ .string = text };
+            }
+        }
         const raw = cell.raw_value orelse return null;
         if (raw.len == 0) return null;
 
         return switch (cell.cell_type) {
             .shared_string => blk: {
                 const idx = std.fmt.parseInt(u32, raw, 10) catch return error.UnsupportedCellValue;
-                const text = (try self.sstText(idx)) orelse return null;
+                const text = (try self.sstDecodedText(arena, idx)) orelse return null;
                 break :blk if (text.len == 0) null else .{ .string = text };
             },
-            .inline_string, .formula_string => .{ .string = raw },
+            .inline_string, .formula_string => blk: {
+                const text = try decodeCellText(arena, raw);
+                break :blk if (text.len == 0) null else .{ .string = text };
+            },
             .number, .date => .{ .number = raw },
             // Strict per spec: `<v>` is exactly "0" or "1"; anything
             // else is malformed OOXML rather than a value to coerce.
@@ -3102,6 +3183,32 @@ pub const Workbook = struct {
             else
                 return error.UnsupportedCellValue,
             .error_value => .{ .error_value = raw },
+        };
+    }
+
+    /// A shared-string entry's text, decoded into `arena`: plain, or
+    /// its runs joined — `readHostGrid`'s reading. Null when the
+    /// workbook has no table; `SstIndexOutOfRange` past it.
+    fn sstDecodedText(self: *Workbook, arena: Allocator, idx: u32) Error!?[]const u8 {
+        const view = (try self.sst()) orelse return null;
+        if (idx >= view.entries.len) return Error.SstIndexOutOfRange;
+        switch (view.entries[idx]) {
+            .plain => |t| return try decodeCellText(arena, t),
+            .rich => |runs| {
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                for (runs) |run| try out.appendSlice(arena, try decodeCellText(arena, run.text));
+                return out.items;
+            },
+        }
+    }
+
+    /// The SST decoder over one cell text. An entity it does not know
+    /// is a value this reader cannot carry, not a byte to pass through
+    /// — the strict decoder's own verdict, under the cell rule's name.
+    fn decodeCellText(arena: Allocator, raw: []const u8) Error![]u8 {
+        return sst_xml_mod.decodeText(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedCellValue,
         };
     }
 
@@ -15293,6 +15400,8 @@ test {
     _ = @import("conditional_format_ndjson.zig");
     // S3b slice 8: same lesson, the sheet-props / calc-props writer.
     _ = @import("sheet_props_ndjson.zig");
+    // S3c slice 2: same lesson, the embeddable-rows writer.
+    _ = @import("embeddable_row_ndjson.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {
@@ -24065,18 +24174,18 @@ test "embeddableRows: lists rows with content and omits the rest" {
     var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
-    const rows = try wb.embeddableRows(
+    var rows = try wb.embeddableRows(
         std.testing.allocator,
         PRUNE_WS_TARGET,
         "A2:A3",
         "A",
         false,
     );
-    defer std.testing.allocator.free(rows);
+    defer rows.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expectEqual(@as(u32, 2), rows[0].row);
-    try std.testing.expectEqualStrings("Alpha", rows[0].text);
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    try std.testing.expectEqual(@as(u32, 2), rows.rows[0].row);
+    try std.testing.expectEqualStrings("Alpha", rows.rows[0].text);
 }
 
 test "embeddableRows: its hashes read back as fresh under prune" {
@@ -24096,19 +24205,19 @@ test "embeddableRows: its hashes read back as fresh under prune" {
     var wb = try Workbook.open(std.testing.allocator, io, path);
     defer wb.deinit();
 
-    const rows = try wb.embeddableRows(
+    var rows = try wb.embeddableRows(
         std.testing.allocator,
         PRUNE_WS_TARGET,
         "A2:A3",
         "A",
         false,
     );
-    defer std.testing.allocator.free(rows);
-    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
 
     // Re-embed with exactly the hashes the write path would store.
     var vec_body: [2 * (4 + 2)]u8 = @splat(3);
-    const hashes = [_]u64{ rows[0].hash, rows[1].hash };
+    const hashes = [_]u64{ rows.rows[0].hash, rows.rows[1].hash };
     try wb.setEmbeddings("m", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
         .id = "title",
         .worksheet_target = PRUNE_WS_TARGET,
@@ -24154,6 +24263,236 @@ test "embeddableRows: rejects a column outside the range" {
         "C",
         false,
     ));
+}
+
+/// The canonical hash of a non-string cell on the prune sheet.
+fn canonHashFor(row: u32, cell: embedding_part.CanonicalCell) !u64 {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    return embedding_part.xxh3Canonical(std.testing.allocator, PRUNE_WS_TARGET, row, cell, &scratch);
+}
+
+test "embeddableRows: text is the reader's — an entity-bearing shared string, a rich shared string's runs joined, an inline string decoded — and the hash is over that text" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/decoded.xlsx", .{dir});
+    defer std.testing.allocator.free(path);
+    const path2 = try std.fmt.allocPrint(std.testing.allocator, "{s}/decoded2.xlsx", .{dir});
+    defer std.testing.allocator.free(path2);
+
+    // The xlsx writer routes strings through the shared-string table:
+    // `a & b <c>` lands as `a &amp; b &lt;c&gt;`, the rich row as two
+    // runs — the two spellings a raw `<t>` read used to hand over
+    // encoded, or refuse. (The rich row is written last: the writer
+    // emits rich entries after every plain one but numbers a rich
+    // cell as it is written, so a plain string written after a rich
+    // row steals its index — pre-existing, recorded, outside S3c.)
+    {
+        var w = zlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Items");
+        try sheet.writeRow(&.{.{ .string = "Title" }});
+        try sheet.writeRow(&.{.{ .string = "a & b <c>" }});
+        try sheet.writeRow(&.{.{ .string = "placeholder" }});
+        try sheet.writeRichRow(&.{.{ .rich = &.{
+            .{ .text = "Hello", .bold = true },
+            .{ .text = " & world" },
+        } }});
+        try w.save(io, path);
+    }
+    // Row 3 becomes an inline string with an entity, the way `setCell`
+    // (and so the C ABI's `set_cell`) writes one.
+    {
+        var wb = try Workbook.open(std.testing.allocator, io, path);
+        defer wb.deinit();
+        const ws = try wb.sheet(0);
+        try ws.setCell("A3", .{ .string = "x < y" });
+        try wb.save(io, path2);
+    }
+
+    var wb = try Workbook.open(std.testing.allocator, io, path2);
+    defer wb.deinit();
+    var rows = try wb.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A4", "A", false);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+    const want = [_][]const u8{ "a & b <c>", "x < y", "Hello & world" };
+    for (rows.rows, want, 0..) |r, text, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(2 + i)), r.row);
+        try std.testing.expectEqualStrings(text, r.text);
+        // The hash is the canonical form over the DECODED text — never
+        // over `a &amp; b`, which no reader sees.
+        try std.testing.expectEqual(try pruneHashFor(r.row, text), r.hash);
+    }
+
+    // And what the read hands over, the sweep calls fresh — through
+    // the same decoding, so a rich or entity-bearing cell is not
+    // permanently stale.
+    var vec_body: [3 * (4 + 2)]u8 = @splat(3);
+    const hashes = [_]u64{ rows.rows[0].hash, rows.rows[1].hash, rows.rows[2].hash };
+    try wb.setEmbeddings("m", 2, .int8_sym_per_vec, &[_]EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = PRUNE_WS_TARGET,
+        .range = "A2:A4",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec_body,
+        .hashes = &hashes,
+    }});
+    const report = try wb.pruneEmbeddings();
+    try std.testing.expectEqual(@as(usize, 3), report.fresh);
+    try std.testing.expectEqual(@as(usize, 0), report.stale);
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+}
+
+test "embeddableRows: numbers, booleans and a formula's cached string as a reader sees them — formulas only on request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/kinds.xlsx", .{dir});
+    defer std.testing.allocator.free(path);
+    {
+        var w = zlsx.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        var sheet = try w.addSheet("Items");
+        try sheet.writeRow(&.{.{ .string = "Title" }});
+        try sheet.writeRow(&.{.{ .number = 1.5 }});
+        try sheet.writeRow(&.{.{ .integer = 42 }});
+        try sheet.writeRow(&.{.{ .boolean = true }});
+        // A formula whose cached value is a string: `t="str"`.
+        try sheet.writeRowWithFormulas(&.{.{ .string = "cached" }}, &.{"A2&\"x\""});
+        try sheet.writeRow(&.{.{ .boolean = false }});
+        try w.save(io, path);
+    }
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+
+    {
+        var rows = try wb.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A6", "A", false);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        try std.testing.expectEqualStrings("1.5", rows.rows[0].text);
+        try std.testing.expectEqual(try canonHashFor(2, .{ .number = "1.5" }), rows.rows[0].hash);
+        try std.testing.expectEqualStrings("42", rows.rows[1].text);
+        try std.testing.expectEqual(try canonHashFor(3, .{ .number = "42" }), rows.rows[1].hash);
+        try std.testing.expectEqualStrings("1", rows.rows[2].text);
+        try std.testing.expectEqual(try canonHashFor(4, .{ .boolean = true }), rows.rows[2].hash);
+        try std.testing.expectEqual(@as(u32, 6), rows.rows[3].row);
+        try std.testing.expectEqualStrings("0", rows.rows[3].text);
+        try std.testing.expectEqual(try canonHashFor(6, .{ .boolean = false }), rows.rows[3].hash);
+    }
+    {
+        var rows = try wb.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A6", "A", true);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 5), rows.rows.len);
+        try std.testing.expectEqual(@as(u32, 5), rows.rows[3].row);
+        try std.testing.expectEqualStrings("cached", rows.rows[3].text);
+        try std.testing.expectEqual(try pruneHashFor(5, "cached"), rows.rows[3].hash);
+    }
+}
+
+test "embeddableRows: a sheet with staged cell writes or appended rows refuses — the parsed view does not carry them" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try writePruneFile(io, dir, "staged.xlsx", .{ "Alpha", "Beta" }, .{
+        embedding_part.TOMBSTONE_HASH,
+        embedding_part.TOMBSTONE_HASH,
+    });
+    defer std.testing.allocator.free(path);
+
+    var wb = try Workbook.open(std.testing.allocator, io, path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    {
+        var rows = try wb.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A3", "A", false);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    }
+    // A staged write anywhere on the sheet — here outside the range —
+    // refuses: one rule, the structural edits' (`applySheetEdit`).
+    try ws.setCell("C9", .{ .number = 1.0 });
+    try std.testing.expectError(error.SheetHasUnsavedMutations, wb.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A3", "A", false));
+
+    var wb2 = try Workbook.open(std.testing.allocator, io, path);
+    defer wb2.deinit();
+    const ws2 = try wb2.sheet(0);
+    try ws2.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Gamma" }}});
+    try std.testing.expectError(error.SheetHasUnsavedAppends, wb2.embeddableRows(std.testing.allocator, PRUNE_WS_TARGET, "A2:A3", "A", false));
+}
+
+test "embeddableRows: a value the reader cannot carry refuses whole — an unknown entity, a boolean that is not 0/1, an index past the table, text that is not UTF-8" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const a = std.testing.allocator;
+    const sheet_part = "xl/worksheets/sheet1.xml";
+    const sst_part = "xl/sharedStrings.xml";
+
+    // The xlsx writer's spellings — a boolean, a shared string (index
+    // 1) and its table entry — patched in place.
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8, want: anyerror };
+    const writer_cases = [_]Case{
+        .{ .name = "bool.xlsx", .part = sheet_part, .old = "t=\"b\"><v>1</v>", .new = "t=\"b\"><v>TRUE</v>", .want = error.UnsupportedCellValue },
+        .{ .name = "sst.xlsx", .part = sheet_part, .old = "t=\"s\"><v>1</v>", .new = "t=\"s\"><v>99</v>", .want = error.SstIndexOutOfRange },
+        .{ .name = "entity.xlsx", .part = sst_part, .old = ">Alpha</t>", .new = ">&bogus;</t>", .want = error.UnsupportedCellValue },
+        .{ .name = "utf8.xlsx", .part = sst_part, .old = ">Alpha</t>", .new = ">\xff\xfe</t>", .want = error.InvalidUtf8 },
+    };
+    for (writer_cases) |case| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, case.name });
+        defer a.free(path);
+        {
+            var w = zlsx.Writer.init(a);
+            defer w.deinit();
+            var sheet = try w.addSheet("Items");
+            try sheet.writeRow(&.{.{ .string = "Title" }});
+            try sheet.writeRow(&.{.{ .boolean = true }});
+            try sheet.writeRow(&.{.{ .string = "Alpha" }});
+            try w.save(io, path);
+        }
+        try chart_fixture.patchPart(a, io, path, case.part, case.old, case.new);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectError(case.want, wb.embeddableRows(a, PRUNE_WS_TARGET, "A2:A3", "A", false));
+    }
+
+    // An inline string (`setCell`'s spelling) with an unknown entity:
+    // the run walker's verdict lands under the same name.
+    {
+        const path = try writePruneFile(io, dir, "inline_src.xlsx", .{ "Alpha", "Beta" }, .{
+            embedding_part.TOMBSTONE_HASH,
+            embedding_part.TOMBSTONE_HASH,
+        });
+        defer a.free(path);
+        const inline_path = try std.fmt.allocPrint(a, "{s}/inline.xlsx", .{dir});
+        defer a.free(inline_path);
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            try (try wb.sheet(0)).setCell("A2", .{ .string = "Alpha" });
+            try wb.save(io, inline_path);
+        }
+        try chart_fixture.patchPart(a, io, inline_path, sheet_part, ">Alpha</t>", ">&bogus;</t>");
+        var wb = try Workbook.open(a, io, inline_path);
+        defer wb.deinit();
+        try std.testing.expectError(error.UnsupportedCellValue, wb.embeddableRows(a, PRUNE_WS_TARGET, "A2:A3", "A", false));
+    }
 }
 
 // ─── setEmbeddings must not clobber foreign custom properties ───────

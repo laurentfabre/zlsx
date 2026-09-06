@@ -369,19 +369,28 @@ libzlsx 0.9.0+ writes the embedding set the E5 read surface reports:
 `Editor.set_embeddings` is `Workbook.setEmbeddings` on the editor handle —
 one call writes the index, a vector / hash part per coverage, the
 workbook→index relationship and the recovery record in its two invisible
-carriers, and replaces any previous set. The shape is the read side's, so
-read → re-embed → write round-trips on the same arrays:
+carriers, and replaces any previous set. `Editor.embeddable_rows` is the
+read that feeds it — `Workbook.embeddableRows`, the `embed_row` records
+`zlsx embed --extract` prints: the rows of a column over a range that
+carry embeddable content, each with the text a model should see and the
+canonical xxh3-64 content hash the write stores beside the vector. The
+shape is the read side's, so read → embed → write round-trips on the same
+arrays and the hashes read fresh under `zlsx embed --prune`:
 
 ```python
 import numpy as np
 import zlsx
 
-vectors = np.asarray(embed(texts), dtype=np.float32)   # (rows, dim), your model's output
 with zlsx.edit("report.xlsx") as ed:
-    ed.set_embeddings("text-embedding-3-small", vectors.shape[1], [
+    rows = ed.embeddable_rows(0, "B2:B101", "B")       # [{"kind": "embed_row", "row": 2, "text": "…", "hash": 683…}, …]
+    vectors = np.asarray(embed([r["text"] for r in rows]), dtype=np.float32)   # (len(rows), dim)
+    by_row = {r["row"]: (v, r["hash"]) for r, v in zip(rows, vectors)}
+    dim = vectors.shape[1]
+    ed.set_embeddings("text-embedding-3-small", dim, [
         {"id": "body", "sheet": 0, "range": "B2:B101", "column": "B",
-         "vectors": vectors,                    # a NumPy array, a list of rows, or flat
-         "hashes": hashes},                     # one uint64 per row; None = no vector (tombstone)
+         # one slot per covered row: a row the read omitted has no vector
+         "vectors": [by_row[r][0] if r in by_row else np.zeros(dim, np.float32) for r in range(2, 102)],
+         "hashes": [by_row[r][1] if r in by_row else None for r in range(2, 102)]},   # None = tombstone
     ], dtype="f32")                             # or "int8-sym-per-vec": quantized in the library
     ed.save("report.xlsx")
 
@@ -390,7 +399,24 @@ with zlsx.embeddings("report.xlsx") as emb:
     emb.vectors("body"), emb.hashes("body"), emb.valid_mask("body")
 ```
 
-Statements about the call raise a plain `ZlsxError` named after the cause
+`embeddable_rows(sheet, range, column, *, include_formulas=False)` returns
+the records in range order — `row` 1-based, `text` as a reader sees the
+cell (a shared or inline string's runs joined, entities resolved; a number's
+`<v>` as written; a boolean as `"1"` / `"0"`), `hash` an `int` in
+`[0, 2**64)` — and omits rows with nothing embeddable (`[]` for a range
+with none); `include_formulas` admits formula cells with a cached value, the
+coverage flag's reading. A sheet the editor holds staged `set_cell` writes
+or `append_rows` for refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
+/ `SheetHasUnsavedAppends` — the parsed view the read walks does not carry
+them; save and re-open, or read first); `InvalidRange` (the range, or a
+column outside it) and `SheetIndexOutOfRange` are the call's; a workbook
+the read cannot serve faithfully refuses with a `ZlsxRefusal`
+(`MissingRelationship` / `MissingSheetPart`, `MalformedSheetXml`, and a cell
+value the read cannot carry — `UnsupportedCellValue`, `SstIndexOutOfRange`,
+`InvalidUtf8`, `UnicodeNormalizationFailed`) rather than return a record
+that lies.
+
+Statements about the write raise a plain `ZlsxError` named after the cause
 — `InvalidEmbeddingInput`, `InvalidDtype` / `UnsupportedDtype`,
 `SheetIndexOutOfRange`, `InvalidCoverageId`, `InvalidRange` (the range, or
 a column outside it), `DuplicateCoverageId`, `CoverageOverlap`,
@@ -415,10 +441,10 @@ workbook's `<definedNames>` block: every existing name keeps `name`,
 defined-name edit (pre-existing, recorded). The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
 rebuild from the archive as opened and do not carry a staged embedding
-write — call them before it, or save and re-open. The per-row content
-hashes are the caller's to compute today (the embeddable-rows read is the
-next S3c slice); `recovery_in_cells` (the Numbers-durable carrier) is
-Zig-only until the editor grows a path for its hidden sheet.
+write — call them before it, or save and re-open. `recovery_in_cells` (the
+Numbers-durable carrier) is Zig-only until the editor grows a path for its
+hidden sheet; the prune and strip sweeps are CLI / Zig-only today (the next
+S3c slice).
 
 ## Spark (PySpark Data Source)
 
@@ -610,8 +636,10 @@ with zlsx.write("out.xlsx") as w:
   differently. A formula whose cached value is an error is a formula
 - Embeddings on write (0.9.0+): `Editor.set_embeddings(model, dim, coverages,
   dtype=...)` — the vector set `zlsx.embeddings(path)` reads, on the same
-  `(rows, dim)` float32 / uint64 shape, replacing any previous set; see
-  *Embeddings*
+  `(rows, dim)` float32 / uint64 shape, replacing any previous set — and
+  `Editor.embeddable_rows(sheet, range, column)`, the rows to embed with the
+  canonical content hash the write stores (the `embed_row` records of
+  `zlsx embed --extract`); see *Embeddings*
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

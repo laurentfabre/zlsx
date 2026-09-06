@@ -4520,6 +4520,115 @@ class Editor:
         )
         del keep
 
+    def embeddable_rows(
+        self,
+        sheet: int,
+        range: str,
+        column: str,
+        *,
+        include_formulas: bool = False,
+    ) -> list[dict]:
+        """The rows of ``column`` over ``range`` on sheet ``sheet`` that
+        carry embeddable content — ``Workbook.embeddableRows`` on the
+        editor handle, as ``zlsx embed --extract`` reports them: one
+        ``{"kind": "embed_row", "row": N, "text": "…", "hash": H}``
+        record per row in range order, parsed from the same NDJSON
+        bytes the CLI prints (docs/cli.md, "embed --extract").
+        ``row`` is the 1-based sheet row; ``text`` is the cell as a
+        reader sees it (a shared or inline string's runs joined,
+        entities resolved; a number's ``<v>`` as written; a boolean as
+        ``"1"`` / ``"0"``); ``hash`` is the canonical xxh3-64 content
+        hash :meth:`set_embeddings` stores beside the vector — an
+        ``int`` in ``[0, 2**64)``, the value :meth:`Embeddings.hashes`
+        reads back — so read → embed → write is one shape::
+
+            rows = ed.embeddable_rows(0, "A2:A100", "A")
+            vectors = embed([r["text"] for r in rows])       # (len(rows), dim)
+            by_row = {r["row"]: (v, r["hash"]) for r, v in zip(rows, vectors)}
+            first, last = 2, 100
+            ed.set_embeddings(model, dim, [{
+                "id": "body", "sheet": 0, "range": "A2:A100", "column": "A",
+                "vectors": [by_row[r][0] if r in by_row else [0.0] * dim
+                            for r in range(first, last + 1)],
+                "hashes": [by_row[r][1] if r in by_row else None      # None = tombstone
+                           for r in range(first, last + 1)],
+            }])
+
+        Rows with nothing embeddable are omitted, not returned empty
+        — a covered row missing here is a tombstone (``None``) on the
+        write, the state ``--prune`` would leave it in. ``[]`` for a
+        range with none. ``include_formulas`` admits formula cells with
+        a cached value — the coverage flag's reading, so the read
+        matches the coverage it feeds.
+
+        Read over the editor's current parts. A sheet this editor
+        holds staged cell writes (:meth:`set_cell`) or appended rows
+        (:meth:`append_rows`) for refuses with a :class:`ZlsxError`
+        named ``SheetHasUnsavedMutations`` / ``SheetHasUnsavedAppends``
+        — the parsed view the read walks does not carry them, so a row
+        would answer with its saved content and a hash the staged value
+        turns stale the moment it lands; save and re-open, or read
+        before the writes. Statements about the call raise a plain
+        :class:`ZlsxError` named after the cause: ``InvalidRange`` (the
+        range, or a column outside it), ``SheetIndexOutOfRange``. A
+        workbook the read cannot serve faithfully refuses with a
+        :class:`ZlsxRefusal` (``error_name``) rather than return a
+        record that lies: ``MissingRelationship`` / ``MissingSheetPart``
+        (the sheet's part is unreachable), ``MalformedSheetXml``, and a
+        cell value the read cannot carry — ``UnsupportedCellValue`` (a
+        boolean ``<v>`` that is not 0 / 1, a shared-string index that
+        is not a number, an entity the decoder does not know),
+        ``SstIndexOutOfRange``, ``InvalidUtf8``,
+        ``UnicodeNormalizationFailed``. Shapes are checked here first: a
+        ``TypeError`` for a non-string range or column, a non-bool
+        ``include_formulas``, a bool where the sheet index belongs.
+
+        Requires libzlsx 0.9.0+ (``zlsx_editor_embeddable_rows_ndjson``).
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EMBEDDABLE_ROWS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_embeddable_rows_ndjson "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        sheet_v = self._u32("sheet", sheet)
+        if not isinstance(range, str):
+            raise TypeError(f"range must be a str, not {type(range).__name__}")
+        if not isinstance(column, str):
+            raise TypeError(f"column must be a str, not {type(column).__name__}")
+        if not isinstance(include_formulas, bool):
+            raise TypeError("include_formulas must be a bool")
+        import json
+
+        range_raw = range.encode("utf-8")
+        range_buf = (ctypes.c_ubyte * max(len(range_raw), 1)).from_buffer_copy(range_raw or b"\0")
+        column_raw = column.encode("utf-8")
+        column_buf = (ctypes.c_ubyte * max(len(column_raw), 1)).from_buffer_copy(column_raw or b"\0")
+        out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        out_len = ctypes.c_size_t(0)
+        diag = _ffi.DiagV1()
+        diag.struct_size = ctypes.sizeof(_ffi.DiagV1)
+        rc = _ffi.lib.zlsx_editor_embeddable_rows_ndjson(
+            self._handle, sheet_v,
+            range_buf, len(range_raw), column_buf, len(column_raw),
+            1 if include_formulas else 0,
+            ctypes.byref(out_ptr), ctypes.byref(out_len),
+            ctypes.byref(diag), self._err, _ERR_BUF_LEN,
+        )
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"zlsx_editor_embeddable_rows_ndjson: {_decode_err(self._err)}")
+            if not out_len.value:
+                return []
+            text = ctypes.string_at(out_ptr, out_len.value).decode("utf-8")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+            _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+        return [json.loads(line) for line in text.split("\n") if line]
+
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
 
