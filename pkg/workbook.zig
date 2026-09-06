@@ -24457,6 +24457,11 @@ test "embeddableRows: numbers, booleans and a formula's cached string as a reade
         try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
         try std.testing.expectEqualStrings("1.5", rows.rows[0].text);
         try std.testing.expectEqual(try canonHashFor(2, .{ .number = "1.5" }), rows.rows[0].hash);
+        // A number's text is the arena's, not the parsed view's `<v>`
+        // (which the next save drops) — the mechanism, pinned by
+        // pointer identity rather than a read of freed memory.
+        const live = (try (try wb.sheet(0)).cellByRef("A2")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(rows.rows[0].text.ptr != live.raw_value.?.ptr);
         try std.testing.expectEqualStrings("42", rows.rows[1].text);
         try std.testing.expectEqual(try canonHashFor(3, .{ .number = "42" }), rows.rows[1].hash);
         try std.testing.expectEqualStrings("1", rows.rows[2].text);

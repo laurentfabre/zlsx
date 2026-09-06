@@ -4579,7 +4579,8 @@ class Editor:
         record that lies: ``MissingRelationship`` / ``MissingSheetPart``
         (the sheet's part is unreachable), ``MalformedSheetXml`` (a
         sheet part the view cannot parse, or a row or cell it cannot
-        place — no ``r``, or a ref under another row),
+        place — no ``r``, or one it cannot read: 0, non-numeric, past
+        the limit — or a ref under another row),
         ``MalformedSharedStringsXml`` (a table it cannot parse), and
         a cell value the read cannot carry — ``UnsupportedCellValue`` (a
         boolean ``<v>`` that is not 0 / 1, a ``<v>`` the number

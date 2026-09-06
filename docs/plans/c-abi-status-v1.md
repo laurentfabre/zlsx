@@ -1595,7 +1595,10 @@ refusal of the same state already has (`statusOf` pins it `-1`). `-2`,
 statements about the workbook, the name in the diag with `plane =
 NONE`: `MissingRelationship` / `MissingSheetPart` (the sheet's part is
 unreachable) and `MalformedSheetXml` (a sheet part the view cannot
-parse), all already in `structural_refusals`, plus five new entries —
+parse, or — since round 2 — a row or cell it cannot place: no `r`, or
+one the view cannot read — 0, non-numeric, past the limit — or a ref
+under another row), all already in `structural_refusals`, plus
+five new entries —
 `UnsupportedCellValue` (a boolean `<v>` that is not `0` / `1`, a `<v>`
 the number canonicalizer cannot read — a comma decimal, `NaN` — a
 `t="d"` ISO-8601 date, a `t` this reader does not know, a shared-string
@@ -1725,7 +1728,28 @@ family exits 3 on (B DOC-203) → listed on `--extract` and `--prune`.
 The round-1 fold was pinned through the read only (B TEST-204) → the
 sweep's own pins (a comma decimal, a date, an unknown `t`, a row and a
 cell without `r`). §19's "four new entries" and the causes list (A
-DOC-201) → five and seven. Recorded: `worksheetForTarget` resolves
+DOC-201) → five and seven. **Round 3** (two agents, convergence; A
+ship-ready with 3 LOW): positional OOXML is in the project's own corpus
+— `wdi_excel.xlsx` (the World Bank exporter) carries no `r` on any row
+or cell of its six sheets (401 395 rows / 9 994 345 cells on the
+first), so every embed surface now refuses it `MalformedSheetXml` where
+`main` answered an EMPTY row list silently (nothing served for a sheet
+full of text — the same silent omission the round-2 fix closed);
+recorded here, pinned corpus-gated in `tests/workbook_corpus.zig`, and
+the follow-up named: the typed parser inferring positions the way
+`src/xlsx.zig` and the formula decoder already do would lift this
+refusal and `PivotEditUnsafe` on the same shape — a slice of its own.
+B's corpus sweep (31 workbooks, 98 sheet pairs, HEAD against a
+`main` build): 85 pairs byte-identical modulo `hash`; besides WDI,
+`poi_poc_shared_strings.xlsx` (one `<row r="0">`, which the view
+counts as unplaced) now refuses where `main` served 49 rows — the
+clause on every surface names the `r` shapes the view cannot read;
+eight `poi_clusterfuzz_xssf` sheets `main` refused `SstEntryIsRich`
+are served, and `calamine_encoded_entities` embeds the decoded text.
+The round-2 dupe of a number's text into the arena had no pin →
+pointer identity against the view's `<v>` (TEST-302); docs/cli.md
+omitted `MissingRelationship` / `MissingSheetPart` and §19's decision
+paragraph the round-2 clause (DOC-303). Recorded: `worksheetForTarget` resolves
 every sibling sheet's part name in index order, so a sibling without
 `r:id` refuses a healthy sheet's read (pre-existing, the sweep's
 too); a `t="d"` cell in a covered column stops `--prune` whole (the

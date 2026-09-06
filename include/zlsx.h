@@ -2220,8 +2220,9 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
  * statement about the workbook, the name in the diag with plane
  * NONE): MissingRelationship / MissingSheetPart — the sheet's part is
  * unreachable; MalformedSheetXml — a sheet part the view cannot
- * parse, or a row or cell it cannot place (no r, or a ref under
- * another row); MalformedSharedStringsXml — a shared-string table it
+ * parse, or a row or cell it cannot place (no r, or one it cannot
+ * read — 0, non-numeric, past the limit — or a ref under another
+ * row); MalformedSharedStringsXml — a shared-string table it
  * cannot parse; and a cell value the read cannot carry, refused whole rather
  * than a record that lies — UnsupportedCellValue (a boolean <v> that
  * is not 0 / 1, a <v> the number canonicalizer cannot read — a comma
