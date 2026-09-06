@@ -11688,7 +11688,7 @@ test "S3c set_embeddings contract violations: -1 with the name in errbuf, the di
     formulas2.include_formulas = 2;
     const cases = [_]Case{
         .{ .name = "InvalidInput", .covs = &.{ok_cov}, .ed = false },
-        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 1 },
+        .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 2 },
         .{ .name = "InvalidInput", .covs = &.{ok_cov}, .flags = 0x8000_0000 },
         .{ .name = "InvalidInput", .covs = &.{formulas2} },
         .{ .name = "InvalidInput", .covs = &.{null_vec} },
