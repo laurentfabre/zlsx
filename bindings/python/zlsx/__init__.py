@@ -4577,8 +4577,10 @@ class Editor:
         workbook the read cannot serve faithfully refuses with a
         :class:`ZlsxRefusal` (``error_name``) rather than return a
         record that lies: ``MissingRelationship`` / ``MissingSheetPart``
-        (the sheet's part is unreachable), ``MalformedSheetXml`` /
-        ``MalformedSharedStringsXml`` (a part the view cannot parse), and
+        (the sheet's part is unreachable), ``MalformedSheetXml`` (a
+        sheet part the view cannot parse, or a row or cell it cannot
+        place — no ``r``, or a ref under another row),
+        ``MalformedSharedStringsXml`` (a table it cannot parse), and
         a cell value the read cannot carry — ``UnsupportedCellValue`` (a
         boolean ``<v>`` that is not 0 / 1, a ``<v>`` the number
         canonicalizer cannot read — a comma decimal, ``NaN`` — a

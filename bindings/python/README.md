@@ -413,8 +413,10 @@ refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
 them; save and re-open, or read first); `InvalidRange` (the range, or a
 column outside it) and `SheetIndexOutOfRange` are the call's; a workbook
 the read cannot serve faithfully refuses with a `ZlsxRefusal`
-(`MissingRelationship` / `MissingSheetPart`, `MalformedSheetXml` /
-`MalformedSharedStringsXml`, and a cell value the read cannot carry —
+(`MissingRelationship` / `MissingSheetPart`; `MalformedSheetXml` — a sheet
+part the view cannot parse, or a row or cell it cannot place: no `r`, or a
+ref under another row; `MalformedSharedStringsXml`; and a cell value the
+read cannot carry —
 `UnsupportedCellValue`: a boolean `<v>` that is not 0 / 1, a `<v>` the number
 canonicalizer cannot read, a `t="d"` ISO-8601 date, a `t` this reader does
 not know, a bad shared-string index or entity; `SstIndexOutOfRange`,

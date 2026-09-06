@@ -234,7 +234,7 @@ def test_embeddable_rows_refuses_after_a_staged_cell_write(tmp_path):
         # the reader does not know — the cell rule's one name, never the
         # canonicalizer's.
         ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b"><v>1,5</v>", "UnsupportedCellValue", True),
-        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="d"><v>2024-01-01</v>', "UnsupportedCellValue", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="d"><v>2024</v>', "UnsupportedCellValue", True),
         ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="zz"><v>42</v>', "UnsupportedCellValue", True),
         # The UTF-8 rule on the kinds the hash does not validate: an
         # error literal, a number (judged before the canonicalizer).
@@ -244,6 +244,10 @@ def test_embeddable_rows_refuses_after_a_staged_cell_write(tmp_path):
         # close — an inner one is tolerated): the table is the
         # workbook's, so the other sheet refuses too.
         ("xl/sharedStrings.xml", b">two</t></si>", b">two</t>", "MalformedSharedStringsXml", False),
+        # A row or cell without r — positional OOXML the typed view
+        # cannot place — refuses rather than read as blank.
+        ("xl/worksheets/sheet1.xml", b'<row r="3"', b"<row", "MalformedSheetXml", True),
+        ("xl/worksheets/sheet1.xml", b'<c r="A3"', b"<c", "MalformedSheetXml", True),
     ],
 )
 def test_embeddable_rows_refuses_a_workbook_it_cannot_serve(tmp_path, part, old, new, name, other_sheet_served):
@@ -265,6 +269,19 @@ def test_embeddable_rows_refuses_a_workbook_it_cannot_serve(tmp_path, part, old,
             with pytest.raises(zlsx.ZlsxRefusal) as other:
                 ed.embeddable_rows(1, "A1:A1", "A")
             assert other.value.error_name == name
+
+
+def test_embeddable_rows_refuses_a_misplaced_cell_outside_the_range(tmp_path):
+    """A cell placed under another row refuses the sheet even when the
+    range does not reach it — the rule is the sheet's, not the range's."""
+    _needs_read()
+    src = tmp_path / "src.xlsx"
+    _write_fixture(src)
+    bad = _patched(src, tmp_path / "bad.xlsx", "xl/worksheets/sheet1.xml", b'<c r="A4"', b'<c r="A2"')
+    with zlsx.Editor(bad) as ed:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.embeddable_rows(0, "A2:A3", "A")
+        assert info.value.error_name == "MalformedSheetXml"
 
 
 def test_embeddable_rows_carries_an_error_cell_as_its_literal(tmp_path):

@@ -1595,16 +1595,20 @@ refusal of the same state already has (`statusOf` pins it `-1`). `-2`,
 statements about the workbook, the name in the diag with `plane =
 NONE`: `MissingRelationship` / `MissingSheetPart` (the sheet's part is
 unreachable) and `MalformedSheetXml` (a sheet part the view cannot
-parse), all already in `structural_refusals`, plus four new entries —
-`UnsupportedCellValue` (a boolean `<v>` that is not `0` / `1`, a
-shared-string index that is not a number, an entity the decoder does
-not know), `SstIndexOutOfRange` (an index past the table),
-`InvalidUtf8`, `UnicodeNormalizationFailed` — a cell value the read
-cannot carry, refused whole rather than a record that lies (the
-`MalformedSheetXml` shape). None of the four is raised by any other
+parse), all already in `structural_refusals`, plus five new entries —
+`UnsupportedCellValue` (a boolean `<v>` that is not `0` / `1`, a `<v>`
+the number canonicalizer cannot read — a comma decimal, `NaN` — a
+`t="d"` ISO-8601 date, a `t` this reader does not know, a shared-string
+index that is not a number, an entity the decoder does not know),
+`SstIndexOutOfRange` (an index past the table), `InvalidUtf8`,
+`UnicodeNormalizationFailed` — a cell value the read cannot carry,
+refused whole rather than a record that lies (the `MalformedSheetXml`
+shape) — and `MalformedSharedStringsXml`, a shared-string table the
+view cannot parse (round 1). None of the five is raised by any other
 status_v1 export (`InvalidUtf8` / `UnicodeNormalizationFailed` come
-from the canonicalizer alone, the other two from this read's own cell
-rule), so the global classifier changes no shipped verdict. The Python
+from the canonicalizer alone, the other three from this read's own
+cell and part rules), so the global classifier changes no shipped
+verdict. The Python
 leg mirrors the S3b reads: `ZlsxError` named after the cause,
 `ZlsxRefusal(error_name)`, the shapes (`TypeError` / `ValueError`)
 checked before ctypes, the buffer released on every path.
@@ -1698,6 +1702,37 @@ shared-string index refuses here, the grid carries "occupied, no
 text"); the staged-write refusal is per sheet, by design; the same
 editor answers again after its save (pinned in Python).
 
+**Round 2** (two agents; A ship-ready with 3 LOW, B 1 MEDIUM + 3 LOW —
+every round-1 fix verified in code and by a pin that fails on a
+revert; fixes in the round-2 commit): a `<row>` or `<c>` written
+without `r` — legal positional OOXML the typed parser drops and counts
+(`unaddressed_rows` / `unaddressed_cells`) — was invisible to the
+resolver, so `--extract` / the export omitted a row the lenient reader
+shows and `--prune` ZEROED its vector (B REL-201; the pivot edit
+already refuses the shape, Codex #205 r1 REL-103) → the resolver
+refuses `MalformedSheetXml` on either count, read and sweep alike,
+pinned on all three surfaces and through `pruneEmbeddings`. The
+"wrong `<row>`" verdict was applied inside the range only, while the
+comment and §19 claimed the whole-sheet host-grid rule (A REL-201) →
+every cell of the sheet is judged before the range filter, pinned with
+a misplaced cell outside the range on all three surfaces. The `.date`
+pin (`2024-01-01`) exercised the round-1 fold, not the arm (A
+TEST-201) → `<v>2024</v>`. `EmbeddableRow.text` for a number or an
+error borrowed the parsed view, which the next save or structural edit
+drops (B REL-202) → duped into the rows' arena; the doc is "owned by
+the arena" again. docs/cli.md named none of the refusals the embed
+family exits 3 on (B DOC-203) → listed on `--extract` and `--prune`.
+The round-1 fold was pinned through the read only (B TEST-204) → the
+sweep's own pins (a comma decimal, a date, an unknown `t`, a row and a
+cell without `r`). §19's "four new entries" and the causes list (A
+DOC-201) → five and seven. Recorded: `worksheetForTarget` resolves
+every sibling sheet's part name in index order, so a sibling without
+`r:id` refuses a healthy sheet's read (pre-existing, the sweep's
+too); a `t="d"` cell in a covered column stops `--prune` whole (the
+pre-round-1 code aborted the same way as `WriteFailed`); the lenient
+reader admits `A03` where the typed layer refuses; `--extract`'s bytes
+rest on the shared writer, unpinned in `cli.zig` (the S3b precedent).
+
 **Tests** (`src/c_abi.zig`, "S3c embeddable_rows …" ×5): the records
 on the S3c fixture byte-for-byte against the shared writer over the
 library's own hasher, the row-2 literal pinned, the hashes fed back to
@@ -1709,31 +1744,37 @@ formula's cached string on request, a rich string's runs joined); nine
 outputs reset, the NULL-with-length rules, `NullOutPointer` on either
 output, `StructSizeTooSmall` byte-for-byte with the outputs poisoned
 and reset, the staged write on one sheet leaving the other readable;
-eleven `-2` patches (`</sheetData>` gone, an index past the table,
+thirteen `-2` patches (`</sheetData>` gone, an index past the table,
 `<v>TRUE</v>`, `&bogus;`, a `0xFF` byte in a string, `<v>1,5</v>`, a
-`t="d"` date, `t="zz"`, a `0xFF` byte in an error literal and in a
-number, the table's last `</si>` gone) with the name in the diag, plane
-NONE, the other sheet still served after a sheet part's verdict and
-refused after the table's; the plane of every verdict, the
-canonicalizer's own name pinned `-1` should it ever escape.
+`t="d"` date whose `<v>` is a number, `t="zz"`, a `0xFF` byte in an
+error literal and in a number, the table's last `</si>` gone, a row
+and a cell without `r`) with the name in the diag, plane NONE, the
+other sheet still served after a sheet part's verdict and refused
+after the table's, plus a misplaced cell outside the range; the plane
+of every verdict, the canonicalizer's own name pinned `-1` should it
+ever escape.
 `pkg/workbook.zig` ("embeddableRows …" ×7): the three existing pins on
 the arena shape; the decoded text and its hash on an entity-bearing
 shared string, a rich shared string and an entity-bearing inline
 string, fed back and pruned fresh; numbers, booleans and a cached
 formula string with and without `include_formulas`; the staged-write
-and append refusals (a write outside the range refuses too); eleven
-cell / part verdicts on patched parts (the round-1 five among them,
-plus a cell whose ref names another row) and the inline run walker's,
-and an error cell carried as its literal with the kind-`e` hash.
+and append refusals (a write outside the range refuses too); thirteen
+cell / part verdicts on patched parts (the round-1 seven among them, a
+row and a cell without `r`, a cell whose ref names another row —
+inside the range, and outside it) and the inline run walker's, the
+sweep refusing on the same five shapes (a comma decimal, a date, an
+unknown `t`, a row and a cell without `r`), and an error cell carried
+as its literal with the kind-`e` hash.
 `pkg/embeddable_row_ndjson.zig` ×2 (the wire shape, no rows no bytes).
 `tests/c_abi_smoke.c` `#error`s without the macro and takes the
-address. Python (`test_embeddable_rows.py`, 31): the goal line — the
+address. Python (`test_embeddable_rows.py`, 34): the goal line — the
 read's hashes written by `set_embeddings` read back with `valid_mask`
 all true and equal; the CLI shape with the pinned literal, the second
 sheet, the empty range; every kind; omitted rows mapped to tombstones;
 six named `ZlsxError`s; the staged write and append with the other
 sheet, the same editor after its save and the saved file answering;
-eleven `ZlsxRefusal`s through zipfile-patched copies (the table's
-refusing the other sheet too); an error cell carried as its literal;
-six shape errors; the closed editor and the older-dylib
-`RuntimeError`; the probe against the version.
+thirteen `ZlsxRefusal`s through zipfile-patched copies (the table's
+refusing the other sheet too) plus a misplaced cell outside the range;
+an error cell carried as its literal; six shape errors; the closed
+editor and the older-dylib `RuntimeError`; the probe against the
+version.

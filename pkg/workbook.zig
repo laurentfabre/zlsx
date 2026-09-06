@@ -752,10 +752,9 @@ pub const EmbeddableRow = struct {
     /// The cell's text as a reader sees it: a shared string (plain, or
     /// its runs joined), an inline string (its runs joined) or a
     /// formula's cached string, entities resolved; a number's or an
-    /// error's `<v>` as written; a boolean as `1` / `0`. Decoded
-    /// strings live in the `EmbeddableRows` arena; a number's or an
-    /// error's `<v>` borrows the parsed view — every text is valid
-    /// while the `Workbook` is.
+    /// error's `<v>` as written; a boolean as `1` / `0`. Owned by the
+    /// `EmbeddableRows` arena (a boolean's is a literal): valid until
+    /// `deinit`, whatever the workbook does meanwhile.
     text: []const u8,
     /// The canonical content hash to store alongside the vector.
     ///
@@ -3068,9 +3067,9 @@ pub const Workbook = struct {
     /// top, which made the read and the sweep quadratic in the sheet
     /// (S3c slice 2 r1 PERF-103). Refs are matched as `cellByRef`
     /// matched them (letters case-insensitive); a cell in the wrong
-    /// `<row>`, or with a ref this reader cannot parse, is
-    /// `MalformedSheetXml` (the host-grid rule); the first cell at a
-    /// ref wins, as `cellByRef` answered.
+    /// `<row>`, or with a ref this reader cannot parse, anywhere on
+    /// the sheet, is `MalformedSheetXml` (the host-grid rule); the
+    /// first cell at a ref wins, as `cellByRef` answered.
     fn columnCellsOverRange(
         allocator: Allocator,
         ws: *Worksheet,
@@ -3078,14 +3077,25 @@ pub const Workbook = struct {
         col_idx: u32,
     ) Error![]?*const sheet_xml_mod.Cell {
         const view = try ws.ensureParsed();
+        // A row or cell without its `r` is one the typed view could not
+        // place (the pivot edit's rule, Codex #205 r1 REL-103): a
+        // positional sheet would read as blank rows here and the sweep
+        // would redact vectors of text that exists (r2 REL-201 B).
+        if (view.unaddressed_rows > 0) return error.MalformedSheetXml;
         const slots = try allocator.alloc(?*const sheet_xml_mod.Cell, range.rowCount());
         errdefer allocator.free(slots);
         @memset(slots, null);
         for (view.rows) |row| {
-            if (row.row_idx < range.first.row or row.row_idx > range.last.row) continue;
+            if (row.unaddressed_cells > 0) return error.MalformedSheetXml;
             for (row.cells) |*c| {
+                // Every cell of the sheet is judged, inside the range
+                // or not: the rule is the sheet's, and a cell placed
+                // under another row is a sheet this reader cannot
+                // serve (a range-bounded check let one outside the
+                // range through, r2 REL-201).
                 const ref = parseA1Ref(c.ref) catch return error.MalformedSheetXml;
                 if (ref.row != row.row_idx) return error.MalformedSheetXml;
+                if (ref.row < range.first.row or ref.row > range.last.row) continue;
                 if (ref.col != col_idx + 1) continue;
                 const slot = ref.row - range.first.row;
                 if (slots[slot] == null) slots[slot] = c;
@@ -3159,7 +3169,11 @@ pub const Workbook = struct {
             const row: u32 = parsed.first.row + @as(u32, @intCast(i));
             const cell = (try self.canonicalCellOf(live, include_formulas, a)) orelse continue;
             const text: []const u8 = switch (cell) {
-                .string, .number, .error_value => |s| s,
+                .string => |s| s,
+                // A number's or an error's `<v>` borrows the parsed view,
+                // which the next save or structural edit drops — the
+                // rows outlive it in their own arena (r2 REL-202).
+                .number, .error_value => |raw| try a.dupe(u8, raw),
                 .boolean => |b| if (b) "1" else "0",
                 .blank => continue,
             };
@@ -24519,7 +24533,9 @@ test "embeddableRows: a value the reader cannot carry refuses whole — an unkno
         // a `t="d"` date, under the cell rule's name — not the
         // canonicalizer's `MalformedNumber`.
         .{ .name = "comma.xlsx", .part = sheet_part, .old = "t=\"b\"><v>1</v>", .new = "><v>1,5</v>", .want = error.UnsupportedCellValue },
-        .{ .name = "date.xlsx", .part = sheet_part, .old = "t=\"b\"><v>1</v>", .new = "t=\"d\"><v>2024-01-01</v>", .want = error.UnsupportedCellValue },
+        // (a `<v>` that parses as a number, so the arm's own verdict is
+        // pinned, not the canonicalizer's fold — r2 TEST-201)
+        .{ .name = "date.xlsx", .part = sheet_part, .old = "t=\"b\"><v>1</v>", .new = "t=\"d\"><v>2024</v>", .want = error.UnsupportedCellValue },
         // r1 REL-103: a `t` this reader does not know is not a number.
         .{ .name = "unknown_t.xlsx", .part = sheet_part, .old = "t=\"b\"><v>1</v>", .new = "t=\"zz\"><v>42</v>", .want = error.UnsupportedCellValue },
         // r1 TEST-104: the pre-hash UTF-8 check is load-bearing for the
@@ -24533,6 +24549,11 @@ test "embeddableRows: a value the reader cannot carry refuses whole — an unkno
         // r1 REL-102: a shared-string table the parser cannot read (the
         // LAST entry's close — the parser tolerates an inner one).
         .{ .name = "sst_part.xlsx", .part = sst_part, .old = ">Alpha</t></si>", .new = ">Alpha</t>", .want = error.MalformedSharedStringsXml },
+        // r2 REL-201 (B): a row or cell without `r` — legal positional
+        // OOXML the typed view cannot place — refuses rather than read
+        // as blank (the pivot edit's rule).
+        .{ .name = "row_no_r.xlsx", .part = sheet_part, .old = "<row r=\"3\"", .new = "<row", .want = error.MalformedSheetXml },
+        .{ .name = "cell_no_r.xlsx", .part = sheet_part, .old = "<c r=\"A3\"", .new = "<c", .want = error.MalformedSheetXml },
     };
     for (writer_cases) |case| {
         const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, case.name });
@@ -24572,6 +24593,53 @@ test "embeddableRows: a value the reader cannot carry refuses whole — an unkno
         var wb = try Workbook.open(a, io, inline_path);
         defer wb.deinit();
         try std.testing.expectError(error.UnsupportedCellValue, wb.embeddableRows(a, PRUNE_WS_TARGET, "A2:A3", "A", false));
+    }
+
+    // r2 REL-201: a cell placed under another row OUTSIDE the range
+    // refuses too — the rule is the sheet's, not the range's (a
+    // range-bounded check omitted the row instead, and the sweep then
+    // redacted what `cellByRef` had served).
+    {
+        const path = try std.fmt.allocPrint(a, "{s}/misplaced.xlsx", .{dir});
+        defer a.free(path);
+        {
+            var w = zlsx.Writer.init(a);
+            defer w.deinit();
+            var sheet = try w.addSheet("Items");
+            try sheet.writeRow(&.{.{ .string = "Title" }});
+            try sheet.writeRow(&.{.{ .boolean = true }});
+            try sheet.writeRow(&.{.{ .string = "Alpha" }});
+            try w.save(io, path);
+        }
+        try chart_fixture.patchPart(a, io, path, sheet_part, "<c r=\"A3\"", "<c r=\"A2\"");
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedSheetXml, wb.embeddableRows(a, PRUNE_WS_TARGET, "A2:A2", "A", false));
+    }
+
+    // r2 TEST-204: the sweep judges through the same reading — the
+    // cell rule's verdicts and the view's refuse `pruneEmbeddings`
+    // whole rather than redact a row that has text.
+    {
+        const PruneCase = struct { name: []const u8, old: []const u8, new: []const u8, want: anyerror };
+        const prune_cases = [_]PruneCase{
+            .{ .name = "prune_comma.xlsx", .old = "<c r=\"A2\" t=\"s\"><v>1</v>", .new = "<c r=\"A2\"><v>1,5</v>", .want = error.UnsupportedCellValue },
+            .{ .name = "prune_date.xlsx", .old = "<c r=\"A2\" t=\"s\"><v>1</v>", .new = "<c r=\"A2\" t=\"d\"><v>2024</v>", .want = error.UnsupportedCellValue },
+            .{ .name = "prune_unknown_t.xlsx", .old = "<c r=\"A2\" t=\"s\"><v>1</v>", .new = "<c r=\"A2\" t=\"zz\"><v>42</v>", .want = error.UnsupportedCellValue },
+            .{ .name = "prune_cell_no_r.xlsx", .old = "<c r=\"A2\"", .new = "<c", .want = error.MalformedSheetXml },
+            .{ .name = "prune_row_no_r.xlsx", .old = "<row r=\"2\"", .new = "<row", .want = error.MalformedSheetXml },
+        };
+        for (prune_cases) |case| {
+            const path = try writePruneFile(io, dir, case.name, .{ "Alpha", "Beta" }, .{
+                try pruneHashFor(2, "Alpha"),
+                try pruneHashFor(3, "Beta"),
+            });
+            defer a.free(path);
+            try chart_fixture.patchPart(a, io, path, sheet_part, case.old, case.new);
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            try std.testing.expectError(case.want, wb.pruneEmbeddings());
+        }
     }
 
     // And an error cell IS carried: its literal, kind `e`.

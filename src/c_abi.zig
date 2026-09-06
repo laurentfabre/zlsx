@@ -10669,8 +10669,10 @@ export fn zlsx_editor_set_embeddings(
 /// `InvalidRange` (the range, or a column outside it),
 /// `SheetIndexOutOfRange`, `StructSizeTooSmall`. -2, the name in the
 /// diag with plane NONE: `MissingRelationship` / `MissingSheetPart`
-/// (the sheet's part is unreachable), `MalformedSheetXml`,
-/// `MalformedSharedStringsXml` (a part the view cannot parse), and a
+/// (the sheet's part is unreachable), `MalformedSheetXml` (a sheet
+/// part the view cannot parse, or a row or cell it cannot place — no
+/// `r`, or a ref under another row), `MalformedSharedStringsXml` (a
+/// table it cannot parse), and a
 /// cell value the read cannot carry — `UnsupportedCellValue` (a
 /// boolean `<v>` that is not `0` / `1`, a `<v>` the number
 /// canonicalizer cannot read — a comma decimal, `NaN` — a `t="d"`
@@ -11563,13 +11565,17 @@ test "S3c embeddable_rows refusals: -2 with the name in the diag — a sheet par
         // (REL-103), the UTF-8 check on the kinds the hash does not
         // validate (TEST-104), a table the parser cannot read (REL-102).
         .{ .file = "s3c2_comma.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "><v>1,5</v>", .name = "UnsupportedCellValue" },
-        .{ .file = "s3c2_date.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"d\"><v>2024-01-01</v>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_date.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"d\"><v>2024</v>", .name = "UnsupportedCellValue" },
         .{ .file = "s3c2_unknown_t.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"zz\"><v>42</v>", .name = "UnsupportedCellValue" },
         .{ .file = "s3c2_err_utf8.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"e\"><v>#N/\xff</v>", .name = "InvalidUtf8" },
         .{ .file = "s3c2_num_utf8.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "><v>1\xff</v>", .name = "InvalidUtf8" },
         // The LAST entry's close (the parser tolerates an inner one); the
         // table is the workbook's, so the other sheet refuses too.
         .{ .file = "s3c2_sst_part.xlsx", .part = "xl/sharedStrings.xml", .old = ">two</t></si>", .new = ">two</t>", .name = "MalformedSharedStringsXml", .other_served = false },
+        // Round 2: a row or cell without `r` (positional OOXML the typed
+        // view cannot place) refuses rather than read as blank (REL-201 B).
+        .{ .file = "s3c2_row_no_r.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<row r=\"3\"", .new = "<row", .name = "MalformedSheetXml" },
+        .{ .file = "s3c2_cell_no_r.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"A3\"", .new = "<c", .name = "MalformedSheetXml" },
     };
     for (cases) |case| {
         const path = try writeS3cFixture(io, &tt, case.file);
@@ -11595,6 +11601,22 @@ test "S3c embeddable_rows refusals: -2 with the name in the diag — a sheet par
         const other = s3cRows(ed, 1, "A1:A1", "A", 0, &out_ptr, &out_len, null, &err_buf);
         try std.testing.expectEqual(if (case.other_served) ZLSX_OK else ZLSX_REFUSED, other);
         zlsx_buffer_release(out_ptr, out_len);
+    }
+
+    // r2 REL-201: a cell placed under another row OUTSIDE the range
+    // refuses too — the rule is the sheet's, not the range's.
+    {
+        const path = try writeS3cFixture(io, &tt, "s3c2_misplaced.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/worksheets/sheet1.xml", "<c r=\"A4\"", "<c r=\"A2\"");
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cRows(ed, 0, "A2:A3", "A", 0, &out_ptr, &out_len, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedSheetXml", diagName(&diag));
+        zlsx_diag_release(&diag);
     }
 }
 
