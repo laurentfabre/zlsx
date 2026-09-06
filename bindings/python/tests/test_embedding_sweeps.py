@@ -256,6 +256,9 @@ def test_strip_removes_every_carrier_and_is_idempotent(tmp_path):
     assert b"zlsxEmbeddings" not in z.read("xl/_rels/workbook.xml.rels")
     with zlsx.embeddings(out) as e:
         assert e.state == "absent"
+    # The lenient reader too, over the table the scrub left.
+    with zlsx.open(out) as book:
+        assert [r[0] for r in book.sheet(0).rows()] == ["title", "alpha", "beta", "gamma"]
     with zlsx.Editor(out) as ed:
         # The cells are what they were, and a strip on a workbook
         # without a set is a no-op: the save is the passthrough.
@@ -274,6 +277,69 @@ def test_strip_on_a_workbook_that_never_had_embeddings_changes_nothing(tmp_path)
         ed.strip_embeddings()
         ed.save(out)
     assert out.read_bytes() == src.read_bytes()
+
+
+def test_strip_leaves_a_cell_that_merely_spells_the_magic(tmp_path):
+    """The scrub's acceptance is the reader's: text the record decoder
+    rejects is user text, and the strip is still the passthrough."""
+    _needs_sweeps()
+    src = tmp_path / "magic.xlsx"
+    out = tmp_path / "magic_out.xlsx"
+    with zlsx.Writer(src) as w:
+        s = w.add_sheet("Notes")
+        s.write_row(["see zlsxER1 for the magic"])
+        s.write_row(["xzlsxER1abc"])
+    with zlsx.embeddings(src) as e:
+        assert e.state == "absent"
+    with zlsx.Editor(src) as ed:
+        ed.strip_embeddings()
+        ed.save(out)
+    assert out.read_bytes() == src.read_bytes()
+    with zlsx.open(out) as book:
+        assert [r[0] for r in book.sheet(0).rows()] == ["see zlsxER1 for the magic", "xzlsxER1abc"]
+
+
+def _foreign_package(emb: Path, dst: Path) -> Path:
+    """The embedded fixture as a consumer that rebuilt the package would
+    leave it: the parts under ``<Default>`` content types, no
+    workbook→index relationship, no recovery record anywhere."""
+    z = zipfile.ZipFile(emb)
+    ct = z.read("[Content_Types].xml")
+    for part in ("title/vec.bin", "title/hashes.bin", "index.xml", "_rels/index.xml.rels"):
+        i = ct.index(b"/xl/zlsxEmbeddings/" + part.encode())
+        o = ct.rfind(b"<Override ", 0, i)
+        ct = ct[:o] + ct[ct.index(b"/>", i) + 2:]
+    ct = ct.replace(b'<Default Extension="xml"', b'<Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="xml"')
+    rels = z.read("xl/_rels/workbook.xml.rels")
+    i = rels.index(b"zlsxEmbeddings/index.xml")
+    o = rels.rfind(b"<Relationship ", 0, i)
+    rels = rels[:o] + rels[rels.index(b"/>", i) + 2:]
+    wbxml = z.read("xl/workbook.xml")
+    o = wbxml.index(b"<definedNames>")
+    wbxml = wbxml[:o] + wbxml[wbxml.index(b"</definedNames>") + len(b"</definedNames>"):]
+    replaced = {"[Content_Types].xml": ct, "xl/_rels/workbook.xml.rels": rels, "xl/workbook.xml": wbxml}
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in z.namelist():
+            if item == "docProps/custom.xml":
+                continue
+            zo.writestr(item, replaced.get(item, z.read(item)))
+    return dst
+
+
+def test_strip_a_foreign_package_whose_only_change_is_removals_reaches_the_archive(tmp_path):
+    """The strip's only store mutation is the removals here, and the
+    save must not fall back to the source bytes."""
+    _needs_sweeps()
+    foreign = _foreign_package(_write_embedded(tmp_path), tmp_path / "foreign.xlsx")
+    with zlsx.embeddings(foreign) as e:
+        assert e.state == "present"
+    out = tmp_path / "foreign_out.xlsx"
+    with zlsx.Editor(foreign) as ed:
+        ed.strip_embeddings()
+        ed.save(out)
+    assert not any(n.startswith("xl/zlsxEmbeddings/") for n in zipfile.ZipFile(out).namelist())
+    with zlsx.embeddings(out) as e:
+        assert e.state == "absent"
 
 
 def test_strip_refuses_a_workbook_xml_it_cannot_walk_before_the_first_removal(tmp_path):

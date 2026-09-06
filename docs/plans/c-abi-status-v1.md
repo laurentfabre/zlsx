@@ -1959,6 +1959,62 @@ were (`classifySlot`: a blank redacts, any other value is `stale`, never
 `fresh`), the documented `setCell(.blank)` → `prune` → `save` sequence.
 Appended rows on an uncovered sheet do not touch the sweep.
 
+**Round 1** (two agents; A ship-ready with 1 MEDIUM + 4 LOW, B not
+ship-ready on 1 MEDIUM + 4 LOW; every fix in the round-1 commit, each
+pinned on the surface that found it): `pruneEmbeddings` re-parsed the
+index rels into a fixed 64-entry buffer and spelled every parse failure —
+`BufferTooSmall` at the 65th relationship included — `MissingEmbeddingPart`,
+so a set of 33+ coverages that `embeddings()` accepts through its grow loop
+refused the sweep on every surface under a name the docs define as "a part
+gone from the archive" (A REL-101, pre-existing on the Zig / CLI path) →
+`EmbeddingView` carries `rels` (the retained grow-loop storage, borrowed
+like the coverages) and the sweep resolves part names from the view;
+pinned with 33 single-row coverages. The scrub replaced worksheet parts
+and the table without dropping `Worksheet.parsed` / `sst_view`, and a save
+with staged deltas regenerates `<sheetData>` from the view — prune (parses
+the covered sheet) → strip → `setCell` → save wrote an inline record back
+and the file read `.stripped` (B REL-101) → `dropViewOverPart`, the
+every-other-replace-site shape; pinned in the table's shape and the
+inline one. The scrub blanked every locator hit while the reader honours
+only a span it can decode under its 3 200-byte cap — a cell that merely
+spelled `zlsxER1` was cut by a strip advertised as a no-op (A + B REL-102)
+→ `recordSpanDecodes`, the reader's own gates (`recovery_record.decode`
+under the same grow loop) before a span is blanked; pinned on the Zig
+layer and Python (`see zlsxER1 for the magic`, `xzlsxER1abc`, the
+passthrough byte for byte). `PartStore.hasUnsavedChanges` saw overrides
+only and `removePart` installs none, so a strip whose only store mutation
+was removals — a foreign package with the parts under `<Default>` content
+types, no relationship, no record — saved the source bytes with every
+vector intact and reported OK (A REL-103 / B REL-105, pre-existing on the
+CLI path; no zlsx-written file reaches it) → the store counts committed
+removals (`removed`) and the predicate ORs it in; pinned store-level (a
+removal with no override, no relationship) and end-to-end in Python (the
+foreign shape strips to `absent`, the archive without the parts). The
+scrub decompressed every worksheet part into the store arena on every
+strip, the documented no-op included (B PERF-103) → `StripScope`: the
+table is always scrubbed (where zlsx's writer and a Numbers export put the
+string), the worksheet parts only for a workbook that carried the
+`zlsxRecovery` sheet at entry (the Editor passing what it saw before its
+own delete), `_rels` files skipped — recorded: a user-RENAMED recovery
+sheet holding an INLINE record is not scanned (its table string still is).
+B's notes taken: the sweep's final loop installed the redacted parts one
+`replacePart` at a time, so an allocation failure landed N−1 of N — now
+`PartStore.replaceParts`, the atomic install, and the "-3 after the first
+part write" clause is gone from every surface; `embeddingSetVerdict`
+names the four error names the parser shares with the workbook vocabulary
+(`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`,
+`BufferTooSmall`) so a future workbook-level raise inside `embeddings()`
+is not folded by accident; a NULL report beside a rejected diag is two
+-1s and errbuf carries the later (`NullOutPointer`). Docs (A + B DOC-104,
+A DOC-105): the Python README still called the sweeps "CLI / Zig-only
+today" above the paragraph that ships them; "a blank or deleted cell" (no
+C delete export) → "a blank (empty) cell"; "call again — the strip is
+re-runnable" did not hold when the cells-sheet delete tore past its
+pre-flights — `StructuralEditIncomplete` on the retry and on the save —
+so the strip's -1 vocabulary names it on every surface and the clause
+says discard; `MalformedContentTypes` dropped from the strip's -2 list
+(unreachable: `removeContentTypeOverride` allocates only).
+
 **Recorded, outside the slice**: the recalc transactions
 (`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
 `zlsx_editor_recalculate`) rebuild their candidate from the archive as
@@ -1970,7 +2026,16 @@ hidden sheet beneath the Editor's mirror; the strip side of that path is
 what this slice built). The CLI vector / state dump.
 
 **Tests** (`src/c_abi.zig`, "S3c prune_embeddings …" ×4, "S3c
-strip_embeddings …" ×3, "S3c sweeps …" ×1): the read's hashes pruning all
+strip_embeddings …" ×3, "S3c sweeps …" ×1; round-1 pins on the Zig layer
+and Python — `pkg/workbook.zig` "S3c slice 3 r1 …" ×4: 33 coverages
+through the view's relationships, the typed views dropped by the scrub in
+both shapes with a staged edit and a save reading `.absent`, a cell that
+merely spells the magic left with the store's mutation counter unchanged
+under both scopes, a removal with no override and no relationship flipping
+`hasUnsavedChanges`; `test_embedding_sweeps.py` +2, 22: the magic-only
+cell's passthrough and the lenient read of it, the foreign package whose
+only change is removals stripping to `absent` with the archive lacking
+the parts; the lenient reader over the scrubbed table on the strip test): the read's hashes pruning all
 fresh with the passthrough save byte for byte, a staged blank redacting and
 a staged string stale, the saved tombstone over a zeroed vector through
 `zlsx_emb_hashes` / `zlsx_emb_vectors` and `valid_empty` on the re-open; a

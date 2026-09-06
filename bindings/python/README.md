@@ -452,8 +452,7 @@ defined-name edit (pre-existing, recorded). The recalc transactions
 rebuild from the archive as opened and do not carry a staged embedding
 write — call them before it, or save and re-open. `recovery_in_cells` (the
 Numbers-durable carrier) is Zig-only until the editor grows a path for its
-hidden sheet; the prune and strip sweeps are CLI / Zig-only today (the next
-S3c slice).
+hidden sheet (its strip side shipped with the sweeps below).
 
 `prune_embeddings()` and `strip_embeddings()` are the two sweeps `zlsx embed
 --prune` / `--strip` run, on the editor handle (0.9.0+). Prune tombstones
@@ -481,9 +480,10 @@ from every carrier — the pre-share operation; `zlsx.embeddings(path)` then
 reports `absent`, not `stripped`. It is idempotent and a no-op on a workbook
 without embeddings; a `recovery_in_cells` sheet goes through the editor's
 own `delete_sheet` path (so sheet indices stay honest — its rules apply:
-`SheetDeleteRequiresCleanState`, `CannotDeleteLastSheet`), and an
+`SheetDeleteRequiresCleanState`, `CannotDeleteLastSheet`), an
 `xl/workbook.xml` the strip cannot walk refuses (`MalformedWorkbookXml`)
-before the first removal.
+before the first removal, and a cell that merely spells the record's magic
+is user text and stays.
 
 ## Spark (PySpark Data Source)
 

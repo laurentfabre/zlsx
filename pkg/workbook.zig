@@ -717,6 +717,13 @@ pub const EmbeddingCoverageView = struct {
 pub const EmbeddingView = struct {
     index: embedding_part.Index,
     coverages: []const EmbeddingCoverageView,
+    /// The index's relationships as the read parsed them (its grow
+    /// loop, retained like the coverages), so a caller that needs part
+    /// NAMES — the redaction sweep — resolves them from the view
+    /// instead of re-parsing into a bounded buffer (a set of 33+
+    /// coverages overflowed a 64-entry one and read as
+    /// `MissingEmbeddingPart`; in-house S3c slice 3 r1 REL-101).
+    rels: []const embedding_part.IndexRelationship,
 
     /// Look up a coverage by its `<coverage id="...">` attribute.
     /// Returns `null` if no coverage with that id exists.
@@ -2362,6 +2369,7 @@ pub const Workbook = struct {
         self.embedding_view = .{
             .index = idx,
             .coverages = views,
+            .rels = rels,
         };
         return .{ .present = self.embedding_view.? };
     }
@@ -2854,6 +2862,24 @@ pub const Workbook = struct {
     /// why the recovery carriers are cleaned unconditionally rather
     /// than only when an index was found.
     pub fn stripEmbeddings(self: *Workbook) Error!void {
+        return self.stripEmbeddingsScoped(.{ .worksheet_parts = self.recoveryCellSheetIndex() != null });
+    }
+
+    /// What `stripEmbeddingsScoped` scans for the cells carrier's text
+    /// beyond the shared-string table.
+    pub const StripScope = struct {
+        /// Scan every worksheet part too — for a workbook that carried
+        /// the `recovery_in_cells` sheet (an inline string in its part,
+        /// or a Numbers export's renumbered one). The table alone is
+        /// scanned otherwise: materializing every sheet on a strip that
+        /// has nothing to find is the cost this gate refuses (in-house
+        /// S3c slice 3 r1 PERF-103). A caller that deleted that sheet
+        /// itself before calling (the Editor) says what it saw.
+        worksheet_parts: bool,
+    };
+
+    /// `stripEmbeddings` with the scrub's scope spelled by the caller.
+    pub fn stripEmbeddingsScoped(self: *Workbook, scope: StripScope) Error!void {
         // The cells carrier's sheet goes first: its delete rewrites
         // `xl/workbook.xml`, so the chunk-name strip must be prepared
         // AFTER it (a strip prepared before would commit the deleted
@@ -2892,7 +2918,7 @@ pub const Workbook = struct {
         self.dropStagedRecoveryNames();
         try self.commitRecoveryNameStrip(&strip);
         try self.removeRecoveryDocProp();
-        try self.scrubRecoveryCellText();
+        try self.scrubRecoveryCellText(scope);
 
         self.invalidateEmbeddingCache();
     }
@@ -2938,15 +2964,9 @@ pub const Workbook = struct {
         const emb_state = self.embeddings() catch |e| return embeddingSetVerdict(e);
         const view = emb_state.viewOrNull() orelse return .{};
         const dim = view.index.dim;
-
-        // Resolve rid→target again rather than reaching into the cached
-        // view: the write below needs part *names*, which the view does
-        // not carry.
-        const rels_part = (try self.store.part(embedding_part.INDEX_RELS_PART_NAME)) orelse
-            return error.MissingEmbeddingPart;
-        var rels_buf: [64]embedding_part.IndexRelationship = undefined;
-        const rels = embedding_part.parseIndexRelationships(rels_part.bytes, &rels_buf) catch
-            return error.MissingEmbeddingPart;
+        // The part names the writes below need come from the view's own
+        // relationships — the ones the read parsed, however many.
+        const rels = view.rels;
 
         var report: PruneReport = .{};
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
@@ -3038,8 +3058,17 @@ pub const Workbook = struct {
             }
         }
 
-        for (pending.items) |p| try self.store.replacePart(p.name, p.bytes);
-        if (report.redacted > 0) self.invalidateEmbeddingCache();
+        // One atomic install: every redacted part lands, or none does —
+        // an allocation failure in the install leaves the set as it was
+        // rather than N−1 of N coverages redacted (in-house S3c slice 3
+        // r1, B's note; the `replaceParts` contract).
+        if (pending.items.len > 0) {
+            const replacements = try self.allocator.alloc(store_mod.PartStore.Replacement, pending.items.len);
+            defer self.allocator.free(replacements);
+            for (pending.items, 0..) |p, i| replacements[i] = .{ .name = p.name, .bytes = p.bytes };
+            try self.store.replaceParts(replacements);
+            self.invalidateEmbeddingCache();
+        }
         return report;
     }
 
@@ -3486,35 +3515,102 @@ pub const Workbook = struct {
 
     /// Blank the cells carrier's text wherever the record reader scans
     /// for it — `xl/sharedStrings.xml` (a save lifts the cell's string
-    /// into the table) and every worksheet part (an inline string, a
-    /// Numbers export's renumbered sheet, a part an Editor's delete
-    /// orphaned) — in place, so no shared-string index moves. Deleting
-    /// the sheet alone left its string in the table, and a stripped
-    /// file read `.stripped` with the whole record (S3c slice 3, found
-    /// through the C surface on a saved `recovery_in_cells` set). The
-    /// span is the reader's own (`recovery_record.recordSpanInText`).
-    fn scrubRecoveryCellText(self: *Workbook) Error!void {
+    /// into the table) and, under `scope`, every worksheet part (an
+    /// inline string, a Numbers export's renumbered sheet) — in place,
+    /// so no shared-string index moves. Deleting the sheet alone left
+    /// its string in the table, and a stripped file read `.stripped`
+    /// with the whole record (S3c slice 3, found through the C surface
+    /// on a saved `recovery_in_cells` set). The span is the reader's
+    /// own (`recovery_record.recordSpanInText`) and so is the
+    /// acceptance (`recordSpanDecodes`): a cell that merely spells the
+    /// magic is user text the reader ignores, and stays (r1 REL-102).
+    /// A replaced part's typed view is dropped — a save with staged
+    /// deltas regenerates `<sheetData>` from it, and the table from the
+    /// SST view, so a stale one would write the record back (r1 B
+    /// REL-101).
+    fn scrubRecoveryCellText(self: *Workbook, scope: StripScope) Error!void {
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
         defer names.deinit(self.allocator);
         for (self.store.parts) |p| {
-            if (std.mem.startsWith(u8, p.name, "xl/worksheets/") or
-                std.mem.eql(u8, p.name, "xl/sharedStrings.xml"))
-            {
-                try names.append(self.allocator, p.name);
-            }
+            const is_table = std.mem.eql(u8, p.name, "xl/sharedStrings.xml");
+            const is_sheet = scope.worksheet_parts and
+                std.mem.startsWith(u8, p.name, "xl/worksheets/") and
+                !std.mem.endsWith(u8, p.name, ".rels");
+            if (is_table or is_sheet) try names.append(self.allocator, p.name);
         }
         for (names.items) |n| {
             const p = (try self.store.part(n)) orelse continue;
             if (recovery_record.recordSpanInText(p.bytes) == null) continue;
             var out: std.ArrayListUnmanaged(u8) = .empty;
             defer out.deinit(self.allocator);
+            var blanked: usize = 0;
             var rest: []const u8 = p.bytes;
             while (recovery_record.recordSpanInText(rest)) |span| {
-                try out.appendSlice(self.allocator, rest[0..span.start]);
+                if (try self.recordSpanDecodes(rest[span.start..span.end])) {
+                    try out.appendSlice(self.allocator, rest[0..span.start]);
+                    blanked += 1;
+                } else {
+                    try out.appendSlice(self.allocator, rest[0..span.end]);
+                }
                 rest = rest[span.end..];
             }
+            if (blanked == 0) continue;
             try out.appendSlice(self.allocator, rest);
             try self.store.replacePart(n, out.items);
+            self.dropViewOverPart(n);
+        }
+    }
+
+    /// Whether a span the locator found (still XML-escaped) is a record
+    /// the reader would accept — `recoverEmbeddingRecord`'s own gates:
+    /// the size the reader's buffer admits, then `recovery_record.decode`
+    /// under the same grow loop. Everything else is text.
+    fn recordSpanDecodes(self: *Workbook, raw: []const u8) Error!bool {
+        if (raw.len > recovery_record.MAX_CHUNK * recovery_record.MAX_CHUNKS) return false;
+        const unescaped = try self.allocator.alloc(u8, raw.len);
+        defer self.allocator.free(unescaped);
+        const text = recovery_record.xmlUnescape(unescaped, raw);
+        var cov_cap: usize = 4;
+        var scratch_cap: usize = 512;
+        while (true) {
+            const covs = try self.allocator.alloc(recovery_record.RecoveredCoverage, cov_cap);
+            defer self.allocator.free(covs);
+            const scratch = try self.allocator.alloc(u8, scratch_cap);
+            defer self.allocator.free(scratch);
+            _ = recovery_record.decode(text, .cell_data, covs, scratch) catch |e| switch (e) {
+                error.BufferTooSmall => {
+                    cov_cap *= 2;
+                    scratch_cap *= 2;
+                    if (scratch_cap > 1 << 20) return false;
+                    continue;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
+            return true;
+        }
+    }
+
+    /// Drop the typed view parsed over part `name`, if any: the sheet
+    /// slot's `parsed` for a worksheet part, `sst_view` for the table —
+    /// what every other site that replaces those bytes does.
+    fn dropViewOverPart(self: *Workbook, name: []const u8) void {
+        if (std.mem.eql(u8, name, "xl/sharedStrings.xml")) {
+            if (self.sst_view) |*v| {
+                var view = v.*;
+                view.deinit(self.allocator);
+                self.sst_view = null;
+            }
+            return;
+        }
+        for (self.worksheets) |*ws| {
+            const resolved = ws.resolved_part_name orelse continue;
+            if (!std.mem.eql(u8, resolved, name)) continue;
+            if (ws.parsed) |*p| {
+                var stale = p.*;
+                stale.deinit(self.allocator);
+                ws.parsed = null;
+            }
         }
     }
 
@@ -3527,6 +3623,16 @@ pub const Workbook = struct {
     /// the caller's call was wrong). A part the index names and the
     /// archive lacks keeps the read's `MissingEmbeddingPart`; an
     /// allocation failure and the archive's own verdicts keep theirs.
+    ///
+    /// The fold matches by name, and the parser's set shares a few
+    /// names with the workbook vocabulary (`MissingRelationship`,
+    /// `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`).
+    /// Today every raise of those reachable from `embeddings()` is the
+    /// parser's own (the store's set does not overlap, and the record
+    /// reader raises store names or `OutOfMemory`), so the fold is
+    /// exact; a workbook-level raise of one of them added inside
+    /// `embeddings()` would fold silently — keep it that way or lift it
+    /// here.
     fn embeddingSetVerdict(e: Error) Error {
         return switch (e) {
             error.OutOfMemory, error.MissingEmbeddingPart => e,
@@ -29706,4 +29812,197 @@ test "S3c slice 3 strip: the workbook.xml verdict lands before the first removal
         try std.testing.expectEqual(@as(?u32, 1), wb.recoveryCellSheetIndex());
         try std.testing.expect((try wb.embeddings()) == .present);
     }
+}
+
+test "S3c slice 3 r1: a set of 33 coverages prunes through the view's own relationships (the fixed 64-entry buffer refused it MissingEmbeddingPart)" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/many.xlsx", .{dir});
+    defer a.free(path);
+    const count = 33;
+    {
+        var wb = try Workbook.empty(a, io);
+        defer wb.deinit();
+        const ws = try wb.addSheet("Items");
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Title" }}});
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+        var ids: [count][8]u8 = undefined;
+        var ranges: [count][8]u8 = undefined;
+        var inputs: [count]EmbeddingCoverageInput = undefined;
+        const vec_body = [_]u8{7} ** (4 + 2);
+        const tomb = [_]u64{embedding_part.TOMBSTONE_HASH};
+        for (0..count) |i| {
+            const id = try std.fmt.bufPrint(&ids[i], "c{d}", .{i});
+            const range = try std.fmt.bufPrint(&ranges[i], "A{d}:A{d}", .{ i + 2, i + 2 });
+            inputs[i] = .{
+                .id = id,
+                .worksheet_target = PRUNE_WS_TARGET,
+                .range = range,
+                .column = "A",
+                .include_formulas = false,
+                .vec_body = &vec_body,
+                .hashes = &tomb,
+            };
+        }
+        try wb.setEmbeddings("m", 2, .int8_sym_per_vec, &inputs);
+        try wb.save(io, path);
+    }
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqual(@as(usize, count), view.coverages.len);
+    try std.testing.expectEqual(@as(usize, 2 * count), view.rels.len);
+    const report = try wb.pruneEmbeddings();
+    // Row 2 has text under a tombstone (became embeddable: stale); the
+    // other 32 covered rows are empty under a tombstone.
+    try std.testing.expectEqual(@as(usize, 1), report.stale);
+    try std.testing.expectEqual(@as(usize, count - 1), report.valid_empty);
+    try std.testing.expectEqual(@as(usize, 0), report.redacted);
+}
+
+/// The prune fixture with the record's text ALSO planted where a
+/// foreign writer would leave it: inline in a surviving sheet (`where`
+/// = a cell ref on Items) — the shape the scrub must clear and whose
+/// typed view a later save must not regenerate from.
+fn writePruneFileWithInlineRecord(io: std.Io, dir: []const u8, name: []const u8) ![]const u8 {
+    const a = std.testing.allocator;
+    const cells = try writePruneFileInCells(io, dir, "inline_src.xlsx");
+    defer a.free(cells);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
+    errdefer a.free(path);
+    var wb = try Workbook.open(a, io, cells);
+    defer wb.deinit();
+    const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+    const span = recovery_record.recordSpanInText(sst.bytes) orelse return error.TestUnexpectedResult;
+    const record = try a.dupe(u8, sst.bytes[span.start..span.end]);
+    defer a.free(record);
+    const sheet = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+    const cell = try std.fmt.allocPrint(a, "<row r=\"9\"><c r=\"A9\" t=\"inlineStr\"><is><t>{s}</t></is></c></row></sheetData>", .{record});
+    defer a.free(cell);
+    const patched = try std.mem.replaceOwned(u8, a, sheet.bytes, "</sheetData>", cell);
+    defer a.free(patched);
+    try wb.store.replacePart("xl/worksheets/sheet1.xml", patched);
+    try wb.save(io, path);
+    return path;
+}
+
+test "S3c slice 3 r1: the scrub drops the typed views it invalidates — prune, strip, a staged edit, a save: absent, in the table's shape and the inline one" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    // The table's shape — zlsx's own — and the inline one.
+    const Shape = struct { name: []const u8, inline_record: bool };
+    for ([_]Shape{ .{ .name = "sst", .inline_record = false }, .{ .name = "inline", .inline_record = true } }) |shape| {
+        const src_name = try std.fmt.allocPrint(a, "views_{s}.xlsx", .{shape.name});
+        defer a.free(src_name);
+        const path = if (shape.inline_record)
+            try writePruneFileWithInlineRecord(io, dir, src_name)
+        else
+            try writePruneFileInCells(io, dir, src_name);
+        defer a.free(path);
+        const out = try std.fmt.allocPrint(a, "{s}/views_{s}_out.xlsx", .{ dir, shape.name });
+        defer a.free(out);
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            // The sweep parses the covered sheet and the table.
+            const report = try wb.pruneEmbeddings();
+            try std.testing.expectEqual(@as(usize, 2), report.fresh);
+            try std.testing.expect((try wb.sheet(0)).parsed != null);
+            try std.testing.expect(wb.sst_view != null);
+            try wb.stripEmbeddings();
+            // The strip deleted a sheet, so the slot table moved: the
+            // sheet is fetched again, never held across it.
+            const items = try wb.sheet(0);
+            try std.testing.expect(wb.sst_view == null);
+            if (shape.inline_record) try std.testing.expect(items.parsed == null);
+            // A staged edit makes the save regenerate the sheet from
+            // its view (and the table from the SST view).
+            try items.setCell("B1", .{ .string = "edited" });
+            try wb.save(io, out);
+        }
+        var wb = try Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expect((try wb.embeddings()) == .absent);
+        for (wb.store.parts) |p| {
+            const bytes = ((try wb.store.part(p.name)) orelse continue).bytes;
+            try std.testing.expect(recovery_record.recordSpanInText(bytes) == null);
+        }
+    }
+}
+
+test "S3c slice 3 r1: a cell that merely spells the magic is user text — the strip leaves it, and the no-set strip stays a no-op" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/magic.xlsx", .{dir});
+    defer a.free(path);
+    {
+        var wb = try Workbook.empty(a, io);
+        defer wb.deinit();
+        const ws = try wb.addSheet("Notes");
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "see zlsxER1 for the magic" }}});
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "xzlsxER1abc" }}});
+        try wb.save(io, path);
+    }
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try std.testing.expect((try wb.embeddings()) == .absent);
+    const before = wb.store.mutations;
+    // Both scopes: the table alone, and every worksheet part.
+    try wb.stripEmbeddings();
+    try wb.stripEmbeddingsScoped(.{ .worksheet_parts = true });
+    try std.testing.expectEqual(before, wb.store.mutations);
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, sst.bytes, "see zlsxER1 for the magic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sst.bytes, "xzlsxER1abc") != null);
+}
+
+test "S3c slice 3 r1: a removal with no override and no relationship is an unsaved change — the passthrough save cannot hide it" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try writePruneFile(io, dir, "removal.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer a.free(path);
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try std.testing.expect(!wb.hasUnsavedChanges());
+    // `_rels/.rels` sits under a `<Default>` content type and nothing
+    // relates to it: the one removal that installs no override.
+    try wb.store.removePart("_rels/.rels");
+    try std.testing.expectEqual(@as(u64, 1), wb.store.removed);
+    // The removal's content-types rewrite staged an override of its
+    // own (the rewriter re-serializes the part even when it matched
+    // nothing); cleared here so the counter is the only witness — the
+    // foreign-package shape the Python pin builds for real.
+    for (wb.store.overrides) |*o| o.* = null;
+    try std.testing.expect(wb.hasUnsavedChanges());
+    // An absent part is a no-op, not a removal.
+    try wb.store.removePart("_rels/.rels");
+    try std.testing.expectEqual(@as(u64, 1), wb.store.removed);
 }

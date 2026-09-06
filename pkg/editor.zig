@@ -757,7 +757,8 @@ pub const Editor = struct {
     /// nothing left to delete. Idempotent, and a no-op on a workbook
     /// without embeddings, as the workbook's is.
     pub fn stripEmbeddings(self: *Editor) !void {
-        if (self.workbook.recoveryCellSheetIndex()) |idx| {
+        const cells_sheet = self.workbook.recoveryCellSheetIndex();
+        if (cells_sheet) |idx| {
             // The strip's own verdict on `xl/workbook.xml`, judged
             // before the delete installs anything — the workbook's
             // strip judges it first too, but runs after the delete
@@ -772,7 +773,10 @@ pub const Editor = struct {
             try self.deleteSheet(idx);
             try self.workbook.store.removePart(part);
         }
-        try self.workbook.stripEmbeddings();
+        // The workbook's scrub scans the worksheet parts only for a
+        // workbook that carried the cells sheet — which this path has
+        // just deleted, so it says what it saw.
+        try self.workbook.stripEmbeddingsScoped(.{ .worksheet_parts = cells_sheet != null });
     }
 
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {

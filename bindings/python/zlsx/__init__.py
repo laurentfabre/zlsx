@@ -4732,16 +4732,23 @@ class Editor:
         ``SheetDeleteRequiresCleanState`` (staged cell writes or
         appended rows on any sheet — save first), :class:`ZlsxRefusal`
         ``CannotDeleteLastSheet``, and every index above the deleted
-        sheet's shifts down by one. Refusals otherwise:
+        sheet's shifts down by one; :class:`ZlsxError`
+        ``StructuralEditIncomplete`` is an editor holding a torn
+        structural edit (this strip's own delete, or an earlier one —
+        discard it). Refusals otherwise:
         ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the strip of
         the record's chunk names cannot walk — judged before the first
-        removal), ``MissingContentTypes`` / ``MalformedContentTypes``,
-        and the delete's verdicts should the cells sheet be present
-        (``MissingRelationship``, a carrier the cross-sheet sweeps
-        cannot read — ``MalformedChartXml``, ``MalformedExtensionXml``,
-        …). A failure after the first removal leaves the staged set
-        partially stripped: discard the editor without saving, or call
-        again — the strip is re-runnable. The recalc transactions
+        removal), ``MissingContentTypes``, and the delete's verdicts
+        should the cells sheet be present (``MissingRelationship``, a
+        carrier the cross-sheet sweeps cannot read —
+        ``MalformedChartXml``, ``MalformedExtensionXml``, …). A failure
+        after the first removal leaves the staged set partially
+        stripped: discard the editor without saving, or call again —
+        the strip is re-runnable, unless the cells-sheet delete itself
+        tore past its pre-flights (then the next call and the save
+        raise ``StructuralEditIncomplete`` — discard the editor). A
+        cell that merely spells the record's magic is user text and
+        stays. The recalc transactions
         rebuild their candidate from the archive as opened and do not
         carry this strip — call them before it, or save and re-open.
 

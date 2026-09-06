@@ -2270,8 +2270,8 @@ typedef struct zlsx_prune_report_v1 {
  * with nothing to redact rewrites nothing.
  *
  * A staged zlsx_editor_set_cell on a covered row is judged as staged,
- * never fresh: a blank or deleted cell redacts its slot, any other
- * value counts `stale`. A covered sheet with staged
+ * never fresh: a blank (empty) cell redacts its slot, any other value
+ * counts `stale`. A covered sheet with staged
  * zlsx_editor_append_row rows refuses instead — -1
  * SheetHasUnsavedAppends (the read's rule) — save first. -1
  * otherwise: InvalidInput (NULL handle), NullOutPointer (NULL report),
@@ -2286,9 +2286,9 @@ typedef struct zlsx_prune_report_v1 {
  * MalformedSheetXml, MalformedSharedStringsXml, UnsupportedCellValue,
  * SstIndexOutOfRange, InvalidUtf8, UnicodeNormalizationFailed — a cell
  * the read cannot carry stops the sweep whole rather than redact a
- * row that has text. A -3 after the first part write leaves the
- * staged set partially redacted: discard the editor without saving,
- * or call again — the sweep is re-runnable. The recalc transactions
+ * row that has text. The redacted parts land in one atomic install
+ * after every row is judged: a -3 in it leaves the set as it was,
+ * never N-1 of N coverages redacted. The recalc transactions
  * (zlsx_editor_mark_recalc_on_load then save,
  * zlsx_editor_save_with_recalc, zlsx_editor_recalculate) rebuild
  * their candidate from the archive as opened and do NOT carry this
@@ -2316,16 +2316,22 @@ int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
  * writes or appended rows on any sheet — save first), -2
  * CannotDeleteLastSheet, and every index above the deleted sheet's
  * shifts down by one. -1 otherwise: InvalidInput (NULL handle),
- * StructSizeTooSmall. -2, the name in the diag with plane NONE:
+ * StructSizeTooSmall, StructuralEditIncomplete (the editor holds a
+ * torn structural edit — this strip's own delete, or an earlier one;
+ * discard it). -2, the name in the diag with plane NONE:
  * MalformedWorkbookXml (an xl/workbook.xml the strip of the record's
  * chunk names cannot walk — judged before the first removal), the
- * package's own MissingContentTypes / MalformedContentTypes, and the
- * delete's verdicts should the cells sheet be present
- * (MissingRelationship, a carrier the cross-sheet sweeps cannot read
- * — MalformedChartXml, MalformedExtensionXml, ...). A -2 or -3 after
- * the first removal leaves the staged set partially stripped: discard
- * the editor without saving, or call again — the strip is
- * re-runnable. The recalc transactions rebuild their candidate from
+ * package's own MissingContentTypes, and the delete's verdicts should
+ * the cells sheet be present (MissingRelationship, a carrier the
+ * cross-sheet sweeps cannot read — MalformedChartXml,
+ * MalformedExtensionXml, ...). A -2 or -3 after the first removal
+ * leaves the staged set partially stripped: discard the editor
+ * without saving, or call again — the strip is re-runnable, unless
+ * the cells-sheet delete itself tore past its pre-flights: then the
+ * next call and the save refuse StructuralEditIncomplete
+ * (zlsx_editor_delete_sheet's rule — discard the editor). A cell that
+ * merely spells the record's magic is user text and stays. The recalc
+ * transactions rebuild their candidate from
  * the archive as opened and do NOT carry this strip: call them before
  * it, or save and re-open. */
 int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
