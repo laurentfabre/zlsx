@@ -3573,14 +3573,23 @@ pub const Workbook = struct {
     /// Whether the archive holds a worksheet part no `<sheet>` resolves
     /// to — `deleteSheet`'s orphan, or a foreign package's. Resolves
     /// every sheet's part name (the cached rels lookup, no sheet bytes
-    /// read) and compares against the `xl/worksheets/` listing.
+    /// read) and compares against the `xl/worksheets/` listing. A
+    /// scope heuristic, never a verdict: a sheet whose part cannot be
+    /// resolved (no `r:id`, a relationship the workbook lacks, a
+    /// target the resolver cannot spell) is reason to scan wider, not
+    /// to refuse a strip `main` accepted (in-house S3c slice 3 r3
+    /// REL-301); only an allocation failure keeps its name.
     fn hasOrphanWorksheetPart(self: *Workbook) Error!bool {
         var live: std.ArrayListUnmanaged([]const u8) = .empty;
         defer live.deinit(self.allocator);
         var i: u32 = 0;
         while (i < self.sheetCount()) : (i += 1) {
             const ws = try self.sheet(i);
-            try live.append(self.allocator, try ws.resolvePartName());
+            const name = ws.resolvePartName() catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return true,
+            };
+            try live.append(self.allocator, name);
         }
         for (self.store.parts) |p| {
             if (!std.mem.startsWith(u8, p.name, "xl/worksheets/")) continue;
@@ -3661,8 +3670,7 @@ pub const Workbook = struct {
     /// allocation failure and the archive's own verdicts keep theirs.
     ///
     /// The fold matches by name, and the parser's set shares a few
-    /// names with the workbook vocabulary (`MissingRelationship`,
-    /// `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`).
+    /// names with the workbook vocabulary (`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`).
     /// Today every raise of those reachable from `embeddings()` is the
     /// parser's own (the store's set does not overlap, and the record
     /// reader raises store names or `OutOfMemory`), so the fold is
@@ -30106,4 +30114,30 @@ test "S3c slice 3 r2: an orphaned worksheet part holding the record inline, no z
     try std.testing.expect((try saved.embeddings()) == .absent);
     const orphan = (try saved.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(recovery_record.recordSpanInText(orphan.bytes) == null);
+}
+
+test "S3c slice 3 r3: a <sheet> whose part cannot be resolved widens the scrub's scope — the strip still strips, never refuses" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try writePruneFile(io, dir, "dangling.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer a.free(path);
+    // The one sheet's relationship id names nothing in the rels file.
+    try chart_fixture.patchPart(a, io, path, "xl/workbook.xml", "r:id=\"rId1\"", "r:id=\"rId9\"");
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try std.testing.expectError(error.MissingRelationship, (try wb.sheet(0)).resolvePartName());
+    try std.testing.expect(try wb.hasOrphanWorksheetPart());
+    try std.testing.expect((try wb.embeddings()) == .present);
+    try wb.stripEmbeddings();
+    try std.testing.expect((try wb.embeddings()) == .absent);
+    for (wb.store.parts) |p| try std.testing.expect(!std.mem.startsWith(u8, p.name, "xl/zlsxEmbeddings"));
 }

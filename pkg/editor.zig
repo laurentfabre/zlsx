@@ -770,7 +770,9 @@ pub const Editor = struct {
             // the workbook's own path removes it the same way, under
             // the workbook's spelling of the name (the store's resolver
             // collapses dot segments; the mirror's `sheet_paths` does
-            // not — in-house S3c slice 3 r2 MAINT-201).
+            // not — in-house S3c slice 3 r2 MAINT-201; a Target on
+            // which the two differ is refused at open, `MissingSheet`,
+            // so this is consistency, not a reachable fix).
             const ws = try self.workbook.sheet(idx);
             const part = try self.allocator.dupe(u8, try ws.resolvePartName());
             defer self.allocator.free(part);
@@ -11317,13 +11319,19 @@ test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet th
         }}, .{ .recovery_in_cells = true });
         try wb.save(io, path);
     }
+    // A relationship Target spelled with a dot segment (the shape on
+    // which the mirror's `sheet_paths` and the store's collapsed
+    // spelling differ) is refused at `Editor.open` — `MissingSheet`,
+    // no ZIP entry under the verbatim spelling — so the one-spelling
+    // rule in `stripEmbeddings` has no reachable pin through this
+    // surface (in-house S3c slice 3 r3 TEST-301, tried and recorded).
+    const doomed = "xl/worksheets/sheet2.xml";
     {
         var ed = try Editor.open(a, io, path);
         defer ed.deinit();
         try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+        try std.testing.expectEqualStrings(doomed, ed.sheet_paths[1]);
         try std.testing.expectEqual(@as(?u32, 1), ed.workbook.recoveryCellSheetIndex());
-        const doomed = try a.dupe(u8, ed.sheet_paths[1]);
-        defer a.free(doomed);
         try std.testing.expect((try ed.workbook.store.part(doomed)) != null);
 
         try ed.stripEmbeddings();

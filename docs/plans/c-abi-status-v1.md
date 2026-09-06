@@ -2000,9 +2000,8 @@ B's notes taken: the sweep's final loop installed the redacted parts one
 `replacePart` at a time, so an allocation failure landed N−1 of N — now
 `PartStore.replaceParts`, the atomic install, and the "-3 after the first
 part write" clause is gone from every surface; `embeddingSetVerdict`
-names the four error names the parser shares with the workbook vocabulary
-(`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`,
-`BufferTooSmall`) so a future workbook-level raise inside `embeddings()`
+names the error names the parser shares with the workbook vocabulary
+(`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`) so a future workbook-level raise inside `embeddings()`
 is not folded by accident; a NULL report beside a rejected diag is two
 -1s and errbuf carries the later (`NullOutPointer`). Docs (A + B DOC-104,
 A DOC-105): the Python README still called the sweeps "CLI / Zig-only
@@ -2046,6 +2045,33 @@ and a `.stripped` read reports the OLDEST record (slice-1 territory);
 `recoverEmbeddingRecord`'s own `BufferTooSmall` (a record past 1 MiB of
 scratch — unreachable under the 3 200-byte carrier bound) would fold
 under `MalformedEmbeddingSet`.
+
+**Round 3** (two agents on the round-2 tree, the convergence round; both
+ship-ready, A 3 LOW, B 2 LOW — every earlier fix verified in code and by
+its reverting test; fixes in the round-3 commit): the round-2 orphan
+check resolved every sheet's part with `try`, so a `<sheet>` whose
+relationship the workbook lacks — a shape `Workbook.open` admits and
+`main` stripped clean — refused the strip `MissingRelationship`, a name
+the four surfaces reserve for the cells-sheet delete (A + B REL-301) → an
+unresolvable sheet is reason to scan wider, never a verdict (only an
+allocation failure keeps its name); pinned with a dangling `r:id` on
+the Zig surface (the Editor / C / Python / CLI refuse that workbook at
+open, `SheetCountMismatch`). The round-2 Editor fix — the doomed part
+removed under `resolvePartName`'s spelling — had no fixture on which
+the mirror's and the workbook's spellings differ, so a revert to
+`sheet_paths[idx]` passed the suite (A MAINT-302 / B TEST-301) → tried:
+a relationship Target with a dot segment (`./worksheets/sheet2.xml`) is
+refused at `Editor.open` (`MissingSheet` — no ZIP entry under the
+verbatim spelling), so the shape on which the two spellings differ is
+unreachable through the Editor; the one-spelling rule stays as
+consistency with the workbook path, recorded on the code and here, and
+the pin asserts the mirror's and the workbook's spellings agree on the
+fixture. Docs
+(A DOC-303): the c_abi comment still named "a content-types part a
+removal cannot patch" as a post-removal -2 (dropped from the header in
+round 2) — gone; the fold comment and this section listed the names the
+parser shares with the workbook vocabulary from memory — now the exact
+set (`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`).
 
 **Recorded, outside the slice**: the recalc transactions
 (`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
