@@ -123,3 +123,26 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
     }
     if (has_pivot_fixture) try std.testing.expect(pivots_total >= 2);
 }
+
+test "WDI Excel — the embed read refuses a positional sheet rather than serve it empty" {
+    // The World Bank exporter writes no `r` on any row (and on most
+    // cells — the rows are the trigger); the
+    // lenient reader infers the positions, the typed view counts and
+    // drops them. `embeddableRows` (and so `--extract`, `--prune`, the C
+    // and Python reads) refuses the sheet whole — before S3c slice 2 it
+    // answered an empty list for a sheet full of text, and the sweep
+    // would have redacted every slot. The follow-up that lifts this
+    // (and `PivotEditUnsafe` on the same shape) is the typed parser
+    // inferring positions the way the lenient reader does.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = std.testing.allocator;
+    const path = corpus_dir ++ "wdi_excel.xlsx";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+    var wb = try pkg.Workbook.open(alloc, io, path);
+    defer wb.deinit();
+    const ws = try wb.sheet(0);
+    const target = try ws.embeddingTarget();
+    try std.testing.expectError(error.MalformedSheetXml, wb.embeddableRows(alloc, target, "A2:A5", "A", false));
+}

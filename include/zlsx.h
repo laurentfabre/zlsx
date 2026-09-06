@@ -2183,6 +2183,62 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
         uint32_t flags,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* ── S3c slice 2: the embeddable-rows read (zlsx_status_v1) ─────────
+ *
+ * Workbook.embeddableRows on the editor handle — the rows of `column`
+ * over `range` on `sheet_idx` that carry embeddable content, as the
+ * `{"kind":"embed_row","row":N,"text":"…","hash":H}` records `zlsx
+ * embed --extract` prints (docs/cli.md, "embed --extract"), one line
+ * per row in range order, a library-allocated UTF-8 buffer
+ * byte-for-byte the CLI's. `row` is 1-based; `text` is the cell as a
+ * reader sees it (a shared or inline string's runs joined, entities
+ * resolved; a number's <v> as written; an error's literal, #N/A; a
+ * boolean as 1 / 0); `hash`
+ * is the canonical xxh3-64 content hash zlsx_editor_set_embeddings
+ * stores beside the vector, as an unsigned 64-bit decimal — the
+ * value zlsx_emb_hashes reads back, so read → embed → write is one
+ * shape (a JSON reader that narrows integers to doubles rounds it;
+ * parse it as an integer). `include_formulas` (0 or 1) admits formula
+ * cells with a cached value — the coverage flag's reading, so the
+ * read matches the coverage it feeds. Rows with nothing embeddable
+ * are omitted: a covered row missing here is a zlsx_emb_tombstone()
+ * slot on the write. A range with none is ZLSX_OK with (*out,
+ * *out_len) = (NULL, 0).
+ *
+ * Read over the editor's current parts. A sheet the editor holds
+ * staged cell writes (zlsx_editor_set_cell; the header cell
+ * zlsx_editor_rename_table_column stages on the host sheet) or
+ * appended rows (zlsx_editor_append_rows) for refuses — the parsed view this read
+ * walks does not carry them, so a row would answer with its saved
+ * content and a hash the staged value turns stale the moment it
+ * lands: -1 SheetHasUnsavedMutations / SheetHasUnsavedAppends; save
+ * and re-open, or read before the writes. -1 otherwise (a statement
+ * about the call, the name in errbuf): InvalidInput — NULL handle,
+ * NULL bytes with a non-zero length, include_formulas past 1;
+ * NullOutPointer; InvalidRange — the range, or a column outside it;
+ * SheetIndexOutOfRange; StructSizeTooSmall. -2 (ZLSX_REFUSED, a
+ * statement about the workbook, the name in the diag with plane
+ * NONE): MissingRelationship / MissingSheetPart — the sheet's part is
+ * unreachable; MalformedSheetXml — a sheet part the view cannot
+ * parse, or a row or cell it cannot place (no r, or one it cannot
+ * read — 0, non-numeric, past the limit — or a ref under another
+ * row); MalformedSharedStringsXml — a shared-string table it
+ * cannot parse; and a cell value the read cannot carry, refused whole rather
+ * than a record that lies — UnsupportedCellValue (a boolean <v> that
+ * is not 0 / 1, a <v> the number canonicalizer cannot read — a comma
+ * decimal, NaN — a t="d" ISO-8601 date, a t this reader does not
+ * know, a shared-string index that is not a number, an entity the
+ * decoder does not know), SstIndexOutOfRange (an index past the
+ * table), InvalidUtf8, UnicodeNormalizationFailed. Release with
+ * zlsx_buffer_release. */
+int32_t zlsx_editor_embeddable_rows_ndjson(zlsx_editor_t * ed,
+        uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * column, size_t column_len,
+        uint32_t include_formulas,
+        uint8_t ** out, size_t * out_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
@@ -2193,6 +2249,7 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
 #define ZLSX_HAS_SHEET_STATE      1   /* reader sheet_state (S3b slice 10) */
 #define ZLSX_HAS_ROWS_FORMULAS    1   /* reader rows_formula_at + rows_formula_ref_at + rows_error_at (S3b slice 11) */
 #define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 (S3c slice 1) */
+#define ZLSX_HAS_EMBEDDABLE_ROWS  1   /* editor embeddable_rows_ndjson (S3c slice 2) */
 
 
 #ifdef __cplusplus

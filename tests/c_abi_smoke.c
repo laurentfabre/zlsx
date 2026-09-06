@@ -65,6 +65,9 @@
 #if !defined(ZLSX_HAS_EMBEDDING_WRITE)
 #error "ZLSX_HAS_EMBEDDING_WRITE missing"
 #endif
+#if !defined(ZLSX_HAS_EMBEDDABLE_ROWS)
+#error "ZLSX_HAS_EMBEDDABLE_ROWS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -164,3 +167,10 @@ static const void *const s3c1_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3c1(void);
 const void *zlsx_c_abi_smoke_anchor_s3c1(void) { return s3c1_exports[0]; }
+
+/* S3c slice 2: the embeddable-rows read on the editor handle. */
+static const void *const s3c2_exports[] = {
+    (const void *)&zlsx_editor_embeddable_rows_ndjson,
+};
+const void *zlsx_c_abi_smoke_anchor_s3c2(void);
+const void *zlsx_c_abi_smoke_anchor_s3c2(void) { return s3c2_exports[0]; }

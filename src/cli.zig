@@ -1224,7 +1224,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     with --strip.
         \\  embed --extract    read-only: emit one NDJSON record per row
         \\                     that has something worth embedding —
-        \\                     {"kind":"embed_row","row":N,"text":"…"}.
+        \\                     {"kind":"embed_row","row":N,"text":"…",
+        \\                     "hash":H}, H the canonical xxh3-64 content
+        \\                     hash the write stores beside the vector.
         \\                     Rows with nothing embeddable are omitted,
         \\                     not emitted empty. Required: --column A,
         \\                     --coverage A2:A100. Takes no --out.
@@ -3503,18 +3505,17 @@ fn runEmbedExtract(
         return 3;
     };
 
-    const rows = wb.embeddableRows(alloc, target, range, column, false) catch |e| {
+    var rows = wb.embeddableRows(alloc, target, range, column, false) catch |e| {
         try err.print("zlsx: embed --extract: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
     };
-    defer alloc.free(rows);
+    defer rows.deinit();
 
-    for (rows) |r| {
-        try out.print("{{\"kind\":\"embed_row\",\"row\":{d},\"text\":", .{r.row});
-        try writeJsonString(out, r.text);
-        try out.writeAll("}\n");
-    }
+    // The one writer every surface shares (`pkg/embeddable_row_ndjson.zig`):
+    // the C ABI's buffer and this stream spell a record the same way
+    // by construction.
+    try zlsx_pkg.embeddable_rows_ndjson.writeAll(out, rows.rows);
     try out.flush();
     return 0;
 }
@@ -3580,12 +3581,12 @@ fn runEmbedApply(
         return 3;
     };
 
-    const rows = ed.workbook.embeddableRows(alloc, target, range, column, false) catch |e| {
+    var rows = ed.workbook.embeddableRows(alloc, target, range, column, false) catch |e| {
         try err.print("zlsx: embed --vectors: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
     };
-    defer alloc.free(rows);
+    defer rows.deinit();
 
     var vecs = readVectorFile(alloc, io, vectors_path) catch |e| {
         try err.print("zlsx: --vectors '{s}': {s}\n", .{ vectors_path, @errorName(e) });
@@ -3643,7 +3644,7 @@ fn runEmbedApply(
     @memset(hashes, zlsx_pkg.embedding_part.TOMBSTONE_HASH);
 
     var written: usize = 0;
-    for (rows) |r| {
+    for (rows.rows) |r| {
         const vec = vecs.get(r.row) orelse continue;
         const slot = r.row - first_row;
         const dst = vec_body[@as(usize, slot) * rec_len ..][0..rec_len];

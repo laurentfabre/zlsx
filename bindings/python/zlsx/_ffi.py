@@ -1900,3 +1900,22 @@ if _HAS_EMBEDDING_WRITE:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_set_embeddings.restype = ctypes.c_int32
+
+# S3c slice 2: the embeddable-rows read, the pivots buffer contract —
+# the header's ZLSX_HAS_EMBEDDABLE_ROWS, plus the buffer and diag
+# releases the wrapper calls unconditionally.
+_HAS_EMBEDDABLE_ROWS = hasattr(lib, "zlsx_editor_embeddable_rows_ndjson") and _HAS_BUFFER_RELEASE and _HAS_DIAG_RELEASE
+if _HAS_EMBEDDABLE_ROWS:
+    lib.zlsx_editor_embeddable_rows_ndjson.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,                                  # sheet_idx
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # range
+        ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,  # column
+        ctypes.c_uint32,                                  # include_formulas (0 / 1)
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),  # out
+        ctypes.POINTER(ctypes.c_size_t),                 # out_len
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_embeddable_rows_ndjson.restype = ctypes.c_int32
