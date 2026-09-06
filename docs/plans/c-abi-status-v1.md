@@ -2073,6 +2073,15 @@ round 2) — gone; the fold comment and this section listed the names the
 parser shares with the workbook vocabulary from memory — now the exact
 set (`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`).
 
+**Round 4** (two agents on the round-3 tree, the confirmation round): A
+converged — every vector "ANALYSED — no defect", every earlier fix
+verified in code and by its reverting test; B ship-ready with one doc
+LOW (DOC-401: this census listed eight of the ten `pkg/workbook.zig`
+slice-3 tests — the round-2 orphan pin and the round-3 dangling-`r:id`
+pin were missing; fixed here) and confirmed the round-3 `catch` swallows
+only `MissingRelationship`, the sole non-OOM name `resolvePartName` can
+raise, with nothing downstream re-resolving a sheet.
+
 **Recorded, outside the slice**: the recalc transactions
 (`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
 `zlsx_editor_recalculate`) rebuild their candidate from the archive as
@@ -2114,13 +2123,19 @@ landing there, ABSENT after the save, the dirty editor `-1` with the set
 and the sheet still standing); the `xl/workbook.xml` verdict with and
 without the cells sheet, the passthrough after each; the plane of every
 verdict, the parser's names `-1`, `WriteFailed` `-3`.
-`pkg/workbook.zig` ("S3c slice 3 …" ×4): the fold on five patches with the
+`pkg/workbook.zig` ("S3c slice 3 …" ×4, "S3c slice 3 r1 …" ×4, "S3c slice 3
+r2 …" ×1, "S3c slice 3 r3 …" ×1 — ten): the fold on five patches with the
 read keeping the parser's name and the store's mutation counter unchanged;
 appended rows covered and uncovered; the SAVED cells strip to `.absent`
 with the table blanked in place (one span gone, every other byte kept),
 the orphan gone, the cells served and the second strip changing nothing;
 the workbook.xml verdict before the first removal with and without the
-cells sheet. `pkg/editor.zig` ×1: the mirror in step after the strip (a
+cells sheet; the round-1 four (33 coverages, the typed views dropped in
+both shapes with the lenient read over the scrubbed table, the magic-only
+cell left under both scopes, a removal flipping `hasUnsavedChanges`); the
+round-2 orphan holding an inline record with no `zlsxRecovery` sheet
+stripping to `.absent`; the round-3 dangling `r:id` widening the scan
+and stripping clean. `pkg/editor.zig` ×1: the mirror in step after the strip (a
 sheet added at 1, a write landing on it, read back from the saved file),
 the orphan gone, the dirty editor refusing with nothing removed.
 `tests/c_abi_smoke.c` `#error`s without the macro, pins the 40-byte
