@@ -6143,6 +6143,16 @@ const structural_refusals = [_]anyerror{
     // `MalformedSheetXml` shape for the other part every string cell
     // depends on (S3C2-REL-102).
     error.MalformedSharedStringsXml,
+    // S3c slice 3: the redaction sweep's verdicts on the set it walks
+    // — the index read's refusal folded under one name (a coverage
+    // range the parser cannot read, a binary part with the wrong
+    // magic, a count that disagrees with its header), and a part the
+    // index names that the archive lacks. Statements about the
+    // workbook; the parser's own names (`InvalidRange`, `InvalidDtype`,
+    // `CountMismatch`, …) stay -1, the write's statement about its
+    // inputs. Raised by no other status_v1 export.
+    error.MalformedEmbeddingSet,
+    error.MissingEmbeddingPart,
     // NOT here, deliberately: `error.ZipBombSuspected`. The S1 caps
     // admit every entry on the open-time directory walk, so the
     // verdict fires where the ABI has no diag to carry it — the
@@ -10477,6 +10487,28 @@ comptime {
     assert(@sizeOf(CEmbCoverage) == 88);
 }
 
+/// `zlsx_prune_report_v1` — what `zlsx_editor_prune_embeddings` did
+/// (`Workbook.PruneReport`), as `uint64_t` counts so a caller never
+/// narrows a slot count; `struct_size` first, the §3 rule. The four
+/// fields of the `{"kind":"prune",…}` record `zlsx embed --prune`
+/// prints, in its order.
+const CPruneReport = extern struct {
+    struct_size: usize,
+    redacted: u64,
+    stale: u64,
+    fresh: u64,
+    valid_empty: u64,
+};
+
+comptime {
+    const assert = std.debug.assert;
+    assert(@offsetOf(CPruneReport, "redacted") == 8);
+    assert(@offsetOf(CPruneReport, "stale") == 16);
+    assert(@offsetOf(CPruneReport, "fresh") == 24);
+    assert(@offsetOf(CPruneReport, "valid_empty") == 32);
+    assert(@sizeOf(CPruneReport) == 40);
+}
+
 /// `zlsx_editor_set_embeddings`'s flags word. v1 defines no bit, so 0
 /// is the only accepted value (a set bit is `InvalidInput`); reserved
 /// so `recovery_in_cells` can cross later without a second export.
@@ -10755,6 +10787,134 @@ fn embeddableRowsNdjsonOwned(
         error.WriteFailed => return error.OutOfMemory,
     };
     return out.toOwnedSlice();
+}
+
+/// The sweeps' allocating writers and `allocPrint` spell an allocation
+/// failure `WriteFailed`; at this boundary that is `-3`, the
+/// embeddable-rows rule (`embeddableRowsNdjsonOwned`). Nothing else on
+/// either sweep's path raises the name.
+fn failSweep(e: anyerror, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) i32 {
+    return failMapped(if (e == error.WriteFailed) error.OutOfMemory else e, diag, err_buf, err_buf_len);
+}
+
+/// The redaction sweep — `Workbook.pruneEmbeddings` on the editor
+/// handle, what `zlsx embed --prune` runs: every slot whose row is no
+/// longer embeddable becomes a tombstone (`zlsx_emb_tombstone()`) and
+/// its vector is zeroed; the coverage's count and range never change
+/// (the format is dense — slot `i` is row `first_row + i`, always).
+/// Content that drifted but is still embeddable counts `stale` and
+/// is never redacted — deleting a vector because its text was EDITED
+/// would lose data the caller never asked to lose; re-embed those
+/// rows. `report` receives the counts — `redacted`, `stale`, `fresh`,
+/// `valid_empty` (a tombstone whose row is still empty), the fields
+/// of the `{"kind":"prune",…}` record the CLI prints; a workbook with
+/// no embedding set, or a stripped one (the recovery record alone),
+/// is ZLSX_OK with every count 0. Each row is judged through the
+/// embeddable-rows read's reading (`zlsx_editor_embeddable_rows_ndjson`),
+/// so a row that read fresh there reads fresh here. Staged in memory;
+/// `zlsx_editor_save` commits; a set with nothing to redact rewrites
+/// nothing.
+///
+/// A staged `zlsx_editor_set_cell` on a covered row is judged as
+/// staged, never fresh (its save-time encoding is not re-derived): a
+/// blank or deleted cell redacts its slot, any other value counts
+/// `stale`. A covered sheet with staged `zlsx_editor_append_row` rows
+/// refuses instead — -1 `SheetHasUnsavedAppends`, the read's rule: the
+/// parsed view does not carry them, and a slot for a row they will
+/// become would be redacted as gone — save first. -1 otherwise:
+/// `InvalidInput` (NULL handle), `NullOutPointer` (NULL report),
+/// `StructSizeTooSmall`. -2, the name in the diag with plane NONE,
+/// each before the first part write: `MalformedEmbeddingSet` (a set
+/// the index read refuses — a coverage range it cannot parse, a
+/// binary part with the wrong magic, a count that disagrees with its
+/// header), `MissingEmbeddingPart` (the index's rels, or a vec / hash
+/// part it names, gone from the archive), and the read's own verdicts
+/// on a covered cell — `MissingRelationship` / `MissingSheetPart`,
+/// `MalformedSheetXml`, `MalformedSharedStringsXml`,
+/// `UnsupportedCellValue`, `SstIndexOutOfRange`, `InvalidUtf8`,
+/// `UnicodeNormalizationFailed` — a cell the read cannot carry stops
+/// the sweep whole rather than redact a row that has text. A -3 after
+/// the first part write (an allocation failure between two coverages'
+/// parts) leaves the staged set partially redacted: discard the
+/// editor without saving, or call again — the sweep is re-runnable.
+/// The recalc transactions (`zlsx_editor_mark_recalc_on_load` + save,
+/// `zlsx_editor_save_with_recalc`, `zlsx_editor_recalculate`) rebuild
+/// their candidate from the archive as opened and do NOT carry this
+/// sweep — call them before it, or save and re-open (the rule
+/// `zlsx_editor_set_embeddings` documents).
+export fn zlsx_editor_prune_embeddings(
+    ed: ?*Editor,
+    report: ?*CPruneReport,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // Every output prepped before anything can fail (§3): a rejected
+    // sibling leaves the accepted one zeroed and releasable.
+    var outputs_ok = prepDiag(diag, err_buf, err_buf_len);
+    const out = report orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    if (!prepOut(CPruneReport, out, err_buf, err_buf_len)) outputs_ok = false;
+    if (!outputs_ok) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const r = state.inner.workbook.pruneEmbeddings() catch |e| {
+        return failSweep(e, diag, err_buf, err_buf_len);
+    };
+    out.redacted = r.redacted;
+    out.stale = r.stale;
+    out.fresh = r.fresh;
+    out.valid_empty = r.valid_empty;
+    return ZLSX_OK;
+}
+
+/// Remove every embedding artefact — `Workbook.stripEmbeddings` on
+/// the editor handle, what `zlsx embed --strip` runs: the
+/// `xl/zlsxEmbeddings/` directory whole (whatever the archive holds
+/// there, not only what the index names), the workbook→index
+/// relationship, and the recovery record from all three carriers (the
+/// hidden `_zlsxRecovery` defined names, the `docProps/custom.xml`
+/// property — the part itself only when nothing else is left in it —
+/// and the `recovery_in_cells` sheet). The pre-share operation: the
+/// result reads `ZLSX_EMB_ABSENT`, not `ZLSX_EMB_STRIPPED` — the
+/// caller asked for the nothing. Idempotent; ZLSX_OK on a workbook
+/// that never had embeddings, and on a partially stripped one. Staged
+/// in memory; `zlsx_editor_save` commits.
+///
+/// The `recovery_in_cells` sheet, when present, goes through the
+/// editor's own `zlsx_editor_delete_sheet` path so sheet indices stay
+/// honest, and only then do its rules apply — judged before the first
+/// part is removed: -1 `SheetDeleteRequiresCleanState` (staged cell
+/// writes or appended rows on any sheet — save first), -2
+/// `CannotDeleteLastSheet`, and every index above the deleted sheet's
+/// shifts down by one. -1 otherwise: `InvalidInput` (NULL handle),
+/// `StructSizeTooSmall`. -2, the name in the diag with plane NONE:
+/// `MalformedWorkbookXml` (an `xl/workbook.xml` the strip of the
+/// record's chunk names cannot walk — judged before the first
+/// removal), the package's own `MissingContentTypes` /
+/// `MalformedContentTypes`, and the delete's verdicts should the
+/// cells sheet be present (`MissingRelationship`, a carrier the
+/// cross-sheet sweeps cannot read — `MalformedChartXml`,
+/// `MalformedExtensionXml`, …). A -2 or -3 after the first removal (an
+/// allocation failure, a content-types part a removal cannot patch)
+/// leaves the staged set partially stripped: discard the editor
+/// without saving, or call again — the strip is re-runnable. The
+/// recalc transactions rebuild their candidate from the archive as
+/// opened and do NOT carry this strip — call them before it, or save
+/// and re-open (the rule `zlsx_editor_set_embeddings` documents).
+export fn zlsx_editor_strip_embeddings(
+    ed: ?*Editor,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.stripEmbeddings() catch |e| {
+        return failSweep(e, diag, err_buf, err_buf_len);
+    };
+    return ZLSX_OK;
 }
 
 // ── S3c slice 1 tests ─────────────────────────────────────────────────
@@ -11631,4 +11791,528 @@ test "S3c embeddable_rows: the plane of every verdict the read can raise" {
     for ([_]anyerror{ error.SheetHasUnsavedMutations, error.SheetHasUnsavedAppends, error.InvalidRange, error.SheetIndexOutOfRange }) |e| {
         try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
     }
+}
+
+// ── S3c slice 3 tests ─────────────────────────────────────────────────
+
+fn s3cPrune(ed: ?*Editor, report: ?*CPruneReport, diag: ?*CDiag, err_buf: []u8) i32 {
+    return zlsx_editor_prune_embeddings(ed, report, diag, err_buf.ptr, err_buf.len);
+}
+
+fn s3cStrip(ed: ?*Editor, diag: ?*CDiag, err_buf: []u8) i32 {
+    return zlsx_editor_strip_embeddings(ed, diag, err_buf.ptr, err_buf.len);
+}
+
+/// A report poisoned in every count, so a zero after the call is the
+/// library's, never the caller's.
+fn poisonedPruneReport() CPruneReport {
+    return .{ .struct_size = @sizeOf(CPruneReport), .redacted = 0xAA, .stale = 0xAA, .fresh = 0xAA, .valid_empty = 0xAA };
+}
+
+fn expectPruneCounts(report: CPruneReport, redacted: u64, stale: u64, fresh: u64, valid_empty: u64) !void {
+    try std.testing.expectEqual(redacted, report.redacted);
+    try std.testing.expectEqual(stale, report.stale);
+    try std.testing.expectEqual(fresh, report.fresh);
+    try std.testing.expectEqual(valid_empty, report.valid_empty);
+}
+
+const s3c3_blank_cell = CCell{ .tag = @intFromEnum(CellTag.empty), .str_len = 0, .str_ptr = null, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 };
+
+fn s3cStringCell(s: []const u8) CCell {
+    return .{ .tag = @intFromEnum(CellTag.string), .str_len = @intCast(s.len), .str_ptr = s.ptr, .i = 0, .f = 0, .b = 0, ._pad = [_]u8{0} ** 7 };
+}
+
+/// The S3c fixture with the `title` coverage written over the read's
+/// own hashes (every slot fresh), saved to `name` — the set every
+/// sweep test starts from.
+fn writeS3c3Embedded(io: std.Io, tt: *TestTmp, src_name: []const u8, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const src = try writeS3cFixture(io, tt, src_name);
+    defer alloc.free(src);
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(src.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    const hashes = [_]u64{ try s3cHash(2, .{ .string = "alpha" }), try s3cHash(3, .{ .string = "beta" }), try s3cHash(4, .{ .string = "gamma" }) };
+    const vecs = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A4", "A", &vecs, &hashes)};
+    if (s3cSet(ed, "m", 3, "f32", &covs, 0, null, &err_buf) != ZLSX_OK) return error.TestUnexpectedResult;
+    if (zlsx_editor_save(ed, path.ptr, path.len, &err_buf, err_buf.len) != 0) return error.TestUnexpectedResult;
+    return path;
+}
+
+/// The same set with the recovery record ALSO in its hidden cells
+/// sheet (`recovery_in_cells`, the Zig-only opt-in) — three sheets,
+/// the recovery sheet last.
+fn writeS3c3EmbeddedInCells(io: std.Io, tt: *TestTmp, src_name: []const u8, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const src = try writeS3cFixture(io, tt, src_name);
+    defer alloc.free(src);
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, src);
+    defer wb.deinit();
+    const hashes = [_]u64{ try s3cHash(2, .{ .string = "alpha" }), try s3cHash(3, .{ .string = "beta" }), try s3cHash(4, .{ .string = "gamma" }) };
+    const vecs = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const body = try zlsx_pkg.embedding_part.encodeVectorBody(alloc, .f32, 3, &vecs);
+    defer alloc.free(body);
+    try wb.setEmbeddingsOpts("m", 3, .f32, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A4",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = body,
+        .hashes = &hashes,
+    }}, .{ .recovery_in_cells = true });
+    try wb.save(io, path);
+    return path;
+}
+
+fn expectSameBytes(io: std.Io, a: []const u8, b: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const ab = try readFileBytes(io, a);
+    defer alloc.free(ab);
+    const bb = try readFileBytes(io, b);
+    defer alloc.free(bb);
+    try std.testing.expectEqualSlices(u8, ab, bb);
+}
+
+test "S3c prune_embeddings: the read's hashes prune all fresh and rewrite nothing; a staged blank redacts its slot; the saved tombstone reads valid_empty" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3c3Embedded(io, &tt, "s3c3_src.xlsx", "s3c3_emb.xlsx");
+    defer alloc.free(path);
+    const same_path = try tt.path(alloc, io, "s3c3_same.xlsx");
+    defer alloc.free(same_path);
+    const pruned_path = try tt.path(alloc, io, "s3c3_pruned.xlsx");
+    defer alloc.free(pruned_path);
+    var err_buf: [128]u8 = undefined;
+
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var report = poisonedPruneReport();
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, &diag, &err_buf));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        zlsx_diag_release(&diag);
+        try expectPruneCounts(report, 0, 0, 3, 0);
+        // Nothing to redact, nothing rewritten: the save is the
+        // untouched editor's passthrough, byte for byte.
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, same_path.ptr, same_path.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, path, same_path);
+
+        // A staged blank on a covered row is judged as staged: its
+        // slot is redacted, the other two stay fresh; a staged string
+        // is never fresh.
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 3, 0, &s3c3_blank_cell, &err_buf, err_buf.len));
+        const edited = s3cStringCell("gamma edited");
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 4, 0, &edited, &err_buf, err_buf.len));
+        report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, null, &err_buf));
+        try expectPruneCounts(report, 1, 1, 1, 0);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, pruned_path.ptr, pruned_path.len, &err_buf, err_buf.len));
+    }
+    // The saved file: slot 1 is a tombstone over a zeroed vector, the
+    // others untouched.
+    {
+        const emb = zlsx_emb_open(pruned_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+        var hashes: [3]u64 = undefined;
+        try std.testing.expectEqual(@as(i32, 0), zlsx_emb_hashes(emb, 0, &hashes, hashes.len));
+        try std.testing.expectEqual(try s3cHash(2, .{ .string = "alpha" }), hashes[0]);
+        try std.testing.expectEqual(zlsx_emb_tombstone(), hashes[1]);
+        try std.testing.expectEqual(try s3cHash(4, .{ .string = "gamma" }), hashes[2]);
+        var vecs: [9]f32 = undefined;
+        try std.testing.expectEqual(@as(i32, 0), zlsx_emb_vectors(emb, 0, &vecs, vecs.len));
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 0, 0, 0, 7, 8, 9 }, &vecs);
+    }
+    // Re-opened: the tombstone over the blank is valid_empty, the
+    // edited row stale (its hash is the old text's), alpha fresh.
+    {
+        const ed = zlsx_editor_open(pruned_path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, null, &err_buf));
+        try expectPruneCounts(report, 0, 1, 1, 1);
+    }
+}
+
+test "S3c prune_embeddings: a row blanked on disk redacts, an edited row is stale and left alone, a workbook without a set is all zeros" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const sheet_part = "xl/worksheets/sheet1.xml";
+
+    // Excel's shape: the cell is gone from the saved part.
+    {
+        const path = try writeS3c3Embedded(io, &tt, "s3c3_b_src.xlsx", "s3c3_blanked.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, sheet_part, "<c r=\"A3\" t=\"s\"><v>4</v></c>", "<c r=\"A3\"/>");
+        const out = try tt.path(alloc, io, "s3c3_blanked_out.xlsx");
+        defer alloc.free(out);
+        {
+            const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+            defer zlsx_editor_close(ed);
+            var report = poisonedPruneReport();
+            try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, null, &err_buf));
+            try expectPruneCounts(report, 1, 0, 2, 0);
+            try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        }
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        var hashes: [3]u64 = undefined;
+        try std.testing.expectEqual(@as(i32, 0), zlsx_emb_hashes(emb, 0, &hashes, hashes.len));
+        try std.testing.expectEqual(zlsx_emb_tombstone(), hashes[1]);
+    }
+    // An edit: stale, not redacted, and nothing rewritten.
+    {
+        const path = try writeS3c3Embedded(io, &tt, "s3c3_e_src.xlsx", "s3c3_edited.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, sheet_part, "<c r=\"A3\" t=\"s\"><v>4</v></c>", "<c r=\"A3\" t=\"s\"><v>5</v></c>");
+        const out = try tt.path(alloc, io, "s3c3_edited_out.xlsx");
+        defer alloc.free(out);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, null, &err_buf));
+        try expectPruneCounts(report, 0, 1, 2, 0);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, path, out);
+    }
+    // No set at all: every count 0, the diag as prep left it.
+    {
+        const plain = try writeS3cFixture(io, &tt, "s3c3_plain.xlsx");
+        defer alloc.free(plain);
+        const ed = zlsx_editor_open(plain.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var report = poisonedPruneReport();
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, &diag, &err_buf));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        zlsx_diag_release(&diag);
+        try expectPruneCounts(report, 0, 0, 0, 0);
+    }
+}
+
+test "S3c prune_embeddings: statements about the call — NULL handle, NULL report, a rejected struct_size on either output, staged appends on the covered sheet" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3c3Embedded(io, &tt, "s3c3_c_src.xlsx", "s3c3_call.xlsx");
+    defer alloc.free(path);
+    var err_buf: [128]u8 = undefined;
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+
+    var report = poisonedPruneReport();
+    try std.testing.expectEqual(ZLSX_ERROR, s3cPrune(null, &report, null, &err_buf));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    // Prepped (zeroed) before the handle was judged: the caller can
+    // read it either way.
+    try expectPruneCounts(report, 0, 0, 0, 0);
+
+    try std.testing.expectEqual(ZLSX_ERROR, s3cPrune(ed, null, null, &err_buf));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+
+    // A report too small: untouched byte for byte; the diag beside it
+    // still prepped.
+    {
+        var small = poisonedPruneReport();
+        small.struct_size = @sizeOf(CPruneReport) - 1;
+        const before = std.mem.toBytes(small);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cPrune(ed, &small, &diag, &err_buf));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqualSlices(u8, &before, &std.mem.toBytes(small));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        zlsx_diag_release(&diag);
+    }
+    // A diag too small: the report, accepted, is zeroed.
+    {
+        var diag = freshDiag();
+        diag.struct_size = @sizeOf(CDiag) - 1;
+        report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cPrune(ed, &report, &diag, &err_buf));
+        try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
+        try expectPruneCounts(report, 0, 0, 0, 0);
+    }
+    // Appended rows on the OTHER sheet do not touch the sweep; on the
+    // covered sheet they refuse it, -1, before anything is judged.
+    {
+        const cells = [_]CCell{s3cStringCell("more")};
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_append_row(ed, 1, &cells, cells.len, &err_buf, err_buf.len));
+        report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_OK, s3cPrune(ed, &report, null, &err_buf));
+        try expectPruneCounts(report, 0, 0, 3, 0);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_append_row(ed, 0, &cells, cells.len, &err_buf, err_buf.len));
+        var diag = freshDiag();
+        report = poisonedPruneReport();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cPrune(ed, &report, &diag, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedAppends", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try expectPruneCounts(report, 0, 0, 0, 0);
+        zlsx_diag_release(&diag);
+    }
+}
+
+test "S3c prune_embeddings: statements about the workbook — a set the index read refuses, a part it names gone, a covered sheet the read cannot serve; nothing staged after a refusal" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const Case = struct { name: []const u8, part: []const u8, old: []const u8, new: []const u8, want: []const u8, read_name: ?[]const u8 };
+    const cases = [_]Case{
+        // The parser's own name (`InvalidRange`) is what the read
+        // reports; the sweep folds it under the set's.
+        .{ .name = "s3c3_index_range.xlsx", .part = "xl/zlsxEmbeddings/index.xml", .old = "range=\"A2:A4\"", .new = "range=\"A0:A4\"", .want = "MalformedEmbeddingSet", .read_name = "InvalidRange" },
+        .{ .name = "s3c3_index_dtype.xlsx", .part = "xl/zlsxEmbeddings/index.xml", .old = "dtype=\"f32\"", .new = "dtype=\"f99\"", .want = "MalformedEmbeddingSet", .read_name = "InvalidDtype" },
+        .{ .name = "s3c3_vec_magic.xlsx", .part = "xl/zlsxEmbeddings/title/vec.bin", .old = "ZVEC", .new = "ZVEX", .want = "MalformedEmbeddingSet", .read_name = "BadMagic" },
+        .{ .name = "s3c3_rels_target.xlsx", .part = "xl/zlsxEmbeddings/_rels/index.xml.rels", .old = "Target=\"title/vec.bin\"", .new = "Target=\"title/none.bin\"", .want = "MissingEmbeddingPart", .read_name = "MissingEmbeddingPart" },
+        .{ .name = "s3c3_sheet_no_r.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"A3\"", .new = "<c", .want = "MalformedSheetXml", .read_name = null },
+        .{ .name = "s3c3_sheet_bool.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "<c r=\"A3\" t=\"s\"><v>4</v>", .new = "<c r=\"A3\" t=\"b\"><v>TRUE</v>", .want = "UnsupportedCellValue", .read_name = null },
+    };
+    for (cases, 0..) |case, i| {
+        const src_name = try std.fmt.allocPrint(alloc, "s3c3_w_src{d}.xlsx", .{i});
+        defer alloc.free(src_name);
+        const path = try writeS3c3Embedded(io, &tt, src_name, case.name);
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, case.part, case.old, case.new);
+        const out_name = try std.fmt.allocPrint(alloc, "s3c3_w_out{d}.xlsx", .{i});
+        defer alloc.free(out_name);
+        const out = try tt.path(alloc, io, out_name);
+        defer alloc.free(out);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var report = poisonedPruneReport();
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cPrune(ed, &report, &diag, &err_buf));
+        try std.testing.expectEqualStrings(case.want, diagName(&diag));
+        try std.testing.expectEqualStrings(case.want, std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        zlsx_diag_release(&diag);
+        try expectPruneCounts(report, 0, 0, 0, 0);
+        // Refused before the first part write: the save is the passthrough.
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, path, out);
+        if (case.read_name) |read_name| {
+            try std.testing.expect(zlsx_emb_open(path.ptr, &err_buf, err_buf.len) == null);
+            try std.testing.expectEqualStrings(read_name, std.mem.sliceTo(&err_buf, 0));
+        }
+    }
+}
+
+test "S3c strip_embeddings: a set strips to ABSENT with every carrier gone; idempotent; a workbook without a set is untouched" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3c3Embedded(io, &tt, "s3c3_s_src.xlsx", "s3c3_strip.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3c3_stripped.xlsx");
+    defer alloc.free(out);
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cStrip(ed, &diag, &err_buf));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+        zlsx_diag_release(&diag);
+        // Twice: the second finds nothing and says so with ZLSX_OK.
+        try std.testing.expectEqual(ZLSX_OK, s3cStrip(ed, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    }
+    {
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_ABSENT, zlsx_emb_state(emb));
+    }
+    // Every carrier: no part under the directory, no relationship, no
+    // hidden name, no docProps part (nothing else lived in it).
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        for (wb.store.parts) |p| {
+            try std.testing.expect(!std.mem.startsWith(u8, p.name, "xl/zlsxEmbeddings"));
+        }
+        const rels = (try wb.store.part("xl/_rels/workbook.xml.rels")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, rels.bytes, "zlsxEmbeddings") == null);
+        const wbxml = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, wbxml.bytes, "_zlsxRecovery") == null);
+        try std.testing.expect((try wb.store.part("docProps/custom.xml")) == null);
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+    }
+    // The cells are what they were: the read still serves them.
+    {
+        const ed = zlsx_editor_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, null, &err_buf));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        try std.testing.expect(std.mem.indexOf(u8, out_ptr.?[0..out_len], "\"text\":\"beta\"") != null);
+        // A strip on a workbook without a set: OK and the passthrough.
+        const same = try tt.path(alloc, io, "s3c3_stripped_again.xlsx");
+        defer alloc.free(same);
+        try std.testing.expectEqual(ZLSX_OK, s3cStrip(ed, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, same.ptr, same.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, out, same);
+    }
+}
+
+test "S3c strip_embeddings: the recovery_in_cells sheet goes through the editor's delete — indices stay honest after the strip, and a dirty editor refuses before the first removal" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3c3EmbeddedInCells(io, &tt, "s3c3_cells_src.xlsx", "s3c3_cells.xlsx");
+    defer alloc.free(path);
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 2), wb.recoveryCellSheetIndex());
+    }
+    const out = try tt.path(alloc, io, "s3c3_cells_out.xlsx");
+    defer alloc.free(out);
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_OK, s3cStrip(ed, &diag, &err_buf));
+        zlsx_diag_release(&diag);
+        // The mirror agrees with the workbook: the next sheet is 2,
+        // and a write to it lands on it.
+        var idx: u32 = no_sheet_idx;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_sheet(ed, "New", 3, &idx, null, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(u32, 2), idx);
+        const x = s3cStringCell("x");
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 2, 1, 0, &x, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    }
+    {
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_ABSENT, zlsx_emb_state(emb));
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, null), wb.recoveryCellSheetIndex());
+        try std.testing.expect((try wb.sheetByName("New")) != null);
+        const ed = zlsx_editor_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 2, "A1:A1", "A", 0, &out_ptr, &out_len, null, &err_buf));
+        defer zlsx_buffer_release(out_ptr, out_len);
+        try std.testing.expect(std.mem.indexOf(u8, out_ptr.?[0..out_len], "\"row\":1,\"text\":\"x\"") != null);
+    }
+    // Dirty: the delete's pre-flight, -1, and nothing removed — the set
+    // and the sheet are still there after the save.
+    {
+        const dirty_out = try tt.path(alloc, io, "s3c3_cells_dirty.xlsx");
+        defer alloc.free(dirty_out);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        const z = s3cStringCell("z");
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 1, 5, 0, &z, &err_buf, err_buf.len));
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_ERROR, s3cStrip(ed, &diag, &err_buf));
+        try std.testing.expectEqualStrings("SheetDeleteRequiresCleanState", std.mem.sliceTo(&err_buf, 0));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        zlsx_diag_release(&diag);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, dirty_out.ptr, dirty_out.len, &err_buf, err_buf.len));
+        const emb = zlsx_emb_open(dirty_out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, dirty_out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(?u32, 2), wb.recoveryCellSheetIndex());
+    }
+}
+
+test "S3c strip_embeddings: an xl/workbook.xml the chunk-name strip cannot walk refuses before the first removal — with and without the cells sheet" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const junk_old = "</workbook>";
+    const junk_new = "<definedName name=\"x>oops</definedName></workbook>";
+    {
+        const path = try writeS3c3Embedded(io, &tt, "s3c3_wx_src.xlsx", "s3c3_wx.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", junk_old, junk_new);
+        const out = try tt.path(alloc, io, "s3c3_wx_out.xlsx");
+        defer alloc.free(out);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cStrip(ed, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        try std.testing.expectEqual(plane_none, diag.plane);
+        zlsx_diag_release(&diag);
+        // Nothing removed: the passthrough save.
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, path, out);
+    }
+    {
+        const path = try writeS3c3EmbeddedInCells(io, &tt, "s3c3_wxc_src.xlsx", "s3c3_wxc.xlsx");
+        defer alloc.free(path);
+        try zlsx_pkg.pivots.fixture.patchPart(alloc, io, path, "xl/workbook.xml", junk_old, junk_new);
+        const out = try tt.path(alloc, io, "s3c3_wxc_out.xlsx");
+        defer alloc.free(out);
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        var diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, s3cStrip(ed, &diag, &err_buf));
+        try std.testing.expectEqualStrings("MalformedWorkbookXml", diagName(&diag));
+        zlsx_diag_release(&diag);
+        // The cells sheet was not deleted ahead of the verdict.
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+        try expectSameBytes(io, path, out);
+    }
+}
+
+test "S3c sweeps: the plane of every verdict; the parser's own names stay -1; WriteFailed crosses as -3" {
+    for ([_]anyerror{ error.MalformedEmbeddingSet, error.MissingEmbeddingPart, error.MalformedWorkbookXml, error.CannotDeleteLastSheet, error.MalformedSheetXml, error.UnsupportedCellValue, error.MissingContentTypes }) |e| {
+        try std.testing.expectEqual(ZLSX_REFUSED, statusOf(e));
+    }
+    for ([_]anyerror{ error.CountMismatch, error.InvalidRange, error.InvalidDtype, error.BadMagic, error.InvalidEmbeddingInput, error.SheetHasUnsavedAppends, error.SheetDeleteRequiresCleanState, error.WriteFailed }) |e| {
+        try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    }
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectEqual(ZLSX_NOMEM, failSweep(error.WriteFailed, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("OutOfMemory", std.mem.sliceTo(&err_buf, 0));
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_REFUSED, failSweep(error.MalformedEmbeddingSet, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("MalformedEmbeddingSet", diagName(&diag));
+    zlsx_diag_release(&diag);
 }

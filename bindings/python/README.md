@@ -455,6 +455,36 @@ Numbers-durable carrier) is Zig-only until the editor grows a path for its
 hidden sheet; the prune and strip sweeps are CLI / Zig-only today (the next
 S3c slice).
 
+`prune_embeddings()` and `strip_embeddings()` are the two sweeps `zlsx embed
+--prune` / `--strip` run, on the editor handle (0.9.0+). Prune tombstones
+every slot whose row is no longer embeddable and zeroes its vector — a row
+deleted in plain Excel leaves its vector on disk — and returns the counts as
+a dict, the fields of the CLI's `{"kind": "prune", …}` record:
+
+```python
+with zlsx.edit("report.xlsx") as ed:
+    ed.prune_embeddings()      # {"redacted": 1, "stale": 0, "fresh": 99, "valid_empty": 0}
+    ed.save("report.xlsx")
+```
+
+Content that drifted but is still embeddable counts `stale` and is never
+redacted (re-embed those rows); the hashes `embeddable_rows` hands over prune
+as all `fresh` once written; a workbook with no set, or a stripped one, is
+all zeros. A staged `set_cell` on a covered row is judged as staged — a
+`None` redacts its slot, any other value is `stale` — and a covered sheet
+with staged `append_rows` raises a `ZlsxError` (`SheetHasUnsavedAppends`;
+save first). A set the index read cannot read refuses with a `ZlsxRefusal`
+(`MalformedEmbeddingSet`, `MissingEmbeddingPart`), as does a covered cell
+the read cannot carry (the `embeddable_rows` names), each before the first
+part write. `strip_embeddings()` removes the parts and the recovery record
+from every carrier — the pre-share operation; `zlsx.embeddings(path)` then
+reports `absent`, not `stripped`. It is idempotent and a no-op on a workbook
+without embeddings; a `recovery_in_cells` sheet goes through the editor's
+own `delete_sheet` path (so sheet indices stay honest — its rules apply:
+`SheetDeleteRequiresCleanState`, `CannotDeleteLastSheet`), and an
+`xl/workbook.xml` the strip cannot walk refuses (`MalformedWorkbookXml`)
+before the first removal.
+
 ## Spark (PySpark Data Source)
 
 Spark 4.0+ / DBR 15.4+ (including serverless). `pip install py-zlsx[spark]`
@@ -648,7 +678,9 @@ with zlsx.write("out.xlsx") as w:
   `(rows, dim)` float32 / uint64 shape, replacing any previous set — and
   `Editor.embeddable_rows(sheet, range, column)`, the rows to embed with the
   canonical content hash the write stores (the `embed_row` records of
-  `zlsx embed --extract`); see *Embeddings*
+  `zlsx embed --extract`), and the two sweeps `Editor.prune_embeddings()` /
+  `Editor.strip_embeddings()` (`zlsx embed --prune` / `--strip`); see
+  *Embeddings*
 - Formula cells on write (`write_row_with_formulas`) — emits `<f>` + cached `<v>`; pass `recalculate=RecalcOptions()` to `save()` and the cached values are computed by zlsx's own engine, or leave it off and Excel recalculates on open. `FormulaSpec.cse(text, ref)` authors legacy CSE rectangles
 - Formula engine (0.8.0+): `Editor.recalculate` / `save_with_recalc` (atomic §5.7.9 transaction) / `evaluate` / `save_to_buffer` / `Editor.from_bytes` / `mark_recalc_on_load` — see *Recalculate & evaluate*
 - Data validation (list / numeric / custom) and conditional formatting (cellIs / expression / colorScale / dataBar)

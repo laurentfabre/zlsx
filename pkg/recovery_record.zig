@@ -510,14 +510,20 @@ fn stripQuotes(s: []const u8) []const u8 {
     return s;
 }
 
-/// Find a record anywhere in a text blob by its magic prefix.
+/// Where a record sits in a text blob: `[start, end)`, from its magic
+/// prefix to the first byte a percent-encoded record cannot contain.
+pub const TextSpan = struct { start: usize, end: usize };
+
+/// Locate a record anywhere in a text blob by its magic prefix — the
+/// one locator the cell-carrier reader (`findRecordInText`) and the
+/// strip's scrub share, so what one finds the other blanks.
 ///
-/// Used for the cell carrier, whose payload may land inline in the
-/// sheet XML or be lifted into `sharedStrings.xml` depending on the
-/// consumer's shared-string policy — so the reader scans rather than
-/// assuming a location. The record is percent-encoded ASCII, so it
-/// terminates at the first byte that cannot appear in one.
-pub fn findRecordInText(text: []const u8, buf: []u8) ?[]const u8 {
+/// The cell carrier's payload may land inline in the sheet XML or be
+/// lifted into `sharedStrings.xml` depending on the consumer's
+/// shared-string policy — so both scan rather than assume a location.
+/// The record is percent-encoded ASCII, so it terminates at the first
+/// byte that cannot appear in one.
+pub fn recordSpanInText(text: []const u8) ?TextSpan {
     const at = std.mem.indexOf(u8, text, MAGIC) orelse return null;
     var end = at;
     while (end < text.len) : (end += 1) {
@@ -525,7 +531,14 @@ pub fn findRecordInText(text: []const u8, buf: []u8) ?[]const u8 {
         const ok = isUnreserved(c) or c == '%' or c == '|';
         if (!ok) break;
     }
-    const raw = text[at..end];
+    return .{ .start = at, .end = end };
+}
+
+/// Find a record anywhere in a text blob by its magic prefix — see
+/// `recordSpanInText`.
+pub fn findRecordInText(text: []const u8, buf: []u8) ?[]const u8 {
+    const span = recordSpanInText(text) orelse return null;
+    const raw = text[span.start..span.end];
     if (raw.len > buf.len) return null;
     return xmlUnescape(buf, raw);
 }

@@ -4638,6 +4638,127 @@ class Editor:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
         return [json.loads(line) for line in text.split("\n") if line]
 
+    def prune_embeddings(self) -> dict:
+        """The redaction sweep — ``Workbook.pruneEmbeddings`` on the
+        editor handle, what ``zlsx embed --prune`` runs: every slot
+        whose row is no longer embeddable becomes a tombstone
+        (:meth:`Embeddings.valid_mask` false, ``hashes`` the tombstone)
+        and its vector is zeroed; the coverage's count and range never
+        change. Content that drifted but is still embeddable is
+        counted ``stale`` and never redacted — deleting a vector because
+        its text was *edited* would lose data you never asked to lose;
+        re-embed those rows. Staged in memory, committed by
+        :meth:`save`; a set with nothing to redact rewrites nothing.
+
+        Returns the counts as a dict — the fields of the
+        ``{"kind": "prune", ...}`` record the CLI prints::
+
+            {"redacted": 1,      # slots turned into tombstones this call
+             "stale": 0,         # content drifted, still embeddable — left as-is
+             "fresh": 2,         # hash matches the row's content
+             "valid_empty": 0}   # a tombstone whose row is still empty
+
+        A workbook with no embedding set, or a stripped one (the
+        recovery record alone), returns every count 0. Each row is
+        judged through :meth:`embeddable_rows`' reading, so a row that
+        read fresh there reads fresh here: the hashes that read hands
+        over, written by :meth:`set_embeddings`, prune as all
+        ``fresh``.
+
+        A staged :meth:`set_cell` on a covered row is judged as staged,
+        never fresh: a blank (``None``) cell redacts its slot, any
+        other value counts ``stale``. A covered sheet with staged
+        :meth:`append_rows` raises :class:`ZlsxError`
+        (``SheetHasUnsavedAppends``, the read's rule) — save first.
+        Refusals (:class:`ZlsxRefusal`, ``error_name``), each before
+        the first part write: ``MalformedEmbeddingSet`` (a set the
+        index read refuses — a coverage range it cannot parse, a binary
+        part with the wrong magic, a count that disagrees with its
+        header), ``MissingEmbeddingPart`` (the index's rels, or a vec /
+        hash part it names, gone from the archive), and the read's own
+        verdicts on a covered cell — ``MissingRelationship`` /
+        ``MissingSheetPart``, ``MalformedSheetXml``,
+        ``MalformedSharedStringsXml``, ``UnsupportedCellValue``,
+        ``SstIndexOutOfRange``, ``InvalidUtf8``,
+        ``UnicodeNormalizationFailed`` — a cell the read cannot carry
+        stops the sweep whole rather than redact a row that has text.
+        The recalc transactions (:meth:`mark_recalc_on_load` + save,
+        :meth:`save_with_recalc`, :meth:`recalculate`) rebuild their
+        candidate from the archive as opened and do not carry this
+        sweep — call them before it, or save and re-open (the rule
+        :meth:`set_embeddings` documents).
+
+        Requires libzlsx 0.9.0+ (``zlsx_editor_prune_embeddings``).
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EMBEDDING_SWEEPS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_prune_embeddings "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        report = _ffi.PruneReportV1()
+        report.struct_size = ctypes.sizeof(_ffi.PruneReportV1)
+        self._structural_call(
+            "zlsx_editor_prune_embeddings", _ffi.lib.zlsx_editor_prune_embeddings,
+            self._handle, ctypes.byref(report),
+        )
+        return {
+            "redacted": int(report.redacted),
+            "stale": int(report.stale),
+            "fresh": int(report.fresh),
+            "valid_empty": int(report.valid_empty),
+        }
+
+    def strip_embeddings(self) -> None:
+        """Remove every embedding artefact — ``Workbook.stripEmbeddings``
+        on the editor handle, what ``zlsx embed --strip`` runs: the
+        ``xl/zlsxEmbeddings/`` directory whole (whatever the archive
+        holds there, not only what the index names), the workbook→index
+        relationship, and the recovery record from all three carriers
+        (the hidden ``_zlsxRecovery`` defined names, the
+        ``docProps/custom.xml`` property — the part itself only when
+        nothing else is left in it — and the ``recovery_in_cells``
+        sheet). The pre-share operation: a later :func:`embeddings`
+        reports ``absent``, not ``stripped`` — you asked for the
+        nothing. Idempotent; a no-op on a workbook that never had
+        embeddings, and on a partially stripped one. Staged in memory,
+        committed by :meth:`save`.
+
+        The ``recovery_in_cells`` sheet, when present, goes through the
+        editor's own :meth:`delete_sheet` path so sheet indices stay
+        honest, and only then do its rules apply — judged before the
+        first part is removed: :class:`ZlsxError`
+        ``SheetDeleteRequiresCleanState`` (staged cell writes or
+        appended rows on any sheet — save first), :class:`ZlsxRefusal`
+        ``CannotDeleteLastSheet``, and every index above the deleted
+        sheet's shifts down by one. Refusals otherwise:
+        ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the strip of
+        the record's chunk names cannot walk — judged before the first
+        removal), ``MissingContentTypes`` / ``MalformedContentTypes``,
+        and the delete's verdicts should the cells sheet be present
+        (``MissingRelationship``, a carrier the cross-sheet sweeps
+        cannot read — ``MalformedChartXml``, ``MalformedExtensionXml``,
+        …). A failure after the first removal leaves the staged set
+        partially stripped: discard the editor without saving, or call
+        again — the strip is re-runnable. The recalc transactions
+        rebuild their candidate from the archive as opened and do not
+        carry this strip — call them before it, or save and re-open.
+
+        Requires libzlsx 0.9.0+ (``zlsx_editor_strip_embeddings``).
+        """
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EMBEDDING_SWEEPS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_strip_embeddings "
+                "(requires 0.9.0+); upgrade libzlsx"
+            )
+        self._structural_call(
+            "zlsx_editor_strip_embeddings", _ffi.lib.zlsx_editor_strip_embeddings,
+            self._handle,
+        )
+
     def doc_props(self) -> dict:
         """Read the workbook's ``docProps`` metadata.
 
