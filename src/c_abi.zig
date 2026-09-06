@@ -10553,8 +10553,12 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// write, bit or no bit. Every write, bit or no bit, first scrubs the
 /// previous record from the shared-string table and — when the sheet
 /// or an orphaned worksheet part is there — from the
-/// worksheet parts first — so the record is one generation in every
-/// carrier; `zlsx_editor_strip_embeddings` removes the sheet. The name
+/// worksheet parts — so the record is one generation in every
+/// carrier; `zlsx_editor_strip_embeddings` removes the sheet. That
+/// scrub reads the shared-string table once per write (cached for the
+/// generation — a read the default write's save does not otherwise
+/// make) and blanks a stale record's table entry in place, so a user
+/// cell that shared that entry reads empty afterwards. The name
 /// is reserved: a sheet spelled so, however cased, IS the carrier, and
 /// its A1 is written. Every other bit is `InvalidInput`.
 ///
@@ -10585,8 +10589,8 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// or one whose `</sheets>` the typed parser reads elsewhere than the
 /// splice — the sheet's add could not land; checked before the first
 /// write), `MalformedSharedStringsXml` / `MalformedSheetXml` (a
-/// shared-string table or, with the sheet present or an orphaned
-/// worksheet part in the archive, a worksheet part
+/// shared-string table or, with the sheet present or an orphaned or
+/// unresolvable worksheet part in the archive, a worksheet part
 /// the scrub would read and the store cannot serve — checked before
 /// the first write),
 /// `EmbeddingExceedsArchiveLimit` (a part past the 512 MiB read cap,
@@ -10598,8 +10602,8 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// strip of the previous record's chunk names cannot walk — a
 /// `<definedName` outside `<definedNames>` the scanner refuses; judged
 /// before the first write). A -2 or -3 that fires AFTER the first part
-/// write (an allocation failure, an index past the cap, a content
-/// types or docProps part the carriers cannot patch) leaves the
+/// write (an allocation failure, an index past the cap, an existing
+/// `docProps/custom.xml` the carrier cannot patch) leaves the
 /// staged part set partially replaced: discard the editor without
 /// saving. A save after this write re-emits the workbook's
 /// `<definedNames>` block: every existing name keeps `name`,

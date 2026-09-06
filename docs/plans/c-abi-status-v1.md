@@ -2226,9 +2226,14 @@ through the same mirror (slice 3).
   the scrub would read is materialized in pass 0c under `carrierPart`'s
   rule (`MalformedSharedStringsXml` / `MalformedSheetXml` — the carrier's
   verdict, never the store's), so the install's scrub can fail on
-  allocation only. The cost on a default write: the table read once
-  (cached for the generation — the save reads it too) and one
-  `hasOrphanWorksheetPart` walk.
+  allocation only. The cost on a default write: the table inflated once
+  per generation — a read the default write's save does NOT otherwise
+  make (with no string delta staged, `buildSstExtensionPlan` skips the
+  table and the save copies its compressed bytes through; round 2,
+  B-DOC-201) — and the `hasOrphanWorksheetPart` walk, twice (pass 0c and
+  the install), over the cached rels lookups. The scrub blanks a stale
+  record's table entry in place, so a user cell that shared that entry
+  reads empty afterwards (round 2, A-DOC-203 — stated on every surface).
 - **Every verdict of the sheet's creation fired after the parts.**
   `Workbook.addSheet` ran last in the install: `StructuralEditIncomplete`,
   `MissingWorkbookPart`, `MalformedWorkbookXml`, `SheetCountMismatch`,
@@ -2244,10 +2249,15 @@ through the same mirror (slice 3).
   skips (a workbook the open admits). Round 1 (B, vector 2) added the
   content-types check to the create case: on a re-embed the vector parts
   take `replacePart`, so the sheet's `addPart` would be the call's FIRST
-  `[Content_Types].xml` patch — `MissingContentTypes` /
-  `MalformedContentTypes` are judged in pass 0c as
-  `stageContentTypeOverride` judges them (the part present, a
-  `</Types>`), no longer the install's residue in that shape.
+  `[Content_Types].xml` patch — and round 2 (B-REL-203) generalized it to
+  every `addPart` the write can make: pass 2d (`preflightContentTypes`)
+  judges `[Content_Types].xml` as `stageContentTypeOverride` judges it
+  (the part present, a `</Types>`) whenever a coverage's parts are not
+  in the archive yet, the index is absent, `docProps/custom.xml` is
+  absent (the Document Inspector's shape) or the sheet will be created —
+  `MissingContentTypes` / `MalformedContentTypes` no longer fire after
+  the parts in any shape; the residue of slice 1's list is an EXISTING
+  `docProps/custom.xml` the carrier cannot patch, and allocation.
 
 **The option governs creation** (decision S3c-12): a workbook already
 carrying the sheet — by its reserved name, matched as the workbook
@@ -2270,10 +2280,12 @@ cells sheet holds staged appended rows) and `StructuralEditIncomplete`
 at `UINT32_MAX` sheets — unreachable in practice); `-2`
 `MissingWorkbookPart`, `SheetCountMismatch`, `MalformedSharedStringsXml`,
 `MalformedSheetXml`, and `IdSpaceExhausted` / `MalformedWorkbookXml` /
-`MissingWorkbookRels` / `MalformedWorkbookRels` / `MissingContentTypes` /
-`MalformedContentTypes` for the sheet's own reasons — all already in
-`structural_refusals`, no new name. Every one lands before the first part
-write. The cells write stages the sheet's `A1` as a cell edit, so a
+`MissingWorkbookRels` / `MalformedWorkbookRels` for the sheet's own
+reasons, `MissingContentTypes` / `MalformedContentTypes` whenever the
+write adds a part — all already in `structural_refusals`, no new name.
+Every one lands before the first part write. The scrub's scope widens on
+an orphaned OR unresolvable worksheet part (`hasOrphanWorksheetPart`'s
+slice-3 r3 heuristic) — the four surfaces say so since round 2. The cells write stages the sheet's `A1` as a cell edit, so a
 structural delete in the same session (`zlsx_editor_delete_sheet`,
 `zlsx_editor_strip_embeddings`) refuses `SheetDeleteRequiresCleanState`
 until a save — the default mode stages no cell (round 1, B-DOC-103; stated
@@ -2314,6 +2326,24 @@ clause on `MalformedSheetXml` — fixed; DOC-103 the staged delta and the
 deletes — fixed, pinned in Python). B's vector 2 content-types pre-flight
 taken.
 
+**Round 2 (in-house, two agents)**: A ship-ready 1 MEDIUM + 3 LOW —
+PERF-201: `hasOrphanWorksheetPart` counted a zip DIRECTORY entry
+(`xl/worksheets/`, `xl/worksheets/_rels/` — six of the corpus's 29
+archives carry one; the store keeps every central-directory entry as a
+part) as an orphaned worksheet part, so every DEFAULT write on such an
+archive materialized and scrubbed every sheet — fixed: `isWorksheetPartName`
+excludes a trailing `/` and is the ONE predicate for the scrub, pass 0c
+and the heuristic (the heuristic had kept an inline copy), pinned on the
+predicate and on a store carrying the entry; DOC-202 / DOC-203 /
+STYLE-204 (the content-types pair on Python + README, the shared table
+entry, a doubled word) — fixed. B ship-ready 3 LOW — DOC-201 (the cost
+line above), DOC-202 (the Zig residue clause that outlived round 1, "or
+unresolvable"), REL-203 (the content-types pre-flight generalized as
+above; pinned: an absent docProps carrier with the bit clear, and a
+coverage new to the archive behind an existing one — the first coverage's
+`replacePart` would have moved the store before the second's `addPart`
+refused).
+
 **Tests** (`src/c_abi.zig`, "S3c slice 4 set_embeddings …" ×3, "S3c slice
 4 r1 set_embeddings …" ×1 — the `delete_sheet` orphan's record scrubbed by
 a write without the bit, `ABSENT` after the Numbers-shaped strip): the bit
@@ -2347,7 +2377,12 @@ patch taking the set without the sheet; "S3c slice 4 r1 …" ×2: the
 `deleteSheet` orphan's record scrubbed by a default write (the table
 clean, `.absent` after the Numbers-shaped strip) and a `[Content_Types].xml`
 without `</Types>` refusing a re-embed with the bit before the first
-write. `pkg/editor.zig` ("S3c slice 4
+write; "S3c slice 4 r2 …" ×2: a zip directory entry under `xl/worksheets/`
+neither a worksheet part nor an orphan (the default write's scope stays
+the table), and the content-types verdict before the first write with an
+absent docProps carrier and with a coverage new to the archive behind an
+existing one (the store's mutation counter unchanged). `pkg/editor.zig`
+("S3c slice 4
 …" ×1): the mirror's third entry `xl/worksheets/sheet3.xml`, hidden on the
 view, `addSheet` at 3 with a `setCell` landing on `sheet4.xml`, the
 second write leaving the mirror alone, the refusal leaving it as it was

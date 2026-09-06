@@ -2565,13 +2565,14 @@ pub const Workbook = struct {
     /// Every refusal above lands before the first part is written, save
     /// the index XML's own cap in pass 4 — which cannot fire: the record
     /// ceiling checked in pass 2c bounds the same fields to a few KB. A
-    /// failure after the first write — an allocation failure, a
-    /// `[Content_Types].xml` or `docProps/custom.xml` the package layer
-    /// cannot patch — leaves the staged part set partially
-    /// replaced: discard the workbook without saving. The hidden sheet
-    /// `recovery_in_cells` adds is prepared and judged in pass 0c
-    /// (`preflightRecoveryCell`, S3c slice 4) and installed last; its
-    /// install can fail on allocation or the content-types patch only.
+    /// failure after the first write — an allocation failure, an existing
+    /// `docProps/custom.xml` the carrier cannot patch — leaves the staged
+    /// part set partially replaced: discard the workbook without saving
+    /// (`[Content_Types].xml` is judged in pass 2d whenever this write
+    /// adds a part, S3c slice 4). The hidden sheet `recovery_in_cells`
+    /// adds is prepared and judged in pass 0c (`preflightRecoveryCell`,
+    /// S3c slice 4) and installed last; its install can fail on
+    /// allocation only.
     /// The remaining `WriteFailed` folds are `bufPrint`s into buffers
     /// the id and rId bounds cannot overflow.
     pub fn setEmbeddings(
@@ -2594,7 +2595,13 @@ pub const Workbook = struct {
     /// a workbook that already carries it has its cell refreshed by
     /// every write, so the record is one generation in every carrier.
     /// Every verdict the sheet's creation can give is judged in pass 0c,
-    /// before the first part write. On an `Editor`, call
+    /// before the first part write. Every write, option or no option,
+    /// first scrubs the previous record from the shared-string table
+    /// (inflated once per generation — a read the default write's save
+    /// does not otherwise make) and, when the cells sheet or an orphaned
+    /// or unresolvable worksheet part is there, from the worksheet parts
+    /// — in place, so a user cell that shared the record's table entry
+    /// reads empty afterwards. On an `Editor`, call
     /// `Editor.setEmbeddingsOpts` — the sheet must reach its mirror.
     pub fn setEmbeddingsOpts(
         self: *Workbook,
@@ -2725,6 +2732,9 @@ pub const Workbook = struct {
         // (in-house r5 S3C-REL-501). The install commits it.
         var strip = try self.prepareRecoveryNameStrip();
         defer if (strip) |*s| s.deinit(self.allocator);
+
+        // Pass 2d: the content types, whenever this write adds a part.
+        try self.preflightContentTypes(specs);
 
         // Pass 3: encode + upsert per coverage's binaries.
         for (inputs, specs) |inp, s| {
@@ -3556,15 +3566,6 @@ pub const Workbook = struct {
             const reserved: u32 = if (std.mem.indexOf(u8, rels.bytes, embedding_part.REL_TYPE_EMBEDDINGS) == null) 1 else 0;
             var prepared = try self.prepareAddSheet(recovery_record.CELL_SHEET_NAME, .{ .state = .hidden }, reserved);
             prepared.deinit(self.allocator);
-            // The sheet's part is the one `addPart` of the install; on a
-            // re-embed the vector parts take `replacePart` (no
-            // content-types touch), so this would be the call's FIRST
-            // `[Content_Types].xml` patch — judged here as
-            // `stageContentTypeOverride` judges it (in-house S3c slice 4
-            // r1, B vector 2).
-            const ct = (try self.store.part("[Content_Types].xml")) orelse
-                return error.MissingContentTypes;
-            if (std.mem.lastIndexOf(u8, ct.bytes, "</Types>") == null) return error.MalformedContentTypes;
         }
         // The install scrubs the previous generation's record from the
         // carrier's text before staging the new cell (`writeRecoveryCell`)
@@ -3580,6 +3581,45 @@ pub const Workbook = struct {
                 _ = try self.carrierPart(p.name, error.MalformedSheetXml);
             }
         }
+    }
+
+    /// Pass 2d: `[Content_Types].xml`, judged as `stageContentTypeOverride`
+    /// judges it (the part present, a `</Types>`) whenever this write
+    /// will `addPart` — a coverage whose parts are not in the archive
+    /// yet, an absent index, an absent `docProps/custom.xml` (the
+    /// Document Inspector's shape), the cells sheet to be created. A
+    /// re-embed's existing parts take `replacePart` and never touch the
+    /// content types, so the write's first `addPart` used to be the one
+    /// place a hostile `[Content_Types].xml` surfaced — after every part
+    /// before it (in-house S3c slice 4 r1 B vector 2 for the sheet, r2
+    /// B-REL-203 for the docProps carrier; generalized here). Presence
+    /// is `hasPart` — a lookup, never an inflate of a vector part.
+    fn preflightContentTypes(self: *Workbook, specs: []const embedding_part.CoverageSpec) Error!void {
+        var adds = (try self.recoveryCellSheetIndex()) == null and self.recovery_opts.recovery_in_cells;
+        if (!adds) adds = !self.store.hasPart("docProps/custom.xml") or
+            !self.store.hasPart(embedding_part.INDEX_PART_NAME) or
+            !self.store.hasPart(embedding_part.INDEX_RELS_PART_NAME);
+        if (!adds) {
+            for (specs) |s| {
+                var buf: [256]u8 = undefined;
+                const vec_path = std.fmt.bufPrint(&buf, "{s}/{s}/vec.bin", .{ embedding_part.EMBEDDINGS_DIR, s.id }) catch
+                    return error.WriteFailed;
+                if (!self.store.hasPart(vec_path)) {
+                    adds = true;
+                    break;
+                }
+                const hash_path = std.fmt.bufPrint(&buf, "{s}/{s}/hashes.bin", .{ embedding_part.EMBEDDINGS_DIR, s.id }) catch
+                    return error.WriteFailed;
+                if (!self.store.hasPart(hash_path)) {
+                    adds = true;
+                    break;
+                }
+            }
+        }
+        if (!adds) return;
+        const ct = (try self.store.part("[Content_Types].xml")) orelse
+            return error.MissingContentTypes;
+        if (std.mem.lastIndexOf(u8, ct.bytes, "</Types>") == null) return error.MalformedContentTypes;
     }
 
     /// Where a previous cells record can hide when the write is about
@@ -3653,9 +3693,19 @@ pub const Workbook = struct {
         }
     }
 
-    /// A worksheet part by name — `xl/worksheets/…`, not its `.rels`.
+    /// A worksheet part by name — `xl/worksheets/…`, not its `.rels`,
+    /// not a zip DIRECTORY entry (`xl/worksheets/`, `xl/worksheets/_rels/`:
+    /// some producers write them, and the store keeps every central-
+    /// directory entry as a part). The ONE predicate for the scrub, its
+    /// pass-0c materialization and the orphan heuristic — the heuristic
+    /// kept an inline copy that counted the directory entry as an
+    /// orphaned worksheet part, so every default write on such an
+    /// archive (six of the corpus's 29) materialized and scrubbed every
+    /// sheet (in-house S3c slice 4 r2 A-PERF-201).
     fn isWorksheetPartName(name: []const u8) bool {
-        return std.mem.startsWith(u8, name, "xl/worksheets/") and !std.mem.endsWith(u8, name, ".rels");
+        return std.mem.startsWith(u8, name, "xl/worksheets/") and
+            !std.mem.endsWith(u8, name, ".rels") and
+            !std.mem.endsWith(u8, name, "/");
     }
 
     /// Whether the archive holds a worksheet part no `<sheet>` resolves
@@ -3680,8 +3730,7 @@ pub const Workbook = struct {
             try live.append(self.allocator, name);
         }
         for (self.store.parts) |p| {
-            if (!std.mem.startsWith(u8, p.name, "xl/worksheets/")) continue;
-            if (std.mem.endsWith(u8, p.name, ".rels")) continue;
+            if (!isWorksheetPartName(p.name)) continue;
             var referenced = false;
             for (live.items) |name| {
                 if (std.mem.eql(u8, name, p.name)) {
@@ -30661,4 +30710,91 @@ test "S3c slice 4 r1: on a re-embed the cells sheet's part is the call's first c
     try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
     const view = (try wb.embeddings()).present;
     try std.testing.expectEqualStrings("m", view.index.model);
+}
+
+test "S3c slice 4 r2: a zip directory entry under xl/worksheets/ is neither a worksheet part nor an orphan — the default write's scope stays the table" {
+    try std.testing.expect(Workbook.isWorksheetPartName("xl/worksheets/sheet1.xml"));
+    try std.testing.expect(Workbook.isWorksheetPartName("xl/worksheets/sheet1_formatted.xml"));
+    try std.testing.expect(!Workbook.isWorksheetPartName("xl/worksheets/_rels/sheet1.xml.rels"));
+    try std.testing.expect(!Workbook.isWorksheetPartName("xl/worksheets/"));
+    try std.testing.expect(!Workbook.isWorksheetPartName("xl/worksheets/_rels/"));
+    try std.testing.expect(!Workbook.isWorksheetPartName("xl/sharedStrings.xml"));
+
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    var wb = try Workbook.empty(a, threaded.io());
+    defer wb.deinit();
+    const ws = try wb.addSheet("Items");
+    try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Title" }}});
+    try std.testing.expect(!(try wb.hasOrphanWorksheetPart()));
+    // The producer's directory entries, as the store keeps them.
+    try wb.store.addPart("xl/worksheets/", "application/octet-stream", "");
+    try wb.store.addPart("xl/worksheets/_rels/", "application/octet-stream", "");
+    try std.testing.expect(!(try wb.hasOrphanWorksheetPart()));
+    try std.testing.expect(!(try wb.recoveryCellScrubScope(false)).worksheet_parts);
+    // A real orphan still widens it.
+    try wb.store.addPart("xl/worksheets/sheet9.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml", "<worksheet/>");
+    try std.testing.expect(try wb.hasOrphanWorksheetPart());
+    try std.testing.expect((try wb.recoveryCellScrubScope(false)).worksheet_parts);
+}
+
+test "S3c slice 4 r2: the content-types verdict lands before the first write wherever the write adds a part — an absent docProps carrier, a coverage new to the archive behind an existing one" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try writePruneFile(io, dir, "ct_r2.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer a.free(path);
+    // The Document Inspector's shape: the docProps carrier gone, the
+    // option clear — its `addPart` would be the call's first
+    // content-types patch, after every part.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.store.removePart("docProps/custom.xml");
+        const ct = (try wb.store.part("[Content_Types].xml")) orelse return error.TestUnexpectedResult;
+        const patched = try std.mem.replaceOwned(u8, a, ct.bytes, "</Types>", "");
+        defer a.free(patched);
+        try wb.store.replacePart("[Content_Types].xml", patched);
+        const before = wb.store.mutations;
+        try std.testing.expectError(error.MalformedContentTypes, wb.setEmbeddings("m2", 2, .int8_sym_per_vec, &s3c4_inputs));
+        try std.testing.expectEqual(before, wb.store.mutations);
+        try std.testing.expectEqualStrings("m", (try wb.embeddings()).present.index.model);
+    }
+    // A coverage new to the archive behind an existing one: the first
+    // coverage's `replacePart` used to land before the second's `addPart`
+    // refused.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        const ct = (try wb.store.part("[Content_Types].xml")) orelse return error.TestUnexpectedResult;
+        const patched = try std.mem.replaceOwned(u8, a, ct.bytes, "</Types>", "");
+        defer a.free(patched);
+        try wb.store.replacePart("[Content_Types].xml", patched);
+        const two = [_]EmbeddingCoverageInput{ s3c4_inputs[0], .{
+            .id = "second",
+            .worksheet_target = PRUNE_WS_TARGET,
+            .range = "A3:A3",
+            .column = "A",
+            .include_formulas = false,
+            .vec_body = &s3c4_vec,
+            .hashes = &s3c4_hashes,
+        } };
+        const before = wb.store.mutations;
+        try std.testing.expectError(error.MalformedContentTypes, wb.setEmbeddings("m2", 2, .int8_sym_per_vec, &two));
+        try std.testing.expectEqual(before, wb.store.mutations);
+        try std.testing.expectEqualStrings("m", (try wb.embeddings()).present.index.model);
+        // The same re-embed over the EXISTING coverage alone adds no part
+        // and takes the set, content types untouched.
+        try wb.setEmbeddings("m3", 2, .int8_sym_per_vec, &s3c4_inputs);
+        try std.testing.expectEqualStrings("m3", (try wb.embeddings()).present.index.model);
+    }
 }

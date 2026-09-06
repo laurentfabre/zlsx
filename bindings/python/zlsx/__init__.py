@@ -4408,7 +4408,11 @@ class Editor:
         first scrubs the previous record from the shared-string table
         and — when the sheet or an orphaned worksheet part is there —
         from the worksheet parts, so the record is one generation in
-        every carrier; :meth:`strip_embeddings` removes the sheet. The
+        every carrier; :meth:`strip_embeddings` removes the sheet. That
+        scrub reads the shared-string table once per write (a read the
+        default write's save does not otherwise make) and blanks a stale
+        record's table entry in place, so a user cell that shared that
+        entry reads empty afterwards. The
         name is reserved: a sheet spelled so, however cased, IS the
         carrier and its ``A1`` is written. Requires libzlsx 0.9.0+ as the
         write itself does (0.9.0 ships both).
@@ -4477,11 +4481,15 @@ class Editor:
         ``SheetCountMismatch`` (no ``xl/workbook.xml``, or one whose
         ``</sheets>`` the typed parser reads elsewhere than the splice,
         so the hidden sheet's add could not land; checked before the
-        first write), ``MalformedSharedStringsXml`` /
+        first write), ``MissingContentTypes`` / ``MalformedContentTypes``
+        (no ``[Content_Types].xml``, or one without ``</Types>``, when
+        this write adds a part — a coverage new to the archive, a first
+        index, an absent ``docProps/custom.xml``, the hidden sheet;
+        checked before the first write), ``MalformedSharedStringsXml`` /
         ``MalformedSheetXml`` (a shared-string table or, with the sheet
-        present or an orphaned worksheet part in the archive, a
-        worksheet part the scrub would read and the store cannot serve;
-        checked before the first write),
+        present or an orphaned or unresolvable worksheet part in the
+        archive, a worksheet part the scrub would read and the store
+        cannot serve; checked before the first write),
         ``EmbeddingExceedsArchiveLimit``
         (a part past the 512 MiB read cap — sized from the inputs before
         a vector is read — or the recovery record past its ceiling),
@@ -4489,7 +4497,7 @@ class Editor:
         but the strip of the previous record's chunk names cannot walk;
         judged before the first write). A refusal that fires after the
         first part is written (an allocation failure, an index past the
-        cap, a content-types or docProps part the carriers cannot patch)
+        cap, an existing ``docProps/custom.xml`` the carrier cannot patch)
         leaves the staged set partially replaced: close the editor
         without saving. A save after this write re-emits the workbook's
         ``<definedNames>`` block: every existing name keeps ``name``,

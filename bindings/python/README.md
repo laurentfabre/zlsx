@@ -441,8 +441,9 @@ record ceiling bounds the same fields). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
 (a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
 and a masked array's masked slots are "no value". A refusal after the first
-part is written (an allocation failure, an index past the cap, a package
-part the carriers cannot patch) leaves the staged set partially replaced:
+part is written (an allocation failure, an index past the cap, an existing
+`docProps/custom.xml` the carrier cannot patch) leaves the staged set
+partially replaced:
 close the editor without saving. A save after the write re-emits the
 workbook's `<definedNames>` block: every existing name keeps `name`,
 `localSheetId` and `hidden` only — its other attributes (`comment`,
@@ -468,10 +469,14 @@ so a structural delete in the same session (`delete_sheet`,
 has its cell refreshed by every later write, whatever `recovery` says, and
 every write first scrubs the previous record from the shared-string table
 (and the worksheet parts when the sheet or an orphaned worksheet part is
-there), so the record is one generation in every carrier;
+there), so the record is one generation in every carrier — that scrub reads
+the table once per write and blanks a stale record's entry in place, so a
+user cell that shared the entry reads empty afterwards;
 `strip_embeddings()` removes the sheet. Its own refusals land before the
 first part write too: `IdSpaceExhausted` (the `sheetId`, part-number or
 `rId` space), `MissingWorkbookPart` / `SheetCountMismatch`,
+`MissingContentTypes` / `MalformedContentTypes` (a `[Content_Types].xml` the
+write cannot add a part to — judged whenever it adds one),
 `MalformedSharedStringsXml` / `MalformedSheetXml` as a `ZlsxRefusal`;
 `SheetHasUnsavedAppends` (staged `append_rows` on the sheet) and
 `StructuralEditIncomplete` as a `ZlsxError`.
