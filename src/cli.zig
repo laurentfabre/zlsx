@@ -299,42 +299,41 @@ const ArgError = error{
     TooManyArgs,
 };
 
+/// Value-bearing flags — the ONE table the sub-command scan and the
+/// `--key=value` splitter read (they used to be two hand-kept lists).
+/// `--key=value` is split into [--key, value] ONLY when key is one of
+/// these — otherwise the token is left verbatim, so an arbitrary
+/// `--Q=1` value passed via the two-token form (`--name --Q=1`) is
+/// consumed as a literal value by the preceding flag rather than
+/// misparsed as a new flag.
+const value_flags = [_][]const u8{
+    "--sheet",      "--name",      "--format",  "--skip",
+    "--take",       "--start-row", "--end-row", "--range",
+    "--sheet-glob", "--output",    "--out",     "--ref",
+    "--value",      "--row",       "--col",     "--new-name",
+    "--vectors",    "--model",     "--column",  "--coverage",
+    "--id",         "--dtype",     "--table",   "--old-name",
+    "--recovery",
+};
+
+fn isValueFlag(a: []const u8) bool {
+    for (value_flags) |vf| {
+        if (std.mem.eql(u8, a, vf)) return true;
+    }
+    return false;
+}
+
 /// First-pass scan: identify the sub-command without validating
 /// flag values. Lets the main pass relax --sheet / --name / --format
 /// validation for workbook-scoped sub-commands that wrappers may
 /// append those flags to universally. Skips every value-bearing
-/// flag's value so it is never mistaken for a positional or a
-/// sub-command token (the list mirrors `parseArgs`'s `value_flags`).
+/// flag's value (`value_flags`) so it is never mistaken for a
+/// positional or a sub-command token.
 fn detectSubcommand(argv: []const []const u8) Subcommand {
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--sheet") or
-            std.mem.eql(u8, a, "--name") or
-            std.mem.eql(u8, a, "--format") or
-            std.mem.eql(u8, a, "--skip") or
-            std.mem.eql(u8, a, "--take") or
-            std.mem.eql(u8, a, "--start-row") or
-            std.mem.eql(u8, a, "--end-row") or
-            std.mem.eql(u8, a, "--range") or
-            std.mem.eql(u8, a, "--sheet-glob") or
-            std.mem.eql(u8, a, "--output") or
-            std.mem.eql(u8, a, "--out") or
-            std.mem.eql(u8, a, "--ref") or
-            std.mem.eql(u8, a, "--value") or
-            std.mem.eql(u8, a, "--row") or
-            std.mem.eql(u8, a, "--col") or
-            std.mem.eql(u8, a, "--new-name") or
-            std.mem.eql(u8, a, "--table") or
-            std.mem.eql(u8, a, "--old-name") or
-            std.mem.eql(u8, a, "--vectors") or
-            std.mem.eql(u8, a, "--model") or
-            std.mem.eql(u8, a, "--column") or
-            std.mem.eql(u8, a, "--coverage") or
-            std.mem.eql(u8, a, "--id") or
-            std.mem.eql(u8, a, "--dtype") or
-            std.mem.eql(u8, a, "--recovery"))
-        {
+        if (isValueFlag(a)) {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
         }
@@ -391,20 +390,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--sst-lazy",    "--all-sheets", "--help",           "--strip",
         "--prune",       "--extract",
     };
-    // Value-bearing flags. `--key=value` is split into [--key, value]
-    // ONLY when key is one of these — otherwise the token is left
-    // verbatim, so an arbitrary `--Q=1` value passed via the
-    // two-token form (`--name --Q=1`) is consumed as a literal value
-    // by the preceding flag rather than misparsed as a new flag.
-    const value_flags = [_][]const u8{
-        "--sheet",      "--name",      "--format",  "--skip",
-        "--take",       "--start-row", "--end-row", "--range",
-        "--sheet-glob", "--output",    "--out",     "--ref",
-        "--value",      "--row",       "--col",     "--new-name",
-        "--vectors",    "--model",     "--column",  "--coverage",
-        "--id",         "--dtype",     "--table",   "--old-name",
-        "--recovery",
-    };
+    // Value-bearing flags: the file-scope `value_flags` table.
     // Context-aware splitter: the token IMMEDIATELY following a
     // value-bearing flag is its literal value and must pass through
     // verbatim, even if it textually matches `--known-flag=value`.
@@ -427,14 +413,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
                 for (boolean_flags) |bf| {
                     if (std.mem.eql(u8, key, bf)) return ArgError.BadArgValue;
                 }
-                var is_value_flag = false;
-                for (value_flags) |vf| {
-                    if (std.mem.eql(u8, key, vf)) {
-                        is_value_flag = true;
-                        break;
-                    }
-                }
-                if (is_value_flag) {
+                if (isValueFlag(key)) {
                     if (split_count + 2 > split_buf.len) return ArgError.TooManyArgs;
                     split_buf[split_count] = key;
                     split_buf[split_count + 1] = raw[eq + 1 ..];
@@ -448,12 +427,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             }
             // Bare `--flag` form: if it's value-bearing, the next
             // token is its literal value.
-            for (value_flags) |vf| {
-                if (std.mem.eql(u8, raw, vf)) {
-                    prev_was_value_flag = true;
-                    break;
-                }
-            }
+            if (isValueFlag(raw)) prev_was_value_flag = true;
         }
         if (split_count >= split_buf.len) return ArgError.TooManyArgs;
         split_buf[split_count] = raw;
@@ -11041,7 +11015,7 @@ test "S3c slice 5: parseArgs — `--recovery` is a value flag of the embed famil
     }
 }
 
-test "S3c slice 5: embed --vectors — `--recovery in-cells` through the real dispatch adds the hidden zlsxRecovery sheet with the record and the set reads present; the default and `invisible` add no sheet; a later write without the flag refreshes the sheet it finds; an unknown value is exit 2 before the open" {
+test "S3c slice 5: embed --vectors — `--recovery in-cells` through the real dispatch adds the hidden zlsxRecovery sheet with the record and the set reads present; the default and `invisible` add no sheet; a later write without the flag refreshes the sheet it finds; `--strip` removes it; an unknown value is exit 2 before the open" {
     const a = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -11146,6 +11120,32 @@ test "S3c slice 5: embed --vectors — `--recovery in-cells` through the real di
         const state = try wb.embeddings();
         try std.testing.expect(state == .present);
         try std.testing.expectEqualStrings("m2", state.present.index.model);
+    }
+
+    // `--strip` removes the carrier the flag created — through the real
+    // dispatch (the Editor's strip, the mirror-safe path, S3c slice 3):
+    // one sheet, no record, the set absent (r2, A-MAINT-201).
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_buf: [64]u8 = undefined;
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const out = try tt.path(a, io, "s3c5_stripped.xlsx");
+        defer a.free(out);
+        var args = base;
+        args.file = out_cells;
+        args.vectors_path = null;
+        args.strip = true;
+        args.out_path = out;
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+        var wb = try zlsx_pkg.Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), s3c5CountRecords(sst.bytes));
+        try std.testing.expect((try wb.embeddings()) == .absent);
     }
 
     // An unknown spelling: exit 2 with the flag's own message, judged
