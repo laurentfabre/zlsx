@@ -249,6 +249,12 @@ Verified against a real Numbers 15.3 export: the default fixture comes
 back `absent`, the `--cells` fixture comes back `stripped` with
 `carrier=cell_data` and full provenance.
 
+Every write surface has the hatch (S3c slices 4 and 5): `flags` bit 0 of
+`zlsx_editor_set_embeddings` (`ZLSX_EMB_WRITE_RECOVERY_IN_CELLS`),
+`Editor.set_embeddings(…, recovery="in_cells")`, and
+`zlsx embed --vectors … --recovery in-cells` — one `Editor.setEmbeddingsOpts`
+call beneath all three.
+
 The library does not choose for you. The default is invisible because
 that is the stated product goal; the hatch is one flag away because
 "your vectors silently vanished" is a worse outcome for some callers

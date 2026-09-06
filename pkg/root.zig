@@ -161,6 +161,7 @@ pub const EmbeddingView = workbook_mod.EmbeddingView;
 pub const EmbeddingState = workbook_mod.EmbeddingState;
 pub const EmbeddingCoverageView = workbook_mod.EmbeddingCoverageView;
 pub const EmbeddingCoverageInput = workbook_mod.EmbeddingCoverageInput;
+pub const RecoveryOptions = workbook_mod.RecoveryOptions;
 pub const EmbeddableRow = workbook_mod.EmbeddableRow;
 pub const EmbeddableRows = workbook_mod.EmbeddableRows;
 

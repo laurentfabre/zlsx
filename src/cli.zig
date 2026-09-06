@@ -246,6 +246,12 @@ const Args = struct {
     coverage_id: ?[]const u8 = null,
     /// emb-6c: `--dtype f32|int8-sym` — on-disk vector encoding.
     dtype_name: ?[]const u8 = null,
+    /// S3c slice 5: `--recovery invisible|in-cells` — where the
+    /// recovery record rides (`zlsx_pkg.RecoveryOptions`). `in-cells`
+    /// also writes it into the hidden `zlsxRecovery` sheet, the one
+    /// carrier an Apple Numbers export keeps. Belongs to
+    /// `embed --vectors`: refused on every other mode and sub-command.
+    recovery_name: ?[]const u8 = null,
     /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
     /// Set via `--ref A1`.
     cell_ref: ?[]const u8 = null,
@@ -325,7 +331,8 @@ fn detectSubcommand(argv: []const []const u8) Subcommand {
             std.mem.eql(u8, a, "--column") or
             std.mem.eql(u8, a, "--coverage") or
             std.mem.eql(u8, a, "--id") or
-            std.mem.eql(u8, a, "--dtype"))
+            std.mem.eql(u8, a, "--dtype") or
+            std.mem.eql(u8, a, "--recovery"))
         {
             i += 1; // skip paired value (bounds-checked by caller)
             continue;
@@ -395,6 +402,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         "--value",      "--row",       "--col",     "--new-name",
         "--vectors",    "--model",     "--column",  "--coverage",
         "--id",         "--dtype",     "--table",   "--old-name",
+        "--recovery",
     };
     // Context-aware splitter: the token IMMEDIATELY following a
     // value-bearing flag is its literal value and must pass through
@@ -592,6 +600,11 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             out.dtype_name = argv[i];
+        } else if (std.mem.eql(u8, a, "--recovery")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            out.recovery_name = argv[i];
         } else if (std.mem.eql(u8, a, "--all-sheets")) {
             // iter59c: no value; expands selection to every sheet.
             // On workbook-scoped sub-commands silently accept (same
@@ -1238,7 +1251,21 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     --column A, --coverage A2:A100, --model
         \\                     NAME, --out PATH. Optional: --id NAME
         \\                     (default "default"), --dtype f32|int8-sym
-        \\                     (default f32), --sheet N (default 0).
+        \\                     (default f32), --sheet N (default 0),
+        \\                     --recovery invisible|in-cells (default
+        \\                     invisible) — where the recovery record
+        \\                     rides: invisible = the hidden defined
+        \\                     names + docProps/custom.xml, which no
+        \\                     user sees and an Apple Numbers export
+        \\                     erases; in-cells ALSO writes it into a
+        \\                     hidden sheet named zlsxRecovery, the one
+        \\                     carrier Numbers keeps, at the cost of a
+        \\                     sheet the user can reveal. Governs the
+        \\                     sheet's creation only: a workbook already
+        \\                     carrying it is refreshed by every write,
+        \\                     whatever --recovery says; --strip removes
+        \\                     it. Refused with --extract / --prune /
+        \\                     --strip.
         \\
         \\                     The model is invoked out of band — the
         \\                     embed pipeline never makes a network call
@@ -3562,6 +3589,17 @@ fn runEmbedApply(
         try err.flush();
         return 2;
     };
+    // The carrier choice, judged with the other flag values — before
+    // the workbook is opened, like `--dtype`. The spelling is the
+    // CLI's (`in-cells`, as `int8-sym`); py-zlsx says `in_cells`.
+    const recovery: zlsx_pkg.RecoveryOptions = blk: {
+        const name = args.recovery_name orelse break :blk .{};
+        if (std.mem.eql(u8, name, "invisible")) break :blk .{};
+        if (std.mem.eql(u8, name, "in-cells")) break :blk .{ .recovery_in_cells = true };
+        try err.print("zlsx: unknown --recovery '{s}' (want invisible | in-cells)\n", .{name});
+        try err.flush();
+        return 2;
+    };
 
     var ed = zlsx_pkg.Editor.open(alloc, io, args.file) catch |e| {
         try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
@@ -3659,8 +3697,10 @@ fn runEmbedApply(
     }
 
     // The Editor's path, not the workbook's: the cells carrier's hidden
-    // sheet must reach the editor's sheet mirror (S3c slice 4).
-    ed.setEmbeddings(model, dim, dtype, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
+    // sheet must reach the editor's sheet mirror (S3c slice 4); the
+    // option rides the same call the C ABI's `flags` bit takes (S3c
+    // slice 5), so the three surfaces are one write.
+    ed.setEmbeddingsOpts(model, dim, dtype, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
         .id = args.coverage_id orelse "default",
         .worksheet_target = target,
         .range = range,
@@ -3668,7 +3708,7 @@ fn runEmbedApply(
         .include_formulas = false,
         .vec_body = vec_body,
         .hashes = hashes,
-    }}) catch |e| {
+    }}, recovery) catch |e| {
         try err.print("zlsx: setEmbeddings: {s}\n", .{@errorName(e)});
         try err.flush();
         return 3;
@@ -3768,6 +3808,17 @@ fn runEmbedCommand(
     }
     if (mode_count > 1) {
         try err.writeAll("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip)\n");
+        try err.flush();
+        return 2;
+    }
+    // `--recovery` chooses a carrier for the record `--vectors` writes.
+    // To the other three modes it is a promise this run cannot keep —
+    // a strip removes that carrier, a prune and an extract write none
+    // — so it is refused rather than ignored, the way `--strip` is on
+    // the other sub-commands: silence on a flag that names where
+    // provenance lands would be the wrong tolerance.
+    if (args.recovery_name != null and args.vectors_path == null) {
+        try err.writeAll("zlsx: --recovery applies to embed --vectors only\n");
         try err.flush();
         return 2;
     }
@@ -10929,5 +10980,209 @@ test "writeDocPropsPretty / writeDocPropsCompact: populated objects, exact bytes
                 "\"hyperlink_base\":\"H\",\"has_custom_properties\":true}",
             w.buffered(),
         );
+    }
+}
+
+// ── S3c slice 5: `--recovery in-cells` — the CLI leg of `recovery_in_cells` ──
+
+fn s3c5CountRecords(text: []const u8) usize {
+    var n: usize = 0;
+    var rest = text;
+    while (zlsx_pkg.recovery_record.recordSpanInText(rest)) |sp| {
+        n += 1;
+        rest = rest[sp.end..];
+    }
+    return n;
+}
+
+test "S3c slice 5: parseArgs — `--recovery` is a value flag of the embed family: both spellings, its value never taken for a sub-command, a missing value, refused on every other sub-command" {
+    {
+        const argv = [_][]const u8{ "embed", "in.xlsx", "--vectors", "v.ndjson", "--recovery", "in-cells", "--out", "o.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.embed, a.subcommand);
+        try std.testing.expectEqualStrings("in.xlsx", a.file);
+        try std.testing.expectEqualStrings("v.ndjson", a.vectors_path.?);
+        try std.testing.expectEqualStrings("in-cells", a.recovery_name.?);
+        try std.testing.expectEqualStrings("o.xlsx", a.out_path.?);
+    }
+    {
+        const argv = [_][]const u8{ "embed", "in.xlsx", "--recovery=invisible", "--vectors", "v.ndjson" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqualStrings("invisible", a.recovery_name.?);
+        try std.testing.expectEqualStrings("v.ndjson", a.vectors_path.?);
+        try std.testing.expectEqualStrings("in.xlsx", a.file);
+    }
+    {
+        // The sub-command scan skips the value, as it does every value
+        // flag's: a value that happens to spell a sub-command names none.
+        const argv = [_][]const u8{ "--recovery", "cells", "embed", "in.xlsx", "--vectors", "v.ndjson" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.embed, a.subcommand);
+        try std.testing.expectEqualStrings("cells", a.recovery_name.?);
+        try std.testing.expectEqualStrings("in.xlsx", a.file);
+    }
+    {
+        const argv = [_][]const u8{ "embed", "in.xlsx", "--vectors", "v.ndjson", "--recovery" };
+        try std.testing.expectError(ArgError.MissingValue, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "in.xlsx", "--recovery", "in-cells" };
+        try std.testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "set-cell", "in.xlsx", "--ref", "A1", "--value", "1", "--out", "o.xlsx", "--recovery", "in-cells" };
+        try std.testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "list-sheets", "in.xlsx", "--recovery=in-cells" };
+        try std.testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    }
+}
+
+test "S3c slice 5: runEmbedApply — `--recovery in-cells` adds the hidden zlsxRecovery sheet with the record and the set reads present; the default and `invisible` add no sheet; a later write without the flag refreshes the sheet it finds; an unknown value is exit 2 before the open" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(a, io, "s3c5_src.xlsx");
+    defer a.free(src);
+    {
+        var w = xlsx.writer_types.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Items");
+        try s.writeRow(&.{.{ .string = "Title" }});
+        try s.writeRow(&.{.{ .string = "Alpha" }});
+        try w.save(io, src);
+    }
+    try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c5_vecs.ndjson", .data = "{\"row\":2,\"vector\":[0.5,0.25]}\n" });
+    const vecs = try tt.path(a, io, "s3c5_vecs.ndjson");
+    defer a.free(vecs);
+    const base: Args = .{
+        .file = src,
+        .subcommand = .embed,
+        .vectors_path = vecs,
+        .model_name = "m1",
+        .column_name = "A",
+        .coverage_range = "A2:A2",
+    };
+    var err_buf: [1024]u8 = undefined;
+
+    // The flag: one hidden sheet after the user's, the record in the
+    // table exactly once, the set present.
+    const out_cells = try tt.path(a, io, "s3c5_cells.xlsx");
+    defer a.free(out_cells);
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var args = base;
+        args.out_path = out_cells;
+        args.recovery_name = "in-cells";
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        var wb = try zlsx_pkg.Workbook.open(a, io, out_cells);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 1), try wb.recoveryCellSheetIndex());
+        try std.testing.expect((try wb.sheet(0)).state() == .visible);
+        try std.testing.expect((try wb.sheet(1)).state() == .hidden);
+        const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, wbx.bytes, "<sheet name=\"zlsxRecovery\" sheetId=\"2\" state=\"hidden\" r:id=\"") != null);
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c5CountRecords(sst.bytes));
+        const state = try wb.embeddings();
+        try std.testing.expect(state == .present);
+        try std.testing.expectEqualStrings("m1", state.present.index.model);
+    }
+
+    // No flag, or the default spelled out: the two invisible carriers
+    // only — no sheet, the set present.
+    const plain_outs = [_][]const u8{ "s3c5_default.xlsx", "s3c5_invisible.xlsx" };
+    const plain_modes = [_]?[]const u8{ null, "invisible" };
+    for (plain_outs, plain_modes) |name, mode| {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const out = try tt.path(a, io, name);
+        defer a.free(out);
+        var args = base;
+        args.out_path = out;
+        args.recovery_name = mode;
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+        var wb = try zlsx_pkg.Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), s3c5CountRecords(sst.bytes));
+        try std.testing.expect((try wb.embeddings()) == .present);
+    }
+
+    // Creation only: a re-embed of the cells workbook WITHOUT the flag
+    // refreshes the sheet it finds — one sheet, one record, the new
+    // generation's (the workbook's rule, reached from the CLI).
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const out = try tt.path(a, io, "s3c5_refresh.xlsx");
+        defer a.free(out);
+        var args = base;
+        args.file = out_cells;
+        args.out_path = out;
+        args.model_name = "m2";
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+        var wb = try zlsx_pkg.Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 1), try wb.recoveryCellSheetIndex());
+        try std.testing.expect((try wb.sheet(1)).state() == .hidden);
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c5CountRecords(sst.bytes));
+        const state = try wb.embeddings();
+        try std.testing.expect(state == .present);
+        try std.testing.expectEqualStrings("m2", state.present.index.model);
+    }
+
+    // An unknown spelling: exit 2 with the flag's own message, judged
+    // with the other flag values — the input (absent here) is never
+    // opened and no output is written.
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const out = try tt.path(a, io, "s3c5_never.xlsx");
+        defer a.free(out);
+        var args = base;
+        args.file = "s3c5-absent-input.xlsx";
+        args.out_path = out;
+        args.recovery_name = "in_cells";
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedApply(a, io, args, vecs, &err_w));
+        try std.testing.expectEqualStrings("zlsx: unknown --recovery 'in_cells' (want invisible | in-cells)\n", err_w.buffered());
+        try std.testing.expectError(error.FileNotFound, tt.dir.dir.access(io, "s3c5_never.xlsx", .{}));
+    }
+}
+
+test "S3c slice 5: runEmbedCommand — `--recovery` with --strip / --prune / --extract is exit 2 before the workbook is opened; two modes and the flag report the mode conflict" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var err_buf: [512]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    // The input does not exist: an open would say "cannot open", so
+    // the flag's message proves the refusal precedes it.
+    const fenced = [_]Args{
+        .{ .file = "s3c5-absent-input.xlsx", .subcommand = .embed, .strip = true, .out_path = "s3c5-never.xlsx", .recovery_name = "in-cells" },
+        .{ .file = "s3c5-absent-input.xlsx", .subcommand = .embed, .prune = true, .out_path = "s3c5-never.xlsx", .recovery_name = "in-cells" },
+        .{ .file = "s3c5-absent-input.xlsx", .subcommand = .embed, .extract = true, .column_name = "A", .coverage_range = "A2:A2", .recovery_name = "invisible" },
+    };
+    for (fenced) |args| {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: --recovery applies to embed --vectors only\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = "s3c5-absent-input.xlsx", .subcommand = .embed, .strip = true, .vectors_path = "v.ndjson", .out_path = "s3c5-never.xlsx", .recovery_name = "in-cells" };
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip)\n", err_w.buffered());
     }
 }
