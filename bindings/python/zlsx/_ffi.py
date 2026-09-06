@@ -1919,3 +1919,42 @@ if _HAS_EMBEDDABLE_ROWS:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_embeddable_rows_ndjson.restype = ctypes.c_int32
+
+
+# S3c slice 3: the embedding sweeps on the editor handle — one probe
+# for both exports, the header's ZLSX_HAS_EMBEDDING_SWEEPS, plus the
+# diag release the wrappers call unconditionally.
+class PruneReportV1(ctypes.Structure):
+    """Mirrors zlsx_prune_report_v1 — 40 bytes, struct_size first; the
+    four counts of the CLI's {"kind":"prune",...} record as uint64."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("redacted", ctypes.c_uint64),
+        ("stale", ctypes.c_uint64),
+        ("fresh", ctypes.c_uint64),
+        ("valid_empty", ctypes.c_uint64),
+    ]
+
+
+assert ctypes.sizeof(PruneReportV1) == 40
+assert PruneReportV1.redacted.offset == 8 and PruneReportV1.valid_empty.offset == 32
+
+_EMBEDDING_SWEEP_SYMBOLS = ("zlsx_editor_prune_embeddings", "zlsx_editor_strip_embeddings")
+_HAS_EMBEDDING_SWEEPS = _HAS_DIAG_RELEASE and all(hasattr(lib, s) for s in _EMBEDDING_SWEEP_SYMBOLS)
+if _HAS_EMBEDDING_SWEEPS:
+    lib.zlsx_editor_prune_embeddings.argtypes = [
+        editor_handle,
+        ctypes.POINTER(PruneReportV1),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_prune_embeddings.restype = ctypes.c_int32
+    lib.zlsx_editor_strip_embeddings.argtypes = [
+        editor_handle,
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_strip_embeddings.restype = ctypes.c_int32

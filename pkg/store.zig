@@ -330,6 +330,13 @@ pub const PartStore = struct {
     /// The torn-edit guard reads this one: a failure whose attempt
     /// never reached a commit poisons nothing (Codex #208 r3 REL-301).
     installs: u64 = 0,
+    /// Parts removed since `open()` — the one mutation that changes the
+    /// archive without installing an override, so `hasUnsavedChanges`
+    /// counts it too: a strip whose only effect was removals (a foreign
+    /// package with no override and no relationship on the parts)
+    /// used to save the source bytes verbatim, the parts intact
+    /// (in-house S3c slice 3 r1 REL-103 / REL-105).
+    removed: u64 = 0,
     /// The `Io` this store was opened with. `save()` needs one for the
     /// atomic-file output long after `open()` returned, so the store
     /// carries its own. Source *reads* go through `backing.io`, which
@@ -966,6 +973,7 @@ pub const PartStore = struct {
         std.debug.assert(w == n - 1);
 
         self.installs += 1;
+        self.removed += 1;
         self.entries = new_entries;
         self.parts = new_parts;
         self.overrides = new_overrides;
@@ -1622,6 +1630,7 @@ pub const PartStore = struct {
     /// former (e.g. for "do I need to save before exit?" — the
     /// answer should remain true even after a previous save).
     pub fn hasUnsavedChanges(self: *const PartStore) bool {
+        if (self.removed > 0) return true;
         for (self.overrides) |o| if (o != null) return true;
         return false;
     }

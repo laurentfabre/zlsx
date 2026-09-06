@@ -2239,6 +2239,104 @@ int32_t zlsx_editor_embeddable_rows_ndjson(zlsx_editor_t * ed,
         uint8_t ** out, size_t * out_len,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* ── S3c slice 3: the embedding sweeps (zlsx_status_v1) ─────────────
+ *
+ * Workbook.pruneEmbeddings and Workbook.stripEmbeddings on the editor
+ * handle — what `zlsx embed --prune` and `zlsx embed --strip` run.
+ * Both are staged in memory and committed by zlsx_editor_save. */
+
+/* What zlsx_editor_prune_embeddings did — 40 bytes, struct_size
+ * first (the §3 rule; set it to sizeof before the call). The four
+ * counts of the {"kind":"prune",...} record the CLI prints, in its
+ * order, as uint64_t. */
+typedef struct zlsx_prune_report_v1 {
+    size_t   struct_size;
+    uint64_t redacted;      /* slots turned into tombstones this call */
+    uint64_t stale;         /* content drifted but still embeddable — left as-is */
+    uint64_t fresh;         /* hash matches the row's content */
+    uint64_t valid_empty;   /* a tombstone whose row is still empty */
+} zlsx_prune_report_v1;
+
+/* The redaction sweep: every slot whose row is no longer embeddable
+ * becomes a tombstone (zlsx_emb_tombstone()) and its vector is zeroed;
+ * the coverage's count and range never change (slot i is row
+ * first_row + i, always). Content that drifted but is still
+ * embeddable counts `stale` and is never redacted — deleting a vector
+ * because its text was EDITED would lose data the caller never asked
+ * to lose; re-embed those rows. A workbook with no embedding set, or
+ * a stripped one (the recovery record alone), is ZLSX_OK with every
+ * count 0. Each row is judged through zlsx_editor_embeddable_rows_ndjson's
+ * reading, so a row that read fresh there reads fresh here; a set
+ * with nothing to redact rewrites nothing.
+ *
+ * A staged zlsx_editor_set_cell on a covered row is judged as staged,
+ * never fresh: a blank (empty) cell redacts its slot, any other value
+ * counts `stale`. A covered sheet with staged
+ * zlsx_editor_append_row rows refuses instead — -1
+ * SheetHasUnsavedAppends (the read's rule) — save first. -1
+ * otherwise: InvalidInput (NULL handle), NullOutPointer (NULL report),
+ * StructSizeTooSmall (the report or the diag; the accepted one is
+ * zeroed, the rejected one untouched). -2, the name in the diag with
+ * plane NONE, each before the first part write: MalformedEmbeddingSet
+ * (a set the index read refuses — a coverage range it cannot parse, a
+ * binary part with the wrong magic, a count that disagrees with its
+ * header), MissingEmbeddingPart (the index's rels, or a vec / hash
+ * part it names, gone from the archive), and the read's own verdicts
+ * on a covered cell — MissingRelationship / MissingSheetPart,
+ * MalformedSheetXml, MalformedSharedStringsXml, UnsupportedCellValue,
+ * SstIndexOutOfRange, InvalidUtf8, UnicodeNormalizationFailed — a cell
+ * the read cannot carry stops the sweep whole rather than redact a
+ * row that has text. The redacted parts land in one atomic install
+ * after every row is judged: a -3 in it leaves the set as it was,
+ * never N-1 of N coverages redacted. The recalc transactions
+ * (zlsx_editor_mark_recalc_on_load then save,
+ * zlsx_editor_save_with_recalc, zlsx_editor_recalculate) rebuild
+ * their candidate from the archive as opened and do NOT carry this
+ * sweep: call them before it, or save and re-open (the rule
+ * zlsx_editor_set_embeddings documents). */
+int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
+        zlsx_prune_report_v1 * report,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Remove every embedding artefact: the xl/zlsxEmbeddings/ directory
+ * whole (whatever the archive holds there, not only what the index
+ * names), the workbook→index relationship, and the recovery record
+ * from all three carriers (the hidden _zlsxRecovery defined names,
+ * the docProps/custom.xml property — the part itself only when
+ * nothing else is left in it — and the recovery_in_cells sheet). The
+ * pre-share operation: the result reads ZLSX_EMB_ABSENT, not
+ * ZLSX_EMB_STRIPPED — the caller asked for the nothing. Idempotent;
+ * ZLSX_OK on a workbook that never had embeddings, and on a partially
+ * stripped one.
+ *
+ * The recovery_in_cells sheet, when present, goes through the
+ * editor's own zlsx_editor_delete_sheet path so sheet indices stay
+ * honest, and only then do its rules apply — judged before the first
+ * part is removed: -1 SheetDeleteRequiresCleanState (staged cell
+ * writes or appended rows on any sheet — save first), -2
+ * CannotDeleteLastSheet, and every index above the deleted sheet's
+ * shifts down by one. -1 otherwise: InvalidInput (NULL handle),
+ * StructSizeTooSmall, StructuralEditIncomplete (the editor holds a
+ * torn structural edit — this strip's own delete, or an earlier one;
+ * discard it). -2, the name in the diag with plane NONE:
+ * MalformedWorkbookXml (an xl/workbook.xml the strip of the record's
+ * chunk names cannot walk — judged before the first removal) and the
+ * delete's verdicts should the cells sheet be present
+ * (MissingRelationship, a carrier the cross-sheet sweeps cannot read —
+ * MalformedChartXml, MalformedExtensionXml, ...). A -2 or -3 after the
+ * first removal
+ * leaves the staged set partially stripped: discard the editor
+ * without saving, or call again — the strip is re-runnable, unless
+ * the cells-sheet delete itself tore past its pre-flights: then the
+ * next call and the save refuse StructuralEditIncomplete
+ * (zlsx_editor_delete_sheet's rule — discard the editor). A cell that
+ * merely spells the record's magic is user text and stays. The recalc
+ * transactions rebuild their candidate from
+ * the archive as opened and do NOT carry this strip: call them before
+ * it, or save and re-open. */
+int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
@@ -2250,6 +2348,7 @@ int32_t zlsx_editor_embeddable_rows_ndjson(zlsx_editor_t * ed,
 #define ZLSX_HAS_ROWS_FORMULAS    1   /* reader rows_formula_at + rows_formula_ref_at + rows_error_at (S3b slice 11) */
 #define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 (S3c slice 1) */
 #define ZLSX_HAS_EMBEDDABLE_ROWS  1   /* editor embeddable_rows_ndjson (S3c slice 2) */
+#define ZLSX_HAS_EMBEDDING_SWEEPS 1   /* editor prune_embeddings + strip_embeddings + zlsx_prune_report_v1 (S3c slice 3) */
 
 
 #ifdef __cplusplus

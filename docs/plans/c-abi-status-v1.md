@@ -223,6 +223,21 @@ References are dereferenced before crossing (the evaluator already
 guarantees `.reference` cannot reach a result). Released with
 `zlsx_value_release` (frees `elems` + `payload`).
 
+### 4.8 `zlsx_prune_report_v1` — 40 bytes (S3c slice 3, §20)
+
+| off | type | field |
+|---|---|---|
+| 0 | `size_t` | `struct_size` |
+| 8 | `uint64_t` | `redacted` (slots turned into tombstones this call) |
+| 16 | `uint64_t` | `stale` (content drifted, still embeddable — left as-is) |
+| 24 | `uint64_t` | `fresh` (hash matches the row's content) |
+| 32 | `uint64_t` | `valid_empty` (a tombstone whose row is still empty) |
+
+Caller-owned, nothing to release; `Workbook.PruneReport`'s four `usize`
+counts widened to `uint64_t` so no LLP64 caller narrows a slot count. The
+fields of the `{"kind":"prune",…}` record `zlsx embed --prune` prints, in
+its order.
+
 ## 5. Export signatures
 
 ```c
@@ -1804,3 +1819,334 @@ refusing the other sheet too) plus a misplaced cell outside the range;
 an error cell carried as its literal; six shape errors; the closed
 editor and the older-dylib `RuntimeError`; the probe against the
 version.
+
+## 20. S3c slice 3 — the embedding sweeps (2026-09-06)
+
+`Workbook.pruneEmbeddings` and `Workbook.stripEmbeddings` cross the
+boundary on the editor handle — the third and last S3c export pair on the
+mutation side, under the §2 contract. Two exports, one header macro, one
+probe, one new struct (§4.8):
+
+| Export | Probe (`_ffi.py`) | Header macro |
+|---|---|---|
+| `zlsx_editor_prune_embeddings(ed, report, diag, errbuf, errbuf_len) → int32_t` | `_HAS_EMBEDDING_SWEEPS` (+ `zlsx_diag_release`) | `ZLSX_HAS_EMBEDDING_SWEEPS` |
+| `zlsx_editor_strip_embeddings(ed, diag, errbuf, errbuf_len) → int32_t` | `_HAS_EMBEDDING_SWEEPS` (+ `zlsx_diag_release`) | `ZLSX_HAS_EMBEDDING_SWEEPS` |
+
+**The shape is the CLI's** (decision S3c-7): what `zlsx embed --prune` and
+`zlsx embed --strip` run, on the S3a status_v1 shape — no arguments beyond
+the handle, staged in memory, `zlsx_editor_save` commits. Prune's result is
+the point of running it, so it crosses as a caller-owned
+`zlsx_prune_report_v1` (§4.8; a struct rather than four out-pointers, so a
+fifth count can append under the §3 rule): the four counts of the CLI's
+`{"kind":"prune",…}` record, in its order, as `uint64_t`; NULL is
+`NullOutPointer` (the S3b reads' name for a missing output), and the report
+is prepped beside the diag before anything is judged — a rejected
+`struct_size` on either leaves the accepted one zeroed and the rejected one
+untouched byte for byte. Python returns the report as a dict with the same
+four keys (`Editor.prune_embeddings()`), and `Editor.strip_embeddings()`
+returns nothing; both reach the Zig layer through the one `_structural_call`
+helper the S3a exports use. A workbook with no set, or a stripped one (the
+recovery record alone), prunes to every count 0 with ZLSX_OK; a strip on a
+workbook without embeddings is ZLSX_OK and stages nothing (the save is the
+untouched editor's passthrough, pinned byte for byte on every surface); a
+sweep with nothing to redact rewrites nothing.
+
+**The refusal split** (decision S3c-8) is §10's rule. `-1`, statements
+about the call: `InvalidInput` (NULL handle), `NullOutPointer`,
+`StructSizeTooSmall`, `SheetHasUnsavedAppends` (prune: a covered sheet
+with staged `append_row` rows — the read's rule, see below) and
+`SheetDeleteRequiresCleanState` (strip: staged cell writes or appended
+rows on any sheet while a `recovery_in_cells` sheet has to go — the
+delete's sequencing statement, `zlsx_editor_delete_sheet`'s own `-1`).
+`-2`, statements about the workbook, the name in the diag with `plane =
+NONE`, each before the first part write or removal: two new entries in
+`structural_refusals` — `MalformedEmbeddingSet` and `MissingEmbeddingPart`
+— plus, on prune, the embeddable-rows read's own verdicts on a covered cell
+(`MissingRelationship` / `MissingSheetPart`, `MalformedSheetXml`,
+`MalformedSharedStringsXml`, `UnsupportedCellValue`, `SstIndexOutOfRange`,
+`InvalidUtf8`, `UnicodeNormalizationFailed`: a cell the read cannot carry
+stops the sweep whole rather than redact a row that has text — §19's rule,
+the same `columnCellsOverRange` / `classifySlot` reading), and, on strip,
+`MalformedWorkbookXml` (an `xl/workbook.xml` the chunk-name strip cannot
+walk — the slice-1 REL-501 shape), `CannotDeleteLastSheet` and the sheet
+delete's verdicts should the cells sheet be present (`MissingRelationship`, a
+carrier the cross-sheet sweeps cannot read — `MalformedChartXml`,
+`MalformedExtensionXml`, …). `-3`: the sweeps' allocating writers and
+`allocPrint` spell an allocation failure `WriteFailed`, folded to
+`OutOfMemory` at the boundary (`failSweep`, the §19
+`embeddableRowsNdjsonOwned` rule; nothing else on either path raises the
+name). Neither new `-2` name is raised by any other status_v1 export
+(`setEmbeddings` never reads the index; the E5 read handle `zlsx_emb_open`
+is a pointer-returning open and keeps the parser's own names in errbuf), so
+the global classifier changes no shipped verdict.
+
+**`MalformedEmbeddingSet`, and why the sweep folds** (the §19
+`UnsupportedCellValue` / `MalformedSharedStringsXml` precedent): the index
+read (`Workbook.embeddings`) raises the embedding parser's own names — a
+coverage `@range` it cannot parse is `InvalidRange`, a `dtype` it does not
+know `InvalidDtype`, a `vec.bin` with the wrong magic `BadMagic`, a count
+that disagrees with its header `CountMismatch` / `CoverageCountMismatch` —
+and `zlsx_editor_set_embeddings` spells several of those same names for a
+statement about ITS inputs, pinned `-1` since slice 1. From a sweep they
+are statements about the workbook, so `pruneEmbeddings` folds every
+`embedding_part.Error` name the index read raises under
+`MalformedEmbeddingSet` (`embeddingSetVerdict`, `isEmbeddingPartError` over
+the parser's error set — one rule, no list to drift) and keeps the read's
+`MissingEmbeddingPart` (the index's rels, or a vec / hash part it names,
+gone) and the archive's own verdicts; the two defensive bounds inside the
+walk (`hashes.value`, `redactSlot`) spell the same name. The read side is
+unchanged: `zlsx_emb_open` on the same file reports `InvalidRange`, pinned
+beside the sweep's verdict on every surface.
+
+**The mirror-safe strip** (decision S3c-9): the `recovery_in_cells`
+carrier is a hidden sheet, and `Workbook.stripEmbeddings` deleted it
+through `Workbook.deleteSheet` — beneath the Editor's `sheet_paths`
+mirror, which then held one entry more than the workbook: an index the
+mirror read as one sheet and the workbook as another, a `set_cell` after
+the strip landing on the wrong sheet, and the next `add_sheet` compounding
+it (the CLI's `--strip` opened fresh, saved at once and never met it).
+`Editor.stripEmbeddings` (new) deletes that sheet through the Editor's own
+`deleteSheet` first — its pre-flights (`SheetDeleteRequiresCleanState`,
+`CannotDeleteLastSheet`, allocated-before-mutation, the S3a REL-402 rule)
+ahead of the first removal, the doomed part removed the way the workbook's
+own path removes it — and the workbook sweep then finds nothing left to
+delete; the strip's own `xl/workbook.xml` verdict is judged ahead of the
+delete as a pure check (`Workbook.preflightEmbeddingStrip`). The export and
+the CLI both run through it: one path.
+
+**Two Zig-layer holes the export exposed** (the `Workbook.stripEmbeddings`
+contract, every surface at once — `zlsx embed --strip` included):
+
+- A strip of a SAVED `recovery_in_cells` set read back `.stripped` with the
+  whole record. The record reader scans every worksheet part and
+  `xl/sharedStrings.xml` for the record text (a Numbers export lifts the
+  cell's string into the table), and a save does the same to the recovery
+  cell — so deleting the sheet left the string in the table and the
+  reader found it. The in-memory pin ("strip: removes the recovery sheet
+  the cell opt-in creates") never saved, so the cell was still staged and
+  vanished with the sheet; the C test on a saved fixture found it.
+  `scrubRecoveryCellText` now blanks the record in place wherever the
+  reader would find it (the table and every worksheet part — an inline
+  string, a renumbered sheet, an orphaned part), through the reader's own
+  locator (`recovery_record.recordSpanInText`, factored out of
+  `findRecordInText` so what one finds the other blanks), so no
+  shared-string index moves; and `removeRecoveryCellSheet` removes the
+  doomed sheet's part, which `deleteSheet` leaves as an orphan by design.
+  Pinned on the Zig layer (the table's bytes before and after: one span
+  gone, every other byte kept), the Editor, the C surface and Python
+  (`absent` after a strip is the goal line).
+- Every verdict the strip can give fired AFTER the first removal: the
+  chunk-name strip walked `xl/workbook.xml` after the parts and the
+  relationship were gone, and the sheet delete ran last — a refusal left
+  the vectors gone and the record standing, or the parts gone and the
+  sheet standing. The strip now prepares the name strip first (the
+  slice-1 pass-1 shape: `prepareRecoveryNameStrip` before the first
+  removal, `commitRecoveryNameStrip` in place of the old one-shot) and,
+  when a cells sheet is present, judges the pure verdict, deletes the
+  sheet (whose own verdicts then precede every removal) and prepares the
+  name strip over the post-delete bytes — the order matters: a strip
+  prepared before the delete would commit the deleted `<sheet>` back.
+  Pinned with the store's mutation counter unchanged after each refusal,
+  with and without the cells sheet, on every surface.
+
+**One prune rule** the export needed: a covered sheet with staged appended
+rows now refuses (`SheetHasUnsavedAppends`) before the first part write.
+The parsed view the sweep walks does not carry `Worksheet.appended_rows`,
+so a slot for a row they will become classified as gone and was redacted
+— the §19 shape, on the sweep. Staged `setCell` deltas are judged as they
+were (`classifySlot`: a blank redacts, any other value is `stale`, never
+`fresh`), the documented `setCell(.blank)` → `prune` → `save` sequence.
+Appended rows on an uncovered sheet do not touch the sweep.
+
+**Round 1** (two agents; A ship-ready with 1 MEDIUM + 4 LOW, B not
+ship-ready on 1 MEDIUM + 4 LOW; every fix in the round-1 commit, each
+pinned on the surface that found it): `pruneEmbeddings` re-parsed the
+index rels into a fixed 64-entry buffer and spelled every parse failure —
+`BufferTooSmall` at the 65th relationship included — `MissingEmbeddingPart`,
+so a set of 33+ coverages that `embeddings()` accepts through its grow loop
+refused the sweep on every surface under a name the docs define as "a part
+gone from the archive" (A REL-101, pre-existing on the Zig / CLI path) →
+`EmbeddingView` carries `rels` (the retained grow-loop storage, borrowed
+like the coverages) and the sweep resolves part names from the view;
+pinned with 33 single-row coverages. The scrub replaced worksheet parts
+and the table without dropping `Worksheet.parsed` / `sst_view`, and a save
+with staged deltas regenerates `<sheetData>` from the view — prune (parses
+the covered sheet) → strip → `setCell` → save wrote an inline record back
+and the file read `.stripped` (B REL-101) → `dropViewOverPart`, the
+every-other-replace-site shape; pinned in the table's shape and the
+inline one. The scrub blanked every locator hit while the reader honours
+only a span it can decode under its 3 200-byte cap — a cell that merely
+spelled `zlsxER1` was cut by a strip advertised as a no-op (A + B REL-102)
+→ `recordSpanDecodes`, the reader's own gates (`recovery_record.decode`
+under the same grow loop) before a span is blanked; pinned on the Zig
+layer and Python (`see zlsxER1 for the magic`, `xzlsxER1abc`, the
+passthrough byte for byte). `PartStore.hasUnsavedChanges` saw overrides
+only and `removePart` installs none, so a strip whose only store mutation
+was removals — a foreign package with the parts under `<Default>` content
+types, no relationship, no record — saved the source bytes with every
+vector intact and reported OK (A REL-103 / B REL-105, pre-existing on the
+CLI path; no zlsx-written file reaches it) → the store counts committed
+removals (`removed`) and the predicate ORs it in; pinned store-level (a
+removal with no override, no relationship) and end-to-end in Python (the
+foreign shape strips to `absent`, the archive without the parts). The
+scrub decompressed every worksheet part into the store arena on every
+strip, the documented no-op included (B PERF-103) → `StripScope`: the
+table is always scrubbed (where zlsx's writer and a Numbers export put the
+string), the worksheet parts only for a workbook that carried the
+`zlsxRecovery` sheet at entry (the Editor passing what it saw before its
+own delete), `_rels` files skipped — recorded: a user-RENAMED recovery
+sheet holding an INLINE record is not scanned (its table string still is).
+B's notes taken: the sweep's final loop installed the redacted parts one
+`replacePart` at a time, so an allocation failure landed N−1 of N — now
+`PartStore.replaceParts`, the atomic install, and the "-3 after the first
+part write" clause is gone from every surface; `embeddingSetVerdict`
+names the error names the parser shares with the workbook vocabulary
+(`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`) so a future workbook-level raise inside `embeddings()`
+is not folded by accident; a NULL report beside a rejected diag is two
+-1s and errbuf carries the later (`NullOutPointer`). Docs (A + B DOC-104,
+A DOC-105): the Python README still called the sweeps "CLI / Zig-only
+today" above the paragraph that ships them; "a blank or deleted cell" (no
+C delete export) → "a blank (empty) cell"; "call again — the strip is
+re-runnable" did not hold when the cells-sheet delete tore past its
+pre-flights — `StructuralEditIncomplete` on the retry and on the save —
+so the strip's -1 vocabulary names it on every surface and the clause
+says discard; `MalformedContentTypes` dropped from the strip's -2 list
+(unreachable: `removeContentTypeOverride` allocates only).
+
+**Round 2** (two agents on the round-1 tree; both ship-ready, A 2 LOW,
+B 4 LOW — every round-1 fix verified in code and by the test that fails
+on its revert; fixes in the round-2 commit): the `StripScope` gate took
+its evidence from the live sheet list alone, so a strip torn by a `-3`
+between the cells-sheet delete and the scrub (or a hidden sheet a user
+had already deleted) left an orphaned worksheet part the reader still
+scans out of the retry's scope — "call again" under-delivered for an
+inline-string orphan (A + B REL-201) → `hasOrphanWorksheetPart`: a
+worksheet part no `<sheet>` resolves to is evidence too, OR-ed into the
+scope on both paths; pinned with an orphan holding an inline record and
+no `zlsxRecovery` sheet stripping to `.absent`. The Editor removed the
+doomed part under the mirror's spelling (`Book.sheets[i].path`, no
+dot-segment collapse) where the workbook's path uses `resolvePartName`
+(B MAINT-201) → the workbook's spelling on both, and the Editor pin
+asserts the part present before the strip so the removal pin is not
+vacuous (A's note). Docs (A + B DOC-201/202): §20 still listed
+`MissingContentTypes` / `MalformedContentTypes` as strip refusals —
+neither can fire on the strip path (`removePart` resolves the part it
+then `part()`s) — dropped from every surface; the Python count read 20
+where the file holds 22; the lenient-reader claim named a pin that read
+a stripped file whose table carried no record — the Zig typed-views pin
+now reads the SCRUBBED table through the lenient reader. Recorded (B):
+the reader honours only the first magic per part and stops at the first
+part with one, so a user span sorting before a real record hides it from
+the read while the scrub blanks every decodable span (the safe
+direction); a foreign producer writing two `zlsxRecovery` sheets sees
+the second deleted beneath the mirror (illegal OOXML); a re-embed across
+a save leaves the previous generation's `<si>` unreferenced in the table
+and a `.stripped` read reports the OLDEST record (slice-1 territory);
+`recoverEmbeddingRecord`'s own `BufferTooSmall` (a record past 1 MiB of
+scratch — unreachable under the 3 200-byte carrier bound) would fold
+under `MalformedEmbeddingSet`.
+
+**Round 3** (two agents on the round-2 tree, the convergence round; both
+ship-ready, A 3 LOW, B 2 LOW — every earlier fix verified in code and by
+its reverting test; fixes in the round-3 commit): the round-2 orphan
+check resolved every sheet's part with `try`, so a `<sheet>` whose
+relationship the workbook lacks — a shape `Workbook.open` admits and
+`main` stripped clean — refused the strip `MissingRelationship`, a name
+the four surfaces reserve for the cells-sheet delete (A + B REL-301) → an
+unresolvable sheet is reason to scan wider, never a verdict (only an
+allocation failure keeps its name); pinned with a dangling `r:id` on
+the Zig surface (the Editor / C / Python / CLI refuse that workbook at
+open, `SheetCountMismatch`). The round-2 Editor fix — the doomed part
+removed under `resolvePartName`'s spelling — had no fixture on which
+the mirror's and the workbook's spellings differ, so a revert to
+`sheet_paths[idx]` passed the suite (A MAINT-302 / B TEST-301) → tried:
+a relationship Target with a dot segment (`./worksheets/sheet2.xml`) is
+refused at `Editor.open` (`MissingSheet` — no ZIP entry under the
+verbatim spelling), so the shape on which the two spellings differ is
+unreachable through the Editor; the one-spelling rule stays as
+consistency with the workbook path, recorded on the code and here, and
+the pin asserts the mirror's and the workbook's spellings agree on the
+fixture. Docs
+(A DOC-303): the c_abi comment still named "a content-types part a
+removal cannot patch" as a post-removal -2 (dropped from the header in
+round 2) — gone; the fold comment and this section listed the names the
+parser shares with the workbook vocabulary from memory — now the exact
+set (`MissingRelationship`, `InvalidUtf8`, `UnicodeNormalizationFailed`, `BufferTooSmall`, `InvalidXmlByte`).
+
+**Round 4** (two agents on the round-3 tree, the confirmation round): A
+converged — every vector "ANALYSED — no defect", every earlier fix
+verified in code and by its reverting test; B ship-ready with one doc
+LOW (DOC-401: this census listed eight of the ten `pkg/workbook.zig`
+slice-3 tests — the round-2 orphan pin and the round-3 dangling-`r:id`
+pin were missing; fixed here) and confirmed the round-3 `catch` swallows
+only `MissingRelationship`, the sole non-OOM name `resolvePartName` can
+raise, with nothing downstream re-resolving a sheet.
+
+**Recorded, outside the slice**: the recalc transactions
+(`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
+`zlsx_editor_recalculate`) rebuild their candidate from the archive as
+opened and carry neither sweep, as they carry no `set_embeddings` (slice
+1's recorded follow-up — the ordering rule is on every surface's
+documentation of the write; the sweeps inherit it). `recovery_in_cells` on
+the write side is still Zig-only (`Workbook.setEmbeddingsOpts` adds its
+hidden sheet beneath the Editor's mirror; the strip side of that path is
+what this slice built). The CLI vector / state dump.
+
+**Tests** (`src/c_abi.zig`, "S3c prune_embeddings …" ×4, "S3c
+strip_embeddings …" ×3, "S3c sweeps …" ×1; round-1 pins on the Zig layer
+and Python — `pkg/workbook.zig` "S3c slice 3 r1 …" ×4: 33 coverages
+through the view's relationships, the typed views dropped by the scrub in
+both shapes with a staged edit and a save reading `.absent`, a cell that
+merely spells the magic left with the store's mutation counter unchanged
+under both scopes, a removal with no override and no relationship flipping
+`hasUnsavedChanges`; `test_embedding_sweeps.py` +2, 22: the magic-only
+cell's passthrough and the lenient read of it, the foreign package whose
+only change is removals stripping to `absent` with the archive lacking
+the parts; the lenient reader over a stripped file's cells on the strip
+test — and, in round 2, over the SCRUBBED table in the Zig
+typed-views pin): the read's hashes pruning all
+fresh with the passthrough save byte for byte, a staged blank redacting and
+a staged string stale, the saved tombstone over a zeroed vector through
+`zlsx_emb_hashes` / `zlsx_emb_vectors` and `valid_empty` on the re-open; a
+row blanked on disk, an edited row stale with nothing rewritten, a workbook
+without a set all zeros; NULL handle, NULL report, a rejected `struct_size`
+on either output (the report untouched byte for byte, the diag prepped;
+the diag rejected, the report zeroed), appended rows on the uncovered sheet
+ignored and on the covered sheet `-1`; six `-2` patches (the index's
+`range` and `dtype`, the vec part's magic, the rels target, a cell without
+`r`, a boolean `<v>`) with the name in the diag, plane NONE, the
+passthrough save after each and the E5 read handle keeping the parser's
+own name; the strip to ABSENT with every carrier checked in the archive,
+twice, the cells still served and the no-set strip a passthrough; the
+`recovery_in_cells` sheet through the mirror (`add_sheet` at 2, a write
+landing there, ABSENT after the save, the dirty editor `-1` with the set
+and the sheet still standing); the `xl/workbook.xml` verdict with and
+without the cells sheet, the passthrough after each; the plane of every
+verdict, the parser's names `-1`, `WriteFailed` `-3`.
+`pkg/workbook.zig` ("S3c slice 3 …" ×4, "S3c slice 3 r1 …" ×4, "S3c slice 3
+r2 …" ×1, "S3c slice 3 r3 …" ×1 — ten): the fold on five patches with the
+read keeping the parser's name and the store's mutation counter unchanged;
+appended rows covered and uncovered; the SAVED cells strip to `.absent`
+with the table blanked in place (one span gone, every other byte kept),
+the orphan gone, the cells served and the second strip changing nothing;
+the workbook.xml verdict before the first removal with and without the
+cells sheet; the round-1 four (33 coverages, the typed views dropped in
+both shapes with the lenient read over the scrubbed table, the magic-only
+cell left under both scopes, a removal flipping `hasUnsavedChanges`); the
+round-2 orphan holding an inline record with no `zlsxRecovery` sheet
+stripping to `.absent`; the round-3 dangling `r:id` widening the scan
+and stripping clean. `pkg/editor.zig` ×1: the mirror in step after the strip (a
+sheet added at 1, a write landing on it, read back from the saved file),
+the orphan gone, the dirty editor refusing with nothing removed.
+`tests/c_abi_smoke.c` `#error`s without the macro, pins the 40-byte
+layout and takes both addresses. Python (`test_embedding_sweeps.py`, 22 — 14 tests, one an 8-case parametrize):
+the goal line — the read's hashes prune all fresh and a stripped file
+reads `absent`; the report's keys and a workbook without a set; a row
+blanked on disk with the tombstone and the zeroed vector read back; an
+edited row stale with the passthrough; the staged `set_cell` shapes; the
+append refusal on the covered sheet only; a set stripped by a tool pruning
+to zeros then stripping to `absent`; eight `ZlsxRefusal`s through
+zipfile-patched copies with the passthrough after each and the read
+keeping the parser's name; the strip's carriers in the archive, idempotent,
+a no-op without a set; the `MalformedWorkbookXml` pre-flight; the closed
+editor, the older-dylib `RuntimeError`, the probe against the version.

@@ -3790,7 +3790,11 @@ fn runEmbedCommand(
     defer ed.deinit();
 
     if (args.strip) {
-        ed.workbook.stripEmbeddings() catch |e| {
+        // The Editor's strip, not the workbook's: the `recovery_in_cells`
+        // sheet goes through the Editor's own delete, so the sheet
+        // mirror the save consults stays in step (one path with the C
+        // surface, S3c slice 3).
+        ed.stripEmbeddings() catch |e| {
             try err.print("zlsx: embed --strip: {s}\n", .{@errorName(e)});
             try err.flush();
             return 3;

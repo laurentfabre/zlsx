@@ -68,6 +68,9 @@
 #if !defined(ZLSX_HAS_EMBEDDABLE_ROWS)
 #error "ZLSX_HAS_EMBEDDABLE_ROWS missing"
 #endif
+#if !defined(ZLSX_HAS_EMBEDDING_SWEEPS)
+#error "ZLSX_HAS_EMBEDDING_SWEEPS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -174,3 +177,16 @@ static const void *const s3c2_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3c2(void);
 const void *zlsx_c_abi_smoke_anchor_s3c2(void) { return s3c2_exports[0]; }
+
+/* S3c slice 3: the embedding sweeps on the editor handle. */
+_Static_assert(sizeof(zlsx_prune_report_v1) == 40, "zlsx_prune_report_v1 is 40 bytes");
+_Static_assert(offsetof(zlsx_prune_report_v1, redacted) == 8, "redacted at 8");
+_Static_assert(offsetof(zlsx_prune_report_v1, stale) == 16, "stale at 16");
+_Static_assert(offsetof(zlsx_prune_report_v1, fresh) == 24, "fresh at 24");
+_Static_assert(offsetof(zlsx_prune_report_v1, valid_empty) == 32, "valid_empty at 32");
+static const void *const s3c3_exports[] = {
+    (const void *)&zlsx_editor_prune_embeddings,
+    (const void *)&zlsx_editor_strip_embeddings,
+};
+const void *zlsx_c_abi_smoke_anchor_s3c3(void);
+const void *zlsx_c_abi_smoke_anchor_s3c3(void) { return s3c3_exports[0]; }

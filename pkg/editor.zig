@@ -744,6 +744,47 @@ pub const Editor = struct {
         return self.workbook.stripDocProps(mask);
     }
 
+    /// `Workbook.stripEmbeddings` on the editor: every embedding
+    /// artefact and the recovery record go, the sheet mirror kept in
+    /// step. The `recovery_in_cells` carrier is a hidden sheet, and
+    /// the workbook's own sweep deletes it beneath `sheet_paths` — an
+    /// index the mirror would then read as one sheet and the workbook
+    /// as another, a `setCell` after the strip landing on the wrong
+    /// sheet. So that sheet goes through `deleteSheet` first — its
+    /// pre-flights (a clean editor, `SheetDeleteRequiresCleanState`;
+    /// never the last sheet, `CannotDeleteLastSheet`) judged before
+    /// the first part is removed — and the workbook sweep finds
+    /// nothing left to delete. Idempotent, and a no-op on a workbook
+    /// without embeddings, as the workbook's is.
+    pub fn stripEmbeddings(self: *Editor) !void {
+        const cells_sheet = self.workbook.recoveryCellSheetIndex();
+        if (cells_sheet) |idx| {
+            // The strip's own verdict on `xl/workbook.xml`, judged
+            // before the delete installs anything — the workbook's
+            // strip judges it first too, but runs after the delete
+            // on this path.
+            try self.workbook.preflightEmbeddingStrip();
+            // The doomed sheet's part: `deleteSheet` leaves it as an
+            // orphan (its documented trade-off), and for this sheet
+            // the orphan is the evidence the strip exists to remove —
+            // the workbook's own path removes it the same way, under
+            // the workbook's spelling of the name (the store's resolver
+            // collapses dot segments; the mirror's `sheet_paths` does
+            // not — in-house S3c slice 3 r2 MAINT-201; a Target on
+            // which the two differ is refused at open, `MissingSheet`,
+            // so this is consistency, not a reachable fix).
+            const ws = try self.workbook.sheet(idx);
+            const part = try self.allocator.dupe(u8, try ws.resolvePartName());
+            defer self.allocator.free(part);
+            try self.deleteSheet(idx);
+            try self.workbook.store.removePart(part);
+        }
+        // The workbook's scrub scans the worksheet parts only for a
+        // workbook that carried the cells sheet — which this path has
+        // just deleted, so it says what it saw.
+        try self.workbook.stripEmbeddingsScoped(.{ .worksheet_parts = cells_sheet != null });
+    }
+
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {
         if (self.sheet_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
 
@@ -11235,5 +11276,109 @@ test "Editor: chart series formulas ride every structural edit; a carrier the wa
         try std.testing.expectError(error.MalformedChartXml, ed.deleteSheet(0));
         try std.testing.expect(!ed.workbook.hasUnsavedChanges());
         try std.testing.expect(!ed.workbook.torn_edit);
+    }
+}
+
+// ─── S3c slice 3: the strip on the editor handle ────────────────────
+
+test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet through the mirror — indices stay honest, the orphan goes, a dirty editor refuses before the first removal" {
+    const a = std.testing.allocator;
+    const recovery_record = @import("recovery_record.zig");
+    const embedding_part = @import("embedding_part.zig");
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/cells.xlsx", .{dir});
+    defer a.free(path);
+    const out = try std.fmt.allocPrint(a, "{s}/cells_out.xlsx", .{dir});
+    defer a.free(out);
+    {
+        var wb = try Workbook.empty(a, io);
+        defer wb.deinit();
+        const ws = try wb.addSheet("Items");
+        try ws.appendRows(&[_][]const Cell{&.{.{ .string = "Title" }}});
+        try ws.appendRows(&[_][]const Cell{&.{.{ .string = "Alpha" }}});
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(a);
+        const hashes = [_]u64{try embedding_part.xxh3Canonical(a, "worksheets/sheet1.xml", 2, .{ .string = "Alpha" }, &scratch)};
+        const vecs = [_]f32{ 1, 2 };
+        const body = try embedding_part.encodeVectorBody(a, .f32, 2, &vecs);
+        defer a.free(body);
+        try wb.setEmbeddingsOpts("m", 2, .f32, &[_]workbook_mod.EmbeddingCoverageInput{.{
+            .id = "title",
+            .worksheet_target = "worksheets/sheet1.xml",
+            .range = "A2:A2",
+            .column = "A",
+            .include_formulas = false,
+            .vec_body = body,
+            .hashes = &hashes,
+        }}, .{ .recovery_in_cells = true });
+        try wb.save(io, path);
+    }
+    // A relationship Target spelled with a dot segment (the shape on
+    // which the mirror's `sheet_paths` and the store's collapsed
+    // spelling differ) is refused at `Editor.open` — `MissingSheet`,
+    // no ZIP entry under the verbatim spelling — so the one-spelling
+    // rule in `stripEmbeddings` has no reachable pin through this
+    // surface (in-house S3c slice 3 r3 TEST-301, tried and recorded).
+    const doomed = "xl/worksheets/sheet2.xml";
+    {
+        var ed = try Editor.open(a, io, path);
+        defer ed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+        try std.testing.expectEqualStrings(doomed, ed.sheet_paths[1]);
+        try std.testing.expectEqual(@as(?u32, 1), ed.workbook.recoveryCellSheetIndex());
+        try std.testing.expect((try ed.workbook.store.part(doomed)) != null);
+
+        try ed.stripEmbeddings();
+
+        try std.testing.expectEqual(@as(usize, 1), ed.sheet_paths.len);
+        try std.testing.expectEqual(@as(u32, 1), ed.workbook.sheetCount());
+        try std.testing.expect((try ed.workbook.embeddings()) == .absent);
+        try std.testing.expect((try ed.workbook.store.part(doomed)) == null);
+        try std.testing.expect((try ed.workbook.sheetByName(recovery_record.CELL_SHEET_NAME)) == null);
+        // Saved as is, the orphan is gone from the archive too.
+        const out_stripped = try std.fmt.allocPrint(a, "{s}/cells_stripped.xlsx", .{dir});
+        defer a.free(out_stripped);
+        try ed.save(io, out_stripped);
+        {
+            var saved = try Workbook.open(a, io, out_stripped);
+            defer saved.deinit();
+            try std.testing.expect((try saved.store.part(doomed)) == null);
+            try std.testing.expect((try saved.embeddings()) == .absent);
+        }
+        // The mirror and the workbook agree on the next index, and a
+        // write to it lands there.
+        try std.testing.expectEqual(@as(u32, 1), try ed.addSheet("New"));
+        try ed.setCell(1, 1, 0, .{ .string = "x" });
+        try ed.save(io, out);
+    }
+    {
+        var wb = try Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expect((try wb.embeddings()) == .absent);
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        const new = (try wb.sheetByName("New")) orelse return error.TestUnexpectedResult;
+        const part = try new.resolvePartName();
+        var rows = try wb.embeddableRows(a, part["xl/".len..], "A1:A1", "A", false);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqualStrings("x", rows.rows[0].text);
+    }
+    // Dirty: the delete's own pre-flight, before the first removal.
+    {
+        var ed = try Editor.open(a, io, path);
+        defer ed.deinit();
+        try ed.setCell(0, 5, 0, .{ .string = "z" });
+        const before = ed.workbook.store.mutations;
+        try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.stripEmbeddings());
+        try std.testing.expectEqual(before, ed.workbook.store.mutations);
+        try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+        try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
+        try std.testing.expect((try ed.workbook.embeddings()) == .present);
     }
 }
