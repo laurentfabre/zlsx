@@ -767,8 +767,12 @@ pub const Editor = struct {
             // The doomed sheet's part: `deleteSheet` leaves it as an
             // orphan (its documented trade-off), and for this sheet
             // the orphan is the evidence the strip exists to remove —
-            // the workbook's own path removes it the same way.
-            const part = try self.allocator.dupe(u8, self.sheet_paths[idx]);
+            // the workbook's own path removes it the same way, under
+            // the workbook's spelling of the name (the store's resolver
+            // collapses dot segments; the mirror's `sheet_paths` does
+            // not — in-house S3c slice 3 r2 MAINT-201).
+            const ws = try self.workbook.sheet(idx);
+            const part = try self.allocator.dupe(u8, try ws.resolvePartName());
             defer self.allocator.free(part);
             try self.deleteSheet(idx);
             try self.workbook.store.removePart(part);
@@ -11320,6 +11324,7 @@ test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet th
         try std.testing.expectEqual(@as(?u32, 1), ed.workbook.recoveryCellSheetIndex());
         const doomed = try a.dupe(u8, ed.sheet_paths[1]);
         defer a.free(doomed);
+        try std.testing.expect((try ed.workbook.store.part(doomed)) != null);
 
         try ed.stripEmbeddings();
 

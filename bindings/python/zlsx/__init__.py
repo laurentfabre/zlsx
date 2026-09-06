@@ -4738,9 +4738,9 @@ class Editor:
         discard it). Refusals otherwise:
         ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the strip of
         the record's chunk names cannot walk — judged before the first
-        removal), ``MissingContentTypes``, and the delete's verdicts
-        should the cells sheet be present (``MissingRelationship``, a
-        carrier the cross-sheet sweeps cannot read —
+        removal) and the delete's verdicts should the cells sheet be
+        present (``MissingRelationship``, a carrier the cross-sheet
+        sweeps cannot read —
         ``MalformedChartXml``, ``MalformedExtensionXml``, …). A failure
         after the first removal leaves the staged set partially
         stripped: discard the editor without saving, or call again —

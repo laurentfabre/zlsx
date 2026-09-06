@@ -10894,12 +10894,11 @@ export fn zlsx_editor_prune_embeddings(
 /// one; discard it). -2, the name in the diag with plane NONE:
 /// `MalformedWorkbookXml` (an `xl/workbook.xml` the strip of the
 /// record's chunk names cannot walk — judged before the first
-/// removal), the package's own `MissingContentTypes`, and the
-/// delete's verdicts should the cells sheet be present
-/// (`MissingRelationship`, a carrier the cross-sheet sweeps cannot
-/// read — `MalformedChartXml`, `MalformedExtensionXml`, …). A -2 or
-/// -3 after the first removal (an allocation failure, a content-types
-/// part a removal cannot patch) leaves the staged set partially
+/// removal) and the delete's verdicts should the cells sheet be
+/// present (`MissingRelationship`, a carrier the cross-sheet sweeps
+/// cannot read — `MalformedChartXml`, `MalformedExtensionXml`, …). A
+/// -2 or -3 after the first removal (an allocation failure, a
+/// content-types part a removal cannot patch) leaves the staged set partially
 /// stripped: discard the editor without saving, or call again — the
 /// strip is re-runnable, unless the cells-sheet delete itself tore
 /// past its pre-flights: then the next call and the save refuse

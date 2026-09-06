@@ -2878,8 +2878,17 @@ pub const Workbook = struct {
         worksheet_parts: bool,
     };
 
-    /// `stripEmbeddings` with the scrub's scope spelled by the caller.
-    pub fn stripEmbeddingsScoped(self: *Workbook, scope: StripScope) Error!void {
+    /// `stripEmbeddings` with the scrub's scope spelled by the caller —
+    /// widened here by the workbook's own evidence: a worksheet part no
+    /// `<sheet>` resolves to. A strip torn between the cells sheet's
+    /// delete and its part's removal (or a hidden sheet a user deleted)
+    /// leaves such an orphan, which the record reader still scans, and
+    /// a retry that judged scope by the live sheet list alone left it
+    /// out (in-house S3c slice 3 r2 REL-201).
+    pub fn stripEmbeddingsScoped(self: *Workbook, scope_in: StripScope) Error!void {
+        const scope: StripScope = .{
+            .worksheet_parts = scope_in.worksheet_parts or try self.hasOrphanWorksheetPart(),
+        };
         // The cells carrier's sheet goes first: its delete rewrites
         // `xl/workbook.xml`, so the chunk-name strip must be prepared
         // AFTER it (a strip prepared before would commit the deleted
@@ -3559,6 +3568,33 @@ pub const Workbook = struct {
             try self.store.replacePart(n, out.items);
             self.dropViewOverPart(n);
         }
+    }
+
+    /// Whether the archive holds a worksheet part no `<sheet>` resolves
+    /// to — `deleteSheet`'s orphan, or a foreign package's. Resolves
+    /// every sheet's part name (the cached rels lookup, no sheet bytes
+    /// read) and compares against the `xl/worksheets/` listing.
+    fn hasOrphanWorksheetPart(self: *Workbook) Error!bool {
+        var live: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer live.deinit(self.allocator);
+        var i: u32 = 0;
+        while (i < self.sheetCount()) : (i += 1) {
+            const ws = try self.sheet(i);
+            try live.append(self.allocator, try ws.resolvePartName());
+        }
+        for (self.store.parts) |p| {
+            if (!std.mem.startsWith(u8, p.name, "xl/worksheets/")) continue;
+            if (std.mem.endsWith(u8, p.name, ".rels")) continue;
+            var referenced = false;
+            for (live.items) |name| {
+                if (std.mem.eql(u8, name, p.name)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) return true;
+        }
+        return false;
     }
 
     /// Whether a span the locator found (still XML-escaped) is a record
@@ -29939,6 +29975,17 @@ test "S3c slice 3 r1: the scrub drops the typed views it invalidates — prune, 
             const bytes = ((try wb.store.part(p.name)) orelse continue).bytes;
             try std.testing.expect(recovery_record.recordSpanInText(bytes) == null);
         }
+        // The lenient reader over the scrubbed table: the entry the
+        // scrub blanked reads as an empty string, every other cell as
+        // it was.
+        var book = try zlsx.Book.open(a, io, out);
+        defer book.deinit();
+        var rows = try book.rows(book.sheets[0], a);
+        defer rows.deinit();
+        const first = (try rows.next()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("Title", first[0].string);
+        const second = (try rows.next()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("Alpha", second[0].string);
     }
 }
 
@@ -30005,4 +30052,58 @@ test "S3c slice 3 r1: a removal with no override and no relationship is an unsav
     // An absent part is a no-op, not a removal.
     try wb.store.removePart("_rels/.rels");
     try std.testing.expectEqual(@as(u64, 1), wb.store.removed);
+}
+
+test "S3c slice 3 r2: an orphaned worksheet part holding the record inline, no zlsxRecovery sheet — the torn retry's shape — strips to absent" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const cells = try writePruneFileInCells(io, dir, "orphan_src.xlsx");
+    defer a.free(cells);
+    const path = try std.fmt.allocPrint(a, "{s}/orphan.xlsx", .{dir});
+    defer a.free(path);
+    const out = try std.fmt.allocPrint(a, "{s}/orphan_out.xlsx", .{dir});
+    defer a.free(out);
+    {
+        var wb = try Workbook.open(a, io, cells);
+        defer wb.deinit();
+        // The record inline in the recovery sheet's own part, as a
+        // foreign writer leaves it; then the sheet deleted beneath the
+        // strip (`Workbook.deleteSheet` keeps the part as an orphan).
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        const span = recovery_record.recordSpanInText(sst.bytes) orelse return error.TestUnexpectedResult;
+        const record = try a.dupe(u8, sst.bytes[span.start..span.end]);
+        defer a.free(record);
+        const sheet2 = (try wb.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult;
+        const cell = try std.fmt.allocPrint(a, "<c r=\"A1\" t=\"inlineStr\"><is><t>{s}</t></is></c>", .{record});
+        defer a.free(cell);
+        const open_at = std.mem.indexOf(u8, sheet2.bytes, "<c r=\"A1\"") orelse return error.TestUnexpectedResult;
+        const close_at = std.mem.indexOfPos(u8, sheet2.bytes, open_at, "</c>") orelse return error.TestUnexpectedResult;
+        const patched = try std.mem.concat(a, u8, &.{ sheet2.bytes[0..open_at], cell, sheet2.bytes[close_at + "</c>".len ..] });
+        defer a.free(patched);
+        try wb.store.replacePart("xl/worksheets/sheet2.xml", patched);
+        try wb.deleteSheet(1);
+        try wb.save(io, path);
+    }
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(?u32, null), wb.recoveryCellSheetIndex());
+    try std.testing.expect((try wb.store.part("xl/worksheets/sheet2.xml")) != null);
+    try std.testing.expect(try wb.hasOrphanWorksheetPart());
+    try std.testing.expect((try wb.embeddings()) == .present);
+    // The plain call — the scope judged from the sheet list alone would
+    // skip the orphan; the workbook's own evidence widens it.
+    try wb.stripEmbeddings();
+    try std.testing.expect((try wb.embeddings()) == .absent);
+    try wb.save(io, out);
+    var saved = try Workbook.open(a, io, out);
+    defer saved.deinit();
+    try std.testing.expect((try saved.embeddings()) == .absent);
+    const orphan = (try saved.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(recovery_record.recordSpanInText(orphan.bytes) == null);
 }

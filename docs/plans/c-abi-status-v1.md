@@ -1868,9 +1868,8 @@ NONE`, each before the first part write or removal: two new entries in
 stops the sweep whole rather than redact a row that has text — §19's rule,
 the same `columnCellsOverRange` / `classifySlot` reading), and, on strip,
 `MalformedWorkbookXml` (an `xl/workbook.xml` the chunk-name strip cannot
-walk — the slice-1 REL-501 shape), the package's `MissingContentTypes` /
-`MalformedContentTypes`, `CannotDeleteLastSheet` and the sheet delete's
-verdicts should the cells sheet be present (`MissingRelationship`, a
+walk — the slice-1 REL-501 shape), `CannotDeleteLastSheet` and the sheet
+delete's verdicts should the cells sheet be present (`MissingRelationship`, a
 carrier the cross-sheet sweeps cannot read — `MalformedChartXml`,
 `MalformedExtensionXml`, …). `-3`: the sweeps' allocating writers and
 `allocPrint` spell an allocation failure `WriteFailed`, folded to
@@ -2015,6 +2014,39 @@ so the strip's -1 vocabulary names it on every surface and the clause
 says discard; `MalformedContentTypes` dropped from the strip's -2 list
 (unreachable: `removeContentTypeOverride` allocates only).
 
+**Round 2** (two agents on the round-1 tree; both ship-ready, A 2 LOW,
+B 4 LOW — every round-1 fix verified in code and by the test that fails
+on its revert; fixes in the round-2 commit): the `StripScope` gate took
+its evidence from the live sheet list alone, so a strip torn by a `-3`
+between the cells-sheet delete and the scrub (or a hidden sheet a user
+had already deleted) left an orphaned worksheet part the reader still
+scans out of the retry's scope — "call again" under-delivered for an
+inline-string orphan (A + B REL-201) → `hasOrphanWorksheetPart`: a
+worksheet part no `<sheet>` resolves to is evidence too, OR-ed into the
+scope on both paths; pinned with an orphan holding an inline record and
+no `zlsxRecovery` sheet stripping to `.absent`. The Editor removed the
+doomed part under the mirror's spelling (`Book.sheets[i].path`, no
+dot-segment collapse) where the workbook's path uses `resolvePartName`
+(B MAINT-201) → the workbook's spelling on both, and the Editor pin
+asserts the part present before the strip so the removal pin is not
+vacuous (A's note). Docs (A + B DOC-201/202): §20 still listed
+`MissingContentTypes` / `MalformedContentTypes` as strip refusals —
+neither can fire on the strip path (`removePart` resolves the part it
+then `part()`s) — dropped from every surface; the Python count read 20
+where the file holds 22; the lenient-reader claim named a pin that read
+a stripped file whose table carried no record — the Zig typed-views pin
+now reads the SCRUBBED table through the lenient reader. Recorded (B):
+the reader honours only the first magic per part and stops at the first
+part with one, so a user span sorting before a real record hides it from
+the read while the scrub blanks every decodable span (the safe
+direction); a foreign producer writing two `zlsxRecovery` sheets sees
+the second deleted beneath the mirror (illegal OOXML); a re-embed across
+a save leaves the previous generation's `<si>` unreferenced in the table
+and a `.stripped` read reports the OLDEST record (slice-1 territory);
+`recoverEmbeddingRecord`'s own `BufferTooSmall` (a record past 1 MiB of
+scratch — unreachable under the 3 200-byte carrier bound) would fold
+under `MalformedEmbeddingSet`.
+
 **Recorded, outside the slice**: the recalc transactions
 (`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
 `zlsx_editor_recalculate`) rebuild their candidate from the archive as
@@ -2035,7 +2067,9 @@ under both scopes, a removal with no override and no relationship flipping
 `hasUnsavedChanges`; `test_embedding_sweeps.py` +2, 22: the magic-only
 cell's passthrough and the lenient read of it, the foreign package whose
 only change is removals stripping to `absent` with the archive lacking
-the parts; the lenient reader over the scrubbed table on the strip test): the read's hashes pruning all
+the parts; the lenient reader over a stripped file's cells on the strip
+test — and, in round 2, over the SCRUBBED table in the Zig
+typed-views pin): the read's hashes pruning all
 fresh with the passthrough save byte for byte, a staged blank redacting and
 a staged string stale, the saved tombstone over a zeroed vector through
 `zlsx_emb_hashes` / `zlsx_emb_vectors` and `valid_empty` on the re-open; a
@@ -2064,7 +2098,7 @@ cells sheet. `pkg/editor.zig` ×1: the mirror in step after the strip (a
 sheet added at 1, a write landing on it, read back from the saved file),
 the orphan gone, the dirty editor refusing with nothing removed.
 `tests/c_abi_smoke.c` `#error`s without the macro, pins the 40-byte
-layout and takes both addresses. Python (`test_embedding_sweeps.py`, 20):
+layout and takes both addresses. Python (`test_embedding_sweeps.py`, 22 — 14 tests, one an 8-case parametrize):
 the goal line — the read's hashes prune all fresh and a stripped file
 reads `absent`; the report's keys and a workbook without a set; a row
 blanked on disk with the tombstone and the zeroed vector read back; an
