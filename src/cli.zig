@@ -302,8 +302,9 @@ const ArgError = error{
 /// First-pass scan: identify the sub-command without validating
 /// flag values. Lets the main pass relax --sheet / --name / --format
 /// validation for workbook-scoped sub-commands that wrappers may
-/// append those flags to universally. Skips `--sheet` / `--name` /
-/// `--format` pairs so their values aren't mistaken for positionals.
+/// append those flags to universally. Skips every value-bearing
+/// flag's value so it is never mistaken for a positional or a
+/// sub-command token (the list mirrors `parseArgs`'s `value_flags`).
 fn detectSubcommand(argv: []const []const u8) Subcommand {
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -3589,9 +3590,10 @@ fn runEmbedApply(
         try err.flush();
         return 2;
     };
-    // The carrier choice, judged with the other flag values — before
-    // the workbook is opened, like `--dtype`. The spelling is the
-    // CLI's (`in-cells`, as `int8-sym`); py-zlsx says `in_cells`.
+    // The carrier choice, judged as `--dtype` is — before the workbook
+    // is opened; the sheet, range, column and id are the write's own
+    // verdicts, after it. The spelling is the CLI's (`in-cells`, as
+    // `int8-sym`); py-zlsx says `in_cells`.
     const recovery: zlsx_pkg.RecoveryOptions = blk: {
         const name = args.recovery_name orelse break :blk .{};
         if (std.mem.eql(u8, name, "invisible")) break :blk .{};
@@ -11039,7 +11041,7 @@ test "S3c slice 5: parseArgs — `--recovery` is a value flag of the embed famil
     }
 }
 
-test "S3c slice 5: runEmbedApply — `--recovery in-cells` adds the hidden zlsxRecovery sheet with the record and the set reads present; the default and `invisible` add no sheet; a later write without the flag refreshes the sheet it finds; an unknown value is exit 2 before the open" {
+test "S3c slice 5: embed --vectors — `--recovery in-cells` through the real dispatch adds the hidden zlsxRecovery sheet with the record and the set reads present; the default and `invisible` add no sheet; a later write without the flag refreshes the sheet it finds; an unknown value is exit 2 before the open" {
     const a = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -11075,11 +11077,17 @@ test "S3c slice 5: runEmbedApply — `--recovery in-cells` adds the hidden zlsxR
     defer a.free(out_cells);
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_buf: [64]u8 = undefined;
+        var out_w = std.Io.Writer.fixed(&out_buf);
         var args = base;
         args.out_path = out_cells;
         args.recovery_name = "in-cells";
-        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+        // Through the real dispatch: the fence must let the flag's own
+        // mode through (r1, A-MAINT-101 — a fence refusing it on every
+        // mode survived the suite).
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, args, &out_w, &err_w));
         try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
         var wb = try zlsx_pkg.Workbook.open(a, io, out_cells);
         defer wb.deinit();
         try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
@@ -11141,8 +11149,8 @@ test "S3c slice 5: runEmbedApply — `--recovery in-cells` adds the hidden zlsxR
     }
 
     // An unknown spelling: exit 2 with the flag's own message, judged
-    // with the other flag values — the input (absent here) is never
-    // opened and no output is written.
+    // as `--dtype` is — the input (absent here) is never opened and no
+    // output is written.
     {
         var err_w = std.Io.Writer.fixed(&err_buf);
         const out = try tt.path(a, io, "s3c5_never.xlsx");

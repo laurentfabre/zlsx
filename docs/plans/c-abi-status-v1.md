@@ -2315,7 +2315,15 @@ zlsx path that authors a hidden sheet, so one user sheet +
 workbook whose only `<sheet>` is `state="hidden"` (Excel's UI refuses to
 hide the last visible sheet). The fix is a change to the delete guard's
 contract on every surface (fold into `LastSheetUndeletable` /
-`CannotDeleteLastSheet`), outside the write slice.
+`CannotDeleteLastSheet`), outside the write slice. **Recorded (slice 5's
+review, 2026-09-07, an owner follow-up)**: a sheet index that names the
+`zlsxRecovery` sheet itself is accepted by this export, `Editor.set_embeddings`
+and the CLI's `--sheet` — the record's cell becomes covered content and
+its hash is over the record the same write replaces (stale at birth,
+`prune` reports it so at once). The fix is one refusal in
+`Workbook.setEmbeddingsOpts`'s pass 1 for a coverage whose
+`worksheet_target` is the carrier's part, and the same on the
+embeddable-rows read — one place, every surface.
 
 **Round 1 (in-house, two agents; ledger `codex_findings_s3c4_r1.md`)**:
 A ship-ready 3 LOW (REL-101 the last-visible-sheet guard — recorded;

@@ -188,13 +188,18 @@ jobs:
       - name: Corpus integration tests
         run: zig build test-corpus
 
-      - name: CLI smoke — list-sheets / meta / cells
+      - name: CLI smoke — list-sheets / meta / cells / embed
         shell: bash
         run: |
           set -euo pipefail
           ./zig-out/bin/zlsx.exe list-sheets tests/corpus/frictionless_2sheets.xlsx
           ./zig-out/bin/zlsx.exe meta tests/corpus/frictionless_2sheets.xlsx
           ./zig-out/bin/zlsx.exe cells tests/corpus/frictionless_2sheets.xlsx --take 3
+          # The embed family end to end (S3c slice 5): a write with the
+          # Numbers-durable carrier; the hidden sheet shows in the listing.
+          printf '{"row":2,"vector":[0.5,0.25]}\n' > vecs.ndjson
+          ./zig-out/bin/zlsx.exe embed tests/corpus/openpyxl_guess_types.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A2 --recovery in-cells --out embed_smoke.xlsx
+          ./zig-out/bin/zlsx.exe list-sheets embed_smoke.xlsx | grep -q '"zlsxRecovery".*"hidden"'
 
       - name: Stage zlsx.dll into Python binding for wheel smoke
         shell: bash
