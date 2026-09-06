@@ -3550,19 +3550,28 @@ pub const Workbook = struct {
         if (existing) |idx| {
             const ws = try self.sheet(idx);
             if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
-        } else {
-            if (!self.recovery_opts.recovery_in_cells) return;
+        } else if (self.recovery_opts.recovery_in_cells) {
             const rels = (try self.store.part("xl/_rels/workbook.xml.rels")) orelse
                 return error.MissingWorkbookRels;
             const reserved: u32 = if (std.mem.indexOf(u8, rels.bytes, embedding_part.REL_TYPE_EMBEDDINGS) == null) 1 else 0;
             var prepared = try self.prepareAddSheet(recovery_record.CELL_SHEET_NAME, .{ .state = .hidden }, reserved);
             prepared.deinit(self.allocator);
+            // The sheet's part is the one `addPart` of the install; on a
+            // re-embed the vector parts take `replacePart` (no
+            // content-types touch), so this would be the call's FIRST
+            // `[Content_Types].xml` patch — judged here as
+            // `stageContentTypeOverride` judges it (in-house S3c slice 4
+            // r1, B vector 2).
+            const ct = (try self.store.part("[Content_Types].xml")) orelse
+                return error.MissingContentTypes;
+            if (std.mem.lastIndexOf(u8, ct.bytes, "</Types>") == null) return error.MalformedContentTypes;
         }
         // The install scrubs the previous generation's record from the
-        // carrier's text before staging the new cell (`writeRecoveryCell`).
-        // Every part that scrub would read is materialized here, so a
-        // payload the store cannot serve is the carrier's own verdict
-        // (`carrierPart`'s rule), judged before the first part write.
+        // carrier's text before staging the new cell (`writeRecoveryCell`)
+        // — on EVERY write, the strip's rule. Every part that scrub would
+        // read is materialized here, so a payload the store cannot serve
+        // is the carrier's own verdict (`carrierPart`'s rule), judged
+        // before the first part write.
         const scope = try self.recoveryCellScrubScope(existing != null);
         for (self.store.parts) |p| {
             if (std.mem.eql(u8, p.name, "xl/sharedStrings.xml")) {
@@ -3891,16 +3900,22 @@ pub const Workbook = struct {
     /// judged in pass 0c (`preflightRecoveryCell`).
     fn writeRecoveryCell(self: *Workbook, rec: []const u8) Error!void {
         const existing = try self.recoveryCellSheetIndex();
-        if (existing == null and !self.recovery_opts.recovery_in_cells) return;
-        // The previous generation goes first: the record reader takes
-        // the FIRST record it finds in the table or a worksheet part,
-        // and the save never collects a dead table entry, so a re-embed
-        // across a save used to leave the previous record ahead of the
-        // new one — a Numbers-shaped strip then read the OLD model (the
-        // cells sibling of in-house S3c slice 1 r1 REL-101). The strip's
-        // scrub, under the strip's scope; the parts it reads were
-        // materialized in pass 0c, so only an allocation can fail here.
+        // The previous generation goes first, whatever this write adds:
+        // the record reader takes the FIRST record it finds in the table
+        // or a worksheet part, and the save never collects a dead table
+        // entry, so a re-embed across a save used to leave the previous
+        // record ahead of the new one — a Numbers-shaped strip then read
+        // the OLD model (the cells sibling of in-house S3c slice 1 r1
+        // REL-101). The strip's scrub under the strip's scope — the
+        // table always, the worksheet parts when the cells sheet or an
+        // orphaned worksheet part is there — on EVERY write: a default
+        // write after a `deleteSheet` of the cells sheet (its part an
+        // orphan, its record still in the table) used to skip it, and
+        // the stale record survived every re-embed (in-house S3c slice 4
+        // r1 B-REL-101). The parts it reads were materialized in pass
+        // 0c, so only an allocation can fail here.
         try self.scrubRecoveryCellText(try self.recoveryCellScrubScope(existing != null));
+        if (existing == null and !self.recovery_opts.recovery_in_cells) return;
         const ws = if (existing) |idx|
             try self.sheet(idx)
         else
@@ -30569,4 +30584,81 @@ test "S3c slice 4: the cells sheet's verdicts land before the first part write �
         const view = (try wb.embeddings()).present;
         try std.testing.expectEqualStrings("m", view.index.model);
     }
+}
+
+test "S3c slice 4 r1: a deleteSheet orphan's record is scrubbed by a DEFAULT write — the strip's rule on every write; the table clean, a Numbers-shaped strip reads .absent" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const cells = try writePruneFileInCells(io, dir, "orphan_r1_src.xlsx");
+    defer a.free(cells);
+    const mid = try std.fmt.allocPrint(a, "{s}/orphan_r1_mid.xlsx", .{dir});
+    defer a.free(mid);
+    const out = try std.fmt.allocPrint(a, "{s}/orphan_r1_out.xlsx", .{dir});
+    defer a.free(out);
+    {
+        // The cells sheet deleted the plain way: `deleteSheet` keeps its
+        // part as an orphan and the table keeps the record.
+        var wb = try Workbook.open(a, io, cells);
+        defer wb.deinit();
+        const idx = (try wb.recoveryCellSheetIndex()) orelse return error.TestUnexpectedResult;
+        try wb.deleteSheet(idx);
+        try wb.save(io, mid);
+    }
+    {
+        var wb = try Workbook.open(a, io, mid);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+        try std.testing.expect(try wb.hasOrphanWorksheetPart());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c4CountRecords(sst.bytes));
+        // A DEFAULT write — no sheet, no option — scrubs it all the same.
+        try wb.setEmbeddings("m2", 2, .int8_sym_per_vec, &s3c4_inputs);
+        try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+        try wb.save(io, out);
+    }
+    var wb = try Workbook.open(a, io, out);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+    const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), s3c4CountRecords(sst.bytes));
+    try std.testing.expect((try wb.embeddings()) == .present);
+    try stripAllButCells(&wb);
+    try std.testing.expect((try wb.embeddings()) == .absent);
+}
+
+test "S3c slice 4 r1: on a re-embed the cells sheet's part is the call's first content-types patch — a [Content_Types].xml without </Types> refuses before the first write" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    // A saved set WITHOUT the cells sheet: the re-embed's vector parts
+    // take `replacePart`, and only the sheet's add would touch
+    // `[Content_Types].xml`.
+    const path = try writePruneFile(io, dir, "ct_r1.xlsx", .{ "Alpha", "Beta" }, .{
+        try pruneHashFor(2, "Alpha"),
+        try pruneHashFor(3, "Beta"),
+    });
+    defer a.free(path);
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    const ct = (try wb.store.part("[Content_Types].xml")) orelse return error.TestUnexpectedResult;
+    const patched = try std.mem.replaceOwned(u8, a, ct.bytes, "</Types>", "");
+    defer a.free(patched);
+    try wb.store.replacePart("[Content_Types].xml", patched);
+    const before = wb.store.mutations;
+    try std.testing.expectError(error.MalformedContentTypes, wb.setEmbeddingsOpts("m2", 2, .int8_sym_per_vec, &s3c4_inputs, .{ .recovery_in_cells = true }));
+    try std.testing.expectEqual(before, wb.store.mutations);
+    try std.testing.expectEqual(@as(u32, 1), wb.sheetCount());
+    const view = (try wb.embeddings()).present;
+    try std.testing.expectEqualStrings("m", view.index.model);
 }

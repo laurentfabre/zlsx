@@ -2127,9 +2127,15 @@ typedef struct zlsx_emb_coverage_v1 {
  * reveal (Workbook.setEmbeddingsOpts' recovery_in_cells). The sheet
  * is appended after the last one and the editor's indices count it
  * (zlsx_editor_add_sheet's next index, zlsx_editor_set_cell's). The
+ * write stages the sheet's A1 as a cell edit, so a structural delete
+ * in the same session — zlsx_editor_delete_sheet,
+ * zlsx_editor_strip_embeddings — refuses SheetDeleteRequiresCleanState
+ * until a save. The
  * bit governs the sheet's CREATION: a workbook already carrying it
- * has its cell refreshed by every later write, bit or no bit — the
- * previous record scrubbed from the shared-string table and the
+ * has its cell refreshed by every later write, bit or no bit. Every
+ * write, bit or no bit, first scrubs the previous record from the
+ * shared-string table and — when the sheet or an orphaned worksheet
+ * part is there — from the
  * worksheet parts first — so the record is one generation in every
  * carrier; zlsx_editor_strip_embeddings removes the sheet. The name
  * is reserved: a sheet spelled so, however cased, IS the carrier and
@@ -2171,7 +2177,8 @@ typedef struct zlsx_emb_coverage_v1 {
  * or one whose </sheets> the typed parser reads elsewhere than the
  * splice, so the hidden sheet's add could not land (checked before the
  * first write); MalformedSharedStringsXml / MalformedSheetXml — a
- * shared-string table or, with the sheet present, a worksheet part the
+ * shared-string table or, with the sheet present or an orphaned
+ * worksheet part in the archive, a worksheet part the
  * scrub would read and the store cannot serve (checked before the
  * first write);
  * EmbeddingExceedsArchiveLimit — a
@@ -2339,7 +2346,9 @@ int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
  * ZLSX_OK on a workbook that never had embeddings, and on a partially
  * stripped one.
  *
- * The recovery_in_cells sheet, when present, goes through the
+ * The recovery_in_cells sheet — found by its reserved name
+ * zlsxRecovery, however cased (the write's rule) — when present,
+ * goes through the
  * editor's own zlsx_editor_delete_sheet path so sheet indices stay
  * honest, and only then do its rules apply — judged before the first
  * part is removed: -1 SheetDeleteRequiresCleanState (staged cell

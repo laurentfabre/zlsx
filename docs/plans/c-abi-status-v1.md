@@ -1900,7 +1900,9 @@ unchanged: `zlsx_emb_open` on the same file reports `InvalidRange`, pinned
 beside the sweep's verdict on every surface.
 
 **The mirror-safe strip** (decision S3c-9): the `recovery_in_cells`
-carrier is a hidden sheet, and `Workbook.stripEmbeddings` deleted it
+carrier is a hidden sheet (found by its reserved name `zlsxRecovery`,
+however cased — slice 4 widened the locator to the workbook's own name
+rule, §21), and `Workbook.stripEmbeddings` deleted it
 through `Workbook.deleteSheet` — beneath the Editor's `sheet_paths`
 mirror, which then held one entry more than the workbook: an index the
 mirror read as one sheet and the workbook as another, a `set_cell` after
@@ -2214,11 +2216,19 @@ through the same mirror (slice 3).
   strip — the cells sibling of slice 1's round-1 HIGH. The write now runs
   the strip's scrub (`scrubRecoveryCellText`, under the strip's scope
   rule: the table always, the worksheet parts when the cells sheet or an
-  orphaned worksheet part is there) before staging the new cell; every
-  part the scrub would read is materialized in pass 0c under
-  `carrierPart`'s rule (`MalformedSharedStringsXml` / `MalformedSheetXml`
-  — the carrier's verdict, never the store's), so the install's scrub can
-  fail on allocation only.
+  orphaned worksheet part is there) before staging the new cell — on
+  EVERY write, bit or no bit (round 1, B-REL-101: the slice commit
+  returned before the scrub when no sheet was there and the bit was
+  clear, so a `deleteSheet` of the cells sheet — its part an orphan, its
+  record still in the table — left a record every default re-embed kept,
+  and a Numbers-shaped strip read the OLD model; the scope rule existed
+  for that orphan and the default path never reached it); every part
+  the scrub would read is materialized in pass 0c under `carrierPart`'s
+  rule (`MalformedSharedStringsXml` / `MalformedSheetXml` — the carrier's
+  verdict, never the store's), so the install's scrub can fail on
+  allocation only. The cost on a default write: the table read once
+  (cached for the generation — the save reads it too) and one
+  `hasOrphanWorksheetPart` walk.
 - **Every verdict of the sheet's creation fired after the parts.**
   `Workbook.addSheet` ran last in the install: `StructuralEditIncomplete`,
   `MissingWorkbookPart`, `MalformedWorkbookXml`, `SheetCountMismatch`,
@@ -2231,7 +2241,13 @@ through the same mirror (slice 3).
   (`preflightRecoveryCell`) prepares and discards when the sheet will be
   created. The dry run is the closed form for `SheetCountMismatch`: a
   `</sheets>` the lexical splice finds inside a comment the typed parser
-  skips (a workbook the open admits).
+  skips (a workbook the open admits). Round 1 (B, vector 2) added the
+  content-types check to the create case: on a re-embed the vector parts
+  take `replacePart`, so the sheet's `addPart` would be the call's FIRST
+  `[Content_Types].xml` patch — `MissingContentTypes` /
+  `MalformedContentTypes` are judged in pass 0c as
+  `stageContentTypeOverride` judges them (the part present, a
+  `</Types>`), no longer the install's residue in that shape.
 
 **The option governs creation** (decision S3c-12): a workbook already
 carrying the sheet — by its reserved name, matched as the workbook
@@ -2254,9 +2270,14 @@ cells sheet holds staged appended rows) and `StructuralEditIncomplete`
 at `UINT32_MAX` sheets — unreachable in practice); `-2`
 `MissingWorkbookPart`, `SheetCountMismatch`, `MalformedSharedStringsXml`,
 `MalformedSheetXml`, and `IdSpaceExhausted` / `MalformedWorkbookXml` /
-`MissingWorkbookRels` / `MalformedWorkbookRels` for the sheet's own
-reasons — all already in `structural_refusals`, no new name. Every one
-lands before the first part write.
+`MissingWorkbookRels` / `MalformedWorkbookRels` / `MissingContentTypes` /
+`MalformedContentTypes` for the sheet's own reasons — all already in
+`structural_refusals`, no new name. Every one lands before the first part
+write. The cells write stages the sheet's `A1` as a cell edit, so a
+structural delete in the same session (`zlsx_editor_delete_sheet`,
+`zlsx_editor_strip_embeddings`) refuses `SheetDeleteRequiresCleanState`
+until a save — the default mode stages no cell (round 1, B-DOC-103; stated
+on every surface).
 
 **Recorded, outside the slice**: the recalc transactions
 (`zlsx_editor_mark_recalc_on_load` + save, `zlsx_editor_save_with_recalc`,
@@ -2268,12 +2289,34 @@ the `sheetCount` assert, a process abort (verified from Python: rc -6).
 The rule is on every surface's documentation of the write; the fix the
 follow-up names is one guard at `recalc_txn.prepare` (refuse while
 `store.installs > 0`), an owner decision. Still Zig-only: nothing — the
-§4 row is all-three (the CLI's `embed --vectors` has no cells flag; the
-CLI leg and the vector / state dump remain S3c). The recovery sheet a
-consumer RENAMES is not found by the locator (its text is still scrubbed
-by the strip) — slice 3's note stands.
+§4 row is all-three (the CLI's `embed --vectors` has no cells flag — it
+writes through `Editor.setEmbeddings` since round 1, A-MAINT-103; the CLI
+leg and the vector / state dump remain S3c). The recovery sheet a
+consumer RENAMES is not found by the locator (its INLINE text is not
+scanned unless an orphan widens the scope; its table string is; the strip
+scrubs it) — slice 3's note stands. **Recorded (round 1, A-REL-101, an
+owner decision)**: `Workbook.deleteSheet` / `Editor.deleteSheet` guard
+the LAST sheet, not the last VISIBLE one; the hidden carrier is the first
+zlsx path that authors a hidden sheet, so one user sheet +
+`set_embeddings(recovery="in_cells")` + save + `delete_sheet(0)` leaves a
+workbook whose only `<sheet>` is `state="hidden"` (Excel's UI refuses to
+hide the last visible sheet). The fix is a change to the delete guard's
+contract on every surface (fold into `LastSheetUndeletable` /
+`CannotDeleteLastSheet`), outside the write slice.
 
-**Tests** (`src/c_abi.zig`, "S3c slice 4 set_embeddings …" ×3): the bit
+**Round 1 (in-house, two agents; ledger `codex_findings_s3c4_r1.md`)**:
+A ship-ready 3 LOW (REL-101 the last-visible-sheet guard — recorded;
+DOC-102 the strip surfaces' reserved-name clause — fixed; MAINT-103 the
+CLI's write beneath the mirror — fixed); B ship-ready 1 MEDIUM + 2 LOW
+(REL-101 the default write's early return before the scrub — fixed, the
+scrub on every write, pinned on all three surfaces; DOC-102 the orphan
+clause on `MalformedSheetXml` — fixed; DOC-103 the staged delta and the
+deletes — fixed, pinned in Python). B's vector 2 content-types pre-flight
+taken.
+
+**Tests** (`src/c_abi.zig`, "S3c slice 4 set_embeddings …" ×3, "S3c slice
+4 r1 set_embeddings …" ×1 — the `delete_sheet` orphan's record scrubbed by
+a write without the bit, `ABSENT` after the Numbers-shaped strip): the bit
 adding the hidden sheet through the mirror (`add_sheet` at 3, a
 `set_cell` there landing on `sheet4.xml`, the reader's `zlsx_sheet_state`
 hidden at 2 and the name, ONE record in the table, the Numbers-shaped
@@ -2300,13 +2343,20 @@ mutation counter unchanged (the `sheetId` space, the reserved `rId`, the
 commented `</sheets>` → `SheetCountMismatch`, `torn_edit` →
 `StructuralEditIncomplete`, appended rows on the sheet →
 `SheetHasUnsavedAppends` with and without the option) and the `rId`
-patch taking the set without the sheet. `pkg/editor.zig` ("S3c slice 4
+patch taking the set without the sheet; "S3c slice 4 r1 …" ×2: the
+`deleteSheet` orphan's record scrubbed by a default write (the table
+clean, `.absent` after the Numbers-shaped strip) and a `[Content_Types].xml`
+without `</Types>` refusing a re-embed with the bit before the first
+write. `pkg/editor.zig` ("S3c slice 4
 …" ×1): the mirror's third entry `xl/worksheets/sheet3.xml`, hidden on the
 view, `addSheet` at 3 with a `setCell` landing on `sheet4.xml`, the
 second write leaving the mirror alone, the refusal leaving it as it was
 and the default options never touching it. `tests/c_abi_smoke.c`: the
-macro present and `== 1u`. `test_embedding_write.py` +6 (+5
-parametrized cases), 56: the hidden sheet through `Book.sheets` /
+macro present and `== 1u`. `test_embedding_write.py` +8 (+5
+parametrized cases), 58 — round 1 added the `delete_sheet` orphan's record
+scrubbed by a default write (`absent` after the strip) and the staged
+delta refusing `strip_embeddings` / `delete_sheet` in the same session
+where the default mode does not: the hidden sheet through `Book.sheets` /
 `Book.sheet_state`, the record row (percent-encoded), `add_sheet` at 3
 and a `set_cell` there, the Numbers-shaped zipfile strip reading
 `stripped` / `cell_data` with the coverages; the default spelled or not

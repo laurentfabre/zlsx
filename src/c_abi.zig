@@ -10544,10 +10544,15 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// one carrier an Apple Numbers export keeps, at the cost of a sheet
 /// the user can reveal; it is appended after the last sheet, and the
 /// editor's sheet indices (`zlsx_editor_add_sheet`'s next index,
-/// `zlsx_editor_set_cell`'s) count it. The bit governs the sheet's
-/// CREATION: a workbook already carrying it (an earlier write with the
-/// bit) has its cell refreshed by every later write, bit or no bit —
-/// the previous record scrubbed from the shared-string table and the
+/// `zlsx_editor_set_cell`'s) count it. The write stages the sheet's
+/// A1 as a cell edit, so a structural delete in the same session
+/// (`zlsx_editor_delete_sheet`, `zlsx_editor_strip_embeddings`)
+/// refuses `SheetDeleteRequiresCleanState` until a save. The bit
+/// governs the sheet's CREATION: a workbook already carrying it (an
+/// earlier write with the bit) has its cell refreshed by every later
+/// write, bit or no bit. Every write, bit or no bit, first scrubs the
+/// previous record from the shared-string table and — when the sheet
+/// or an orphaned worksheet part is there — from the
 /// worksheet parts first — so the record is one generation in every
 /// carrier; `zlsx_editor_strip_embeddings` removes the sheet. The name
 /// is reserved: a sheet spelled so, however cased, IS the carrier, and
@@ -10580,7 +10585,8 @@ fn arrayArg(comptime T: type, ptr: ?[*]const T, len: usize, err_buf: ?[*]u8, err
 /// or one whose `</sheets>` the typed parser reads elsewhere than the
 /// splice — the sheet's add could not land; checked before the first
 /// write), `MalformedSharedStringsXml` / `MalformedSheetXml` (a
-/// shared-string table or, with the sheet present, a worksheet part
+/// shared-string table or, with the sheet present or an orphaned
+/// worksheet part in the archive, a worksheet part
 /// the scrub would read and the store cannot serve — checked before
 /// the first write),
 /// `EmbeddingExceedsArchiveLimit` (a part past the 512 MiB read cap,
@@ -11311,6 +11317,77 @@ test "S3c slice 4 set_embeddings: a second cells write in one editor and a third
     try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
     try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
     try std.testing.expect((try wb.sheetByName("New")) != null);
+}
+
+test "S3c slice 4 r1 set_embeddings: a delete_sheet orphan's record is scrubbed by a write WITHOUT the bit — the table clean, a Numbers-shaped strip reads ABSENT" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3cFixture(io, &tt, "s3c4_orphan_src.xlsx");
+    defer alloc.free(path);
+    const cells = try tt.path(alloc, io, "s3c4_orphan_cells.xlsx");
+    defer alloc.free(cells);
+    const mid = try tt.path(alloc, io, "s3c4_orphan_mid.xlsx");
+    defer alloc.free(mid);
+    const out = try tt.path(alloc, io, "s3c4_orphan_out.xlsx");
+    defer alloc.free(out);
+    const numbers = try tt.path(alloc, io, "s3c4_orphan_numbers.xlsx");
+    defer alloc.free(numbers);
+
+    var err_buf: [128]u8 = undefined;
+    const v1 = [_]f32{ 1, 2, 3 };
+    const h1 = [_]u64{7};
+    const covs = [_]CEmbCoverage{s3cCoverage("title", 0, "A2:A2", "A", &v1, &h1)};
+    {
+        const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m1", 3, "f32", &covs, ZLSX_EMB_WRITE_RECOVERY_IN_CELLS, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, cells.ptr, cells.len, &err_buf, err_buf.len));
+    }
+    // The cells sheet deleted the plain way (not the strip): its part
+    // stays as an orphan and the table keeps the record.
+    {
+        const ed = zlsx_editor_open(cells.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_delete_sheet(ed, 2, null, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, mid.ptr, mid.len, &err_buf, err_buf.len));
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, mid);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectEqual(@as(?u32, null), try wb.recoveryCellSheetIndex());
+        try std.testing.expect((try wb.store.part("xl/worksheets/sheet3.xml")) != null);
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s3c4CountRecords(sst.bytes));
+    }
+    // A write WITHOUT the bit scrubs it all the same (it used to return
+    // before the scrub, and a Numbers-shaped strip read m1 back).
+    {
+        const ed = zlsx_editor_open(mid.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_editor_close(ed);
+        try std.testing.expectEqual(ZLSX_OK, s3cSet(ed, "m2", 3, "f32", &covs, 0, null, &err_buf));
+        try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    }
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        const sst = (try wb.store.part("xl/sharedStrings.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), s3c4CountRecords(sst.bytes));
+    }
+    {
+        const emb = zlsx_emb_open(out.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_emb_close(emb);
+        try std.testing.expectEqual(ZLSX_EMB_PRESENT, zlsx_emb_state(emb));
+    }
+    try s3c4NumbersStrip(io, out, numbers);
+    const emb = zlsx_emb_open(numbers.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_emb_close(emb);
+    try std.testing.expectEqual(ZLSX_EMB_ABSENT, zlsx_emb_state(emb));
 }
 
 test "S3c slice 4 set_embeddings: the cells sheet's verdicts are -2 before the first write with the name in the diag — the sheetId space, the rId after the write's own relationship, a </sheets> the typed parser reads elsewhere; staged appends on the sheet -1; a reserved bit InvalidInput; the plane of each" {

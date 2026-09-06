@@ -3658,7 +3658,9 @@ fn runEmbedApply(
         written += 1;
     }
 
-    ed.workbook.setEmbeddings(model, dim, dtype, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
+    // The Editor's path, not the workbook's: the cells carrier's hidden
+    // sheet must reach the editor's sheet mirror (S3c slice 4).
+    ed.setEmbeddings(model, dim, dtype, &[_]zlsx_pkg.EmbeddingCoverageInput{.{
         .id = args.coverage_id orelse "default",
         .worksheet_target = target,
         .range = range,

@@ -630,6 +630,70 @@ def test_set_embeddings_recovery_in_cells_is_created_once_and_refreshed_by_every
         assert emb.stripped and emb.carrier == "cell_data" and emb.model == "m3"
 
 
+def test_set_embeddings_scrubs_a_delete_sheet_orphans_record_on_a_default_write(tmp_path):
+    """The cells sheet removed with ``delete_sheet`` (not the strip) keeps
+    its part as an orphan and its record in the table; a later write
+    WITHOUT ``recovery`` scrubs it all the same — the strip's rule on
+    every write — so a Numbers-shaped strip reads ``absent``, not the
+    old model (in-house r1 B-REL-101)."""
+    _needs_write()
+    src = tmp_path / "src.xlsx"
+    cells = tmp_path / "cells.xlsx"
+    mid = tmp_path / "mid.xlsx"
+    out = tmp_path / "out.xlsx"
+    numbers = tmp_path / "numbers.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m1", 3, [TITLE], recovery="in_cells")
+        ed.save(cells)
+    with zlsx.Editor(cells) as ed:
+        ed.delete_sheet(2)
+        ed.save(mid)
+    with zlsx.open(mid) as book:
+        assert book.sheets == ["Docs", "Second"]
+    assert "xl/worksheets/sheet3.xml" in zipfile.ZipFile(mid).namelist()   # the orphan
+    assert _record_count(mid) == 1
+    with zlsx.Editor(mid) as ed:
+        ed.set_embeddings("m2", 3, [TITLE])
+        ed.save(out)
+    with zlsx.open(out) as book:
+        assert book.sheets == ["Docs", "Second"]
+    assert _record_count(out) == 0
+    with zlsx.embeddings(out) as emb:
+        assert emb.present and emb.model == "m2"
+    _numbers_shaped(out, numbers)
+    with zlsx.embeddings(numbers) as emb:
+        assert emb.absent
+
+
+def test_set_embeddings_in_cells_stages_a_cell_edit_the_deletes_see(tmp_path):
+    """The cells write stages the sheet's A1 as a cell edit, so a
+    structural delete in the same session refuses
+    ``SheetDeleteRequiresCleanState`` until a save (the documented
+    asymmetry with the default mode — in-house r1 B-DOC-103)."""
+    _needs_write()
+    import zlsx._ffi as ffi
+
+    if not ffi._HAS_EMBEDDING_SWEEPS:
+        pytest.skip("loaded libzlsx predates the embedding sweeps")
+    src = tmp_path / "src.xlsx"
+    out = tmp_path / "out.xlsx"
+    _write_fixture(src)
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [TITLE], recovery="in_cells")
+        for call in (ed.strip_embeddings, lambda: ed.delete_sheet(1)):
+            with pytest.raises(zlsx.ZlsxError) as info:
+                call()
+            assert not isinstance(info.value, zlsx.ZlsxRefusal)
+            assert "SheetDeleteRequiresCleanState" in str(info.value)
+        ed.save(out)
+    with zlsx.Editor(out) as ed:
+        ed.strip_embeddings()
+    with zlsx.Editor(src) as ed:
+        ed.set_embeddings("m", 3, [TITLE])
+        ed.strip_embeddings()   # the default mode stages no cell: clean
+
+
 def test_strip_embeddings_removes_the_cells_sheet_the_write_created(tmp_path):
     """The strip through the same mirror: the sheet goes, the next index
     is 2 again, the file reads ``absent``."""

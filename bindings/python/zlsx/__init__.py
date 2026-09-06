@@ -4398,11 +4398,16 @@ class Editor:
         (the two cannot be had together). The sheet is appended after
         the last one and the editor's indices count it: the next
         :meth:`add_sheet` returns one more, :meth:`set_cell` addresses
-        it. ``"in_cells"`` governs the sheet's CREATION: a workbook
-        already carrying it (an earlier ``"in_cells"`` write) has its
-        cell refreshed by every later write, whatever ``recovery`` says
-        — the previous record scrubbed from the shared-string table and
-        the worksheet parts first — so the record is one generation in
+        it. The write stages the sheet's ``A1`` as a cell edit, so a
+        structural delete in the same session (:meth:`delete_sheet`,
+        :meth:`strip_embeddings`) refuses ``SheetDeleteRequiresCleanState``
+        until a save. ``"in_cells"`` governs the sheet's CREATION: a
+        workbook already carrying it (an earlier ``"in_cells"`` write)
+        has its cell refreshed by every later write, whatever
+        ``recovery`` says. Every write, whatever ``recovery`` says,
+        first scrubs the previous record from the shared-string table
+        and — when the sheet or an orphaned worksheet part is there —
+        from the worksheet parts, so the record is one generation in
         every carrier; :meth:`strip_embeddings` removes the sheet. The
         name is reserved: a sheet spelled so, however cased, IS the
         carrier and its ``A1`` is written. Requires libzlsx 0.9.0+ as the
@@ -4474,8 +4479,9 @@ class Editor:
         so the hidden sheet's add could not land; checked before the
         first write), ``MalformedSharedStringsXml`` /
         ``MalformedSheetXml`` (a shared-string table or, with the sheet
-        present, a worksheet part the scrub would read and the store
-        cannot serve; checked before the first write),
+        present or an orphaned worksheet part in the archive, a
+        worksheet part the scrub would read and the store cannot serve;
+        checked before the first write),
         ``EmbeddingExceedsArchiveLimit``
         (a part past the 512 MiB read cap — sized from the inputs before
         a vector is read — or the recovery record past its ceiling),
@@ -4780,7 +4786,9 @@ class Editor:
         embeddings, and on a partially stripped one. Staged in memory,
         committed by :meth:`save`.
 
-        The ``recovery_in_cells`` sheet, when present, goes through the
+        The ``recovery_in_cells`` sheet — found by its reserved name
+        ``zlsxRecovery``, however cased (the write's rule) — when present,
+        goes through the
         editor's own :meth:`delete_sheet` path so sheet indices stay
         honest, and only then do its rules apply — judged before the
         first part is removed: :class:`ZlsxError`
