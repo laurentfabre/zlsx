@@ -1662,6 +1662,42 @@ writer fix of its own with a regression pin on all three surfaces
 carried: prune / strip → C + Py, `recovery_in_cells`, the CLI vector
 dump (the rest of S3c).
 
+**Round 1** (two agents; A 3 MEDIUM + 2 LOW, B 1 MEDIUM + 6 LOW, both
+not ship-ready on the same MEDIUM; every fix in the round-1 commit): the
+`try` on the hasher surfaced the number canonicalizer's own
+`MalformedNumber` — a comma decimal, `NaN`, or every `t="d"` ISO-8601
+date cell (a Strict-conformance workbook's dates) refused the whole
+read as an unclassified `-1` on no surface's list, and `--prune`
+aborted the same way (REL-101) → `hashCanonical` folds it under
+`UnsupportedCellValue` at both call sites, and `.date` refuses there
+explicitly (the canonical form has no date kind). A shared-string
+table the parser cannot read crossed as `-1 MalformedXml` while the
+sheet part's failure is `-2 MalformedSheetXml` (REL-102) →
+`sstDecodedText` maps the store's and the parser's names to a new
+`MalformedSharedStringsXml` (`Workbook.Error`, `structural_refusals`,
+every surface). One `cellByRef` scan per covered row made the read and
+the sweep quadratic in the sheet — 34 s for a 40 000-row column through
+the dylib (PERF-103) → `columnCellsOverRange` resolves the column's
+cells from ONE pass over the view for both (`canonicalCellOf` takes
+the cell; a cell in the wrong `<row>` or with a ref this reader cannot
+parse is `MalformedSheetXml`, the host-grid rule). A cell whose `t`
+names no known type was served as a number with a number-kind hash (B
+REL-103) → `UnsupportedCellValue`. The pre-hash UTF-8 check was
+load-bearing for number / error cells only and pinned on strings only
+(TEST-104) → an error literal and a number with a `0xFF` byte on all
+three surfaces, and the `StructSizeTooSmall` case now poisons the
+outputs. Docs: `rename_table_column` stages the header cell as a delta
+on the host sheet, so it is a trigger of `SheetHasUnsavedMutations`
+too (B DOC-105 — named on every surface); the error-cell kind (`#N/A`,
+hash kind `e`) was missing from every new surface's description of
+`text`, and `EmbeddableRow.text` overstated the arena's ownership (a
+number's or an error's `<v>` borrows the parsed view) (A DOC-105); the
+Python count (DOC-106). Recorded: the read is stricter than
+`readHostGrid` where a value's MEANING is unknown (a non-numeric
+shared-string index refuses here, the grid carries "occupied, no
+text"); the staged-write refusal is per sheet, by design; the same
+editor answers again after its save (pinned in Python).
+
 **Tests** (`src/c_abi.zig`, "S3c embeddable_rows …" ×5): the records
 on the S3c fixture byte-for-byte against the shared writer over the
 library's own hasher, the row-2 literal pinned, the hashes fed back to
@@ -1671,25 +1707,33 @@ kind (an entity-bearing string, a number, a blank omitted, a boolean, a
 formula's cached string on request, a rich string's runs joined); nine
 `-1` cases with the name in errbuf, the diag as prep left it and the
 outputs reset, the NULL-with-length rules, `NullOutPointer` on either
-output, `StructSizeTooSmall` byte-for-byte, the staged write on one
-sheet leaving the other readable; five `-2` patches (`</sheetData>`
-gone, an index past the table, `<v>TRUE</v>`, `&bogus;`, a `0xFF`
-byte) with the name in the diag, plane NONE, and the other sheet still
-served; the plane of every verdict. `pkg/workbook.zig` ("embeddableRows
-…" ×7): the three existing pins on the arena shape; the decoded text
-and its hash on an entity-bearing shared string, a rich shared string
-and an entity-bearing inline string, fed back and pruned fresh;
-numbers, booleans and a cached formula string with and without
-`include_formulas`; the staged-write and append refusals (a write
-outside the range refuses too); the four cell verdicts on patched parts
-plus the inline run walker's. `pkg/embeddable_row_ndjson.zig` ×2 (the
-wire shape, no rows no bytes). `tests/c_abi_smoke.c` `#error`s without
-the macro and takes the address. Python (`test_embeddable_rows.py`, 23):
-the goal line — the read's hashes written by `set_embeddings` read back
-with `valid_mask` all true and equal; the CLI shape with the pinned
-literal, the second sheet, the empty range; every kind; omitted rows
-mapped to tombstones; six named `ZlsxError`s; the staged write and
-append with the other sheet and the saved file still answering; five
-`ZlsxRefusal`s through zipfile-patched copies; six shape errors; the
-closed editor and the older-dylib `RuntimeError`; the probe against the
-version.
+output, `StructSizeTooSmall` byte-for-byte with the outputs poisoned
+and reset, the staged write on one sheet leaving the other readable;
+eleven `-2` patches (`</sheetData>` gone, an index past the table,
+`<v>TRUE</v>`, `&bogus;`, a `0xFF` byte in a string, `<v>1,5</v>`, a
+`t="d"` date, `t="zz"`, a `0xFF` byte in an error literal and in a
+number, the table's last `</si>` gone) with the name in the diag, plane
+NONE, the other sheet still served after a sheet part's verdict and
+refused after the table's; the plane of every verdict, the
+canonicalizer's own name pinned `-1` should it ever escape.
+`pkg/workbook.zig` ("embeddableRows …" ×7): the three existing pins on
+the arena shape; the decoded text and its hash on an entity-bearing
+shared string, a rich shared string and an entity-bearing inline
+string, fed back and pruned fresh; numbers, booleans and a cached
+formula string with and without `include_formulas`; the staged-write
+and append refusals (a write outside the range refuses too); eleven
+cell / part verdicts on patched parts (the round-1 five among them,
+plus a cell whose ref names another row) and the inline run walker's,
+and an error cell carried as its literal with the kind-`e` hash.
+`pkg/embeddable_row_ndjson.zig` ×2 (the wire shape, no rows no bytes).
+`tests/c_abi_smoke.c` `#error`s without the macro and takes the
+address. Python (`test_embeddable_rows.py`, 31): the goal line — the
+read's hashes written by `set_embeddings` read back with `valid_mask`
+all true and equal; the CLI shape with the pinned literal, the second
+sheet, the empty range; every kind; omitted rows mapped to tombstones;
+six named `ZlsxError`s; the staged write and append with the other
+sheet, the same editor after its save and the saved file answering;
+eleven `ZlsxRefusal`s through zipfile-patched copies (the table's
+refusing the other sheet too); an error cell carried as its literal;
+six shape errors; the closed editor and the older-dylib
+`RuntimeError`; the probe against the version.

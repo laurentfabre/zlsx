@@ -2192,7 +2192,8 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
  * per row in range order, a library-allocated UTF-8 buffer
  * byte-for-byte the CLI's. `row` is 1-based; `text` is the cell as a
  * reader sees it (a shared or inline string's runs joined, entities
- * resolved; a number's <v> as written; a boolean as 1 / 0); `hash`
+ * resolved; a number's <v> as written; an error's literal, #N/A; a
+ * boolean as 1 / 0); `hash`
  * is the canonical xxh3-64 content hash zlsx_editor_set_embeddings
  * stores beside the vector, as an unsigned 64-bit decimal — the
  * value zlsx_emb_hashes reads back, so read → embed → write is one
@@ -2205,8 +2206,9 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
  * *out_len) = (NULL, 0).
  *
  * Read over the editor's current parts. A sheet the editor holds
- * staged cell writes (zlsx_editor_set_cell) or appended rows
- * (zlsx_editor_append_rows) for refuses — the parsed view this read
+ * staged cell writes (zlsx_editor_set_cell; the header cell
+ * zlsx_editor_rename_table_column stages on the host sheet) or
+ * appended rows (zlsx_editor_append_rows) for refuses — the parsed view this read
  * walks does not carry them, so a row would answer with its saved
  * content and a hash the staged value turns stale the moment it
  * lands: -1 SheetHasUnsavedMutations / SheetHasUnsavedAppends; save
@@ -2218,12 +2220,15 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
  * statement about the workbook, the name in the diag with plane
  * NONE): MissingRelationship / MissingSheetPart — the sheet's part is
  * unreachable; MalformedSheetXml — a sheet part the view cannot
+ * parse; MalformedSharedStringsXml — a shared-string table it cannot
  * parse; and a cell value the read cannot carry, refused whole rather
  * than a record that lies — UnsupportedCellValue (a boolean <v> that
- * is not 0 / 1, a shared-string index that is not a number, an
- * entity the decoder does not know), SstIndexOutOfRange (an index
- * past the table), InvalidUtf8, UnicodeNormalizationFailed. Release
- * with zlsx_buffer_release. */
+ * is not 0 / 1, a <v> the number canonicalizer cannot read — a comma
+ * decimal, NaN — a t="d" ISO-8601 date, a t this reader does not
+ * know, a shared-string index that is not a number, an entity the
+ * decoder does not know), SstIndexOutOfRange (an index past the
+ * table), InvalidUtf8, UnicodeNormalizationFailed. Release with
+ * zlsx_buffer_release. */
 int32_t zlsx_editor_embeddable_rows_ndjson(zlsx_editor_t * ed,
         uint32_t sheet_idx,
         const uint8_t * range, size_t range_len,

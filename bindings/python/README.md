@@ -402,17 +402,22 @@ with zlsx.embeddings("report.xlsx") as emb:
 `embeddable_rows(sheet, range, column, *, include_formulas=False)` returns
 the records in range order — `row` 1-based, `text` as a reader sees the
 cell (a shared or inline string's runs joined, entities resolved; a number's
-`<v>` as written; a boolean as `"1"` / `"0"`), `hash` an `int` in
+`<v>` as written; an error's literal, `#N/A`; a boolean as `"1"` / `"0"`),
+`hash` an `int` in
 `[0, 2**64)` — and omits rows with nothing embeddable (`[]` for a range
 with none); `include_formulas` admits formula cells with a cached value, the
 coverage flag's reading. A sheet the editor holds staged `set_cell` writes
-or `append_rows` for refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
+(or the header cell `rename_table_column` stages) or `append_rows` for
+refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
 / `SheetHasUnsavedAppends` — the parsed view the read walks does not carry
 them; save and re-open, or read first); `InvalidRange` (the range, or a
 column outside it) and `SheetIndexOutOfRange` are the call's; a workbook
 the read cannot serve faithfully refuses with a `ZlsxRefusal`
-(`MissingRelationship` / `MissingSheetPart`, `MalformedSheetXml`, and a cell
-value the read cannot carry — `UnsupportedCellValue`, `SstIndexOutOfRange`,
+(`MissingRelationship` / `MissingSheetPart`, `MalformedSheetXml` /
+`MalformedSharedStringsXml`, and a cell value the read cannot carry —
+`UnsupportedCellValue`: a boolean `<v>` that is not 0 / 1, a `<v>` the number
+canonicalizer cannot read, a `t="d"` ISO-8601 date, a `t` this reader does
+not know, a bad shared-string index or entity; `SstIndexOutOfRange`,
 `InvalidUtf8`, `UnicodeNormalizationFailed`) rather than return a record
 that lies.
 

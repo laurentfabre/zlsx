@@ -6139,6 +6139,10 @@ const structural_refusals = [_]anyerror{
     error.SstIndexOutOfRange,
     error.InvalidUtf8,
     error.UnicodeNormalizationFailed,
+    // Round 1: a shared-string table the parser cannot read — the
+    // `MalformedSheetXml` shape for the other part every string cell
+    // depends on (S3C2-REL-102).
+    error.MalformedSharedStringsXml,
     // NOT here, deliberately: `error.ZipBombSuspected`. The S1 caps
     // admit every entry on the open-time directory walk, so the
     // verdict fires where the ABI has no diag to carry it — the
@@ -10643,8 +10647,9 @@ export fn zlsx_editor_set_embeddings(
 /// buffer, byte-for-byte what `zlsx embed --extract` prints
 /// (docs/cli.md, "embed --extract"): the 1-based `row`, `text` as a
 /// reader sees the cell (a shared or inline string's runs joined,
-/// entities resolved; a number's `<v>` as written; a boolean as `1` /
-/// `0`) and `hash`, the canonical xxh3-64 content hash
+/// entities resolved; a number's `<v>` as written; an error's
+/// literal, `#N/A`; a boolean as `1` / `0`) and `hash`, the canonical
+/// xxh3-64 content hash
 /// `zlsx_editor_set_embeddings` stores beside the vector, as an
 /// unsigned 64-bit decimal. `include_formulas` (0 / 1) admits formula
 /// cells with a cached value — the coverage flag's reading, so the
@@ -10652,7 +10657,9 @@ export fn zlsx_editor_set_embeddings(
 /// are omitted (a covered row missing here is a `zlsx_emb_tombstone()`
 /// slot on the write); a range with none is ZLSX_OK with `(NULL, 0)`.
 /// Read over the editor's current parts. A sheet the editor holds
-/// staged cell writes or appended rows for refuses — the parsed view
+/// staged cell writes (`set_cell`, or the header cell
+/// `rename_table_column` stages on the host sheet) or appended rows
+/// for refuses — the parsed view
 /// this read walks does not carry them, so a row would answer with
 /// its saved content and a hash the staged value turns stale the
 /// moment it lands: -1 `SheetHasUnsavedMutations` /
@@ -10662,10 +10669,13 @@ export fn zlsx_editor_set_embeddings(
 /// `InvalidRange` (the range, or a column outside it),
 /// `SheetIndexOutOfRange`, `StructSizeTooSmall`. -2, the name in the
 /// diag with plane NONE: `MissingRelationship` / `MissingSheetPart`
-/// (the sheet's part is unreachable), `MalformedSheetXml`, and a cell
-/// value the read cannot carry — `UnsupportedCellValue` (a boolean
-/// `<v>` that is not `0` / `1`, a shared-string index that is not a
-/// number, an entity the decoder does not know),
+/// (the sheet's part is unreachable), `MalformedSheetXml`,
+/// `MalformedSharedStringsXml` (a part the view cannot parse), and a
+/// cell value the read cannot carry — `UnsupportedCellValue` (a
+/// boolean `<v>` that is not `0` / `1`, a `<v>` the number
+/// canonicalizer cannot read — a comma decimal, `NaN` — a `t="d"`
+/// ISO-8601 date, a `t` this reader does not know, a shared-string
+/// index that is not a number, an entity the decoder does not know),
 /// `SstIndexOutOfRange`, `InvalidUtf8`, `UnicodeNormalizationFailed` —
 /// refused whole rather than hand over a record that lies. Release
 /// with `zlsx_buffer_release`.
@@ -11499,16 +11509,20 @@ test "S3c embeddable_rows contract violations: -1 with the name in errbuf, the d
         try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
     }
-    // A diag below the v1 size: -1 StructSizeTooSmall, the diag byte-for-byte.
+    // A diag below the v1 size: -1 StructSizeTooSmall, the diag
+    // byte-for-byte — and the outputs reset BEFORE the size is judged
+    // (poisoned here; round 1 TEST-104).
     {
         var small = freshDiag();
         small.struct_size = @sizeOf(CDiag) - 1;
         const before = std.mem.toBytes(small);
-        var out_ptr: ?[*]u8 = null;
-        var out_len: usize = 0;
+        var out_ptr: ?[*]u8 = &poison;
+        var out_len: usize = 7;
         try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A2:A4", "A", 0, &out_ptr, &out_len, &small, &err_buf));
         try std.testing.expectEqualStrings("StructSizeTooSmall", std.mem.sliceTo(&err_buf, 0));
         try std.testing.expectEqualSlices(u8, &before, &std.mem.toBytes(small));
+        try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
+        try std.testing.expectEqual(@as(usize, 0), out_len);
     }
     // A staged cell write — outside the range, even — makes the sheet
     // unreadable for this read: a sequencing statement, -1, never a
@@ -11537,13 +11551,25 @@ test "S3c embeddable_rows refusals: -2 with the name in the diag — a sheet par
     defer tt.deinit();
     var err_buf: [128]u8 = undefined;
 
-    const Case = struct { file: []const u8, part: []const u8, old: []const u8, new: []const u8, name: []const u8 };
+    const Case = struct { file: []const u8, part: []const u8, old: []const u8, new: []const u8, name: []const u8, other_served: bool = true };
     const cases = [_]Case{
         .{ .file = "s3c2_sheet.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "</sheetData>", .new = "", .name = "MalformedSheetXml" },
         .{ .file = "s3c2_sst.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"s\"><v>99</v>", .name = "SstIndexOutOfRange" },
         .{ .file = "s3c2_bool.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"b\"><v>TRUE</v>", .name = "UnsupportedCellValue" },
         .{ .file = "s3c2_entity.xlsx", .part = "xl/sharedStrings.xml", .old = ">alpha</t>", .new = ">&bogus;</t>", .name = "UnsupportedCellValue" },
         .{ .file = "s3c2_utf8.xlsx", .part = "xl/sharedStrings.xml", .old = ">alpha</t>", .new = ">\xff</t>", .name = "InvalidUtf8" },
+        // Round 1: a `<v>` the number canonicalizer cannot read and a
+        // `t="d"` date (REL-101), a `t` the reader does not know
+        // (REL-103), the UTF-8 check on the kinds the hash does not
+        // validate (TEST-104), a table the parser cannot read (REL-102).
+        .{ .file = "s3c2_comma.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "><v>1,5</v>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_date.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"d\"><v>2024-01-01</v>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_unknown_t.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"zz\"><v>42</v>", .name = "UnsupportedCellValue" },
+        .{ .file = "s3c2_err_utf8.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "t=\"e\"><v>#N/\xff</v>", .name = "InvalidUtf8" },
+        .{ .file = "s3c2_num_utf8.xlsx", .part = "xl/worksheets/sheet1.xml", .old = "t=\"s\"><v>2</v>", .new = "><v>1\xff</v>", .name = "InvalidUtf8" },
+        // The LAST entry's close (the parser tolerates an inner one); the
+        // table is the workbook's, so the other sheet refuses too.
+        .{ .file = "s3c2_sst_part.xlsx", .part = "xl/sharedStrings.xml", .old = ">two</t></si>", .new = ">two</t>", .name = "MalformedSharedStringsXml", .other_served = false },
     };
     for (cases) |case| {
         const path = try writeS3cFixture(io, &tt, case.file);
@@ -11564,16 +11590,21 @@ test "S3c embeddable_rows refusals: -2 with the name in the diag — a sheet par
         try std.testing.expectEqual(@as(?[*]u8, null), out_ptr);
         try std.testing.expectEqual(@as(usize, 0), out_len);
         zlsx_diag_release(&diag);
-        // The verdict is on the workbook: the other sheet still answers.
-        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 1, "A1:A1", "A", 0, &out_ptr, &out_len, null, &err_buf));
+        // The verdict is the part's: a sheet part's leaves the other
+        // sheet served, the shared-string table's refuses it too.
+        const other = s3cRows(ed, 1, "A1:A1", "A", 0, &out_ptr, &out_len, null, &err_buf);
+        try std.testing.expectEqual(if (case.other_served) ZLSX_OK else ZLSX_REFUSED, other);
         zlsx_buffer_release(out_ptr, out_len);
     }
 }
 
 test "S3c embeddable_rows: the plane of every verdict the read can raise" {
-    for ([_]anyerror{ error.UnsupportedCellValue, error.SstIndexOutOfRange, error.InvalidUtf8, error.UnicodeNormalizationFailed, error.MalformedSheetXml, error.MissingSheetPart, error.MissingRelationship }) |e| {
+    for ([_]anyerror{ error.UnsupportedCellValue, error.SstIndexOutOfRange, error.InvalidUtf8, error.UnicodeNormalizationFailed, error.MalformedSharedStringsXml, error.MalformedSheetXml, error.MissingSheetPart, error.MissingRelationship }) |e| {
         try std.testing.expectEqual(ZLSX_REFUSED, statusOf(e));
     }
+    // The canonicalizer's own name never reaches the boundary from this
+    // read (folded under UnsupportedCellValue); should it, it is a -1.
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.MalformedNumber));
     for ([_]anyerror{ error.SheetHasUnsavedMutations, error.SheetHasUnsavedAppends, error.InvalidRange, error.SheetIndexOutOfRange }) |e| {
         try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
     }

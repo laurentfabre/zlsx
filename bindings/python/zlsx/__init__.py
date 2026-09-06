@@ -4536,8 +4536,9 @@ class Editor:
         bytes the CLI prints (docs/cli.md, "embed --extract").
         ``row`` is the 1-based sheet row; ``text`` is the cell as a
         reader sees it (a shared or inline string's runs joined,
-        entities resolved; a number's ``<v>`` as written; a boolean as
-        ``"1"`` / ``"0"``); ``hash`` is the canonical xxh3-64 content
+        entities resolved; a number's ``<v>`` as written; an error's
+        literal, ``#N/A``; a boolean as ``"1"`` / ``"0"``); ``hash`` is
+        the canonical xxh3-64 content
         hash :meth:`set_embeddings` stores beside the vector — an
         ``int`` in ``[0, 2**64)``, the value :meth:`Embeddings.hashes`
         reads back — so read → embed → write is one shape::
@@ -4562,8 +4563,10 @@ class Editor:
         matches the coverage it feeds.
 
         Read over the editor's current parts. A sheet this editor
-        holds staged cell writes (:meth:`set_cell`) or appended rows
-        (:meth:`append_rows`) for refuses with a :class:`ZlsxError`
+        holds staged cell writes (:meth:`set_cell`, or the header cell
+        :meth:`rename_table_column` stages on the host sheet) or
+        appended rows (:meth:`append_rows`) for refuses with a
+        :class:`ZlsxError`
         named ``SheetHasUnsavedMutations`` / ``SheetHasUnsavedAppends``
         — the parsed view the read walks does not carry them, so a row
         would answer with its saved content and a hash the staged value
@@ -4574,11 +4577,14 @@ class Editor:
         workbook the read cannot serve faithfully refuses with a
         :class:`ZlsxRefusal` (``error_name``) rather than return a
         record that lies: ``MissingRelationship`` / ``MissingSheetPart``
-        (the sheet's part is unreachable), ``MalformedSheetXml``, and a
-        cell value the read cannot carry — ``UnsupportedCellValue`` (a
-        boolean ``<v>`` that is not 0 / 1, a shared-string index that
-        is not a number, an entity the decoder does not know),
-        ``SstIndexOutOfRange``, ``InvalidUtf8``,
+        (the sheet's part is unreachable), ``MalformedSheetXml`` /
+        ``MalformedSharedStringsXml`` (a part the view cannot parse), and
+        a cell value the read cannot carry — ``UnsupportedCellValue`` (a
+        boolean ``<v>`` that is not 0 / 1, a ``<v>`` the number
+        canonicalizer cannot read — a comma decimal, ``NaN`` — a
+        ``t="d"`` ISO-8601 date, a ``t`` this reader does not know, a
+        shared-string index that is not a number, an entity the decoder
+        does not know), ``SstIndexOutOfRange``, ``InvalidUtf8``,
         ``UnicodeNormalizationFailed``. Shapes are checked here first: a
         ``TypeError`` for a non-string range or column, a non-bool
         ``include_formulas``, a bool where the sheet index belongs.

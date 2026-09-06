@@ -209,6 +209,8 @@ def test_embeddable_rows_refuses_after_a_staged_cell_write(tmp_path):
         assert ": SheetHasUnsavedMutations" in str(info.value)
         assert [r["text"] for r in ed.embeddable_rows(1, "A1:A1", "A")] == ["two"]
         ed.save(out)
+        # The save commits the staged write: the same editor answers again.
+        assert [r["text"] for r in ed.embeddable_rows(0, "A2:A4", "A")] == ["alpha", "beta", "gamma"]
     with zlsx.Editor(out) as ed:
         assert [r["text"] for r in ed.embeddable_rows(0, "A2:A4", "A")] == ["alpha", "beta", "gamma"]
         ed.append_rows(0, [["delta"]])
@@ -221,19 +223,34 @@ def test_embeddable_rows_refuses_after_a_staged_cell_write(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "part, old, new, name",
+    "part, old, new, name, other_sheet_served",
     [
-        ("xl/worksheets/sheet1.xml", b"</sheetData>", b"", "MalformedSheetXml"),
-        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="s"><v>99</v>', "SstIndexOutOfRange"),
-        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="b"><v>TRUE</v>', "UnsupportedCellValue"),
-        ("xl/sharedStrings.xml", b">alpha</t>", b">&bogus;</t>", "UnsupportedCellValue"),
-        ("xl/sharedStrings.xml", b">alpha</t>", b">\xff</t>", "InvalidUtf8"),
+        ("xl/worksheets/sheet1.xml", b"</sheetData>", b"", "MalformedSheetXml", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="s"><v>99</v>', "SstIndexOutOfRange", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="b"><v>TRUE</v>', "UnsupportedCellValue", True),
+        ("xl/sharedStrings.xml", b">alpha</t>", b">&bogus;</t>", "UnsupportedCellValue", True),
+        ("xl/sharedStrings.xml", b">alpha</t>", b">\xff</t>", "InvalidUtf8", True),
+        # A <v> the number canonicalizer cannot read, a t="d" date, a t
+        # the reader does not know — the cell rule's one name, never the
+        # canonicalizer's.
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b"><v>1,5</v>", "UnsupportedCellValue", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="d"><v>2024-01-01</v>', "UnsupportedCellValue", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="zz"><v>42</v>', "UnsupportedCellValue", True),
+        # The UTF-8 rule on the kinds the hash does not validate: an
+        # error literal, a number (judged before the canonicalizer).
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="e"><v>#N/\xff</v>', "InvalidUtf8", True),
+        ("xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b"><v>1\xff</v>", "InvalidUtf8", True),
+        # A shared-string table the parser cannot read (the LAST entry's
+        # close — an inner one is tolerated): the table is the
+        # workbook's, so the other sheet refuses too.
+        ("xl/sharedStrings.xml", b">two</t></si>", b">two</t>", "MalformedSharedStringsXml", False),
     ],
 )
-def test_embeddable_rows_refuses_a_workbook_it_cannot_serve(tmp_path, part, old, new, name):
-    """A sheet part the view cannot parse, or a cell value the read
-    cannot carry: a typed refusal rather than a record that lies. The
-    verdict is the sheet's — the other sheet still answers."""
+def test_embeddable_rows_refuses_a_workbook_it_cannot_serve(tmp_path, part, old, new, name, other_sheet_served):
+    """A part the view cannot parse, or a cell value the read cannot
+    carry: a typed refusal rather than a record that lies. A sheet
+    part's verdict leaves the other sheet served; the shared-string
+    table's does not."""
     _needs_read()
     src = tmp_path / "src.xlsx"
     _write_fixture(src)
@@ -242,7 +259,24 @@ def test_embeddable_rows_refuses_a_workbook_it_cannot_serve(tmp_path, part, old,
         with pytest.raises(zlsx.ZlsxRefusal) as info:
             ed.embeddable_rows(0, "A2:A4", "A")
         assert info.value.error_name == name
-        assert [r["text"] for r in ed.embeddable_rows(1, "A1:A1", "A")] == ["two"]
+        if other_sheet_served:
+            assert [r["text"] for r in ed.embeddable_rows(1, "A1:A1", "A")] == ["two"]
+        else:
+            with pytest.raises(zlsx.ZlsxRefusal) as other:
+                ed.embeddable_rows(1, "A1:A1", "A")
+            assert other.value.error_name == name
+
+
+def test_embeddable_rows_carries_an_error_cell_as_its_literal(tmp_path):
+    """An error cell is embeddable — its literal, the hash's kind ``e``."""
+    _needs_read()
+    src = tmp_path / "src.xlsx"
+    _write_fixture(src)
+    err = _patched(src, tmp_path / "err.xlsx", "xl/worksheets/sheet1.xml", b't="s"><v>2</v>', b't="e"><v>#N/A</v>')
+    with zlsx.Editor(err) as ed:
+        rows = ed.embeddable_rows(0, "A2:A4", "A")
+        assert [(r["row"], r["text"]) for r in rows] == [(2, "#N/A"), (3, "beta"), (4, "gamma")]
+        assert rows[0]["hash"] != ALPHA_ROW2_HASH
 
 
 # ── the Python surface ───────────────────────────────────────────────
