@@ -1500,6 +1500,13 @@ pub const PartStore = struct {
         return self.partControlled(name, .none);
     }
 
+    /// Whether the store holds a part by that name — `part`'s lookup
+    /// without its materialization, for a caller that only needs to
+    /// know whether its write will be an `addPart` (S3c slice 4).
+    pub fn hasPart(self: *const PartStore, name: []const u8) bool {
+        return self.findIndex(name) != null;
+    }
+
     /// `part` with §5.5's poll seam (M5d1). First access to a part is
     /// what decompresses it, so "model materialization" is exactly this
     /// call — and on a workbook whose SST is 120 MiB it is a long

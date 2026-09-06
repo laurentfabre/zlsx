@@ -18,6 +18,7 @@ const sheet_edit = @import("sheet_edit.zig");
 const table_edit = @import("table_edit.zig");
 const pivots_mod = @import("pivots.zig");
 const store_mod = @import("store.zig");
+const embedding_part = @import("embedding_part.zig");
 const AtomicFile = @import("atomic_file.zig").AtomicFile;
 
 const Allocator = std.mem.Allocator;
@@ -757,7 +758,7 @@ pub const Editor = struct {
     /// nothing left to delete. Idempotent, and a no-op on a workbook
     /// without embeddings, as the workbook's is.
     pub fn stripEmbeddings(self: *Editor) !void {
-        const cells_sheet = self.workbook.recoveryCellSheetIndex();
+        const cells_sheet = try self.workbook.recoveryCellSheetIndex();
         if (cells_sheet) |idx| {
             // The strip's own verdict on `xl/workbook.xml`, judged
             // before the delete installs anything — the workbook's
@@ -783,6 +784,70 @@ pub const Editor = struct {
         // workbook that carried the cells sheet — which this path has
         // just deleted, so it says what it saw.
         try self.workbook.stripEmbeddingsScoped(.{ .worksheet_parts = cells_sheet != null });
+    }
+
+    /// `Workbook.setEmbeddings` on the editor — `setEmbeddingsOpts` with
+    /// the default options (the record in the two invisible carriers).
+    pub fn setEmbeddings(
+        self: *Editor,
+        model: []const u8,
+        dim: u32,
+        dtype: embedding_part.Dtype,
+        inputs: []const workbook_mod.EmbeddingCoverageInput,
+    ) !void {
+        return self.setEmbeddingsOpts(model, dim, dtype, inputs, .{});
+    }
+
+    /// `Workbook.setEmbeddingsOpts` on the editor, the sheet mirror kept
+    /// in step. The `recovery_in_cells` carrier is a hidden sheet the
+    /// workbook adds through its own `addSheet`, beneath `sheet_paths` —
+    /// an index the mirror would not know, a `setCell` at the next
+    /// index landing on the wrong sheet (the strip's mirror hole, S3c
+    /// slice 3, on the write side). So the mirror's entry is allocated
+    /// BEFORE the workbook mutates (the `addSheet` rule: the part name
+    /// computed ahead from the same store walk `Workbook.addSheet`
+    /// does; nothing between the two adds a worksheet part) and
+    /// installed after — whatever the verdict: a failure past the add
+    /// (an allocation staging the cell) leaves the sheet in the
+    /// workbook, and the mirror must say so. Every refusal the sheet's
+    /// creation can give is the workbook's pass 0c, before the first
+    /// part write, and leaves the mirror as it was. An existing sheet
+    /// is refreshed in place (the workbook's rule); the mirror does not
+    /// move.
+    pub fn setEmbeddingsOpts(
+        self: *Editor,
+        model: []const u8,
+        dim: u32,
+        dtype: embedding_part.Dtype,
+        inputs: []const workbook_mod.EmbeddingCoverageInput,
+        opts: workbook_mod.RecoveryOptions,
+    ) !void {
+        const old_paths = self.sheet_paths;
+        var pending_path: ?[]const u8 = null;
+        var pending_paths: ?[][]const u8 = null;
+        defer if (pending_path) |p| self.allocator.free(p);
+        defer if (pending_paths) |p| self.allocator.free(p);
+        if (opts.recovery_in_cells and (try self.workbook.recoveryCellSheetIndex()) == null) {
+            if (old_paths.len >= std.math.maxInt(u32)) return error.TooManySheets;
+            var path_buf: [64]u8 = undefined;
+            const part_name = try self.workbook.nextSheetPartName(&path_buf);
+            pending_path = try self.allocator.dupe(u8, part_name);
+            pending_paths = try self.allocator.alloc([]const u8, old_paths.len + 1);
+        }
+
+        const result = self.workbook.setEmbeddingsOpts(model, dim, dtype, inputs, opts);
+
+        if (pending_paths) |paths| {
+            if (self.workbook.sheetCount() == old_paths.len + 1) {
+                @memcpy(paths[0..old_paths.len], old_paths);
+                paths[old_paths.len] = pending_path.?;
+                self.sheet_paths = paths;
+                self.allocator.free(old_paths);
+                pending_path = null;
+                pending_paths = null;
+            }
+        }
+        return result;
     }
 
     pub fn addSheet(self: *Editor, name: []const u8) !u32 {
@@ -11284,7 +11349,6 @@ test "Editor: chart series formulas ride every structural edit; a carrier the wa
 test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet through the mirror — indices stay honest, the orphan goes, a dirty editor refuses before the first removal" {
     const a = std.testing.allocator;
     const recovery_record = @import("recovery_record.zig");
-    const embedding_part = @import("embedding_part.zig");
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -11331,7 +11395,7 @@ test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet th
         defer ed.deinit();
         try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
         try std.testing.expectEqualStrings(doomed, ed.sheet_paths[1]);
-        try std.testing.expectEqual(@as(?u32, 1), ed.workbook.recoveryCellSheetIndex());
+        try std.testing.expectEqual(@as(?u32, 1), try ed.workbook.recoveryCellSheetIndex());
         try std.testing.expect((try ed.workbook.store.part(doomed)) != null);
 
         try ed.stripEmbeddings();
@@ -11377,6 +11441,111 @@ test "S3c slice 3: Editor.stripEmbeddings deletes the recovery_in_cells sheet th
         const before = ed.workbook.store.mutations;
         try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.stripEmbeddings());
         try std.testing.expectEqual(before, ed.workbook.store.mutations);
+        try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+        try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
+        try std.testing.expect((try ed.workbook.embeddings()) == .present);
+    }
+}
+
+test "S3c slice 4: Editor.setEmbeddingsOpts adds the hidden cells sheet through the mirror — the next addSheet index agrees, a setCell after it lands where the mirror says; a second write refreshes without growing it; a refusal before the first write leaves the mirror as it was" {
+    const a = std.testing.allocator;
+    const recovery_record = @import("recovery_record.zig");
+    const workbook_xml = @import("typed_parts/workbook_xml.zig");
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/cells_write.xlsx", .{dir});
+    defer a.free(path);
+    const out = try std.fmt.allocPrint(a, "{s}/cells_write_out.xlsx", .{dir});
+    defer a.free(out);
+    {
+        var wb = try Workbook.empty(a, io);
+        defer wb.deinit();
+        const items = try wb.addSheet("Items");
+        try items.appendRows(&[_][]const Cell{&.{.{ .string = "Title" }}});
+        try items.appendRows(&[_][]const Cell{&.{.{ .string = "Alpha" }}});
+        const second = try wb.addSheet("Second");
+        try second.appendRows(&[_][]const Cell{&.{.{ .string = "two" }}});
+        try wb.save(io, path);
+    }
+    const vec: [1 * (4 + 2)]u8 = @splat(7);
+    const hashes = [_]u64{0xAAAA};
+    const inputs = [_]workbook_mod.EmbeddingCoverageInput{.{
+        .id = "title",
+        .worksheet_target = "worksheets/sheet1.xml",
+        .range = "A2:A2",
+        .column = "A",
+        .include_formulas = false,
+        .vec_body = &vec,
+        .hashes = &hashes,
+    }};
+    const opts: workbook_mod.RecoveryOptions = .{ .recovery_in_cells = true };
+    {
+        var ed = try Editor.open(a, io, path);
+        defer ed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+
+        try ed.setEmbeddingsOpts("m1", 2, .int8_sym_per_vec, &inputs, opts);
+
+        try std.testing.expectEqual(@as(usize, 3), ed.sheet_paths.len);
+        try std.testing.expectEqualStrings("xl/worksheets/sheet3.xml", ed.sheet_paths[2]);
+        try std.testing.expectEqual(@as(u32, 3), ed.workbook.sheetCount());
+        try std.testing.expectEqual(@as(?u32, 2), try ed.workbook.recoveryCellSheetIndex());
+        try std.testing.expectEqual(workbook_xml.SheetState.hidden, (try ed.workbook.sheet(2)).state());
+        // A second write refreshes the sheet; the mirror does not move.
+        try ed.setEmbeddingsOpts("m2", 2, .int8_sym_per_vec, &inputs, opts);
+        try std.testing.expectEqual(@as(usize, 3), ed.sheet_paths.len);
+        try std.testing.expectEqual(@as(u32, 3), ed.workbook.sheetCount());
+        // The mirror and the workbook agree on the next index, and a
+        // write to it lands there.
+        try std.testing.expectEqual(@as(u32, 3), try ed.addSheet("New"));
+        try ed.setCell(3, 1, 0, .{ .string = "x" });
+        try ed.save(io, out);
+    }
+    {
+        var wb = try Workbook.open(a, io, out);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 4), wb.sheetCount());
+        try std.testing.expectEqual(workbook_xml.SheetState.hidden, (try wb.sheet(2)).state());
+        try std.testing.expectEqual(@as(?u32, 2), try wb.recoveryCellSheetIndex());
+        const view = (try wb.embeddings()).present;
+        try std.testing.expectEqualStrings("m2", view.index.model);
+        const new = (try wb.sheetByName("New")) orelse return error.TestUnexpectedResult;
+        const part = try new.resolvePartName();
+        try std.testing.expectEqualStrings("xl/worksheets/sheet4.xml", part);
+        var rows = try wb.embeddableRows(a, part["xl/".len..], "A1:A1", "A", false);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqualStrings("x", rows.rows[0].text);
+        // The cells sheet holds the record and nothing else.
+        const rec_sheet = try wb.sheet(2);
+        const rec_part = try rec_sheet.resolvePartName();
+        var rec_rows = try wb.embeddableRows(a, rec_part["xl/".len..], "A1:A1", "A", false);
+        defer rec_rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rec_rows.rows.len);
+        try std.testing.expect(recovery_record.recordSpanInText(rec_rows.rows[0].text) != null);
+    }
+    // A refusal before the first write: the mirror as it was, nothing
+    // staged.
+    {
+        var ed = try Editor.open(a, io, path);
+        defer ed.deinit();
+        const wbx = (try ed.workbook.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        const patched = try std.mem.replaceOwned(u8, a, wbx.bytes, "sheetId=\"1\"", "sheetId=\"4294967295\"");
+        defer a.free(patched);
+        try ed.workbook.store.replacePart("xl/workbook.xml", patched);
+        const before = ed.workbook.store.mutations;
+        try std.testing.expectError(error.IdSpaceExhausted, ed.setEmbeddingsOpts("m", 2, .int8_sym_per_vec, &inputs, opts));
+        try std.testing.expectEqual(before, ed.workbook.store.mutations);
+        try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
+        try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
+        try std.testing.expect((try ed.workbook.embeddings()) == .absent);
+        // The default options never touch the mirror.
+        try ed.setEmbeddings("m", 2, .int8_sym_per_vec, &inputs);
         try std.testing.expectEqual(@as(usize, 2), ed.sheet_paths.len);
         try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
         try std.testing.expect((try ed.workbook.embeddings()) == .present);

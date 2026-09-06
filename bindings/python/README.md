@@ -441,8 +441,9 @@ record ceiling bounds the same fields). A NumPy array crosses as one
 contiguous float32 / uint64 buffer; values narrow to float32 as they are
 (a float64 past its range lands as `inf`), `2**64 - 1` is the tombstone,
 and a masked array's masked slots are "no value". A refusal after the first
-part is written (an allocation failure, an index past the cap, a package
-part the carriers cannot patch) leaves the staged set partially replaced:
+part is written (an allocation failure, an index past the cap, an existing
+`docProps/custom.xml` the carrier cannot patch) leaves the staged set
+partially replaced:
 close the editor without saving. A save after the write re-emits the
 workbook's `<definedNames>` block: every existing name keeps `name`,
 `localSheetId` and `hidden` only — its other attributes (`comment`,
@@ -450,9 +451,41 @@ workbook's `<definedNames>` block: every existing name keeps `name`,
 defined-name edit (pre-existing, recorded). The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
 rebuild from the archive as opened and do not carry a staged embedding
-write — call them before it, or save and re-open. `recovery_in_cells` (the
-Numbers-durable carrier) is Zig-only until the editor grows a path for its
-hidden sheet (its strip side shipped with the sweeps below).
+write — call them before it, or save and re-open.
+
+`recovery=` picks where the recovery record rides. The default,
+`"invisible"`, is the two carriers no user sees — and an Apple Numbers
+export erases them, so that export reads `absent`. `recovery="in_cells"`
+also writes the record into a hidden sheet named `zlsxRecovery` (Excel's
+*Hide*; `Book.sheet_state` reads `"hidden"`), the one carrier Numbers keeps,
+so a Numbers export reads `stripped` with `carrier == "cell_data"` and the
+model, dimension and ranges intact — at the cost of a sheet the user can
+reveal; the two cannot be had together. The sheet is appended after the
+last one and the editor's indices count it (`add_sheet` returns one more,
+`set_cell` addresses it); the write stages the sheet's `A1` as a cell edit,
+so a structural delete in the same session (`delete_sheet`,
+`strip_embeddings`) refuses `SheetDeleteRequiresCleanState` until a save.
+`"in_cells"` governs the sheet's creation: a workbook already carrying it
+has its cell refreshed by every later write, whatever `recovery` says, and
+every write first scrubs the previous record from the shared-string table
+(and the worksheet parts when the sheet or an orphaned worksheet part is
+there), so the record is one generation in every carrier — that scrub reads
+the table once per write and blanks a stale record's entry in place, so a
+user cell that shared the entry reads empty afterwards;
+`strip_embeddings()` removes the sheet. Its own refusals land before the
+first part write too: `IdSpaceExhausted` (the `sheetId`, part-number or
+`rId` space), `MissingWorkbookPart` / `SheetCountMismatch`,
+`MissingContentTypes` / `MalformedContentTypes` (a `[Content_Types].xml` the
+write cannot add a part to — judged whenever it adds one),
+`MalformedSharedStringsXml` / `MalformedSheetXml` as a `ZlsxRefusal`;
+`SheetHasUnsavedAppends` (staged `append_rows` on the sheet) and
+`StructuralEditIncomplete` as a `ZlsxError`.
+
+```python
+with zlsx.edit("report.xlsx") as ed:
+    ed.set_embeddings(model, dim, coverages, recovery="in_cells")   # survives a Numbers export
+    ed.save("report.xlsx")
+```
 
 `prune_embeddings()` and `strip_embeddings()` are the two sweeps `zlsx embed
 --prune` / `--strip` run, on the editor handle (0.9.0+). Prune tombstones

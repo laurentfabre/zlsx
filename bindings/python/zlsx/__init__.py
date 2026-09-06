@@ -4362,6 +4362,12 @@ class Editor:
     _EMB_COVERAGE_KEYS = frozenset(
         {"id", "sheet", "range", "column", "vectors", "hashes", "include_formulas"}
     )
+    # `recovery=` → the flags word: the record in its two invisible
+    # carriers only, or also in the hidden `zlsxRecovery` sheet.
+    _EMB_RECOVERY_MODES = {
+        "invisible": 0,
+        "in_cells": _ffi.ZLSX_EMB_WRITE_RECOVERY_IN_CELLS,
+    }
 
     def set_embeddings(
         self,
@@ -4370,6 +4376,7 @@ class Editor:
         coverages: Sequence[dict],
         *,
         dtype: str = "f32",
+        recovery: str = "invisible",
     ) -> None:
         """Write the workbook's embedding set — ``Workbook.setEmbeddings``
         on the editor handle: the index, a vec / hashes part per
@@ -4378,6 +4385,37 @@ class Editor:
         ``docProps/custom.xml``). Replaces any previous set; staged in
         memory, committed by :meth:`save` / :meth:`save_to_buffer`; read
         back with :func:`embeddings` (``present``).
+
+        ``recovery`` picks where the recovery record rides
+        (``Workbook.setEmbeddingsOpts``): ``"invisible"`` (the default)
+        is the two carriers above, which no user sees and an Apple
+        Numbers export erases — a Numbers export then reads ``absent``;
+        ``"in_cells"`` also writes it into a hidden sheet named
+        ``zlsxRecovery`` (Excel's *Hide*; ``Book.sheet_state`` reads
+        ``"hidden"``), the one carrier Numbers keeps, so that export
+        reads ``stripped`` with ``carrier == "cell_data"`` and the
+        provenance intact — at the cost of a sheet the user can reveal
+        (the two cannot be had together). The sheet is appended after
+        the last one and the editor's indices count it: the next
+        :meth:`add_sheet` returns one more, :meth:`set_cell` addresses
+        it. The write stages the sheet's ``A1`` as a cell edit, so a
+        structural delete in the same session (:meth:`delete_sheet`,
+        :meth:`strip_embeddings`) refuses ``SheetDeleteRequiresCleanState``
+        until a save. ``"in_cells"`` governs the sheet's CREATION: a
+        workbook already carrying it (an earlier ``"in_cells"`` write)
+        has its cell refreshed by every later write, whatever
+        ``recovery`` says. Every write, whatever ``recovery`` says,
+        first scrubs the previous record from the shared-string table
+        and — when the sheet or an orphaned worksheet part is there —
+        from the worksheet parts, so the record is one generation in
+        every carrier; :meth:`strip_embeddings` removes the sheet. That
+        scrub reads the shared-string table once per write (a read the
+        default write's save does not otherwise make) and blanks a stale
+        record's table entry in place, so a user cell that shared that
+        entry reads empty afterwards. The
+        name is reserved: a sheet spelled so, however cased, IS the
+        carrier and its ``A1`` is written. Requires libzlsx 0.9.0+ as the
+        write itself does (0.9.0 ships both).
 
         Each coverage is a dict::
 
@@ -4422,23 +4460,44 @@ class Editor:
         ``UnsupportedDtype``, ``SheetIndexOutOfRange``,
         ``InvalidCoverageId``, ``InvalidRange`` (the range, or a column
         outside it), ``DuplicateCoverageId``, ``CoverageOverlap``,
-        ``InvalidXmlByte`` (a C0 control byte in ``model``). A workbook
+        ``InvalidXmlByte`` (a C0 control byte in ``model``); when the
+        cells carrier is written, ``SheetHasUnsavedAppends`` (the
+        ``zlsxRecovery`` sheet holds staged :meth:`append_rows` — save
+        first) and ``StructuralEditIncomplete`` (the editor holds a torn
+        structural edit and the sheet would have to be created — close
+        it). A workbook
         the set cannot land in refuses with a :class:`ZlsxRefusal`
         (``error_name``): ``MissingWorkbookRels`` /
         ``MalformedWorkbookRels`` (no ``xl/_rels/workbook.xml.rels`` — or
         no ``_rels/.rels`` close tag when ``docProps/custom.xml`` has to
         be created — to register a relationship in; checked before the
-        first write), ``IdSpaceExhausted`` (a rels ``rId`` or custom
-        property ``pid`` space already at ``2**32 - 1``; checked before
-        the first write), ``MissingRelationship`` (a sheet whose part
-        the workbook does not reach), ``EmbeddingExceedsArchiveLimit``
+        first write), ``IdSpaceExhausted`` (a rels ``rId`` — for the
+        hidden sheet, the one after the write's own relationship's — or
+        custom property ``pid`` space, or, when the sheet is created,
+        the ``sheetId`` or worksheet part-number space, already at
+        ``2**32 - 1``; checked before the first write),
+        ``MissingRelationship`` (a sheet whose part
+        the workbook does not reach), ``MissingWorkbookPart`` /
+        ``SheetCountMismatch`` (no ``xl/workbook.xml``, or one whose
+        ``</sheets>`` the typed parser reads elsewhere than the splice,
+        so the hidden sheet's add could not land; checked before the
+        first write), ``MissingContentTypes`` / ``MalformedContentTypes``
+        (no ``[Content_Types].xml``, or one without ``</Types>``, when
+        this write adds a part — a coverage new to the archive, a first
+        index, an absent ``docProps/custom.xml``, the hidden sheet;
+        checked before the first write), ``MalformedSharedStringsXml`` /
+        ``MalformedSheetXml`` (a shared-string table or, with the sheet
+        present or an orphaned or unresolvable worksheet part in the
+        archive, a worksheet part the scrub would read and the store
+        cannot serve; checked before the first write),
+        ``EmbeddingExceedsArchiveLimit``
         (a part past the 512 MiB read cap — sized from the inputs before
         a vector is read — or the recovery record past its ceiling),
         ``MalformedWorkbookXml`` (an ``xl/workbook.xml`` the open admits
         but the strip of the previous record's chunk names cannot walk;
         judged before the first write). A refusal that fires after the
         first part is written (an allocation failure, an index past the
-        cap, a content-types or docProps part the carriers cannot patch)
+        cap, an existing ``docProps/custom.xml`` the carrier cannot patch)
         leaves the staged set partially replaced: close the editor
         without saving. A save after this write re-emits the workbook's
         ``<definedNames>`` block: every existing name keeps ``name``,
@@ -4450,12 +4509,15 @@ class Editor:
         :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
         candidate from the archive as opened and do NOT carry this
         write: call them before it, or save and re-open (a recorded,
-        pre-existing rule of the transaction's generation model). Shapes are checked here first
+        pre-existing rule of the transaction's generation model — under
+        ``recovery="in_cells"`` the write adds a sheet, and the rule
+        bites as it does after :meth:`add_sheet`). Shapes are checked here first
         — a ``TypeError`` for a non-dict coverage, a non-string id /
         range / column, a bool where a number belongs, a non-numeric
-        array; a ``ValueError`` for an unknown or missing key, a ragged
-        matrix, a hash outside ``[0, 2**64)`` — before ctypes could
-        truncate. Inherited from the Zig surface: the index read hands
+        array, a non-string ``recovery``; a ``ValueError`` for an unknown
+        or missing key, a ragged matrix, a hash outside ``[0, 2**64)``,
+        a ``recovery`` that is neither ``"invisible"`` nor
+        ``"in_cells"`` — before ctypes could truncate. Inherited from the Zig surface: the index read hands
         the model name back raw, so one carrying ``&``, ``<`` or ``"``
         reads back entity-escaped, and a tab, LF or CR in it reads back
         as written here while a conforming XML parser normalizes them
@@ -4474,6 +4536,13 @@ class Editor:
             raise TypeError(f"model must be a str, not {type(model).__name__}")
         if not isinstance(dtype, str):
             raise TypeError(f"dtype must be a str, not {type(dtype).__name__}")
+        if not isinstance(recovery, str):
+            raise TypeError(f"recovery must be a str, not {type(recovery).__name__}")
+        flags = self._EMB_RECOVERY_MODES.get(recovery)
+        if flags is None:
+            raise ValueError(
+                f"recovery must be one of {sorted(self._EMB_RECOVERY_MODES)}, not {recovery!r}"
+            )
         dim_v = self._u32("dim", dim)
         if isinstance(coverages, (str, bytes, dict)):
             raise TypeError("coverages must be a sequence of coverage dicts")
@@ -4516,7 +4585,7 @@ class Editor:
         self._structural_call(
             "zlsx_editor_set_embeddings", _ffi.lib.zlsx_editor_set_embeddings,
             self._handle, model_buf, len(model_raw), dim_v,
-            dtype_buf, len(dtype_raw), arr, len(covs), 0,
+            dtype_buf, len(dtype_raw), arr, len(covs), flags,
         )
         del keep
 
@@ -4725,7 +4794,9 @@ class Editor:
         embeddings, and on a partially stripped one. Staged in memory,
         committed by :meth:`save`.
 
-        The ``recovery_in_cells`` sheet, when present, goes through the
+        The ``recovery_in_cells`` sheet — found by its reserved name
+        ``zlsxRecovery``, however cased (the write's rule) — when present,
+        goes through the
         editor's own :meth:`delete_sheet` path so sheet indices stay
         honest, and only then do its rules apply — judged before the
         first part is removed: :class:`ZlsxError`
