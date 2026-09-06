@@ -125,7 +125,8 @@ test "Workbook corpus sweep — open + materialise every sheet without leak" {
 }
 
 test "WDI Excel — the embed read refuses a positional sheet rather than serve it empty" {
-    // The World Bank exporter writes no `r` on any row or cell; the
+    // The World Bank exporter writes no `r` on any row (and on most
+    // cells — the rows are the trigger); the
     // lenient reader infers the positions, the typed view counts and
     // drops them. `embeddableRows` (and so `--extract`, `--prune`, the C
     // and Python reads) refuses the sheet whole — before S3c slice 2 it

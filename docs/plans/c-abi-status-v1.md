@@ -1626,7 +1626,8 @@ checked before ctypes, the buffer released on every path.
   embedder as the entities and was hashed as such; a rich shared string
   refused the whole read (`SstEntryIsRich` — one bold word in the
   column and `--extract` failed); a rich inline string was its first
-  run alone. `canonicalCellFor` now reads a cell the way `readHostGrid`
+  run alone. `canonicalCellFor` (`canonicalCellOf` since round 1, the
+  cell in hand) now reads a cell the way `readHostGrid`
   (the S7b pivot rebuild) reads one — a shared string plain or its runs
   joined, an inline string's runs joined through `inlineStringText`, a
   formula's cached `t="str"` value decoded — through
@@ -1731,8 +1732,9 @@ cell without `r`). §19's "four new entries" and the causes list (A
 DOC-201) → five and seven. **Round 3** (two agents, convergence; A
 ship-ready with 3 LOW): positional OOXML is in the project's own corpus
 — `wdi_excel.xlsx` (the World Bank exporter) carries no `r` on any row
-or cell of its six sheets (401 395 rows / 9 994 345 cells on the
-first), so every embed surface now refuses it `MalformedSheetXml` where
+of its six sheets, and on most cells (the first sheet: 401 395 rows,
+9 994 345 of 10 492 903 cells `r`-less — a mixed shape, the rows being
+the trigger), so every embed surface now refuses it `MalformedSheetXml` where
 `main` answered an EMPTY row list silently (nothing served for a sheet
 full of text — the same silent omission the round-2 fix closed);
 recorded here, pinned corpus-gated in `tests/workbook_corpus.zig`, and

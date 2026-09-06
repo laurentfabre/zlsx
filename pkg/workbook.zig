@@ -3114,7 +3114,7 @@ pub const Workbook = struct {
     /// this list gets `TOMBSTONE_HASH` when the vectors come back,
     /// which is the same state `--prune` would leave it in.
     ///
-    /// `text` is the cell as a reader sees it (`canonicalCellFor`):
+    /// `text` is the cell as a reader sees it (`canonicalCellOf`):
     /// a shared string plain or its runs joined, an inline string's
     /// runs joined, a formula's cached string — entities resolved by
     /// the one strict decoder every cell reader uses. The hash is

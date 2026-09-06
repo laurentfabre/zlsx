@@ -420,7 +420,8 @@ it cannot read — 0, non-numeric, past the limit — or a ref under another row
 read cannot carry —
 `UnsupportedCellValue`: a boolean `<v>` that is not 0 / 1, a `<v>` the number
 canonicalizer cannot read, a `t="d"` ISO-8601 date, a `t` this reader does
-not know, a bad shared-string index or entity; `SstIndexOutOfRange`,
+not know, a shared-string index that is not a number, an entity the decoder
+does not know; `SstIndexOutOfRange`,
 `InvalidUtf8`, `UnicodeNormalizationFailed`) rather than return a record
 that lies.
 
