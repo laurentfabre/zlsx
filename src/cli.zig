@@ -3565,8 +3565,8 @@ fn runEmbedApply(
         return 2;
     };
     // The carrier choice, judged as `--dtype` is — before the workbook
-    // is opened; the sheet, range, column and id are the write's own
-    // verdicts, after it. The spelling is the CLI's (`in-cells`, as
+    // is opened; the sheet, range, column, id and model are the write's
+    // own verdicts, after it. The spelling is the CLI's (`in-cells`, as
     // `int8-sym`); py-zlsx says `in_cells`.
     const recovery: zlsx_pkg.RecoveryOptions = blk: {
         const name = args.recovery_name orelse break :blk .{};
