@@ -434,6 +434,8 @@ zlsx cells data.xlsx --all-sheets | jq 'select(.t=="str") | {sheet, ref, v}'
 zlsx embed b.xlsx --extract --column A --coverage A2:A100 > rows.ndjson
 my-embedder < rows.ndjson > vecs.ndjson
 zlsx embed b.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A100 --out out.xlsx
+# Keep the provenance record through an Apple Numbers export too (costs a hidden sheet).
+zlsx embed b.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A100 --recovery in-cells --out out.xlsx
 ```
 
 ---
