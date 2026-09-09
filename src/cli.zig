@@ -1273,9 +1273,10 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     "coverage":ID,"row":N,"hash":H,"vector":
         \\                     […]} per covered row — hash and vector
         \\                     null on a tombstoned slot. What
-        \\                     zlsx.embeddings / zlsx_emb_* report.
-        \\                     Takes no --out. The vector records are a
-        \\                     --vectors input again:
+        \\                     zlsx.embeddings / zlsx_emb_* report, plus
+        \\                     hash_algo, column and include_formulas
+        \\                     (CLI only). Takes no --out. The vector
+        \\                     records are a --vectors input again:
         \\                       zlsx embed b.xlsx --dump | jq -c \
         \\                         'select(.kind=="vector" and .hash != null)
         \\                          | {row, vector}' > vecs.ndjson
@@ -3844,6 +3845,13 @@ fn runEmbedDump(
             }
         },
         .present => |view| {
+            // One row of floats — the CLI's own buffer, exit 4 as
+            // `--vectors`' vector buffer is — taken before the first
+            // record, so that verdict too precedes the first byte; the
+            // set then streams through it one record at a time rather
+            // than as `count × dim` floats.
+            const row = alloc.alloc(f32, view.index.dim) catch return 4;
+            defer alloc.free(row);
             try writeEmbeddingsRecordHead(out, "present", view.index.model, view.index.dim, view.index.dtype.string(), view.index.hash_algo, view.coverages.len);
             try out.writeAll("}\n");
             for (view.coverages) |cv| {
@@ -3853,11 +3861,6 @@ fn runEmbedDump(
                 try writeJsonString(out, c.column);
                 try out.print(",\"include_formulas\":{s},\"rows\":{d}}}\n", .{ if (c.include_formulas) "true" else "false", cv.vec.header.count });
             }
-            // One row of floats — the CLI's own buffer, exit 4 as
-            // `--vectors`' vector buffer is; the set streams through it
-            // one record at a time rather than as `count × dim` floats.
-            const row = alloc.alloc(f32, view.index.dim) catch return 4;
-            defer alloc.free(row);
             for (view.coverages) |cv| {
                 const first_row = cv.coverage.parsed_range.first.row;
                 var i: u32 = 0;
@@ -11471,7 +11474,10 @@ test "S3c slice 6: embed --dump — absent; present as the state, the coverage a
 
     // The write: rows 2 and 4 carry a vector; row 3 (embeddable, no
     // vector) becomes a tombstone.
-    try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_vecs.ndjson", .data = "{\"row\":2,\"vector\":[0.5,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n" });
+    // 0.1 is not exact in binary: the dump must spell the SINGLE's
+    // shortest digits (`0.1`), not the widened double's
+    // (`0.10000000149011612`) — pinned here on the CLI path.
+    try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_vecs.ndjson", .data = "{\"row\":2,\"vector\":[0.1,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n" });
     const vecs = try tt.path(a, io, "s3c6_vecs.ndjson");
     defer a.free(vecs);
     const write_base: Args = .{ .file = src, .subcommand = .embed, .vectors_path = vecs, .model_name = "m1", .column_name = "A", .coverage_range = "A2:A4" };
@@ -11497,7 +11503,7 @@ test "S3c slice 6: embed --dump — absent; present as the state, the coverage a
     const want_f32 = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{d}{s}", .{
         "{\"kind\":\"embeddings\",\"state\":\"present\",\"model\":\"m1\",\"dim\":2,\"dtype\":\"f32\",\"hash_algo\":\"xxh3-64\",\"coverage_count\":1}\n",
         "{\"kind\":\"coverage\",\"id\":\"default\",\"sheet\":\"worksheets/sheet1.xml\",\"range\":\"A2:A4\",\"column\":\"A\",\"include_formulas\":false,\"rows\":3}\n",
-        "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":2,\"hash\":6830279115424181645,\"vector\":[0.5,0.25]}\n",
+        "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":2,\"hash\":6830279115424181645,\"vector\":[0.1,0.25]}\n",
         "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":3,\"hash\":null,\"vector\":null}\n",
         "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":4,\"hash\":",
         h_gamma,
@@ -11528,7 +11534,7 @@ test "S3c slice 6: embed --dump — absent; present as the state, the coverage a
             const vec_at = std.mem.indexOf(u8, line, "\"vector\":").?;
             try filtered.writer.print("{{{s},{s}\n", .{ line[row_at..hash_at], line[vec_at..] });
         }
-        try std.testing.expectEqualStrings("{\"row\":2,\"vector\":[0.5,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n", filtered.written());
+        try std.testing.expectEqualStrings("{\"row\":2,\"vector\":[0.1,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n", filtered.written());
         try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_roundtrip.ndjson", .data = filtered.written() });
         const rt_vecs = try tt.path(a, io, "s3c6_roundtrip.ndjson");
         defer a.free(rt_vecs);
@@ -11635,6 +11641,79 @@ test "S3c slice 6: embed --dump — absent; present as the state, the coverage a
         try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
         try std.testing.expect(std.mem.indexOf(u8, out_w.buffered(), "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":2,\"hash\":6830279115424181645,\"vector\":[null,null]}\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, out_w.buffered(), ",\"vector\":[1,-1.5]}\n") != null);
+    }
+
+    // An index string that is not UTF-8 — the index parser accepts the
+    // byte, the C surface copies it out raw — refuses the dump whole:
+    // exit 3, `InvalidUtf8`, stdout empty.
+    {
+        const out_bad = try tt.path(a, io, "s3c6_badutf8.xlsx");
+        defer a.free(out_bad);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_f32);
+            defer wb.deinit();
+            const idx = (try wb.store.part(zlsx_pkg.embedding_part.INDEX_PART_NAME)) orelse return error.TestUnexpectedResult;
+            const patched = try std.mem.replaceOwned(u8, a, idx.bytes, "model=\"m1\"", "model=\"m\xff1\"");
+            defer a.free(patched);
+            try std.testing.expect(patched.len == idx.bytes.len + 1);
+            try wb.store.replacePart(zlsx_pkg.embedding_part.INDEX_PART_NAME, patched);
+            try wb.save(io, out_bad);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_bad, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 3), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: embed --dump: InvalidUtf8\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+
+    // The same refusal on the stripped path: the record's percent
+    // encoding can spell a byte JSON cannot carry (`m%FF`), and the
+    // reader decodes it as given.
+    {
+        const out_bad = try tt.path(a, io, "s3c6_badutf8_stripped.xlsx");
+        defer a.free(out_bad);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_stripped);
+            defer wb.deinit();
+            const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+            const patched = try std.mem.replaceOwned(u8, a, wbx.bytes, "zlsxER1|m1|", "zlsxER1|m%FF|");
+            defer a.free(patched);
+            try std.testing.expect(patched.len == wbx.bytes.len + 2);
+            try wb.store.replacePart("xl/workbook.xml", patched);
+            try wb.save(io, out_bad);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_bad, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 3), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: embed --dump: InvalidUtf8\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+
+    // A recovery record the reader cannot decode is not a refusal: it
+    // reads `absent` (the library's rule — provenance, not data; a
+    // malformed record must not make a readable workbook refuse), and
+    // so does the dump.
+    {
+        const out_bad = try tt.path(a, io, "s3c6_badrecord.xlsx");
+        defer a.free(out_bad);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_stripped);
+            defer wb.deinit();
+            const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+            const patched = try std.mem.replaceOwned(u8, a, wbx.bytes, "zlsxER1|", "zlsxER9|");
+            defer a.free(patched);
+            try std.testing.expect(std.mem.indexOf(u8, patched, "zlsxER9|") != null);
+            try wb.store.replacePart("xl/workbook.xml", patched);
+            try wb.save(io, out_bad);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_bad, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqualStrings("{\"kind\":\"embeddings\",\"state\":\"absent\"}\n", out_w.buffered());
     }
 
     // A set the read cannot serve — its vec part gone — refuses before
