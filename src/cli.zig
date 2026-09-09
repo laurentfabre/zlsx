@@ -11851,7 +11851,7 @@ test "S3c slice 6: embed --dump — two coverages: the coverage records in index
 /// buffer's exit 4 included (r2, A-TEST-202: the buffer taken after two
 /// records were written survived the suite) — and succeed otherwise.
 fn s3c6DumpForFailures(alloc: std.mem.Allocator, io: std.Io, file: []const u8) !void {
-    var err_buf: [256]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
     var out_buf: [4096]u8 = undefined;
     var err_w = std.Io.Writer.fixed(&err_buf);
     var out_w = std.Io.Writer.fixed(&out_buf);
@@ -11891,4 +11891,16 @@ test "S3c slice 6: embed --dump — every allocation failure on the path exits n
         try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
     }
     try std.testing.checkAllAllocationFailures(a, s3c6DumpForFailures, .{ io, @as([]const u8, out) });
+    // The stripped state too (r3, B-REL-301): the record reader's grow
+    // loop orphaned its first buffer when its second allocation failed
+    // — a leak this sweep found once it looked there.
+    const out_stripped = try tt.path(a, io, "s3c6_oom_stripped.xlsx");
+    defer a.free(out_stripped);
+    {
+        var wb = try zlsx_pkg.Workbook.open(a, io, out);
+        defer wb.deinit();
+        try wb.store.removePart(zlsx_pkg.embedding_part.INDEX_PART_NAME);
+        try wb.save(io, out_stripped);
+    }
+    try std.testing.checkAllAllocationFailures(a, s3c6DumpForFailures, .{ io, @as([]const u8, out_stripped) });
 }
