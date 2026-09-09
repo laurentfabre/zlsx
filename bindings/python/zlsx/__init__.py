@@ -4986,13 +4986,16 @@ class Editor:
         Raises :class:`ZlsxRefusal` ``RecalcRequiresReopen`` — nothing
         mutated — when a structural edit (:meth:`add_sheet`,
         :meth:`insert_row`, :meth:`rename_sheet`, …), an embedding write
-        / prune / strip, or a :meth:`save` that materialized cell writes
-        has installed into the live generation since it went live: the
+        / prune / strip, a :meth:`strip_doc_props` that changed a part,
+        or a :meth:`save` that materialized cell writes has installed
+        into the live generation since it went live: the
         mark's candidate is built from the archive as opened and cannot
         carry those parts (the recalc-transaction guard; before it the
         wrong order dropped them silently or aborted the process). Mark
         first, or save and re-open. Staged cell writes are not installs:
-        ``set_cell`` then this then :meth:`save` lands both."""
+        ``set_cell`` then this then :meth:`save` lands both
+        (:meth:`save_with_recalc` alone never writes a staged cell — it
+        refuses ``SheetHasUnsavedMutations``)."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_MARK_RECALC:
@@ -5080,8 +5083,11 @@ class Editor:
         of the pre-commit refusals: a mutator installed into the live
         generation since it went live (:meth:`mark_recalc_on_load`'s
         rule) and the run would build a candidate; a workbook with
-        nothing to recalculate is the plain save of the live store,
-        installs carried — not refused."""
+        nothing to recalculate writes the live store's parts, installs
+        carried — not refused. A staged :meth:`set_cell` on any sheet
+        raises :class:`ZlsxError` ``SheetHasUnsavedMutations`` before
+        anything runs: neither arm of this transaction writes it —
+        :meth:`save` first, or :meth:`recalculate` then :meth:`save`."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SAVE_WITH_RECALC:

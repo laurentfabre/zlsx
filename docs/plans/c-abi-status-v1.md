@@ -2432,14 +2432,15 @@ under both spellings.
 (`store.installs == generation_installs`), judged at the top of
 `recalc_txn.prepare` — the choke point every transaction passes:
 `markRecalcOnLoad`, `recalculate`, `saveWithRecalc`, and the exported
-`prepare` — and only there (decision RTG-3): a run with nothing to
-recalculate (`recalc_run.prepare`'s `.none` arm) builds no candidate
-and swaps nothing, so it is not refused — `saveWithRecalc` over such a
-workbook is the plain save of the live store, installs carried, and
-`recalculate` a no-op report; pinned on every surface. The retention
-refusals sit at the same point, so an evaluation can precede the
-verdict as it precedes theirs (a gate before the model was tried and
-dropped: it refused the no-op arm, which used to serve the edit
+`prepare` — the authority — and once more in `recalc_run.prepare`
+right after the no-formula decision (decision RTG-3, in-house r1
+RTG-DOC-101): a run with nothing to recalculate (the `.none` arm)
+builds no candidate and swaps nothing, so it is not refused —
+`saveWithRecalc` over such a workbook writes the live store's parts,
+installs included, and `recalculate` returns a no-op report; pinned on
+every surface — while a run that would build one refuses before its
+graph, drive and staging are spent (a gate before the model was tried
+and dropped: it refused the no-op arm, which used to serve the edit
 correctly). The verdict is a
 new `Workbook.Error` member, `RecalcRequiresReopen`, in
 `c_abi.zig::structural_refusals` — `-2` with the name in the diag, no
@@ -2465,12 +2466,16 @@ installs those into its candidate, so after a swap the live store's
 `Workbook.generation_installs`, and the guard reads the difference. A
 mark after a mark, a recalc after a recalc, stay legal (pinned); the
 first install a mutator makes afterwards is the one the guard sees.
-Staged cell writes are deltas, not installs — the model reads them, the
-save re-emits them over whichever generation is live — so `set_cell` +
-mark + save lands both (pinned on Zig and Python). The save that
+Staged cell writes are deltas, not installs — the model reads them,
+`save` re-emits them over whichever generation is live — so `set_cell`
++ mark + save lands both (pinned on Zig and Python). The save that
 materializes them (`applySavePlans` → `store.replacePart`) IS an
 install: `set_cell` + `save` + mark + `save` used to lose the cell in
-the second file (measured before the guard) and refuses now.
+the second file (measured before the guard) and refuses now. A torn
+workbook (`torn_edit`) is judged first — `StructuralEditIncomplete`,
+whose remedy is to discard the instance (RTG-REL-103); the exported
+`prepare` → `swap` two-step asserts at the swap that no mutator ran in
+between (RTG-REL-105).
 
 **The three shapes measured before the guard, from Python against the
 `002a31f` library**: `set_cell; save(a); mark; save(b)` — `b` without
@@ -2489,13 +2494,16 @@ edit, save, re-open, recalc, and asserts the refusal on the way.
 
 **Pinned**: `pkg/recalc_txn.zig` (a rename refuses before anything is
 built — store identity, `installs`, the retained set, the sheet all
-unchanged, and before the retention ceiling; the transaction's own
-installs are the generation's; a staged delta is not an install and
-the materializing save is; the saved file re-opened takes a transaction
-again), `pkg/recalc_run.zig` (an added sheet and a moved row refuse
-`recalculate` before the evaluation and `saveWithRecalc` before the
-rename, the destination absent, the stale cache untouched; the
-documented order lands both), `pkg/workbook.zig` (the write under
+unchanged, before the retention ceiling, and under an allocator that
+fails every request; the transaction's own installs are the
+generation's; a staged delta is not an install and the materializing
+save is; the saved file re-opened takes a transaction again; a torn
+workbook hears `StructuralEditIncomplete` first; a fresh-emit workbook
+refuses until saved), `pkg/recalc_run.zig` (an added sheet and a moved
+row refuse `recalculate` before the graph is built and `saveWithRecalc`
+before the rename, the destination absent, the stale cache untouched;
+the documented order lands both; the `.none` arm carries the added
+sheet), `pkg/workbook.zig` (the write under
 either recovery and a strip; the documented order; every saved output
 re-opened takes a mark), `src/c_abi.zig` (six mutators × three
 transactions: `-2`, the name in diag and errbuf, plane none, census
@@ -2506,12 +2514,42 @@ documented order by construction; the guard is unreachable from the
 CLI), Python `test_basic.py` (five installs × three transactions, the
 documented orders, a re-opened file), `test_embedding_write.py` (the
 write under either recovery), `test_embedding_sweeps.py` (a strip, a
-redacting prune; a prune that changed nothing installs nothing).
+redacting prune; a prune that changed nothing installs nothing);
+`test_basic.py` again for `strip_doc_props` on a corpus workbook with
+docProps (an install) and on a writer-made one (nothing changed, the
+mark legal) (RTG-DOC-104).
+
+**Gated in round 1 (B-REL-101 HIGH / A-REL-102, pre-existing)**:
+`saveWithRecalc`'s own file carries no staged cell delta on either arm
+— the `.none` arm writes `store.saveControlled` past `applySavePlans`,
+the `.ok` arm's staging patches formula results only — where a plain
+`save` re-emits them. Measured from Python: `set_cell` +
+`save_with_recalc` → the cell absent from the file, present in memory
+and after a following `save` — memory and file diverging behind a
+successful §5.7.9 rename, the very composition RTG-4's first wording
+called safe. This PR gates it: `recalc_run.saveWithRecalc` refuses
+`SheetHasUnsavedMutations` (the existing name; `-1`, its sibling
+`SheetHasUnsavedAppends`' classification) before anything runs when any
+sheet holds a staged `setCell` — save first, or `recalculate` then
+`save`, both of which carry the write (pinned on Zig, C and Python, on
+a workbook with and without formulas). A delta over an
+installed-into generation hears the generation's verdict instead
+(`requireGenerationUnmodified` inside the delta gate — not at the
+entry, which would have refused the `.none` arm): its remedy is the
+complete one, where "save first" leads to the same verdict one save
+later — the `recovery_in_cells` write stages its record cell AND
+installs, and says `RecalcRequiresReopen` (pinned: a delta plus an
+added sheet). `recalculate` + `save` and mark
++ `save` stay legal over staged deltas. Folding the deltas into the
+candidate (applying the save plans over `next` before serialising, so
+the transaction's file IS the plain save plus the recalc) is the
+recorded follow-up.
 
 **Recorded, not done**: building the candidate over the live generation
 (inheriting overrides) would lift the ordering rule instead of policing
 it — the other half of B-REL-201's fix, an owner call on the
 transaction's generation model. `Workbook.empty()` installs its skeleton
 parts at birth against a baseline of zero, so a fresh-emit workbook
-refuses every transaction until saved and re-opened (the same answer the
-transaction gave before, as `MissingWorkbookPart` over an empty backing).
+refuses every transaction until saved and re-opened (pinned; before the
+guard the transaction went to `nextGeneration` over the `fresh()` store's
+empty backing).

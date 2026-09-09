@@ -393,6 +393,12 @@ pub const Candidate = struct {
         assert(!self.swapped);
         assert(wb.worksheets.len == self.sheet_views.len);
         assert(wb.retained.capacity > wb.retained.items.len);
+        // The guard judged the live generation at `prepare`; a mutator
+        // between that and this swap would be dropped by the moves
+        // below AND hidden by the baseline they record — a caller of
+        // the exported two-step holding a candidate across an edit is
+        // a bug, stated here (in-house r1 RTG-REL-105).
+        assert(wb.store.installs == wb.generation_installs);
 
         var gen: RetainedGeneration = .{
             .store = wb.store,
@@ -1309,6 +1315,9 @@ test "retention: the swap re-measures the generation it retires" {
     defer gpa.free(big);
     @memset(big, ' ');
     try h.wb.store.replacePart("xl/workbook.xml", big);
+    // The raw replace is weight, not a mutation between prepare and
+    // swap: align the baseline so the swap's precondition holds.
+    h.wb.generation_installs = h.wb.store.installs;
 
     const snapshot = candidate.retired_bytes;
     const truth = generationBytes(&h.wb.store);
@@ -1765,6 +1774,44 @@ test "recalc guard: a rename installed into the live generation refuses before a
     try testing.expectEqual(installs, h.wb.store.installs);
     try testing.expectEqual(@as(usize, 0), h.wb.retained.items.len);
     try testing.expectEqualStrings("Renamed", (try h.wb.sheet(0)).name());
+}
+
+test "recalc guard: nothing is built before the verdict — under an allocator that fails every request the rename still hears RecalcRequiresReopen, not OutOfMemory" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    try h.wb.renameSheet(0, "Renamed");
+
+    // `prepare` allocates through `wb.allocator` only; a first request
+    // that fails would surface as OutOfMemory if anything were built
+    // ahead of the guard (in-house r1 RTG-TEST-106).
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    h.wb.allocator = failing.allocator();
+    defer h.wb.allocator = gpa;
+    try testing.expectError(error.RecalcRequiresReopen, prepare(&h.wb, &staged_one, &.{}, .{}));
+    try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "recalc guard: a torn workbook hears StructuralEditIncomplete first — its remedy is to discard the instance, not to save" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    try h.wb.renameSheet(0, "Renamed");
+    h.wb.torn_edit = true;
+    try testing.expectError(error.StructuralEditIncomplete, h.wb.markRecalcOnLoad());
+    try testing.expectError(error.StructuralEditIncomplete, prepare(&h.wb, &staged_one, &.{}, .{}));
+}
+
+test "recalc guard: a fresh-emit workbook installs its skeleton at birth — every transaction refuses until it is saved and re-opened" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    var fresh = try Workbook.empty(gpa, h.io());
+    defer fresh.deinit();
+    _ = try fresh.addSheet("Only");
+    try testing.expect(fresh.store.installs > 0);
+    try testing.expectError(error.RecalcRequiresReopen, fresh.markRecalcOnLoad());
 }
 
 test "recalc guard: the transaction's own installs are the generation's — a mark after a mark and a rename after a mark are legal, a mark after that rename is not, and the saved file re-opened takes one again" {

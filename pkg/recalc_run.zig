@@ -214,12 +214,23 @@ pub fn saveWithRecalc(
     // below writes the store directly, past `applySavePlans`' own
     // guard (Codex #208 r5 REL-501).
     try wb.requireCompleteStructuralState();
+    // Neither arm carries a staged cell write: the `.none` arm writes
+    // the store past `applySavePlans` (the only emitter of deltas) and
+    // the `.ok` arm's staging patches formula results only — so the
+    // file this transaction commits would lack every `setCell` while
+    // the workbook's memory kept it, memory and file diverging behind
+    // a successful rename. Refused as the appended-row case is
+    // (`logicalViewGate`): save first, or `recalculate` then `save`
+    // (in-house RTG r1 B-REL-101, pre-existing; folding the deltas into
+    // the candidate is the recorded follow-up).
+    try requireNoStagedDeltas(wb);
     var prepared = try prepare(wb, gpa, io, run, opts);
     switch (prepared) {
         .refused => |r| return takeRefusal(wb, opts, r),
-        // Nothing to recalculate, so nothing to prepare — and a save
-        // that writes the staged state is precisely what "byte-identical
-        // to a plain save" means.
+        // Nothing to recalculate, so nothing to prepare — the store's
+        // parts as they stand (there is no staged delta to write: the
+        // gate above), which is what "byte-identical to a plain save"
+        // means here.
         .none => |r| {
             var watch: control.Watch = .init(io, controlOf(run));
             const commit = try wb.store.saveControlled(io, path, watch.poller());
@@ -370,6 +381,13 @@ pub fn prepare(
     // property of the file, and a run that merely happened to change no
     // byte is a different (and much later) statement.
     if (input.cells.len == 0) return .{ .none = .{ .resolved = run.effective(.recalc) } };
+
+    // The recalc-transaction guard, once the run is known to build a
+    // candidate: `recalc_txn.prepare` is the authority (in-house r1
+    // RTG-DOC-101), this call spends no graph, drive or staging on a
+    // swap that cannot happen — and sits AFTER the no-formula decision
+    // so the `.none` arm, which builds nothing, stays legal.
+    try wb.requireGenerationUnmodified();
 
     var g = switch (try engine.graph.build(gpa, input, bridge.resolver(), .{
         .parse_limits = opts.parse_limits,
@@ -602,6 +620,27 @@ fn censusRefusal(
 /// caller has already added to. Refusing here — before the model, before
 /// any candidate — is the only answer that is both truthful and
 /// zero-mutation.
+/// The file transaction's own gate: `saveWithRecalc` serialises the
+/// candidate, never the save plans, so a staged `setCell` on any sheet
+/// would be absent from the file it commits. `recalculate` is not
+/// gated — it models the deltas and swaps nothing they live in, and the
+/// plain `save` after it emits them.
+///
+/// A delta over an installed-into generation hears the generation's
+/// verdict instead: its remedy — save and re-open — is the complete one,
+/// where "save first" would lead to the same verdict one save later (the
+/// `recovery_in_cells` write stages its record cell AND installs). Judged
+/// here rather than at the entry so a workbook with no delta and nothing
+/// to recalculate keeps its `.none` arm.
+fn requireNoStagedDeltas(wb: *Workbook) Error!void {
+    for (wb.worksheets) |*ws| {
+        if (ws.deltas.count() > 0) {
+            try wb.requireGenerationUnmodified();
+            return Error.SheetHasUnsavedMutations;
+        }
+    }
+}
+
 fn logicalViewGate(wb: *Workbook) Error!void {
     for (wb.worksheets) |*ws| {
         if (ws.appended_rows.items.len > 0) return Error.SheetHasUnsavedAppends;
@@ -2608,7 +2647,7 @@ test "logical-view gate: a staged delta is modeled, not refused" {
 
 // ─── the embedding-staleness preflight ───────────────────────────
 
-test "recalc guard: an added sheet or a moved row refuses recalculate before the evaluation and saveWithRecalc before the rename — memory and the destination untouched; the documented order lands both" {
+test "recalc guard: an added sheet or a moved row refuses recalculate before the graph is built and saveWithRecalc before the rename — memory and the destination untouched; the documented order lands both" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -2656,6 +2695,53 @@ test "recalc guard: an added sheet or a moved row refuses recalculate before the
     defer wb.deinit();
     try testing.expectEqual(@as(u32, 2), wb.sheetCount());
     try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "saveWithRecalc refuses SheetHasUnsavedMutations over a staged cell write — its file would lack it; the destination stays absent, recalculate then save carries both" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    for ([_][]const u8{ sheet_stale, sheet_no_formula }) |sheet| {
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet });
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+        try testing.expectError(error.SheetHasUnsavedMutations, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        try wb.save(io, ordered);
+        var reopened = try Workbook.open(a, io, ordered);
+        defer reopened.deinit();
+        try testing.expectEqualStrings("41", try cellCache(try reopened.sheet(0), "A1"));
+        if (sheet.ptr == sheet_stale.ptr) {
+            try testing.expectEqualStrings("42", try cellCache(try reopened.sheet(0), "B1"));
+        }
+    }
+
+    // Both conditions at once: the generation's verdict is heard, its
+    // remedy being the complete one.
+    const path = try writeFixture(a, io, dir, "both.xlsx", .{});
+    defer a.free(path);
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+    _ = try wb.addSheet("Extra");
+    try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
 }
 
 test "recalc guard: a workbook with nothing to recalculate builds no candidate — the mark refuses over an added sheet, recalculate is a no-op and saveWithRecalc is the plain save that carries it" {

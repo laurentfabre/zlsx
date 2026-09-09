@@ -1703,8 +1703,9 @@ const char * zlsx_engine_fingerprint(void);
 /* §5.7.7's mark-only transaction: keep every cached value, set
  * fullCalcOnLoad="1", remove nothing else. Typed refusals (-2) include
  * FormulaPrecisionAsDisplayed and RecalcRequiresReopen (no plane): a
- * structural edit, an embedding write / prune / strip or a save that
- * materialized cell writes has installed into the live generation
+ * structural edit, an embedding write / prune / strip, a doc-props
+ * strip that changed a part or a save that materialized cell writes
+ * has installed into the live generation
  * since it went live, and the mark's candidate — the archive as
  * opened — cannot carry it; nothing is mutated. Mark first, or save
  * and re-open. diag is optional (NULL ok). */
@@ -1780,8 +1781,11 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * (-2, no plane, no census) is one of the failures before the rename
  * — a mutator installed into the live generation since it went live
  * (zlsx_editor_mark_recalc_on_load's rule) and the run would build a
- * candidate; a workbook with nothing to recalculate is the plain save
- * of the live store, installs carried, not refused. */
+ * candidate; a workbook with nothing to recalculate writes the live
+ * store's parts, installs carried, not refused. A staged cell write on
+ * any sheet is -1 SheetHasUnsavedMutations before anything runs:
+ * neither arm of this transaction writes it — save first, or
+ * zlsx_editor_recalculate then zlsx_editor_save. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
         const uint8_t * out_path_ptr, size_t out_path_len,
         const zlsx_run_v1 * run,

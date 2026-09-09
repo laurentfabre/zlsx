@@ -2554,6 +2554,55 @@ def test_recalc_transaction_guard_documented_orders_land_both(tmp_path):
     assert _sheet_names(again) == ["Data", "Second", "Fourth"]
 
 
+@pytest.mark.parametrize("with_formula", [True, False])
+def test_save_with_recalc_refuses_a_staged_cell_write(tmp_path, with_formula):
+    """``save_with_recalc``'s own file never carried a staged ``set_cell``
+    on either arm (pre-existing; in-house RTG r1 B-REL-101): it refuses
+    ``SheetHasUnsavedMutations`` before anything runs, the destination
+    absent; ``recalculate`` then ``save`` carries the write."""
+    _require_structural()
+    _skip_unless_recalc_guard()
+    src = tmp_path / "src.xlsx"
+    (_three_by_three_with_formula if with_formula else _three_by_three)(src)
+    refused = tmp_path / "refused.xlsx"
+    out = tmp_path / "out.xlsx"
+    with zlsx.edit(src) as ed:
+        ed.set_cell(0, 1, 0, "seven")
+        with pytest.raises(zlsx.ZlsxError, match="SheetHasUnsavedMutations") as info:
+            ed.save_with_recalc(refused)
+        assert not isinstance(info.value, zlsx.ZlsxRefusal)
+        assert not refused.exists()
+        ed.recalculate()
+        ed.save(out)
+    with zlsx.open(out) as book:
+        rows = list(book.sheet(0).rows())
+        assert rows[0] == ["seven", 2, 3]
+        if with_formula:
+            assert list(book.sheet(1).rows()) == [["two", 2]]
+
+
+def test_recalc_transaction_guard_after_a_doc_props_strip(tmp_path):
+    """``strip_doc_props`` rewrites the docProps parts it changes — an
+    install (in-house r1 RTG-DOC-104); on a workbook without docProps
+    it changes nothing and the mark stays legal."""
+    _skip_unless_recalc_guard()
+    import zlsx._ffi as ffi
+
+    if not getattr(ffi, "_HAS_STRIP_DOC_PROPS", True):
+        pytest.skip("loaded libzlsx predates strip_doc_props")
+    src = _skip_if_missing("openpyxl_guess_types.xlsx")
+    with zlsx.edit(src) as ed:
+        ed.strip_doc_props()
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.mark_recalc_on_load()
+        assert info.value.error_name == "RecalcRequiresReopen"
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    with zlsx.edit(plain) as ed:
+        ed.strip_doc_props()
+        ed.mark_recalc_on_load()
+
+
 def test_recalc_transaction_guard_leaves_the_no_op_arm_alone(tmp_path):
     """A workbook with nothing to recalculate builds no candidate: the
     mark refuses over the added sheet, ``recalculate`` is a no-op report

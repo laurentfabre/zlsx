@@ -1500,11 +1500,13 @@ pub const Workbook = struct {
     /// other allocation it makes is installed into the workbook by the
     /// swap).
     ///
-    /// Refuses `RecalcRequiresReopen` before the evaluation when a
+    /// Refuses `RecalcRequiresReopen` — before the graph is built, once
+    /// the run is known to have formula cells to recalculate — when a
     /// mutator has installed into the live generation since it went
-    /// live — the candidate could not carry those parts
+    /// live: the candidate could not carry those parts
     /// (`requireGenerationUnmodified`; recalculate first, or save and
-    /// re-open).
+    /// re-open). A workbook with nothing to recalculate builds no
+    /// candidate and is not refused.
     pub fn recalculate(
         self: *Workbook,
         allocator: Allocator,
@@ -1528,7 +1530,10 @@ pub const Workbook = struct {
     /// `RecalcRequiresReopen` is one of the failures before the rename:
     /// a mutator installed into the live generation since it went live,
     /// and the candidate — the archive as opened plus the run's own
-    /// patches — could not carry it (`requireGenerationUnmodified`).
+    /// patches — could not carry it (`requireGenerationUnmodified`). So
+    /// is `SheetHasUnsavedMutations`: a staged `setCell` on any sheet,
+    /// which neither arm of this transaction writes — save first, or
+    /// `recalculate` then `save` (in-house RTG r1 B-REL-101).
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -1609,6 +1614,9 @@ pub const Workbook = struct {
     /// Rewrite `docProps/core.xml` and `docProps/app.xml` with every
     /// field the mask targets removed, and (when
     /// `mask.custom_properties`) drop `docProps/custom.xml` entirely.
+    /// A part this rewrites or drops is an install: a recalc transaction
+    /// afterwards refuses `RecalcRequiresReopen` (run it first, or save
+    /// and re-open); a strip that changes nothing installs nothing.
     ///
     /// Everything else is byte-preserved: only the parts that actually
     /// carry masked fields are replaced, and within those only the
@@ -7276,18 +7284,29 @@ pub const Workbook = struct {
     /// embedding set stripped, a saved cell write gone, an added sheet
     /// tripping the sheet-count invariant (S3c slice 1 r2 B-REL-201,
     /// each shape measured before the guard). Cell writes still staged
-    /// as deltas are NOT installs — the model reads them and the save
+    /// as deltas are NOT installs — the model reads them and `save`
     /// re-emits them over whichever generation is live — so
     /// `setCell` + `markRecalcOnLoad` + `save` stays legal, as does a
-    /// transaction after a transaction. Judged in `recalc_txn.prepare`,
+    /// transaction after a transaction. (`saveWithRecalc`'s own file
+    /// carries no staged delta on either arm, so that transaction
+    /// refuses `SheetHasUnsavedMutations` over one — its own gate,
+    /// in-house r1 RTG-REL-101/102.) Judged in `recalc_txn.prepare`,
     /// before anything is built — the one choke point every transaction
-    /// passes, and only there: a run with nothing to recalculate
-    /// (`recalc_run`'s `.none` arm) builds no candidate and swaps
-    /// nothing, so it is not refused — `saveWithRecalc` over such a
-    /// workbook is the plain save of the live store, which carries the
-    /// installs. The retention refusals sit at the same point, so an
-    /// evaluation can precede this verdict as it precedes theirs.
+    /// passes — once more in `recalc_run.prepare` after the
+    /// no-formula decision, so no graph is built for a swap that cannot
+    /// happen, and inside `saveWithRecalc`'s own delta gate, so a delta
+    /// over an installed-into generation hears this verdict's complete
+    /// remedy — while
+    /// a run with nothing to recalculate (the `.none` arm,
+    /// which builds no candidate) stays legal: `saveWithRecalc` there
+    /// writes the live store's parts, installs included (and, by its own
+    /// gate, no staged delta pending).
+    ///
+    /// A torn workbook is judged first: its remedy is to discard the
+    /// instance, and `RecalcRequiresReopen`'s "save and re-open" would
+    /// send the caller to a save that refuses (in-house r1 RTG-REL-103).
     pub fn requireGenerationUnmodified(self: *const Workbook) Error!void {
+        try self.requireCompleteStructuralState();
         assert(self.store.installs >= self.generation_installs);
         if (self.store.installs != self.generation_installs) return error.RecalcRequiresReopen;
     }

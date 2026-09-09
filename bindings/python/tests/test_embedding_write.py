@@ -550,8 +550,11 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
     assert b'fullCalcOnLoad="1"' not in wb_xml
     assert wb_xml.count(b"<sheet ") == (3 if recovery == "in_cells" else 2)
 
-    # Nothing to recalculate: no candidate, so the mark refuses but
-    # `save_with_recalc` is the plain save that carries the set.
+    # Nothing to recalculate: no candidate, so the mark refuses and
+    # `recalculate` is a no-op; `save_with_recalc` writes the live
+    # store's parts — the set included — under `invisible`, while the
+    # `in_cells` write also stages its record cell, and a delta over an
+    # installed-into generation hears the generation's verdict.
     plain = tmp_path / "plain.xlsx"
     _write_fixture(plain)
     with zlsx.Editor(plain) as ed:
@@ -560,7 +563,14 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
             ed.mark_recalc_on_load()
         assert info.value.error_name == "RecalcRequiresReopen"
         assert ed.recalculate().cells_written == 0
-        ed.save_with_recalc(plain_out)
+        if recovery == "in_cells":
+            with pytest.raises(zlsx.ZlsxRefusal) as info:
+                ed.save_with_recalc(plain_out)
+            assert info.value.error_name == "RecalcRequiresReopen"
+            assert not plain_out.exists()
+            ed.save(plain_out)
+        else:
+            ed.save_with_recalc(plain_out)
     with zlsx.embeddings(plain_out) as emb:
         assert emb.present and emb.model == "m"
 
