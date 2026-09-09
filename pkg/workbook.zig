@@ -2443,11 +2443,39 @@ pub const Workbook = struct {
         }
         if (joined.items.len == 0) return null;
 
-        // Grow-loop on both buffers, same contract as parseIndex.
-        var cov_cap: usize = 4;
-        var scratch_cap: usize = 512;
+        // Grow-loop on both buffers, same contract as parseIndex. The
+        // cap is where a record stops being a record: the reader admits
+        // at most MAX_CHUNKS chunk bodies of MAX_CHUNK × 4 bytes
+        // (`findDefinedNameValue`'s buffer, four times the writer's
+        // chunk) and a coverage costs five bytes at least (`|||0|`), so
+        // no carrier can name more than `reader_max_coverages`, and the
+        // count is judged before any coverage is read. The loop must
+        // grow past that bound, or a decodable foreign record would
+        // fold to `absent` — pinned at compile time, so a bump of the
+        // record's constants fails the build rather than the contract
+        // (in-house S3c slice 6 r3).
+        const cov_cap_start: usize = 4;
+        const scratch_cap_start: usize = 512;
+        const scratch_cap_max: usize = 1 << 20;
+        const cov_cap_max: usize = cov_cap_start * (scratch_cap_max / scratch_cap_start);
+        const reader_max_coverages: usize = recovery_record.MAX_CHUNKS * recovery_record.MAX_CHUNK * 4 / 5;
+        // The derivation of `cov_cap_max` is the loop's own arithmetic
+        // only while the doubling lands on the cap exactly, and the
+        // scratch side must reach the reader's whole joined text — both
+        // premises stated here, so a value change fails the build too
+        // (in-house S3c slice 6 r4).
+        comptime std.debug.assert(std.math.isPowerOfTwo(scratch_cap_max / scratch_cap_start));
+        comptime std.debug.assert(recovery_record.MAX_CHUNKS * recovery_record.MAX_CHUNK * 4 <= scratch_cap_max);
+        comptime std.debug.assert(reader_max_coverages < cov_cap_max);
+        var cov_cap: usize = cov_cap_start;
+        var scratch_cap: usize = scratch_cap_start;
         while (true) {
             const covs = try self.allocator.alloc(recovery_record.RecoveredCoverage, cov_cap);
+            // The second allocation's failure must not orphan the first
+            // (in-house S3c slice 6 r3 — every surface, under
+            // `zlsx_emb_open`); the `catch` below frees both by hand on
+            // the paths that are not error returns.
+            errdefer self.allocator.free(covs);
             const scratch = try self.allocator.alloc(u8, scratch_cap);
             const rec = recovery_record.decode(joined.items, carrier, covs, scratch) catch |e| {
                 self.allocator.free(covs);
@@ -2456,7 +2484,12 @@ pub const Workbook = struct {
                     error.BufferTooSmall => {
                         cov_cap *= 2;
                         scratch_cap *= 2;
-                        if (scratch_cap > 1 << 20) return error.BufferTooSmall;
+                        // Past the cap the record is malformed (the
+                        // bound above) — the fold below, not a refusal
+                        // (in-house S3c slice 6 r2: the one decode
+                        // failure that reached every surface as
+                        // `BufferTooSmall`).
+                        if (scratch_cap > scratch_cap_max) return null;
                         continue;
                     },
                     // A record we cannot parse is reported as absent
@@ -16017,6 +16050,9 @@ test {
     _ = @import("sheet_props_ndjson.zig");
     // S3c slice 2: same lesson, the embeddable-rows writer.
     _ = @import("embeddable_row_ndjson.zig");
+    // S3c slice 6: same lesson, the shared JSON scalar writers (their
+    // pins — the escaper's, `writeF64`'s — ran on no root before).
+    _ = @import("json_text.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {

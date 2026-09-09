@@ -2045,9 +2045,12 @@ direction); a foreign producer writing two `zlsxRecovery` sheets sees
 the second deleted beneath the mirror (illegal OOXML); a re-embed across
 a save leaves the previous generation's `<si>` unreferenced in the table
 and a `.stripped` read reports the OLDEST record (slice-1 territory);
-`recoverEmbeddingRecord`'s own `BufferTooSmall` (a record past 1 MiB of
-scratch — unreachable under the 3 200-byte carrier bound) would fold
-under `MalformedEmbeddingSet`.
+`recoverEmbeddingRecord`'s own `BufferTooSmall` was reachable after all —
+not through the scratch (unreachable under the carrier bound) but through
+the coverage COUNT, judged before any coverage is read, so a record
+claiming more than 8 192 coverages refused on every surface; since S3c
+slice 6 (2026-09-09) the cap breach reads `absent` like every other
+malformed record.
 
 **Round 3** (two agents on the round-2 tree, the convergence round; both
 ship-ready, A 3 LOW, B 2 LOW — every earlier fix verified in code and by
@@ -2093,7 +2096,8 @@ opened and carry neither sweep, as they carry no `set_embeddings` (slice
 documentation of the write; the sweeps inherit it). `recovery_in_cells` on
 the write side is still Zig-only (`Workbook.setEmbeddingsOpts` adds its
 hidden sheet beneath the Editor's mirror; the strip side of that path is
-what this slice built). The CLI vector / state dump.
+what this slice built). The CLI vector / state dump shipped as `embed --dump`
+(S3c slice 6, 2026-09-09).
 
 **Tests** (`src/c_abi.zig`, "S3c prune_embeddings …" ×4, "S3c
 strip_embeddings …" ×3, "S3c sweeps …" ×1; round-1 pins on the Zig layer
@@ -2304,7 +2308,8 @@ follow-up names is one guard at `recalc_txn.prepare` (refuse while
 §4 row is all-four since slice 5 (2026-09-07): the CLI's `embed --vectors
 … --recovery in-cells` takes the very `Editor.setEmbeddingsOpts` call this
 export takes (the CLI wrote through `Editor.setEmbeddings` since round 1,
-A-MAINT-103); the vector / state dump remains S3c. The recovery sheet a
+A-MAINT-103); the vector / state dump is `embed --dump` (slice 6, 2026-09-09).
+The recovery sheet a
 consumer RENAMES is not found by the locator (its INLINE text is not
 scanned unless an orphan widens the scope; its table string is; the strip
 scrubs it) — slice 3's note stands. **Recorded (round 1, A-REL-101, an
