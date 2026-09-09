@@ -2045,9 +2045,12 @@ direction); a foreign producer writing two `zlsxRecovery` sheets sees
 the second deleted beneath the mirror (illegal OOXML); a re-embed across
 a save leaves the previous generation's `<si>` unreferenced in the table
 and a `.stripped` read reports the OLDEST record (slice-1 territory);
-`recoverEmbeddingRecord`'s own `BufferTooSmall` (a record past 1 MiB of
-scratch — unreachable under the 3 200-byte carrier bound) would fold
-under `MalformedEmbeddingSet`.
+`recoverEmbeddingRecord`'s own `BufferTooSmall` was reachable after all —
+not through the scratch (unreachable under the carrier bound) but through
+the coverage COUNT, judged before any coverage is read, so a record
+claiming more than 8 192 coverages refused on every surface; since S3c
+slice 6 (2026-09-09) the cap breach reads `absent` like every other
+malformed record.
 
 **Round 3** (two agents on the round-2 tree, the convergence round; both
 ship-ready, A 3 LOW, B 2 LOW — every earlier fix verified in code and by

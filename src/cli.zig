@@ -1267,8 +1267,9 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                     carrier the record survived in; absent
         \\                     has the state alone); then one
         \\                     {"kind":"coverage","id":…,"sheet":…,
-        \\                     "range":…,"rows":N} per coverage (present
-        \\                     adds column, include_formulas); then,
+        \\                     "range":…,"column":…,"include_formulas":
+        \\                     …,"rows":N} per coverage (stripped omits
+        \\                     the two the record lacks); then,
         \\                     present only, one {"kind":"vector",
         \\                     "coverage":ID,"row":N,"hash":H,"vector":
         \\                     […]} per covered row — hash and vector
@@ -11716,6 +11717,31 @@ test "S3c slice 6: embed --dump — absent; present as the state, the coverage a
         try std.testing.expectEqualStrings("{\"kind\":\"embeddings\",\"state\":\"absent\"}\n", out_w.buffered());
     }
 
+    // The one decode failure that used to refuse: a record claiming more
+    // coverages than any carrier could hold ran the reader's growth cap
+    // out and reached every surface as `BufferTooSmall` (r2). Malformed
+    // is malformed — it reads `absent` now.
+    {
+        const out_bad = try tt.path(a, io, "s3c6_badcount.xlsx");
+        defer a.free(out_bad);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_stripped);
+            defer wb.deinit();
+            const wbx = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+            const patched = try std.mem.replaceOwned(u8, a, wbx.bytes, "|xxh3-64|1|", "|xxh3-64|99999|");
+            defer a.free(patched);
+            try std.testing.expect(patched.len == wbx.bytes.len + 4);
+            try wb.store.replacePart("xl/workbook.xml", patched);
+            try wb.save(io, out_bad);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_bad, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqualStrings("{\"kind\":\"embeddings\",\"state\":\"absent\"}\n", out_w.buffered());
+    }
+
     // A set the read cannot serve — its vec part gone — refuses before
     // the first byte: exit 3, the name on stderr, stdout empty.
     {
@@ -11818,4 +11844,51 @@ test "S3c slice 6: embed --dump — two coverages: the coverage records in index
             "{\"kind\":\"vector\",\"coverage\":\"first\",\"row\":3,\"hash\":null,\"vector\":null}\n",
         out_w.buffered(),
     );
+}
+
+/// `checkAllAllocationFailures`' shape: under an injected failure the
+/// dump must exit non-zero with NOTHING on stdout — the one-row
+/// buffer's exit 4 included (r2, A-TEST-202: the buffer taken after two
+/// records were written survived the suite) — and succeed otherwise.
+fn s3c6DumpForFailures(alloc: std.mem.Allocator, io: std.Io, file: []const u8) !void {
+    var err_buf: [256]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    const args: Args = .{ .file = file, .subcommand = .embed, .dump = true };
+    const rc = try runEmbedCommand(alloc, io, args, &out_w, &err_w);
+    if (rc == 0) return;
+    if (out_w.buffered().len != 0) return error.TestUnexpectedResult;
+    return error.OutOfMemory;
+}
+
+test "S3c slice 6: embed --dump — every allocation failure on the path exits non-zero with stdout empty, the one-row buffer's exit 4 included" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(a, io, "s3c6_oom_src.xlsx");
+    defer a.free(src);
+    {
+        var w = xlsx.writer_types.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Items");
+        try s.writeRow(&.{.{ .string = "Title" }});
+        try s.writeRow(&.{.{ .string = "alpha" }});
+        try w.save(io, src);
+    }
+    try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_oom_vecs.ndjson", .data = "{\"row\":2,\"vector\":[0.5,0.25]}\n" });
+    const vecs = try tt.path(a, io, "s3c6_oom_vecs.ndjson");
+    defer a.free(vecs);
+    const out = try tt.path(a, io, "s3c6_oom.xlsx");
+    defer a.free(out);
+    {
+        var err_buf: [256]u8 = undefined;
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        const args: Args = .{ .file = src, .subcommand = .embed, .vectors_path = vecs, .model_name = "m1", .column_name = "A", .coverage_range = "A2:A2", .out_path = out };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+    }
+    try std.testing.checkAllAllocationFailures(a, s3c6DumpForFailures, .{ io, @as([]const u8, out) });
 }

@@ -2456,7 +2456,15 @@ pub const Workbook = struct {
                     error.BufferTooSmall => {
                         cov_cap *= 2;
                         scratch_cap *= 2;
-                        if (scratch_cap > 1 << 20) return error.BufferTooSmall;
+                        // Past the growth cap the record is malformed —
+                        // no carrier can hold one that needs more (16 ×
+                        // 200-byte chunks; a coverage costs eight bytes
+                        // at least, and the count is judged before any
+                        // coverage is read) — so it is the fold below,
+                        // not a refusal (in-house S3c slice 6 r2: the
+                        // one decode failure that reached every surface
+                        // as `BufferTooSmall`).
+                        if (scratch_cap > 1 << 20) return null;
                         continue;
                     },
                     // A record we cannot parse is reported as absent
