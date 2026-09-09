@@ -143,7 +143,7 @@ them with the writer.
 | `Workbook.saveWithRecalc(alloc, io, path, run, opts)` | The same pipeline plus §5.7.9's file transaction: serialize from the *unswapped* candidate → temp write → `File.sync` → final cancellation poll → rename → swap → directory fsync. Any failure before the rename leaves both the destination's prior bytes and the workbook's memory untouched. |
 | `Workbook.openBuffer(alloc, io, bytes)` | Open a package already in memory. The borrow ends when it returns — the store copies. |
 | `Workbook.openBufferControlled(alloc, io, bytes, ctl)` | Same, with §5.5's cancel/deadline reaching the archive scan and the eager part decompression. |
-| `Workbook.markRecalcOnLoad()` | Set `<calcPr fullCalcOnLoad="1">` and change nothing else. Honestly named: it does not calculate. |
+| `Workbook.markRecalcOnLoad()` | Set `<calcPr fullCalcOnLoad="1">` and change nothing else. Honestly named: it does not calculate. Refuses `RecalcRequiresReopen` after a structural edit, an embedding write / prune / strip or a save that materialized cell writes (the recalc-transaction guard: the candidate is built from the archive as opened and cannot carry those parts — run the transaction first, or save and re-open). |
 | `zlsx_recalc.writerSaveWithRecalc(alloc, io, writer, path, run, opts)` | The composition, in a **third module** (`zlsx_recalc`) that imports `zlsx` and `zlsx_pkg`. `Writer` bytes → `Workbook.openBuffer` → `saveWithRecalc`, with the `Control` threaded into all three stages. |
 
 `RunInputs` (clock, UTC offset, seed, fidelity, platform profile, plus

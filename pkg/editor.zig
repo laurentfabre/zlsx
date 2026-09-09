@@ -3146,6 +3146,8 @@ test "C1: after a row insert the reference follows the cell, INDIRECT follows th
     defer ta.free(src_path);
     const dst_path = try tt.path(ta, io, "c1_indirect_eval_dst.xlsx");
     defer ta.free(dst_path);
+    const mid_path = try tt.path(ta, io, "c1_indirect_eval_mid.xlsx");
+    defer ta.free(mid_path);
 
     {
         var w = xlsx.Writer.init(ta);
@@ -3159,15 +3161,26 @@ test "C1: after a row insert the reference follows the cell, INDIRECT follows th
         try w.save(io, src_path);
     }
 
+    const recalc_run = @import("recalc_run.zig");
+    const run: recalc_run.RunInputs = .{
+        .now_utc_ms = 1_700_000_000_000,
+        .rng_seed = 0x5EED_5D3,
+        .limits = .{},
+    };
     {
         var wb = try Workbook.open(ta, io, src_path);
         defer wb.deinit();
         try wb.insertRow(0, 1);
-        var report = try wb.saveWithRecalc(ta, io, dst_path, .{
-            .now_utc_ms = 1_700_000_000_000,
-            .rng_seed = 0x5EED_5D3,
-            .limits = .{},
-        }, .{});
+        // The edit installed into the live generation; the transaction's
+        // candidate could not carry it (the recalc-transaction guard) —
+        // the composition is edit, save, re-open, then recalc.
+        try std.testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(ta, io, dst_path, run, .{}));
+        try wb.save(io, mid_path);
+    }
+    {
+        var wb = try Workbook.open(ta, io, mid_path);
+        defer wb.deinit();
+        var report = try wb.saveWithRecalc(ta, io, dst_path, run, .{});
         report.deinit(ta);
     }
 

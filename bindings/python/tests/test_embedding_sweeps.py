@@ -389,3 +389,47 @@ def test_sweeps_probe_agrees_with_the_library_version():
     major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
     if (major, minor) >= (0, 9):
         assert ffi._HAS_EMBEDDING_SWEEPS, "libzlsx >= 0.9.0 must export zlsx_editor_prune_embeddings and zlsx_editor_strip_embeddings"
+
+
+def test_a_sweep_that_installed_makes_every_recalc_transaction_the_typed_refusal(tmp_path):
+    """The recalc-transaction guard on the sweeps: a strip removes parts
+    and a redacting prune replaces them — installs a candidate built
+    from the archive as opened cannot carry — so the mark raises
+    ``ZlsxRefusal`` ``RecalcRequiresReopen``; the fixture has no
+    formula, so ``recalculate`` builds no candidate (a no-op report)
+    and ``save_with_recalc`` is the plain save that carries the sweep.
+    A prune that changes nothing installs nothing and the mark stays
+    legal."""
+    _needs_sweeps()
+    import zlsx._ffi as ffi
+
+    if not (ffi._HAS_MARK_RECALC and ffi._HAS_RECALC and ffi._HAS_SAVE_WITH_RECALC):
+        pytest.skip("loaded libzlsx predates the recalc transactions")
+
+    def expect_guard(ed, out):
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.mark_recalc_on_load()
+        assert info.value.error_name == "RecalcRequiresReopen"
+        assert ed.recalculate().cells_written == 0
+        ed.save_with_recalc(out)
+
+    emb = _write_embedded(tmp_path)
+
+    stripped = tmp_path / "stripped.xlsx"
+    with zlsx.Editor(emb) as ed:
+        ed.strip_embeddings()
+        expect_guard(ed, stripped)
+    with zlsx.embeddings(stripped) as e:
+        assert e.state == "absent"
+
+    blanked = _patched(emb, tmp_path / "blanked.xlsx", SHEET1, BETA_CELL, b'<c r="A3"/>')
+    pruned = tmp_path / "pruned.xlsx"
+    with zlsx.Editor(blanked) as ed:
+        assert ed.prune_embeddings() == {"redacted": 1, "stale": 0, "fresh": 2, "valid_empty": 0}
+        expect_guard(ed, pruned)
+    with zlsx.embeddings(pruned) as e:
+        assert e.valid_mask("title").tolist() == [True, False, True]
+
+    with zlsx.Editor(emb) as ed:
+        assert ed.prune_embeddings() == ALL_FRESH
+        ed.mark_recalc_on_load()

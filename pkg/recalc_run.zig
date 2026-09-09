@@ -2608,6 +2608,87 @@ test "logical-view gate: a staged delta is modeled, not refused" {
 
 // ─── the embedding-staleness preflight ───────────────────────────
 
+test "recalc guard: an added sheet or a moved row refuses recalculate before the evaluation and saveWithRecalc before the rename — memory and the destination untouched; the documented order lands both" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        _ = try wb.addSheet("Extra");
+        try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, fixed_run, .{}));
+        try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+        try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
+    }
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, fixed_run, .{}));
+        try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+    }
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        _ = try wb.addSheet("Extra");
+        try wb.save(io, ordered);
+    }
+    var wb = try Workbook.open(a, io, ordered);
+    defer wb.deinit();
+    try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+    try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "recalc guard: a workbook with nothing to recalculate builds no candidate — the mark refuses over an added sheet, recalculate is a no-op and saveWithRecalc is the plain save that carries it" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "plain.xlsx", .{ .sheet = sheet_no_formula });
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "plain_out.xlsx" });
+    defer a.free(out);
+
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        _ = try wb.addSheet("Extra");
+        try testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        var s = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+        s.deinit(a);
+    }
+    var wb = try Workbook.open(a, io, out);
+    defer wb.deinit();
+    try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+}
+
 test "embedding preflight: a staged cell inside a coverage refuses" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});

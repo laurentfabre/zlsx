@@ -450,8 +450,11 @@ workbook's `<definedNames>` block: every existing name keeps `name`,
 `description`, `function`, `vbProcedure`, …) are dropped, as after any staged
 defined-name edit (pre-existing, recorded). The recalc transactions
 (`mark_recalc_on_load` then `save`, `save_with_recalc`, `recalculate`)
-rebuild from the archive as opened and do not carry a staged embedding
-write — call them before it, or save and re-open.
+rebuild from the archive as opened and cannot carry a staged embedding
+write, so after it they raise `ZlsxRefusal` `RecalcRequiresReopen` (the
+recalc-transaction guard — the same verdict after a structural edit or a
+save that materialized cell writes) — call them before it, or save and
+re-open.
 
 `recovery=` picks where the recovery record rides. The default,
 `"invisible"`, is the two carriers no user sees — and an Apple Numbers

@@ -3245,8 +3245,10 @@ class ZlsxRefusal(ZlsxError):
     holds, the last sheet, a part it cannot read, a pivot graph it
     cannot read whole. ``error_name`` is
     the Zig error name (``"RowEditUnsafeForSheet"``,
-    ``"DuplicateSheetName"``, ``"CannotDeleteLastSheet"``, …); the
-    structural vocabulary is listed on :meth:`Editor.insert_row`.
+    ``"DuplicateSheetName"``, ``"CannotDeleteLastSheet"``,
+    ``"RecalcRequiresReopen"`` — a recalc transaction over a generation
+    a mutator installed into, :meth:`Editor.mark_recalc_on_load` — …);
+    the structural vocabulary is listed on :meth:`Editor.insert_row`.
     Statements about the call (an index off the grid, a sheet, table or
     column that does not exist, an edit on a sheet with unsaved cell
     writes) raise a plain :class:`ZlsxError`."""
@@ -4507,11 +4509,11 @@ class Editor:
         (pre-existing, recorded). The recalc transactions —
         :meth:`mark_recalc_on_load` then :meth:`save`,
         :meth:`save_with_recalc`, :meth:`recalculate` — rebuild their
-        candidate from the archive as opened and do NOT carry this
-        write: call them before it, or save and re-open (a recorded,
-        pre-existing rule of the transaction's generation model — under
-        ``recovery="in_cells"`` the write adds a sheet, and the rule
-        bites as it does after :meth:`add_sheet`). Shapes are checked here first
+        candidate from the archive as opened and cannot carry this
+        write, so after it they raise :class:`ZlsxRefusal`
+        ``RecalcRequiresReopen`` (the recalc-transaction guard; the same
+        verdict after :meth:`add_sheet`, under either recovery): call
+        them before it, or save and re-open. Shapes are checked here first
         — a ``TypeError`` for a non-dict coverage, a non-string id /
         range / column, a bool where a number belongs, a non-numeric
         array, a non-string ``recovery``; a ``ValueError`` for an unknown
@@ -4753,9 +4755,10 @@ class Editor:
         stops the sweep whole rather than redact a row that has text.
         The recalc transactions (:meth:`mark_recalc_on_load` + save,
         :meth:`save_with_recalc`, :meth:`recalculate`) rebuild their
-        candidate from the archive as opened and do not carry this
-        sweep — call them before it, or save and re-open (the rule
-        :meth:`set_embeddings` documents).
+        candidate from the archive as opened and cannot carry this
+        sweep: after a prune that removed or replaced a part they raise
+        ``RecalcRequiresReopen`` (the rule :meth:`set_embeddings`
+        documents) — call them before it, or save and re-open.
 
         Requires libzlsx 0.9.0+ (``zlsx_editor_prune_embeddings``).
         """
@@ -4819,9 +4822,10 @@ class Editor:
         tore past its pre-flights (then the next call and the save
         raise ``StructuralEditIncomplete`` — discard the editor). A
         cell that merely spells the record's magic is user text and
-        stays. The recalc transactions
-        rebuild their candidate from the archive as opened and do not
-        carry this strip — call them before it, or save and re-open.
+        stays. The recalc transactions rebuild their candidate from the
+        archive as opened and cannot carry this strip: after it they
+        raise ``RecalcRequiresReopen`` (the rule :meth:`set_embeddings`
+        documents) — call them before it, or save and re-open.
 
         Requires libzlsx 0.9.0+ (``zlsx_editor_strip_embeddings``).
         """
@@ -4977,7 +4981,18 @@ class Editor:
 
     def mark_recalc_on_load(self) -> None:
         """§5.7.7's mark-only transaction: keep every cached value, set
-        ``fullCalcOnLoad="1"``, change nothing else."""
+        ``fullCalcOnLoad="1"``, change nothing else.
+
+        Raises :class:`ZlsxRefusal` ``RecalcRequiresReopen`` — nothing
+        mutated — when a structural edit (:meth:`add_sheet`,
+        :meth:`insert_row`, :meth:`rename_sheet`, …), an embedding write
+        / prune / strip, or a :meth:`save` that materialized cell writes
+        has installed into the live generation since it went live: the
+        mark's candidate is built from the archive as opened and cannot
+        carry those parts (the recalc-transaction guard; before it the
+        wrong order dropped them silently or aborted the process). Mark
+        first, or save and re-open. Staged cell writes are not installs:
+        ``set_cell`` then this then :meth:`save` lands both."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_MARK_RECALC:
@@ -5013,7 +5028,11 @@ class Editor:
         and swap the result in as the final operation. On refusal
         (:class:`ZlsxFormulaRefusal`), timeout (:class:`TimeoutError`,
         observed pre-commit only) or Ctrl-C the workbook is exactly as
-        it was."""
+        it was. ``RecalcRequiresReopen`` (:class:`ZlsxRefusal`, no
+        plane) refuses when a mutator has installed into the live
+        generation since it went live — :meth:`mark_recalc_on_load`'s
+        rule — and the run would build a candidate; a workbook with
+        nothing to recalculate builds none and stays legal."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_RECALC:
@@ -5056,7 +5075,13 @@ class Editor:
         absence) AND this editor's memory untouched. A cancellation that
         lands post-commit returns normally with
         ``report.cancelled_late=True``. A directory fsync failing after
-        the rename is ``report.durability_warning``, never an error."""
+        the rename is ``report.durability_warning``, never an error.
+        ``RecalcRequiresReopen`` (:class:`ZlsxRefusal`, no plane) is one
+        of the pre-commit refusals: a mutator installed into the live
+        generation since it went live (:meth:`mark_recalc_on_load`'s
+        rule) and the run would build a candidate; a workbook with
+        nothing to recalculate is the plain save of the live store,
+        installs carried — not refused."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SAVE_WITH_RECALC:

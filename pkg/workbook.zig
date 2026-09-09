@@ -149,6 +149,20 @@ pub const Error = error{
     /// workbook. (Codex #208 r2 REL-201; the disk file is untouched —
     /// only this instance is poisoned.)
     StructuralEditIncomplete,
+    /// A recalc transaction (`markRecalcOnLoad`, `recalculate`,
+    /// `saveWithRecalc`) was asked for over a generation that holds
+    /// parts added, replaced or removed since it went live — every
+    /// mutation that installs into the store: a sheet added, renamed or
+    /// deleted, a row or column inserted or deleted, an embedding
+    /// write, prune or strip, an image added, a doc-props strip, a save
+    /// that materialized staged cell writes — and the transaction's
+    /// candidate is built
+    /// from the archive as opened, so it could not carry them: the
+    /// swap would silently drop them (or trip an invariant). Nothing is
+    /// mutated. Run the transaction before those edits, or save and
+    /// re-open the workbook. (The recalc-transaction guard; S3c slice 1
+    /// r2 B-REL-201.)
+    RecalcRequiresReopen,
     /// Style validation failed — empty font name, non-positive font
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
@@ -1172,6 +1186,18 @@ pub const Workbook = struct {
     /// — §5.7.4 gates repeated recalc on it, and a number nobody adds up
     /// is a promise nobody keeps.
     retained_bytes: u64 = 0,
+    /// What `store.installs` read when the live generation went live:
+    /// 0 for the store `open` built, the candidate's own build count
+    /// after a recalc swap (the transaction replaces the patched
+    /// sheets, the calc state and the chain in its candidate before
+    /// installing it, and those are the generation's, not a
+    /// mutator's). Every install above it is a mutator's — a sheet
+    /// added, renamed or deleted, a row or column moved, an embedding
+    /// write, prune or strip, a save's materialized deltas — and no
+    /// candidate a transaction builds from the archive as opened
+    /// carries those: `requireGenerationUnmodified` refuses the
+    /// transaction while the two differ (the recalc-transaction guard).
+    generation_installs: u64 = 0,
 
     /// Open an .xlsx file as a typed `Workbook`.
     ///
@@ -1427,6 +1453,13 @@ pub const Workbook = struct {
     /// live store — the same prepare/swap, the same retained generation,
     /// the same no-fail swap. A three-line shortcut would have replaced
     /// bytes that the workbook's own typed views still described.
+    ///
+    /// Refuses `RecalcRequiresReopen` — nothing mutated — when a mutator
+    /// has installed into the live generation since it went live (a
+    /// structural edit, an embedding write / prune / strip, a save that
+    /// materialized cell writes): the candidate is built from the
+    /// archive as opened and would drop them. Mark first, or save and
+    /// re-open (`requireGenerationUnmodified`).
     pub fn markRecalcOnLoad(self: *Workbook) Error!void {
         var result = recalc_txn.markRecalcOnLoad(self, .{}) catch |e| switch (e) {
             // No cancellation token was supplied, so nothing can trigger
@@ -1466,6 +1499,12 @@ pub const Workbook = struct {
     /// built it had to use (`recalc_txn.prepare` has no choice — every
     /// other allocation it makes is installed into the workbook by the
     /// swap).
+    ///
+    /// Refuses `RecalcRequiresReopen` before the evaluation when a
+    /// mutator has installed into the live generation since it went
+    /// live — the candidate could not carry those parts
+    /// (`requireGenerationUnmodified`; recalculate first, or save and
+    /// re-open).
     pub fn recalculate(
         self: *Workbook,
         allocator: Allocator,
@@ -1486,6 +1525,10 @@ pub const Workbook = struct {
     /// if it never existed); a successful rename leaves memory and file
     /// consistent; and a directory fsync that fails afterwards is a
     /// `durability_warning` on the returned report, never an error.
+    /// `RecalcRequiresReopen` is one of the failures before the rename:
+    /// a mutator installed into the live generation since it went live,
+    /// and the candidate — the archive as opened plus the run's own
+    /// patches — could not carry it (`requireGenerationUnmodified`).
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -2595,10 +2638,11 @@ pub const Workbook = struct {
     /// described the previous set (valid until the next write, prune
     /// or strip). The recalc transactions (`markRecalcOnLoad` +
     /// `save`, `saveWithRecalc`, `recalculate`) rebuild their candidate
-    /// from the archive as opened and do NOT carry this write — call
-    /// them before it, or save and re-open (a recorded, pre-existing
-    /// rule of the transaction's generation model that also reverts a
-    /// `renameSheet` and trips on an `addSheet`).
+    /// from the archive as opened and cannot carry this write, so they
+    /// refuse `RecalcRequiresReopen` after it (the recalc-transaction
+    /// guard, `requireGenerationUnmodified` — the same verdict after a
+    /// `renameSheet` or an `addSheet`): call them before it, or save
+    /// and re-open.
     ///
     /// Every refusal above lands before the first part is written, save
     /// the index XML's own cap in pass 4 — which cannot fire: the record
@@ -7221,6 +7265,31 @@ pub const Workbook = struct {
     /// REL-201, r3 REL-303, r5 REL-501).
     pub fn requireCompleteStructuralState(self: *const Workbook) Error!void {
         if (self.torn_edit) return error.StructuralEditIncomplete;
+    }
+
+    /// The recalc-transaction guard's predicate: has a mutator installed
+    /// into the live generation since it went live? A candidate the
+    /// transaction builds is `store.nextGeneration()` — the archive as
+    /// opened, overrides not inherited — plus what the run re-derives
+    /// (the patched sheets, the calc state); an install a mutator made
+    /// is neither, so the swap would drop it: a rename reverted, an
+    /// embedding set stripped, a saved cell write gone, an added sheet
+    /// tripping the sheet-count invariant (S3c slice 1 r2 B-REL-201,
+    /// each shape measured before the guard). Cell writes still staged
+    /// as deltas are NOT installs — the model reads them and the save
+    /// re-emits them over whichever generation is live — so
+    /// `setCell` + `markRecalcOnLoad` + `save` stays legal, as does a
+    /// transaction after a transaction. Judged in `recalc_txn.prepare`,
+    /// before anything is built — the one choke point every transaction
+    /// passes, and only there: a run with nothing to recalculate
+    /// (`recalc_run`'s `.none` arm) builds no candidate and swaps
+    /// nothing, so it is not refused — `saveWithRecalc` over such a
+    /// workbook is the plain save of the live store, which carries the
+    /// installs. The retention refusals sit at the same point, so an
+    /// evaluation can precede this verdict as it precedes theirs.
+    pub fn requireGenerationUnmodified(self: *const Workbook) Error!void {
+        assert(self.store.installs >= self.generation_installs);
+        if (self.store.installs != self.generation_installs) return error.RecalcRequiresReopen;
     }
 
     fn applySheetEditTransform(self: *Workbook, sheet_idx: u32, spec: SheetEditSpec, prepared_in: ?*PreparedPivotEdits) Error!void {
@@ -30561,6 +30630,94 @@ test "S3c slice 4: the cells sheet is created once and refreshed by every write 
     try std.testing.expect(state == .stripped);
     try std.testing.expectEqual(recovery_record.Carrier.cell_data, state.stripped.carrier);
     try std.testing.expectEqualStrings("m3", state.stripped.model);
+}
+
+test "recalc guard: an embedding write under either recovery and a strip install into the live generation — markRecalcOnLoad refuses RecalcRequiresReopen, no abort, nothing torn, the set (or its absence) survives the save; the documented order lands both" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/guard_src.xlsx", .{dir});
+    defer a.free(path);
+    const out_invisible = try std.fmt.allocPrint(a, "{s}/guard_invisible.xlsx", .{dir});
+    defer a.free(out_invisible);
+    const out_cells = try std.fmt.allocPrint(a, "{s}/guard_cells.xlsx", .{dir});
+    defer a.free(out_cells);
+    const out_stripped = try std.fmt.allocPrint(a, "{s}/guard_stripped.xlsx", .{dir});
+    defer a.free(out_stripped);
+    const out_ordered = try std.fmt.allocPrint(a, "{s}/guard_ordered.xlsx", .{dir});
+    defer a.free(out_ordered);
+    {
+        var wb = try Workbook.empty(a, io);
+        defer wb.deinit();
+        const ws = try wb.addSheet("Items");
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Title" }}});
+        try ws.appendRows(&[_][]const zlsx.Cell{&.{.{ .string = "Alpha" }}});
+        try wb.save(io, path);
+    }
+    // The invisible recovery installs the index and vector parts.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.setEmbeddings("m1", 2, .int8_sym_per_vec, &s3c4_inputs);
+        try std.testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        try std.testing.expect((try wb.embeddings()) == .present);
+        try wb.save(io, out_invisible);
+    }
+    // The cells recovery adds a sheet as well — the shape that aborted
+    // the process on the sheet-count invariant before the guard.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.setEmbeddingsOpts("m2", 2, .int8_sym_per_vec, &s3c4_inputs, .{ .recovery_in_cells = true });
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try std.testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        try std.testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try wb.save(io, out_cells);
+    }
+    // A strip removes parts: an install too.
+    {
+        var wb = try Workbook.open(a, io, out_invisible);
+        defer wb.deinit();
+        try wb.stripEmbeddings();
+        try std.testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        try wb.save(io, out_stripped);
+    }
+    // The documented order: mark, then write.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.markRecalcOnLoad();
+        try wb.setEmbeddings("m3", 2, .int8_sym_per_vec, &s3c4_inputs);
+        try wb.save(io, out_ordered);
+    }
+    const Expect = struct { path: []const u8, model: ?[]const u8, sheets: u32, marked: bool };
+    const expects = [_]Expect{
+        .{ .path = out_invisible, .model = "m1", .sheets = 1, .marked = false },
+        .{ .path = out_cells, .model = "m2", .sheets = 2, .marked = false },
+        .{ .path = out_stripped, .model = null, .sheets = 1, .marked = false },
+        .{ .path = out_ordered, .model = "m3", .sheets = 1, .marked = true },
+    };
+    for (expects) |e| {
+        var wb = try Workbook.open(a, io, e.path);
+        defer wb.deinit();
+        try std.testing.expectEqual(e.sheets, wb.sheetCount());
+        const state = try wb.embeddings();
+        if (e.model) |m| {
+            try std.testing.expect(state == .present);
+            try std.testing.expectEqualStrings(m, state.present.index.model);
+        } else {
+            try std.testing.expect(state != .present);
+        }
+        const wb_part = (try wb.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(e.marked, std.mem.indexOf(u8, wb_part.bytes, "fullCalcOnLoad=\"1\"") != null);
+        // A re-opened file is a generation a transaction accepts.
+        try wb.markRecalcOnLoad();
+    }
 }
 
 test "S3c slice 4: a sheet by the reserved name, however cased, IS the carrier — one locator for the write and the strip; no second sheet, no SheetNameInUse after the parts" {
