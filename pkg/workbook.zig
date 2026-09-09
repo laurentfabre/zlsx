@@ -16017,6 +16017,9 @@ test {
     _ = @import("sheet_props_ndjson.zig");
     // S3c slice 2: same lesson, the embeddable-rows writer.
     _ = @import("embeddable_row_ndjson.zig");
+    // S3c slice 6: same lesson, the shared JSON scalar writers (their
+    // pins — the escaper's, `writeF64`'s — ran on no root before).
+    _ = @import("json_text.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {

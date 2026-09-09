@@ -59,6 +59,21 @@ pub fn writeOptF64(w: *std.Io.Writer, v: ?f64) !void {
     if (v) |x| try writeF64(w, x) else try w.writeAll("null");
 }
 
+/// `writeF64` for a single: the shortest digits that round-trip the
+/// f32 — `0.1` for the f32 nearest 0.1, where widening to a double
+/// first would print `0.10000000149011612` — under the same plain /
+/// exponent split. `zlsx embed --dump` spells vector components with
+/// it; a non-finite component is the caller's to keep off the wire.
+pub fn writeF32(w: *std.Io.Writer, v: f32) !void {
+    std.debug.assert(std.math.isFinite(v));
+    const mag = @abs(v);
+    if (mag == 0 or (mag >= 1e-6 and mag < 1e21)) {
+        try w.print("{d}", .{v});
+    } else {
+        try w.print("{e}", .{v});
+    }
+}
+
 test "writeString: metacharacters, short escapes, C0 controls, UTF-8 verbatim" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -67,6 +82,25 @@ test "writeString: metacharacters, short escapes, C0 controls, UTF-8 verbatim" {
         "\"a\\\"b\\\\c\\nd\\re\\tf\\bg\\fh\\u0001i\\u001fj\x7fk café\"",
         w.buffered(),
     );
+}
+
+test "writeF32: the single's shortest digits, not the widened double's; the same plain / exponent split" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const vals = [_]f32{ 0.1, 0.3, 0.5, -1.5, 0, -0.0, 1e-6, 1e-7, 2.5e-7, 3.4028235e38, 1.17549435e-38, 123456789.0 };
+    for (vals) |v| {
+        try writeF32(&w, v);
+        try w.writeByte(' ');
+    }
+    try std.testing.expectEqualStrings(
+        "0.1 0.3 0.5 -1.5 0 -0 0.000001 1e-7 2.5e-7 3.4028235e38 1.1754944e-38 123456790 ",
+        w.buffered(),
+    );
+    // The widened double spells the same f32 differently — the reason
+    // the single has a writer of its own.
+    var w2 = std.Io.Writer.fixed(&buf);
+    try writeF64(&w2, @as(f32, 0.1));
+    try std.testing.expectEqualStrings("0.10000000149011612", w2.buffered());
 }
 
 test "writeF64: plain decimal inside [1e-6, 1e21), exponent form outside, zero and sign kept" {

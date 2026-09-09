@@ -422,7 +422,7 @@ contract: [docs/cli.md](docs/cli.md).**
 | Read | `rows` (default) · `cells` · `meta` · `list-sheets` · `comments` · `validations` · `hyperlinks` · `pivots` · `merges` · `defined-names` · `doc-props` · `anchors` · `conditional-formats` · `sheet-props` · `calc-props` · `styles` · `sst` |
 | Edit | `append-rows` · `set-cell` · `insert-row` · `delete-row` · `insert-column` · `delete-column` · `add-sheet` · `rename-sheet` · `delete-sheet` · `rename-table-column` |
 | Privacy | `scrub-metadata` · `embed --strip` · `embed --prune` |
-| Embeddings | `embed --extract` · `embed --vectors` |
+| Embeddings | `embed --extract` · `embed --vectors` · `embed --dump` |
 | Formula | `eval` · `recalc` |
 | Databricks | `dbx push` · `dbx pull` · `dbx genie` · `dbx audit` |
 
@@ -436,6 +436,8 @@ my-embedder < rows.ndjson > vecs.ndjson
 zlsx embed b.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A100 --out out.xlsx
 # Keep the provenance record through an Apple Numbers export too (costs a hidden sheet).
 zlsx embed b.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A100 --recovery in-cells --out out.xlsx
+# What the file stores: the state (present / stripped / absent), the coverages, every vector with its hash.
+zlsx embed out.xlsx --dump
 ```
 
 ---

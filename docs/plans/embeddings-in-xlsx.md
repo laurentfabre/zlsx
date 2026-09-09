@@ -255,6 +255,12 @@ Every write surface has the hatch (S3c slices 4 and 5): `flags` bit 0 of
 `zlsx embed --vectors … --recovery in-cells` — one `Editor.setEmbeddingsOpts`
 call beneath all three.
 
+Every read surface reports the state the same way (S3c slice 6):
+`Workbook.embeddings`, the `zlsx_emb_*` handle, `zlsx.embeddings(path)` and
+`zlsx embed --dump` — the last as NDJSON: the state with its provenance, the
+coverages and, when present, every slot's hash and vector, a tombstone as
+`null` (`docs/cli.md`, "embed --dump").
+
 The library does not choose for you. The default is invisible because
 that is the stated product goal; the hatch is one flag away because
 "your vectors silently vanished" is a worse outcome for some callers

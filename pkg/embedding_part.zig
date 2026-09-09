@@ -1010,36 +1010,45 @@ pub fn decodeAllF32(vec: ParsedVecPart, out: []f32) Error!void {
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const rec = try vec.record(@intCast(i));
-        const dst = out[i * dim ..][0..dim];
-        switch (vec.header.dtype) {
-            .f32 => {
-                for (dst, 0..) |*v, j| {
-                    v.* = @bitCast(std.mem.readInt(u32, rec[j * 4 ..][0..4], .little));
-                }
-            },
-            .binary16 => {
-                for (dst, 0..) |*v, j| {
-                    v.* = binary16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
-                }
-            },
-            .bfloat16 => {
-                for (dst, 0..) |*v, j| {
-                    v.* = bfloat16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
-                }
-            },
-            .int8_sym_per_vec => {
-                const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
-                const q: []const i8 = @ptrCast(rec[4..]);
-                dequantizeI8Sym(q, scale, dst);
-            },
-            .int8_asym_per_vec => {
-                const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
-                const zero: i8 = @bitCast(rec[4]);
-                const q: []const i8 = @ptrCast(rec[5..]);
-                dequantizeI8Asym(q, scale, zero, dst);
-            },
-        }
+        try decodeRecordF32(vec, @intCast(i), out[i * dim ..][0..dim]);
+    }
+}
+
+/// Decode ONE record — vector `idx` of `vec` — into `out` as f32
+/// (`out.len` must be exactly `dim`). The row `decodeAllF32` loops
+/// over: `zlsx embed --dump` streams a set one record at a time
+/// through this rather than materializing `count × dim` floats, and
+/// every dtype's layout stays here, once.
+pub fn decodeRecordF32(vec: ParsedVecPart, idx: u32, out: []f32) Error!void {
+    if (out.len != vec.header.dim) return Error.InvalidRange;
+    const rec = try vec.record(idx);
+    switch (vec.header.dtype) {
+        .f32 => {
+            for (out, 0..) |*v, j| {
+                v.* = @bitCast(std.mem.readInt(u32, rec[j * 4 ..][0..4], .little));
+            }
+        },
+        .binary16 => {
+            for (out, 0..) |*v, j| {
+                v.* = binary16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
+            }
+        },
+        .bfloat16 => {
+            for (out, 0..) |*v, j| {
+                v.* = bfloat16ToF32(std.mem.readInt(u16, rec[j * 2 ..][0..2], .little));
+            }
+        },
+        .int8_sym_per_vec => {
+            const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
+            const q: []const i8 = @ptrCast(rec[4..]);
+            dequantizeI8Sym(q, scale, out);
+        },
+        .int8_asym_per_vec => {
+            const scale: f32 = @bitCast(std.mem.readInt(u32, rec[0..4], .little));
+            const zero: i8 = @bitCast(rec[4]);
+            const q: []const i8 = @ptrCast(rec[5..]);
+            dequantizeI8Asym(q, scale, zero, out);
+        },
     }
 }
 
@@ -2240,6 +2249,28 @@ test "decodeAllF32 handles plain f32 bodies" {
     var out: [4]f32 = undefined;
     try decodeAllF32(vec, &out);
     for (vals, out) |want, got| try testing.expectEqual(want, got);
+}
+
+test "decodeRecordF32: one record at a time reads what decodeAllF32 reads, both encodable dtypes; a mis-sized buffer and a slot past the count refuse InvalidRange" {
+    const a = testing.allocator;
+    const vectors = [_]f32{ 1.0, -2.5, 0.25, 4.0, 0, 0, 0, 0, 100, -100, 50, 0.5 };
+    for ([_]Dtype{ .f32, .int8_sym_per_vec }) |dtype| {
+        const body = try encodeVectorBody(a, dtype, 4, &vectors);
+        defer a.free(body);
+        const part = try encodeVecPart(a, .{ .version = WIRE_VERSION, .dim = 4, .count = 3, .dtype = dtype }, body);
+        defer a.free(part);
+        const vec = try parseVecPart(part);
+        var all: [12]f32 = undefined;
+        try decodeAllF32(vec, &all);
+        var one: [4]f32 = undefined;
+        for (0..3) |i| {
+            try decodeRecordF32(vec, @intCast(i), &one);
+            try testing.expectEqualSlices(f32, all[i * 4 ..][0..4], &one);
+        }
+        var short: [3]f32 = undefined;
+        try testing.expectError(Error.InvalidRange, decodeRecordF32(vec, 0, &short));
+        try testing.expectError(Error.InvalidRange, decodeRecordF32(vec, 3, &one));
+    }
 }
 
 test "decodeAllF32 rejects a mis-sized output buffer" {

@@ -200,6 +200,8 @@ jobs:
           printf '{"row":2,"vector":[0.5,0.25]}\n' > vecs.ndjson
           ./zig-out/bin/zlsx.exe embed tests/corpus/openpyxl_guess_types.xlsx --vectors vecs.ndjson --model M --column A --coverage A2:A2 --recovery in-cells --out embed_smoke.xlsx
           ./zig-out/bin/zlsx.exe list-sheets embed_smoke.xlsx | grep -q '"zlsxRecovery".*"hidden"'
+          # The read leg (S3c slice 6): the dump reports the set present, with its vector.
+          ./zig-out/bin/zlsx.exe embed embed_smoke.xlsx --dump | grep -q '"kind":"vector","coverage":"default","row":2,"hash":[0-9]*,"vector":\[0.5,0.25\]'
 
       - name: Stage zlsx.dll into Python binding for wheel smoke
         shell: bash

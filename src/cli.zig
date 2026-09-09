@@ -252,6 +252,10 @@ const Args = struct {
     /// carrier an Apple Numbers export keeps. Belongs to
     /// `embed --vectors`: refused on every other mode and sub-command.
     recovery_name: ?[]const u8 = null,
+    /// S3c slice 6: `embed --dump` — print the embedding state and the
+    /// stored vectors + hashes as NDJSON on stdout. Read-only, takes no
+    /// `--out`. Rejected on every other sub-command.
+    dump: bool = false,
     /// iter-cm-4: A1-style cell ref for the `set-cell` sub-command.
     /// Set via `--ref A1`.
     cell_ref: ?[]const u8 = null,
@@ -388,7 +392,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     const boolean_flags = [_][]const u8{
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
         "--sst-lazy",    "--all-sheets", "--help",           "--strip",
-        "--prune",       "--extract",
+        "--prune",       "--extract",    "--dump",
     };
     // Value-bearing flags: the file-scope `value_flags` table.
     // Context-aware splitter: the token IMMEDIATELY following a
@@ -545,6 +549,9 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--extract")) {
             if (out.subcommand != .embed) return ArgError.UnknownFlag;
             out.extract = true;
+        } else if (std.mem.eql(u8, a, "--dump")) {
+            if (out.subcommand != .embed) return ArgError.UnknownFlag;
+            out.dump = true;
         } else if (std.mem.eql(u8, a, "--vectors")) {
             if (out.subcommand != .embed) return ArgError.UnknownFlag;
             i += 1;
@@ -1251,6 +1258,27 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                       zlsx embed b.xlsx --vectors vecs.ndjson \
         \\                         --model M --column A --coverage A2:A100 \
         \\                         --out out.xlsx
+        \\  embed --dump       read-only: print the embedding state and
+        \\                     the stored vectors as NDJSON. First
+        \\                     {"kind":"embeddings","state":"present"|
+        \\                     "stripped"|"absent",…} with the model,
+        \\                     dim, dtype, hash_algo and coverage_count
+        \\                     (a stripped set adds its digest and the
+        \\                     carrier the record survived in; absent
+        \\                     has the state alone); then one
+        \\                     {"kind":"coverage","id":…,"sheet":…,
+        \\                     "range":…,"rows":N} per coverage (present
+        \\                     adds column, include_formulas); then,
+        \\                     present only, one {"kind":"vector",
+        \\                     "coverage":ID,"row":N,"hash":H,"vector":
+        \\                     […]} per covered row — hash and vector
+        \\                     null on a tombstoned slot. What
+        \\                     zlsx.embeddings / zlsx_emb_* report.
+        \\                     Takes no --out. The vector records are a
+        \\                     --vectors input again:
+        \\                       zlsx embed b.xlsx --dump | jq -c \
+        \\                         'select(.kind=="vector" and .hash != null)
+        \\                          | {row, vector}' > vecs.ndjson
         \\  dbx push|pull|genie  Databricks over REST (the one network-
         \\                     touching family). Auth from DATABRICKS_HOST
         \\                     / DATABRICKS_TOKEN; genie space from
@@ -3756,6 +3784,174 @@ fn readVectorFile(
     return map;
 }
 
+/// S3c slice 6: `zlsx embed <file> --dump`.
+///
+/// The embedding read row's CLI leg: what `Workbook.embeddings` found,
+/// as the C ABI's `zlsx_emb_*` getters and py-zlsx's `Embeddings`
+/// report it — the state first (present / stripped / absent, with the
+/// provenance a stripped set kept), then the coverages, then — present
+/// only — every covered slot's hash and vector. Read-only: opens the
+/// workbook, writes none, takes no `--out`.
+///
+/// Nothing reaches stdout before the whole set has been read and
+/// judged: the index, both binary parts of every coverage and their
+/// cross-checks are `embeddings()`'s, so a refusal (exit 3, the
+/// family's code for a set the read cannot serve — the names `--prune`
+/// folds under `MalformedEmbeddingSet`, plus `MissingEmbeddingPart`)
+/// leaves stdout empty rather than a state record with no vectors
+/// behind it. The per-slot decode cannot fail after that: the part
+/// parsers proved every record's bytes are there, and the strings the
+/// records carry are proved UTF-8 before the first byte is written.
+fn runEmbedDump(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var wb = zlsx_pkg.Workbook.open(alloc, io, args.file) catch |e| {
+        try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+        try err.flush();
+        return openFailureExit(e);
+    };
+    defer wb.deinit();
+
+    const state = wb.embeddings() catch |e| {
+        try err.print("zlsx: embed --dump: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return 3;
+    };
+
+    // NDJSON must stay parseable: the index and the recovery record
+    // hand their strings over as the bytes the parser accepted (the C
+    // surface copies them out raw; py-zlsx decodes and raises), so a
+    // string that is not UTF-8 refuses the dump whole, before any
+    // record is written — the rule every reader sub-command applies.
+    if (!dumpTextIsUtf8(state)) {
+        try err.writeAll("zlsx: embed --dump: InvalidUtf8\n");
+        try err.flush();
+        return 3;
+    }
+
+    switch (state) {
+        .absent => try out.writeAll("{\"kind\":\"embeddings\",\"state\":\"absent\"}\n"),
+        .stripped => |rec| {
+            try writeEmbeddingsRecordHead(out, "stripped", rec.model, rec.dim, rec.dtype, rec.hash_algo, rec.coverages.len);
+            try out.print(",\"digest\":{d},\"carrier\":\"{s}\"}}\n", .{ rec.digest, @tagName(rec.carrier) });
+            for (rec.coverages) |c| {
+                try writeCoverageRecordHead(out, c.id, c.worksheet_target, c.range);
+                try out.print(",\"rows\":{d}}}\n", .{c.count});
+            }
+        },
+        .present => |view| {
+            try writeEmbeddingsRecordHead(out, "present", view.index.model, view.index.dim, view.index.dtype.string(), view.index.hash_algo, view.coverages.len);
+            try out.writeAll("}\n");
+            for (view.coverages) |cv| {
+                const c = cv.coverage;
+                try writeCoverageRecordHead(out, c.id, c.worksheet_target, c.range);
+                try out.writeAll(",\"column\":");
+                try writeJsonString(out, c.column);
+                try out.print(",\"include_formulas\":{s},\"rows\":{d}}}\n", .{ if (c.include_formulas) "true" else "false", cv.vec.header.count });
+            }
+            // One row of floats — the CLI's own buffer, exit 4 as
+            // `--vectors`' vector buffer is; the set streams through it
+            // one record at a time rather than as `count × dim` floats.
+            const row = alloc.alloc(f32, view.index.dim) catch return 4;
+            defer alloc.free(row);
+            for (view.coverages) |cv| {
+                const first_row = cv.coverage.parsed_range.first.row;
+                var i: u32 = 0;
+                while (i < cv.vec.header.count) : (i += 1) {
+                    try out.writeAll("{\"kind\":\"vector\",\"coverage\":");
+                    try writeJsonString(out, cv.coverage.id);
+                    try out.print(",\"row\":{d},", .{first_row + i});
+                    // In bounds by the loop; the hash part's length was
+                    // proved against its count when the view was built.
+                    const hash = cv.hashes.value(i) catch unreachable;
+                    if (hash == zlsx_pkg.embedding_part.TOMBSTONE_HASH) {
+                        // No vector, by the tombstone contract — the
+                        // slot stays (the range is dense, indices stay
+                        // aligned), its bytes are not shown.
+                        try out.writeAll("\"hash\":null,\"vector\":null}\n");
+                        continue;
+                    }
+                    // `row.len` is the header's dim and `i` is in
+                    // bounds; the vec part's length was proved against
+                    // `count × recordBytes(dim)` when the view was built.
+                    zlsx_pkg.embedding_part.decodeRecordF32(cv.vec, i, row) catch unreachable;
+                    try out.print("\"hash\":{d},\"vector\":[", .{hash});
+                    for (row, 0..) |v, j| {
+                        if (j != 0) try out.writeByte(',');
+                        // JSON has no NaN / Inf; a foreign writer's
+                        // non-finite component prints as null, the
+                        // `cells` rule for a non-finite number.
+                        if (std.math.isFinite(v)) try zlsx_pkg.json_text.writeF32(out, v) else try out.writeAll("null");
+                    }
+                    try out.writeAll("]}\n");
+                }
+            }
+        },
+    }
+    try out.flush();
+    return 0;
+}
+
+/// Every string a `--dump` record would carry, proved UTF-8 — the
+/// index's or the recovery record's, by state.
+fn dumpTextIsUtf8(state: zlsx_pkg.EmbeddingState) bool {
+    const ok = std.unicode.utf8ValidateSlice;
+    switch (state) {
+        .absent => return true,
+        .stripped => |rec| {
+            if (!ok(rec.model) or !ok(rec.dtype) or !ok(rec.hash_algo)) return false;
+            for (rec.coverages) |c| {
+                if (!ok(c.id) or !ok(c.worksheet_target) or !ok(c.range)) return false;
+            }
+            return true;
+        },
+        .present => |view| {
+            if (!ok(view.index.model) or !ok(view.index.hash_algo)) return false;
+            for (view.coverages) |cv| {
+                const c = cv.coverage;
+                if (!ok(c.id) or !ok(c.worksheet_target) or !ok(c.range) or !ok(c.column)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+/// The `{"kind":"embeddings",…}` record up to (not including) the
+/// closing brace: the fields present and stripped share, in the order
+/// docs/cli.md fixes.
+fn writeEmbeddingsRecordHead(
+    out: *std.Io.Writer,
+    state: []const u8,
+    model: []const u8,
+    dim: u32,
+    dtype: []const u8,
+    hash_algo: []const u8,
+    coverage_count: usize,
+) !void {
+    try out.print("{{\"kind\":\"embeddings\",\"state\":\"{s}\",\"model\":", .{state});
+    try writeJsonString(out, model);
+    try out.print(",\"dim\":{d},\"dtype\":", .{dim});
+    try writeJsonString(out, dtype);
+    try out.writeAll(",\"hash_algo\":");
+    try writeJsonString(out, hash_algo);
+    try out.print(",\"coverage_count\":{d}", .{coverage_count});
+}
+
+/// The `{"kind":"coverage",…}` record's shared head: the three fields
+/// a present and a stripped coverage both carry.
+fn writeCoverageRecordHead(out: *std.Io.Writer, id: []const u8, sheet: []const u8, range: []const u8) !void {
+    try out.writeAll("{\"kind\":\"coverage\",\"id\":");
+    try writeJsonString(out, id);
+    try out.writeAll(",\"sheet\":");
+    try writeJsonString(out, sheet);
+    try out.writeAll(",\"range\":");
+    try writeJsonString(out, range);
+}
+
 /// emb-6a: `zlsx embed <file> --strip --out PATH`.
 ///
 /// Removes the embedding parts and the recovery record together, so
@@ -3776,32 +3972,35 @@ fn runEmbedCommand(
     if (args.strip) mode_count += 1;
     if (args.prune) mode_count += 1;
     if (args.extract) mode_count += 1;
+    if (args.dump) mode_count += 1;
     if (args.vectors_path != null) mode_count += 1;
     if (mode_count == 0) {
-        try err.writeAll("zlsx: embed requires one of --extract, --vectors PATH, --prune, --strip\n");
+        try err.writeAll("zlsx: embed requires one of --extract, --vectors PATH, --prune, --strip, --dump\n");
         try err.flush();
         return 2;
     }
     if (mode_count > 1) {
-        try err.writeAll("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip)\n");
+        try err.writeAll("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip / --dump)\n");
         try err.flush();
         return 2;
     }
     // `--recovery` chooses a carrier for the record `--vectors` writes.
-    // To the other three modes it is a promise this run cannot keep —
-    // a strip removes that carrier, a prune and an extract write none
-    // — so it is refused rather than ignored, the way `--strip` is on
-    // the other sub-commands: silence on a flag that names where
-    // provenance lands would be the wrong tolerance.
+    // To the other four modes it is a promise this run cannot keep —
+    // a strip removes that carrier, a prune writes none, an extract
+    // and a dump write nothing at all — so it is refused rather than
+    // ignored, the way `--strip` is on the other sub-commands: silence
+    // on a flag that names where provenance lands would be the wrong
+    // tolerance.
     if (args.recovery_name != null and args.vectors_path == null) {
         try err.writeAll("zlsx: --recovery applies to embed --vectors only\n");
         try err.flush();
         return 2;
     }
 
-    // Phase one of the write path: read-only, emits on stdout, never
-    // touches the workbook — so it deliberately does NOT want --out.
+    // The two read-only modes: emit on stdout, never touch the
+    // workbook — so they deliberately do NOT want --out.
     if (args.extract) return try runEmbedExtract(alloc, io, args, out, err);
+    if (args.dump) return try runEmbedDump(alloc, io, args, out, err);
     if (args.vectors_path) |vp| return try runEmbedApply(alloc, io, args, vp, err);
 
     const mode: []const u8 = if (args.strip) "--strip" else "--prune";
@@ -11191,6 +11390,353 @@ test "S3c slice 5: runEmbedCommand — `--recovery` with --strip / --prune / --e
         var out_w = std.Io.Writer.fixed(&out_buf);
         const args: Args = .{ .file = "s3c5-absent-input.xlsx", .subcommand = .embed, .strip = true, .vectors_path = "v.ndjson", .out_path = "s3c5-never.xlsx", .recovery_name = "in-cells" };
         try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
-        try std.testing.expectEqualStrings("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip)\n", err_w.buffered());
+        try std.testing.expectEqualStrings("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip / --dump)\n", err_w.buffered());
     }
+}
+
+test "S3c slice 6: parseArgs — `--dump` is a boolean flag of the embed family: set before or after the sub-command token, the `=` spelling refused, refused on every other sub-command" {
+    {
+        const argv = [_][]const u8{ "embed", "in.xlsx", "--dump" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.embed, a.subcommand);
+        try std.testing.expect(a.dump);
+        try std.testing.expectEqualStrings("in.xlsx", a.file);
+        try std.testing.expect(!a.extract and !a.strip and !a.prune and a.vectors_path == null);
+    }
+    {
+        const argv = [_][]const u8{ "--dump", "embed", "in.xlsx" };
+        const a = try parseArgs(&argv);
+        try std.testing.expectEqual(Subcommand.embed, a.subcommand);
+        try std.testing.expect(a.dump);
+        try std.testing.expectEqualStrings("in.xlsx", a.file);
+    }
+    {
+        // A boolean flag takes no value: the `=` spelling is refused as
+        // `--strip=1` is.
+        const argv = [_][]const u8{ "embed", "in.xlsx", "--dump=1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+    for ([_][]const u8{ "rows", "cells", "list-sheets", "meta" }) |sub| {
+        const argv = [_][]const u8{ sub, "in.xlsx", "--dump" };
+        try std.testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "set-cell", "in.xlsx", "--ref", "A1", "--value", "1", "--out", "o.xlsx", "--dump" };
+        try std.testing.expectError(ArgError.UnknownFlag, parseArgs(&argv));
+    }
+}
+
+/// The vec part's name for a present coverage, resolved through the
+/// view's relationships as the read resolves it.
+fn s3c6VecPartName(view: zlsx_pkg.EmbeddingView, cv: zlsx_pkg.EmbeddingCoverageView, buf: []u8) ![]const u8 {
+    for (view.rels) |r| {
+        if (std.mem.eql(u8, r.id, cv.coverage.vec_rid)) {
+            return std.fmt.bufPrint(buf, "{s}/{s}", .{ zlsx_pkg.embedding_part.EMBEDDINGS_DIR, r.target });
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "S3c slice 6: embed --dump — absent; present as the state, the coverage and every slot with its hash and vector (a tombstone null); int8-sym read back dequantized; the vector records a --vectors input again; stripped with its provenance; a non-finite component null; a set the read cannot serve refused with stdout empty; the fence, the mode conflict, the open's verdict" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(a, io, "s3c6_src.xlsx");
+    defer a.free(src);
+    {
+        var w = xlsx.writer_types.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Items");
+        try s.writeRow(&.{.{ .string = "Title" }});
+        try s.writeRow(&.{.{ .string = "alpha" }});
+        try s.writeRow(&.{.{ .string = "beta" }});
+        try s.writeRow(&.{.{ .string = "gamma" }});
+        try w.save(io, src);
+    }
+    var err_buf: [1024]u8 = undefined;
+    var out_buf: [8192]u8 = undefined;
+
+    // A workbook that never had a set: the state alone.
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = src, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqualStrings("{\"kind\":\"embeddings\",\"state\":\"absent\"}\n", out_w.buffered());
+    }
+
+    // The write: rows 2 and 4 carry a vector; row 3 (embeddable, no
+    // vector) becomes a tombstone.
+    try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_vecs.ndjson", .data = "{\"row\":2,\"vector\":[0.5,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n" });
+    const vecs = try tt.path(a, io, "s3c6_vecs.ndjson");
+    defer a.free(vecs);
+    const write_base: Args = .{ .file = src, .subcommand = .embed, .vectors_path = vecs, .model_name = "m1", .column_name = "A", .coverage_range = "A2:A4" };
+    const out_f32 = try tt.path(a, io, "s3c6_f32.xlsx");
+    defer a.free(out_f32);
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var args = write_base;
+        args.out_path = out_f32;
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+    }
+    // The hashes as the set stores them: the cross-surface literal for
+    // "alpha" at row 2 on worksheets/sheet1.xml (pinned on the C and
+    // Python surfaces since S3c slice 2), the other read off the view.
+    const h_gamma: u64 = blk: {
+        var wb = try zlsx_pkg.Workbook.open(a, io, out_f32);
+        defer wb.deinit();
+        const view = (try wb.embeddings()).present;
+        try std.testing.expectEqual(@as(u64, 6830279115424181645), try view.coverages[0].hashes.value(0));
+        try std.testing.expectEqual(zlsx_pkg.embedding_part.TOMBSTONE_HASH, try view.coverages[0].hashes.value(1));
+        break :blk try view.coverages[0].hashes.value(2);
+    };
+    const want_f32 = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{d}{s}", .{
+        "{\"kind\":\"embeddings\",\"state\":\"present\",\"model\":\"m1\",\"dim\":2,\"dtype\":\"f32\",\"hash_algo\":\"xxh3-64\",\"coverage_count\":1}\n",
+        "{\"kind\":\"coverage\",\"id\":\"default\",\"sheet\":\"worksheets/sheet1.xml\",\"range\":\"A2:A4\",\"column\":\"A\",\"include_formulas\":false,\"rows\":3}\n",
+        "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":2,\"hash\":6830279115424181645,\"vector\":[0.5,0.25]}\n",
+        "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":3,\"hash\":null,\"vector\":null}\n",
+        "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":4,\"hash\":",
+        h_gamma,
+        ",\"vector\":[1,-1.5]}\n",
+    });
+    defer a.free(want_f32);
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = out_f32, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqualStrings(want_f32, out_w.buffered());
+    }
+
+    // The vector records are a `--vectors` input again: filtered to
+    // {row, vector} (tombstones dropped) and written back over the
+    // source, the dump is byte-identical — the shape claim, pinned.
+    {
+        var filtered: std.Io.Writer.Allocating = .init(a);
+        defer filtered.deinit();
+        var lines = std.mem.splitScalar(u8, want_f32, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "{\"kind\":\"vector\"")) continue;
+            if (std.mem.indexOf(u8, line, "\"hash\":null") != null) continue;
+            const row_at = std.mem.indexOf(u8, line, "\"row\":").?;
+            const hash_at = std.mem.indexOf(u8, line, ",\"hash\":").?;
+            const vec_at = std.mem.indexOf(u8, line, "\"vector\":").?;
+            try filtered.writer.print("{{{s},{s}\n", .{ line[row_at..hash_at], line[vec_at..] });
+        }
+        try std.testing.expectEqualStrings("{\"row\":2,\"vector\":[0.5,0.25]}\n{\"row\":4,\"vector\":[1,-1.5]}\n", filtered.written());
+        try tt.dir.dir.writeFile(io, .{ .sub_path = "s3c6_roundtrip.ndjson", .data = filtered.written() });
+        const rt_vecs = try tt.path(a, io, "s3c6_roundtrip.ndjson");
+        defer a.free(rt_vecs);
+        const out_rt = try tt.path(a, io, "s3c6_roundtrip.xlsx");
+        defer a.free(out_rt);
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var args = write_base;
+        args.vectors_path = rt_vecs;
+        args.out_path = out_rt;
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, rt_vecs, &err_w));
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_rt, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqualStrings(want_f32, out_w.buffered());
+    }
+
+    // `--dtype int8-sym` reads back as the index spells it, dequantized
+    // through the one decoder the C surface's `zlsx_emb_vectors` uses.
+    {
+        const out_i8 = try tt.path(a, io, "s3c6_i8.xlsx");
+        defer a.free(out_i8);
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var args = write_base;
+        args.out_path = out_i8;
+        args.dtype_name = "int8-sym";
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedApply(a, io, args, vecs, &err_w));
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_i8, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        const got = out_w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, got, "{\"kind\":\"embeddings\",\"state\":\"present\",\"model\":\"m1\",\"dim\":2,\"dtype\":\"int8-sym-per-vec\",\"hash_algo\":\"xxh3-64\",\"coverage_count\":1}\n"));
+        try std.testing.expect(std.mem.indexOf(u8, got, "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":3,\"hash\":null,\"vector\":null}\n") != null);
+        // Row 4's record: [1, -1.5] quantized per-vec (scale 1.5/127)
+        // and dequantized — within one code of the source.
+        const row4_at = std.mem.indexOf(u8, got, "\"row\":4,\"hash\":").?;
+        const vec_at = std.mem.indexOfPos(u8, got, row4_at, "\"vector\":[").? + "\"vector\":[".len;
+        const vec_end = std.mem.indexOfScalarPos(u8, got, vec_at, ']').?;
+        var it = std.mem.splitScalar(u8, got[vec_at..vec_end], ',');
+        const c0 = try std.fmt.parseFloat(f32, it.next().?);
+        const c1 = try std.fmt.parseFloat(f32, it.next().?);
+        try std.testing.expect(it.next() == null);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), c0, 1.5 / 127.0 + 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, -1.5), c1, 1.5 / 127.0 + 1e-6);
+    }
+
+    // A stripped set — the index gone, the record kept, what a consumer
+    // that rebuilds the archive leaves: the provenance with its digest
+    // and carrier; the coverages without column / include_formulas (the
+    // record does not carry them); no vector records.
+    const out_stripped = try tt.path(a, io, "s3c6_stripped.xlsx");
+    defer a.free(out_stripped);
+    const digest: u64 = blk: {
+        var wb = try zlsx_pkg.Workbook.open(a, io, out_f32);
+        defer wb.deinit();
+        try wb.store.removePart(zlsx_pkg.embedding_part.INDEX_PART_NAME);
+        try wb.save(io, out_stripped);
+        var wb2 = try zlsx_pkg.Workbook.open(a, io, out_stripped);
+        defer wb2.deinit();
+        const st = try wb2.embeddings();
+        try std.testing.expect(st == .stripped);
+        break :blk st.stripped.digest;
+    };
+    {
+        const want = try std.fmt.allocPrint(a, "{s}{d}{s}{s}", .{
+            "{\"kind\":\"embeddings\",\"state\":\"stripped\",\"model\":\"m1\",\"dim\":2,\"dtype\":\"f32\",\"hash_algo\":\"xxh3-64\",\"coverage_count\":1,\"digest\":",
+            digest,
+            ",\"carrier\":\"defined_name\"}\n",
+            "{\"kind\":\"coverage\",\"id\":\"default\",\"sheet\":\"worksheets/sheet1.xml\",\"range\":\"A2:A4\",\"rows\":3}\n",
+        });
+        defer a.free(want);
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_stripped, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+        try std.testing.expectEqualStrings(want, out_w.buffered());
+    }
+
+    // A component no zlsx write produces — a foreign writer's infinity
+    // or NaN — prints as null: JSON has no spelling for it (the `cells`
+    // rule for a non-finite number). Everything else on the record is
+    // as before.
+    {
+        const out_nan = try tt.path(a, io, "s3c6_nonfinite.xlsx");
+        defer a.free(out_nan);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_f32);
+            defer wb.deinit();
+            const view = (try wb.embeddings()).present;
+            var name_buf: [256]u8 = undefined;
+            const vec_name = try s3c6VecPartName(view, view.coverages[0], &name_buf);
+            const part = (try wb.store.part(vec_name)) orelse return error.TestUnexpectedResult;
+            const patched = try a.dupe(u8, part.bytes);
+            defer a.free(patched);
+            const rec0 = zlsx_pkg.embedding_part.VEC_HEADER_BYTES;
+            std.mem.writeInt(u32, patched[rec0..][0..4], 0x7f800000, .little); // +Inf
+            std.mem.writeInt(u32, patched[rec0 + 4 ..][0..4], 0x7fc00000, .little); // NaN
+            try wb.store.replacePart(vec_name, patched);
+            try wb.save(io, out_nan);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_nan, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expect(std.mem.indexOf(u8, out_w.buffered(), "{\"kind\":\"vector\",\"coverage\":\"default\",\"row\":2,\"hash\":6830279115424181645,\"vector\":[null,null]}\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out_w.buffered(), ",\"vector\":[1,-1.5]}\n") != null);
+    }
+
+    // A set the read cannot serve — its vec part gone — refuses before
+    // the first byte: exit 3, the name on stderr, stdout empty.
+    {
+        const out_torn = try tt.path(a, io, "s3c6_torn.xlsx");
+        defer a.free(out_torn);
+        {
+            var wb = try zlsx_pkg.Workbook.open(a, io, out_f32);
+            defer wb.deinit();
+            const view = (try wb.embeddings()).present;
+            var name_buf: [256]u8 = undefined;
+            const vec_name = try s3c6VecPartName(view, view.coverages[0], &name_buf);
+            try wb.store.removePart(vec_name);
+            try wb.save(io, out_torn);
+        }
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const dump: Args = .{ .file = out_torn, .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 3), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: embed --dump: MissingEmbeddingPart\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+
+    // The fence, the mode conflict and the open's own verdict — the
+    // input does not exist, so a message other than "cannot open"
+    // proves the refusal precedes the open.
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = "s3c6-absent-input.xlsx", .subcommand = .embed, .dump = true, .recovery_name = "in-cells" };
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: --recovery applies to embed --vectors only\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = "s3c6-absent-input.xlsx", .subcommand = .embed, .dump = true, .extract = true, .column_name = "A", .coverage_range = "A2:A4" };
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expectEqualStrings("zlsx: embed modes are mutually exclusive (--extract / --vectors / --prune / --strip / --dump)\n", err_w.buffered());
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+    {
+        var err_w = std.Io.Writer.fixed(&err_buf);
+        var out_w = std.Io.Writer.fixed(&out_buf);
+        const args: Args = .{ .file = "s3c6-absent-input.xlsx", .subcommand = .embed, .dump = true };
+        try std.testing.expectEqual(@as(u8, 2), try runEmbedCommand(a, io, args, &out_w, &err_w));
+        try std.testing.expect(std.mem.startsWith(u8, err_w.buffered(), "zlsx: cannot open 's3c6-absent-input.xlsx': "));
+        try std.testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    }
+}
+
+test "S3c slice 6: embed --dump — two coverages: the coverage records in index order, the vector records grouped per coverage in slot order, the hashes printed as stored" {
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src = try tt.path(a, io, "s3c6_two_src.xlsx");
+    defer a.free(src);
+    {
+        var w = xlsx.writer_types.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Items");
+        try s.writeRow(&.{.{ .string = "Title" }});
+        try s.writeRow(&.{.{ .string = "alpha" }});
+        try w.save(io, src);
+    }
+    const out = try tt.path(a, io, "s3c6_two.xlsx");
+    defer a.free(out);
+    {
+        var wb = try zlsx_pkg.Workbook.open(a, io, src);
+        defer wb.deinit();
+        const target = try (try wb.sheet(0)).embeddingTarget();
+        const body_second = try zlsx_pkg.embedding_part.encodeVectorBody(a, .f32, 2, &[_]f32{ 0.1, 0.2 });
+        defer a.free(body_second);
+        const body_first = try zlsx_pkg.embedding_part.encodeVectorBody(a, .f32, 2, &[_]f32{ 1, 2, 3, 4 });
+        defer a.free(body_first);
+        // The write takes the hashes as given — the dump prints them as
+        // stored, so arbitrary values pin "as stored".
+        try wb.setEmbeddings("m", 2, .f32, &[_]zlsx_pkg.EmbeddingCoverageInput{
+            .{ .id = "second", .worksheet_target = target, .range = "B5:B5", .column = "B", .vec_body = body_second, .hashes = &[_]u64{7} },
+            .{ .id = "first", .worksheet_target = target, .range = "A2:A3", .column = "A", .include_formulas = true, .vec_body = body_first, .hashes = &[_]u64{ 42, zlsx_pkg.embedding_part.TOMBSTONE_HASH } },
+        });
+        try wb.save(io, out);
+    }
+    var err_buf: [512]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    const dump: Args = .{ .file = out, .subcommand = .embed, .dump = true };
+    try std.testing.expectEqual(@as(u8, 0), try runEmbedCommand(a, io, dump, &out_w, &err_w));
+    try std.testing.expectEqual(@as(usize, 0), err_w.buffered().len);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"embeddings\",\"state\":\"present\",\"model\":\"m\",\"dim\":2,\"dtype\":\"f32\",\"hash_algo\":\"xxh3-64\",\"coverage_count\":2}\n" ++
+            "{\"kind\":\"coverage\",\"id\":\"second\",\"sheet\":\"worksheets/sheet1.xml\",\"range\":\"B5:B5\",\"column\":\"B\",\"include_formulas\":false,\"rows\":1}\n" ++
+            "{\"kind\":\"coverage\",\"id\":\"first\",\"sheet\":\"worksheets/sheet1.xml\",\"range\":\"A2:A3\",\"column\":\"A\",\"include_formulas\":true,\"rows\":2}\n" ++
+            "{\"kind\":\"vector\",\"coverage\":\"second\",\"row\":5,\"hash\":7,\"vector\":[0.1,0.2]}\n" ++
+            "{\"kind\":\"vector\",\"coverage\":\"first\",\"row\":2,\"hash\":42,\"vector\":[1,2]}\n" ++
+            "{\"kind\":\"vector\",\"coverage\":\"first\",\"row\":3,\"hash\":null,\"vector\":null}\n",
+        out_w.buffered(),
+    );
 }
