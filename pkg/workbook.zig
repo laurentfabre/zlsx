@@ -2459,6 +2459,13 @@ pub const Workbook = struct {
         const scratch_cap_max: usize = 1 << 20;
         const cov_cap_max: usize = cov_cap_start * (scratch_cap_max / scratch_cap_start);
         const reader_max_coverages: usize = recovery_record.MAX_CHUNKS * recovery_record.MAX_CHUNK * 4 / 5;
+        // The derivation of `cov_cap_max` is the loop's own arithmetic
+        // only while the doubling lands on the cap exactly, and the
+        // scratch side must reach the reader's whole joined text — both
+        // premises stated here, so a value change fails the build too
+        // (in-house S3c slice 6 r4).
+        comptime std.debug.assert(std.math.isPowerOfTwo(scratch_cap_max / scratch_cap_start));
+        comptime std.debug.assert(recovery_record.MAX_CHUNKS * recovery_record.MAX_CHUNK * 4 <= scratch_cap_max);
         comptime std.debug.assert(reader_max_coverages < cov_cap_max);
         var cov_cap: usize = cov_cap_start;
         var scratch_cap: usize = scratch_cap_start;
