@@ -1528,7 +1528,9 @@ pub const Workbook = struct {
     /// (`pkg/recalc_run.zig`). What a caller needs from here: any failure
     /// before the rename leaves BOTH the destination's prior bytes and
     /// this workbook's memory untouched (or the destination still absent
-    /// if it never existed); a successful rename leaves memory and file
+    /// if it never existed) — the candidate arm's promise; the arm with
+    /// nothing to recalculate is a plain save, whose failure leaves the
+    /// plans applied in memory; a successful rename leaves memory and file
     /// consistent; and a directory fsync that fails afterwards is a
     /// `durability_warning` on the returned report, never an error.
     /// `RecalcRequiresReopen` is one of the failures before the rename:
@@ -1546,8 +1548,15 @@ pub const Workbook = struct {
     /// they were, and after the rename memory and file agree on them
     /// too. The arm with nothing to recalculate is the plain save of
     /// the live store, `applySavePlans` included — memory as after
-    /// `save`. Appended rows stay refused (`SheetHasUnsavedAppends`):
-    /// the model cannot read them.
+    /// `save`. What either arm materialized is a save's install: the
+    /// next transaction on this workbook refuses `RecalcRequiresReopen`
+    /// (its candidate, the archive as opened again, could not carry it)
+    /// — save and re-open, as after `save`; a transaction that carried
+    /// nothing leaves the next one legal. A staged `.formula` delta is
+    /// the one the run publishes into: the file carries its formula
+    /// cache-free, as `recalculate` then `save` writes it, while the
+    /// report counted the value. Appended rows stay refused
+    /// (`SheetHasUnsavedAppends`): the model cannot read them.
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -4759,15 +4768,14 @@ pub const Workbook = struct {
 
     /// The fold's pivot phase: S7b-3's marker, for every cache a staged
     /// cell write lands in, rendered over `store`. The graph is read
-    /// from the live parts as the save reads it — a recalc transaction
-    /// never touches a pivot part, so the candidate's definition is the
-    /// live one's bytes or the archive's — and the definition installed
-    /// is the marked live one either way: freshly marked, or, when the
-    /// live one already carries the marker, its bytes as they are
-    /// (byte-identical over a candidate that holds the same, the marker
-    /// restored over one built from an archive that lacks it). Read
-    /// best-effort as at save: a graph that cannot be read marks
-    /// nothing, and only a resource failure is the transaction's.
+    /// from the live parts as the save reads it: a recalc transaction
+    /// never touches a pivot part, and the guard holds when this runs
+    /// (a marker a save or an earlier fold installed keeps the next
+    /// transaction out), so the candidate's definition is the live
+    /// one's bytes — a definition already marked is byte-preserved, as
+    /// the save preserves it. Read best-effort as at save: a graph that
+    /// cannot be read marks nothing, and only a resource failure is the
+    /// transaction's.
     fn markPivotCachesForCellWritesInto(self: *Workbook, store: *PartStore) Error!void {
         var any_writes = false;
         for (self.worksheets) |*ws| {
@@ -4798,9 +4806,9 @@ pub const Workbook = struct {
                 }
             }
             if (!hit) continue;
-            const marked = pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e);
-            defer if (marked) |m| a.free(m);
-            try store.replacePart(c.part_name, marked orelse c.raw_xml);
+            const marked = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+            defer a.free(marked);
+            try store.replacePart(c.part_name, marked);
         }
     }
 
@@ -7470,7 +7478,9 @@ pub const Workbook = struct {
     /// re-emits them over whichever generation is live, and
     /// `saveWithRecalc` renders them into its candidate (the save-plan
     /// fold, `foldSavePlansInto`) — so `setCell` + any transaction
-    /// stays legal, as does a transaction after a transaction. Judged
+    /// stays legal, as does a transaction after a transaction that
+    /// carried no plans (what a fold materialized is a save's install,
+    /// kept above the baseline the swap records). Judged
     /// in `recalc_txn.prepare`, before anything is built — the one
     /// choke point every transaction passes — once more in
     /// `recalc_run.prepare` after the no-formula decision, so no graph

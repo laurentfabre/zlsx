@@ -5758,7 +5758,9 @@ export fn zlsx_open_buffer(
 /// the prepared candidate, rename, swap in memory between the rename
 /// and the directory fsync. Any failure before the rename leaves BOTH
 /// the destination's prior bytes (or its absence) and the editor's
-/// memory untouched; a directory fsync that fails afterwards is the
+/// memory untouched (the candidate arm's promise; the arm with nothing
+/// to recalculate is a plain save, whose failure leaves the plans
+/// applied in memory); a directory fsync that fails afterwards is the
 /// report's durability warning — the §5.7.9 slot goes live here —
 /// never an error. A -2 refusal carries the refusing cells in the
 /// diag's census (M9a2's seam through `recalc_run.prepare`);
@@ -5774,9 +5776,11 @@ export fn zlsx_open_buffer(
 /// candidate and are drained from the editor at the swap — a failure
 /// before the rename leaves them staged; the arm with nothing to
 /// recalculate applies them to the live store as `zlsx_editor_save`
-/// does. Appended rows stay refused (`SheetHasUnsavedAppends`): the
-/// run cannot read them. Over an embedding write's install the verdict
-/// is `RecalcRequiresReopen`.
+/// does. What either arm materialized is a save's install: the next
+/// transaction on this editor is -2 `RecalcRequiresReopen` — save and
+/// re-open, as after `zlsx_editor_save`. Appended rows stay refused
+/// (`SheetHasUnsavedAppends`): the run cannot read them. Over an
+/// embedding write's install the verdict is `RecalcRequiresReopen`.
 export fn zlsx_editor_save_with_recalc(
     ed: ?*Editor,
     out_path_ptr: ?[*]const u8,
@@ -12994,6 +12998,12 @@ test "recalc-transaction guard: after add_sheet, insert_row, rename_sheet, set_e
         var diag = freshDiag();
         try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_with_recalc(ed, fold_out.ptr, fold_out.len, &crun, &report, &diag, &err_buf, err_buf.len));
         zlsx_recalc_report_release(&report);
+        zlsx_diag_release(&diag);
+        // What it materialized is a save's install: the next
+        // transaction on this editor hears the guard.
+        diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_mark_recalc_on_load(ed, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("RecalcRequiresReopen", diagName(&diag));
         zlsx_diag_release(&diag);
         try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
         for ([_][:0]const u8{ fold_out, out }) |saved| {

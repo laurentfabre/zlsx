@@ -1777,7 +1777,9 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * candidate, rename, swap in memory between the rename and the
  * directory fsync. Any failure before the rename leaves BOTH the
  * destination's prior bytes (or its absence) and the editor's memory
- * untouched. A directory fsync failing after the rename is
+ * untouched (the candidate arm's promise; the arm with nothing to
+ * recalculate is a plain save, whose failure leaves the plans applied
+ * in memory). A directory fsync failing after the rename is
  * report->durability_warning (+ durability_errno) on a ZLSX_OK return
  * — the §5.7.9 slot goes live here — never an error. A -2 refusal
  * carries the refusing cells in diag->census; RecalcRequiresReopen
@@ -1792,9 +1794,11 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * candidate and are drained from the editor at the swap — a failure
  * before the rename leaves them staged; the arm with nothing to
  * recalculate applies them to the live store as zlsx_editor_save
- * does. Appended rows stay refused (SheetHasUnsavedAppends): the run
- * cannot read them. Over an embedding write's install the verdict is
- * RecalcRequiresReopen. */
+ * does. What either arm materialized is a save's install: the next
+ * transaction on this editor is -2 RecalcRequiresReopen — save and
+ * re-open, as after zlsx_editor_save. Appended rows stay refused
+ * (SheetHasUnsavedAppends): the run cannot read them. Over an
+ * embedding write's install the verdict is RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
         const uint8_t * out_path_ptr, size_t out_path_len,
         const zlsx_run_v1 * run,

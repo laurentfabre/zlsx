@@ -2573,6 +2573,21 @@ def test_save_with_recalc_carries_a_staged_cell_write(tmp_path, with_formula):
     with zlsx.edit(src) as ed:
         ed.set_cell(0, 1, 0, "seven")
         ed.save_with_recalc(folded)
+        # What it materialized is a save's install: the next transaction
+        # that builds a candidate hears the guard — save and re-open. A
+        # workbook with nothing to recalculate builds none: `recalculate`
+        # is a no-op and `save_with_recalc` the plain save again.
+        second = tmp_path / "second.xlsx"
+        ops = (ed.mark_recalc_on_load, ed.recalculate, lambda: ed.save_with_recalc(second))
+        for op in ops if with_formula else ops[:1]:
+            with pytest.raises(zlsx.ZlsxRefusal) as info:
+                op()
+            assert info.value.error_name == "RecalcRequiresReopen"
+        if with_formula:
+            assert not second.exists()
+        else:
+            assert ed.recalculate().cells_written == 0
+            assert ed.save_with_recalc(second).cells_written == 0
         ed.save(out)
     for path in (folded, out):
         with zlsx.open(path) as book:

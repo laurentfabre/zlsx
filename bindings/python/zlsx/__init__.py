@@ -5081,7 +5081,9 @@ class Editor:
         """§5.7.9's atomic file transaction: recalculate, write, rename,
         then swap in memory. Any pre-commit failure — refusal, timeout,
         Ctrl-C, I/O error — leaves the destination's prior bytes (or its
-        absence) AND this editor's memory untouched. A cancellation that
+        absence) AND this editor's memory untouched (the candidate arm's
+        promise; the arm with nothing to recalculate is a plain save,
+        whose failure leaves the plans applied in memory). A cancellation that
         lands post-commit returns normally with
         ``report.cancelled_late=True``. A directory fsync failing after
         the rename is ``report.durability_warning``, never an error.
@@ -5096,8 +5098,11 @@ class Editor:
         leaves (its recovery carrier), go into the candidate and are
         drained from the editor at the swap — a failure before the
         rename leaves them staged; the arm with nothing to recalculate
-        applies them to the live store as :meth:`save` does. Appended
-        rows (:meth:`append_rows`) stay refused
+        applies them to the live store as :meth:`save` does. What
+        either arm materialized is a save's install: the next transaction
+        on this editor raises :class:`ZlsxRefusal`
+        ``RecalcRequiresReopen`` — save and re-open, as after
+        :meth:`save`. Appended rows (:meth:`append_rows`) stay refused
         (``SheetHasUnsavedAppends``): the run cannot read them. Over an
         embedding write's install the verdict is
         ``RecalcRequiresReopen``."""

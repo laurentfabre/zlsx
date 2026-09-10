@@ -2593,8 +2593,20 @@ destination absent, the generation unmoved (pinned under
 `checkAllAllocationFailures` over the fold and over the whole transaction).
 The arm with nothing to recalculate is the plain save of the live store,
 `applySavePlans` included — memory as after `save`, its materialization a
-save's install. The file is byte-identical to `recalculate` then `save`
-(pinned on both arms); the one difference in what is rendered is the pivot
+save's install. So is the candidate arm's: the fold's installs are counted
+and kept above the baseline `Candidate.swap` records, so the next
+transaction on that workbook refuses `RecalcRequiresReopen` — the next
+candidate, the archive as opened again, could not carry what the fold
+materialized, and a shared string the fold added to the table would
+dangle from the live sheet bytes a later run re-stages (in-house fold r1
+A-REL-101, HIGH: an invalid file behind a successful rename, not the
+value revert below); a transaction that carried nothing leaves the next
+one legal (pinned both ways). A staged `.formula` delta is the one delta
+the run publishes into: the file carries the formula cache-free, as
+`recalculate` then `save` writes it, while the report counted the value
+(r1 A-SEM-105, recorded). The file is byte-identical to `recalculate`
+then `save` (pinned on both arms); the one difference in what is rendered
+is the pivot
 phase: the save also rebuilds an affected cache where it can (S7b-5),
 reading the live sheet views, and the fold's candidate holds recalculated
 bytes those views do not describe, so it takes S7b-3's marker alone — the
@@ -2631,11 +2643,12 @@ is not re-staged and reverts in the second's output — from Python against
 the `4639582` library, `save_with_recalc(a); save_with_recalc(b)` on a
 workbook whose one formula was stale wrote `<v>2</v>` into `a` and
 `<v>0</v>` into `b` (`sheets_patched` 1 then 0); `recalculate` then `save`
-after the two wrote `2` again. With the fold the same order reverts a
-materialized write the first transaction carried, the deltas being drained
-at its swap. The guard deliberately admits a transaction after a
-transaction (RTG-2); the inheritance is the fix, and until it the safe
-order is one transaction per open, or save and re-open between two.
+after the two wrote `2` again. A transaction after one whose fold
+materialized anything is refused (above), so the fold does not widen the
+class; a transaction after one that carried nothing stays admitted (RTG-2)
+and re-derives the run's own patches from the archive — the inheritance is
+the fix, and until it the safe order is one transaction per open, or save
+and re-open between two.
 `Workbook.empty()` installs its skeleton
 parts at birth against a baseline of zero, so a fresh-emit workbook
 refuses every transaction until saved and re-opened (pinned; before the

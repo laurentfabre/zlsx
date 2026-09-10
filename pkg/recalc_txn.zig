@@ -68,7 +68,13 @@
 //! staged in the workbook until `swap` drains them: a transaction that
 //! fails before its rename leaves them where they were. The in-memory
 //! transactions do not fold — after them the plain `save` emits the
-//! plans over whichever generation is live.
+//! plans over whichever generation is live. What the fold installs is a
+//! save's install, not the candidate's build: the swap keeps it above
+//! the baseline, so a transaction after one that carried plans refuses
+//! `RecalcRequiresReopen` — the next candidate, the archive as opened
+//! again, could not carry them, and a shared string the fold added
+//! would dangle from the live bytes the run re-stages. A transaction
+//! after one that folded nothing stays legal.
 //!
 //! Not here
 //! --------
@@ -390,6 +396,10 @@ pub const Candidate = struct {
     /// (`Options.fold_save_plans`): the swap drains them, they being in
     /// the parts it installs.
     drain_save_plans: bool = false,
+    /// How many of the candidate's installs the fold made: a save's
+    /// installs, kept out of the baseline the swap records so the next
+    /// transaction hears the guard over them.
+    fold_installs: u64 = 0,
     swapped: bool = false,
 
     /// Give up on the candidate. The workbook is exactly as it was.
@@ -468,7 +478,11 @@ pub const Candidate = struct {
         // the calc state, the chain's removal), not a mutator's — so a
         // transaction after a transaction stays legal and the first
         // install a mutator makes afterwards is the one the guard sees.
-        wb.generation_installs = wb.store.installs;
+        // The fold's installs are a save's, not the build's: left above
+        // the baseline, so a transaction after one that carried plans
+        // refuses as one after `save` does.
+        assert(wb.store.installs >= self.fold_installs);
+        wb.generation_installs = wb.store.installs - self.fold_installs;
         // The deltas and the defined-name plan the fold rendered into
         // this generation's parts are staged no longer. Frees only.
         if (self.drain_save_plans) wb.drainSavePlans();
@@ -597,7 +611,23 @@ pub fn prepare(
     // spliced in); after the staged parts, so a sheet's deltas land
     // over the run's own patches as a save's land over a recalculated
     // generation.
-    if (opts.fold_save_plans) try wb.foldSavePlansInto(&next);
+    // The fold's installs are a save's — materialized staged state the
+    // archive as opened does not hold, which the NEXT candidate's
+    // `nextGeneration` would drop (a shared string it added would then
+    // dangle from the live sheet bytes a later run re-stages). Counted
+    // here and kept out of the baseline the swap records, so a
+    // transaction after one that carried plans hears the guard, as one
+    // after `save` does (in-house fold r1 A-REL-101).
+    var fold_installs: u64 = 0;
+    if (opts.fold_save_plans) {
+        // The fold is a stretch of its own (a sheet re-emitted whole):
+        // polled before it as the staged parts were before theirs
+        // (in-house fold r1 B-REL-105).
+        if (cancelled(opts)) return Error.Cancelled;
+        const before = next.installs;
+        try wb.foldSavePlansInto(&next);
+        fold_installs = next.installs - before;
+    }
 
     if (cancelled(opts)) return Error.Cancelled;
 
@@ -656,6 +686,7 @@ pub fn prepare(
         .retired_bytes = retired_bytes,
         .report = report,
         .drain_save_plans = opts.fold_save_plans,
+        .fold_installs = fold_installs,
     } };
 }
 
