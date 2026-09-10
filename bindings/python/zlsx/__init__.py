@@ -5100,9 +5100,10 @@ class Editor:
         rename leaves them staged; the arm with nothing to recalculate
         applies them to the live store as :meth:`save` does. What
         either arm materialized is a save's install: the next transaction
-        on this editor raises :class:`ZlsxRefusal`
-        ``RecalcRequiresReopen`` — save and re-open, as after
-        :meth:`save`. Appended rows (:meth:`append_rows`) stay refused
+        on this editor that would build a candidate raises
+        :class:`ZlsxRefusal` ``RecalcRequiresReopen`` — save and re-open,
+        as after :meth:`save` (a workbook with nothing to recalculate
+        keeps its plain-save arm). Appended rows (:meth:`append_rows`) stay refused
         (``SheetHasUnsavedAppends``): the run cannot read them. Over an
         embedding write's install the verdict is
         ``RecalcRequiresReopen``."""

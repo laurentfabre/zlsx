@@ -2818,12 +2818,17 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
     // splices the names BEFORE the calc-state patch where the documented
     // order splices them after a created `<calcPr>` — the two must
     // commute (in-house fold r1 B-DOC-103).
+    // The third shape has no `<calcPr>` but a successor of it, so a
+    // created `<calcPr>` and the names block must both land before it
+    // (in-house fold r2 B-REL-203).
     const Shape = struct { sheet: []const u8, calc_pr: []const u8 };
     for ([_]Shape{
         .{ .sheet = sheet_stale, .calc_pr = "<calcPr calcId=\"191029\"/>" },
         .{ .sheet = sheet_no_formula, .calc_pr = "<calcPr calcId=\"191029\"/>" },
         .{ .sheet = sheet_stale, .calc_pr = "" },
         .{ .sheet = sheet_no_formula, .calc_pr = "" },
+        .{ .sheet = sheet_stale, .calc_pr = "<extLst/>" },
+        .{ .sheet = sheet_no_formula, .calc_pr = "<extLst/>" },
     }) |shape| {
         const sheet = shape.sheet;
         const stale = sheet.ptr == sheet_stale.ptr;
@@ -2836,6 +2841,9 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
             // replace — one left as it was would answer the old bytes.
             _ = try (try wb.sheet(0)).ensureParsed();
             try stageBoth(&wb);
+            // A shared string too, so the identity crosses the table's
+            // creation (in-house fold r2 A-TEST-204).
+            try (try wb.sheet(0)).setCell("C1", .{ .shared_string = "hello" });
             var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
             r.deinit(a);
             // Drained: the plans are in the live generation's parts.
@@ -2856,7 +2864,12 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
             defer reopened.deinit();
             try testing.expectEqualStrings("41", try cellCache(try reopened.sheet(0), "A1"));
             try testing.expectEqualStrings(if (stale) "42" else "999", try cellCache(try reopened.sheet(0), "B1"));
+            try testing.expectEqualStrings("0", try cellCache(try reopened.sheet(0), "C1"));
             try testing.expect(hasDefinedName(&reopened, "Total"));
+            const wb_xml = ((try reopened.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult).bytes;
+            const names_at = std.mem.indexOf(u8, wb_xml, "<definedNames>") orelse return error.TestUnexpectedResult;
+            if (std.mem.indexOf(u8, wb_xml, "<extLst")) |ext_at| try testing.expect(names_at < ext_at);
+            if (std.mem.indexOf(u8, wb_xml, "<calcPr")) |calc_at| try testing.expect(names_at < calc_at);
         }
         // The documented order, byte for byte — and the in-memory
         // transaction leaves the plans staged for the save after it.
@@ -2864,9 +2877,10 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
             var wb = try Workbook.open(a, io, path);
             defer wb.deinit();
             try stageBoth(&wb);
+            try (try wb.sheet(0)).setCell("C1", .{ .shared_string = "hello" });
             var r = try wb.recalculate(a, io, fixed_run, .{});
             r.deinit(a);
-            try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).deltas.count());
+            try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
             try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
             try wb.save(io, ordered);
         }
@@ -2916,6 +2930,41 @@ test "save-plan fold: a transaction after one that carried plans refuses — a s
         var r2 = try wb.saveWithRecalc(a, io, second, fixed_run, .{});
         r2.deinit(a);
     }
+}
+
+test "measured, recorded: recalculate then saveWithRecalc in one open — the file transaction is admitted (the in-memory one carried nothing) and its candidate, the archive as opened, carries neither the first run's patch nor a second edit for it" {
+    // The candidate-over-the-live-generation follow-up (§22): the
+    // second run finds B1 fresh in the live bytes, stages no edit, and
+    // the candidate's archive bytes still say 999. Recorded as the
+    // outcome it IS, so the fix updates this pin (in-house fold r2
+    // A-SEM-202).
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+    var r = try wb.recalculate(a, io, fixed_run, .{});
+    r.deinit(a);
+    try testing.expectEqualStrings("42", try cellCache(try wb.sheet(0), "B1"));
+    var r2 = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+    defer r2.deinit(a);
+    try testing.expectEqual(@as(u32, 0), r2.sheets_patched);
+    var reopened = try Workbook.open(a, io, out);
+    defer reopened.deinit();
+    try testing.expectEqualStrings("41", try cellCache(try reopened.sheet(0), "A1"));
+    try testing.expectEqualStrings("999", try cellCache(try reopened.sheet(0), "B1"));
 }
 
 test "save-plan fold: a shared-string write over a workbook without a table lands the table, its relationship and its content type in the file on both arms, an inline string beside it" {

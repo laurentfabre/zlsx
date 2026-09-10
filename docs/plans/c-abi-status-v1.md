@@ -2595,7 +2595,10 @@ The arm with nothing to recalculate is the plain save of the live store,
 `applySavePlans` included — memory as after `save`, its materialization a
 save's install. So is the candidate arm's: the fold's installs are counted
 and kept above the baseline `Candidate.swap` records, so the next
-transaction on that workbook refuses `RecalcRequiresReopen` — the next
+transaction on that workbook that would build a candidate refuses
+`RecalcRequiresReopen` (over a workbook with nothing to recalculate the
+mark refuses, `recalculate` is a no-op and `save_with_recalc` the plain
+save again, as the guard has always judged that arm) — the next
 candidate, the archive as opened again, could not carry what the fold
 materialized, and a shared string the fold added to the table would
 dangle from the live sheet bytes a later run re-stages (in-house fold r1
@@ -2611,8 +2614,8 @@ phase: the save also rebuilds an affected cache where it can (S7b-5),
 reading the live sheet views, and the fold's candidate holds recalculated
 bytes those views do not describe, so it takes S7b-3's marker alone — the
 state every shape the rebuild cannot lay out already takes, Excel laying
-the cache out at open either way — installing the live definition's bytes
-when they already carry it. A mark-only candidate (`keep_stale_and_mark`)
+the cache out at open either way — a definition already marked
+byte-preserved, as the save preserves it. A mark-only candidate (`keep_stale_and_mark`)
 carries the plans too: §5.7.7's byte identity is against an un-recalculated
 *save*. Appended rows stay refused (`SheetHasUnsavedAppends`,
 `logicalViewGate`): the model cannot read them. On C nothing changes but
@@ -2620,8 +2623,8 @@ the outcome (no new export or macro — the `abi-no-3file` label again); on
 Python likewise; the CLI never reached either gate. Pinned:
 `pkg/recalc_run.zig` (both arms with a write and a name, byte-identical to
 the documented order, the plans drained, the live views agreeing with the
-file, a transaction after the candidate arm legal and after the plain arm
-the save's verdict; a shared-string write over a workbook without a table
+file, a transaction after either arm the save's verdict and after a fold
+that carried nothing legal; a shared-string write over a workbook without a table
 on both arms; the mark-only candidate with a parsed view rebuilt over the
 folded part; a write inside a pivot source — the marker in the file, the
 records as they were, a shared string extending the table; the exported
@@ -2646,9 +2649,13 @@ workbook whose one formula was stale wrote `<v>2</v>` into `a` and
 after the two wrote `2` again. A transaction after one whose fold
 materialized anything is refused (above), so the fold does not widen the
 class; a transaction after one that carried nothing stays admitted (RTG-2)
-and re-derives the run's own patches from the archive — the inheritance is
-the fix, and until it the safe order is one transaction per open, or save
-and re-open between two.
+and re-derives the run's own patches from the archive — `recalculate`
+then `saveWithRecalc` in one open is that sequence too (the in-memory
+transaction carries nothing, so the file transaction is admitted, and the
+first run's patches the second finds fresh in the live bytes are not
+re-staged; pinned as a measurement, in-house fold r2 A-SEM-202) — the
+inheritance is the fix, and until it the safe order is one transaction per
+open, or save and re-open between two.
 `Workbook.empty()` installs its skeleton
 parts at birth against a baseline of zero, so a fresh-emit workbook
 refuses every transaction until saved and re-opened (pinned; before the

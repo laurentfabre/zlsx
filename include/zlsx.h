@@ -1795,8 +1795,9 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * before the rename leaves them staged; the arm with nothing to
  * recalculate applies them to the live store as zlsx_editor_save
  * does. What either arm materialized is a save's install: the next
- * transaction on this editor is -2 RecalcRequiresReopen — save and
- * re-open, as after zlsx_editor_save. Appended rows stay refused
+ * transaction on this editor that would build a candidate is -2
+ * RecalcRequiresReopen — save and re-open, as after zlsx_editor_save
+ * (a workbook with nothing to recalculate keeps its plain-save arm). Appended rows stay refused
  * (SheetHasUnsavedAppends): the run cannot read them. Over an
  * embedding write's install the verdict is RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,

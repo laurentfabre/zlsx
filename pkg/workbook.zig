@@ -1549,10 +1549,12 @@ pub const Workbook = struct {
     /// too. The arm with nothing to recalculate is the plain save of
     /// the live store, `applySavePlans` included — memory as after
     /// `save`. What either arm materialized is a save's install: the
-    /// next transaction on this workbook refuses `RecalcRequiresReopen`
-    /// (its candidate, the archive as opened again, could not carry it)
-    /// — save and re-open, as after `save`; a transaction that carried
-    /// nothing leaves the next one legal. A staged `.formula` delta is
+    /// next transaction on this workbook that would build a candidate
+    /// refuses `RecalcRequiresReopen` (its candidate, the archive as
+    /// opened again, could not carry it) — save and re-open, as after
+    /// `save`; a transaction that carried nothing leaves the next one
+    /// legal, and a workbook with nothing to recalculate keeps its
+    /// `.none` arm. A staged `.formula` delta is
     /// the one the run publishes into: the file carries its formula
     /// cache-free, as `recalculate` then `save` writes it, while the
     /// report counted the value. Appended rows stay refused
@@ -4733,8 +4735,16 @@ pub const Workbook = struct {
         }
 
         // Phase 0b: the refresh marker on every cache a staged write
-        // lands in.
-        try self.markPivotCachesForCellWritesInto(next);
+        // lands in — the graph walked over the candidate's workbook.xml
+        // as just spliced, as the save walks it over the re-parsed live
+        // one: a source named by a staged name resolves (in-house fold
+        // r2 A-PAR-203).
+        {
+            const wb_part = (try next.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+            var spliced = try workbook_xml_mod.parse(a, wb_part.bytes);
+            defer spliced.deinit(a);
+            try self.markPivotCachesForCellWritesInto(next, &spliced);
+        }
 
         // Phase 1: the SST extension, against the candidate's table.
         var sst_view: ?sst_xml_mod.SstXml = null;
@@ -4768,7 +4778,9 @@ pub const Workbook = struct {
 
     /// The fold's pivot phase: S7b-3's marker, for every cache a staged
     /// cell write lands in, rendered over `store`. The graph is read
-    /// from the live parts as the save reads it: a recalc transaction
+    /// from the live parts over `wb_view` — the candidate's workbook.xml
+    /// with the names spliced, as the save re-parses the live one before
+    /// its walk: a recalc transaction
     /// never touches a pivot part, and the guard holds when this runs
     /// (a marker a save or an earlier fold installed keeps the next
     /// transaction out), so the candidate's definition is the live
@@ -4776,7 +4788,7 @@ pub const Workbook = struct {
     /// the save preserves it. Read best-effort as at save: a graph that
     /// cannot be read marks nothing, and only a resource failure is the
     /// transaction's.
-    fn markPivotCachesForCellWritesInto(self: *Workbook, store: *PartStore) Error!void {
+    fn markPivotCachesForCellWritesInto(self: *Workbook, store: *PartStore, wb_view: *const workbook_xml_mod.WorkbookXml) Error!void {
         var any_writes = false;
         for (self.worksheets) |*ws| {
             if (ws.deltas.count() > 0) {
@@ -4790,12 +4802,12 @@ pub const Workbook = struct {
             else => return,
         };
         if (!carries) return;
-        var p = self.pivotTables() catch |e| switch (e) {
+        const a = self.allocator;
+        var p = pivots_mod.collect(a, &self.store, wb_view) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
         };
         defer p.deinit();
-        const a = self.allocator;
         for (p.caches) |*c| {
             var hit = false;
             for (self.worksheets) |*ws| {
@@ -6062,11 +6074,32 @@ pub const Workbook = struct {
                 try out.appendSlice(a, src[close_end..]);
             }
         } else {
-            // No `<definedNames>` block: insert before `<calcPr`, or
-            // before `</workbook>` if calcPr is absent. This places the
-            // block at OOXML's expected position in the schema sequence.
+            // No `<definedNames>` block: insert before `<calcPr`, else
+            // before the first of `<calcPr>`'s schema successors the
+            // part has (a `<calcPr>` the calc-state patch creates lands
+            // before that same element, so the two splices commute in
+            // either order — in-house fold r2 B-REL-203), else before
+            // `</workbook>`. This places the block at OOXML's expected
+            // position in the schema sequence.
             const insert_at: usize = blk: {
                 if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i;
+                var first: ?usize = null;
+                for (engine.calc.calc_pr_successors) |succ| {
+                    var from: usize = 0;
+                    while (std.mem.indexOfPos(u8, src, from, "<")) |lt| {
+                        from = lt + 1;
+                        const name_end = lt + 1 + succ.len;
+                        if (name_end >= src.len) break;
+                        if (!std.mem.eql(u8, src[lt + 1 .. name_end], succ)) continue;
+                        switch (src[name_end]) {
+                            ' ', '\t', '\r', '\n', '>', '/' => {},
+                            else => continue,
+                        }
+                        if (first == null or lt < first.?) first = lt;
+                        break;
+                    }
+                }
+                if (first) |i| break :blk i;
                 if (std.mem.indexOf(u8, src, "</workbook>")) |i| break :blk i;
                 return error.MalformedXml;
             };
