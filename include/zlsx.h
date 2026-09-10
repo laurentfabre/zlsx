@@ -1437,7 +1437,10 @@ int32_t zlsx_editor_has_custom_properties(zlsx_editor_t * ed);
 
 /* Strip identifying document metadata, staged for the next save.
  * strip_timestamps also drops created/modified/revision, which the
- * default mask keeps. Returns 0 on success, -1 on failure. */
+ * default mask keeps. A part this rewrites or drops is an install: a
+ * recalc transaction afterwards refuses RecalcRequiresReopen (run it
+ * first, or save and re-open); a strip that changes nothing installs
+ * nothing. Returns 0 on success, -1 on failure. */
 int32_t zlsx_editor_strip_doc_props(
     zlsx_editor_t * ed,
     int32_t         strip_timestamps,

@@ -2252,11 +2252,14 @@ test "recalc guard: the run-level verdict lands before the drive — a token arm
     defer a.free(src);
 
     // The same poll counter as the between-two-cells cancellation: the
-    // token arms on the second clock read, which is the drive's poll.
-    // With the gate ahead of the graph the drive is never reached and
-    // the generation's verdict is what the caller hears; a gate moved
-    // below the graph, or deleted, would say `Cancelled` here (in-house
-    // r3 A-TEST-301).
+    // token arms on the second clock read, which is the drive's first
+    // per-cell poll (the graph build reads no clock). With the gate
+    // ahead of the graph the drive is never reached and the
+    // generation's verdict is what the caller hears; a gate moved below
+    // the drive's first poll, or deleted, would say `Cancelled` here —
+    // the bound this pin holds is "above the drive"; "above the graph"
+    // is the placement, read at the call site (in-house r3 A-TEST-301,
+    // r4 A-TEST-401).
     var flag: u8 = 0;
     const io = control.inject.wrap(base, .{ .trip_at = 2, .trip_flag = &flag });
     var run = fixed_run;

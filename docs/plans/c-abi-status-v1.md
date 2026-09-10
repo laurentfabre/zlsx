@@ -2473,8 +2473,9 @@ Staged cell writes are deltas, not installs — the model reads them,
 materializes them (`applySavePlans` → `store.replacePart`) IS an
 install: `set_cell` + `save` + mark + `save` used to lose the cell in
 the second file (measured before the guard) and refuses now. A torn
-workbook (`torn_edit`) is judged first — `StructuralEditIncomplete`,
-whose remedy is to discard the instance (RTG-REL-103); the exported
+workbook (`torn_edit`) is judged first on every transaction and every
+arm — `StructuralEditIncomplete`, whose remedy is to discard the
+instance (RTG-REL-103; the in-memory no-op arm too, r3 B-REL-304); the exported
 `prepare` → `swap` two-step asserts at the swap that no mutator ran in
 between (RTG-REL-105).
 
@@ -2518,7 +2519,22 @@ write under either recovery), `test_embedding_sweeps.py` (a strip, a
 redacting prune; a prune that changed nothing installs nothing);
 `test_basic.py` again for `strip_doc_props` on a corpus workbook with
 docProps (an install) and on a writer-made one (nothing changed, the
-mark legal) (RTG-DOC-104).
+mark legal) (RTG-DOC-104). Rounds 2–3 added, in `pkg/recalc_run.zig`:
+the save-state gate on both fixtures (a delta, a defined name;
+destination absent; `recalculate` then `save` carries each), staged
+state plus an added sheet hearing the guard (a delta on the file path,
+appended rows on the in-memory path), the run's own verdicts ahead of
+the gate (a token already up, a zero limit), a torn workbook with
+nothing to recalculate refusing on all three transactions, and the
+run-level call's placement (a token armed for the drive's first poll
+never fires over an added sheet — the bound is "above the drive"; the
+graph build reads no clock); in `src/c_abi.zig`: a staged cell write
+on both fixtures (`-1`, diag empty, destination absent, `recalculate`
+then save carrying it) and the `statusOf` pin for
+`WorkbookHasStagedDefinedNames`; in Python: the delta gate on both
+fixtures, the invisible and cells writes over a no-formula workbook
+(the guard's verdict, the plain save landing set and carrier), the
+doc-props strip.
 
 **Gated in round 1 (B-REL-101 HIGH / A-REL-102, pre-existing)**:
 `saveWithRecalc`'s own file carries no staged cell delta on either arm

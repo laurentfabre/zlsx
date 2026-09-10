@@ -6556,6 +6556,10 @@ pub const Workbook = struct {
     /// truncated or carries an unusable size. Use `addImageRange` to
     /// size an image by a cell range instead, or `addImageAnchored`
     /// to pass a deliberate extent.
+    ///
+    /// This family installs parts (the image, its drawing, the rels): a
+    /// recalc transaction afterwards refuses `RecalcRequiresReopen` —
+    /// run it first, or save and re-open.
     pub fn addImage(
         self: *Workbook,
         sheet_idx: u32,

@@ -4901,6 +4901,12 @@ class Editor:
         their own, and removing them visibly empties Excel's
         document-info pane.
 
+        A part this rewrites or drops is an install: a recalc transaction
+        afterwards (:meth:`mark_recalc_on_load`, :meth:`recalculate`,
+        :meth:`save_with_recalc`) raises ``RecalcRequiresReopen`` — run
+        it first, or save and re-open; a strip that changes nothing
+        installs nothing.
+
         Requires libzlsx 0.5.0+.
         """
         if not _ffi._HAS_DOCPROPS:

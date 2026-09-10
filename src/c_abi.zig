@@ -4600,6 +4600,10 @@ export fn zlsx_editor_has_custom_properties(ed: *Editor) callconv(.c) i32 {
 /// identifying alone and removing them visibly empties Excel's
 /// document-info pane.
 ///
+/// A part this rewrites or drops is an install: a recalc transaction
+/// afterwards refuses `RecalcRequiresReopen` (run it first, or save and
+/// re-open); a strip that changes nothing installs nothing.
+///
 /// Returns 0 on success, -1 on failure (`err_buf` populated).
 export fn zlsx_editor_strip_doc_props(
     ed: *Editor,
