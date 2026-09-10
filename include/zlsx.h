@@ -1900,8 +1900,8 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  * structural edit needs the sheet (the workbook, for a sheet delete)
  * free of staged cell writes and appended rows: save first. The
  * converse order has its own -2: after any of these edits (or an
- * embedding write / prune / strip, or a save that materialized cell
- * writes) the recalc transactions — zlsx_editor_mark_recalc_on_load,
+ * embedding write / prune / strip, a doc-props strip that changed a
+ * part, or a save that materialized cell writes) the recalc transactions — zlsx_editor_mark_recalc_on_load,
  * zlsx_editor_recalculate, zlsx_editor_save_with_recalc — refuse
  * RecalcRequiresReopen (no plane; their candidate is built from the
  * archive as opened and cannot carry the installed parts): run the

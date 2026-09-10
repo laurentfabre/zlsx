@@ -9657,6 +9657,7 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.MalformedXml));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WriteFailed));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetHasUnsavedMutations));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WorkbookHasStagedDefinedNames));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.RowEditRequiresCleanSheet));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetIndexOutOfRange));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidSheetName));

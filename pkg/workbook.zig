@@ -1516,7 +1516,8 @@ pub const Workbook = struct {
     /// live: the candidate could not carry those parts
     /// (`requireGenerationUnmodified`; recalculate first, or save and
     /// re-open). A workbook with nothing to recalculate builds no
-    /// candidate and is not refused.
+    /// candidate and is not refused; a torn one is
+    /// `StructuralEditIncomplete` on every arm, as `saveWithRecalc`.
     pub fn recalculate(
         self: *Workbook,
         allocator: Allocator,
@@ -7310,8 +7311,9 @@ pub const Workbook = struct {
     /// before anything is built — the one choke point every transaction
     /// passes — once more in `recalc_run.prepare` after the
     /// no-formula decision, so no graph is built for a swap that cannot
-    /// happen, and inside `saveWithRecalc`'s own delta gate, so a delta
-    /// over an installed-into generation hears this verdict's complete
+    /// happen, and inside `saveWithRecalc`'s save-state gate and the
+    /// run's `logicalViewGate` (appended rows), so staged state over an
+    /// installed-into generation hears this verdict's complete
     /// remedy — while
     /// a run with nothing to recalculate (the `.none` arm,
     /// which builds no candidate) stays legal: `saveWithRecalc` there

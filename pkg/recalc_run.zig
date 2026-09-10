@@ -334,6 +334,10 @@ pub fn prepare(
     opts: Options,
 ) Error!Prepared {
     try validateRun(run);
+    // A torn instance's remedy is to discard it; every arm says so —
+    // the `.none` arm included, which returns before any predicate
+    // that would have said it (in-house RTG r3 B-REL-304).
+    try wb.requireCompleteStructuralState();
 
     var watch: control.Watch = .init(io, controlOf(run));
     watch.poller().check() catch return Error.Cancelled;
@@ -2204,6 +2208,67 @@ test "cancellation: a token that fires between two cells rolls the run back" {
     try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
     try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
     try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "C1"));
+}
+
+test "a torn workbook with nothing to recalculate is StructuralEditIncomplete, not a no-op report" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "plain.xlsx", .{ .sheet = sheet_no_formula });
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    wb.torn_edit = true;
+    try testing.expectError(error.StructuralEditIncomplete, wb.recalculate(a, io, fixed_run, .{}));
+    try testing.expectError(error.StructuralEditIncomplete, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+    try testing.expectError(error.StructuralEditIncomplete, wb.markRecalcOnLoad());
+}
+
+test "recalc guard: the run-level verdict lands before the drive — a token armed for the drive's poll never fires over an added sheet" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, base, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, base, dir, "in.xlsx", .{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>A1+1</f><v>999</v></c>" ++
+            "<c r=\"C1\"><f>B1+1</f><v>999</v></c>" ++
+            "</row></sheetData></worksheet>",
+    });
+    defer a.free(src);
+
+    // The same poll counter as the between-two-cells cancellation: the
+    // token arms on the second clock read, which is the drive's poll.
+    // With the gate ahead of the graph the drive is never reached and
+    // the generation's verdict is what the caller hears; a gate moved
+    // below the graph, or deleted, would say `Cancelled` here (in-house
+    // r3 A-TEST-301).
+    var flag: u8 = 0;
+    const io = control.inject.wrap(base, .{ .trip_at = 2, .trip_flag = &flag });
+    var run = fixed_run;
+    run.deadline = .{ .nanoseconds = std.math.maxInt(i64) };
+    run.cancel = .{ .flag = &flag };
+
+    var wb = try Workbook.open(a, base, src);
+    defer wb.deinit();
+    _ = try wb.addSheet("Extra");
+    try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, run, .{}));
+    try testing.expectEqual(@as(u8, 0), flag);
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
 }
 
 test "saveWithRecalc: saving over the source is the same transaction" {
