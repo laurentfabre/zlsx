@@ -551,12 +551,14 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
     assert wb_xml.count(b"<sheet ") == (3 if recovery == "in_cells" else 2)
 
     # Nothing to recalculate: no candidate, so the mark refuses and
-    # `recalculate` is a no-op — but the write stages save-plan state
-    # too (its recovery names under `invisible`, its record cell under
-    # `in_cells`), which `save_with_recalc`'s own file never carries,
-    # and staged state over an installed-into generation hears the
-    # generation's verdict. The plain save lands everything.
+    # `recalculate` is a no-op — and `save_with_recalc` is the plain
+    # save (the save-plan fold, 2026-09-11): the save-plan state the
+    # write stages (its recovery names under `invisible`, its record
+    # cell under `in_cells`) lands with the set, as `save` lands it.
+    # Before the fold the transaction refused that staged state over
+    # the write's install.
     plain = tmp_path / "plain.xlsx"
+    plain_saved = tmp_path / "plain_saved.xlsx"
     _write_fixture(plain)
     with zlsx.Editor(plain) as ed:
         ed.set_embeddings("m", 3, [TITLE], recovery=recovery)
@@ -564,16 +566,19 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
             ed.mark_recalc_on_load()
         assert info.value.error_name == "RecalcRequiresReopen"
         assert ed.recalculate().cells_written == 0
-        with pytest.raises(zlsx.ZlsxRefusal) as info:
-            ed.save_with_recalc(plain_out)
-        assert info.value.error_name == "RecalcRequiresReopen"
-        assert not plain_out.exists()
-        ed.save(plain_out)
-    with zlsx.embeddings(plain_out) as emb:
-        assert emb.present and emb.model == "m"
-    if recovery == "invisible":
-        # The carrier the transaction's file would have lacked.
-        assert b"_zlsxRecovery0" in zipfile.ZipFile(plain_out).read("xl/workbook.xml")
+        assert ed.save_with_recalc(plain_out).cells_written == 0
+        ed.save(plain_saved)
+    for path in (plain_out, plain_saved):
+        with zlsx.embeddings(path) as emb:
+            assert emb.present and emb.model == "m"
+        wb_xml = zipfile.ZipFile(path).read("xl/workbook.xml")
+        assert b'fullCalcOnLoad="1"' not in wb_xml
+        if recovery == "invisible":
+            # The carrier the transaction's file used to lack.
+            assert b"_zlsxRecovery0" in wb_xml
+        else:
+            # The record cell's sheet, the write's third.
+            assert wb_xml.count(b"<sheet ") == 3
 
 
 # ── recovery in cells (S3c slice 4) ──────────────────────────────────

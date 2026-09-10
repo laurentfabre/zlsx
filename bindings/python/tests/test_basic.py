@@ -2558,30 +2558,28 @@ def test_recalc_transaction_guard_documented_orders_land_both(tmp_path):
 
 
 @pytest.mark.parametrize("with_formula", [True, False])
-def test_save_with_recalc_refuses_a_staged_cell_write(tmp_path, with_formula):
-    """``save_with_recalc``'s own file never carried a staged ``set_cell``
-    on either arm (pre-existing; in-house RTG r1 B-REL-101): it refuses
-    ``SheetHasUnsavedMutations`` before anything runs, the destination
-    absent; ``recalculate`` then ``save`` carries the write."""
+def test_save_with_recalc_carries_a_staged_cell_write(tmp_path, with_formula):
+    """``save_with_recalc``'s file is the plain save plus the recalc on
+    either arm (the save-plan fold, 2026-09-11): the staged ``set_cell``
+    in it, drained from the editor, a ``save`` after it carrying the
+    same. Before the fold the transaction refused it (in-house RTG r1
+    B-REL-101)."""
     _require_structural()
     _skip_unless_recalc_guard()
     src = tmp_path / "src.xlsx"
     (_three_by_three_with_formula if with_formula else _three_by_three)(src)
-    refused = tmp_path / "refused.xlsx"
+    folded = tmp_path / "folded.xlsx"
     out = tmp_path / "out.xlsx"
     with zlsx.edit(src) as ed:
         ed.set_cell(0, 1, 0, "seven")
-        with pytest.raises(zlsx.ZlsxError, match="SheetHasUnsavedMutations") as info:
-            ed.save_with_recalc(refused)
-        assert not isinstance(info.value, zlsx.ZlsxRefusal)
-        assert not refused.exists()
-        ed.recalculate()
+        ed.save_with_recalc(folded)
         ed.save(out)
-    with zlsx.open(out) as book:
-        rows = list(book.sheet(0).rows())
-        assert rows[0] == ["seven", 2, 3]
-        if with_formula:
-            assert list(book.sheet(1).rows()) == [["two", 2]]
+    for path in (folded, out):
+        with zlsx.open(path) as book:
+            rows = list(book.sheet(0).rows())
+            assert rows[0] == ["seven", 2, 3]
+            if with_formula:
+                assert list(book.sheet(1).rows()) == [["two", 2]]
 
 
 def test_recalc_transaction_guard_after_a_doc_props_strip(tmp_path):
