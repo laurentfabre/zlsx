@@ -1785,7 +1785,10 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * store's parts, installs carried, not refused. A staged cell write on
  * any sheet is -1 SheetHasUnsavedMutations before anything runs:
  * neither arm of this transaction writes it — save first, or
- * zlsx_editor_recalculate then zlsx_editor_save. */
+ * zlsx_editor_recalculate then zlsx_editor_save. The staged defined
+ * names an embedding write leaves (its recovery carrier) are the same
+ * kind of state; over that write's install the verdict is
+ * RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
         const uint8_t * out_path_ptr, size_t out_path_len,
         const zlsx_run_v1 * run,

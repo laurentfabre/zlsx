@@ -2429,9 +2429,12 @@ def test_editor_mark_recalc_on_load(tmp_path):
 
 
 def _skip_unless_recalc_guard():
+    """The three transactions are 0.8.0 exports; the guard ships with
+    0.9.0's structural edits — probe that generation, not the
+    transactions (in-house RTG r2 B-TEST-202)."""
     ffi = _skip_unless_recalc()
-    if not (ffi._HAS_MARK_RECALC and ffi._HAS_SAVE_WITH_RECALC):
-        pytest.skip("loaded libzlsx predates mark_recalc_on_load / save_with_recalc (0.9.0+)")
+    if not (ffi._HAS_MARK_RECALC and ffi._HAS_SAVE_WITH_RECALC and ffi._HAS_STRUCTURAL_EDITS):
+        pytest.skip("loaded libzlsx predates the recalc-transaction guard (0.9.0+)")
     return ffi
 
 
@@ -2586,10 +2589,6 @@ def test_recalc_transaction_guard_after_a_doc_props_strip(tmp_path):
     install (in-house r1 RTG-DOC-104); on a workbook without docProps
     it changes nothing and the mark stays legal."""
     _skip_unless_recalc_guard()
-    import zlsx._ffi as ffi
-
-    if not getattr(ffi, "_HAS_STRIP_DOC_PROPS", True):
-        pytest.skip("loaded libzlsx predates strip_doc_props")
     src = _skip_if_missing("openpyxl_guess_types.xlsx")
     with zlsx.edit(src) as ed:
         ed.strip_doc_props()

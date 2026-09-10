@@ -403,8 +403,8 @@ def test_a_sweep_that_installed_makes_every_recalc_transaction_the_typed_refusal
     _needs_sweeps()
     import zlsx._ffi as ffi
 
-    if not (ffi._HAS_MARK_RECALC and ffi._HAS_RECALC and ffi._HAS_SAVE_WITH_RECALC):
-        pytest.skip("loaded libzlsx predates the recalc transactions")
+    if not (ffi._HAS_MARK_RECALC and ffi._HAS_RECALC and ffi._HAS_SAVE_WITH_RECALC and ffi._HAS_STRUCTURAL_EDITS):
+        pytest.skip("loaded libzlsx predates the recalc-transaction guard")
 
     def expect_guard(ed, out):
         with pytest.raises(zlsx.ZlsxRefusal) as info:

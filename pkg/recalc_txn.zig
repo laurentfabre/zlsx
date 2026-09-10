@@ -46,8 +46,9 @@
 //! `prepare` is handed or derives: the staged sheet parts, the calc
 //! state, the chain's removal. A part a *mutator* installed into the live
 //! generation (a sheet added, renamed or deleted, a row or column moved,
-//! an embedding set written, pruned or stripped, a save's materialized
-//! cell writes) is in neither, so the swap would silently drop it — or,
+//! an embedding set written, pruned or stripped, an image added, a
+//! doc-props strip, a save's materialized cell writes) is in neither,
+//! so the swap would silently drop it — or,
 //! for a sheet added, trip the sheet-count invariant. `prepare` therefore
 //! refuses `RecalcRequiresReopen` before building anything whenever
 //! `store.installs` has moved past the count the generation went live
@@ -1782,12 +1783,17 @@ test "recalc guard: nothing is built before the verdict — under an allocator t
     defer h.deinit(gpa);
     try h.wb.renameSheet(0, "Renamed");
 
-    // `prepare` allocates through `wb.allocator` only; a first request
-    // that fails would surface as OutOfMemory if anything were built
-    // ahead of the guard (in-house r1 RTG-TEST-106).
+    // `prepare` allocates through `wb.allocator`, and the candidate's
+    // `nextGeneration` through the STORE's; a first request that fails
+    // on either would surface as OutOfMemory if anything were built
+    // ahead of the guard (in-house r1 RTG-TEST-106, r2 TEST-203).
     var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
     h.wb.allocator = failing.allocator();
-    defer h.wb.allocator = gpa;
+    h.wb.store.allocator = failing.allocator();
+    defer {
+        h.wb.allocator = gpa;
+        h.wb.store.allocator = gpa;
+    }
     try testing.expectError(error.RecalcRequiresReopen, prepare(&h.wb, &staged_one, &.{}, .{}));
     try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
     try testing.expectEqual(@as(usize, 0), failing.allocations);

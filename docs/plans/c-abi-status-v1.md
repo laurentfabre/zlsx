@@ -389,7 +389,7 @@ name with `plane = ZLSX_PLANE_NONE` and an empty census:
 | The workbook's own structure, found broken on the way: `InternalSheetNameTooLong` (a stored sheet name that is EMPTY — an OOXML-invariant violation no argument fixes; the historical 128-byte carrier bound fell in #216 r17, a valid escape-heavy name legitimately exceeds it), `MalformedWorkbookXml` (`xl/workbook.xml` without the `</sheets>` a splice needs), `IdSpaceExhausted` (a `sheetId`, `rId` or worksheet part number already at `UINT32_MAX` — checked arithmetic, never a trap), `MissingRelationship`, `SheetElementNotFound`, `RelationshipElementNotFound`, `SheetCountMismatch`, `MissingWorkbookPart`, `MissingWorkbookRels`, `MissingContentTypes`, `MalformedContentTypes`, `ContentTypesOverrideNotFound` | `InvalidInput` — NULL where bytes are required (NULL with length 0 is the empty string, judged by the editor) |
 | | `RowEditRequiresCleanSheet`, `ColEditRequiresCleanSheet`, `SheetDeleteRequiresCleanState` — sequencing: the sheet (the workbook, for a sheet delete) has staged cell writes or appended rows; save first |
 | `MalformedPivotXml` — the pivot graph cannot be read whole | `NullOutPointer`, `StructSizeTooSmall` |
-| `RecalcRequiresReopen` — the recalc-transaction guard (§22, 2026-09-10): the live generation holds parts a mutator installed since it went live (a sheet added / renamed / deleted, a row or column moved, an embedding set written / pruned / stripped, a save that materialized cell writes) and a transaction's candidate — the archive as opened plus the run's own patches — cannot carry them; on `zlsx_editor_mark_recalc_on_load`, `zlsx_editor_recalculate`, `zlsx_editor_save_with_recalc` (no plane, no census). A statement about the generation, not the call: the same call before those edits, or on the saved file re-opened, succeeds | |
+| `RecalcRequiresReopen` — the recalc-transaction guard (§22, 2026-09-10): the live generation holds parts a mutator installed since it went live (a sheet added / renamed / deleted, a row or column moved, an embedding set written / pruned / stripped, an image added, a doc-props strip, a save that materialized cell writes) and a transaction's candidate — the archive as opened plus the run's own patches — cannot carry them; on `zlsx_editor_mark_recalc_on_load`, `zlsx_editor_recalculate`, `zlsx_editor_save_with_recalc` (no plane, no census). A statement about the generation, not the call: the same call before those edits, or on the saved file re-opened, succeeds | |
 
 The list is `c_abi.zig::structural_refusals`, one place. The editor folds
 its own pre-flights into the two `*UnsafeForSheet` names; what the
@@ -2312,7 +2312,8 @@ The rule is on every surface's documentation of the write; the fix the
 follow-up names is one guard at `recalc_txn.prepare` (refuse while
 `store.installs > 0`) — **shipped 2026-09-10 (§22)**, against the count
 the generation went live with rather than zero, so a transaction after
-a transaction stays legal. Still Zig-only: nothing — the
+a transaction stays legal; the invisible write's staged recovery names
+make `save_with_recalc` say the same, r2 A-REL-201. Still Zig-only: nothing — the
 §4 row is all-four since slice 5 (2026-09-07): the CLI's `embed --vectors
 … --recovery in-cells` takes the very `Editor.setEmbeddingsOpts` call this
 export takes (the CLI wrote through `Editor.setEmbeddings` since round 1,
@@ -2529,17 +2530,27 @@ and after a following `save` — memory and file diverging behind a
 successful §5.7.9 rename, the very composition RTG-4's first wording
 called safe. This PR gates it: `recalc_run.saveWithRecalc` refuses
 `SheetHasUnsavedMutations` (the existing name; `-1`, its sibling
-`SheetHasUnsavedAppends`' classification) before anything runs when any
-sheet holds a staged `setCell` — save first, or `recalculate` then
-`save`, both of which carry the write (pinned on Zig, C and Python, on
-a workbook with and without formulas). A delta over an
+`SheetHasUnsavedAppends`' classification) when any sheet holds a staged
+`setCell`, and — round 2, A/B-REL-201 — `WorkbookHasStagedDefinedNames`
+(new, `-1`, the workbook-scoped sibling) when the workbook.xml plan
+holds a staged defined name (`addDefinedName`, Zig-only; the recovery
+names the invisible embedding write stages — that write installs too,
+so on C / Python the verdict is the guard's). Both after the run's own
+verdicts (`run.validate`, the cancel poll — r2 B-REL-205) and before
+anything else runs; save first, or `recalculate` then `save`, both of
+which carry the state (pinned on Zig, C and Python, on a workbook with
+and without formulas). Recorded beside the fold: `hasUnsavedChanges`
+does not count a staged defined name, and `recalculate` models names
+from the part, not the plan (both pre-existing, r2 B). A delta over an
 installed-into generation hears the generation's verdict instead
-(`requireGenerationUnmodified` inside the delta gate — not at the
-entry, which would have refused the `.none` arm): its remedy is the
-complete one, where "save first" leads to the same verdict one save
+(`requireGenerationUnmodified` inside the gate — not at the entry,
+which would have refused the `.none` arm — and inside `logicalViewGate`
+for appended rows on the in-memory path, r2 A-REL-202): its remedy is
+the complete one, where "save first" leads to the same verdict one save
 later — the `recovery_in_cells` write stages its record cell AND
-installs, and says `RecalcRequiresReopen` (pinned: a delta plus an
-added sheet). `recalculate` + `save` and mark
+installs, the invisible write its names AND installs, and both say
+`RecalcRequiresReopen` (pinned: a delta plus an added sheet; appended
+rows plus an added sheet; either write over a no-formula workbook). `recalculate` + `save` and mark
 + `save` stay legal over staged deltas. Folding the deltas into the
 candidate (applying the save plans over `next` before serialising, so
 the transaction's file IS the plain save plus the recalc) is the

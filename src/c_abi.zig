@@ -5766,7 +5766,10 @@ export fn zlsx_open_buffer(
 /// store's parts, installs carried — not refused. A staged cell write
 /// on any sheet is -1 `SheetHasUnsavedMutations` before anything runs:
 /// neither arm of this transaction writes it (save first, or
-/// `zlsx_editor_recalculate` then `zlsx_editor_save`).
+/// `zlsx_editor_recalculate` then `zlsx_editor_save`); the staged
+/// defined names an embedding write leaves (its recovery carrier) are
+/// the same kind of state, and over that write's install the verdict is
+/// `RecalcRequiresReopen`.
 export fn zlsx_editor_save_with_recalc(
     ed: ?*Editor,
     out_path_ptr: ?[*]const u8,
@@ -6136,8 +6139,8 @@ const structural_refusals = [_]anyerror{
     // The recalc-transaction guard: the live generation holds parts a
     // mutator installed since it went live (a sheet added, renamed or
     // deleted, a row or column moved, an embedding set written, pruned
-    // or stripped, a doc-props strip, a save's materialized cell
-    // writes) and the
+    // or stripped, an image added, a doc-props strip, a save's
+    // materialized cell writes) and the
     // transaction's candidate — the archive as opened plus the run's
     // own patches — cannot carry them. A statement about the
     // workbook's generation, not the call: the same call before those

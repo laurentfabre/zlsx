@@ -5087,7 +5087,10 @@ class Editor:
         carried — not refused. A staged :meth:`set_cell` on any sheet
         raises :class:`ZlsxError` ``SheetHasUnsavedMutations`` before
         anything runs: neither arm of this transaction writes it —
-        :meth:`save` first, or :meth:`recalculate` then :meth:`save`."""
+        :meth:`save` first, or :meth:`recalculate` then :meth:`save`.
+        The staged defined names :meth:`set_embeddings` leaves (its
+        recovery carrier) are the same kind of state; over that write's
+        install the verdict is ``RecalcRequiresReopen``."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SAVE_WITH_RECALC:

@@ -516,8 +516,8 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
     _needs_write()
     import zlsx._ffi as ffi
 
-    if not (ffi._HAS_MARK_RECALC and ffi._HAS_RECALC and ffi._HAS_SAVE_WITH_RECALC):
-        pytest.skip("loaded libzlsx predates the recalc transactions")
+    if not (ffi._HAS_MARK_RECALC and ffi._HAS_RECALC and ffi._HAS_SAVE_WITH_RECALC and ffi._HAS_STRUCTURAL_EDITS):
+        pytest.skip("loaded libzlsx predates the recalc-transaction guard")
     src = tmp_path / "src.xlsx"
     refused = tmp_path / "refused.xlsx"
     out = tmp_path / "out.xlsx"
@@ -551,10 +551,11 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
     assert wb_xml.count(b"<sheet ") == (3 if recovery == "in_cells" else 2)
 
     # Nothing to recalculate: no candidate, so the mark refuses and
-    # `recalculate` is a no-op; `save_with_recalc` writes the live
-    # store's parts — the set included — under `invisible`, while the
-    # `in_cells` write also stages its record cell, and a delta over an
-    # installed-into generation hears the generation's verdict.
+    # `recalculate` is a no-op — but the write stages save-plan state
+    # too (its recovery names under `invisible`, its record cell under
+    # `in_cells`), which `save_with_recalc`'s own file never carries,
+    # and staged state over an installed-into generation hears the
+    # generation's verdict. The plain save lands everything.
     plain = tmp_path / "plain.xlsx"
     _write_fixture(plain)
     with zlsx.Editor(plain) as ed:
@@ -563,16 +564,16 @@ def test_set_embeddings_then_a_recalc_transaction_is_the_typed_refusal(tmp_path,
             ed.mark_recalc_on_load()
         assert info.value.error_name == "RecalcRequiresReopen"
         assert ed.recalculate().cells_written == 0
-        if recovery == "in_cells":
-            with pytest.raises(zlsx.ZlsxRefusal) as info:
-                ed.save_with_recalc(plain_out)
-            assert info.value.error_name == "RecalcRequiresReopen"
-            assert not plain_out.exists()
-            ed.save(plain_out)
-        else:
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
             ed.save_with_recalc(plain_out)
+        assert info.value.error_name == "RecalcRequiresReopen"
+        assert not plain_out.exists()
+        ed.save(plain_out)
     with zlsx.embeddings(plain_out) as emb:
         assert emb.present and emb.model == "m"
+    if recovery == "invisible":
+        # The carrier the transaction's file would have lacked.
+        assert b"_zlsxRecovery0" in zipfile.ZipFile(plain_out).read("xl/workbook.xml")
 
 
 # ── recovery in cells (S3c slice 4) ──────────────────────────────────

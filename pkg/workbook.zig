@@ -163,6 +163,14 @@ pub const Error = error{
     /// re-open the workbook. (The recalc-transaction guard; S3c slice 1
     /// r2 B-REL-201.)
     RecalcRequiresReopen,
+    /// `saveWithRecalc` was asked for while the workbook.xml plan holds
+    /// a staged defined name (`addDefinedName`; the recovery names an
+    /// embedding write stages): the file transaction serialises its
+    /// candidate, never the save plans, so the name would be absent from
+    /// the file it commits while memory kept it. Save first, or
+    /// `recalculate` then `save`. The sibling of `SheetHasUnsavedMutations`
+    /// for the workbook-scoped axis (in-house RTG r2 A/B-REL-201).
+    WorkbookHasStagedDefinedNames,
     /// Style validation failed — empty font name, non-positive font
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
@@ -1193,7 +1201,8 @@ pub const Workbook = struct {
     /// installing it, and those are the generation's, not a
     /// mutator's). Every install above it is a mutator's — a sheet
     /// added, renamed or deleted, a row or column moved, an embedding
-    /// write, prune or strip, a save's materialized deltas — and no
+    /// write, prune or strip, an image added, a doc-props strip, a
+    /// save's materialized deltas — and no
     /// candidate a transaction builds from the archive as opened
     /// carries those: `requireGenerationUnmodified` refuses the
     /// transaction while the two differ (the recalc-transaction guard).
@@ -1456,8 +1465,9 @@ pub const Workbook = struct {
     ///
     /// Refuses `RecalcRequiresReopen` — nothing mutated — when a mutator
     /// has installed into the live generation since it went live (a
-    /// structural edit, an embedding write / prune / strip, a save that
-    /// materialized cell writes): the candidate is built from the
+    /// structural edit, an embedding write / prune / strip, an image
+    /// added, a doc-props strip, a save that materialized cell writes):
+    /// the candidate is built from the
     /// archive as opened and would drop them. Mark first, or save and
     /// re-open (`requireGenerationUnmodified`).
     pub fn markRecalcOnLoad(self: *Workbook) Error!void {
@@ -1533,7 +1543,11 @@ pub const Workbook = struct {
     /// patches — could not carry it (`requireGenerationUnmodified`). So
     /// is `SheetHasUnsavedMutations`: a staged `setCell` on any sheet,
     /// which neither arm of this transaction writes — save first, or
-    /// `recalculate` then `save` (in-house RTG r1 B-REL-101).
+    /// `recalculate` then `save` (in-house RTG r1 B-REL-101); and
+    /// `WorkbookHasStagedDefinedNames` for a staged defined name, the
+    /// workbook.xml plan being the other save-plan axis neither arm
+    /// splices (r2 A/B-REL-201). Staged state over an installed-into
+    /// generation hears `RecalcRequiresReopen`.
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -7283,7 +7297,9 @@ pub const Workbook = struct {
     /// is neither, so the swap would drop it: a rename reverted, an
     /// embedding set stripped, a saved cell write gone, an added sheet
     /// tripping the sheet-count invariant (S3c slice 1 r2 B-REL-201,
-    /// each shape measured before the guard). Cell writes still staged
+    /// each shape measured before the guard; every mutation that
+    /// installs is in the set — an image added, a doc-props strip
+    /// included). Cell writes still staged
     /// as deltas are NOT installs — the model reads them and `save`
     /// re-emits them over whichever generation is live — so
     /// `setCell` + `markRecalcOnLoad` + `save` stays legal, as does a
