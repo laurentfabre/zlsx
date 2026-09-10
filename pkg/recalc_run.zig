@@ -214,14 +214,31 @@ pub fn saveWithRecalc(
     // below writes the store directly, past `applySavePlans`' own
     // guard (Codex #208 r5 REL-501).
     try wb.requireCompleteStructuralState();
+    // The run's own verdicts first — a bad input or a token already up
+    // is what `prepare` would answer, and the gate below must not
+    // pre-empt them (in-house RTG r2 B-REL-205).
+    try validateRun(run);
+    var watch: control.Watch = .init(io, controlOf(run));
+    watch.poller().check() catch return Error.Cancelled;
+    // Neither arm carries any staged save-plan state: the `.none` arm
+    // writes the store past `applySavePlans` (the only emitter of the
+    // deltas and of the workbook.xml plan) and the `.ok` arm's staging
+    // patches formula results only — so the file this transaction
+    // commits would lack every `setCell` and every staged defined name
+    // while the workbook's memory kept them, memory and file diverging
+    // behind a successful rename. Refused as the appended-row case is
+    // (`logicalViewGate`): save first, or `recalculate` then `save`
+    // (in-house RTG r1 B-REL-101, r2 A/B-REL-201, pre-existing; folding
+    // the plans into the candidate is the recorded follow-up).
+    try requireNoStagedSaveState(wb);
     var prepared = try prepare(wb, gpa, io, run, opts);
     switch (prepared) {
         .refused => |r| return takeRefusal(wb, opts, r),
-        // Nothing to recalculate, so nothing to prepare — and a save
-        // that writes the staged state is precisely what "byte-identical
-        // to a plain save" means.
+        // Nothing to recalculate, so nothing to prepare — the store's
+        // parts as they stand (there is no staged delta or name to
+        // write: the gate above), which is what "byte-identical to a
+        // plain save" means here.
         .none => |r| {
-            var watch: control.Watch = .init(io, controlOf(run));
             const commit = try wb.store.saveControlled(io, path, watch.poller());
             var out = r;
             if (commit.durability_warning) out.durability.warn(commit.durability_errno);
@@ -229,7 +246,6 @@ pub fn saveWithRecalc(
         },
         .ok => |*candidate| {
             var swapper: Swapper = .{ .wb = wb, .candidate = candidate };
-            var watch: control.Watch = .init(io, controlOf(run));
 
             const commit = candidate.next.saveCommitted(
                 io,
@@ -317,10 +333,11 @@ pub fn prepare(
     run: RunInputs,
     opts: Options,
 ) Error!Prepared {
-    run.validate() catch |e| return switch (e) {
-        error.LimitOutOfRange => Error.FormulaLimitExceeded,
-        error.UtcOffsetOutOfRange => Error.FormulaMalformedInput,
-    };
+    try validateRun(run);
+    // A torn instance's remedy is to discard it; every arm says so —
+    // the `.none` arm included, which returns before any predicate
+    // that would have said it (in-house RTG r3 B-REL-304).
+    try wb.requireCompleteStructuralState();
 
     var watch: control.Watch = .init(io, controlOf(run));
     watch.poller().check() catch return Error.Cancelled;
@@ -370,6 +387,13 @@ pub fn prepare(
     // property of the file, and a run that merely happened to change no
     // byte is a different (and much later) statement.
     if (input.cells.len == 0) return .{ .none = .{ .resolved = run.effective(.recalc) } };
+
+    // The recalc-transaction guard, once the run is known to build a
+    // candidate: `recalc_txn.prepare` is the authority (in-house r1
+    // RTG-DOC-101), this call spends no graph, drive or staging on a
+    // swap that cannot happen — and sits AFTER the no-formula decision
+    // so the `.none` arm, which builds nothing, stays legal.
+    try wb.requireGenerationUnmodified();
 
     var g = switch (try engine.graph.build(gpa, input, bridge.resolver(), .{
         .parse_limits = opts.parse_limits,
@@ -602,10 +626,52 @@ fn censusRefusal(
 /// caller has already added to. Refusing here — before the model, before
 /// any candidate — is the only answer that is both truthful and
 /// zero-mutation.
+/// `RunInputs.validate`'s two verdicts as the pipeline's errors — the
+/// one mapping, read by `prepare` and by `saveWithRecalc`'s entry.
+fn validateRun(run: RunInputs) Error!void {
+    run.validate() catch |e| return switch (e) {
+        error.LimitOutOfRange => Error.FormulaLimitExceeded,
+        error.UtcOffsetOutOfRange => Error.FormulaMalformedInput,
+    };
+}
+
+/// The file transaction's own gate: `saveWithRecalc` serialises the
+/// candidate, never the save plans, so a staged `setCell` on any sheet
+/// or a staged defined name (the workbook.xml plan — `addDefinedName`,
+/// and the recovery names an embedding write stages) would be absent
+/// from the file it commits. `recalculate` is not gated — it models the
+/// deltas and swaps nothing the plans live in, and the plain `save`
+/// after it emits them.
+///
+/// Staged state over an installed-into generation hears the
+/// generation's verdict instead: its remedy — save and re-open — is the
+/// complete one, where "save first" would lead to the same verdict one
+/// save later (the `recovery_in_cells` write stages its record cell AND
+/// installs; the invisible write stages its names AND installs). Judged
+/// here rather than at the entry so a workbook with nothing staged and
+/// nothing to recalculate keeps its `.none` arm.
+fn requireNoStagedSaveState(wb: *Workbook) Error!void {
+    for (wb.worksheets) |*ws| {
+        if (ws.deltas.count() > 0) {
+            try wb.requireGenerationUnmodified();
+            return Error.SheetHasUnsavedMutations;
+        }
+    }
+    if (wb.workbook_xml_plan.defined_names.items.len > 0) {
+        try wb.requireGenerationUnmodified();
+        return Error.WorkbookHasStagedDefinedNames;
+    }
+}
+
 fn logicalViewGate(wb: *Workbook) Error!void {
     for (wb.worksheets) |*ws| {
-        if (ws.appended_rows.items.len > 0) return Error.SheetHasUnsavedAppends;
-        if (ws.body.items.len > 0) return Error.SheetHasUnsavedAppends;
+        if (ws.appended_rows.items.len > 0 or ws.body.items.len > 0) {
+            // The same precedence as the file transaction's gate: over
+            // an installed-into generation the generation's verdict is
+            // the complete remedy (in-house RTG r2 A-REL-202).
+            try wb.requireGenerationUnmodified();
+            return Error.SheetHasUnsavedAppends;
+        }
     }
 }
 
@@ -2144,6 +2210,70 @@ test "cancellation: a token that fires between two cells rolls the run back" {
     try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "C1"));
 }
 
+test "a torn workbook with nothing to recalculate is StructuralEditIncomplete, not a no-op report" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "plain.xlsx", .{ .sheet = sheet_no_formula });
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    wb.torn_edit = true;
+    try testing.expectError(error.StructuralEditIncomplete, wb.recalculate(a, io, fixed_run, .{}));
+    try testing.expectError(error.StructuralEditIncomplete, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+    try testing.expectError(error.StructuralEditIncomplete, wb.markRecalcOnLoad());
+}
+
+test "recalc guard: the run-level verdict lands before the drive — a token armed for the drive's poll never fires over an added sheet" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, base, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, base, dir, "in.xlsx", .{
+        .sheet = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+            "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>A1+1</f><v>999</v></c>" ++
+            "<c r=\"C1\"><f>B1+1</f><v>999</v></c>" ++
+            "</row></sheetData></worksheet>",
+    });
+    defer a.free(src);
+
+    // The same poll counter as the between-two-cells cancellation: the
+    // token arms on the second clock read, which is the drive's first
+    // per-cell poll (the graph build reads no clock). With the gate
+    // ahead of the graph the drive is never reached and the
+    // generation's verdict is what the caller hears; a gate moved below
+    // the drive's first poll, or deleted, would say `Cancelled` here —
+    // the bound this pin holds is "above the drive"; "above the graph"
+    // is the placement, read at the call site (in-house r3 A-TEST-301,
+    // r4 A-TEST-401).
+    var flag: u8 = 0;
+    const io = control.inject.wrap(base, .{ .trip_at = 2, .trip_flag = &flag });
+    var run = fixed_run;
+    run.deadline = .{ .nanoseconds = std.math.maxInt(i64) };
+    run.cancel = .{ .flag = &flag };
+
+    var wb = try Workbook.open(a, base, src);
+    defer wb.deinit();
+    _ = try wb.addSheet("Extra");
+    try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, run, .{}));
+    try testing.expectEqual(@as(u8, 0), flag);
+    try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+}
+
 test "saveWithRecalc: saving over the source is the same transaction" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -2607,6 +2737,205 @@ test "logical-view gate: a staged delta is modeled, not refused" {
 }
 
 // ─── the embedding-staleness preflight ───────────────────────────
+
+test "recalc guard: an added sheet or a moved row refuses recalculate before the graph is built and saveWithRecalc before the rename — memory and the destination untouched; the documented order lands both" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        _ = try wb.addSheet("Extra");
+        try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, fixed_run, .{}));
+        try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+        try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
+    }
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.insertRow(0, 1);
+        try testing.expectError(error.RecalcRequiresReopen, wb.recalculate(a, io, fixed_run, .{}));
+        try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+    }
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        _ = try wb.addSheet("Extra");
+        try wb.save(io, ordered);
+    }
+    var wb = try Workbook.open(a, io, ordered);
+    defer wb.deinit();
+    try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+    try testing.expectEqualStrings("2", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "saveWithRecalc refuses SheetHasUnsavedMutations over a staged cell write — its file would lack it; the destination stays absent, recalculate then save carries both" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    for ([_][]const u8{ sheet_stale, sheet_no_formula }) |sheet| {
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet });
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+        try testing.expectError(error.SheetHasUnsavedMutations, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        try wb.save(io, ordered);
+        var reopened = try Workbook.open(a, io, ordered);
+        defer reopened.deinit();
+        try testing.expectEqualStrings("41", try cellCache(try reopened.sheet(0), "A1"));
+        if (sheet.ptr == sheet_stale.ptr) {
+            try testing.expectEqualStrings("42", try cellCache(try reopened.sheet(0), "B1"));
+        }
+    }
+
+    // Both conditions at once: the generation's verdict is heard, its
+    // remedy being the complete one — for a delta, and for appended
+    // rows on the in-memory path.
+    const path = try writeFixture(a, io, dir, "both.xlsx", .{});
+    defer a.free(path);
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+    _ = try wb.addSheet("Extra");
+    try testing.expectError(error.RecalcRequiresReopen, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+    var wb2 = try Workbook.open(a, io, path);
+    defer wb2.deinit();
+    try (try wb2.sheet(0)).appendRows(&.{&.{.{ .number = 7 }}});
+    _ = try wb2.addSheet("Extra");
+    try testing.expectError(error.RecalcRequiresReopen, wb2.recalculate(a, io, fixed_run, .{}));
+}
+
+test "saveWithRecalc: the run's own verdicts come before its save-state gate — a token already up over a staged cell is Cancelled, a bad limit is FormulaLimitExceeded" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const src = try writeFixture(a, io, dir, "in.xlsx", .{});
+    defer a.free(src);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+
+    var flag: u8 = 1;
+    var run = fixed_run;
+    run.cancel = .{ .flag = &flag };
+    try testing.expectError(error.Cancelled, wb.saveWithRecalc(a, io, out, run, .{}));
+
+    var bad = fixed_run;
+    bad.limits.max_matrix_cells = 0;
+    try testing.expectError(error.FormulaLimitExceeded, wb.saveWithRecalc(a, io, out, bad, .{}));
+    try testing.expectError(error.SheetHasUnsavedMutations, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+}
+
+test "saveWithRecalc refuses WorkbookHasStagedDefinedNames over a staged defined name — neither arm splices the plan; recalculate then save carries it" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    for ([_][]const u8{ sheet_stale, sheet_no_formula }) |sheet| {
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet });
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
+        try testing.expectError(error.WorkbookHasStagedDefinedNames, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        try wb.save(io, ordered);
+        var reopened = try Workbook.open(a, io, ordered);
+        defer reopened.deinit();
+        const wb_part = (try reopened.store.part("xl/workbook.xml")) orelse return error.MissingPart;
+        try testing.expect(std.mem.indexOf(u8, wb_part.bytes, "name=\"Total\"") != null);
+    }
+}
+
+test "recalc guard: a workbook with nothing to recalculate builds no candidate — the mark refuses over an added sheet, recalculate is a no-op and saveWithRecalc is the plain save that carries it" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const path = try writeFixture(a, io, dir, "plain.xlsx", .{ .sheet = sheet_no_formula });
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "plain_out.xlsx" });
+    defer a.free(out);
+
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        _ = try wb.addSheet("Extra");
+        try testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        var r = try wb.recalculate(a, io, fixed_run, .{});
+        r.deinit(a);
+        try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
+        var s = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+        s.deinit(a);
+    }
+    var wb = try Workbook.open(a, io, out);
+    defer wb.deinit();
+    try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+}
 
 test "embedding preflight: a staged cell inside a coverage refuses" {
     const a = testing.allocator;

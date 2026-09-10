@@ -741,6 +741,14 @@ zlsx recalc <file.xlsx> --out <out.xlsx> [--now ISO8601] [--utc-offset MIN]
   anything is opened. The write is one atomic transaction (§5.7.9): on
   every refusal or cancellation path the destination's prior bytes are
   untouched ("no file" only when it was absent).
+- Every invocation opens its file fresh, so the library's
+  recalc-transaction guard (`RecalcRequiresReopen` on the Zig, C and
+  Python surfaces: a transaction asked for over a generation that holds
+  a structural edit, an embedding write or sweep, an image, a doc-props
+  strip or a materialized save) cannot
+  fire from the CLI — `recalc` over the output of `add-sheet`,
+  `insert-row`, `embed --vectors`, … is the documented safe order by
+  construction (pinned).
 
 #### The stream state machine
 

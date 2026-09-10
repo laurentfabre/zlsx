@@ -1437,7 +1437,10 @@ int32_t zlsx_editor_has_custom_properties(zlsx_editor_t * ed);
 
 /* Strip identifying document metadata, staged for the next save.
  * strip_timestamps also drops created/modified/revision, which the
- * default mask keeps. Returns 0 on success, -1 on failure. */
+ * default mask keeps. A part this rewrites or drops is an install: a
+ * recalc transaction afterwards refuses RecalcRequiresReopen (run it
+ * first, or save and re-open); a strip that changes nothing installs
+ * nothing. Returns 0 on success, -1 on failure. */
 int32_t zlsx_editor_strip_doc_props(
     zlsx_editor_t * ed,
     int32_t         strip_timestamps,
@@ -1702,13 +1705,23 @@ const char * zlsx_engine_fingerprint(void);
 
 /* §5.7.7's mark-only transaction: keep every cached value, set
  * fullCalcOnLoad="1", remove nothing else. Typed refusals (-2) include
- * FormulaPrecisionAsDisplayed. diag is optional (NULL ok). */
+ * FormulaPrecisionAsDisplayed and RecalcRequiresReopen (no plane): a
+ * structural edit, an embedding write / prune / strip, a doc-props
+ * strip that changed a part or a save that materialized cell writes
+ * has installed into the live generation
+ * since it went live, and the mark's candidate — the archive as
+ * opened — cannot carry it; nothing is mutated. Mark first, or save
+ * and re-open. diag is optional (NULL ok). */
 int32_t zlsx_editor_mark_recalc_on_load(zlsx_editor_t * ed,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
 /* §5.7's in-memory transaction (M5d2 pipeline): recalculate every
  * formula cell and swap the result in as the final operation. On any
- * non-zero status the workbook is exactly as it was. No file I/O. */
+ * non-zero status the workbook is exactly as it was. No file I/O.
+ * RecalcRequiresReopen (-2, no plane, no census) refuses when a
+ * mutator has installed into the live generation since it went live
+ * (zlsx_editor_mark_recalc_on_load's rule) and the run would build a
+ * candidate; a workbook with nothing to recalculate stays legal. */
 int32_t zlsx_editor_recalculate(zlsx_editor_t * ed, const zlsx_run_v1 * run,
         zlsx_recalc_report_v1 * report, zlsx_diag_v1 * diag,
         char * errbuf, size_t errbuf_len);
@@ -1767,7 +1780,18 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * untouched. A directory fsync failing after the rename is
  * report->durability_warning (+ durability_errno) on a ZLSX_OK return
  * — the §5.7.9 slot goes live here — never an error. A -2 refusal
- * carries the refusing cells in diag->census. */
+ * carries the refusing cells in diag->census; RecalcRequiresReopen
+ * (-2, no plane, no census) is one of the failures before the rename
+ * — a mutator installed into the live generation since it went live
+ * (zlsx_editor_mark_recalc_on_load's rule) and the run would build a
+ * candidate; a workbook with nothing to recalculate writes the live
+ * store's parts, installs carried, not refused. A staged cell write on
+ * any sheet is -1 SheetHasUnsavedMutations before anything runs:
+ * neither arm of this transaction writes it — save first, or
+ * zlsx_editor_recalculate then zlsx_editor_save. The staged defined
+ * names an embedding write leaves (its recovery carrier) are the same
+ * kind of state; over that write's install the verdict is
+ * RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
         const uint8_t * out_path_ptr, size_t out_path_len,
         const zlsx_run_v1 * run,
@@ -1877,7 +1901,14 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  * where bytes are required), and the sequencing errors RowEditRequiresCleanSheet /
  * ColEditRequiresCleanSheet / SheetDeleteRequiresCleanState — a
  * structural edit needs the sheet (the workbook, for a sheet delete)
- * free of staged cell writes and appended rows: save first.
+ * free of staged cell writes and appended rows: save first. The
+ * converse order has its own -2: after any of these edits (or an
+ * embedding write / prune / strip, a doc-props strip that changed a
+ * part, or a save that materialized cell writes) the recalc transactions — zlsx_editor_mark_recalc_on_load,
+ * zlsx_editor_recalculate, zlsx_editor_save_with_recalc — refuse
+ * RecalcRequiresReopen (no plane; their candidate is built from the
+ * archive as opened and cannot carry the installed parts): run the
+ * transaction first, or save and re-open.
  *
  * Every edit is staged in memory; zlsx_editor_save /
  * zlsx_editor_save_to_buffer commit it, with every cross-part
@@ -2208,9 +2239,10 @@ typedef struct zlsx_emb_coverage_v1 {
  * defined-name edit (pre-existing, recorded).
  * The recalc transactions — zlsx_editor_mark_recalc_on_load
  * then save, zlsx_editor_save_with_recalc, zlsx_editor_recalculate —
- * rebuild their candidate from the archive as opened and do NOT carry
- * this write: call them before it, or save and re-open (a recorded,
- * pre-existing rule of the transaction's generation model). The
+ * rebuild their candidate from the archive as opened and cannot carry
+ * this write, so after it they refuse RecalcRequiresReopen (-2, the
+ * recalc-transaction guard; the same verdict after a structural
+ * edit): call them before it, or save and re-open. The
  * record's hidden _zlsxRecoveryN defined names are staged with the
  * workbook plan and appear in zlsx_editor_defined_names_ndjson only
  * after a save. Inherited from
@@ -2335,9 +2367,10 @@ typedef struct zlsx_prune_report_v1 {
  * never N-1 of N coverages redacted. The recalc transactions
  * (zlsx_editor_mark_recalc_on_load then save,
  * zlsx_editor_save_with_recalc, zlsx_editor_recalculate) rebuild
- * their candidate from the archive as opened and do NOT carry this
- * sweep: call them before it, or save and re-open (the rule
- * zlsx_editor_set_embeddings documents). */
+ * their candidate from the archive as opened and cannot carry this
+ * sweep: after a prune that removed or replaced a part they refuse
+ * RecalcRequiresReopen (the rule zlsx_editor_set_embeddings
+ * documents) — call them before it, or save and re-open. */
 int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
         zlsx_prune_report_v1 * report,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
@@ -2377,8 +2410,9 @@ int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
  * next call and the save refuse StructuralEditIncomplete
  * (zlsx_editor_delete_sheet's rule — discard the editor). A cell that
  * merely spells the record's magic is user text and stays. The recalc
- * transactions rebuild their candidate from
- * the archive as opened and do NOT carry this strip: call them before
+ * transactions rebuild their candidate from the archive as opened and
+ * cannot carry this strip: after it they refuse RecalcRequiresReopen
+ * (the rule zlsx_editor_set_embeddings documents) — call them before
  * it, or save and re-open. */
 int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

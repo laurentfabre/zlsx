@@ -2428,6 +2428,203 @@ def test_editor_mark_recalc_on_load(tmp_path):
     assert 'fullCalcOnLoad="1"' in wb_xml
 
 
+def _skip_unless_recalc_guard():
+    """The three transactions are 0.8.0 exports; the guard ships with
+    0.9.0's structural edits — probe that generation, not the
+    transactions (in-house RTG r2 B-TEST-202)."""
+    ffi = _skip_unless_recalc()
+    if not (ffi._HAS_MARK_RECALC and ffi._HAS_SAVE_WITH_RECALC and ffi._HAS_STRUCTURAL_EDITS):
+        pytest.skip("loaded libzlsx predates the recalc-transaction guard (0.9.0+)")
+    return ffi
+
+
+def _expect_recalc_guard(ed, refused):
+    """Every transaction on ``ed`` is the typed refusal, no plane, and
+    ``refused`` never appears."""
+    for name, op in (
+        ("mark_recalc_on_load", ed.mark_recalc_on_load),
+        ("recalculate", ed.recalculate),
+        ("save_with_recalc", lambda: ed.save_with_recalc(refused)),
+    ):
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            op()
+        assert info.value.error_name == "RecalcRequiresReopen", name
+        assert not isinstance(info.value, zlsx.ZlsxFormulaRefusal), name
+    assert not refused.exists()
+
+
+def _sheet_names(path):
+    import re
+    import zipfile
+
+    xml = zipfile.ZipFile(path).read("xl/workbook.xml").decode("utf-8")
+    return re.findall(r'<sheet name="([^"]*)"', xml)
+
+
+def _three_by_three_with_formula(path):
+    """`_three_by_three` plus one formula on Second — what makes
+    ``recalculate`` / ``save_with_recalc`` build a candidate."""
+    with zlsx.write(path) as w:
+        s = w.add_sheet("Data")
+        s.write_row([1, 2, 3])
+        s.write_row([4, 5, 6])
+        s.write_row([7, 8, 9])
+        w.add_sheet("Second").write_row_with_formulas(["two", 0], [None, "1+1"])
+
+
+@pytest.mark.parametrize("edit", ["add_sheet", "insert_row", "rename_sheet", "delete_sheet", "saved_cell"])
+def test_recalc_transaction_guard_refuses_after_an_install(tmp_path, edit):
+    """The recalc transactions build their candidate from the archive
+    as opened, so a part a mutator installed into the live generation —
+    a sheet added / renamed / deleted, a row moved, a save that
+    materialized a cell write — cannot be carried: the typed refusal
+    ``RecalcRequiresReopen`` (before the guard: a silent drop or a
+    process abort), nothing mutated, and the plain save still lands the
+    edit."""
+    import zipfile
+
+    _require_structural()
+    _skip_unless_recalc_guard()
+    src = tmp_path / "src.xlsx"
+    _three_by_three_with_formula(src)
+    first = tmp_path / "first.xlsx"
+    refused = tmp_path / "refused.xlsx"
+    out = tmp_path / "out.xlsx"
+
+    with zlsx.edit(src) as ed:
+        if edit == "add_sheet":
+            assert ed.add_sheet("Third") == 2
+        elif edit == "insert_row":
+            ed.insert_row(0, 2)
+        elif edit == "rename_sheet":
+            ed.rename_sheet(1, "Renamed")
+        elif edit == "delete_sheet":
+            ed.delete_sheet(0)  # Second keeps the formula the candidate needs
+        else:
+            ed.set_cell(0, 1, 0, "seven")
+            ed.save(first)  # the save materializes the write into the store
+        _expect_recalc_guard(ed, refused)
+        ed.save(out)
+
+    names = _sheet_names(out)
+    with zlsx.open(out) as book:
+        if edit == "add_sheet":
+            assert names == ["Data", "Second", "Third"]
+        elif edit == "insert_row":
+            assert list(book.sheet(0).rows())[:2] == [[1, 2, 3], [4, 5, 6]]
+            assert b'r="A4"' in zipfile.ZipFile(out).read("xl/worksheets/sheet1.xml")
+        elif edit == "rename_sheet":
+            assert names == ["Data", "Renamed"]
+        elif edit == "delete_sheet":
+            assert names == ["Second"]
+        else:
+            assert list(book.sheet(0).rows())[0] == ["seven", 2, 3]
+    assert b'fullCalcOnLoad="1"' not in zipfile.ZipFile(out).read("xl/workbook.xml")
+
+
+def test_recalc_transaction_guard_documented_orders_land_both(tmp_path):
+    """The mark first, then the edit: both land. A staged cell write is
+    not an install: ``set_cell`` then the mark then ``save`` lands both.
+    A saved file re-opened takes a transaction again."""
+    import zipfile
+
+    _require_structural()
+    _skip_unless_recalc_guard()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+    out = tmp_path / "out.xlsx"
+    again = tmp_path / "again.xlsx"
+
+    with zlsx.edit(src) as ed:
+        ed.mark_recalc_on_load()
+        ed.set_cell(0, 1, 0, "seven")
+        ed.mark_recalc_on_load()  # a transaction after a transaction, over a staged delta
+        assert ed.add_sheet("Third") == 2
+        ed.save(out)
+    assert _sheet_names(out) == ["Data", "Second", "Third"]
+    with zlsx.open(out) as book:
+        assert list(book.sheet(0).rows())[0] == ["seven", 2, 3]
+    assert b'fullCalcOnLoad="1"' in zipfile.ZipFile(out).read("xl/workbook.xml")
+
+    with zlsx.edit(out) as ed:
+        ed.rename_sheet(2, "Fourth")
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.mark_recalc_on_load()
+        assert info.value.error_name == "RecalcRequiresReopen"
+        ed.save(again)
+    with zlsx.edit(again) as ed:
+        ed.mark_recalc_on_load()
+    assert _sheet_names(again) == ["Data", "Second", "Fourth"]
+
+
+@pytest.mark.parametrize("with_formula", [True, False])
+def test_save_with_recalc_refuses_a_staged_cell_write(tmp_path, with_formula):
+    """``save_with_recalc``'s own file never carried a staged ``set_cell``
+    on either arm (pre-existing; in-house RTG r1 B-REL-101): it refuses
+    ``SheetHasUnsavedMutations`` before anything runs, the destination
+    absent; ``recalculate`` then ``save`` carries the write."""
+    _require_structural()
+    _skip_unless_recalc_guard()
+    src = tmp_path / "src.xlsx"
+    (_three_by_three_with_formula if with_formula else _three_by_three)(src)
+    refused = tmp_path / "refused.xlsx"
+    out = tmp_path / "out.xlsx"
+    with zlsx.edit(src) as ed:
+        ed.set_cell(0, 1, 0, "seven")
+        with pytest.raises(zlsx.ZlsxError, match="SheetHasUnsavedMutations") as info:
+            ed.save_with_recalc(refused)
+        assert not isinstance(info.value, zlsx.ZlsxRefusal)
+        assert not refused.exists()
+        ed.recalculate()
+        ed.save(out)
+    with zlsx.open(out) as book:
+        rows = list(book.sheet(0).rows())
+        assert rows[0] == ["seven", 2, 3]
+        if with_formula:
+            assert list(book.sheet(1).rows()) == [["two", 2]]
+
+
+def test_recalc_transaction_guard_after_a_doc_props_strip(tmp_path):
+    """``strip_doc_props`` rewrites the docProps parts it changes — an
+    install (in-house r1 RTG-DOC-104); on a workbook without docProps
+    it changes nothing and the mark stays legal."""
+    _skip_unless_recalc_guard()
+    src = _skip_if_missing("openpyxl_guess_types.xlsx")
+    with zlsx.edit(src) as ed:
+        ed.strip_doc_props()
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.mark_recalc_on_load()
+        assert info.value.error_name == "RecalcRequiresReopen"
+    plain = tmp_path / "plain.xlsx"
+    _three_by_three(plain)
+    with zlsx.edit(plain) as ed:
+        ed.strip_doc_props()
+        ed.mark_recalc_on_load()
+
+
+def test_recalc_transaction_guard_leaves_the_no_op_arm_alone(tmp_path):
+    """A workbook with nothing to recalculate builds no candidate: the
+    mark refuses over the added sheet, ``recalculate`` is a no-op report
+    and ``save_with_recalc`` is the plain save — the sheet in the file,
+    nothing marked."""
+    import zipfile
+
+    _require_structural()
+    _skip_unless_recalc_guard()
+    src = tmp_path / "src.xlsx"
+    _three_by_three(src)
+    out = tmp_path / "out.xlsx"
+    with zlsx.edit(src) as ed:
+        assert ed.add_sheet("Third") == 2
+        with pytest.raises(zlsx.ZlsxRefusal) as info:
+            ed.mark_recalc_on_load()
+        assert info.value.error_name == "RecalcRequiresReopen"
+        assert ed.recalculate().cells_written == 0
+        ed.save_with_recalc(out)
+    assert _sheet_names(out) == ["Data", "Second", "Third"]
+    assert b'fullCalcOnLoad="1"' not in zipfile.ZipFile(out).read("xl/workbook.xml")
+
+
 def test_editor_recalc_timeout_pre_commit(tmp_path):
     ffi = _skip_unless_recalc()
     if not ffi._HAS_SAVE_WITH_RECALC:

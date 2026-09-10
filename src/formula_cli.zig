@@ -1677,6 +1677,45 @@ test "recalc --report success: the report is the stream's terminal" {
     try testing.expect(found);
 }
 
+test "the recalc-transaction guard is unreachable from the CLI: every invocation re-opens its file, so recalc over the output of a structural edit is the documented order" {
+    const a = testing.allocator;
+    var env = try TestEnv.init(a);
+    defer env.deinit(a);
+    const path = try writeTestFixture(a, env.io(), env.dir, "in.xlsx", t_sheet_stale);
+    defer a.free(path);
+    const edited = try std.fs.path.join(a, &.{ env.dir, "edited.xlsx" });
+    defer a.free(edited);
+    const out_path = try std.fs.path.join(a, &.{ env.dir, "out.xlsx" });
+    defer a.free(out_path);
+
+    // The edit lands in a file of its own — the CLI has no way to hold
+    // an edited generation and ask for a transaction over it.
+    {
+        var wb = try zlsx_pkg.Workbook.open(a, env.io(), path);
+        defer wb.deinit();
+        _ = try wb.addSheet("Extra");
+        try wb.save(env.io(), edited);
+    }
+
+    var r = try drive(a, env.io(), &.{ "recalc", edited, "--out", out_path, "--report", "--now", t_now, "--seed", t_seed }, .{});
+    defer r.deinit(a);
+    try testing.expectEqual(exit_ok, r.code);
+    try expectKinds(a, r.out, &.{"recalc-report"});
+
+    var wb = try zlsx_pkg.Workbook.open(a, env.io(), out_path);
+    defer wb.deinit();
+    try testing.expectEqual(@as(u32, 2), wb.sheetCount());
+    const view = try (try wb.sheet(0)).ensureParsed();
+    var found = false;
+    for (view.rows) |row| for (row.cells) |c| {
+        if (std.mem.eql(u8, c.ref, "B1")) {
+            try testing.expectEqualStrings("2", c.raw_value orelse "");
+            found = true;
+        }
+    };
+    try testing.expect(found);
+}
+
 test "recalc without --report: stdout silent on every outcome" {
     const a = testing.allocator;
     var env = try TestEnv.init(a);

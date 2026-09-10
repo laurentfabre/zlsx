@@ -39,6 +39,24 @@
 //! ref-counted `SourceBacking`, so a four-deep retained set costs one file
 //! descriptor, not four.
 //!
+//! What a candidate cannot carry (the recalc-transaction guard)
+//! ------------------------------------------------------------
+//! A candidate starts from `PartStore.nextGeneration()` — the archive as
+//! opened, overrides not inherited — and holds, beyond that, only what
+//! `prepare` is handed or derives: the staged sheet parts, the calc
+//! state, the chain's removal. A part a *mutator* installed into the live
+//! generation (a sheet added, renamed or deleted, a row or column moved,
+//! an embedding set written, pruned or stripped, an image added, a
+//! doc-props strip, a save's materialized cell writes) is in neither,
+//! so the swap would silently drop it — or,
+//! for a sheet added, trip the sheet-count invariant. `prepare` therefore
+//! refuses `RecalcRequiresReopen` before building anything whenever
+//! `store.installs` has moved past the count the generation went live
+//! with (`Workbook.generation_installs`, set by `swap`); the staged
+//! deltas the model reads and the save re-emits are not installs, and a
+//! transaction after a transaction stays legal. The remedy is the order:
+//! run the transaction first, or save and re-open.
+//!
 //! Not here
 //! --------
 //! The file transaction — temp file, `File.sync`, rename, directory fsync
@@ -376,6 +394,12 @@ pub const Candidate = struct {
         assert(!self.swapped);
         assert(wb.worksheets.len == self.sheet_views.len);
         assert(wb.retained.capacity > wb.retained.items.len);
+        // The guard judged the live generation at `prepare`; a mutator
+        // between that and this swap would be dropped by the moves
+        // below AND hidden by the baseline they record — a caller of
+        // the exported two-step holding a candidate across an edit is
+        // a bug, stated here (in-house r1 RTG-REL-105).
+        assert(wb.store.installs == wb.generation_installs);
 
         var gen: RetainedGeneration = .{
             .store = wb.store,
@@ -414,6 +438,12 @@ pub const Candidate = struct {
         wb.workbook = self.workbook_view;
         wb.retained.appendAssumeCapacity(gen);
         wb.retained_bytes += gen.bytes;
+        // The guard's baseline: what this generation's counter reads as
+        // it goes live is the candidate's own build (the staged parts,
+        // the calc state, the chain's removal), not a mutator's — so a
+        // transaction after a transaction stays legal and the first
+        // install a mutator makes afterwards is the one the guard sees.
+        wb.generation_installs = wb.store.installs;
 
         self.gpa.free(self.sheet_views);
         self.swapped = true;
@@ -454,6 +484,16 @@ pub fn prepare(
 ) Error!Result {
     const gpa = wb.allocator;
     if (cancelled(opts)) return Error.Cancelled;
+
+    // The recalc-transaction guard, first of all: the candidate below is
+    // `nextGeneration()` — the archive as opened — plus `staged` and the
+    // calc state, so a part a mutator installed into the live
+    // generation (a sheet added or renamed, a row moved, an embedding
+    // set written or stripped, a save's materialized deltas) is not in
+    // it, and the swap would drop it. Refused here rather than folded
+    // into a plane: nothing about the cells is wrong, the generation is
+    // simply not one a candidate can be built for (B-REL-201).
+    try wb.requireGenerationUnmodified();
 
     // §5.7.4's counted retention, both halves, refused BEFORE anything is
     // built. Neither number depends on the candidate — what a swap would
@@ -1233,6 +1273,10 @@ test "retention: a large replaced part counts against the byte ceiling" {
     defer gpa.free(big);
     @memset(big, ' ');
     try h.wb.store.replacePart("xl/workbook.xml", big);
+    // The raw replace is this fixture's way of giving the generation
+    // weight, not a mutation the guard is about: align the baseline so
+    // the verdict under test is the ceiling's.
+    h.wb.generation_installs = h.wb.store.installs;
 
     // The store now holds a block the arena knows nothing about, and the
     // figure the ceiling reads must include it.
@@ -1272,6 +1316,9 @@ test "retention: the swap re-measures the generation it retires" {
     defer gpa.free(big);
     @memset(big, ' ');
     try h.wb.store.replacePart("xl/workbook.xml", big);
+    // The raw replace is weight, not a mutation between prepare and
+    // swap: align the baseline so the swap's precondition holds.
+    h.wb.generation_installs = h.wb.store.installs;
 
     const snapshot = candidate.retired_bytes;
     const truth = generationBytes(&h.wb.store);
@@ -1704,6 +1751,129 @@ test "markRecalcOnLoad: fullPrecision=\"0\" refuses through the Workbook error s
     var h = try Harness.init(gpa, .{ .calc_pr = "<calcPr calcId=\"1\" fullPrecision=\"0\"/>" });
     defer h.deinit(gpa);
     try testing.expectError(error.FormulaPrecisionAsDisplayed, h.wb.markRecalcOnLoad());
+}
+
+// ─── the recalc-transaction guard ────────────────────────────────
+
+test "recalc guard: a rename installed into the live generation refuses before anything is built — the store, the retained set and the sheet are exactly as they were" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    try h.wb.renameSheet(0, "Renamed");
+    const installs = h.wb.store.installs;
+    try testing.expect(installs > h.wb.generation_installs);
+    const identity = try partIdentity(gpa, &h.wb.store);
+    defer gpa.free(identity);
+
+    try testing.expectError(error.RecalcRequiresReopen, prepare(&h.wb, &staged_one, &.{}, .{}));
+    try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
+    // Judged before the retention ceiling too: a zero budget is not
+    // what the caller hears about.
+    try testing.expectError(error.RecalcRequiresReopen, prepare(&h.wb, &staged_one, &.{}, .{ .max_retained_generations = 0 }));
+    try expectPartsIdentical(identity, &h.wb.store);
+    try testing.expectEqual(installs, h.wb.store.installs);
+    try testing.expectEqual(@as(usize, 0), h.wb.retained.items.len);
+    try testing.expectEqualStrings("Renamed", (try h.wb.sheet(0)).name());
+}
+
+test "recalc guard: nothing is built before the verdict — under an allocator that fails every request the rename still hears RecalcRequiresReopen, not OutOfMemory" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    try h.wb.renameSheet(0, "Renamed");
+
+    // `prepare` allocates through `wb.allocator`, and the candidate's
+    // `nextGeneration` through the STORE's; a first request that fails
+    // on either would surface as OutOfMemory if anything were built
+    // ahead of the guard (in-house r1 RTG-TEST-106, r2 TEST-203).
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    h.wb.allocator = failing.allocator();
+    h.wb.store.allocator = failing.allocator();
+    defer {
+        h.wb.allocator = gpa;
+        h.wb.store.allocator = gpa;
+    }
+    try testing.expectError(error.RecalcRequiresReopen, prepare(&h.wb, &staged_one, &.{}, .{}));
+    try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "recalc guard: a torn workbook hears StructuralEditIncomplete first — its remedy is to discard the instance, not to save" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    try h.wb.renameSheet(0, "Renamed");
+    h.wb.torn_edit = true;
+    try testing.expectError(error.StructuralEditIncomplete, h.wb.markRecalcOnLoad());
+    try testing.expectError(error.StructuralEditIncomplete, prepare(&h.wb, &staged_one, &.{}, .{}));
+}
+
+test "recalc guard: a fresh-emit workbook installs its skeleton at birth — every transaction refuses until it is saved and re-opened" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+    var fresh = try Workbook.empty(gpa, h.io());
+    defer fresh.deinit();
+    _ = try fresh.addSheet("Only");
+    try testing.expect(fresh.store.installs > 0);
+    try testing.expectError(error.RecalcRequiresReopen, fresh.markRecalcOnLoad());
+}
+
+test "recalc guard: the transaction's own installs are the generation's — a mark after a mark and a rename after a mark are legal, a mark after that rename is not, and the saved file re-opened takes one again" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    try h.wb.markRecalcOnLoad();
+    // The mark replaced `xl/workbook.xml` in its candidate: the counter
+    // moved, and the baseline moved with it at the swap.
+    try testing.expect(h.wb.store.installs > 0);
+    try testing.expectEqual(h.wb.store.installs, h.wb.generation_installs);
+    try h.wb.markRecalcOnLoad();
+    try testing.expectEqual(@as(usize, 2), h.wb.retained.items.len);
+
+    try h.wb.renameSheet(0, "Renamed");
+    try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
+
+    // The documented order — mark, edit, save — lands both …
+    const out = try std.fs.path.join(gpa, &.{ h.dir, "marked-then-renamed.xlsx" });
+    defer gpa.free(out);
+    try h.wb.save(h.io(), out);
+    var reopened = try Workbook.open(gpa, h.io(), out);
+    defer reopened.deinit();
+    try testing.expectEqualStrings("Renamed", (try reopened.sheet(0)).name());
+    const wb_part = (try reopened.store.part(workbook_part)) orelse return error.MissingPart;
+    try testing.expect(std.mem.indexOf(u8, wb_part.bytes, "fullCalcOnLoad=\"1\"") != null);
+    // … and the re-opened file is a generation a candidate can be
+    // built for again.
+    try testing.expectEqual(@as(u64, 0), reopened.store.installs);
+    try reopened.markRecalcOnLoad();
+}
+
+test "recalc guard: a staged cell write is not an install — setCell, mark, save lands both; the save that materializes it into the store is one" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa, .{});
+    defer h.deinit(gpa);
+
+    try (try h.wb.sheet(0)).setCell("C1", .{ .string = "seven" });
+    try testing.expectEqual(h.wb.store.installs, h.wb.generation_installs);
+    try h.wb.markRecalcOnLoad();
+    const out = try std.fs.path.join(gpa, &.{ h.dir, "cell-then-mark.xlsx" });
+    defer gpa.free(out);
+    try h.wb.save(h.io(), out);
+    // The save re-emitted the sheet into the store: from here a
+    // candidate could not carry it (the third shape measured before
+    // the guard: the second save silently lost the cell).
+    try testing.expect(h.wb.store.installs > h.wb.generation_installs);
+    try testing.expectError(error.RecalcRequiresReopen, h.wb.markRecalcOnLoad());
+
+    var reopened = try Workbook.open(gpa, h.io(), out);
+    defer reopened.deinit();
+    const sheet = (try reopened.store.part(sheet_part)) orelse return error.MissingPart;
+    try testing.expect(std.mem.indexOf(u8, sheet.bytes, "seven") != null);
+    const wb_part = (try reopened.store.part(workbook_part)) orelse return error.MissingPart;
+    try testing.expect(std.mem.indexOf(u8, wb_part.bytes, "fullCalcOnLoad=\"1\"") != null);
 }
 
 // ─── §5.7.6 through the transaction ──────────────────────────────
