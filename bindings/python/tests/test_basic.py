@@ -4977,6 +4977,50 @@ def test_shared_string_at_names_a_deferred_decode_failure(tmp_path, monkeypatch)
             zlsx.open_sst_lazy(path)
 
 
+def _patch_part(src, dst, part, fn):
+    """Copy an xlsx, rewriting one part's bytes through `fn`."""
+    import zipfile
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == part or (part.endswith("*") and item.filename.startswith(part[:-1])):
+                data = fn(item.filename, data)
+            zout.writestr(item, data)
+
+
+def test_open_sst_lazy_defers_the_entity_verdict_to_first_touch(tmp_path):
+    """A malformed entity in one entry: `open` refuses the file at open
+    (`MalformedXml`), `open_sst_lazy` opens it and fails on that entry
+    alone — `shared_string_at` as `ZlsxError` named after the reader,
+    the row iteration too — while the entries around it read (in-house
+    r1 B-DOC-101, which measured the shipped shape)."""
+    _require_lazy_sst()
+    src = tmp_path / "ent_src.xlsx"
+    dst = tmp_path / "ent.xlsx"
+    with zlsx.write(src) as w:
+        sheet = w.add_sheet("S")
+        sheet.write_row(["fine", "bad", "after"])
+        sheet.write_row(["fine", "after"])
+    _patch_part(src, dst, "xl/sharedStrings.xml",
+                lambda _n, d: d.replace(b'<t xml:space="preserve">bad</t>', b"<t>bad &#x110000; cp</t>"))
+    with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+        zlsx.open(dst)
+    with zlsx.open_sst_lazy(dst) as book:
+        assert book.shared_strings_count() == 3
+        assert book.shared_string_at(0) == "fine"
+        with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+            book.shared_string_at(1)
+        assert book.shared_string_at(2) == "after"
+        rows = book.sheet(0).rows()
+        with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+            next(rows)
+        # A fresh iterator past the first row never touches the bad
+        # entry: the second row reads.
+        rows = book.sheet(0).rows()
+        assert rows.skip(1) == 1
+        assert next(rows) == ["fine", "after"]
+
+
 def test_open_sst_lazy_failures_are_named_after_the_reader(tmp_path):
     _require_lazy_sst()
     with pytest.raises(zlsx.ZlsxError, match="FileNotFound"):
@@ -5020,10 +5064,28 @@ def test_threads_may_share_one_sst_lazy_book(tmp_path):
     _require_lazy_sst()
     import threading
 
+    import re
+
+    src = tmp_path / "sst_lazy_threads_src.xlsx"
     path = tmp_path / "sst_lazy_threads.xlsx"
-    _sst_workbook(path, sheets=8, rows=200)
+    _sst_workbook(src, sheets=8, rows=200)
+    # A shared formula down each sheet: the library's `zlsx_rows_skip`
+    # then drains through `next()` (`Rows.hasFormulaSpreads`), so a
+    # `skip` is a first touch of every shared string it passes — the
+    # race in-house r1 THR-101 reproduced on `skip` alone.
+    row_re = re.compile(rb'<row r="(\d+)">(.*?)</row>', re.S)
+
+    def spread(_name, data):
+        def one(m):
+            r = int(m.group(1))
+            f = (b'<c r="D1"><f t="shared" ref="D1:D201" si="0">A1</f><v>0</v></c>' if r == 1
+                 else b'<c r="D%d"><f t="shared" si="0"/><v>0</v></c>' % r)
+            return b'<row r="%d">' % r + m.group(2) + f + b"</row>"
+        return row_re.sub(one, data)
+
+    _patch_part(src, path, "xl/worksheets/*", spread)
     n_sst = None
-    for _ in range(20):
+    for it in range(20):
         book = zlsx.open_sst_lazy(path)
         if n_sst is None:
             n_sst = book.shared_strings_count()
@@ -5033,7 +5095,12 @@ def test_threads_may_share_one_sst_lazy_book(tmp_path):
         def worker(i):
             try:
                 n = 0
-                for row in book.sheet(i).rows():
+                rows = book.sheet(i).rows()
+                if it % 2:
+                    # Half the iterations skip past most of the sheet —
+                    # every skipped row a first touch under the lock.
+                    n = rows.skip(150)
+                for row in rows:
                     if n < 200:
                         assert row[0] == f"s{i}r{n}" and row[1] == "shared"
                     n += 1
@@ -5063,6 +5130,7 @@ def test_threads_may_share_one_sst_lazy_book(tmp_path):
         def racer(i):
             try:
                 rows = book.sheet(i).rows()
+                rows.skip(i)
                 for _row in rows:
                     counts[i] += 1
                     try:
@@ -5081,4 +5149,4 @@ def test_threads_may_share_one_sst_lazy_book(tmp_path):
         for t in threads:
             t.join()
         assert not errors
-        assert all(c in (0, 201) for c in counts)
+        assert all(c in (0, 201 - i) for i, c in enumerate(counts))

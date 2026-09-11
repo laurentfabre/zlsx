@@ -696,9 +696,8 @@ pub const SstBackend = union(enum) {
     eager: [][]const u8,
     /// Offset table + sparse resolution cache; entries are decoded
     /// into `Book.sst_arena` on first `sharedStringAt(idx)` access.
-    /// Reserved for iter-sst-3b — not constructed yet by any
-    /// production path; the variant exists at iter-sst-3a so the
-    /// accessor switch covers both arms exhaustively.
+    /// Constructed by `Book.openSstLazy` (iter-sst-3b) and, since S3e
+    /// slice 2, by `zlsx_book_open_sst_lazy` on the C surface.
     lazy: struct {
         offsets: []usize,
         lengths: []usize,
@@ -908,11 +907,13 @@ pub const Book = struct {
     /// same slice as the eager backend with the same lifetime
     /// contract.
     ///
-    /// Trade-off: lazy mode defers per-entry plain-text decoding and
-    /// its allocation, so the one failure it can add is `OutOfMemory`
-    /// from `sharedStringAt(idx)` (or, transitively, from a
-    /// `Rows.next()` cell read that resolves to that idx) instead of
-    /// at open. It removes no validation — neither walker refuses a
+    /// Trade-off: lazy mode defers per-entry plain-text decoding, so
+    /// what it moves from open to `sharedStringAt(idx)` (or,
+    /// transitively, to a `Rows.next()` cell read that resolves to
+    /// that idx) is the entity decode's verdict — a malformed entity
+    /// `Book.open` refuses at open as `MalformedXml` fails here at
+    /// first touch — and the allocation (`OutOfMemory`). It refuses
+    /// nothing else the eager walker does not — neither refuses a
     /// torn `<t>` body — but the two read such a table differently:
     /// the eager walker's `</t>` search runs past the entry, so the
     /// torn entry swallows markup and the entries after it up to the
@@ -1427,10 +1428,11 @@ pub const Book = struct {
     }
 
     /// Resolved shared string at `idx`. Errors with `MalformedXml`
-    /// when `idx` is past the end of the SST. Eager-backend accessor;
-    /// the streaming-SST plan (docs/plans/archive/streaming-sst.md) introduces
-    /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
-    /// centralises the lookup so future migration touches one site.
+    /// when `idx` is past the end of the SST on either backend; on the
+    /// lazy backend the first touch also carries the entity decode's
+    /// verdict (`MalformedXml`, which the eager parser raised at open)
+    /// and its allocation. The one lookup site for both backends
+    /// (docs/plans/archive/streaming-sst.md).
     pub fn sharedStringAt(self: *Book, idx: usize) ![]const u8 {
         switch (self.sst) {
             .eager => |entries| {
@@ -4365,9 +4367,9 @@ pub fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
 /// Lazy SST builder (iter-sst-3b). Walks the SST once recording the
 /// byte span of each `<si>...</si>` body, but does NOT decode plain
 /// text. `Book.sharedStringAt` materialises individual entries into
-/// `sst_arena` on first access. Rich-text runs are not eagerly
-/// captured by the lazy backend yet (deferred to a follow-up iter);
-/// `Book.richRuns(idx)` returns null on lazy-opened books.
+/// `sst_arena` on first access. Rich-text runs ARE captured eagerly
+/// (`parseSstRichRunsForBody` below), so `Book.richRuns(idx)` answers
+/// on lazy-opened books as on eager ones.
 fn parseSharedStringsLazy(book: *Book, sst_xml: []u8) !void {
     const hint: usize = blk: {
         const open = std.mem.indexOf(u8, sst_xml, "<sst") orelse break :blk 64;
@@ -5852,8 +5854,50 @@ test "S3e slice 2: neither backend refuses a torn entry; the eager walker swallo
     try std.testing.expectEqualStrings("first", try lazy.sharedStringAt(2));
     try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(3));
     // Past the end is the reader's `MalformedXml` on both, which the C
-    // status read pre-empts as `SstIndexOutOfRange`.
+    // status read pre-empts as `SharedStringIndexOutOfRange`.
     try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(4));
+}
+
+test "S3e slice 2: a malformed entity is the eager parser's refusal at open and the lazy backend's at first touch" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // The one verdict the deferral moves (in-house r1 B-DOC-101,
+    // measured through py-zlsx: `open` refused the file, `open_sst_lazy`
+    // opened it and failed on the entry). `appendDecoded` is shared by
+    // both walkers; the eager one runs it at open, the lazy one at
+    // `sharedStringAt`, on the entry alone — the sound entries read.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\" uniqueCount=\"3\">" ++
+        "<si><t>sound</t></si>" ++
+        "<si><t>bad &#x110000; entity</t></si>" ++
+        "<si><t>after</t></si>" ++
+        "</sst>";
+    var eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer eager.deinit();
+    eager.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStrings(&eager, eager.shared_strings_xml.?));
+
+    var lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer lazy.deinit();
+    lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStringsLazy(&lazy, lazy.shared_strings_xml.?);
+    try std.testing.expectEqual(@as(usize, 3), lazy.sharedStringsCount());
+    try std.testing.expectEqualStrings("sound", try lazy.sharedStringAt(0));
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(1));
+    // The verdict is not cached as a value: the entry fails again, and
+    // the entries around it read.
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(1));
+    try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(2));
+    try std.testing.expectEqual(@as(u32, 2), lazy.sst.lazy.resolved.count());
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {

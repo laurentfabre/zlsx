@@ -107,10 +107,12 @@ differently: on `open` the torn entry swallows markup and the entries
 after it up to the next `</t>` (every later index shifts);
 `open_sst_lazy` bounds each entry by its `</si>`, keeps the ordinal and
 yields the text before the tear.
-The one failure the deferral adds is the allocation, at first touch
-instead of at open (`ZlsxError` from `shared_string_at` or the row
-iteration; out of range stays `IndexError`). A `Rows` over such a book takes the per-book lock
-for each row it yields (a first touch mutates the handle). Requires
+What the deferral defers is the entity decode's verdict — a malformed
+entity `open` refuses at open (`MalformedXml`) fails here at the entry's
+first touch — and the allocation (`ZlsxError` from `shared_string_at`
+or the row iteration, named after the reader's error; out of range
+stays `IndexError`). A `Rows` over such a book takes the per-book lock
+for each row it yields or skips (a first touch mutates the handle). Requires
 libzlsx 0.9.0+ (`zlsx_book_open_sst_lazy`).
 
 ## Write
@@ -784,8 +786,8 @@ with zlsx.write("out.xlsx") as w:
   indexed and each entry decoded on first touch (`Book.shared_string_at`,
   a row that resolves to it) and cached; `Book.sst_lazy` tells it apart.
   `Book.shared_string_at` reads through the status export on a 0.9.0+
-  dylib: out of range stays `IndexError`, a failed decode (its
-  allocation) is `ZlsxError` named after the reader's error
+  dylib: out of range stays `IndexError`, a failed decode (a malformed
+  entity, its allocation) is `ZlsxError` named after the reader's error
 - Formula text and error tags on read (0.9.0+): `Rows.formula_strings()` /
   `Rows.formula_refs()` / `Rows.error_strings()` — the `<f>` body
   (entity-decoded), a shared / array slave's base cell, and the `t="e"`
@@ -817,7 +819,7 @@ with zlsx.write("out.xlsx") as w:
 
 Distinct `Book` and `Writer` handles are fully independent — call them freely from any threads. Operations on the same handle must be externally synchronized, same as sqlite3 or libcurl. The C ABI's refcount lets a row iterator outlive its Book handle safely; all other cross-thread sharing is the caller's responsibility.
 
-For a `Book` the binding takes that lock for you: every call on the book — the per-sheet loads and getters (`preload_sheet`, `stream_sheet`, `Sheet.rows`, `Sheet.read_all`, `merged_ranges`, `hyperlinks`, `data_validations`, `comments`), the workbook-wide getters (`sheet_state`, `shared_string_at`, `rich_text`, the style lookups) and `close` — runs under a per-book lock, so threads may share one `Book` — a lazy one included, whose first touch of a sheet mutates the C handle (ctypes releases the GIL around every foreign call, so the GIL is no substitute) — and a `with zlsx.open_lazy(...) as book:` exiting while a thread is still inside a call waits for it (every later call raises `ZlsxError`). Iterating a `Rows` is unlocked: one iterator per thread, and an iterator outlives the book's close through the C refcount — except over a `zlsx.open_sst_lazy` book, where each row's read takes the lock too (a first touch of a shared string mutates the handle; measured: eight iterators over one such book abort without it).
+For a `Book` the binding takes that lock for you: every call on the book — the per-sheet loads and getters (`preload_sheet`, `stream_sheet`, `Sheet.rows`, `Sheet.read_all`, `merged_ranges`, `hyperlinks`, `data_validations`, `comments`), the workbook-wide getters (`sheet_state`, `shared_string_at`, `rich_text`, the style lookups) and `close` — runs under a per-book lock, so threads may share one `Book` — a lazy one included, whose first touch of a sheet mutates the C handle (ctypes releases the GIL around every foreign call, so the GIL is no substitute) — and a `with zlsx.open_lazy(...) as book:` exiting while a thread is still inside a call waits for it (every later call raises `ZlsxError`). Iterating a `Rows` is unlocked: one iterator per thread, and an iterator outlives the book's close through the C refcount — except over a `zlsx.open_sst_lazy` book, where each row's read or skip takes the lock too (a first touch of a shared string mutates the handle; measured: eight iterators over one such book abort without it, on `next()` and on `skip()`).
 
 Cancellable formula-engine calls (`recalculate`, `save_with_recalc`, `evaluate`, `Writer.save(recalculate=...)`) run their FFI call on a private worker thread while the calling thread waits interruptibly; the handle-synchronization rule above still applies — the worker is an implementation detail, not a license to share the handle.
 

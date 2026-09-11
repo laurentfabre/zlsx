@@ -489,8 +489,9 @@ def _serialized(method):
     getters, the workbook-wide getters, the iterator and matrix openers,
     :meth:`Book.close`; a :class:`Rows` iteration is unlocked — one
     iterator per thread, and it outlives a close through the C refcount —
-    except on a :func:`open_sst_lazy` book, where each row's read takes
-    the lock too (a first touch of a shared string mutates the handle)."""
+    except on a :func:`open_sst_lazy` book, where each row's read or
+    skip takes the lock too (a first touch of a shared string mutates
+    the handle)."""
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
@@ -546,7 +547,7 @@ class Book:
         #: (:meth:`shared_string_at`, a row that resolves to it); ``False``
         #: for every other opener, whose table is decoded at open. A
         #: :class:`Rows` over such a book takes the per-book lock for each
-        #: row it yields.
+        #: row it yields or skips.
         self.sst_lazy: bool = sst_lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
@@ -908,11 +909,12 @@ class Book:
         """Return shared-string entry ``sst_idx`` as a decoded UTF-8
         ``str``. Raises :class:`IndexError` on out-of-range. On a
         :func:`open_sst_lazy` book the entry is decoded on its first
-        touch and cached; a failure of that decode (its allocation)
-        raises :class:`ZlsxError` named after the reader's error where
-        the library reports it apart from the bound (libzlsx 0.9.0+,
-        ``zlsx_book_shared_string``; an older dylib folds both into
-        ``IndexError``). Requires libzlsx 0.2.6+."""
+        touch and cached; a failure of that decode (a malformed entity
+        the eager openers refuse at open — ``MalformedXml`` — or its
+        allocation) raises :class:`ZlsxError` named after the reader's
+        error where the library reports it apart from the bound (libzlsx
+        0.9.0+, ``zlsx_book_shared_string``; an older dylib folds every
+        failure into ``IndexError``). Requires libzlsx 0.2.6+."""
         if not self._handle:
             raise ZlsxError("book is closed")
         out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
@@ -928,7 +930,7 @@ class Book:
             )
             if rc != _ffi.ZLSX_OK:
                 name = _decode_err(self._err)
-                if name == "SstIndexOutOfRange":
+                if name == "SharedStringIndexOutOfRange":
                     raise IndexError(f"sst_idx {sst_idx} out of range")
                 raise ZlsxError(f"zlsx_book_shared_string({sst_idx}): {name}")
         else:
@@ -1361,6 +1363,12 @@ class Sheet:
 # ─── Rows ─────────────────────────────────────────────────────────────
 
 
+#: The context a `Rows` over an eager book enters per row — one shared
+#: instance, so the unlocked path pays no allocation (in-house r1
+#: A-PERF-103 / B-PY-101).
+_NO_LOCK = contextlib.nullcontext()
+
+
 class Rows:
     """Iterator over a sheet's rows. Normally constructed via
     :meth:`Sheet.rows`.
@@ -1379,6 +1387,16 @@ class Rows:
         # underlying Book handle until this iterator is closed.
         self._book = book
         self._current_len = 0
+        # On a book whose shared strings decode on first touch, a row's
+        # read — `next()`, and `skip()`, which the library drains through
+        # `next()` on a sheet with shared or array formulas — mutates
+        # the handle (the resolution cache and its arena), so two
+        # iterators on two threads over one such book race without the
+        # book's lock (in-house r1 THR-101, both reviewers, reproduced
+        # on `skip`); a Rows over every other book reads loaded state
+        # and stays unlocked (one iterator per thread). The lock
+        # outlives a close, as the iterator does.
+        self._row_ctx = book._lock if book.sst_lazy else _NO_LOCK
         if _handle is not None:
             # `Book.stream_sheet` opened the handle through the status
             # export; adopt it (the C handle already retains the book).
@@ -1407,13 +1425,7 @@ class Rows:
             raise ZlsxError("Rows iterator is closed")
         cells_ptr = _ffi.cell_ptr()
         cells_len = ctypes.c_size_t()
-        # On a book whose shared strings decode on first touch, a row's
-        # read mutates the handle (the resolution cache and its arena),
-        # so two iterators on two threads over one such book race
-        # without the book's lock — a Rows over every other book reads
-        # loaded state and stays unlocked (one iterator per thread).
-        # The lock outlives a close, as the iterator does.
-        with self._book._lock if self._book.sst_lazy else contextlib.nullcontext():
+        with self._row_ctx:
             rc = _ffi.lib.zlsx_rows_next(
                 self._handle,
                 ctypes.byref(cells_ptr),
@@ -1597,9 +1609,10 @@ class Rows:
             return skipped
 
         out = ctypes.c_size_t(0)
-        rc = _ffi.lib.zlsx_rows_skip(
-            self._handle, n, ctypes.byref(out), self._err, _ERR_BUF_LEN
-        )
+        with self._row_ctx:
+            rc = _ffi.lib.zlsx_rows_skip(
+                self._handle, n, ctypes.byref(out), self._err, _ERR_BUF_LEN
+            )
         # The previous row's cells are gone whether or not the skip
         # landed (the library empties its view before it reads); keep
         # the side-channel accessors from answering for a row that is
@@ -1780,7 +1793,8 @@ def open_lazy(path: Union[str, Path]) -> Book:
     same book; a close waits for the call in flight, and every later call
     raises :class:`ZlsxError`). Iterating a :class:`Rows` is unlocked: one
     iterator per thread, and it outlives a close through the C refcount
-    (on a :func:`open_sst_lazy` book each row's read takes the lock).
+    (on a :func:`open_sst_lazy` book each row's read or skip takes the
+    lock).
 
     Raises :class:`ZlsxError` on parse failure, named after the reader's
     error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).
@@ -1825,13 +1839,15 @@ def open_sst_lazy(path: Union[str, Path]) -> Book:
     table differently: on :func:`open` the torn entry swallows markup
     and the entries after it up to the next ``</t>`` (every later index
     shifts), while this opener bounds each entry by its ``</si>``, keeps
-    the ordinal and yields the text before the tear. The one failure
-    the deferral adds is the
-    allocation, at first touch instead of at open — :class:`ZlsxError`
-    from :meth:`Book.shared_string_at` or the row iteration. Threads may share the book as they share any other
+    the ordinal and yields the text before the tear. What the deferral
+    defers is the entity decode's verdict — a malformed entity that
+    :func:`open` refuses at open (``MalformedXml``) fails here at the
+    entry's first touch — and the allocation: :class:`ZlsxError` from
+    :meth:`Book.shared_string_at` or the row iteration, named after the
+    reader's error. Threads may share the book as they share any other
     (see :func:`open_lazy`), and here a :class:`Rows` takes the
-    per-book lock for each row it yields, since a first touch mutates
-    the handle.
+    per-book lock for each row it yields or skips, since a first touch
+    mutates the handle.
 
     Raises :class:`ZlsxError` on parse failure, named after the reader's
     error. Requires libzlsx 0.9.0+ (``zlsx_book_open_sst_lazy``).

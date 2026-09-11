@@ -455,13 +455,19 @@ export fn zlsx_book_stream_sheet(
 // (every later index shifts), the lazy one is bounded by its `</si>`,
 // keeps its ordinal and yields the text before the tear
 // (pinned in xlsx.zig; a pre-existing divergence of the reader,
-// recorded in §24, not this slice's to lift) — so the one failure the
-// deferral adds is the allocation: OOM at first touch instead of at
-// open. The legacy `zlsx_shared_string_at`
+// recorded in §24, not this slice's to lift). What the deferral
+// defers is the entity decode's verdict — a malformed entity is
+// `MalformedXml` at open on the eager openers and at first touch here
+// — and the allocation: OOM at first touch instead of at open. The
+// legacy `zlsx_shared_string_at`
 // folds that into its -1 beside out-of-range; `zlsx_book_shared_string`
+// folds both into its -1 beside out-of-range; `zlsx_book_shared_string`
 // is the same read under the status contract, where the bound is
-// -1 `SstIndexOutOfRange` and the allocation -3. No `zlsx_diag_v1`:
-// the reader's vocabulary is all -1 / -3 (§23's argument).
+// -1 `SharedStringIndexOutOfRange` (a statement about the call — the
+// S3c embeddable-rows read's `SstIndexOutOfRange` is a verdict on a
+// cell of the workbook and stays a -2 refusal), the deferred verdict
+// -1 `MalformedXml` and the allocation -3. No `zlsx_diag_v1`: the
+// reader's vocabulary is all -1 / -3 (§23's argument).
 
 /// Open an xlsx file with every sheet loaded and the file released
 /// (`zlsx_book_open`'s shape) but the shared-string table indexed
@@ -508,14 +514,15 @@ export fn zlsx_book_open_sst_lazy(
 
 /// Shared-string entry `sst_idx` under the status contract — the read
 /// `zlsx_shared_string_at` performs, with the failure classified:
-/// -1 `SstIndexOutOfRange` for an index past `zlsx_shared_string_count`
-/// (judged before the reader is asked, on every handle), -3 for the
-/// allocation a lazy handle's first touch of the entry may fail (the
-/// legacy getter's -1 covers both), -1 `InvalidInput` for a NULL book,
-/// -1 `NullOutPointer` for a NULL `out_ptr` or `out_len`. On ZLSX_OK
-/// the slice points into the handle's storage (valid until the handle
-/// is closed; do not free); on any other status `*out_ptr` is "" and
-/// `*out_len` 0.
+/// -1 `SharedStringIndexOutOfRange` for an index past
+/// `zlsx_shared_string_count` (judged before the reader is asked, on
+/// every handle), -1 `MalformedXml` for the entity verdict an SST-lazy
+/// handle's first touch of the entry defers and -3 for its allocation
+/// (the legacy getter's -1 covers all three), -1 `InvalidInput` for a
+/// NULL book, -1 `NullOutPointer` for a NULL `out_ptr` or `out_len`.
+/// On ZLSX_OK the slice points into the handle's storage (valid until
+/// the handle is closed; do not free); on any other status `*out_ptr`
+/// is "" and `*out_len` 0 (a NULL one cannot be reset; the other is).
 export fn zlsx_book_shared_string(
     book: ?*Book,
     sst_idx: usize,
@@ -524,6 +531,8 @@ export fn zlsx_book_shared_string(
     err_buf: ?[*]u8,
     err_buf_len: usize,
 ) callconv(.c) i32 {
+    if (out_ptr) |p| p.* = @ptrCast("");
+    if (out_len) |l| l.* = 0;
     const ptr_slot = out_ptr orelse {
         writeError(err_buf, err_buf_len, "NullOutPointer");
         return ZLSX_ERROR;
@@ -532,11 +541,9 @@ export fn zlsx_book_shared_string(
         writeError(err_buf, err_buf_len, "NullOutPointer");
         return ZLSX_ERROR;
     };
-    ptr_slot.* = @ptrCast("");
-    len_slot.* = 0;
     const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     if (sst_idx >= state.inner.sharedStringsCount()) {
-        writeError(err_buf, err_buf_len, "SstIndexOutOfRange");
+        writeError(err_buf, err_buf_len, "SharedStringIndexOutOfRange");
         return ZLSX_ERROR;
     }
     const s = state.inner.sharedStringAt(sst_idx) catch |e|
@@ -10459,24 +10466,32 @@ test "S3e lazy SST: the opener indexes the table and loads every sheet; each tou
     }
     try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
 
-    // Out of range is -1 SstIndexOutOfRange on the status read — the
+    // Out of range is -1 SharedStringIndexOutOfRange on the status read — the
     // first index past the end and the far end of the usize range —
     // judged before the reader, the outputs "" / 0; the legacy getter
     // folds it to its -1.
     s_ptr = @ptrFromInt(@alignOf(usize));
     s_len = 99;
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 6, &s_ptr, &s_len, &err_buf, err_buf.len));
-    try std.testing.expectEqualStrings("SstIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
     try std.testing.expectEqual(@as(usize, 0), s_len);
-    try std.testing.expectEqualStrings("", s_ptr[0..s_len]);
+    // The pointer is reset to the "" sentinel, not left at the poison
+    // (in-house r1 A-TST-105 / B-TST-101: `s_ptr[0..0]` compared equal
+    // for any pointer).
+    try std.testing.expect(@intFromPtr(s_ptr) != @alignOf(usize));
+    try std.testing.expectEqual(@as(u8, 0), s_ptr[0]);
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, std.math.maxInt(usize), &s_ptr, &s_len, &err_buf, err_buf.len));
-    try std.testing.expectEqualStrings("SstIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
     try std.testing.expectEqual(@as(i32, -1), zlsx_shared_string_at(book, 6, &s_ptr, &s_len));
     // A NULL output or a NULL book is a statement about the call.
+    s_len = 99;
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 0, null, &s_len, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), s_len); // the present output is reset (r1 B-ABI-101)
+    s_ptr = @ptrFromInt(@alignOf(usize));
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 0, &s_ptr, null, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(u8, 0), s_ptr[0]);
     s_len = 99;
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(null, 0, &s_ptr, &s_len, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
@@ -10529,7 +10544,7 @@ test "S3e lazy SST: the opener's own failures; the status read on the eager open
     try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(eager, 1, &s_ptr, &s_len, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("beta", s_ptr[0..s_len]);
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(eager, 6, &s_ptr, &s_len, &err_buf, err_buf.len));
-    try std.testing.expectEqualStrings("SstIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
     {
         var lazy_slot: ?*Book = null;
         try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_lazy(path, &lazy_slot, &err_buf, err_buf.len));

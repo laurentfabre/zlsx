@@ -194,11 +194,13 @@ int32_t zlsx_book_stream_sheet(zlsx_book_t * book,
  * zlsx_book_open() the torn entry swallows markup and the entries
  * after it up to the next </t> (every later index shifts); this opener
  * bounds each entry by its </si>, keeps the ordinal and yields the
- * text before the tear. The one failure the
- * deferral adds is the allocation — OOM at first touch instead of at
- * open, which the legacy zlsx_shared_string_at() folds into its -1
- * beside out-of-range and zlsx_book_shared_string() reports as
- * ZLSX_NOMEM. A first touch
+ * text before the tear. What the deferral defers is the entity
+ * decode's verdict — a malformed entity is MalformedXml at open on
+ * zlsx_book_open() and at first touch here — and the allocation — OOM
+ * at first touch instead of at open; the legacy zlsx_shared_string_at()
+ * folds both into its -1 beside out-of-range, zlsx_book_shared_string()
+ * reports them as ZLSX_ERROR MalformedXml and ZLSX_NOMEM, and a row
+ * iterator's zlsx_rows_next() as -1 with the name. A first touch
  * mutates the handle: same-handle calls are externally synchronized
  * (the contract at the top of this header).
  *
@@ -217,15 +219,18 @@ int32_t zlsx_book_open_sst_lazy(const char  * path,
 /*
  * Shared-string entry `sst_idx` under zlsx_status_v1 — the read
  * zlsx_shared_string_at() performs, with the failure classified:
- * ZLSX_ERROR SstIndexOutOfRange for an index past
+ * ZLSX_ERROR SharedStringIndexOutOfRange for an index past
  * zlsx_shared_string_count() (judged before the reader, on every
- * handle); ZLSX_NOMEM for the allocation a handle from
- * zlsx_book_open_sst_lazy() may fail on the entry's first touch (the
- * legacy getter's -1 covers both); ZLSX_ERROR InvalidInput for a NULL
- * book; ZLSX_ERROR NullOutPointer for a NULL `out_ptr` or `out_len`.
- * On ZLSX_OK the slice points into the handle's storage (valid until
- * the handle is closed; do not free); on any other status *out_ptr is
- * "" and *out_len 0.
+ * handle — a statement about the call; the embeddable-rows read's
+ * SstIndexOutOfRange is a verdict on a cell and stays ZLSX_REFUSED);
+ * ZLSX_ERROR MalformedXml for the entity verdict a handle from
+ * zlsx_book_open_sst_lazy() defers to the entry's first touch and
+ * ZLSX_NOMEM for its allocation (the legacy getter's -1 covers all
+ * three); ZLSX_ERROR InvalidInput for a NULL book; ZLSX_ERROR
+ * NullOutPointer for a NULL `out_ptr` or `out_len`. On ZLSX_OK the
+ * slice points into the handle's storage (valid until the handle is
+ * closed; do not free); on any other status *out_ptr is "" and
+ * *out_len 0 (a NULL one cannot be reset; the other is).
  */
 int32_t zlsx_book_shared_string(zlsx_book_t   * book,
                                 size_t          sst_idx,
@@ -528,8 +533,9 @@ size_t zlsx_shared_string_count(zlsx_book_t * book);
  * Copy SST entry `sst_idx` into `*out_ptr` / `*out_len`. Slice into
  * Book-owned storage; do not free. Returns 0 on success, -1 on
  * out-of-range — and, on a handle from zlsx_book_open_sst_lazy(), on
- * the allocation the entry's first touch may fail; zlsx_book_shared_string()
- * is the same read with the two told apart.
+ * the entity verdict or the allocation the entry's first touch may
+ * fail; zlsx_book_shared_string() is the same read with the three
+ * told apart.
  */
 int32_t zlsx_shared_string_at(zlsx_book_t *     book,
                               size_t            sst_idx,

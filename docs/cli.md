@@ -890,8 +890,9 @@ selectors are tolerated and ignored).
                               # cell access (huge-workbook RAM mitigation; sparse access
                               # wins, full sweeps cost a bit more). Neither backend refuses
                               # a torn <t>: eager swallows past it up to the next </t>
-                              # (later indices shift), lazy keeps its ordinal; the one added failure
-                              # is the allocation, at first access, not at open.
+                              # (later indices shift), lazy keeps its ordinal. A malformed
+                              # entity (MalformedXml) and the allocation surface at first
+                              # access instead of at open.
 ```
 
 **Output modes**:
