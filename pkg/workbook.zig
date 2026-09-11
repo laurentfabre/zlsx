@@ -1552,12 +1552,12 @@ pub const Workbook = struct {
     /// next transaction on this workbook that would build a candidate
     /// refuses `RecalcRequiresReopen` (its candidate, the archive as
     /// opened again, could not carry it) — save and re-open, as after
-    /// `save`; a transaction that carried nothing leaves the next one
-    /// legal, and a workbook with nothing to recalculate keeps its
-    /// `.none` arm — legal, and re-derived from the archive as opened:
-    /// a patch the earlier run installed that this run finds fresh in
-    /// the live bytes is not re-staged (the recorded revert, contract
-    /// §22; one transaction per open, or save and re-open between two).
+    /// `save`; a workbook with nothing to recalculate keeps its `.none`
+    /// arm. A transaction after one that carried nothing is legal, and
+    /// re-derived from the archive as opened: a patch the earlier run
+    /// installed that this run finds fresh in the live bytes is not
+    /// re-staged (the recorded revert, contract §22; one transaction
+    /// per open, or save and re-open between two).
     /// A pivot cache a staged write lands in takes the refresh marker
     /// alone, where the plain save also rebuilds it where it can. A
     /// staged `.formula` delta is
@@ -4602,7 +4602,6 @@ pub const Workbook = struct {
     /// candidate renders the same plans over it with
     /// `foldSavePlansInto` instead.
     pub fn applySavePlans(self: *Workbook) Error!void {
-
         // A torn model must not ship (Codex #208 r2 REL-201).
         try self.requireCompleteStructuralState();
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
@@ -4740,6 +4739,18 @@ pub const Workbook = struct {
             try self.renderDefinedNamesPlanInto(next, existing.defined_names);
         }
 
+        // Phases 0b, 1 and 2 are the writes': nothing to mark or render,
+        // no part to parse, when no sheet holds one (in-house fold r3
+        // A-PERF-302, r4 B-PERF-401).
+        var any_writes = false;
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0) {
+                any_writes = true;
+                break;
+            }
+        }
+        if (!any_writes) return;
+
         // Phase 0b: the refresh marker on every cache a staged write
         // lands in — the graph walked over the candidate's workbook.xml
         // as just spliced, as the save walks it over the re-parsed live
@@ -4751,18 +4762,6 @@ pub const Workbook = struct {
             defer spliced.deinit(a);
             try self.markPivotCachesForCellWritesInto(next, &spliced);
         }
-
-        // Phases 1 and 2 are the sheets': nothing to render, and no
-        // table to parse, when no sheet holds a write (in-house fold r3
-        // A-PERF-302).
-        var any_writes = false;
-        for (self.worksheets) |*ws| {
-            if (ws.deltas.count() > 0) {
-                any_writes = true;
-                break;
-            }
-        }
-        if (!any_writes) return;
 
         // Phase 1: the SST extension, against the candidate's table.
         var sst_view: ?sst_xml_mod.SstXml = null;
@@ -6099,7 +6098,10 @@ pub const Workbook = struct {
             // a book view is not one), else before `</workbook>`. One
             // anchor for the two splices, so they commute in either
             // order (in-house fold r2 B-REL-203, r3 A-REL-301); a part
-            // the reader refuses falls back to `</workbook>` as before.
+            // the reader refuses (a `fullPrecision="0"` calcPr, say —
+            // a workbook this layer opens and saves) keeps the
+            // `<calcPr` anchor it always had, then `</workbook>` (r4
+            // A-REL-401).
             const insert_at: usize = blk: {
                 var parsed = try engine.calc.parseCalcState(a, src);
                 switch (parsed) {
@@ -6108,7 +6110,7 @@ pub const Workbook = struct {
                         if (state.spans.element.end > state.spans.element.start) break :blk state.spans.element.start;
                         if (state.spans.insert_at) |i| break :blk i;
                     },
-                    .refused => {},
+                    .refused => if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i,
                 }
                 if (std.mem.indexOf(u8, src, "</workbook>")) |i| break :blk i;
                 return error.MalformedXml;

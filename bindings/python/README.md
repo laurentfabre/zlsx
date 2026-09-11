@@ -146,8 +146,12 @@ report = ed.recalculate()                       # RecalcReport
 print(report.cells_written, report.resolved.now, report.resolved.seed)
 
 # Atomic file transaction (§5.7.9): recalc, write, rename, THEN swap.
-# A pre-commit failure leaves the destination's prior bytes (or its
-# absence) and this editor's memory untouched.
+# The file is the plain save plus the recalc (staged cell writes go in
+# and are drained at the swap). A pre-commit failure leaves the
+# destination's prior bytes (or its absence) and this editor's memory
+# untouched on the candidate arm; a workbook with nothing to
+# recalculate is a plain save. The next transaction that would build a
+# candidate then refuses RecalcRequiresReopen: save and re-open.
 report = ed.save_with_recalc("model_out.xlsx", timeout=30.0)
 
 # Standalone cache-based evaluation — never mutates anything.

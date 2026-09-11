@@ -2977,6 +2977,49 @@ test "measured, recorded: recalculate then saveWithRecalc in one open — the fi
     try testing.expectEqualStrings("999", try cellCache(try reopened.sheet(0), "B1"));
 }
 
+test "save-plan fold: a workbook whose calc state the reader refuses keeps the names splice's `<calcPr` anchor — the plain save and the arm with nothing to recalculate both place the block before it" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const saved = try std.fs.path.join(a, &.{ dir, "saved.xlsx" });
+    defer a.free(saved);
+    // `fullPrecision="0"` refuses through all of v1 (§5.4c): the reader
+    // has no slot to offer, and the splice must not fall past the
+    // element to `</workbook>` (in-house fold r4 A-REL-401).
+    const path = try writeFixture(a, io, dir, "in.xlsx", .{
+        .sheet = sheet_no_formula,
+        .calc_pr = "<calcPr calcId=\"191029\" fullPrecision=\"0\"/>",
+    });
+    defer a.free(path);
+
+    for ([_][]const u8{ out, saved }) |dest| {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
+        if (dest.ptr == out.ptr) {
+            var r = try wb.saveWithRecalc(a, io, dest, fixed_run, .{});
+            r.deinit(a);
+        } else {
+            try wb.save(io, dest);
+        }
+        var reopened = try Workbook.open(a, io, dest);
+        defer reopened.deinit();
+        const wb_xml = ((try reopened.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult).bytes;
+        const names_at = std.mem.indexOf(u8, wb_xml, "<definedNames>") orelse return error.TestUnexpectedResult;
+        const calc_at = std.mem.indexOf(u8, wb_xml, "<calcPr") orelse return error.TestUnexpectedResult;
+        try testing.expect(names_at < calc_at);
+        try testing.expect(std.mem.indexOf(u8, wb_xml, "fullPrecision=\"0\"") != null);
+    }
+}
+
 test "save-plan fold: a shared-string write over a workbook without a table lands the table, its relationship and its content type in the file on both arms, an inline string beside it" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
