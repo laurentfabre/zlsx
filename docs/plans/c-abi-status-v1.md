@@ -2807,7 +2807,9 @@ fails the probe test, not skips.
 
 **Tests** (`src/c_abi.zig`, "S3e lazy sheets: …"; `tests/c_abi_smoke.c`
 `#error`s without the macro and takes the three addresses;
-`test_basic.py`, "open_lazy" / "lazy_sheets"): the deferral and the four
+`test_basic.py`, the "S3e slice 1" section — nine tests: the
+`open_lazy` / `stream_sheet` / `eager_books` / `close_waits` /
+`threads_may_share` / `lazy_sheets_probe` names): the deferral and the four
 load paths, idempotent preload, out of range on both calls, NULL out,
 the missing / garbage file names with the slot nulled, the iterator
 outliving the book, the eager and buffer openers already loaded, the

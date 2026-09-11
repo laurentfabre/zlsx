@@ -4792,7 +4792,12 @@ def test_close_waits_for_in_flight_per_sheet_calls(tmp_path):
                     book.shared_string_at(0)
                     book.cell_font(0)
             except zlsx.ZlsxError as exc:
-                assert "closed" in str(exc)
+                # An assert here would escape the thread as a pytest
+                # WARNING, not a failure (in-house r4 S3E1-TEST-401): a
+                # ZlsxError other than the closed-book one is a defect
+                # the main thread must see.
+                if "closed" not in str(exc):
+                    errors.append(exc)
             except Exception as exc:  # pragma: no cover — surfaced below
                 errors.append(exc)
 
