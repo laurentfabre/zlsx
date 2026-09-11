@@ -4649,6 +4649,38 @@ def test_open_lazy_defers_every_sheet_and_each_touch_loads_one(tmp_path):
         assert [len(book.merged_ranges(i)) for i in range(4)] == [1, 1, 1, 1]
 
 
+def test_stream_sheet_adopts_the_status_handle_and_never_reopens(tmp_path, monkeypatch):
+    """`Rows` adopts the handle `zlsx_book_stream_sheet` wrote; a `Rows`
+    that fell through to `zlsx_rows_open` would still read the right
+    sheet and leak the status handle (in-house r1 S3E1-TEST-103)."""
+    _require_lazy_sheets()
+    import zlsx._ffi as ffi
+    path = tmp_path / "lazy_adopt.xlsx"
+    _lazy_workbook(path)
+    written = []
+    real_stream = ffi.lib.zlsx_book_stream_sheet
+
+    def spy_stream(handle, idx, out, err, err_len):
+        rc = real_stream(handle, idx, out, err, err_len)
+        written.append(out._obj.value)
+        return rc
+
+    def no_reopen(*args):
+        raise AssertionError("stream_sheet must not re-open through zlsx_rows_open")
+
+    monkeypatch.setattr(ffi.lib, "zlsx_book_stream_sheet", spy_stream)
+    monkeypatch.setattr(ffi.lib, "zlsx_rows_open", no_reopen)
+    with zlsx.open_lazy(path) as book:
+        rows = book.stream_sheet("Two")
+        assert written and rows._handle == written[0]
+        assert list(rows) == [["Two", 1]]
+        rows.close()
+    # `_handle` is keyword-only: the public constructor's contract is
+    # (book, sheet_idx) and nothing else.
+    with pytest.raises(TypeError):
+        zlsx.Rows(book, 0, 12345)
+
+
 def test_open_lazy_selector_errors_come_before_the_probe(tmp_path, monkeypatch):
     _require_lazy_sheets()
     import zlsx._ffi as ffi
@@ -4731,3 +4763,52 @@ def test_lazy_sheets_probe_agrees_with_the_library_version():
     major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
     if (major, minor) >= (0, 9):
         assert ffi._HAS_LAZY_SHEETS, "libzlsx >= 0.9.0 must export zlsx_book_open_lazy / _preload_sheet / _stream_sheet"
+    # The probe is the trio, not two of them (in-house r1 S3E1-TEST-104).
+    if ffi._HAS_LAZY_SHEETS:
+        assert all(
+            hasattr(ffi.lib, sym)
+            for sym in ("zlsx_book_open_lazy", "zlsx_book_preload_sheet", "zlsx_book_stream_sheet")
+        )
+
+
+def test_threads_may_share_one_lazy_book(tmp_path):
+    """Eight threads on ONE lazy book, each streaming its own sheet and
+    reading another sheet's merged ranges — the shape that segfaulted
+    without the per-book lock (in-house r1 S3E1-DOC-103: ctypes
+    releases the GIL, and a lazy handle's first touch mutates it). A
+    regression here is a crash of the test process, not an assertion."""
+    _require_lazy_sheets()
+    import threading
+
+    path = tmp_path / "lazy_threads.xlsx"
+    with zlsx.write(path) as w:
+        for i in range(8):
+            sheet = w.add_sheet(f"S{i}")
+            for r in range(200):
+                sheet.write_row([f"S{i}", r])
+            sheet.add_merged_cell("A1:B1")
+    for _ in range(20):
+        book = zlsx.open_lazy(path)
+        seen = [None] * 8
+        errors = []
+
+        def worker(i):
+            try:
+                n = 0
+                for row in book.stream_sheet(i):
+                    assert row[0] == f"S{i}"
+                    n += 1
+                seen[i] = n
+                book.merged_ranges((i + 1) % 8)
+                book.hyperlinks((i + 3) % 8)
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors and seen == [200] * 8
+        assert [len(book.merged_ranges(i)) for i in range(8)] == [1] * 8
+        book.close()

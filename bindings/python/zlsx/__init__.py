@@ -31,6 +31,7 @@ apart (libzlsx 0.9.0+).
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import threading
 import time
@@ -474,6 +475,22 @@ class Alignment:
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
+def _serialized(method):
+    """Run ``method`` under the book's lock. The C library does not lock
+    a handle (its same-handle rule is the caller's), and ctypes releases
+    the GIL around every foreign call, so two Python threads sharing one
+    :class:`Book` reach the library concurrently; on a :func:`open_lazy`
+    book a first touch of a sheet mutates the handle and a concurrent
+    per-sheet read on another sheet is a crash. The lock covers the
+    calls that load or read per-sheet state; a :class:`Rows` iteration
+    is unlocked — one iterator per thread."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class Book:
     """A workbook handle. Use :func:`zlsx.open` (every sheet loaded at
     open, the file released before it returns), :func:`zlsx.open_bytes`
@@ -500,11 +517,17 @@ class Book:
         callers enumerate them, and the list is short (<10 in typical
         workbooks). Shared by the path, buffer and lazy constructors."""
         self._handle = handle
+        # Re-entrant: `Sheet.read_all` and the iterator constructors take
+        # it from inside methods that already hold it.
+        self._lock = threading.RLock()
         #: ``True`` for a book from :func:`open_lazy` — its sheets load on
         #: first touch (:meth:`preload_sheet`, :meth:`stream_sheet`,
         #: :meth:`Sheet.rows`) and the file stays open until the last
         #: handle closes; ``False`` for :func:`open` / :func:`open_bytes`,
         #: whose sheets are all loaded before the constructor returns.
+        #: Threads may share a book, lazy or eager: the calls that load
+        #: or read per-sheet state are serialised by a per-book lock
+        #: (see :func:`open_lazy`); a :class:`Rows` is one thread's.
         self.lazy: bool = lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
@@ -582,6 +605,7 @@ class Book:
             # A code this binding does not know — a newer library.
             raise ZlsxError(f"zlsx_sheet_state({idx}) returned {code}") from None
 
+    @_serialized
     def preload_sheet(self, selector: Union[int, str]) -> None:
         """Load one sheet now — its XML and side indices — so
         :meth:`merged_ranges`, :meth:`hyperlinks`, :meth:`data_validations`
@@ -606,6 +630,7 @@ class Book:
         if rc != _ffi.ZLSX_OK:
             raise ZlsxError(f"zlsx_book_preload_sheet({idx}): {_decode_err(self._err)}")
 
+    @_serialized
     def stream_sheet(self, selector: Union[int, str]) -> "Rows":
         """A row iterator over one sheet, by 0-based index or by name —
         :meth:`Sheet.rows` through ``zlsx_book_stream_sheet``, the
@@ -629,6 +654,7 @@ class Book:
             raise ZlsxError(f"zlsx_book_stream_sheet({idx}): {_decode_err(self._err)}")
         return Rows(self, idx, _handle=handle.value)
 
+    @_serialized
     def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:
         """Merged cell ranges declared in sheet ``sheet_idx``'s
         ``<mergeCells>`` block. Returns an empty list for sheets
@@ -657,6 +683,7 @@ class Book:
             ))
         return out
 
+    @_serialized
     def hyperlinks(self, sheet_idx: int) -> list[Hyperlink]:
         """Hyperlinks declared on sheet ``sheet_idx``, resolved through
         the sheet's ``_rels/sheet{N}.xml.rels`` file. Both external
@@ -699,6 +726,7 @@ class Book:
             ))
         return out
 
+    @_serialized
     def comments(self, sheet_idx: int) -> list[Comment]:
         """Cell comments declared on sheet ``sheet_idx`` (from
         ``xl/comments*.xml`` discovered via the sheet's rels).
@@ -767,6 +795,7 @@ class Book:
             ))
         return out
 
+    @_serialized
     def data_validations(self, sheet_idx: int) -> list[DataValidation]:
         """Data validations on ``sheet_idx`` (dropdowns + numeric / date
         / time / text-length / custom). Empty list for sheets without a
@@ -1204,9 +1233,10 @@ class Sheet:
             return (all_rows[0], all_rows[1:])
 
         err = ctypes.create_string_buffer(_ERR_BUF_LEN)
-        handle = _ffi.lib.zlsx_matrix_open(
-            self._book._handle, self.index, err, _ERR_BUF_LEN
-        )
+        with self._book._lock:
+            handle = _ffi.lib.zlsx_matrix_open(
+                self._book._handle, self.index, err, _ERR_BUF_LEN
+            )
         if not handle:
             raise ZlsxError(f"zlsx_matrix_open: {_decode_err(err)}")
         try:
@@ -1275,7 +1305,7 @@ class Rows:
     immediately to avoid dangling references.
     """
 
-    def __init__(self, book: Book, sheet_idx: int, _handle=None):
+    def __init__(self, book: Book, sheet_idx: int, *, _handle=None):
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
         # Hold a reference to the Python Book so callers using iter29
         # helpers (`style_indices`, `number_format`) don't have to
@@ -1288,9 +1318,12 @@ class Rows:
             # export; adopt it (the C handle already retains the book).
             self._handle = _handle
             return
-        self._handle = _ffi.lib.zlsx_rows_open(
-            book._handle, sheet_idx, self._err, _ERR_BUF_LEN
-        )
+        # The legacy opener loads the sheet on demand on a lazy book —
+        # under the book's lock, like every other per-sheet touch.
+        with book._lock:
+            self._handle = _ffi.lib.zlsx_rows_open(
+                book._handle, sheet_idx, self._err, _ERR_BUF_LEN
+            )
         if not self._handle:
             raise ZlsxError(f"zlsx_rows_open: {_decode_err(self._err)}")
 
@@ -1653,6 +1686,16 @@ def open_lazy(path: Union[str, Path]) -> Book:
         with zlsx.open_lazy("wide.xlsx") as book:
             for row in book.stream_sheet("Q3"):
                 ...
+
+    Threads may share one book: the C library does not lock a handle (its
+    same-handle rule is the caller's — a lazy handle's first touch of a
+    sheet mutates it, and ctypes releases the GIL around every foreign
+    call), so py-zlsx serialises the calls that load or read per-sheet
+    state — :meth:`Book.preload_sheet`, :meth:`Book.stream_sheet`,
+    :meth:`Sheet.rows`, :meth:`Sheet.read_all`, :meth:`Book.merged_ranges`
+    and its siblings — with a per-book lock, on lazy and eager books
+    alike. Iterating a :class:`Rows` is unlocked: one iterator per
+    thread.
 
     Raises :class:`ZlsxError` on parse failure, named after the reader's
     error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).

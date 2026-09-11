@@ -303,6 +303,139 @@ export fn zlsx_book_open_buffer(
     return @ptrCast(state);
 }
 
+// ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
+//
+// `Book.openLazy` / `preloadSheet` / `streamSheet` under `zlsx_status_v1`
+// (§23). The lazy handle is a `BookState` like the eager ones — the
+// same refcount, the same per-sheet getters, the same row iterators —
+// whose archive stays open for the handle's lifetime and whose sheets
+// are extracted on first touch. The touch is a mutation of the Book
+// (`sheet_data` and the side-index maps grow), which the header's
+// same-handle rule already covers: operations on one handle are
+// externally synchronised, so two threads streaming two sheets of one
+// lazy handle is the caller's lock to take. Distinct handles stay
+// independent.
+//
+// No `zlsx_diag_v1` on any of the three: the reader's vocabulary
+// (`BadZip`, `MalformedXml`, `MissingSheet`, `ZipBombSuspected`, …) has
+// no Plane-2 member and no structural verdict — `statusOf` folds every
+// name to -1 (pinned below), OOM to -3 — so a diag would never be
+// written. `zlsx_open_buffer`'s shipped shape. NULL where a pointer is
+// required is -1 (§2: a statement about the call): `NullPath`,
+// `NullOutPointer`, and `InvalidInput` for a NULL book — the S3a
+// spelling, through `bookStateOrNull`.
+
+/// The status exports' handle argument: NULL is `InvalidInput` (-1),
+/// the `editorStateOrNull` twin — the legacy reader family takes a
+/// non-null `*Book` and leaves NULL undefined.
+fn bookStateOrNull(book: ?*Book, err_buf: ?[*]u8, err_buf_len: usize) ?*BookState {
+    const b = book orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return null;
+    };
+    return @ptrCast(@alignCast(b));
+}
+
+/// Open an xlsx file lazily: the central directory, the shared strings,
+/// the styles and the theme are read now; sheet XML and the per-sheet
+/// side indices (merged ranges, hyperlinks, data validations, comments)
+/// are extracted on first touch — `zlsx_book_preload_sheet`,
+/// `zlsx_book_stream_sheet`, `zlsx_rows_open`, `zlsx_matrix_open`. Until
+/// then the per-sheet getters answer for an unloaded sheet as for a
+/// sheet that has none (`Book.openLazy`'s getter contract). The archive
+/// file stays open until the last reference on the handle drops (row
+/// and matrix handles included), so the source cannot be renamed or
+/// deleted on Windows while any is live; `zlsx_book_open` releases it
+/// before returning. On ZLSX_OK `*out` holds the handle (close with
+/// `zlsx_book_close`); on any other status `*out` is NULL. A NULL `out`
+/// is -1 `NullOutPointer`, a NULL `path` -1 `NullPath`, both before the
+/// file is touched.
+export fn zlsx_book_open_lazy(
+    path_ptr: ?[*:0]const u8,
+    out: ?*?*Book,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const path = std.mem.span(path_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullPath");
+        return ZLSX_ERROR;
+    });
+    // The `zlsx_book_open` ownership shape: the handle owns its Io,
+    // allocated first so the Threaded never moves after init.
+    const state = gpa.create(BookState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
+    state.inner = xlsx.Book.openLazy(gpa, state.threaded.io(), path) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    slot.* = @ptrCast(state);
+    return ZLSX_OK;
+}
+
+/// Load sheet `idx`'s XML and side indices now, so the per-sheet
+/// getters answer for it without a row iteration (`Book.preloadSheet`).
+/// Idempotent — a loaded sheet is a hashmap hit, and on a handle from
+/// `zlsx_book_open` or `zlsx_book_open_buffer` every sheet already is,
+/// so the call is a no-op there. `idx` out of range is -1
+/// `SheetIndexOutOfRange` and a NULL `book` -1 `InvalidInput` (statements
+/// about the call); an archive or sheet-part error is -1 with the
+/// reader's name in errbuf; OOM is -3.
+/// A failure after the extraction leaves the sheet loaded with partial
+/// side indices, which the reader tolerates (each parser is
+/// no-op-on-missing) — the next call is the hashmap hit, not a retry.
+export fn zlsx_book_preload_sheet(
+    book: ?*Book,
+    idx: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (idx >= state.inner.sheets.len) {
+        writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
+        return ZLSX_ERROR;
+    }
+    state.inner.preloadSheet(state.inner.sheets[idx]) catch |e|
+        return failMapped(e, null, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Open a row iterator for sheet `idx` under the status contract
+/// (`Book.streamSheet`): the same iterator `zlsx_rows_open` returns,
+/// loading the sheet on demand on a lazy handle, with the failure
+/// classified — -1 `SheetIndexOutOfRange`, -1 `InvalidInput` for a
+/// NULL `book`, -1 `NullOutPointer`, -1 with the reader's name for an
+/// archive or sheet-part error, -3 for OOM — instead of NULL.
+/// On ZLSX_OK `*out` holds the handle (close with `zlsx_rows_close`;
+/// it retains the book, so the book may be closed first); on any other
+/// status `*out` is NULL.
+export fn zlsx_book_stream_sheet(
+    book: ?*Book,
+    idx: u32,
+    out: ?*?*Rows,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const rs = rowsOpenInner(state, idx) catch |e|
+        return failMapped(e, null, err_buf, err_buf_len);
+    slot.* = @ptrCast(rs);
+    return ZLSX_OK;
+}
+
 /// Drop the caller's reference to a Book. Safe to call with NULL (no-op).
 /// Active row iterators hold their own references, so this will not
 /// prematurely free the underlying state while rows are still being read.
@@ -929,118 +1062,6 @@ export fn zlsx_rows_close(rows: ?*Rows) callconv(.c) void {
         gpa.destroy(rs);
         book.unref();
     }
-}
-
-// ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
-//
-// `Book.openLazy` / `preloadSheet` / `streamSheet` under `zlsx_status_v1`
-// (§23). The lazy handle is a `BookState` like the eager ones — the
-// same refcount, the same per-sheet getters, the same row iterators —
-// whose archive stays open for the handle's lifetime and whose sheets
-// are extracted on first touch. The touch is a mutation of the Book
-// (`sheet_data` and the side-index maps grow), which the header's
-// same-handle rule already covers: operations on one handle are
-// externally synchronised, so two threads streaming two sheets of one
-// lazy handle is the caller's lock to take. Distinct handles stay
-// independent.
-//
-// No `zlsx_diag_v1` on any of the three: the reader's vocabulary
-// (`BadZip`, `MalformedXml`, `MissingSheet`, `ZipBombSuspected`, …) has
-// no Plane-2 member and no structural verdict — `statusOf` folds every
-// name to -1 (pinned below), OOM to -3 — so a diag would never be
-// written. `zlsx_open_buffer`'s shipped shape.
-
-/// Open an xlsx file lazily: the central directory, the shared strings,
-/// the styles and the theme are read now; sheet XML and the per-sheet
-/// side indices (merged ranges, hyperlinks, data validations, comments)
-/// are extracted on first touch — `zlsx_book_preload_sheet`,
-/// `zlsx_book_stream_sheet`, `zlsx_rows_open`, `zlsx_matrix_open`. Until
-/// then the per-sheet getters answer for an unloaded sheet as for a
-/// sheet that has none (`Book.openLazy`'s getter contract). The archive
-/// file stays open until the last reference on the handle drops (row
-/// and matrix handles included), so the source cannot be renamed or
-/// deleted on Windows while any is live; `zlsx_book_open` releases it
-/// before returning. On ZLSX_OK `*out` holds the handle (close with
-/// `zlsx_book_close`); on any other status `*out` is NULL.
-export fn zlsx_book_open_lazy(
-    path_ptr: [*:0]const u8,
-    out: ?*?*Book,
-    err_buf: ?[*]u8,
-    err_buf_len: usize,
-) callconv(.c) i32 {
-    const slot = out orelse {
-        writeError(err_buf, err_buf_len, "NullOutPointer");
-        return ZLSX_ERROR;
-    };
-    slot.* = null;
-    const path = std.mem.span(path_ptr);
-    // The `zlsx_book_open` ownership shape: the handle owns its Io,
-    // allocated first so the Threaded never moves after init.
-    const state = gpa.create(BookState) catch {
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        return ZLSX_NOMEM;
-    };
-    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
-    state.inner = xlsx.Book.openLazy(gpa, state.threaded.io(), path) catch |e| {
-        state.threaded.deinit();
-        gpa.destroy(state);
-        return failMapped(e, null, err_buf, err_buf_len);
-    };
-    slot.* = @ptrCast(state);
-    return ZLSX_OK;
-}
-
-/// Load sheet `idx`'s XML and side indices now, so the per-sheet
-/// getters answer for it without a row iteration (`Book.preloadSheet`).
-/// Idempotent — a loaded sheet is a hashmap hit, and on a handle from
-/// `zlsx_book_open` or `zlsx_book_open_buffer` every sheet already is,
-/// so the call is a no-op there. `idx` out of range is -1
-/// `SheetIndexOutOfRange` (a statement about the call); an archive or
-/// sheet-part error is -1 with the reader's name in errbuf; OOM is -3.
-/// A failure after the extraction leaves the sheet loaded with partial
-/// side indices, which the reader tolerates (each parser is
-/// no-op-on-missing) — the next call is the hashmap hit, not a retry.
-export fn zlsx_book_preload_sheet(
-    book: *Book,
-    idx: u32,
-    err_buf: ?[*]u8,
-    err_buf_len: usize,
-) callconv(.c) i32 {
-    const state: *BookState = @ptrCast(@alignCast(book));
-    if (idx >= state.inner.sheets.len) {
-        writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
-        return ZLSX_ERROR;
-    }
-    state.inner.preloadSheet(state.inner.sheets[idx]) catch |e|
-        return failMapped(e, null, err_buf, err_buf_len);
-    return ZLSX_OK;
-}
-
-/// Open a row iterator for sheet `idx` under the status contract
-/// (`Book.streamSheet`): the same iterator `zlsx_rows_open` returns,
-/// loading the sheet on demand on a lazy handle, with the failure
-/// classified — -1 `SheetIndexOutOfRange`, -1 with the reader's name
-/// for an archive or sheet-part error, -3 for OOM — instead of NULL.
-/// On ZLSX_OK `*out` holds the handle (close with `zlsx_rows_close`;
-/// it retains the book, so the book may be closed first); on any other
-/// status `*out` is NULL.
-export fn zlsx_book_stream_sheet(
-    book: *Book,
-    idx: u32,
-    out: ?*?*Rows,
-    err_buf: ?[*]u8,
-    err_buf_len: usize,
-) callconv(.c) i32 {
-    const slot = out orelse {
-        writeError(err_buf, err_buf_len, "NullOutPointer");
-        return ZLSX_ERROR;
-    };
-    slot.* = null;
-    const state: *BookState = @ptrCast(@alignCast(book));
-    const rs = rowsOpenInner(state, idx) catch |e|
-        return failMapped(e, null, err_buf, err_buf_len);
-    slot.* = @ptrCast(rs);
-    return ZLSX_OK;
 }
 
 /// Advance to the next row. On return:
@@ -10011,6 +10032,13 @@ test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet
         try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 3));
     }
     for (0..4) |i| try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, @intCast(i)));
+    // Every row / matrix handle above is closed: the retain each took
+    // is balanced by its release, and the opener's own reference is the
+    // one left (the C ABI allocates through `smp_allocator`, so
+    // `std.testing.allocator` cannot see a leaked BookState — the
+    // refcount is the measurable).
+    const st: *BookState = @ptrCast(@alignCast(book));
+    try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
 
     // Out of range is -1 SheetIndexOutOfRange on both fallible calls —
     // the first index past the end and the far end of the u32 range —
@@ -10028,9 +10056,19 @@ test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet
     // The legacy opener says the same thing its own way.
     try std.testing.expectEqual(@as(?*Rows, null), zlsx_rows_open(book, 4, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
-    // A NULL out-pointer is a statement about the call.
+    // A NULL out-pointer or a NULL book is a statement about the call
+    // (in-house r1 S3E1-ABI-102: every status export guards its
+    // pointers; the legacy `*Book` family leaves NULL undefined).
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(book, 0, null, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_preload_sheet(null, 0, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    bad_slot = @ptrFromInt(@alignOf(RowsState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(null, 0, &bad_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Rows, null), bad_slot);
+    // The failed opens released the reference they took.
+    try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
 }
 
 test "S3e lazy sheets: a row handle from stream_sheet outlives the book, and the eager openers' handles are already loaded" {
@@ -10104,6 +10142,10 @@ test "S3e lazy sheets: the lazy opener's failures are -1 with the reader's name,
     defer alloc.free(missing);
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(missing, null, &err_buf, err_buf.len));
     try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    var null_path_slot: ?*Book = @ptrFromInt(@alignOf(BookState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(null, &null_path_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullPath", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Book, null), null_path_slot);
     // A path that does not exist, then bytes that are not an archive.
     var slot: ?*Book = @ptrFromInt(@alignOf(BookState));
     try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(missing, &slot, &err_buf, err_buf.len));

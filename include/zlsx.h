@@ -123,12 +123,15 @@ zlsx_book_t * zlsx_book_open_buffer(const uint8_t * data,
  * and is the opener for that case. Same-handle calls are externally
  * synchronized (the contract at the top of this header).
  *
- * zlsx_status_v1: ZLSX_OK with the handle in *out (close with
- * zlsx_book_close()); ZLSX_ERROR with the reader's error name in errbuf
+ * zlsx_status_v1 (the block under "Formula engine (M9a1)" below defines
+ * the codes; the three lazy-sheet exports follow it): ZLSX_OK with the
+ * handle in *out (close with zlsx_book_close()); ZLSX_ERROR with the
+ * reader's error name in errbuf
  * (an unreadable archive, a malformed part, the decompression caps —
  * the reader has no typed refusal, so there is no zlsx_diag_v1 here,
  * the zlsx_open_buffer() shape); ZLSX_NOMEM. *out is NULL on any
- * non-zero status; a NULL `out` is ZLSX_ERROR NullOutPointer.
+ * non-zero status; a NULL `out` is ZLSX_ERROR NullOutPointer and a NULL
+ * `path` ZLSX_ERROR NullPath, both before the file is touched.
  */
 int32_t zlsx_book_open_lazy(const char  * path,
                             zlsx_book_t ** out,
@@ -141,7 +144,9 @@ int32_t zlsx_book_open_lazy(const char  * path,
  * sheet is a hashmap hit, and on a handle from zlsx_book_open() or
  * zlsx_book_open_buffer() every sheet already is, so the call is a
  * no-op there. ZLSX_OK; ZLSX_ERROR SheetIndexOutOfRange for an index
- * past zlsx_sheet_count(); ZLSX_ERROR with the reader's name for an
+ * past zlsx_sheet_count() and ZLSX_ERROR InvalidInput for a NULL book
+ * (the legacy reader family leaves NULL undefined; every status export
+ * guards it); ZLSX_ERROR with the reader's name for an
  * archive or sheet-part failure (the sheet then stays loaded with the
  * side indices parsed up to the failure — the next call is the hit,
  * not a retry); ZLSX_NOMEM.
@@ -155,8 +160,9 @@ int32_t zlsx_book_preload_sheet(zlsx_book_t * book,
  * Open a row iterator for sheet `idx` under zlsx_status_v1 — the
  * iterator zlsx_rows_open() returns, loading the sheet on demand on a
  * lazy handle, with the failure classified instead of NULL: ZLSX_ERROR
- * SheetIndexOutOfRange, ZLSX_ERROR with the reader's name for an
- * archive or sheet-part failure, ZLSX_NOMEM. On ZLSX_OK *out holds the
+ * SheetIndexOutOfRange, ZLSX_ERROR InvalidInput for a NULL book,
+ * ZLSX_ERROR with the reader's name for an archive or sheet-part
+ * failure, ZLSX_NOMEM. On ZLSX_OK *out holds the
  * handle (close with zlsx_rows_close(); it retains the book, so the
  * book may be closed first); on any other status *out is NULL. A NULL
  * `out` is ZLSX_ERROR NullOutPointer.
@@ -1588,7 +1594,10 @@ int32_t zlsx_emb_hashes(zlsx_emb_t * emb, size_t i, uint64_t * out, size_t out_l
 /* ── Formula engine (M9a1) ──────────────────────────────────────────
  *
  * zlsx_status_v1 — NEW exports below only; everything above keeps its
- * shipped 0/-1 convention:
+ * shipped 0/-1 convention, except the exports whose comments name the
+ * contract (the reader's lazy-sheet trio, zlsx_book_open_lazy() /
+ * zlsx_book_preload_sheet() / zlsx_book_stream_sheet(), and the editor's
+ * structural block), which follow it too:
  *    0  OK
  *   -1  generic error (Zig error name in errbuf)
  *   -2  typed Plane-2 refusal (zlsx_diag_v1 populated when supplied)

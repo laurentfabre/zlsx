@@ -2705,11 +2705,27 @@ side-index maps grow), which the header's same-handle rule already
 covers — operations on one handle are externally synchronised — so the
 rule is now stated as load-bearing for a lazy handle: two threads
 reaching for two sheets of one lazy handle take the caller's lock;
-distinct handles stay independent. No mutex was added inside the handle:
-the eager reader family carries none, the contract at the top of
+distinct handles stay independent. No mutex was added inside the C
+handle: the eager reader family carries none, the contract at the top of
 `include/zlsx.h` is the sqlite3 / libcurl one, and a lock on the loads
 alone would not cover a getter racing a load on another sheet (the maps
-are shared), so the honest statement is the existing rule.
+are shared), so the honest statement is the existing rule. **py-zlsx
+takes that lock for the caller** (in-house r1 S3E1-DOC-103, which
+reproduced the crash: eight Python threads each streaming one sheet of
+ONE lazy book and reading another's merged ranges — ctypes releases the
+GIL around every foreign call — aborted within 150 iterations; the same
+shape on an eager book never did): `Book._lock`, a re-entrant per-book
+lock taken by every call that loads or reads per-sheet state
+(`preload_sheet`, `stream_sheet`, `Sheet.rows` → `zlsx_rows_open`,
+`Sheet.read_all` → `zlsx_matrix_open`, the four per-sheet getters), on
+lazy and eager books alike; a `Rows` iteration is unlocked — one iterator
+per thread. Pinned as a threaded test (a regression is a crash of the
+test process, stated), and measured: the probe survives with the lock,
+aborts with it replaced by a null context. The header's preamble names
+the three exports as status_v1 exports that sit above the status block
+(the S3a structural block's precedent), and their prototypes follow
+`zlsx_book_open_buffer` in the header as the exports follow it in
+`src/c_abi.zig` (AGENTS.md's ordering rule).
 
 **Status mapping, no diag — deliberately.** The reader's vocabulary
 (`BadZip`, `MalformedXml`, `MissingSheet`, `MissingWorkbook`,
@@ -2722,8 +2738,13 @@ written — `zlsx_open_buffer`'s shipped shape, and the decompression-caps
 precedent (§13, `ZipBombSuspected` a deliberate `-1` at open). `idx` past
 `zlsx_sheet_count` is `-1 SheetIndexOutOfRange` on preload and stream
 alike (a statement about the call; the far end of the u32 range pinned
-too); a NULL `out` is `-1 NullOutPointer` before anything is touched;
-`*out` is NULL on every non-zero status (poisoned slots pinned). A preload
+too); a NULL `out` is `-1 NullOutPointer` and a NULL `path`
+`-1 NullPath`, both before the file is touched; a NULL `book` on preload
+and stream is `-1 InvalidInput` through `bookStateOrNull`, the
+`editorStateOrNull` twin (in-house r1 S3E1-ABI-102: every status export
+guards its pointers where the legacy `*Book` family leaves NULL
+undefined; all pinned, the slot nulled); `*out` is NULL on every
+non-zero status (poisoned slots pinned). A preload
 that fails after the extraction leaves the sheet loaded with the side
 indices parsed up to the failure — the reader's documented tolerance,
 each parser no-op-on-missing — and the next call is the hashmap hit, not
@@ -2746,7 +2767,10 @@ judged before the dylib probe so a closed book or a bad selector is the
 same error whatever dylib is loaded; the `c_uint32` index has no other
 guard — ctypes wraps a negative silently); a non-zero status raises
 `ZlsxError` named after the reader's error (`FileNotFound`, `BadZip`
-pinned). `Rows` adopts the status opener's handle (`_handle=`) instead of
+pinned). `Rows` adopts the status opener's handle (keyword-only
+`_handle=`; pinned with `zlsx_rows_open` monkeypatched to raise — a
+`Rows` that fell through would have read the right sheet and leaked the
+status handle, in-house r1 S3E1-TEST-103 / -104) instead of
 re-opening through `zlsx_rows_open`; `Sheet.rows()` and `read_all` keep
 the legacy opener and load on demand on a lazy book (pinned). The four
 per-sheet getters' docstrings state the unloaded-sheet answer. Older

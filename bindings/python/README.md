@@ -79,7 +79,9 @@ with zlsx.open_lazy("wide.xlsx") as book:     # book.lazy is True
 
 The file stays open until the last handle closes — row iterators hold
 their own reference, so a `stream_sheet` iterator keeps reading after
-`book.close()`. Requires libzlsx 0.9.0+ (`zlsx_book_open_lazy`).
+`book.close()`. Threads may share one book: the calls that load or read
+per-sheet state are serialised by a per-book lock (see "Thread safety");
+one `Rows` per thread. Requires libzlsx 0.9.0+ (`zlsx_book_open_lazy`).
 
 ## Write
 
@@ -777,6 +779,8 @@ with zlsx.write("out.xlsx") as w:
 ## Thread safety
 
 Distinct `Book` and `Writer` handles are fully independent — call them freely from any threads. Operations on the same handle must be externally synchronized, same as sqlite3 or libcurl. The C ABI's refcount lets a row iterator outlive its Book handle safely; all other cross-thread sharing is the caller's responsibility.
+
+For a `Book` the binding takes that lock for you where it matters: the calls that load or read per-sheet state (`preload_sheet`, `stream_sheet`, `Sheet.rows`, `Sheet.read_all`, `merged_ranges`, `hyperlinks`, `data_validations`, `comments`) run under a per-book lock, so threads may share one `Book` — a lazy one included, whose first touch of a sheet mutates the C handle (ctypes releases the GIL around every foreign call, so the GIL is no substitute). Iterating a `Rows` is unlocked: one iterator per thread.
 
 Cancellable formula-engine calls (`recalculate`, `save_with_recalc`, `evaluate`, `Writer.save(recalculate=...)`) run their FFI call on a private worker thread while the calling thread waits interruptibly; the handle-synchronization rule above still applies — the worker is an implementation detail, not a license to share the handle.
 
