@@ -71,6 +71,9 @@
 #if !defined(ZLSX_HAS_EMBEDDING_SWEEPS)
 #error "ZLSX_HAS_EMBEDDING_SWEEPS missing"
 #endif
+#if !defined(ZLSX_HAS_LAZY_SHEETS)
+#error "ZLSX_HAS_LAZY_SHEETS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -197,3 +200,13 @@ static const void *const s3c3_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3c3(void);
 const void *zlsx_c_abi_smoke_anchor_s3c3(void) { return s3c3_exports[0]; }
+
+/* S3e slice 1: lazy per-sheet loading on the reader handle — the three
+ * status exports under one macro. */
+static const void *const s3e1_exports[] = {
+    (const void *)&zlsx_book_open_lazy,
+    (const void *)&zlsx_book_preload_sheet,
+    (const void *)&zlsx_book_stream_sheet,
+};
+const void *zlsx_c_abi_smoke_anchor_s3e1(void);
+const void *zlsx_c_abi_smoke_anchor_s3e1(void) { return s3e1_exports[0]; }

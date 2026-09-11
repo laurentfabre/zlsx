@@ -31,6 +31,7 @@ apart (libzlsx 0.9.0+).
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import threading
 import time
@@ -45,6 +46,7 @@ __version__ = "0.9.0"
 level may drift when the binding ships a Python-only fix."""
 
 __all__ = [
+    "open_lazy",
     "open",
     "open_bytes",
     "write",
@@ -473,8 +475,30 @@ class Alignment:
 # ─── Book ─────────────────────────────────────────────────────────────
 
 
+def _serialized(method):
+    """Run ``method`` under the book's lock. The C library does not lock
+    a handle (its same-handle rule is the caller's), and ctypes releases
+    the GIL around every foreign call, so two Python threads sharing one
+    :class:`Book` reach the library concurrently; on a :func:`open_lazy`
+    book a first touch of a sheet mutates the handle and a concurrent
+    per-sheet read on another sheet is a crash, and a close under any
+    call frees the state the call is reading. The lock covers every
+    call that dereferences the book's handle — the per-sheet loads and
+    getters, the workbook-wide getters, the iterator and matrix openers,
+    :meth:`Book.close`; a :class:`Rows` iteration is unlocked — one
+    iterator per thread, and it outlives a close through the C refcount."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class Book:
-    """A workbook handle. Use :func:`zlsx.open` to construct one.
+    """A workbook handle. Use :func:`zlsx.open` (every sheet loaded at
+    open, the file released before it returns), :func:`zlsx.open_bytes`
+    or :func:`zlsx.open_lazy` (sheets loaded on first touch; see
+    :attr:`lazy`) to construct one.
 
     Also usable as a context manager; exit closes the handle::
 
@@ -491,11 +515,25 @@ class Book:
             raise ZlsxError(f"zlsx_book_open({path!r}): {_decode_err(self._err)}")
         self._attach(handle)
 
-    def _attach(self, handle) -> None:
+    def _attach(self, handle, lazy: bool = False) -> None:
         """Adopt an already-open C handle and cache sheet names — most
         callers enumerate them, and the list is short (<10 in typical
-        workbooks). Shared by the path and buffer constructors."""
+        workbooks). Shared by the path, buffer and lazy constructors."""
         self._handle = handle
+        # Re-entrant: `Sheet.read_all` and the iterator constructors take
+        # it from inside methods that already hold it.
+        self._lock = threading.RLock()
+        #: ``True`` for a book from :func:`open_lazy` — its sheets load on
+        #: first touch (:meth:`preload_sheet`, :meth:`stream_sheet`,
+        #: :meth:`Sheet.rows`, :meth:`Sheet.read_all`) and the file stays open until the last
+        #: handle closes; ``False`` for :func:`open` / :func:`open_bytes`,
+        #: whose sheets are all loaded before the constructor returns.
+        #: Threads may share a book, lazy or eager: every call on the
+        #: book — the per-sheet loads and getters, the workbook-wide
+        #: getters, the iterator and matrix openers, :meth:`close` — is
+        #: serialised by a per-book lock (see :func:`open_lazy`); a
+        #: :class:`Rows` is one thread's.
+        self.lazy: bool = lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
         name_buf = ctypes.create_string_buffer(256)
@@ -507,6 +545,7 @@ class Book:
                 _ffi.lib.zlsx_sheet_name(self._handle, i, name_buf, len(name_buf))
             self.sheets.append(name_buf.value.decode("utf-8", errors="replace"))
 
+    @_serialized
     def _sheet_index(self, selector: Union[int, str]) -> int:
         """Resolve a 0-based index or a name to the index — the one
         selector rule :meth:`sheet` and :meth:`sheet_state` share
@@ -535,6 +574,7 @@ class Book:
         """Select a sheet by 0-based index or by name."""
         return Sheet(self, self._sheet_index(selector))
 
+    @_serialized
     def sheet_state(self, selector: Union[int, str]) -> str:
         """Visibility of one sheet, by 0-based index or by name:
         ``"visible"``, ``"hidden"`` (Excel's *Hide*) or ``"veryHidden"``
@@ -572,10 +612,62 @@ class Book:
             # A code this binding does not know — a newer library.
             raise ZlsxError(f"zlsx_sheet_state({idx}) returned {code}") from None
 
+    @_serialized
+    def preload_sheet(self, selector: Union[int, str]) -> None:
+        """Load one sheet now — its XML and side indices — so
+        :meth:`merged_ranges`, :meth:`hyperlinks`, :meth:`data_validations`
+        and :meth:`comments` answer for it without a row iteration. Only a
+        :func:`open_lazy` book has anything to load; on :func:`open` /
+        :func:`open_bytes` books every sheet already is, and the call is
+        a no-op. Idempotent. ``selector`` is a 0-based index or a name
+        under :meth:`sheet`'s rule (``IndexError`` / ``KeyError`` /
+        ``TypeError``); an archive or sheet-part failure raises
+        :class:`ZlsxError` named after the reader's error. Requires
+        libzlsx 0.9.0+ (``zlsx_book_preload_sheet``)."""
+        # The selector rule first, the probe second — a closed book or a
+        # bad selector is the same error whatever dylib is loaded (the
+        # `sheet_state` order).
+        idx = self._sheet_index(selector)
+        if not _ffi._HAS_LAZY_SHEETS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose preload_sheet (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+        rc = _ffi.lib.zlsx_book_preload_sheet(self._handle, idx, self._err, _ERR_BUF_LEN)
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_book_preload_sheet({idx}): {_decode_err(self._err)}")
+
+    @_serialized
+    def stream_sheet(self, selector: Union[int, str]) -> "Rows":
+        """A row iterator over one sheet, by 0-based index or by name —
+        :meth:`Sheet.rows` through ``zlsx_book_stream_sheet``, the
+        status-contract opener: on a :func:`open_lazy` book the sheet is
+        loaded on first touch here (an archive or sheet-part failure
+        raises :class:`ZlsxError` named after the reader's error); on an
+        eager book it is the same iterator :meth:`Sheet.rows` returns.
+        The iterator holds its own reference, so the book may be closed
+        while it is being read. Requires libzlsx 0.9.0+."""
+        idx = self._sheet_index(selector)
+        if not _ffi._HAS_LAZY_SHEETS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose stream_sheet (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+        handle = _ffi.rows_handle()
+        rc = _ffi.lib.zlsx_book_stream_sheet(
+            self._handle, idx, ctypes.byref(handle), self._err, _ERR_BUF_LEN
+        )
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_book_stream_sheet({idx}): {_decode_err(self._err)}")
+        return Rows(self, idx, _handle=handle.value)
+
+    @_serialized
     def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:
         """Merged cell ranges declared in sheet ``sheet_idx``'s
         ``<mergeCells>`` block. Returns an empty list for sheets
-        without merges."""
+        without merges — and, on a :func:`open_lazy` book, for a sheet
+        not yet loaded (:meth:`preload_sheet` or a row iteration loads
+        it)."""
         if not self._handle:
             raise ZlsxError("book is closed")
         if not _ffi._HAS_READER_META:
@@ -598,12 +690,14 @@ class Book:
             ))
         return out
 
+    @_serialized
     def hyperlinks(self, sheet_idx: int) -> list[Hyperlink]:
         """Hyperlinks declared on sheet ``sheet_idx``, resolved through
         the sheet's ``_rels/sheet{N}.xml.rels`` file. Both external
         (``url``) and internal (``location``) targets are returned;
         for any well-formed source exactly one is non-empty. Returns
-        an empty list for sheets without a ``<hyperlinks>`` block.
+        an empty list for sheets without a ``<hyperlinks>`` block — and,
+        on a :func:`open_lazy` book, for a sheet not yet loaded.
         Requires libzlsx 0.2.7+ to populate ``location``; older dylibs
         return ``location=""`` for every entry."""
         if not self._handle:
@@ -639,10 +733,12 @@ class Book:
             ))
         return out
 
+    @_serialized
     def comments(self, sheet_idx: int) -> list[Comment]:
         """Cell comments declared on sheet ``sheet_idx`` (from
         ``xl/comments*.xml`` discovered via the sheet's rels).
-        Returns an empty list for sheets without a comments part.
+        Returns an empty list for sheets without a comments part — and,
+        on a :func:`open_lazy` book, for a sheet not yet loaded.
         Requires libzlsx 0.2.6+."""
         if not self._handle:
             raise ZlsxError("book is closed")
@@ -706,10 +802,12 @@ class Book:
             ))
         return out
 
+    @_serialized
     def data_validations(self, sheet_idx: int) -> list[DataValidation]:
         """Data validations on ``sheet_idx`` (dropdowns + numeric / date
         / time / text-length / custom). Empty list for sheets without a
-        ``<dataValidations>`` block. Extended fields (``kind``, ``op``,
+        ``<dataValidations>`` block — and, on a :func:`open_lazy` book,
+        for a sheet not yet loaded. Extended fields (``kind``, ``op``,
         ``formula1``, ``formula2``) require libzlsx 0.2.6+; on older
         libraries they fall back to the list-only defaults."""
         if not self._handle:
@@ -773,6 +871,7 @@ class Book:
             ))
         return out
 
+    @_serialized
     def shared_strings_count(self) -> int:
         """Total number of shared-string entries in the workbook.
         Returns 0 when the workbook has no ``xl/sharedStrings.xml``
@@ -790,6 +889,7 @@ class Book:
             )
         return _ffi.lib.zlsx_shared_string_count(self._handle)
 
+    @_serialized
     def shared_string_at(self, sst_idx: int) -> str:
         """Return shared-string entry ``sst_idx`` as a decoded UTF-8
         ``str``. Raises :class:`IndexError` on out-of-range.
@@ -824,6 +924,7 @@ class Book:
         count = self.shared_strings_count()
         return [self.shared_string_at(i) for i in range(count)]
 
+    @_serialized
     def rich_text(self, sst_idx: int) -> list[RichRun] | None:
         """Rich-text runs for shared-string entry ``sst_idx``. Returns
         ``None`` for plain single-run strings (no ``<r>`` wrappers in
@@ -899,6 +1000,7 @@ class Book:
             ))
         return out
 
+    @_serialized
     def number_format(self, style_idx: int) -> str | None:
         """Resolve a cell's style index (from ``Rows.style_indices()``)
         to its number-format code. Returns ``None`` on out-of-range
@@ -922,6 +1024,7 @@ class Book:
             return None
         return ctypes.string_at(out_ptr, out_len.value).decode("utf-8", errors="replace")
 
+    @_serialized
     def cell_font(self, style_idx: int) -> Font | None:
         """Resolve a cell's style index to its :class:`Font` properties
         (bold / italic / color / size / name). Returns ``None`` on
@@ -951,6 +1054,7 @@ class Book:
             name=name,
         )
 
+    @_serialized
     def cell_fill(self, style_idx: int) -> Fill | None:
         """Resolve a cell's style index to its :class:`Fill`
         (pattern + fg/bg ARGB). Returns ``None`` on out-of-range
@@ -979,6 +1083,7 @@ class Book:
             bg_color_argb=int(cf.bg_color_argb) if cf.has_bg else None,
         )
 
+    @_serialized
     def cell_border(self, style_idx: int) -> Border | None:
         """Resolve a cell's style index to its :class:`Border`
         (left/right/top/bottom/diagonal sides). Returns ``None`` on
@@ -1015,6 +1120,7 @@ class Book:
             diagonal=_side(cb.diagonal),
         )
 
+    @_serialized
     def cell_alignment(self, style_idx: int) -> Alignment | None:
         """Resolve a cell's style index to its :class:`Alignment`
         (horizontal + wrap_text). Returns ``None`` on out-of-range
@@ -1045,6 +1151,7 @@ class Book:
             )
         return Alignment(horizontal=horizontal, wrap_text=bool(ca.wrap_text))
 
+    @_serialized
     def is_date_format(self, style_idx: int) -> bool:
         """True when the style index resolves to a date / time /
         datetime pattern. Combine with ``xlsx.fromExcelSerial`` (or
@@ -1063,10 +1170,21 @@ class Book:
         """Drop our reference to the book. Active row iterators hold their
         own references, so this is safe to call before iteration finishes —
         the C ABI's refcount keeps the state alive until the last handle
-        closes."""
-        if self._handle:
-            _ffi.lib.zlsx_book_close(self._handle)
-            self._handle = None
+        closes (a :func:`open_lazy` book's file with it). Taken under the
+        book's lock, so a close racing any call on the book from another
+        thread waits for it and every later call raises ``ZlsxError``
+        (in-house r2 S3E1-REL-201 / THR-201, r3 THR-301 / -302: the C
+        header forbids a concurrent close, and the shipped shape freed the
+        state under a getter)."""
+        # A `Book.__new__` instance whose open failed is discarded before
+        # `_attach` ran: `__del__` reaches here with no lock and no handle.
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if self._handle:
+                _ffi.lib.zlsx_book_close(self._handle)
+                self._handle = None
 
     def __enter__(self) -> "Book":
         return self
@@ -1142,9 +1260,15 @@ class Sheet:
             return (all_rows[0], all_rows[1:])
 
         err = ctypes.create_string_buffer(_ERR_BUF_LEN)
-        handle = _ffi.lib.zlsx_matrix_open(
-            self._book._handle, self.index, err, _ERR_BUF_LEN
-        )
+        with self._book._lock:
+            # The closed check belongs under the lock: a close that won it
+            # between the courtesy check above and here nulled the handle
+            # (in-house r3 S3E1-THR-301 — the legacy opener took NULL).
+            if not self._book._handle:
+                raise ZlsxError("Book is closed")
+            handle = _ffi.lib.zlsx_matrix_open(
+                self._book._handle, self.index, err, _ERR_BUF_LEN
+            )
         if not handle:
             raise ZlsxError(f"zlsx_matrix_open: {_decode_err(err)}")
         try:
@@ -1213,7 +1337,7 @@ class Rows:
     immediately to avoid dangling references.
     """
 
-    def __init__(self, book: Book, sheet_idx: int):
+    def __init__(self, book: Book, sheet_idx: int, *, _handle=None):
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
         # Hold a reference to the Python Book so callers using iter29
         # helpers (`style_indices`, `number_format`) don't have to
@@ -1221,9 +1345,23 @@ class Rows:
         # underlying Book handle until this iterator is closed.
         self._book = book
         self._current_len = 0
-        self._handle = _ffi.lib.zlsx_rows_open(
-            book._handle, sheet_idx, self._err, _ERR_BUF_LEN
-        )
+        if _handle is not None:
+            # `Book.stream_sheet` opened the handle through the status
+            # export; adopt it (the C handle already retains the book).
+            self._handle = _handle
+            return
+        # The legacy opener loads the sheet on demand on a lazy book —
+        # under the book's lock, like every other call on the book, and
+        # the closed check under it too: `Sheet.rows`'s check is a
+        # courtesy, a close that won the lock in between nulled the handle
+        # (in-house r3 S3E1-THR-301), and the public constructor had none.
+        self._handle = None
+        with book._lock:
+            if not book._handle:
+                raise ZlsxError("Book is closed")
+            self._handle = _ffi.lib.zlsx_rows_open(
+                book._handle, sheet_idx, self._err, _ERR_BUF_LEN
+            )
         if not self._handle:
             raise ZlsxError(f"zlsx_rows_open: {_decode_err(self._err)}")
 
@@ -1561,6 +1699,65 @@ def open_bytes(data: Union[bytes, bytearray, memoryview]) -> Book:
     if not handle:
         raise ZlsxError(f"zlsx_book_open_buffer({len(raw)} bytes): {_decode_err(book._err)}")
     book._attach(handle)
+    return book
+
+
+def open_lazy(path: Union[str, Path]) -> Book:
+    """Open an ``.xlsx`` file lazily: the sheet inventory, the shared
+    strings, the styles and the theme are read now; each sheet's XML and
+    its side indices (merged ranges, hyperlinks, data validations,
+    comments) are extracted on first touch — :meth:`Book.preload_sheet`,
+    :meth:`Book.stream_sheet`, :meth:`Sheet.rows` or :meth:`Sheet.read_all`
+    on that sheet. Until
+    then :meth:`Book.merged_ranges` and its siblings answer for an
+    unloaded sheet as for one that has none; the workbook-wide getters
+    (:attr:`Book.sheets`, :meth:`Book.sheet_state`,
+    :meth:`Book.shared_string_at`, the style lookups) are populated at
+    open. The book reads as :attr:`Book.lazy`.
+
+    The file stays open until the last handle closes (row iterators
+    included), so on Windows it cannot be renamed or deleted meanwhile;
+    :func:`open` loads every sheet and releases the file before
+    returning, and is the opener for that case. On a workbook of many
+    sheets where the caller reads one, the lazy open skips the other
+    sheets' extraction entirely::
+
+        with zlsx.open_lazy("wide.xlsx") as book:
+            for row in book.stream_sheet("Q3"):
+                ...
+
+    Threads may share one book: the C library does not lock a handle (its
+    same-handle rule is the caller's — a lazy handle's first touch of a
+    sheet mutates it, and ctypes releases the GIL around every foreign
+    call), so py-zlsx serialises every call on the book — the per-sheet
+    loads and getters (:meth:`Book.preload_sheet`, :meth:`Book.stream_sheet`,
+    :meth:`Sheet.rows`, :meth:`Sheet.read_all`, :meth:`Book.merged_ranges`
+    and its siblings), the workbook-wide getters (:meth:`Book.sheet_state`,
+    :meth:`Book.shared_string_at`, the style lookups), and
+    :meth:`Book.close` — with a per-book lock, on lazy and eager books
+    alike (a bulk read of one sheet therefore waits for another's on the
+    same book; a close waits for the call in flight, and every later call
+    raises :class:`ZlsxError`). Iterating a :class:`Rows` is unlocked: one
+    iterator per thread, and it outlives a close through the C refcount.
+
+    Raises :class:`ZlsxError` on parse failure, named after the reader's
+    error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).
+    """
+    if not _ffi._HAS_LAZY_SHEETS:
+        raise RuntimeError(
+            "loaded libzlsx does not expose open_lazy (requires 0.9.0+); "
+            "upgrade libzlsx"
+        )
+    book = Book.__new__(Book)
+    book._handle = None
+    book._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+    handle = _ffi.book_handle()
+    rc = _ffi.lib.zlsx_book_open_lazy(
+        str(path).encode("utf-8"), ctypes.byref(handle), book._err, _ERR_BUF_LEN
+    )
+    if rc != _ffi.ZLSX_OK:
+        raise ZlsxError(f"zlsx_book_open_lazy({str(path)!r}): {_decode_err(book._err)}")
+    book._attach(handle.value, lazy=True)
     return book
 
 

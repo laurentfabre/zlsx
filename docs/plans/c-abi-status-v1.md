@@ -2661,3 +2661,163 @@ parts at birth against a baseline of zero, so a fresh-emit workbook
 refuses every transaction until saved and re-opened (pinned; before the
 guard the transaction went to `nextGeneration` over the `fresh()` store's
 empty backing).
+
+## 23. S3e slice 1 — lazy per-sheet loading on the reader handle (2026-09-11)
+
+Three exports on the READER handle, `zlsx_status_v1`, one macro, one
+probe, no release function, no `zlsx_diag_v1`. The row's Zig surface is
+the reader's `Book.openLazy` / `Book.preloadSheet` / `Book.streamSheet`
+(iter54's foundation: `Book.open` is the facade that opens lazily, loads
+every sheet and closes the archive before returning), so the C leg is
+the same three calls over the same `BookState` the eager openers hand
+out — the same refcount, the same per-sheet getters, the same row and
+matrix handles — not a new handle kind.
+
+| Export | Zig | Probe (`_ffi.py`) | Header macro |
+|---|---|---|---|
+| `zlsx_book_open_lazy(path, out, errbuf, len) → int32_t` | `Book.openLazy` | `_HAS_LAZY_SHEETS` | `ZLSX_HAS_LAZY_SHEETS` |
+| `zlsx_book_preload_sheet(book, idx, errbuf, len) → int32_t` | `Book.preloadSheet` | (same) | (same) |
+| `zlsx_book_stream_sheet(book, idx, out, errbuf, len) → int32_t` | `Book.streamSheet` | (same) | (same) |
+
+**What a lazy handle is.** `zlsx_book_open_lazy` reads the central
+directory, the shared strings, `styles.xml` and `theme.xml`; each sheet's
+XML and its side indices (merged ranges, hyperlinks, data validations,
+comments) are extracted on first touch — `zlsx_book_preload_sheet`,
+`zlsx_book_stream_sheet`, and the legacy `zlsx_rows_open` /
+`zlsx_matrix_open`, which go through the same `Book.rows` →
+`ensureSheetLoaded` (pinned: each of the four loads one sheet of a
+four-sheet fixture, `zlsx_merged_range_count` 0 before and 1 after). Until
+a sheet is touched the per-sheet getters answer for it as for a sheet
+without the feature (`Book.openLazy`'s getter contract, stated on every
+surface); the workbook-wide getters (`zlsx_sheet_count` / `_name` /
+`_state`, shared strings, rich runs, styles, number formats) are populated
+at open on every handle. The archive file stays open until the last
+reference drops — row and matrix handles retain the book, so a
+`zlsx_book_stream_sheet` handle reads after `zlsx_book_close` (pinned) and
+the file closes with it; `zlsx_book_open` releases it before returning and
+stays the opener for a source that must be renamable or deletable while
+read (Windows locks). Both `zlsx_book_open` and `zlsx_book_open_buffer`
+hand out handles on which every sheet is already loaded: preload is a
+no-op there and stream_sheet the cache hit (pinned on both).
+
+**Threads.** A first touch mutates the Book (`sheet_data` and the
+side-index maps grow), which the header's same-handle rule already
+covers — operations on one handle are externally synchronised — so the
+rule is now stated as load-bearing for a lazy handle: two threads
+reaching for two sheets of one lazy handle take the caller's lock;
+distinct handles stay independent. No mutex was added inside the C
+handle: the eager reader family carries none, the contract at the top of
+`include/zlsx.h` is the sqlite3 / libcurl one, and a lock on the loads
+alone would not cover a getter racing a load on another sheet (the maps
+are shared), so the honest statement is the existing rule. **py-zlsx
+takes that lock for the caller** (in-house r1 S3E1-DOC-103, which
+reproduced the crash: eight Python threads each streaming one sheet of
+ONE lazy book and reading another's merged ranges — ctypes releases the
+GIL around every foreign call — aborted within 150 iterations; the same
+shape on an eager book never did): `Book._lock`, a re-entrant per-book
+lock taken by every call that loads or reads per-sheet state
+(`preload_sheet`, `stream_sheet`, `Sheet.rows` → `zlsx_rows_open`,
+`Sheet.read_all` → `zlsx_matrix_open`, the four per-sheet getters) and
+by `Book.close` (in-house r2 A-REL-201 / B-THR-201, both measured: a
+close racing a locked per-sheet call passed a freed `BookState` to the
+library and aborted — the `with … as book:` exiting while a pool
+straggler is inside a call; the mechanism predates the slice, the
+promise is the slice's; the lock is fetched with `getattr` so a
+`Book.__new__` instance whose open failed can still be finalised; a
+close now waits for an in-flight load and every later call raises
+`ZlsxError`), on lazy and eager books alike — an eager book's bulk reads
+of distinct sheets are serialised too, a deliberate trade against a
+`lazy`-conditional lock — and, since in-house r3 (B-THR-301 HIGH /
+B-THR-302, both reproduced), by EVERY call that dereferences the book's
+handle: the closed-book check of the legacy openers (`Sheet.rows` /
+`Sheet.read_all` / the public `zlsx.Rows`) moved under the lock (a close
+that won it between the courtesy check and the C call handed
+`zlsx_rows_open` a NULL `*Book`; the public constructor had no check at
+all — deterministic exit 139 after a close), and the workbook-wide
+getters (`sheet_state`, `_sheet_index`'s name lookup, `shared_string_at`,
+`rich_text`, `number_format`, the four style lookups, `is_date_format`)
+are `@_serialized` too (a close under any of them freed the state —
+five of five probed crashed); the docs on every surface say "every call
+on the book" instead of an enumeration; a `Rows` iteration is unlocked —
+one iterator per thread, and it outlives a close through the C refcount.
+Pinned as two threaded tests (eight streams + getters on one lazy book;
+eight worker loops over `rows()` / `read_all` / the per-sheet and
+workbook-wide getters racing a close, plus the deterministic
+`zlsx.Rows(book, 0)` after a close — a regression is a crash of the test
+process, stated), and measured: the probes survive with the lock, abort
+with it replaced by a null context / with `close` outside it. The
+header's preamble names the trio as the status_v1 exports declared above
+the status block (the first such family; the S3a block sits below it and
+names the contract itself), and their prototypes follow
+`zlsx_book_open_buffer` in the header as the exports follow it in
+`src/c_abi.zig` (AGENTS.md's ordering rule).
+
+**Status mapping, no diag — deliberately.** The reader's vocabulary
+(`BadZip`, `MalformedXml`, `MissingSheet`, `MissingWorkbook`,
+`ArchiveClosed`, `UnsupportedCompression`, `ZipBombSuspected`, the
+hyperlink / comment reference names, `SheetIndexOutOfRange`,
+`FileNotFound`) has no Plane-2 member and no structural verdict, so the
+one §2 mapping folds every name to `-1` with the name in errbuf (pinned
+name by name) and OOM to `-3`; a `zlsx_diag_v1` parameter would never be
+written — `zlsx_open_buffer`'s shipped shape, and the decompression-caps
+precedent (§13, `ZipBombSuspected` a deliberate `-1` at open). `idx` past
+`zlsx_sheet_count` is `-1 SheetIndexOutOfRange` on preload and stream
+alike (a statement about the call; the far end of the u32 range pinned
+too); a NULL `out` is `-1 NullOutPointer` and a NULL `path`
+`-1 NullPath`, both before the file is touched; a NULL `book` on preload
+and stream is `-1 InvalidInput` through `bookStateOrNull`, the
+`editorStateOrNull` twin (in-house r1 S3E1-ABI-102: every status export
+guards its pointers where the legacy `*Book` family leaves NULL
+undefined; all pinned, the slot nulled); `*out` is NULL on every
+non-zero status (poisoned slots pinned). A preload
+that fails after the extraction leaves the sheet loaded with the side
+indices parsed up to the failure — the reader's documented tolerance,
+each parser no-op-on-missing — and the next call is the hashmap hit, not
+a retry; stated on the export and in the header.
+
+**One body for two openers.** `zlsx_rows_open` (legacy NULL / errbuf) and
+`zlsx_book_stream_sheet` (status) share `rowsOpenInner`, an error-union
+body with errdefers — the `matrixOpenInner` shape — over
+`Book.streamSheet` (the bounds check and `rows(sheets[idx])` in one), so
+the retain, the load and the handle cannot drift between the two, and a
+partial failure releases the reference it took. The legacy opener's
+observable behaviour is unchanged (`SheetIndexOutOfRange` in errbuf,
+NULL).
+
+**Python.** `zlsx.open_lazy(path) → Book` (`Book.lazy` is `True`; `open`
+and `open_bytes` books read `False`), `Book.preload_sheet(selector)` and
+`Book.stream_sheet(selector) → Rows` under `Book.sheet()`'s selector rule
+(the shared `Book._sheet_index`: `IndexError` / `KeyError` / `TypeError`,
+judged before the dylib probe so a closed book or a bad selector is the
+same error whatever dylib is loaded; the `c_uint32` index has no other
+guard — ctypes wraps a negative silently); a non-zero status raises
+`ZlsxError` named after the reader's error (`FileNotFound`, `BadZip`
+pinned). `Rows` adopts the status opener's handle (keyword-only
+`_handle=`; pinned with `zlsx_rows_open` monkeypatched to raise — a
+`Rows` that fell through would have read the right sheet and leaked the
+status handle, in-house r1 S3E1-TEST-103 / -104; the probe test pins
+that a ≥ 0.9 dylib carries the trio symbol by symbol, not the probe's
+own conjunction — the package's `_HAS_X` precedent, r2 B-TEST-202)
+instead of
+re-opening through `zlsx_rows_open`; `Sheet.rows()` and `read_all` keep
+the legacy opener and load on demand on a lazy book (pinned). The four
+per-sheet getters' docstrings state the unloaded-sheet answer. Older
+dylibs raise `RuntimeError` on the three; a ≥ 0.9 dylib without the trio
+fails the probe test, not skips.
+
+**Tests** (`src/c_abi.zig`, "S3e lazy sheets: …"; `tests/c_abi_smoke.c`
+`#error`s without the macro and takes the three addresses;
+`test_basic.py`, the "S3e slice 1" section — nine tests: the
+`open_lazy` / `stream_sheet` / `eager_books` / `close_waits` /
+`threads_may_share` / `lazy_sheets_probe` names): the deferral and the four
+load paths, idempotent preload, out of range on both calls, NULL out,
+the missing / garbage file names with the slot nulled, the iterator
+outliving the book, the eager and buffer openers already loaded, the
+reader names' `-1` fold; Python mirrors each plus the selector-before-
+probe order and the older-dylib branch.
+
+**Not in this slice.** The lazy SST backend (`Book.openSstLazy`,
+`--sst-lazy` on the CLI) is S3e's second slice; a lazy opener over a
+buffer has no Zig primitive (the `.buffer` source's borrow ends at the
+open call, so a lazy buffer handle would have to copy); the CLI leg of
+per-sheet loading (the matrix's fourth column) stays `— S3e`.

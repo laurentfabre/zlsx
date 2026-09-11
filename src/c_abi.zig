@@ -303,6 +303,139 @@ export fn zlsx_book_open_buffer(
     return @ptrCast(state);
 }
 
+// ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
+//
+// `Book.openLazy` / `preloadSheet` / `streamSheet` under `zlsx_status_v1`
+// (§23). The lazy handle is a `BookState` like the eager ones — the
+// same refcount, the same per-sheet getters, the same row iterators —
+// whose archive stays open for the handle's lifetime and whose sheets
+// are extracted on first touch. The touch is a mutation of the Book
+// (`sheet_data` and the side-index maps grow), which the header's
+// same-handle rule already covers: operations on one handle are
+// externally synchronised, so two threads streaming two sheets of one
+// lazy handle is the caller's lock to take. Distinct handles stay
+// independent.
+//
+// No `zlsx_diag_v1` on any of the three: the reader's vocabulary
+// (`BadZip`, `MalformedXml`, `MissingSheet`, `ZipBombSuspected`, …) has
+// no Plane-2 member and no structural verdict — `statusOf` folds every
+// name to -1 (pinned below), OOM to -3 — so a diag would never be
+// written. `zlsx_open_buffer`'s shipped shape. NULL where a pointer is
+// required is -1 (§2: a statement about the call): `NullPath`,
+// `NullOutPointer`, and `InvalidInput` for a NULL book — the S3a
+// spelling, through `bookStateOrNull`.
+
+/// The status exports' handle argument: NULL is `InvalidInput` (-1),
+/// the `editorStateOrNull` twin — the legacy reader family takes a
+/// non-null `*Book` and leaves NULL undefined.
+fn bookStateOrNull(book: ?*Book, err_buf: ?[*]u8, err_buf_len: usize) ?*BookState {
+    const b = book orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return null;
+    };
+    return @ptrCast(@alignCast(b));
+}
+
+/// Open an xlsx file lazily: the central directory, the shared strings,
+/// the styles and the theme are read now; sheet XML and the per-sheet
+/// side indices (merged ranges, hyperlinks, data validations, comments)
+/// are extracted on first touch — `zlsx_book_preload_sheet`,
+/// `zlsx_book_stream_sheet`, `zlsx_rows_open`, `zlsx_matrix_open`. Until
+/// then the per-sheet getters answer for an unloaded sheet as for a
+/// sheet that has none (`Book.openLazy`'s getter contract). The archive
+/// file stays open until the last reference on the handle drops (row
+/// and matrix handles included), so the source cannot be renamed or
+/// deleted on Windows while any is live; `zlsx_book_open` releases it
+/// before returning. On ZLSX_OK `*out` holds the handle (close with
+/// `zlsx_book_close`); on any other status `*out` is NULL. A NULL `out`
+/// is -1 `NullOutPointer`, a NULL `path` -1 `NullPath`, both before the
+/// file is touched.
+export fn zlsx_book_open_lazy(
+    path_ptr: ?[*:0]const u8,
+    out: ?*?*Book,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const path = std.mem.span(path_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullPath");
+        return ZLSX_ERROR;
+    });
+    // The `zlsx_book_open` ownership shape: the handle owns its Io,
+    // allocated first so the Threaded never moves after init.
+    const state = gpa.create(BookState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
+    state.inner = xlsx.Book.openLazy(gpa, state.threaded.io(), path) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    slot.* = @ptrCast(state);
+    return ZLSX_OK;
+}
+
+/// Load sheet `idx`'s XML and side indices now, so the per-sheet
+/// getters answer for it without a row iteration (`Book.preloadSheet`).
+/// Idempotent — a loaded sheet is a hashmap hit, and on a handle from
+/// `zlsx_book_open` or `zlsx_book_open_buffer` every sheet already is,
+/// so the call is a no-op there. `idx` out of range is -1
+/// `SheetIndexOutOfRange` and a NULL `book` -1 `InvalidInput` (statements
+/// about the call); an archive or sheet-part error is -1 with the
+/// reader's name in errbuf; OOM is -3.
+/// A failure after the extraction leaves the sheet loaded with partial
+/// side indices, which the reader tolerates (each parser is
+/// no-op-on-missing) — the next call is the hashmap hit, not a retry.
+export fn zlsx_book_preload_sheet(
+    book: ?*Book,
+    idx: u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (idx >= state.inner.sheets.len) {
+        writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
+        return ZLSX_ERROR;
+    }
+    state.inner.preloadSheet(state.inner.sheets[idx]) catch |e|
+        return failMapped(e, null, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Open a row iterator for sheet `idx` under the status contract
+/// (`Book.streamSheet`): the same iterator `zlsx_rows_open` returns,
+/// loading the sheet on demand on a lazy handle, with the failure
+/// classified — -1 `SheetIndexOutOfRange`, -1 `InvalidInput` for a
+/// NULL `book`, -1 `NullOutPointer`, -1 with the reader's name for an
+/// archive or sheet-part error, -3 for OOM — instead of NULL.
+/// On ZLSX_OK `*out` holds the handle (close with `zlsx_rows_close`;
+/// it retains the book, so the book may be closed first); on any other
+/// status `*out` is NULL.
+export fn zlsx_book_stream_sheet(
+    book: ?*Book,
+    idx: u32,
+    out: ?*?*Rows,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const rs = rowsOpenInner(state, idx) catch |e|
+        return failMapped(e, null, err_buf, err_buf_len);
+    slot.* = @ptrCast(rs);
+    return ZLSX_OK;
+}
+
 /// Drop the caller's reference to a Book. Safe to call with NULL (no-op).
 /// Active row iterators hold their own references, so this will not
 /// prematurely free the underlying state while rows are still being read.
@@ -878,6 +1011,9 @@ export fn zlsx_sheet_state(book: *Book, idx: u32) callconv(.c) i32 {
 }
 
 /// Open a row iterator for sheet `idx`. Returns NULL on failure.
+/// On a handle from `zlsx_book_open_lazy` this is the on-demand load
+/// (`Book.rows` → `ensureSheetLoaded`), the same one
+/// `zlsx_book_stream_sheet` performs under the status contract.
 export fn zlsx_rows_open(
     book: *Book,
     sheet_idx: u32,
@@ -885,33 +1021,33 @@ export fn zlsx_rows_open(
     err_buf_len: usize,
 ) callconv(.c) ?*Rows {
     const state: *BookState = @ptrCast(@alignCast(book));
+    const rs = rowsOpenInner(state, sheet_idx) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return null;
+    };
+    return @ptrCast(rs);
+}
+
+/// The one body behind `zlsx_rows_open` (legacy NULL / errbuf) and
+/// `zlsx_book_stream_sheet` (`zlsx_status_v1`): the retain, the sheet
+/// load — on demand on a lazy handle, a cache hit on an eager one —
+/// and the handle. An error union so the errdefers fire (the
+/// `matrixOpenInner` shape); a `?*Rows` return path would have skipped
+/// them and leaked the reference on a partial failure.
+fn rowsOpenInner(state: *BookState, sheet_idx: u32) !*RowsState {
     // Retain BEFORE any state dereference so a concurrent zlsx_book_close
     // on another thread can't drop the refcount to zero while we're
-    // reading state.inner.sheets. Every failure branch below releases
-    // this reference explicitly (the function signature is `?*Rows`, not
-    // an error union, so Zig's errdefer wouldn't fire across the C ABI).
+    // reading state.inner.sheets.
     _ = state.refcount.fetchAdd(1, .acq_rel);
+    errdefer state.unref();
 
-    if (sheet_idx >= state.inner.sheets.len) {
-        writeError(err_buf, err_buf_len, "SheetIndexOutOfRange");
-        state.unref();
-        return null;
-    }
-    const sheet = state.inner.sheets[sheet_idx];
-    const inner = state.inner.rows(sheet, gpa) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        state.unref();
-        return null;
-    };
-    const rs = gpa.create(RowsState) catch {
-        var mutable = inner;
-        mutable.deinit();
-        writeError(err_buf, err_buf_len, "OutOfMemory");
-        state.unref();
-        return null;
-    };
+    // `streamSheet` is the index-based Zig entry point the row's
+    // surface names: the bounds check and `rows(sheets[idx])` in one.
+    var inner = try state.inner.streamSheet(sheet_idx, gpa);
+    errdefer inner.deinit();
+    const rs = try gpa.create(RowsState);
     rs.* = .{ .book = state, .inner = inner, .c_cells = .empty };
-    return @ptrCast(rs);
+    return rs;
 }
 
 /// Close and free a Rows handle. Safe with NULL. Drops the reference
@@ -4276,8 +4412,11 @@ test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
                 rows_handles[ri] = null;
             }
         }
-        // If the refcount underflowed / leaked, testing.allocator's
-        // leak detector catches it at the end of the test.
+        // The C ABI allocates through `smp_allocator`, so
+        // `std.testing.allocator` sees none of the handles: an underflow
+        // is a use-after-free the GPA may or may not trap, and a leak is
+        // invisible here. The S3e lazy-sheets tests pin the balance by
+        // reading `BookState.refcount` directly.
     }
 }
 
@@ -9807,6 +9946,246 @@ test "S3b sheet_state: a fresh writer's sheets carry no attribute and read visib
     try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 0));
     try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book.?, 1));
     try std.testing.expectEqual(@as(i32, -1), zlsx_sheet_state(book.?, 2));
+}
+
+// ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
+
+/// Four sheets through the writer, one merged range each — the per-sheet
+/// side index a lazy handle has not parsed until the sheet is touched,
+/// so `zlsx_merged_range_count` is the observable of the load: 0 before,
+/// 1 after, on the same handle.
+fn writeS3eLazyFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = xlsx.Writer.init(alloc);
+    defer w.deinit();
+    for ([_][]const u8{ "One", "Two", "Three", "Four" }) |sheet_name| {
+        var sheet = try w.addSheet(sheet_name);
+        try sheet.writeRow(&.{ .{ .string = sheet_name }, .{ .integer = 1 } });
+        try sheet.addMergedCell("A1:B1");
+    }
+    try w.save(io, path);
+    return path;
+}
+
+test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet, rows_open and matrix_open each load one on demand" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3eLazyFixture(io, &tt, "s3e_lazy.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    var slot: ?*Book = @ptrFromInt(@alignOf(BookState)); // poisoned: must be written
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_lazy(path, &slot, &err_buf, err_buf.len));
+    const book = slot orelse return error.TestUnexpectedResult;
+    defer zlsx_book_close(book);
+
+    // The workbook-wide state is populated at open: the inventory, the
+    // names, the visibility.
+    try std.testing.expectEqual(@as(u32, 4), zlsx_sheet_count(book));
+    var name_buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 5), zlsx_sheet_name(book, 2, &name_buf, name_buf.len));
+    try std.testing.expectEqualStrings("Three", std.mem.sliceTo(&name_buf, 0));
+    try std.testing.expectEqual(ZLSX_SHEET_STATE_VISIBLE, zlsx_sheet_state(book, 3));
+    // No sheet is loaded: every per-sheet getter answers as for a sheet
+    // without the feature.
+    for (0..4) |i| try std.testing.expectEqual(@as(usize, 0), zlsx_merged_range_count(book, @intCast(i)));
+
+    // preload: the side index appears without a row iteration; a second
+    // call is the hashmap hit (still one range, not two).
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_preload_sheet(book, 0, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 0));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_preload_sheet(book, 0, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 0));
+    var mr: CMergeRange = undefined;
+    try std.testing.expectEqual(@as(i32, 0), zlsx_merged_range_at(book, 0, 0, &mr));
+    try std.testing.expectEqual(@as(u32, 1), mr.bottom_right_col);
+    // The other three stay unloaded — a preload is per sheet.
+    for (1..4) |i| try std.testing.expectEqual(@as(usize, 0), zlsx_merged_range_count(book, @intCast(i)));
+
+    const st: *BookState = @ptrCast(@alignCast(book));
+    // stream_sheet: the status opener loads sheet 1 and its rows read.
+    {
+        var rows_slot: ?*Rows = @ptrFromInt(@alignOf(RowsState));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_stream_sheet(book, 1, &rows_slot, &err_buf, err_buf.len));
+        const rows = rows_slot orelse return error.TestUnexpectedResult;
+        defer zlsx_rows_close(rows);
+        // The retain is observed while the handle is live (r2 B-TEST-201:
+        // a forgotten fetchAdd would free the book under the first close
+        // and the later "== 1" read would be of freed, unpoisoned memory).
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 1));
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(usize, 2), cells_len);
+        try std.testing.expectEqualStrings("Two", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+        try std.testing.expectEqual(@intFromEnum(CellTag.integer), cells_ptr[1].tag);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    }
+    // rows_open: the legacy opener is the same on-demand load.
+    {
+        const rows = zlsx_rows_open(book, 2, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_rows_close(rows);
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 2));
+    }
+    // matrix_open: the bulk read goes through `Book.rows` too.
+    {
+        const matrix = zlsx_matrix_open(book, 3, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_matrix_close(matrix);
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 3));
+    }
+    for (0..4) |i| try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, @intCast(i)));
+    // Every row / matrix handle above is closed: the retain each took
+    // is balanced by its release, and the opener's own reference is the
+    // one left (the C ABI allocates through `smp_allocator`, so
+    // `std.testing.allocator` cannot see a leaked BookState — the
+    // refcount is the measurable).
+    try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
+
+    // Out of range is -1 SheetIndexOutOfRange on both fallible calls —
+    // the first index past the end and the far end of the u32 range —
+    // and the stream slot is nulled.
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_preload_sheet(book, 4, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_preload_sheet(book, std.math.maxInt(u32), &err_buf, err_buf.len));
+    var bad_slot: ?*Rows = @ptrFromInt(@alignOf(RowsState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(book, 4, &bad_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Rows, null), bad_slot);
+    bad_slot = @ptrFromInt(@alignOf(RowsState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(book, std.math.maxInt(u32), &bad_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(?*Rows, null), bad_slot);
+    // The legacy opener says the same thing its own way.
+    try std.testing.expectEqual(@as(?*Rows, null), zlsx_rows_open(book, 4, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    // A NULL out-pointer or a NULL book is a statement about the call
+    // (in-house r1 S3E1-ABI-102: every status export guards its
+    // pointers; the legacy `*Book` family leaves NULL undefined).
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(book, 0, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_preload_sheet(null, 0, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    bad_slot = @ptrFromInt(@alignOf(RowsState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_stream_sheet(null, 0, &bad_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Rows, null), bad_slot);
+    // The failed opens released the reference they took.
+    try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
+}
+
+test "S3e lazy sheets: a row handle from stream_sheet outlives the book, and the eager openers' handles are already loaded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3eLazyFixture(io, &tt, "s3e_lazy_refs.xlsx");
+    defer std.testing.allocator.free(path);
+    var err_buf: [128]u8 = undefined;
+
+    // The iterator retains the book (the lazy archive with it): close
+    // the book first, read the rows after.
+    {
+        var slot: ?*Book = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_lazy(path, &slot, &err_buf, err_buf.len));
+        const book = slot orelse return error.TestUnexpectedResult;
+        var rows_slot: ?*Rows = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_stream_sheet(book, 3, &rows_slot, &err_buf, err_buf.len));
+        const rows = rows_slot orelse return error.TestUnexpectedResult;
+        zlsx_book_close(book);
+        defer zlsx_rows_close(rows);
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("Four", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    }
+
+    // The eager openers preload everything: the getters are populated
+    // at open, preload is a no-op and stream_sheet is the cache hit.
+    const eager = zlsx_book_open(path, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_book_close(eager);
+    for (0..4) |i| try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(eager, @intCast(i)));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_preload_sheet(eager, 1, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(eager, 1));
+    {
+        var rows_slot: ?*Rows = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_stream_sheet(eager, 1, &rows_slot, &err_buf, err_buf.len));
+        const rows = rows_slot orelse return error.TestUnexpectedResult;
+        defer zlsx_rows_close(rows);
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("Two", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+    }
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_preload_sheet(eager, 4, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SheetIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    {
+        const bytes = try readFileBytes(io, path);
+        defer std.testing.allocator.free(bytes);
+        const from_bytes = zlsx_book_open_buffer(bytes.ptr, bytes.len, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_book_close(from_bytes);
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_preload_sheet(from_bytes, 3, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(from_bytes, 3));
+    }
+}
+
+test "S3e lazy sheets: the lazy opener's failures are -1 with the reader's name, the slot nulled, and no reader name is a refusal" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const alloc = std.testing.allocator;
+    var err_buf: [128]u8 = undefined;
+
+    // NULL out is a statement about the call, before the file is touched.
+    const missing = try tt.path(alloc, io, "s3e_missing.xlsx");
+    defer alloc.free(missing);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(missing, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    var null_path_slot: ?*Book = @ptrFromInt(@alignOf(BookState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(null, &null_path_slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullPath", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Book, null), null_path_slot);
+    // A path that does not exist, then bytes that are not an archive.
+    var slot: ?*Book = @ptrFromInt(@alignOf(BookState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(missing, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(?*Book, null), slot);
+    try std.testing.expectEqualStrings("FileNotFound", std.mem.sliceTo(&err_buf, 0));
+    const garbage = try tt.path(alloc, io, "s3e_garbage.xlsx");
+    defer alloc.free(garbage);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = garbage, .data = "not a zip archive at all" });
+    slot = @ptrFromInt(@alignOf(BookState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_lazy(garbage, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(?*Book, null), slot);
+    try std.testing.expectEqualStrings("BadZip", std.mem.sliceTo(&err_buf, 0));
+
+    // The three exports carry no diag because nothing the reader raises
+    // is a Plane-2 or structural refusal: every name in its vocabulary
+    // folds to -1 through the one mapping, OOM to -3.
+    for ([_]anyerror{
+        error.BadZip,
+        error.MalformedXml,
+        error.MissingSheet,
+        error.MissingWorkbook,
+        error.ArchiveClosed,
+        error.UnsupportedCompression,
+        error.ZipBombSuspected,
+        error.InvalidHyperlinkLocation,
+        error.InvalidHyperlinkRange,
+        error.InvalidCommentRef,
+        error.SheetIndexOutOfRange,
+        error.FileNotFound,
+    }) |e| try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
 }
 
 // ─── S3b slice 11: formula text and error tags on the row iterator ───

@@ -4592,3 +4592,288 @@ def test_rows_skip_drain_fallback_leaves_no_current_row(tmp_path, monkeypatch):
             assert next(rows) == ["three"]
             assert rows.skip(5) == 0
             assert rows.style_indices() == []
+
+
+# ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
+
+
+def _lazy_workbook(path):
+    """Four sheets through the writer, one merged range each — the
+    per-sheet side index a lazy book has not parsed until the sheet is
+    touched, so `merged_ranges` is the observable of the load: `[]`
+    before, one range after, on the same book."""
+    with zlsx.write(path) as w:
+        for name in ("One", "Two", "Three", "Four"):
+            sheet = w.add_sheet(name)
+            sheet.write_row([name, 1])
+            sheet.add_merged_cell("A1:B1")
+
+
+def _require_lazy_sheets():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_LAZY_SHEETS:
+        pytest.skip("libzlsx lacks zlsx_book_open_lazy (0.9.0+)")
+
+
+def test_open_lazy_defers_every_sheet_and_each_touch_loads_one(tmp_path):
+    _require_lazy_sheets()
+    path = tmp_path / "lazy.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open_lazy(path) as book:
+        # The workbook-wide state is populated at open.
+        assert book.lazy is True
+        assert book.sheets == ["One", "Two", "Three", "Four"]
+        assert book.sheet_state("Four") == "visible"
+        # No sheet is loaded: every per-sheet getter answers as for a
+        # sheet without the feature.
+        assert [book.merged_ranges(i) for i in range(4)] == [[], [], [], []]
+        assert book.hyperlinks(0) == [] and book.comments(0) == [] and book.data_validations(0) == []
+
+        # preload: by index, then by name; idempotent (one range, not two).
+        assert book.preload_sheet(0) is None
+        assert len(book.merged_ranges(0)) == 1
+        book.preload_sheet("One")
+        assert len(book.merged_ranges(0)) == 1
+        assert [len(book.merged_ranges(i)) for i in range(1, 4)] == [0, 0, 0]
+
+        # stream_sheet: the status opener loads the sheet and its rows read.
+        rows = book.stream_sheet("Two")
+        assert isinstance(rows, zlsx.Rows)
+        assert list(rows) == [["Two", 1]]
+        assert len(book.merged_ranges(1)) == 1
+        # Sheet.rows(): the legacy opener is the same on-demand load.
+        assert list(book.sheet(2).rows()) == [["Three", 1]]
+        assert len(book.merged_ranges(2)) == 1
+        # read_all goes through the same iterator.
+        assert book.sheet(3).read_all() == (None, [["Four", 1]])
+        assert [len(book.merged_ranges(i)) for i in range(4)] == [1, 1, 1, 1]
+
+
+def test_stream_sheet_adopts_the_status_handle_and_never_reopens(tmp_path, monkeypatch):
+    """`Rows` adopts the handle `zlsx_book_stream_sheet` wrote; a `Rows`
+    that fell through to `zlsx_rows_open` would still read the right
+    sheet and leak the status handle (in-house r1 S3E1-TEST-103)."""
+    _require_lazy_sheets()
+    import zlsx._ffi as ffi
+    path = tmp_path / "lazy_adopt.xlsx"
+    _lazy_workbook(path)
+    written = []
+    real_stream = ffi.lib.zlsx_book_stream_sheet
+
+    def spy_stream(handle, idx, out, err, err_len):
+        rc = real_stream(handle, idx, out, err, err_len)
+        written.append(out._obj.value)
+        return rc
+
+    def no_reopen(*args):
+        raise AssertionError("stream_sheet must not re-open through zlsx_rows_open")
+
+    monkeypatch.setattr(ffi.lib, "zlsx_book_stream_sheet", spy_stream)
+    monkeypatch.setattr(ffi.lib, "zlsx_rows_open", no_reopen)
+    with zlsx.open_lazy(path) as book:
+        rows = book.stream_sheet("Two")
+        assert written and rows._handle == written[0]
+        assert list(rows) == [["Two", 1]]
+        rows.close()
+    # `_handle` is keyword-only: the public constructor's contract is
+    # (book, sheet_idx) and nothing else.
+    with pytest.raises(TypeError):
+        zlsx.Rows(book, 0, 12345)
+
+
+def test_open_lazy_selector_errors_come_before_the_probe(tmp_path, monkeypatch):
+    _require_lazy_sheets()
+    import zlsx._ffi as ffi
+    path = tmp_path / "lazy_sel.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open_lazy(path) as book:
+        for bad, exc in ((4, IndexError), (-1, IndexError), ("Nope", KeyError), (1.5, TypeError)):
+            with pytest.raises(exc):
+                book.preload_sheet(bad)
+            with pytest.raises(exc):
+                book.stream_sheet(bad)
+        # An older dylib: the selector rule still first, then RuntimeError.
+        monkeypatch.setattr(ffi, "_HAS_LAZY_SHEETS", False)
+        with pytest.raises(IndexError):
+            book.preload_sheet(4)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.preload_sheet(0)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.stream_sheet(0)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            zlsx.open_lazy(path)
+    # A closed book is the same error on both, whatever dylib is loaded.
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.preload_sheet(0)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.stream_sheet(0)
+
+
+def test_open_lazy_failures_are_named_after_the_reader(tmp_path):
+    _require_lazy_sheets()
+    with pytest.raises(zlsx.ZlsxError, match="FileNotFound"):
+        zlsx.open_lazy(tmp_path / "missing.xlsx")
+    garbage = tmp_path / "garbage.xlsx"
+    garbage.write_bytes(b"not a zip archive at all")
+    with pytest.raises(zlsx.ZlsxError, match="BadZip"):
+        zlsx.open_lazy(garbage)
+
+
+def test_open_lazy_rows_outlive_the_book(tmp_path):
+    """The iterator retains the C handle (the lazy archive with it):
+    close the book first, read the rows after — the `Book.close`
+    contract, on the status opener's handle."""
+    _require_lazy_sheets()
+    path = tmp_path / "lazy_refs.xlsx"
+    _lazy_workbook(path)
+    book = zlsx.open_lazy(path)
+    rows = book.stream_sheet(3)
+    book.close()
+    assert book._handle is None
+    assert list(rows) == [["Four", 1]]
+    rows.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        next(rows)
+
+
+def test_eager_books_are_already_loaded_and_the_lazy_methods_are_no_ops(tmp_path):
+    _require_lazy_sheets()
+    path = tmp_path / "eager.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open(path) as book:
+        assert book.lazy is False
+        assert [len(book.merged_ranges(i)) for i in range(4)] == [1, 1, 1, 1]
+        book.preload_sheet("Three")
+        assert len(book.merged_ranges(2)) == 1
+        assert list(book.stream_sheet(1)) == [["Two", 1]]
+        with pytest.raises(IndexError):
+            book.stream_sheet(4)
+    with zlsx.open_bytes(path.read_bytes()) as book:
+        assert book.lazy is False
+        book.preload_sheet(0)
+        assert list(book.stream_sheet("Four")) == [["Four", 1]]
+
+
+def test_close_waits_for_in_flight_per_sheet_calls(tmp_path):
+    """Eight threads hammering per-sheet calls on ONE lazy book while the
+    main thread closes it: each worker ends in success or the closed-book
+    error, never a crash (in-house r2 S3E1-REL-201 / THR-201: `close`
+    outside the lock freed the C state under a getter). A regression is
+    a crash of the test process."""
+    _require_lazy_sheets()
+    import threading
+
+    path = tmp_path / "lazy_close_race.xlsx"
+    with zlsx.write(path) as w:
+        for i in range(8):
+            sheet = w.add_sheet(f"S{i}")
+            for r in range(100):
+                sheet.write_row([f"S{i}", r])
+            sheet.add_merged_cell("A1:B1")
+    for _ in range(40):
+        book = zlsx.open_lazy(path)
+        start = threading.Barrier(9)
+        errors = []
+
+        def worker(i):
+            start.wait()
+            try:
+                for k in range(8):
+                    j = (i + k) % 8
+                    book.merged_ranges(j)
+                    book.preload_sheet((j + 1) % 8)
+                    # The legacy openers and the workbook-wide getters
+                    # race the close too (in-house r3 S3E1-THR-301 / -302).
+                    it = book.sheet(j).rows()
+                    next(it)
+                    it.close()
+                    book.sheet(f"S{j}").read_all()
+                    book.sheet_state(j)
+                    book.shared_string_at(0)
+                    book.cell_font(0)
+            except zlsx.ZlsxError as exc:
+                # An assert here would escape the thread as a pytest
+                # WARNING, not a failure (in-house r4 S3E1-TEST-401): a
+                # ZlsxError other than the closed-book one is a defect
+                # the main thread must see.
+                if "closed" not in str(exc):
+                    errors.append(exc)
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        start.wait()
+        book.close()
+        for t in threads:
+            t.join()
+        assert not errors
+        with pytest.raises(zlsx.ZlsxError, match="closed"):
+            book.merged_ranges(0)
+    # The public constructor on a closed book is the closed-book error,
+    # not a NULL to the legacy opener (deterministic before r3).
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        zlsx.Rows(book, 0)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.sheet_state(0)
+
+
+def test_lazy_sheets_probe_agrees_with_the_library_version():
+    """A dylib at or past 0.9.0 exports the trio; a probe that says
+    otherwise is a packaging error, not a reason to skip the block
+    above (the sheet_state precedent)."""
+    import zlsx._ffi as ffi
+
+    major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
+    if (major, minor) >= (0, 9):
+        assert ffi._HAS_LAZY_SHEETS, "libzlsx >= 0.9.0 must export zlsx_book_open_lazy / _preload_sheet / _stream_sheet"
+    # The probe is the trio, not two of them (in-house r1 S3E1-TEST-104).
+    if ffi._HAS_LAZY_SHEETS:
+        assert all(
+            hasattr(ffi.lib, sym)
+            for sym in ("zlsx_book_open_lazy", "zlsx_book_preload_sheet", "zlsx_book_stream_sheet")
+        )
+
+
+def test_threads_may_share_one_lazy_book(tmp_path):
+    """Eight threads on ONE lazy book, each streaming its own sheet and
+    reading another sheet's merged ranges — the shape that segfaulted
+    without the per-book lock (in-house r1 S3E1-DOC-103: ctypes
+    releases the GIL, and a lazy handle's first touch mutates it). A
+    regression here is a crash of the test process, not an assertion."""
+    _require_lazy_sheets()
+    import threading
+
+    path = tmp_path / "lazy_threads.xlsx"
+    with zlsx.write(path) as w:
+        for i in range(8):
+            sheet = w.add_sheet(f"S{i}")
+            for r in range(200):
+                sheet.write_row([f"S{i}", r])
+            sheet.add_merged_cell("A1:B1")
+    for _ in range(20):
+        book = zlsx.open_lazy(path)
+        seen = [None] * 8
+        errors = []
+
+        def worker(i):
+            try:
+                n = 0
+                for row in book.stream_sheet(i):
+                    assert row[0] == f"S{i}"
+                    n += 1
+                seen[i] = n
+                book.merged_ranges((i + 1) % 8)
+                book.hyperlinks((i + 3) % 8)
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors and seen == [200] * 8
+        assert [len(book.merged_ranges(i)) for i in range(8)] == [1] * 8
+        book.close()

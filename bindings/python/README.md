@@ -57,6 +57,32 @@ with zlsx.open_bytes(content) as book:      # bytes, bytearray, or memoryview
 
 Requires libzlsx 0.6.0+ (`zlsx_book_open_buffer` in the C ABI).
 
+### Lazy — one sheet of many
+
+`zlsx.open` loads every sheet's XML and side indices before it returns
+(and releases the file, so the source can be renamed or deleted while the
+book is read). On a workbook of many sheets where the caller reads one,
+`open_lazy` reads the inventory, the shared strings and the styles at
+open and extracts each sheet on first touch — `Book.preload_sheet`,
+`Book.stream_sheet`, `Sheet.rows()` or `Sheet.read_all()` on that sheet —
+so the other sheets are never inflated:
+
+```python
+with zlsx.open_lazy("wide.xlsx") as book:     # book.lazy is True
+    print(book.sheets)                         # the inventory, at open
+    print(book.merged_ranges(3))               # [] — sheet 3 not loaded yet
+    for row in book.stream_sheet("Q3"):        # loads "Q3", streams its rows
+        ...
+    book.preload_sheet(3)                      # side indices without a row read
+    print(book.merged_ranges(3))               # populated now
+```
+
+The file stays open until the last handle closes — row iterators hold
+their own reference, so a `stream_sheet` iterator keeps reading after
+`book.close()`. Threads may share one book: every call on it is
+serialised by a per-book lock (see "Thread safety"); one `Rows` per
+thread. Requires libzlsx 0.9.0+ (`zlsx_book_open_lazy`).
+
 ## Write
 
 The writer produces fresh workbooks; editing an existing one is `zlsx.edit` / `Editor`, below. Cell styles registered via `Writer.add_style` get a 1-based index; pass those indices alongside values in `write_row(styles=[…])`.
@@ -715,6 +741,14 @@ with zlsx.write("out.xlsx") as w:
   the `<sheet state>` attribute as `zlsx list-sheets` spells it (`visible` /
   `hidden` / `veryHidden`; a missing or unrecognised value reads `visible`);
   hidden sheets stay in `Book.sheets` and read like any other
+- Lazy per-sheet loading (0.9.0+): `zlsx.open_lazy(path)` — the sheet
+  inventory, shared strings and styles at open, each sheet's XML and side
+  indices (merged ranges, hyperlinks, validations, comments) on first touch
+  through `Book.preload_sheet(selector)`, `Book.stream_sheet(selector)`,
+  `Sheet.rows()` or `Sheet.read_all()`; until then the per-sheet getters answer `[]` for an
+  unloaded sheet. `Book.lazy` tells the openers apart. The file stays open
+  until the last handle closes (row iterators included) — `zlsx.open`
+  loads every sheet and releases it before returning
 - Formula text and error tags on read (0.9.0+): `Rows.formula_strings()` /
   `Rows.formula_refs()` / `Rows.error_strings()` — the `<f>` body
   (entity-decoded), a shared / array slave's base cell, and the `t="e"`
@@ -745,6 +779,8 @@ with zlsx.write("out.xlsx") as w:
 ## Thread safety
 
 Distinct `Book` and `Writer` handles are fully independent — call them freely from any threads. Operations on the same handle must be externally synchronized, same as sqlite3 or libcurl. The C ABI's refcount lets a row iterator outlive its Book handle safely; all other cross-thread sharing is the caller's responsibility.
+
+For a `Book` the binding takes that lock for you: every call on the book — the per-sheet loads and getters (`preload_sheet`, `stream_sheet`, `Sheet.rows`, `Sheet.read_all`, `merged_ranges`, `hyperlinks`, `data_validations`, `comments`), the workbook-wide getters (`sheet_state`, `shared_string_at`, `rich_text`, the style lookups) and `close` — runs under a per-book lock, so threads may share one `Book` — a lazy one included, whose first touch of a sheet mutates the C handle (ctypes releases the GIL around every foreign call, so the GIL is no substitute) — and a `with zlsx.open_lazy(...) as book:` exiting while a thread is still inside a call waits for it (every later call raises `ZlsxError`). Iterating a `Rows` is unlocked: one iterator per thread, and an iterator outlives the book's close through the C refcount.
 
 Cancellable formula-engine calls (`recalculate`, `save_with_recalc`, `evaluate`, `Writer.save(recalculate=...)`) run their FFI call on a private worker thread while the calling thread waits interruptibly; the handle-synchronization rule above still applies — the worker is an implementation detail, not a license to share the handle.
 
