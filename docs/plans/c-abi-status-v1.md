@@ -2876,17 +2876,29 @@ the first run for the torn ones, index 3 `after`) — pinned in
 eager walker swallows past it and the lazy one keeps its ordinal". A
 cell's `<v>` index therefore resolves to different text on the two
 openers over such a table; the ordinal-keeping read is the one
-ECMA-376 describes, and bounding the eager walker's `</t>` search by
-the entry (the lazy walker's shape) is an owner follow-up on the
-reader, outside this slice's surface. Stated on every surface as the
-divergence, not as parity. **What the deferral does move** (in-house
-r1 B-DOC-101, measured through py-zlsx — the slice had first said "the
-one failure it adds is the allocation", false): the entity decode's
-verdict. `appendDecoded` is shared by both walkers and refuses a
-malformed entity (`&#x110000;`, `&x` without `;`) as `MalformedXml`;
-the eager parser runs it at open, so `Book.open` refuses the file, the
-lazy backend at `sharedStringAt`, so `open_sst_lazy` opens the file
-and that entry alone fails — `-1 MalformedXml` from
+ECMA-376 describes, and bounding the eager walker's closer searches
+by the entry (the lazy walker's shape) is an owner follow-up on the
+reader, outside this slice's surface — all three of them (in-house r2
+A/B-DOC-202): the `</rPr>` and `</rPh>` searches are the same
+unbounded `indexOfPos(xml, …)`, and with no closer left in the part
+the eager walker DROPS the entry (three of four, later indices shift)
+where the `</t>` case swallows; a torn `<rPr>`'s flags leak into the
+next rich entry; a torn `<si>` (no `</si>` at all) merges with the
+next on BOTH walkers, so the lazy walker's "skips THAT entry" comment
+overstates its recovery. Stated on every surface as the divergence,
+not as parity. **What the deferral does move** (in-house r1 B-DOC-101,
+measured through py-zlsx — the slice had first said "the one failure
+it adds is the allocation", false): a PLAIN entry's entity verdict
+(in-house r2 A/B-DOC-201: a rich-run entry's runs are decoded at open
+on the lazy backend too, `parseSstRichRunsForBody` through the same
+`appendDecoded`, so its malformed entity refuses the open on both —
+measured through the dylib, pinned in Zig and Python; the slice had
+stated the deferral unqualified). `appendDecoded` is shared by both
+walkers and refuses a malformed entity (`&#x110000;`, `&x` without
+`;`) as `MalformedXml`; the eager parser runs it at open, so
+`Book.open` refuses the file, the lazy backend at `sharedStringAt` for
+a plain entry, so `open_sst_lazy` opens the file and that entry alone
+fails — `-1 MalformedXml` from
 `zlsx_book_shared_string` and `zlsx_rows_next`, `ZlsxError` from
 `Book.shared_string_at` and the row iteration, the entries around it
 reading, the verdict not cached (pinned in `src/xlsx.zig`, "S3e slice
@@ -2988,6 +3000,20 @@ A-PERF-103 / B-PY-101 → one shared null context; A-TST-105 / B-TST-101
 → the pointer reset pinned; B-DOC-102 → three stale iter-sst comments
 in `xlsx.zig` corrected; B-ABI-101 → the present output reset on a
 NullOutPointer path, stated.
+
+**Round 2 (in-house, A and B both ship-ready; the same MEDIUM; ledger
+`codex_findings_s3e2_r2.md`)**: A/B-DOC-201 (the deferred verdict is a
+plain entry's — rich runs decode at open on the lazy backend) → every
+surface qualified, the rich shape pinned in Zig and Python; A/B-DOC-202
+(the follow-up names `</t>` alone) → the record above names the three
+closer searches and the torn-`<si>` merge; A-DOC-203 / B-DOC-204 (three
+`SstIndexOutOfRange` spellings survived the rename) and A-DOC-204 /
+B-DOC-203 (a garbled duplicate line in the c_abi section) → corrected;
+A-PY-206 (`shared_string_at(2**64)` masked to entry 0 through
+`c_size_t`, pre-existing) → the bound judged in Python, pinned;
+A-TST-205 / B-TST-201 (the probe-shape assertion resolves through
+`dlsym` and cannot see a one-symbol probe) → the probe's own expression
+pinned from `_ffi.py`'s source.
 
 **Not in this slice.** Lazy sheets AND a lazy SST on one handle
 (`openLazyWithSst(.path, .lazy)` without the eager facade) has no

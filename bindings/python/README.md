@@ -107,9 +107,11 @@ differently: on `open` the torn entry swallows markup and the entries
 after it up to the next `</t>` (every later index shifts);
 `open_sst_lazy` bounds each entry by its `</si>`, keeps the ordinal and
 yields the text before the tear.
-What the deferral defers is the entity decode's verdict — a malformed
-entity `open` refuses at open (`MalformedXml`) fails here at the entry's
-first touch — and the allocation (`ZlsxError` from `shared_string_at`
+What the deferral defers, for a plain entry, is the entity decode's
+verdict — a malformed entity `open` refuses at open (`MalformedXml`)
+fails here at the entry's first touch; a rich-text entry's runs are
+decoded at open here too, so its malformed entity refuses the open on
+both — and the allocation (`ZlsxError` from `shared_string_at`
 or the row iteration, named after the reader's error; out of range
 stays `IndexError`). A `Rows` over such a book takes the per-book lock
 for each row it yields or skips (a first touch mutates the handle). Requires
@@ -786,8 +788,9 @@ with zlsx.write("out.xlsx") as w:
   indexed and each entry decoded on first touch (`Book.shared_string_at`,
   a row that resolves to it) and cached; `Book.sst_lazy` tells it apart.
   `Book.shared_string_at` reads through the status export on a 0.9.0+
-  dylib: out of range stays `IndexError`, a failed decode (a malformed
-  entity, its allocation) is `ZlsxError` named after the reader's error
+  dylib: out of range stays `IndexError`, a failed decode (a plain
+  entry's malformed entity, its allocation) is `ZlsxError` named after
+  the reader's error
 - Formula text and error tags on read (0.9.0+): `Rows.formula_strings()` /
   `Rows.formula_refs()` / `Rows.error_strings()` — the `<f>` body
   (entity-decoded), a shared / array slave's base cell, and the `t="e"`

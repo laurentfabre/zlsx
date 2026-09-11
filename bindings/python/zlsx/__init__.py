@@ -909,14 +909,18 @@ class Book:
         """Return shared-string entry ``sst_idx`` as a decoded UTF-8
         ``str``. Raises :class:`IndexError` on out-of-range. On a
         :func:`open_sst_lazy` book the entry is decoded on its first
-        touch and cached; a failure of that decode (a malformed entity
-        the eager openers refuse at open — ``MalformedXml`` — or its
-        allocation) raises :class:`ZlsxError` named after the reader's
+        touch and cached; a failure of that decode (a plain entry's
+        malformed entity, which the eager openers refuse at open —
+        ``MalformedXml`` — or its allocation) raises :class:`ZlsxError` named after the reader's
         error where the library reports it apart from the bound (libzlsx
         0.9.0+, ``zlsx_book_shared_string``; an older dylib folds every
         failure into ``IndexError``). Requires libzlsx 0.2.6+."""
         if not self._handle:
             raise ZlsxError("book is closed")
+        # ctypes masks an int past the C `size_t` (2**64 reads entry 0;
+        # in-house r2 A-PY-206, pre-existing) — the bound is judged here.
+        if not 0 <= sst_idx < (1 << 64):
+            raise IndexError(f"sst_idx {sst_idx} out of range")
         out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
         out_len = ctypes.c_size_t(0)
         if _ffi._HAS_LAZY_SST:
@@ -1840,9 +1844,11 @@ def open_sst_lazy(path: Union[str, Path]) -> Book:
     and the entries after it up to the next ``</t>`` (every later index
     shifts), while this opener bounds each entry by its ``</si>``, keeps
     the ordinal and yields the text before the tear. What the deferral
-    defers is the entity decode's verdict — a malformed entity that
-    :func:`open` refuses at open (``MalformedXml``) fails here at the
-    entry's first touch — and the allocation: :class:`ZlsxError` from
+    defers, for a plain entry, is the entity decode's verdict — a
+    malformed entity that :func:`open` refuses at open (``MalformedXml``)
+    fails here at the entry's first touch; a rich-text entry's runs are
+    decoded at open here too, so its malformed entity refuses the open
+    on both — and the allocation: :class:`ZlsxError` from
     :meth:`Book.shared_string_at` or the row iteration, named after the
     reader's error. Threads may share the book as they share any other
     (see :func:`open_lazy`), and here a :class:`Rows` takes the

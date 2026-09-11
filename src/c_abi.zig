@@ -456,12 +456,15 @@ export fn zlsx_book_stream_sheet(
 // keeps its ordinal and yields the text before the tear
 // (pinned in xlsx.zig; a pre-existing divergence of the reader,
 // recorded in §24, not this slice's to lift). What the deferral
-// defers is the entity decode's verdict — a malformed entity is
-// `MalformedXml` at open on the eager openers and at first touch here
-// — and the allocation: OOM at first touch instead of at open. The
-// legacy `zlsx_shared_string_at`
-// folds that into its -1 beside out-of-range; `zlsx_book_shared_string`
-// folds both into its -1 beside out-of-range; `zlsx_book_shared_string`
+// defers, for a PLAIN entry (`<si><t>…</t></si>`), is the entity
+// decode's verdict — a malformed entity is `MalformedXml` at open on
+// the eager openers and at first touch here — and the allocation: OOM
+// at first touch instead of at open; a rich-run entry's runs are
+// decoded at open on this handle too (the lazy walk captures rich
+// runs eagerly), so its malformed entity refuses the open as on the
+// eager openers. The legacy `zlsx_shared_string_at` folds the deferred
+// verdict and the allocation into its -1 beside out-of-range;
+// `zlsx_book_shared_string`
 // is the same read under the status contract, where the bound is
 // -1 `SharedStringIndexOutOfRange` (a statement about the call — the
 // S3c embeddable-rows read's `SstIndexOutOfRange` is a verdict on a
@@ -517,7 +520,7 @@ export fn zlsx_book_open_sst_lazy(
 /// -1 `SharedStringIndexOutOfRange` for an index past
 /// `zlsx_shared_string_count` (judged before the reader is asked, on
 /// every handle), -1 `MalformedXml` for the entity verdict an SST-lazy
-/// handle's first touch of the entry defers and -3 for its allocation
+/// handle's first touch of a plain entry defers and -3 for its allocation
 /// (the legacy getter's -1 covers all three), -1 `InvalidInput` for a
 /// NULL book, -1 `NullOutPointer` for a NULL `out_ptr` or `out_len`.
 /// On ZLSX_OK the slice points into the handle's storage (valid until

@@ -4935,9 +4935,11 @@ def test_open_sst_lazy_loads_every_sheet_and_reads_what_open_reads(tmp_path, mon
         assert [list(book.sheet(i).rows()) for i in range(2)] == expect_rows
         assert book.sheet(0).read_all() == (None, expect_rows[0])
         # Out of range is IndexError on both books (the status read's
-        # SstIndexOutOfRange); a negative index wraps through c_size_t
+        # SharedStringIndexOutOfRange); a negative index wraps through c_size_t
         # to the far end and is the same statement.
-        for bad in (9, 10 ** 6, -1):
+        # 2**64 would mask to entry 0 through ctypes (in-house r2
+        # A-PY-206): judged in Python.
+        for bad in (9, 10 ** 6, -1, 1 << 64):
             with pytest.raises(IndexError):
                 book.shared_string_at(bad)
     # `stream_sheet`'s iterator outlives the close (the C refcount), and
@@ -4951,7 +4953,7 @@ def test_open_sst_lazy_loads_every_sheet_and_reads_what_open_reads(tmp_path, mon
 
 def test_shared_string_at_names_a_deferred_decode_failure(tmp_path, monkeypatch):
     """The status read tells the bound from the decode's allocation:
-    `SstIndexOutOfRange` stays `IndexError` (the shipped contract), any
+    `SharedStringIndexOutOfRange` stays `IndexError` (the shipped contract), any
     other name is `ZlsxError` named after it — pinned by standing in
     for the library, since an allocation failure cannot be induced
     through the dylib."""
@@ -5019,6 +5021,16 @@ def test_open_sst_lazy_defers_the_entity_verdict_to_first_touch(tmp_path):
         rows = book.sheet(0).rows()
         assert rows.skip(1) == 1
         assert next(rows) == ["fine", "after"]
+    # A rich-text entry's runs are decoded at open on the lazy backend
+    # too (in-house r2 A-DOC-201): its malformed entity refuses the open
+    # on both openers.
+    rich = tmp_path / "ent_rich.xlsx"
+    _patch_part(src, rich, "xl/sharedStrings.xml",
+                lambda _n, d: d.replace(b'<t xml:space="preserve">bad</t>', b"<r><t>bad &#x110000; run</t></r>"))
+    with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+        zlsx.open(rich)
+    with pytest.raises(zlsx.ZlsxError, match="MalformedXml"):
+        zlsx.open_sst_lazy(rich)
 
 
 def test_open_sst_lazy_failures_are_named_after_the_reader(tmp_path):
@@ -5050,6 +5062,14 @@ def test_lazy_sst_probe_agrees_with_the_library_version():
         assert ffi._HAS_LAZY_SST, "libzlsx >= 0.9.0 must export zlsx_book_open_sst_lazy / zlsx_book_shared_string"
     if ffi._HAS_LAZY_SST:
         assert all(hasattr(ffi.lib, sym) for sym in ("zlsx_book_open_sst_lazy", "zlsx_book_shared_string"))
+    # The probe's own expression names both symbols — a `dlsym` check
+    # cannot see a one-symbol probe on a dylib exporting both (in-house
+    # r2 A-TST-205 / B-TST-201).
+    import inspect
+    import re
+    src = inspect.getsource(ffi)
+    m = re.search(r"_HAS_LAZY_SST = \((.*?)\n\)", src, re.S)
+    assert m and "zlsx_book_open_sst_lazy" in m.group(1) and "zlsx_book_shared_string" in m.group(1)
 
 
 def test_threads_may_share_one_sst_lazy_book(tmp_path):

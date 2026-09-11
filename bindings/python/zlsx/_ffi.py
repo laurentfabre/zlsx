@@ -194,9 +194,10 @@ if _HAS_LAZY_SHEETS:
 # `Book.openSstLazy` as a zlsx_status_v1 opener (every sheet loaded and
 # the file released, the shared-string table indexed and each entry
 # decoded on first touch) plus the status read of one entry, whose
-# out-of-range is `SstIndexOutOfRange` and whose deferred-decode
-# allocation failure is ZLSX_NOMEM where the legacy getter folds both
-# into -1. One capability, two symbols. `zlsx.open_sst_lazy` raises
+# out-of-range is `SharedStringIndexOutOfRange`, whose deferred entity
+# verdict (a plain entry's, on an SST-lazy book) is `MalformedXml` and
+# whose deferred allocation failure is ZLSX_NOMEM, where the legacy
+# getter folds all three into -1. One capability, two symbols. `zlsx.open_sst_lazy` raises
 # RuntimeError without it; `Book.shared_string_at` falls back to the
 # legacy getter.
 _HAS_LAZY_SST = (

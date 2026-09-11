@@ -910,9 +910,11 @@ pub const Book = struct {
     /// Trade-off: lazy mode defers per-entry plain-text decoding, so
     /// what it moves from open to `sharedStringAt(idx)` (or,
     /// transitively, to a `Rows.next()` cell read that resolves to
-    /// that idx) is the entity decode's verdict — a malformed entity
-    /// `Book.open` refuses at open as `MalformedXml` fails here at
-    /// first touch — and the allocation (`OutOfMemory`). It refuses
+    /// that idx) is a plain entry's entity verdict — a malformed
+    /// entity `Book.open` refuses at open as `MalformedXml` fails here
+    /// at first touch; a rich-run entry's runs are decoded at open by
+    /// `parseSstRichRunsForBody`, so its malformed entity refuses the
+    /// open on both — and the allocation (`OutOfMemory`). It refuses
     /// nothing else the eager walker does not — neither refuses a
     /// torn `<t>` body — but the two read such a table differently:
     /// the eager walker's `</t>` search runs past the entry, so the
@@ -5811,7 +5813,9 @@ test "S3e slice 2: neither backend refuses a torn entry; the eager walker swallo
     // ordinal, decoding the text before the tear — the divergence §24
     // records (the deferral removes no validation; the two openers
     // read a torn table differently, a pre-existing reader behaviour,
-    // an owner follow-up).
+    // an owner follow-up; the eager `</rPr>` / `</rPh>` searches are
+    // unbounded the same way and drop the entry when no closer is
+    // left — in-house r2 DOC-202).
     const sst_xml =
         "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"4\" uniqueCount=\"4\">" ++
         "<si><t>ok &amp; sound</t></si>" ++
@@ -5898,6 +5902,31 @@ test "S3e slice 2: a malformed entity is the eager parser's refusal at open and 
     try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(1));
     try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(2));
     try std.testing.expectEqual(@as(u32, 2), lazy.sst.lazy.resolved.count());
+
+    // A rich-run entry is the exception (in-house r2 A-DOC-201): the
+    // lazy walk captures rich runs at open through the same decoder,
+    // so its malformed entity refuses the open on both backends.
+    const rich_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\" uniqueCount=\"2\">" ++
+        "<si><t>sound</t></si>" ++
+        "<si><r><t>bad &#x110000; run</t></r></si>" ++
+        "</sst>";
+    var rich_eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rich_eager.deinit();
+    rich_eager.shared_strings_xml = try std.testing.allocator.dupe(u8, rich_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStrings(&rich_eager, rich_eager.shared_strings_xml.?));
+    var rich_lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rich_lazy.deinit();
+    rich_lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, rich_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStringsLazy(&rich_lazy, rich_lazy.shared_strings_xml.?));
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {

@@ -194,10 +194,13 @@ int32_t zlsx_book_stream_sheet(zlsx_book_t * book,
  * zlsx_book_open() the torn entry swallows markup and the entries
  * after it up to the next </t> (every later index shifts); this opener
  * bounds each entry by its </si>, keeps the ordinal and yields the
- * text before the tear. What the deferral defers is the entity
- * decode's verdict — a malformed entity is MalformedXml at open on
- * zlsx_book_open() and at first touch here — and the allocation — OOM
- * at first touch instead of at open; the legacy zlsx_shared_string_at()
+ * text before the tear. What the deferral defers, for a plain entry
+ * (<si><t>…</t></si>), is the entity decode's verdict — a malformed
+ * entity is MalformedXml at open on zlsx_book_open() and at first
+ * touch here; a rich-run entry's runs are decoded at open on this
+ * handle too, so its malformed entity refuses the open on both — and
+ * the allocation — OOM at first touch instead of at open; the legacy
+ * zlsx_shared_string_at()
  * folds both into its -1 beside out-of-range, zlsx_book_shared_string()
  * reports them as ZLSX_ERROR MalformedXml and ZLSX_NOMEM, and a row
  * iterator's zlsx_rows_next() as -1 with the name. A first touch
@@ -224,7 +227,7 @@ int32_t zlsx_book_open_sst_lazy(const char  * path,
  * handle — a statement about the call; the embeddable-rows read's
  * SstIndexOutOfRange is a verdict on a cell and stays ZLSX_REFUSED);
  * ZLSX_ERROR MalformedXml for the entity verdict a handle from
- * zlsx_book_open_sst_lazy() defers to the entry's first touch and
+ * zlsx_book_open_sst_lazy() defers to a plain entry's first touch and
  * ZLSX_NOMEM for its allocation (the legacy getter's -1 covers all
  * three); ZLSX_ERROR InvalidInput for a NULL book; ZLSX_ERROR
  * NullOutPointer for a NULL `out_ptr` or `out_len`. On ZLSX_OK the
