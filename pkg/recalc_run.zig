@@ -2977,7 +2977,7 @@ test "measured, recorded: recalculate then saveWithRecalc in one open — the fi
     try testing.expectEqualStrings("999", try cellCache(try reopened.sheet(0), "B1"));
 }
 
-test "save-plan fold: a workbook whose calc state the reader refuses keeps the names splice's `<calcPr` anchor — the plain save and the arm with nothing to recalculate both place the block before it" {
+test "save-plan fold: a workbook whose calc state the reader refuses keeps the names splice's `<calcPr` anchor — the plain save places the block before it; the file transaction refuses the calc state before either arm" {
     const a = testing.allocator;
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -3000,24 +3000,27 @@ test "save-plan fold: a workbook whose calc state the reader refuses keeps the n
     });
     defer a.free(path);
 
-    for ([_][]const u8{ out, saved }) |dest| {
-        var wb = try Workbook.open(a, io, path);
-        defer wb.deinit();
-        try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
-        if (dest.ptr == out.ptr) {
-            var r = try wb.saveWithRecalc(a, io, dest, fixed_run, .{});
-            r.deinit(a);
-        } else {
-            try wb.save(io, dest);
-        }
-        var reopened = try Workbook.open(a, io, dest);
-        defer reopened.deinit();
-        const wb_xml = ((try reopened.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult).bytes;
-        const names_at = std.mem.indexOf(u8, wb_xml, "<definedNames>") orelse return error.TestUnexpectedResult;
-        const calc_at = std.mem.indexOf(u8, wb_xml, "<calcPr") orelse return error.TestUnexpectedResult;
-        try testing.expect(names_at < calc_at);
-        try testing.expect(std.mem.indexOf(u8, wb_xml, "fullPrecision=\"0\"") != null);
-    }
+    var wb = try Workbook.open(a, io, path);
+    defer wb.deinit();
+    try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
+    // The model build reads the calc state ahead of the no-formula
+    // decision, so the transaction refuses it whole — the name stays
+    // staged, the destination absent.
+    if (wb.saveWithRecalc(a, io, out, fixed_run, .{})) |report| {
+        var r = report;
+        r.deinit(a);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+    try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
+    try wb.save(io, saved);
+    var reopened = try Workbook.open(a, io, saved);
+    defer reopened.deinit();
+    const wb_xml = ((try reopened.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult).bytes;
+    const names_at = std.mem.indexOf(u8, wb_xml, "<definedNames>") orelse return error.TestUnexpectedResult;
+    const calc_at = std.mem.indexOf(u8, wb_xml, "<calcPr") orelse return error.TestUnexpectedResult;
+    try testing.expect(names_at < calc_at);
+    try testing.expect(std.mem.indexOf(u8, wb_xml, "fullPrecision=\"0\"") != null);
 }
 
 test "save-plan fold: a shared-string write over a workbook without a table lands the table, its relationship and its content type in the file on both arms, an inline string beside it" {
