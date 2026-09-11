@@ -144,15 +144,21 @@ ed = zlsx.Editor("model.xlsx")
 # as the final operation. On ANY failure the workbook is exactly as it was.
 report = ed.recalculate()                       # RecalcReport
 print(report.cells_written, report.resolved.now, report.resolved.seed)
+ed.save("model_recalculated.xlsx")              # the plain save carries it
 
-# Atomic file transaction (§5.7.9): recalc, write, rename, THEN swap.
-# The file is the plain save plus the recalc (staged cell writes go in
-# and are drained at the swap). A pre-commit failure leaves the
-# destination's prior bytes (or its absence) and this editor's memory
-# untouched on the candidate arm; a workbook with nothing to
-# recalculate is a plain save. The next transaction that would build a
-# candidate then refuses RecalcRequiresReopen: save and re-open.
-report = ed.save_with_recalc("model_out.xlsx", timeout=30.0)
+# Atomic file transaction (§5.7.9): recalc, write, rename, THEN swap —
+# one transaction per open (a second one in the same editor re-derives
+# its candidate from the archive as opened and drops what the first
+# computed; save and re-open between two). The file is the plain save
+# plus the recalc: staged cell writes go in and are drained at the
+# swap, and after one that carried a write the next transaction that
+# would build a candidate refuses RecalcRequiresReopen. A pre-commit
+# failure leaves the destination's prior bytes (or its absence) and
+# this editor's memory untouched on the candidate arm; a workbook with
+# nothing to recalculate is a plain save.
+with zlsx.Editor("model.xlsx") as fresh:
+    fresh.set_cell(0, 1, 0, 42.0)
+    report = fresh.save_with_recalc("model_out.xlsx", timeout=30.0)
 
 # Standalone cache-based evaluation — never mutates anything.
 r = ed.evaluate("=SUM(A1:B9)")                  # EvalResult
@@ -164,8 +170,11 @@ r.resolved                                       # the exact resolved context �
 blob = ed.save_to_buffer()                       # bytes
 ed2 = zlsx.Editor.from_bytes(blob)               # copies; the borrow ends at the call
 
-# Keep every cache, set fullCalcOnLoad="1" for the next consumer.
-ed.mark_recalc_on_load()
+# Keep every cache, set fullCalcOnLoad="1" for the next consumer — its
+# own transaction, on its own open.
+with zlsx.Editor("model.xlsx") as marked:
+    marked.mark_recalc_on_load()
+    marked.save("model_marked.xlsx")
 ```
 
 Writer-side, `save(recalculate=...)` routes the save through the recalc

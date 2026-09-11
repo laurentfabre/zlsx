@@ -3006,11 +3006,7 @@ test "save-plan fold: a workbook whose calc state the reader refuses keeps the n
     // The model build reads the calc state ahead of the no-formula
     // decision, so the transaction refuses it whole — the name stays
     // staged, the destination absent.
-    if (wb.saveWithRecalc(a, io, out, fixed_run, .{})) |report| {
-        var r = report;
-        r.deinit(a);
-        return error.TestUnexpectedResult;
-    } else |_| {}
+    try testing.expectError(error.FormulaPrecisionAsDisplayed, wb.saveWithRecalc(a, io, out, fixed_run, .{}));
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
     try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
     try wb.save(io, saved);
