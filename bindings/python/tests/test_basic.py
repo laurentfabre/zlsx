@@ -4592,3 +4592,142 @@ def test_rows_skip_drain_fallback_leaves_no_current_row(tmp_path, monkeypatch):
             assert next(rows) == ["three"]
             assert rows.skip(5) == 0
             assert rows.style_indices() == []
+
+
+# ─── S3e slice 1: lazy per-sheet loading on the reader handle ────────
+
+
+def _lazy_workbook(path):
+    """Four sheets through the writer, one merged range each — the
+    per-sheet side index a lazy book has not parsed until the sheet is
+    touched, so `merged_ranges` is the observable of the load: `[]`
+    before, one range after, on the same book."""
+    with zlsx.write(path) as w:
+        for name in ("One", "Two", "Three", "Four"):
+            sheet = w.add_sheet(name)
+            sheet.write_row([name, 1])
+            sheet.add_merged_cell("A1:B1")
+
+
+def _require_lazy_sheets():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_LAZY_SHEETS:
+        pytest.skip("libzlsx lacks zlsx_book_open_lazy (0.9.0+)")
+
+
+def test_open_lazy_defers_every_sheet_and_each_touch_loads_one(tmp_path):
+    _require_lazy_sheets()
+    path = tmp_path / "lazy.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open_lazy(path) as book:
+        # The workbook-wide state is populated at open.
+        assert book.lazy is True
+        assert book.sheets == ["One", "Two", "Three", "Four"]
+        assert book.sheet_state("Four") == "visible"
+        # No sheet is loaded: every per-sheet getter answers as for a
+        # sheet without the feature.
+        assert [book.merged_ranges(i) for i in range(4)] == [[], [], [], []]
+        assert book.hyperlinks(0) == [] and book.comments(0) == [] and book.data_validations(0) == []
+
+        # preload: by index, then by name; idempotent (one range, not two).
+        assert book.preload_sheet(0) is None
+        assert len(book.merged_ranges(0)) == 1
+        book.preload_sheet("One")
+        assert len(book.merged_ranges(0)) == 1
+        assert [len(book.merged_ranges(i)) for i in range(1, 4)] == [0, 0, 0]
+
+        # stream_sheet: the status opener loads the sheet and its rows read.
+        rows = book.stream_sheet("Two")
+        assert isinstance(rows, zlsx.Rows)
+        assert list(rows) == [["Two", 1]]
+        assert len(book.merged_ranges(1)) == 1
+        # Sheet.rows(): the legacy opener is the same on-demand load.
+        assert list(book.sheet(2).rows()) == [["Three", 1]]
+        assert len(book.merged_ranges(2)) == 1
+        # read_all goes through the same iterator.
+        assert book.sheet(3).read_all() == (None, [["Four", 1]])
+        assert [len(book.merged_ranges(i)) for i in range(4)] == [1, 1, 1, 1]
+
+
+def test_open_lazy_selector_errors_come_before_the_probe(tmp_path, monkeypatch):
+    _require_lazy_sheets()
+    import zlsx._ffi as ffi
+    path = tmp_path / "lazy_sel.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open_lazy(path) as book:
+        for bad, exc in ((4, IndexError), (-1, IndexError), ("Nope", KeyError), (1.5, TypeError)):
+            with pytest.raises(exc):
+                book.preload_sheet(bad)
+            with pytest.raises(exc):
+                book.stream_sheet(bad)
+        # An older dylib: the selector rule still first, then RuntimeError.
+        monkeypatch.setattr(ffi, "_HAS_LAZY_SHEETS", False)
+        with pytest.raises(IndexError):
+            book.preload_sheet(4)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.preload_sheet(0)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            book.stream_sheet(0)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            zlsx.open_lazy(path)
+    # A closed book is the same error on both, whatever dylib is loaded.
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.preload_sheet(0)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.stream_sheet(0)
+
+
+def test_open_lazy_failures_are_named_after_the_reader(tmp_path):
+    _require_lazy_sheets()
+    with pytest.raises(zlsx.ZlsxError, match="FileNotFound"):
+        zlsx.open_lazy(tmp_path / "missing.xlsx")
+    garbage = tmp_path / "garbage.xlsx"
+    garbage.write_bytes(b"not a zip archive at all")
+    with pytest.raises(zlsx.ZlsxError, match="BadZip"):
+        zlsx.open_lazy(garbage)
+
+
+def test_open_lazy_rows_outlive_the_book(tmp_path):
+    """The iterator retains the C handle (the lazy archive with it):
+    close the book first, read the rows after — the `Book.close`
+    contract, on the status opener's handle."""
+    _require_lazy_sheets()
+    path = tmp_path / "lazy_refs.xlsx"
+    _lazy_workbook(path)
+    book = zlsx.open_lazy(path)
+    rows = book.stream_sheet(3)
+    book.close()
+    assert book._handle is None
+    assert list(rows) == [["Four", 1]]
+    rows.close()
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        next(rows)
+
+
+def test_eager_books_are_already_loaded_and_the_lazy_methods_are_no_ops(tmp_path):
+    _require_lazy_sheets()
+    path = tmp_path / "eager.xlsx"
+    _lazy_workbook(path)
+    with zlsx.open(path) as book:
+        assert book.lazy is False
+        assert [len(book.merged_ranges(i)) for i in range(4)] == [1, 1, 1, 1]
+        book.preload_sheet("Three")
+        assert len(book.merged_ranges(2)) == 1
+        assert list(book.stream_sheet(1)) == [["Two", 1]]
+        with pytest.raises(IndexError):
+            book.stream_sheet(4)
+    with zlsx.open_bytes(path.read_bytes()) as book:
+        assert book.lazy is False
+        book.preload_sheet(0)
+        assert list(book.stream_sheet("Four")) == [["Four", 1]]
+
+
+def test_lazy_sheets_probe_agrees_with_the_library_version():
+    """A dylib at or past 0.9.0 exports the trio; a probe that says
+    otherwise is a packaging error, not a reason to skip the block
+    above (the sheet_state precedent)."""
+    import zlsx._ffi as ffi
+
+    major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
+    if (major, minor) >= (0, 9):
+        assert ffi._HAS_LAZY_SHEETS, "libzlsx >= 0.9.0 must export zlsx_book_open_lazy / _preload_sheet / _stream_sheet"

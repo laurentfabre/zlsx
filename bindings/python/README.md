@@ -57,6 +57,30 @@ with zlsx.open_bytes(content) as book:      # bytes, bytearray, or memoryview
 
 Requires libzlsx 0.6.0+ (`zlsx_book_open_buffer` in the C ABI).
 
+### Lazy — one sheet of many
+
+`zlsx.open` loads every sheet's XML and side indices before it returns
+(and releases the file, so the source can be renamed or deleted while the
+book is read). On a workbook of many sheets where the caller reads one,
+`open_lazy` reads the inventory, the shared strings and the styles at
+open and extracts each sheet on first touch — `Book.preload_sheet`,
+`Book.stream_sheet` or `Sheet.rows()` on that sheet — so the other sheets
+are never inflated:
+
+```python
+with zlsx.open_lazy("wide.xlsx") as book:     # book.lazy is True
+    print(book.sheets)                         # the inventory, at open
+    print(book.merged_ranges(3))               # [] — sheet 3 not loaded yet
+    for row in book.stream_sheet("Q3"):        # loads "Q3", streams its rows
+        ...
+    book.preload_sheet(3)                      # side indices without a row read
+    print(book.merged_ranges(3))               # populated now
+```
+
+The file stays open until the last handle closes — row iterators hold
+their own reference, so a `stream_sheet` iterator keeps reading after
+`book.close()`. Requires libzlsx 0.9.0+ (`zlsx_book_open_lazy`).
+
 ## Write
 
 The writer produces fresh workbooks; editing an existing one is `zlsx.edit` / `Editor`, below. Cell styles registered via `Writer.add_style` get a 1-based index; pass those indices alongside values in `write_row(styles=[…])`.
@@ -715,6 +739,14 @@ with zlsx.write("out.xlsx") as w:
   the `<sheet state>` attribute as `zlsx list-sheets` spells it (`visible` /
   `hidden` / `veryHidden`; a missing or unrecognised value reads `visible`);
   hidden sheets stay in `Book.sheets` and read like any other
+- Lazy per-sheet loading (0.9.0+): `zlsx.open_lazy(path)` — the sheet
+  inventory, shared strings and styles at open, each sheet's XML and side
+  indices (merged ranges, hyperlinks, validations, comments) on first touch
+  through `Book.preload_sheet(selector)`, `Book.stream_sheet(selector)` or
+  `Sheet.rows()`; until then the per-sheet getters answer `[]` for an
+  unloaded sheet. `Book.lazy` tells the openers apart. The file stays open
+  until the last handle closes (row iterators included) — `zlsx.open`
+  loads every sheet and releases it before returning
 - Formula text and error tags on read (0.9.0+): `Rows.formula_strings()` /
   `Rows.formula_refs()` / `Rows.error_strings()` — the `<f>` body
   (entity-decoded), a shared / array slave's base cell, and the `t="e"`

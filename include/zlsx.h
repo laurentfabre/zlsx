@@ -9,7 +9,11 @@
  * Distinct handles are independent; operations on the SAME handle must
  * be externally synchronized — in particular, do not call zlsx_book_close()
  * concurrently with any other call taking the same handle. This matches
- * the sqlite3 / libcurl convention.
+ * the sqlite3 / libcurl convention. The rule is load-bearing for a handle
+ * from zlsx_book_open_lazy(): its sheets are extracted on first touch
+ * (zlsx_book_preload_sheet(), zlsx_book_stream_sheet(), zlsx_rows_open(),
+ * zlsx_matrix_open() mutate the book), so two threads reaching for two
+ * sheets of one lazy handle need the caller's lock.
  *
  * The internal refcount lets a zlsx_rows_t* returned by zlsx_rows_open()
  * safely outlive the caller's zlsx_book_t* handle; the last close on
@@ -102,9 +106,71 @@ zlsx_book_t * zlsx_book_open_buffer(const uint8_t * data,
                                     uint8_t       * err_buf,
                                     size_t          err_buf_len);
 
+/*
+ * Open an xlsx file lazily (S3e slice 1; probe: ZLSX_HAS_LAZY_SHEETS).
+ * The central directory, the shared strings, styles.xml and theme.xml
+ * are read now; each sheet's XML and its side indices (merged ranges,
+ * hyperlinks, data validations, comments) are extracted on first touch
+ * — zlsx_book_preload_sheet(), zlsx_book_stream_sheet(), zlsx_rows_open()
+ * or zlsx_matrix_open() on that sheet. Until then the per-sheet getters
+ * (zlsx_merged_range_count() and its siblings) answer for an unloaded
+ * sheet as for one that has none; the workbook-wide getters (sheet
+ * names and states, shared strings, rich runs, styles, number formats)
+ * are populated at open on every handle. The archive file stays open
+ * until the last reference on the handle drops (row and matrix handles
+ * included), so on Windows the source cannot be renamed or deleted
+ * while any is live — zlsx_book_open() releases it before returning
+ * and is the opener for that case. Same-handle calls are externally
+ * synchronized (the contract at the top of this header).
+ *
+ * zlsx_status_v1: ZLSX_OK with the handle in *out (close with
+ * zlsx_book_close()); ZLSX_ERROR with the reader's error name in errbuf
+ * (an unreadable archive, a malformed part, the decompression caps —
+ * the reader has no typed refusal, so there is no zlsx_diag_v1 here,
+ * the zlsx_open_buffer() shape); ZLSX_NOMEM. *out is NULL on any
+ * non-zero status; a NULL `out` is ZLSX_ERROR NullOutPointer.
+ */
+int32_t zlsx_book_open_lazy(const char  * path,
+                            zlsx_book_t ** out,
+                            uint8_t     * err_buf,
+                            size_t        err_buf_len);
+
+/*
+ * Load sheet `idx` now — its XML and side indices — so the per-sheet
+ * getters answer for it without a row iteration. Idempotent: a loaded
+ * sheet is a hashmap hit, and on a handle from zlsx_book_open() or
+ * zlsx_book_open_buffer() every sheet already is, so the call is a
+ * no-op there. ZLSX_OK; ZLSX_ERROR SheetIndexOutOfRange for an index
+ * past zlsx_sheet_count(); ZLSX_ERROR with the reader's name for an
+ * archive or sheet-part failure (the sheet then stays loaded with the
+ * side indices parsed up to the failure — the next call is the hit,
+ * not a retry); ZLSX_NOMEM.
+ */
+int32_t zlsx_book_preload_sheet(zlsx_book_t * book,
+                                uint32_t      idx,
+                                uint8_t     * err_buf,
+                                size_t        err_buf_len);
+
+/*
+ * Open a row iterator for sheet `idx` under zlsx_status_v1 — the
+ * iterator zlsx_rows_open() returns, loading the sheet on demand on a
+ * lazy handle, with the failure classified instead of NULL: ZLSX_ERROR
+ * SheetIndexOutOfRange, ZLSX_ERROR with the reader's name for an
+ * archive or sheet-part failure, ZLSX_NOMEM. On ZLSX_OK *out holds the
+ * handle (close with zlsx_rows_close(); it retains the book, so the
+ * book may be closed first); on any other status *out is NULL. A NULL
+ * `out` is ZLSX_ERROR NullOutPointer.
+ */
+int32_t zlsx_book_stream_sheet(zlsx_book_t * book,
+                               uint32_t      idx,
+                               zlsx_rows_t ** out,
+                               uint8_t     * err_buf,
+                               size_t        err_buf_len);
+
 /* Drop the caller's reference to a Book. NULL-safe (no-op). Active
  * row iterators hold their own references, so calling this while rows
- * are live is safe — the state is freed on the last reference. */
+ * are live is safe — the state is freed on the last reference. A lazy
+ * handle's archive file closes with that last reference. */
 void zlsx_book_close(zlsx_book_t * book);
 
 /* Number of sheets in the workbook. */
@@ -455,7 +521,9 @@ int32_t zlsx_rich_run_font_name(zlsx_book_t *     book,
 
 /*
  * Open a row iterator for sheet `sheet_idx`. On failure returns NULL
- * and writes a diagnostic into err_buf as per zlsx_book_open().
+ * and writes a diagnostic into err_buf as per zlsx_book_open(). On a
+ * handle from zlsx_book_open_lazy() this loads the sheet on demand —
+ * zlsx_book_stream_sheet() is the same iterator under zlsx_status_v1.
  *
  * The returned iterator retains a reference on the book, so it is safe
  * to close `book` while `rows` is still live — the underlying state
@@ -2442,6 +2510,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
 #define ZLSX_HAS_EMBEDDING_WRITE  1   /* editor set_embeddings + zlsx_emb_coverage_v1 + ZLSX_EMB_WRITE_RECOVERY_IN_CELLS (S3c slices 1 + 4; 0.9.0 ships both — no release exposes the export without the bit) */
 #define ZLSX_HAS_EMBEDDABLE_ROWS  1   /* editor embeddable_rows_ndjson (S3c slice 2) */
 #define ZLSX_HAS_EMBEDDING_SWEEPS 1   /* editor prune_embeddings + strip_embeddings + zlsx_prune_report_v1 (S3c slice 3) */
+#define ZLSX_HAS_LAZY_SHEETS      1   /* reader book_open_lazy + book_preload_sheet + book_stream_sheet (S3e slice 1) */
 
 
 #ifdef __cplusplus

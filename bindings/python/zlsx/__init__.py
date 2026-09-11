@@ -45,6 +45,7 @@ __version__ = "0.9.0"
 level may drift when the binding ships a Python-only fix."""
 
 __all__ = [
+    "open_lazy",
     "open",
     "open_bytes",
     "write",
@@ -474,7 +475,10 @@ class Alignment:
 
 
 class Book:
-    """A workbook handle. Use :func:`zlsx.open` to construct one.
+    """A workbook handle. Use :func:`zlsx.open` (every sheet loaded at
+    open, the file released before it returns), :func:`zlsx.open_bytes`
+    or :func:`zlsx.open_lazy` (sheets loaded on first touch; see
+    :attr:`lazy`) to construct one.
 
     Also usable as a context manager; exit closes the handle::
 
@@ -491,11 +495,17 @@ class Book:
             raise ZlsxError(f"zlsx_book_open({path!r}): {_decode_err(self._err)}")
         self._attach(handle)
 
-    def _attach(self, handle) -> None:
+    def _attach(self, handle, lazy: bool = False) -> None:
         """Adopt an already-open C handle and cache sheet names — most
         callers enumerate them, and the list is short (<10 in typical
-        workbooks). Shared by the path and buffer constructors."""
+        workbooks). Shared by the path, buffer and lazy constructors."""
         self._handle = handle
+        #: ``True`` for a book from :func:`open_lazy` — its sheets load on
+        #: first touch (:meth:`preload_sheet`, :meth:`stream_sheet`,
+        #: :meth:`Sheet.rows`) and the file stays open until the last
+        #: handle closes; ``False`` for :func:`open` / :func:`open_bytes`,
+        #: whose sheets are all loaded before the constructor returns.
+        self.lazy: bool = lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
         name_buf = ctypes.create_string_buffer(256)
@@ -572,10 +582,59 @@ class Book:
             # A code this binding does not know — a newer library.
             raise ZlsxError(f"zlsx_sheet_state({idx}) returned {code}") from None
 
+    def preload_sheet(self, selector: Union[int, str]) -> None:
+        """Load one sheet now — its XML and side indices — so
+        :meth:`merged_ranges`, :meth:`hyperlinks`, :meth:`data_validations`
+        and :meth:`comments` answer for it without a row iteration. Only a
+        :func:`open_lazy` book has anything to load; on :func:`open` /
+        :func:`open_bytes` books every sheet already is, and the call is
+        a no-op. Idempotent. ``selector`` is a 0-based index or a name
+        under :meth:`sheet`'s rule (``IndexError`` / ``KeyError`` /
+        ``TypeError``); an archive or sheet-part failure raises
+        :class:`ZlsxError` named after the reader's error. Requires
+        libzlsx 0.9.0+ (``zlsx_book_preload_sheet``)."""
+        # The selector rule first, the probe second — a closed book or a
+        # bad selector is the same error whatever dylib is loaded (the
+        # `sheet_state` order).
+        idx = self._sheet_index(selector)
+        if not _ffi._HAS_LAZY_SHEETS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose preload_sheet (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+        rc = _ffi.lib.zlsx_book_preload_sheet(self._handle, idx, self._err, _ERR_BUF_LEN)
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_book_preload_sheet({idx}): {_decode_err(self._err)}")
+
+    def stream_sheet(self, selector: Union[int, str]) -> "Rows":
+        """A row iterator over one sheet, by 0-based index or by name —
+        :meth:`Sheet.rows` through ``zlsx_book_stream_sheet``, the
+        status-contract opener: on a :func:`open_lazy` book the sheet is
+        loaded on first touch here (an archive or sheet-part failure
+        raises :class:`ZlsxError` named after the reader's error); on an
+        eager book it is the same iterator :meth:`Sheet.rows` returns.
+        The iterator holds its own reference, so the book may be closed
+        while it is being read. Requires libzlsx 0.9.0+."""
+        idx = self._sheet_index(selector)
+        if not _ffi._HAS_LAZY_SHEETS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose stream_sheet (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+        handle = _ffi.rows_handle()
+        rc = _ffi.lib.zlsx_book_stream_sheet(
+            self._handle, idx, ctypes.byref(handle), self._err, _ERR_BUF_LEN
+        )
+        if rc != _ffi.ZLSX_OK:
+            raise ZlsxError(f"zlsx_book_stream_sheet({idx}): {_decode_err(self._err)}")
+        return Rows(self, idx, _handle=handle.value)
+
     def merged_ranges(self, sheet_idx: int) -> list[MergeRange]:
         """Merged cell ranges declared in sheet ``sheet_idx``'s
         ``<mergeCells>`` block. Returns an empty list for sheets
-        without merges."""
+        without merges — and, on a :func:`open_lazy` book, for a sheet
+        not yet loaded (:meth:`preload_sheet` or a row iteration loads
+        it)."""
         if not self._handle:
             raise ZlsxError("book is closed")
         if not _ffi._HAS_READER_META:
@@ -603,7 +662,8 @@ class Book:
         the sheet's ``_rels/sheet{N}.xml.rels`` file. Both external
         (``url``) and internal (``location``) targets are returned;
         for any well-formed source exactly one is non-empty. Returns
-        an empty list for sheets without a ``<hyperlinks>`` block.
+        an empty list for sheets without a ``<hyperlinks>`` block — and,
+        on a :func:`open_lazy` book, for a sheet not yet loaded.
         Requires libzlsx 0.2.7+ to populate ``location``; older dylibs
         return ``location=""`` for every entry."""
         if not self._handle:
@@ -642,7 +702,8 @@ class Book:
     def comments(self, sheet_idx: int) -> list[Comment]:
         """Cell comments declared on sheet ``sheet_idx`` (from
         ``xl/comments*.xml`` discovered via the sheet's rels).
-        Returns an empty list for sheets without a comments part.
+        Returns an empty list for sheets without a comments part — and,
+        on a :func:`open_lazy` book, for a sheet not yet loaded.
         Requires libzlsx 0.2.6+."""
         if not self._handle:
             raise ZlsxError("book is closed")
@@ -709,7 +770,8 @@ class Book:
     def data_validations(self, sheet_idx: int) -> list[DataValidation]:
         """Data validations on ``sheet_idx`` (dropdowns + numeric / date
         / time / text-length / custom). Empty list for sheets without a
-        ``<dataValidations>`` block. Extended fields (``kind``, ``op``,
+        ``<dataValidations>`` block — and, on a :func:`open_lazy` book,
+        for a sheet not yet loaded. Extended fields (``kind``, ``op``,
         ``formula1``, ``formula2``) require libzlsx 0.2.6+; on older
         libraries they fall back to the list-only defaults."""
         if not self._handle:
@@ -1063,7 +1125,7 @@ class Book:
         """Drop our reference to the book. Active row iterators hold their
         own references, so this is safe to call before iteration finishes —
         the C ABI's refcount keeps the state alive until the last handle
-        closes."""
+        closes (a :func:`open_lazy` book's file with it)."""
         if self._handle:
             _ffi.lib.zlsx_book_close(self._handle)
             self._handle = None
@@ -1213,7 +1275,7 @@ class Rows:
     immediately to avoid dangling references.
     """
 
-    def __init__(self, book: Book, sheet_idx: int):
+    def __init__(self, book: Book, sheet_idx: int, _handle=None):
         self._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
         # Hold a reference to the Python Book so callers using iter29
         # helpers (`style_indices`, `number_format`) don't have to
@@ -1221,6 +1283,11 @@ class Rows:
         # underlying Book handle until this iterator is closed.
         self._book = book
         self._current_len = 0
+        if _handle is not None:
+            # `Book.stream_sheet` opened the handle through the status
+            # export; adopt it (the C handle already retains the book).
+            self._handle = _handle
+            return
         self._handle = _ffi.lib.zlsx_rows_open(
             book._handle, sheet_idx, self._err, _ERR_BUF_LEN
         )
@@ -1561,6 +1628,50 @@ def open_bytes(data: Union[bytes, bytearray, memoryview]) -> Book:
     if not handle:
         raise ZlsxError(f"zlsx_book_open_buffer({len(raw)} bytes): {_decode_err(book._err)}")
     book._attach(handle)
+    return book
+
+
+def open_lazy(path: Union[str, Path]) -> Book:
+    """Open an ``.xlsx`` file lazily: the sheet inventory, the shared
+    strings, the styles and the theme are read now; each sheet's XML and
+    its side indices (merged ranges, hyperlinks, data validations,
+    comments) are extracted on first touch — :meth:`Book.preload_sheet`,
+    :meth:`Book.stream_sheet` or :meth:`Sheet.rows` on that sheet. Until
+    then :meth:`Book.merged_ranges` and its siblings answer for an
+    unloaded sheet as for one that has none; the workbook-wide getters
+    (:attr:`Book.sheets`, :meth:`Book.sheet_state`,
+    :meth:`Book.shared_string_at`, the style lookups) are populated at
+    open. The book reads as :attr:`Book.lazy`.
+
+    The file stays open until the last handle closes (row iterators
+    included), so on Windows it cannot be renamed or deleted meanwhile;
+    :func:`open` loads every sheet and releases the file before
+    returning, and is the opener for that case. On a workbook of many
+    sheets where the caller reads one, the lazy open skips the other
+    sheets' extraction entirely::
+
+        with zlsx.open_lazy("wide.xlsx") as book:
+            for row in book.stream_sheet("Q3"):
+                ...
+
+    Raises :class:`ZlsxError` on parse failure, named after the reader's
+    error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).
+    """
+    if not _ffi._HAS_LAZY_SHEETS:
+        raise RuntimeError(
+            "loaded libzlsx does not expose open_lazy (requires 0.9.0+); "
+            "upgrade libzlsx"
+        )
+    book = Book.__new__(Book)
+    book._handle = None
+    book._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+    handle = _ffi.book_handle()
+    rc = _ffi.lib.zlsx_book_open_lazy(
+        str(path).encode("utf-8"), ctypes.byref(handle), book._err, _ERR_BUF_LEN
+    )
+    if rc != _ffi.ZLSX_OK:
+        raise ZlsxError(f"zlsx_book_open_lazy({str(path)!r}): {_decode_err(book._err)}")
+    book._attach(handle.value, lazy=True)
     return book
 
 

@@ -152,6 +152,44 @@ if _HAS_SHEET_STATE:
     lib.zlsx_sheet_state.argtypes = [book_handle, ctypes.c_uint32]
     lib.zlsx_sheet_state.restype = ctypes.c_int32
 
+# S3e slice 1 (0.9.0+): lazy per-sheet loading on the reader handle —
+# `Book.openLazy` / `preloadSheet` / `streamSheet` as zlsx_status_v1
+# exports (int32 status, the handle through an out-pointer, no diag:
+# the reader has no typed refusal). One capability, three symbols — a
+# dylib carrying one without the others is not a shape any release
+# shipped. `zlsx.open_lazy` / `Book.preload_sheet` / `Book.stream_sheet`
+# raise RuntimeError without it.
+_HAS_LAZY_SHEETS = (
+    hasattr(lib, "zlsx_book_open_lazy")
+    and hasattr(lib, "zlsx_book_preload_sheet")
+    and hasattr(lib, "zlsx_book_stream_sheet")
+)
+if _HAS_LAZY_SHEETS:
+    lib.zlsx_book_open_lazy.argtypes = [
+        ctypes.c_char_p,               # path (null-terminated)
+        ctypes.POINTER(book_handle),   # out
+        ctypes.c_char_p,               # err_buf
+        ctypes.c_size_t,               # err_buf_len
+    ]
+    lib.zlsx_book_open_lazy.restype = ctypes.c_int32
+    # The index is a c_uint32: ctypes wraps a negative int silently, so
+    # the Python-side bound (`Book._sheet_index`) is the only guard.
+    lib.zlsx_book_preload_sheet.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_book_preload_sheet.restype = ctypes.c_int32
+    lib.zlsx_book_stream_sheet.argtypes = [
+        book_handle,
+        ctypes.c_uint32,
+        ctypes.POINTER(rows_handle),   # out
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_book_stream_sheet.restype = ctypes.c_int32
+
 lib.zlsx_rows_open.argtypes = [
     book_handle,
     ctypes.c_uint32,
