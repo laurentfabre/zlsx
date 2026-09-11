@@ -436,6 +436,126 @@ export fn zlsx_book_stream_sheet(
     return ZLSX_OK;
 }
 
+// ─── S3e slice 2: the lazy SST backend on the reader handle ──────────
+//
+// `Book.openSstLazy` under `zlsx_status_v1` (§24): eager sheets, lazy
+// shared strings. The handle is a `BookState` like every other — every
+// sheet loaded and the archive released before the call returns, as
+// `zlsx_book_open` — whose shared-string table is an offset index built
+// at open; an entry's text is decoded into the handle's arena on first
+// touch (`zlsx_shared_string_at`, `zlsx_book_shared_string`, a row
+// iterator or matrix resolving a cell to it) and cached. The touch is a
+// mutation of the Book (the resolution map and the arena grow), which
+// the header's same-handle rule covers as it covers a lazy sheet load.
+//
+// The deferred decode removes no validation: neither walker refuses a
+// torn `<t>` body. The two read such a table differently — the eager
+// walker's `</t>` search runs past the entry, so the torn entry
+// swallows markup and the entries after it up to the next `</t>`
+// (every later index shifts), the lazy one is bounded by its `</si>`,
+// keeps its ordinal and yields the text before the tear
+// (pinned in xlsx.zig; a pre-existing divergence of the reader,
+// recorded in §24, not this slice's to lift). What the deferral
+// defers, for a PLAIN entry (`<si><t>…</t></si>`), is the entity
+// decode's verdict — a malformed entity is `MalformedXml` at open on
+// the eager openers and at first touch here — and the allocation: OOM
+// at first touch instead of at open; a rich-run entry's runs are
+// decoded at open on this handle too (the lazy walk captures rich
+// runs eagerly), so its malformed entity refuses the open as on the
+// eager openers. The legacy `zlsx_shared_string_at` folds the deferred
+// verdict and the allocation into its -1 beside out-of-range;
+// `zlsx_book_shared_string`
+// is the same read under the status contract, where the bound is
+// -1 `SharedStringIndexOutOfRange` (a statement about the call — the
+// S3c embeddable-rows read's `SstIndexOutOfRange` is a verdict on a
+// cell of the workbook and stays a -2 refusal), the deferred verdict
+// -1 `MalformedXml` and the allocation -3. No `zlsx_diag_v1`: the
+// reader's vocabulary is all -1 / -3 (§23's argument).
+
+/// Open an xlsx file with every sheet loaded and the file released
+/// (`zlsx_book_open`'s shape) but the shared-string table indexed
+/// rather than decoded: `Book.openSstLazy`. Each entry's text is
+/// decoded on first touch and cached for the handle's lifetime, so a
+/// workbook of millions of unique strings costs the entries a caller
+/// reaches, not the table. Rich runs, styles, the sheet inventory and
+/// every per-sheet side index are populated at open as on every
+/// handle. On ZLSX_OK `*out` holds the handle (close with
+/// `zlsx_book_close`); on any other status `*out` is NULL. A NULL `out`
+/// is -1 `NullOutPointer`, a NULL `path` -1 `NullPath`, both before the
+/// file is touched; an archive or part failure is -1 with the reader's
+/// name; OOM is -3.
+export fn zlsx_book_open_sst_lazy(
+    path_ptr: ?[*:0]const u8,
+    out: ?*?*Book,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const slot = out orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    slot.* = null;
+    const path = std.mem.span(path_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullPath");
+        return ZLSX_ERROR;
+    });
+    // The `zlsx_book_open` ownership shape: the handle owns its Io,
+    // allocated first so the Threaded never moves after init.
+    const state = gpa.create(BookState) catch {
+        writeError(err_buf, err_buf_len, "OutOfMemory");
+        return ZLSX_NOMEM;
+    };
+    state.* = .{ .inner = undefined, .threaded = .init(gpa, .{}) };
+    state.inner = xlsx.Book.openSstLazy(gpa, state.threaded.io(), path) catch |e| {
+        state.threaded.deinit();
+        gpa.destroy(state);
+        return failMapped(e, null, err_buf, err_buf_len);
+    };
+    slot.* = @ptrCast(state);
+    return ZLSX_OK;
+}
+
+/// Shared-string entry `sst_idx` under the status contract — the read
+/// `zlsx_shared_string_at` performs, with the failure classified:
+/// -1 `SharedStringIndexOutOfRange` for an index past
+/// `zlsx_shared_string_count` (judged before the reader is asked, on
+/// every handle), -1 `MalformedXml` for the entity verdict an SST-lazy
+/// handle's first touch of a plain entry defers and -3 for its allocation
+/// (the legacy getter's -1 covers all three), -1 `InvalidInput` for a
+/// NULL book, -1 `NullOutPointer` for a NULL `out_ptr` or `out_len`.
+/// On ZLSX_OK the slice points into the handle's storage (valid until
+/// the handle is closed; do not free); on any other status `*out_ptr`
+/// is "" and `*out_len` 0 (a NULL one cannot be reset; the other is).
+export fn zlsx_book_shared_string(
+    book: ?*Book,
+    sst_idx: usize,
+    out_ptr: ?*[*]const u8,
+    out_len: ?*usize,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    if (out_ptr) |p| p.* = @ptrCast("");
+    if (out_len) |l| l.* = 0;
+    const ptr_slot = out_ptr orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const len_slot = out_len orelse {
+        writeError(err_buf, err_buf_len, "NullOutPointer");
+        return ZLSX_ERROR;
+    };
+    const state = bookStateOrNull(book, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (sst_idx >= state.inner.sharedStringsCount()) {
+        writeError(err_buf, err_buf_len, "SharedStringIndexOutOfRange");
+        return ZLSX_ERROR;
+    }
+    const s = state.inner.sharedStringAt(sst_idx) catch |e|
+        return failMapped(e, null, err_buf, err_buf_len);
+    if (s.len != 0) ptr_slot.* = s.ptr;
+    len_slot.* = s.len;
+    return ZLSX_OK;
+}
+
 /// Drop the caller's reference to a Book. Safe to call with NULL (no-op).
 /// Active row iterators hold their own references, so this will not
 /// prematurely free the underlying state while rows are still being read.
@@ -10237,6 +10357,218 @@ const s3b11_rows =
 /// failed-skip test: the fixture's spreads make `skipRows` decode
 /// through `next()`, which tears on it.
 const s3b11_torn_tail = "<row r=\"7\"><c r=\"A7\"><f>Z9</f><v>9</v></c><c r=\"B7\"";
+
+// ─── S3e slice 2: the lazy SST backend on the reader handle ──────────
+
+/// Two sheets, six distinct shared strings between them and one merged
+/// range each: the resolution map's count is the observable of the
+/// deferred decode (0 at open, one per entry touched), the merged range
+/// the observable of the eager sheet load the SST-lazy opener keeps.
+fn writeS3eSstFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = xlsx.Writer.init(alloc);
+    defer w.deinit();
+    {
+        var sheet = try w.addSheet("One");
+        try sheet.writeRow(&.{ .{ .string = "alpha" }, .{ .string = "beta" }, .{ .string = "gamma" } });
+        try sheet.addMergedCell("A1:B1");
+    }
+    {
+        var sheet = try w.addSheet("Two");
+        try sheet.writeRow(&.{ .{ .string = "delta" }, .{ .string = "alpha" }, .{ .string = "epsilon & zeta" } });
+        try sheet.writeRow(&.{ .{ .string = "" }, .{ .integer = 7 } });
+        try sheet.addMergedCell("A1:B1");
+    }
+    try w.save(io, path);
+    return path;
+}
+
+test "S3e lazy SST: the opener indexes the table and loads every sheet; each touch decodes one entry; the bound and the pointers are statements about the call" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3eSstFixture(io, &tt, "s3e_sst.xlsx");
+    defer std.testing.allocator.free(path);
+
+    var err_buf: [128]u8 = undefined;
+    var slot: ?*Book = @ptrFromInt(@alignOf(BookState)); // poisoned: must be written
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_sst_lazy(path, &slot, &err_buf, err_buf.len));
+    const book = slot orelse return error.TestUnexpectedResult;
+    defer zlsx_book_close(book);
+    const st: *BookState = @ptrCast(@alignCast(book));
+
+    // The lazy backend, nothing decoded; the sheets eager and the file
+    // released — `zlsx_book_open`'s shape with the table indexed (a
+    // `Book.open` behind the export would read `.eager`; a
+    // `Book.openLazy` would keep the archive and load no sheet).
+    try std.testing.expectEqual(xlsx.SstBackend.lazy, std.meta.activeTag(st.inner.sst));
+    try std.testing.expectEqual(@as(u32, 0), st.inner.sst.lazy.resolved.count());
+    try std.testing.expect(st.inner.archive == null);
+    try std.testing.expectEqual(@as(u32, 2), zlsx_sheet_count(book));
+    for (0..2) |i| try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, @intCast(i)));
+    // The count needs no decode; the writer interned the empty string too.
+    try std.testing.expectEqual(@as(usize, 6), zlsx_shared_string_count(book));
+    try std.testing.expectEqual(@as(u32, 0), st.inner.sst.lazy.resolved.count());
+
+    // The status read decodes one entry; the second call is the cache hit.
+    var s_ptr: [*]const u8 = undefined;
+    var s_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(book, 3, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("delta", s_ptr[0..s_len]);
+    try std.testing.expectEqual(@as(u32, 1), st.inner.sst.lazy.resolved.count());
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(book, 3, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 1), st.inner.sst.lazy.resolved.count());
+    // The legacy getter is the same deferred decode.
+    try std.testing.expectEqual(@as(i32, 0), zlsx_shared_string_at(book, 4, &s_ptr, &s_len));
+    try std.testing.expectEqualStrings("epsilon & zeta", s_ptr[0..s_len]);
+    try std.testing.expectEqual(@as(u32, 2), st.inner.sst.lazy.resolved.count());
+    // The empty entry: the "" sentinel with length 0, on both reads.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(book, 5, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(usize, 0), s_len);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_shared_string_at(book, 5, &s_ptr, &s_len));
+    try std.testing.expectEqual(@as(usize, 0), s_len);
+    try std.testing.expectEqual(@as(u32, 3), st.inner.sst.lazy.resolved.count());
+
+    // A row iteration resolves the cells it yields — and only those:
+    // sheet One's three strings, one of which (`alpha`) is shared with
+    // sheet Two and not yet touched.
+    {
+        const rows = zlsx_rows_open(book, 0, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_rows_close(rows);
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqual(@as(usize, 3), cells_len);
+        try std.testing.expectEqualStrings("alpha", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+        try std.testing.expectEqualStrings("gamma", cells_ptr[2].str_ptr[0..cells_ptr[2].str_len]);
+        try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+    }
+    try std.testing.expectEqual(@as(u32, 6), st.inner.sst.lazy.resolved.count());
+    // The bulk read reaches the same cache.
+    {
+        const matrix = zlsx_matrix_open(book, 1, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        defer zlsx_matrix_close(matrix);
+        try std.testing.expectEqual(@as(u32, 6), st.inner.sst.lazy.resolved.count());
+    }
+    // The slice-1 exports are legal on the handle: every sheet is
+    // loaded, so preload is the no-op and stream_sheet the cache hit.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_preload_sheet(book, 1, &err_buf, err_buf.len));
+    {
+        var rows_slot: ?*Rows = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_stream_sheet(book, 1, &rows_slot, &err_buf, err_buf.len));
+        const rows = rows_slot orelse return error.TestUnexpectedResult;
+        defer zlsx_rows_close(rows);
+        var cells_ptr: [*]const CCell = undefined;
+        var cells_len: usize = 0;
+        try std.testing.expectEqual(@as(i32, 1), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("delta", cells_ptr[0].str_ptr[0..cells_ptr[0].str_len]);
+    }
+    try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
+
+    // Out of range is -1 SharedStringIndexOutOfRange on the status read — the
+    // first index past the end and the far end of the usize range —
+    // judged before the reader, the outputs "" / 0; the legacy getter
+    // folds it to its -1.
+    s_ptr = @ptrFromInt(@alignOf(usize));
+    s_len = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 6, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), s_len);
+    // The pointer is reset to the "" sentinel, not left at the poison
+    // (in-house r1 A-TST-105 / B-TST-101: `s_ptr[0..0]` compared equal
+    // for any pointer).
+    try std.testing.expect(@intFromPtr(s_ptr) != @alignOf(usize));
+    try std.testing.expectEqual(@as(u8, 0), s_ptr[0]);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, std.math.maxInt(usize), &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(i32, -1), zlsx_shared_string_at(book, 6, &s_ptr, &s_len));
+    // A NULL output or a NULL book is a statement about the call.
+    s_len = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 0, null, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), s_len); // the present output is reset (r1 B-ABI-101)
+    s_ptr = @ptrFromInt(@alignOf(usize));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(book, 0, &s_ptr, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(u8, 0), s_ptr[0]);
+    s_len = 99;
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(null, 0, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("InvalidInput", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), s_len);
+    // Nothing above decoded anything more.
+    try std.testing.expectEqual(@as(u32, 6), st.inner.sst.lazy.resolved.count());
+}
+
+test "S3e lazy SST: the opener's own failures; the status read on the eager openers' handles; the reader's names fold to -1 and the allocation to -3" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const path = try writeS3eSstFixture(io, &tt, "s3e_sst_eager.xlsx");
+    defer std.testing.allocator.free(path);
+    var err_buf: [128]u8 = undefined;
+
+    // NULL out / NULL path before the file is touched; a missing file
+    // and a non-archive are the reader's names; the slot is nulled on
+    // every failure.
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_sst_lazy(path, null, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullOutPointer", std.mem.sliceTo(&err_buf, 0));
+    var slot: ?*Book = @ptrFromInt(@alignOf(BookState));
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_sst_lazy(null, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("NullPath", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Book, null), slot);
+    slot = @ptrFromInt(@alignOf(BookState));
+    const missing = try tt.path(std.testing.allocator, io, "s3e_sst_missing.xlsx");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_sst_lazy(missing, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("FileNotFound", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Book, null), slot);
+    slot = @ptrFromInt(@alignOf(BookState));
+    const not_zip = try tt.path(std.testing.allocator, io, "s3e_sst_not_zip.xlsx");
+    defer std.testing.allocator.free(not_zip);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = not_zip, .data = "not a zip archive" });
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_open_sst_lazy(not_zip, &slot, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("BadZip", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(?*Book, null), slot);
+
+    // The status read works on every handle: the eager openers' tables
+    // are decoded at open, the bound is the same statement.
+    const eager = zlsx_book_open(path, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_book_close(eager);
+    const est: *BookState = @ptrCast(@alignCast(eager));
+    try std.testing.expectEqual(xlsx.SstBackend.eager, std.meta.activeTag(est.inner.sst));
+    var s_ptr: [*]const u8 = undefined;
+    var s_len: usize = 0;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(eager, 1, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("beta", s_ptr[0..s_len]);
+    try std.testing.expectEqual(ZLSX_ERROR, zlsx_book_shared_string(eager, 6, &s_ptr, &s_len, &err_buf, err_buf.len));
+    try std.testing.expectEqualStrings("SharedStringIndexOutOfRange", std.mem.sliceTo(&err_buf, 0));
+    {
+        var lazy_slot: ?*Book = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_lazy(path, &lazy_slot, &err_buf, err_buf.len));
+        const lazy = lazy_slot orelse return error.TestUnexpectedResult;
+        defer zlsx_book_close(lazy);
+        const lst: *BookState = @ptrCast(@alignCast(lazy));
+        try std.testing.expectEqual(xlsx.SstBackend.eager, std.meta.activeTag(lst.inner.sst));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_shared_string(lazy, 2, &s_ptr, &s_len, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("gamma", s_ptr[0..s_len]);
+    }
+
+    // The one §2 mapping, name by name: everything the SST-lazy opener
+    // and the deferred decode can raise is -1 with the name, the
+    // allocation -3 — no Plane-2 member, no structural verdict, so no
+    // diag on either export (§23's argument, re-pinned for the names
+    // this slice adds to the C surface's reach).
+    inline for (.{ error.BadZip, error.MalformedXml, error.MissingWorkbook, error.MissingSheet, error.FileNotFound, error.ZipBombSuspected, error.UnsupportedCompression }) |e| {
+        try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    }
+    try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+}
 
 fn writeS3bFormulaFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
     return writeS3bFormulaFixtureWithTail(io, tt, name, "");

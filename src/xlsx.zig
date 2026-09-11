@@ -696,9 +696,8 @@ pub const SstBackend = union(enum) {
     eager: [][]const u8,
     /// Offset table + sparse resolution cache; entries are decoded
     /// into `Book.sst_arena` on first `sharedStringAt(idx)` access.
-    /// Reserved for iter-sst-3b — not constructed yet by any
-    /// production path; the variant exists at iter-sst-3a so the
-    /// accessor switch covers both arms exhaustively.
+    /// Constructed by `Book.openSstLazy` (iter-sst-3b) and, since S3e
+    /// slice 2, by `zlsx_book_open_sst_lazy` on the C surface.
     lazy: struct {
         offsets: []usize,
         lengths: []usize,
@@ -726,8 +725,8 @@ pub const Book = struct {
     /// Decompressed `xl/sharedStrings.xml` (nullable — small xlsx files
     /// with only inline strings omit this part).
     shared_strings_xml: ?[]u8 = null,
-    /// SST storage backend (eager today; lazy variant arrives in
-    /// iter-sst-3b). Production callers use the
+    /// SST storage backend (`.eager` from `open` / `openLazy` /
+    /// `openBuffer`, `.lazy` from `openSstLazy`). Production callers use the
     /// `Book.sharedStringAt(idx)` / `Book.sharedStringsCount()`
     /// accessors which dispatch on the union tag; tests and
     /// fuzz scaffolding may reach into `sst.eager` directly when they
@@ -908,12 +907,22 @@ pub const Book = struct {
     /// same slice as the eager backend with the same lifetime
     /// contract.
     ///
-    /// Trade-off: lazy mode defers per-entry plain-text decoding,
-    /// so a malformed `<t>` body inside an `<si>` won't surface at
-    /// `openSstLazy` time — it'll surface as `MalformedXml` from
-    /// `sharedStringAt(idx)` (or, transitively, from a `Rows.next()`
-    /// cell read that resolves to that idx). Callers that need
-    /// "open fails fast on bad SST" should use `Book.open` instead.
+    /// Trade-off: lazy mode defers per-entry plain-text decoding, so
+    /// what it moves from open to `sharedStringAt(idx)` (or,
+    /// transitively, to a `Rows.next()` cell read that resolves to
+    /// that idx) is a plain entry's entity verdict — a malformed
+    /// entity `Book.open` refuses at open as `MalformedXml` fails here
+    /// at first touch; a rich-run entry's runs are decoded at open by
+    /// `parseSstRichRunsForBody`, so its malformed entity refuses the
+    /// open on both — and the allocation (`OutOfMemory`). It refuses
+    /// nothing else the eager walker does not — neither refuses a
+    /// torn `<t>` body — but the two read such a table differently:
+    /// the eager walker's `</t>` search runs past the entry, so the
+    /// torn entry swallows markup and the entries after it up to the
+    /// next `</t>` (every later index shifts); the lazy one is bounded
+    /// by its `</si>`, keeps the ordinal and yields the text before
+    /// the tear (the "S3e slice 2" test below). There is no "open
+    /// fails fast on bad SST" to trade away.
     /// Single-threaded contract — the lazy backend mutates internal
     /// state on first-touch. Multi-threaded SST access requires the
     /// caller to serialise externally or to call `Book.open` instead.
@@ -1421,10 +1430,11 @@ pub const Book = struct {
     }
 
     /// Resolved shared string at `idx`. Errors with `MalformedXml`
-    /// when `idx` is past the end of the SST. Eager-backend accessor;
-    /// the streaming-SST plan (docs/plans/archive/streaming-sst.md) introduces
-    /// a lazy variant in iter-sst-3 — this iter-sst-1 accessor
-    /// centralises the lookup so future migration touches one site.
+    /// when `idx` is past the end of the SST on either backend; on the
+    /// lazy backend the first touch also carries the entity decode's
+    /// verdict (`MalformedXml`, which the eager parser raised at open)
+    /// and its allocation. The one lookup site for both backends
+    /// (docs/plans/archive/streaming-sst.md).
     pub fn sharedStringAt(self: *Book, idx: usize) ![]const u8 {
         switch (self.sst) {
             .eager => |entries| {
@@ -4359,9 +4369,9 @@ pub fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
 /// Lazy SST builder (iter-sst-3b). Walks the SST once recording the
 /// byte span of each `<si>...</si>` body, but does NOT decode plain
 /// text. `Book.sharedStringAt` materialises individual entries into
-/// `sst_arena` on first access. Rich-text runs are not eagerly
-/// captured by the lazy backend yet (deferred to a follow-up iter);
-/// `Book.richRuns(idx)` returns null on lazy-opened books.
+/// `sst_arena` on first access. Rich-text runs ARE captured eagerly
+/// (`parseSstRichRunsForBody` below), so `Book.richRuns(idx)` answers
+/// on lazy-opened books as on eager ones.
 fn parseSharedStringsLazy(book: *Book, sst_xml: []u8) !void {
     const hint: usize = blk: {
         const open = std.mem.indexOf(u8, sst_xml, "<sst") orelse break :blk 64;
@@ -4518,7 +4528,11 @@ fn parseSstRichRunsForBody(book: *Book, body: []const u8, sst_idx: usize) !void 
             }
             j = t_close + "</t>".len;
         } else {
-            j = next_lt + 1;
+            // Any other markup: skip to the tag's end — the eager
+            // walker's rule (in-house r3 B-DOC-302: one byte at a time
+            // let a `<r><t>` inside a comment add a run here alone).
+            const skip_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 1, '>') orelse break;
+            j = skip_gt + 1;
         }
         std.debug.assert(j > j_prev);
     }
@@ -4529,12 +4543,22 @@ fn parseSstRichRunsForBody(book: *Book, body: []const u8, sst_idx: usize) !void 
     }
 }
 
-/// Decode a single SST entry's body span into the Book's `sst_arena`.
-/// Used by the lazy backend on first `sharedStringAt(idx)` access; the
-/// returned slice is cached in `lazy.resolved` so subsequent accesses
-/// are O(1) hashmap hits. Errors with `MalformedXml` if the offset
-/// table is corrupted (defensive — should never fire on a sanely
-/// parsed SST).
+/// Decode a single SST entry's body span, cache the result in
+/// `lazy.resolved` and return it. Used by the lazy backend on first
+/// `sharedStringAt(idx)` access; subsequent accesses are O(1) hashmap
+/// hits. Errors with `MalformedXml` if the offset table is corrupted
+/// (defensive — should never fire on a sanely parsed SST) or if an
+/// entity in the entry does not decode (the eager parser's verdict at
+/// open, deferred to here for a plain entry).
+///
+/// The decode runs on the Book's general allocator and only a
+/// successful result is copied into `sst_arena`: a refused entity used
+/// to leave its reservation in the arena on EVERY touch of the entry,
+/// since the verdict is not cached (in-house r3 B-MEM-301, measured:
+/// +1.25 GiB over 20 000 failing touches of one 64 KiB entry — on the
+/// handle whose point is memory pressure). A plain single-span entry
+/// without entities borrows from `shared_strings_xml` and allocates
+/// nothing, as before.
 fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
     const lazy = switch (book.sst) {
         .lazy => |*l| l,
@@ -4550,8 +4574,9 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
     // Concat every `<t>...</t>` body in this entry, decoding entities.
     // Mirrors the eager parser's plain-text path but only runs on the
     // single requested entry.
-    const arena = book.sst_arena.allocator();
+    const scratch = book.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(scratch);
     var t_count: usize = 0;
     var first_span: []const u8 = "";
     var first_has_ent = false;
@@ -4576,17 +4601,16 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
                 first_has_ent = span_has_ent;
             } else {
                 if (buf.capacity == 0) {
-                    const cap: usize = first_span.len + span.len + 8;
-                    buf = try .initCapacity(arena, cap);
+                    try buf.ensureTotalCapacity(scratch, first_span.len + span.len + 8);
                     if (first_has_ent) {
-                        try appendDecoded(arena, &buf, first_span);
+                        try appendDecoded(scratch, &buf, first_span);
                     } else {
                         buf.appendSliceAssumeCapacity(first_span);
                     }
                 }
-                try buf.ensureUnusedCapacity(arena, span.len);
+                try buf.ensureUnusedCapacity(scratch, span.len);
                 if (span_has_ent) {
-                    try appendDecoded(arena, &buf, span);
+                    try appendDecoded(scratch, &buf, span);
                 } else {
                     buf.appendSliceAssumeCapacity(span);
                 }
@@ -4609,21 +4633,28 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
                 j = rph_close + "</rPh>".len;
             }
         } else {
-            j = next_lt + 1;
+            // Any other markup: skip to the tag's end — the eager
+            // walker's rule. Advancing one byte instead let a `<t>`
+            // inside a comment, CDATA section or processing
+            // instruction read on this backend alone (in-house r3
+            // A-REC-301 / B-DOC-302).
+            const skip_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 1, '>') orelse break;
+            j = skip_gt + 1;
         }
     }
 
+    const arena = book.sst_arena.allocator();
     const decoded: []const u8 = if (t_count == 0) "" else if (t_count == 1) blk: {
         if (first_has_ent) {
-            var b: std.ArrayListUnmanaged(u8) = try .initCapacity(arena, first_span.len);
-            try appendDecoded(arena, &b, first_span);
-            break :blk try b.toOwnedSlice(arena);
+            try buf.ensureTotalCapacity(scratch, first_span.len);
+            try appendDecoded(scratch, &buf, first_span);
+            break :blk try arena.dupe(u8, buf.items);
         } else {
             // Borrow span directly — lifetime matches sst_xml which
             // lives for the Book's lifetime.
             break :blk first_span;
         }
-    } else try buf.toOwnedSlice(arena);
+    } else try arena.dupe(u8, buf.items);
 
     try lazy.resolved.put(book.allocator, @intCast(idx), decoded);
     return decoded;
@@ -5788,6 +5819,206 @@ test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" 
         // Out-of-range still reports MalformedXml on the lazy backend.
         try std.testing.expectError(error.MalformedXml, book.sharedStringAt(99));
     }
+}
+
+test "S3e slice 2: neither backend refuses a torn entry; the eager walker swallows past it and the lazy one keeps its ordinal" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // One sound entry, one whose `<t>` never closes, one whose second
+    // run is torn, one sound entry after them. Neither walker refuses:
+    // the eager one's `</t>` search is not bounded by the entry, so the
+    // torn entry SWALLOWS markup and the entries after it up to the
+    // next `</t>` (its text carries `<si>` tags, every later index
+    // shifts); the lazy one spans `<si>`…`</si>` first and keeps the
+    // ordinal, decoding the text before the tear — the divergence §24
+    // records (the deferral removes no validation; the two openers
+    // read a torn table differently, a pre-existing reader behaviour,
+    // an owner follow-up; the eager `</rPr>` / `</rPh>` searches are
+    // unbounded the same way and drop the entry when no closer is
+    // left — in-house r2 DOC-202).
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"4\" uniqueCount=\"4\">" ++
+        "<si><t>ok &amp; sound</t></si>" ++
+        "<si><t>torn</si>" ++
+        "<si><r><t>first</t></r><r><t>second</si>" ++
+        "<si><t>after</t></si>" ++
+        "</sst>";
+
+    var eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer eager.deinit();
+    eager.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStrings(&eager, eager.shared_strings_xml.?);
+
+    var lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer lazy.deinit();
+    lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStringsLazy(&lazy, lazy.shared_strings_xml.?);
+    try std.testing.expect(std.meta.activeTag(lazy.sst) == .lazy);
+
+    // Eager: two entries — the sound first one, then the torn one
+    // carrying everything up to the last `</t>`, the two entries in
+    // between gone.
+    try std.testing.expectEqual(@as(usize, 2), eager.sharedStringsCount());
+    try std.testing.expectEqualStrings("ok & sound", try eager.sharedStringAt(0));
+    try std.testing.expectEqualStrings("torn</si><si><r><t>firstsecond</si><si><t>after", try eager.sharedStringAt(1));
+    try std.testing.expectError(error.MalformedXml, eager.sharedStringAt(2));
+    // Lazy: four ordinals, the torn ones the text before the tear —
+    // index 3 is "after".
+    try std.testing.expectEqual(@as(usize, 4), lazy.sharedStringsCount());
+    try std.testing.expectEqualStrings("ok & sound", try lazy.sharedStringAt(0));
+    try std.testing.expectEqualStrings("", try lazy.sharedStringAt(1));
+    try std.testing.expectEqualStrings("first", try lazy.sharedStringAt(2));
+    try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(3));
+    // Past the end is the reader's `MalformedXml` on both, which the C
+    // status read pre-empts as `SharedStringIndexOutOfRange`.
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(4));
+}
+
+test "S3e slice 2: a malformed entity is the eager parser's refusal at open and the lazy backend's at first touch" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // The one verdict the deferral moves (in-house r1 B-DOC-101,
+    // measured through py-zlsx: `open` refused the file, `open_sst_lazy`
+    // opened it and failed on the entry). `appendDecoded` is shared by
+    // both walkers; the eager one runs it at open, the lazy one at
+    // `sharedStringAt`, on the entry alone — the sound entries read.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"3\" uniqueCount=\"3\">" ++
+        "<si><t>sound</t></si>" ++
+        "<si><t>bad &#x110000; entity</t></si>" ++
+        "<si><t>after</t></si>" ++
+        "</sst>";
+    var eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer eager.deinit();
+    eager.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStrings(&eager, eager.shared_strings_xml.?));
+
+    var lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer lazy.deinit();
+    lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStringsLazy(&lazy, lazy.shared_strings_xml.?);
+    try std.testing.expectEqual(@as(usize, 3), lazy.sharedStringsCount());
+    try std.testing.expectEqualStrings("sound", try lazy.sharedStringAt(0));
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(1));
+    // The verdict is not cached as a value: the entry fails again, and
+    // the entries around it read.
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(1));
+    try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(2));
+    try std.testing.expectEqual(@as(u32, 2), lazy.sst.lazy.resolved.count());
+
+    // A rich-run entry is the exception (in-house r2 A-DOC-201): the
+    // lazy walk captures rich runs at open through the same decoder,
+    // so its malformed entity refuses the open on both backends.
+    const rich_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\" uniqueCount=\"2\">" ++
+        "<si><t>sound</t></si>" ++
+        "<si><r><t>bad &#x110000; run</t></r></si>" ++
+        "</sst>";
+    var rich_eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rich_eager.deinit();
+    rich_eager.shared_strings_xml = try std.testing.allocator.dupe(u8, rich_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStrings(&rich_eager, rich_eager.shared_strings_xml.?));
+    var rich_lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rich_lazy.deinit();
+    rich_lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, rich_xml);
+    try std.testing.expectError(error.MalformedXml, parseSharedStringsLazy(&rich_lazy, rich_lazy.shared_strings_xml.?));
+}
+
+test "S3e slice 2: markup neither walker recognises is skipped to its end on both backends; a refused decode leaves nothing in the arena" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A `<t>` inside a comment, a CDATA section and a processing
+    // instruction, before and after the real text; a comment carrying
+    // a rich run. The eager walker skips unrecognised markup to its
+    // `>`; the lazy walkers advanced one byte and read the hidden
+    // `<t>` (in-house r3 A-REC-301 / B-DOC-302: `two` vs `xtwo`) —
+    // aligned. Neither walker is comment-aware (the `>` inside the
+    // comment ends the skip), so both read the same text.
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"4\" uniqueCount=\"4\">" ++
+        "<si><!-- <t>x</t> --><t>two</t></si>" ++
+        "<si><t>three</t><![CDATA[<t>y</t>]]></si>" ++
+        "<si><?pi <t>z</t> ?><t>four</t></si>" ++
+        "<si><!-- <r><t>hidden</t></r> --><r><rPr><b/></rPr><t>run</t></r></si>" ++
+        "</sst>";
+    var eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer eager.deinit();
+    eager.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStrings(&eager, eager.shared_strings_xml.?);
+    var lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer lazy.deinit();
+    lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStringsLazy(&lazy, lazy.shared_strings_xml.?);
+    try std.testing.expectEqual(@as(usize, 4), eager.sharedStringsCount());
+    try std.testing.expectEqual(@as(usize, 4), lazy.sharedStringsCount());
+    for (0..4) |i| try std.testing.expectEqualStrings(try eager.sharedStringAt(i), try lazy.sharedStringAt(i));
+    try std.testing.expectEqualStrings("two", try lazy.sharedStringAt(0));
+    try std.testing.expectEqualStrings("three", try lazy.sharedStringAt(1));
+    try std.testing.expectEqualStrings("four", try lazy.sharedStringAt(2));
+    // The skip ends at the first `>` inside the comment (neither walker
+    // is comment-aware), so the comment's `<t>` still reads — on BOTH,
+    // which is the pin; the run itself is the one outside the comment.
+    try std.testing.expectEqualStrings("hiddenrun", try lazy.sharedStringAt(3));
+    try std.testing.expectEqual(@as(usize, 1), (eager.richRuns(3) orelse return error.TestUnexpectedResult).len);
+    try std.testing.expectEqual(@as(usize, 1), (lazy.richRuns(3) orelse return error.TestUnexpectedResult).len);
+    try std.testing.expectEqualStrings("run", (lazy.richRuns(3).?)[0].text);
+    try std.testing.expectEqual(@as(?[]const RichRun, null), lazy.richRuns(0));
+
+    // A refused decode allocates nothing in the arena, however often
+    // the entry is touched (in-house r3 B-MEM-301: the reservation was
+    // made in the arena before the entity was judged — 20 000 touches
+    // of one 64 KiB entry cost 1.25 GiB).
+    const bad_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\">" ++
+        "<si><t>bad &#x110000; entity in a long body long body long body long body</t><t>second &#x110000; run</t></si>" ++
+        "</sst>";
+    var bad: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer bad.deinit();
+    bad.shared_strings_xml = try std.testing.allocator.dupe(u8, bad_xml);
+    try parseSharedStringsLazy(&bad, bad.shared_strings_xml.?);
+    const arena_before = bad.sst_arena.queryCapacity();
+    for (0..200) |_| try std.testing.expectError(error.MalformedXml, bad.sharedStringAt(0));
+    try std.testing.expectEqual(arena_before, bad.sst_arena.queryCapacity());
+    try std.testing.expectEqual(@as(u32, 0), bad.sst.lazy.resolved.count());
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {

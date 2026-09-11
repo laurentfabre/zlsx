@@ -2821,3 +2821,228 @@ probe order and the older-dylib branch.
 buffer has no Zig primitive (the `.buffer` source's borrow ends at the
 open call, so a lazy buffer handle would have to copy); the CLI leg of
 per-sheet loading (the matrix's fourth column) stays `— S3e`.
+
+## 24. S3e slice 2 — the lazy SST backend on the reader handle (2026-09-11)
+
+Two exports on the READER handle, `zlsx_status_v1`, one macro, one
+probe, no release function, no `zlsx_diag_v1`. The row's Zig surface is
+`Book.openSstLazy` — eager sheets, lazy shared strings: `Book.open`'s
+facade (every sheet loaded, the archive released before the call
+returns) over `openLazyWithSst(.lazy)`, whose SST walk records each
+`<si>` body's span and captures the rich runs but decodes no text;
+`Book.sharedStringAt` decodes an entry into `sst_arena` on its first
+touch and caches it (`sst.lazy.resolved`). The C leg is that opener
+over the same `BookState` the other openers hand out, plus the one read
+whose contract the backend changes.
+
+| Export | Zig | Probe (`_ffi.py`) | Header macro |
+|---|---|---|---|
+| `zlsx_book_open_sst_lazy(path, out, errbuf, len) → int32_t` | `Book.openSstLazy` | `_HAS_LAZY_SST` | `ZLSX_HAS_LAZY_SST` |
+| `zlsx_book_shared_string(book, idx, out_ptr, out_len, errbuf, len) → int32_t` | `Book.sharedStringAt` | (same) | (same) |
+
+**What an SST-lazy handle is.** `zlsx_book_open_sst_lazy` reads the
+central directory, indexes the shared-string table, parses `styles.xml`
+and `theme.xml`, loads every sheet's XML and side indices and closes the
+file — `zlsx_book_open`'s shape (pinned: the backend tag `.lazy`, the
+resolution map empty, the archive `null`, `zlsx_merged_range_count` 1 on
+every sheet without a preload); `zlsx_shared_string_count` needs no
+decode. Each entry's text is decoded on first touch —
+`zlsx_shared_string_at`, `zlsx_book_shared_string`, a row iterator
+(`zlsx_rows_next`) or matrix (`zlsx_matrix_open`) resolving a cell to it
+— and cached for the handle's lifetime (pinned: one entry per status
+read, the second read a hit, a sheet's iteration resolving exactly its
+cells, the bulk read reaching the same cache). Rich runs, the sheet
+inventory and the styles are populated at open as on every handle;
+the slice-1 exports are legal on it (preload the no-op, stream_sheet
+the hit; pinned). Every other opener's handle reads `.eager` (pinned on
+`zlsx_book_open` and `zlsx_book_open_lazy`).
+
+**What the deferral defers — and does not.** The lazy decode is the
+eager walker's `<t>` concatenation run per entry: it removes no
+validation — neither walker refuses a torn `<t>` body — so the
+"malformed `<t>` surfaces at first access" trade-off the Zig doc comment
+and the CLI docs had stated was an over-claim, corrected in this slice.
+**Measured while writing that pin, recorded, not lifted**: the two
+walkers read a torn table differently. The eager one's `</t>` search
+(`indexOfPos` over the whole part) is not bounded by the entry, so the
+torn entry swallows markup and the entries after it up to the next
+`</t>` — a four-entry table with two torn entries reads two, index 1
+being `torn</si><si><r><t>firstsecond</si><si><t>after`, the two
+entries in between gone; the lazy one spans `<si>`…`</si>` first and
+`materialiseSstEntry` searches within that body, so it keeps the
+ordinal and decodes the text before the tear (four entries, `""` and
+the first run for the torn ones, index 3 `after`) — pinned in
+`src/xlsx.zig`, "S3e slice 2: neither backend refuses a torn entry; the
+eager walker swallows past it and the lazy one keeps its ordinal". A
+cell's `<v>` index therefore resolves to different text on the two
+openers over such a table; the ordinal-keeping read is the one
+ECMA-376 describes, and bounding the eager walker's closer searches
+by the entry (the lazy walker's shape) is an owner follow-up on the
+reader, outside this slice's surface — all three of them (in-house r2
+A/B-DOC-202): the `</rPr>` and `</rPh>` searches are the same
+unbounded `indexOfPos(xml, …)`, and with no closer left in the part
+the eager walker DROPS the entry (three of four, later indices shift)
+where the `</t>` case swallows; a torn `<rPr>`'s flags leak into the
+next rich entry; a torn `<si>` (no `</si>` at all) merges with the
+next on BOTH walkers, so the lazy walker's "skips THAT entry" comment
+overstates its recovery. Stated on every surface as the divergence,
+not as parity. **What the deferral does move** (in-house r1 B-DOC-101,
+measured through py-zlsx — the slice had first said "the one failure
+it adds is the allocation", false): a PLAIN entry's entity verdict
+(in-house r2 A/B-DOC-201: a rich-run entry's runs are decoded at open
+on the lazy backend too, `parseSstRichRunsForBody` through the same
+`appendDecoded`, so its malformed entity refuses the open on both —
+measured through the dylib, pinned in Zig and Python; the slice had
+stated the deferral unqualified). `appendDecoded` is shared by both
+walkers and refuses a malformed entity (`&#x110000;`, `&x` without
+`;`) as `MalformedXml`; the eager parser runs it at open, so
+`Book.open` refuses the file, the lazy backend at `sharedStringAt` for
+a plain entry, so `open_sst_lazy` opens the file and that entry alone
+fails — `-1 MalformedXml` from
+`zlsx_book_shared_string` and `zlsx_rows_next`, `ZlsxError` from
+`Book.shared_string_at` and the row iteration, the entries around it
+reading, the verdict not cached (pinned in `src/xlsx.zig`, "S3e slice
+2: a malformed entity …", and through the public Python surface with a
+zip-patched file). Plus the allocation: OOM at first touch instead of
+at open. The pre-slice caveat was right in substance for entities and
+wrong for torn bodies; every surface now says which. The legacy `zlsx_shared_string_at` folds that into its `-1`
+beside out-of-range (its comment says so now); `zlsx_book_shared_string`
+is the same read under the status contract — the bound judged before
+the reader is asked, on every handle, as `-1 SharedStringIndexOutOfRange`
+(the first index past the end and the far end of the `size_t` range
+pinned; the reader's own out-of-range name is `MalformedXml`, which the
+export therefore never surfaces for a bound; a statement about the
+call — the S3c embeddable-rows read's `SstIndexOutOfRange`, a verdict
+on a cell of the workbook and a `-2` refusal in `structural_refusals`,
+keeps its name and class, in-house r1 A-DOC-102: the slice had first
+spelled the bound with that name, one name under two status classes),
+the deferred entity verdict `-1 MalformedXml` (below), the allocation
+`-3`, a NULL `book` `-1 InvalidInput` through `bookStateOrNull`, a NULL
+`out_ptr` or `out_len` `-1 NullOutPointer`; on every non-zero status
+`*out_ptr` is `""` and `*out_len` 0 — the present one on a
+NullOutPointer path, the NULL one cannot be (pinned; the pointer reset
+pinned as the `""` sentinel's NUL and not the poison, r1 A-TST-105 /
+B-TST-101: `s_ptr[0..0]` compared equal for any pointer). No diag on either export: §23's
+argument holds — the opener's names (`BadZip`, `MalformedXml`,
+`MissingWorkbook`, `MissingSheet`, `FileNotFound`, `ZipBombSuspected`,
+`UnsupportedCompression`) fold to `-1` and OOM to `-3`, re-pinned name
+by name; `NullPath` / `NullOutPointer` before the file is touched, the
+slot nulled on every failure (pinned with the missing and the garbage
+file).
+
+**Threads.** A first touch of an entry mutates the Book (the resolution
+map and the arena grow), so the header's same-handle rule is stated
+load-bearing for an SST-lazy handle as for a lazy-sheet one: two threads
+iterating two sheets of one such handle take the caller's lock. **py-zlsx
+takes it**: `Book._lock` already serialises every call on the book
+(§23), and a `Rows` iteration — unlocked since slice 1, one iterator per
+thread — takes the lock for each row it yields **or skips** when the
+book reads `sst_lazy` (`Rows._row_ctx`, bound once in the constructor:
+the book's lock, or one shared `contextlib.nullcontext()` instance so
+an eager book's iterators stay unlocked and pay no allocation, r1
+A-PERF-103 / B-PY-101). Measured before the slice's pin was written:
+eight threads each iterating its own sheet of ONE SST-lazy book of 16
+000 distinct strings aborted within 30 iterations with the row lock
+off and survived with it on (the probe flips `Book.sst_lazy` after the
+open — the shipped shape without the slice's lock). **`skip` too** (r1
+THR-101, both reviewers, B reproduced it): the library's `skipRows`
+drains through `next()` on a sheet with a shared or array formula
+(`Rows.hasFormulaSpreads`), so every skipped row is a first touch —
+eight threads each skipping 399 rows of its sheet aborted (exit 134,
+the hash map's pointer-stability assert under `materialiseSstEntry`)
+with the lock off and survived with it on; the slice had locked
+`__next__` alone. Pinned as one threaded test over a zip-patched file
+carrying a shared formula down every sheet (eight iterations racing
+the workbook-wide reads `shared_string_at` / `rich_text`, every other
+iteration skipping 150 rows first, then the same race with a skip and
+a close in it: the iterators keep reading through the C refcount,
+every call on the book after the close raises, nothing crashes).
+
+**Python.** `zlsx.open_sst_lazy(path) → Book` (`Book.sst_lazy` is
+`True`, `Book.lazy` `False`; every other opener reads `False`; pinned
+with `zlsx_book_open` and `zlsx_book_open_lazy` monkeypatched to raise —
+an opener that fell through to the eager export behind a flag would
+have read every string identically). `Book.shared_string_at` routes
+through `zlsx_book_shared_string` when the probe holds: `SharedStringIndexOutOfRange`
+stays `IndexError` (the shipped contract; a negative index wraps through
+`c_size_t` to the far end and is the same statement), any other name is
+`ZlsxError` named after it (pinned with the real `MalformedXml` of a
+malformed entity, and by standing in for the export with
+`OutOfMemory` / `ZLSX_NOMEM` — an allocation failure cannot be induced
+through the dylib); an older dylib keeps the legacy getter and its
+`IndexError` for every failure. A non-zero status on the opener raises
+`ZlsxError` named after the reader's error (`FileNotFound`, `BadZip`
+pinned); a closed book raises on every call, the SST reads included.
+Older dylibs raise `RuntimeError` on `open_sst_lazy`; a ≥ 0.9 dylib
+without the pair fails the probe test, not skips.
+
+**Round 3 (in-house, A and B both ship-ready; ledger
+`codex_findings_s3e2_r3.md`)**: B-MEM-301 MEDIUM — `materialiseSstEntry`
+reserved in `sst_arena` BEFORE the entity was judged, and the verdict
+is not cached, so every failing touch of a plain entry leaked its
+length into the arena (measured: 20 000 `shared_string_at` calls on a
+64 KiB bad entry, +1.25 GiB RSS — on the handle whose point is memory
+pressure) → the decode runs on the Book's general allocator and only
+a successful result is copied into the arena; pinned (200 failing
+touches, `queryCapacity` unchanged, the map empty); the "cheap; stated"
+clause below retracted. A-REC-301 / B-DOC-302 MEDIUM — the two lazy
+walkers advanced ONE BYTE past unrecognised markup where the eager
+walker skips to the tag's `>`, so a `<t>` inside an XML comment, a
+CDATA section or a processing instruction read on the SST-lazy handle
+alone (`two` vs `xtwo`; a comment carrying `<r><t>` added a rich run)
+— a divergence on WELL-FORMED input, lifted: both lazy `else` branches
+follow the eager rule now, pinned on four shapes for the text and the
+runs (neither walker is comment-aware; both read the same). B-DOC-303
+LOW — a workbook without `xl/sharedStrings.xml` (inline strings only)
+reads the default `.eager` backend on every opener, count 0; the
+`.lazy` pin is a statement about a workbook that has the part, and
+Python's `sst_lazy` stays `True` there (its rows lock for nothing —
+harmless, stated). A-DOC-302 LOW — a fourth stale iter-sst comment
+(`Book.sst`'s) corrected.
+
+**Recorded, not lifted.** The torn-entry divergence above (the eager
+walker's unbounded closer searches) — an owner follow-up on
+`parseSharedStrings`; the deferred entity verdict is per entry and not
+cached, so a caller sweeping the table re-runs the failing decode on
+every touch of that entry — a decode on the general allocator freed on
+exit since round 3, so a re-run costs time, not memory.
+
+**Tests** (`src/c_abi.zig`, "S3e lazy SST: …" — two; `src/xlsx.zig`,
+"S3e slice 2: …" — two; `tests/c_abi_smoke.c` `#error`s without the
+macro and takes the two addresses; `test_basic.py`, the "S3e slice 2"
+section — six: `open_sst_lazy_loads_every_sheet` /
+`shared_string_at_names` / `open_sst_lazy_defers_the_entity_verdict` /
+`open_sst_lazy_failures` / `lazy_sst_probe` /
+`threads_may_share_one_sst_lazy_book`).
+
+**Round 1 (in-house, A ship-ready with two MEDIUMs, B not ship-ready on
+one HIGH + one MEDIUM; ledger `codex_findings_s3e2_r1.md`)**: THR-101
+(`skip` unlocked, reproduced) → `Rows._row_ctx` on `next` and `skip`;
+A-DOC-102 (`SstIndexOutOfRange` already a `-2` structural refusal) →
+`SharedStringIndexOutOfRange`; B-DOC-101 (the entity verdict is deferred
+validation) → the sentence corrected on every surface, two pins;
+A-PERF-103 / B-PY-101 → one shared null context; A-TST-105 / B-TST-101
+→ the pointer reset pinned; B-DOC-102 → three stale iter-sst comments
+in `xlsx.zig` corrected; B-ABI-101 → the present output reset on a
+NullOutPointer path, stated.
+
+**Round 2 (in-house, A and B both ship-ready; the same MEDIUM; ledger
+`codex_findings_s3e2_r2.md`)**: A/B-DOC-201 (the deferred verdict is a
+plain entry's — rich runs decode at open on the lazy backend) → every
+surface qualified, the rich shape pinned in Zig and Python; A/B-DOC-202
+(the follow-up names `</t>` alone) → the record above names the three
+closer searches and the torn-`<si>` merge; A-DOC-203 / B-DOC-204 (three
+`SstIndexOutOfRange` spellings survived the rename) and A-DOC-204 /
+B-DOC-203 (a garbled duplicate line in the c_abi section) → corrected;
+A-PY-206 (`shared_string_at(2**64)` masked to entry 0 through
+`c_size_t`, pre-existing) → the bound judged in Python, pinned;
+A-TST-205 / B-TST-201 (the probe-shape assertion resolves through
+`dlsym` and cannot see a one-symbol probe) → the probe's own expression
+pinned from `_ffi.py`'s source.
+
+**Not in this slice.** Lazy sheets AND a lazy SST on one handle
+(`openLazyWithSst(.path, .lazy)` without the eager facade) has no
+public Zig entry point; a buffer opener with a lazy SST likewise (the
+`.buffer` borrow ends at the open call). `--sst-lazy` on the CLI
+predates the slice; the CLI leg of per-sheet loading (the matrix's
+fourth column) stays `— S3e`.
