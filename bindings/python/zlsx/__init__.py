@@ -482,8 +482,9 @@ def _serialized(method):
     :class:`Book` reach the library concurrently; on a :func:`open_lazy`
     book a first touch of a sheet mutates the handle and a concurrent
     per-sheet read on another sheet is a crash. The lock covers the
-    calls that load or read per-sheet state; a :class:`Rows` iteration
-    is unlocked — one iterator per thread."""
+    calls that load or read per-sheet state and :meth:`Book.close`; a
+    :class:`Rows` iteration is unlocked — one iterator per thread, and
+    it outlives a close through the C refcount."""
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
@@ -522,12 +523,13 @@ class Book:
         self._lock = threading.RLock()
         #: ``True`` for a book from :func:`open_lazy` — its sheets load on
         #: first touch (:meth:`preload_sheet`, :meth:`stream_sheet`,
-        #: :meth:`Sheet.rows`) and the file stays open until the last
+        #: :meth:`Sheet.rows`, :meth:`Sheet.read_all`) and the file stays open until the last
         #: handle closes; ``False`` for :func:`open` / :func:`open_bytes`,
         #: whose sheets are all loaded before the constructor returns.
         #: Threads may share a book, lazy or eager: the calls that load
-        #: or read per-sheet state are serialised by a per-book lock
-        #: (see :func:`open_lazy`); a :class:`Rows` is one thread's.
+        #: or read per-sheet state, and :meth:`close`, are serialised by
+        #: a per-book lock (see :func:`open_lazy`); a :class:`Rows` is
+        #: one thread's.
         self.lazy: bool = lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
@@ -1154,10 +1156,20 @@ class Book:
         """Drop our reference to the book. Active row iterators hold their
         own references, so this is safe to call before iteration finishes —
         the C ABI's refcount keeps the state alive until the last handle
-        closes (a :func:`open_lazy` book's file with it)."""
-        if self._handle:
-            _ffi.lib.zlsx_book_close(self._handle)
-            self._handle = None
+        closes (a :func:`open_lazy` book's file with it). Taken under the
+        book's lock, so a close racing a per-sheet call on another thread
+        waits for it and every later call raises ``ZlsxError`` (in-house
+        r2 S3E1-REL-201 / THR-201: the C header forbids a concurrent
+        close, and the shipped shape freed the state under a getter)."""
+        # A `Book.__new__` instance whose open failed is discarded before
+        # `_attach` ran: `__del__` reaches here with no lock and no handle.
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if self._handle:
+                _ffi.lib.zlsx_book_close(self._handle)
+                self._handle = None
 
     def __enter__(self) -> "Book":
         return self
@@ -1669,7 +1681,8 @@ def open_lazy(path: Union[str, Path]) -> Book:
     strings, the styles and the theme are read now; each sheet's XML and
     its side indices (merged ranges, hyperlinks, data validations,
     comments) are extracted on first touch — :meth:`Book.preload_sheet`,
-    :meth:`Book.stream_sheet` or :meth:`Sheet.rows` on that sheet. Until
+    :meth:`Book.stream_sheet`, :meth:`Sheet.rows` or :meth:`Sheet.read_all`
+    on that sheet. Until
     then :meth:`Book.merged_ranges` and its siblings answer for an
     unloaded sheet as for one that has none; the workbook-wide getters
     (:attr:`Book.sheets`, :meth:`Book.sheet_state`,
@@ -1693,9 +1706,12 @@ def open_lazy(path: Union[str, Path]) -> Book:
     call), so py-zlsx serialises the calls that load or read per-sheet
     state — :meth:`Book.preload_sheet`, :meth:`Book.stream_sheet`,
     :meth:`Sheet.rows`, :meth:`Sheet.read_all`, :meth:`Book.merged_ranges`
-    and its siblings — with a per-book lock, on lazy and eager books
-    alike. Iterating a :class:`Rows` is unlocked: one iterator per
-    thread.
+    and its siblings, and :meth:`Book.close` — with a per-book lock, on
+    lazy and eager books alike (a bulk read of one sheet therefore waits
+    for another's on the same book; a close waits for an in-flight load,
+    and every later call raises :class:`ZlsxError`). Iterating a
+    :class:`Rows` is unlocked: one iterator per thread, and it outlives
+    a close through the C refcount.
 
     Raises :class:`ZlsxError` on parse failure, named after the reader's
     error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).

@@ -2717,13 +2717,25 @@ GIL around every foreign call — aborted within 150 iterations; the same
 shape on an eager book never did): `Book._lock`, a re-entrant per-book
 lock taken by every call that loads or reads per-sheet state
 (`preload_sheet`, `stream_sheet`, `Sheet.rows` → `zlsx_rows_open`,
-`Sheet.read_all` → `zlsx_matrix_open`, the four per-sheet getters), on
-lazy and eager books alike; a `Rows` iteration is unlocked — one iterator
-per thread. Pinned as a threaded test (a regression is a crash of the
-test process, stated), and measured: the probe survives with the lock,
-aborts with it replaced by a null context. The header's preamble names
-the three exports as status_v1 exports that sit above the status block
-(the S3a structural block's precedent), and their prototypes follow
+`Sheet.read_all` → `zlsx_matrix_open`, the four per-sheet getters) and
+by `Book.close` (in-house r2 A-REL-201 / B-THR-201, both measured: a
+close racing a locked per-sheet call passed a freed `BookState` to the
+library and aborted — the `with … as book:` exiting while a pool
+straggler is inside a call; the mechanism predates the slice, the
+promise is the slice's; the lock is fetched with `getattr` so a
+`Book.__new__` instance whose open failed can still be finalised; a
+close now waits for an in-flight load and every later call raises
+`ZlsxError`), on lazy and eager books alike — an eager book's bulk reads
+of distinct sheets are serialised too, a deliberate trade against a
+`lazy`-conditional lock; a `Rows` iteration is unlocked — one iterator
+per thread, and it outlives a close through the C refcount. Pinned as
+two threaded tests (eight streams + getters on one lazy book; eight
+getter loops racing a close — a regression is a crash of the test
+process, stated), and measured: the probes survive with the lock, abort
+with it replaced by a null context / with `close` outside it. The
+header's preamble names the trio as the status_v1 exports declared above
+the status block (the first such family; the S3a block sits below it and
+names the contract itself), and their prototypes follow
 `zlsx_book_open_buffer` in the header as the exports follow it in
 `src/c_abi.zig` (AGENTS.md's ordering rule).
 
@@ -2770,7 +2782,10 @@ guard — ctypes wraps a negative silently); a non-zero status raises
 pinned). `Rows` adopts the status opener's handle (keyword-only
 `_handle=`; pinned with `zlsx_rows_open` monkeypatched to raise — a
 `Rows` that fell through would have read the right sheet and leaked the
-status handle, in-house r1 S3E1-TEST-103 / -104) instead of
+status handle, in-house r1 S3E1-TEST-103 / -104; the probe test pins
+that a ≥ 0.9 dylib carries the trio symbol by symbol, not the probe's
+own conjunction — the package's `_HAS_X` precedent, r2 B-TEST-202)
+instead of
 re-opening through `zlsx_rows_open`; `Sheet.rows()` and `read_all` keep
 the legacy opener and load on demand on a lazy book (pinned). The four
 per-sheet getters' docstrings state the unloaded-sheet answer. Older

@@ -73,7 +73,7 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   1,315 MB. Shared
   strings with rich-text runs, styles, themes, merged ranges, hyperlinks,
   data validations, comments, dates (both epochs), lazy per-sheet streaming
-  for big workbooks, and `open_bytes` for in-memory buffers.
+  for big workbooks (`open_lazy`), and `open_bytes` for in-memory buffers.
 - **Writer** — pragmatic openpyxl-parity styling: fonts, 19 fill patterns,
   14 border styles × 5 sides, number formats, alignment, column widths, row
   heights, freeze panes, auto-filter, merged ranges, internal + external

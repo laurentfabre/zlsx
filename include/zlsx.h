@@ -147,9 +147,10 @@ int32_t zlsx_book_open_lazy(const char  * path,
  * past zlsx_sheet_count() and ZLSX_ERROR InvalidInput for a NULL book
  * (the legacy reader family leaves NULL undefined; every status export
  * guards it); ZLSX_ERROR with the reader's name for an
- * archive or sheet-part failure (the sheet then stays loaded with the
- * side indices parsed up to the failure — the next call is the hit,
- * not a retry); ZLSX_NOMEM.
+ * archive or sheet-part failure — a failure after the extraction
+ * leaves the sheet loaded with the side indices parsed up to it (the
+ * next call is the hit, not a retry); a failure before it caches
+ * nothing and the next call retries; ZLSX_NOMEM.
  */
 int32_t zlsx_book_preload_sheet(zlsx_book_t * book,
                                 uint32_t      idx,
@@ -1594,10 +1595,11 @@ int32_t zlsx_emb_hashes(zlsx_emb_t * emb, size_t i, uint64_t * out, size_t out_l
 /* ── Formula engine (M9a1) ──────────────────────────────────────────
  *
  * zlsx_status_v1 — NEW exports below only; everything above keeps its
- * shipped 0/-1 convention, except the exports whose comments name the
- * contract (the reader's lazy-sheet trio, zlsx_book_open_lazy() /
- * zlsx_book_preload_sheet() / zlsx_book_stream_sheet(), and the editor's
- * structural block), which follow it too:
+ * shipped 0/-1 convention, except the reader's lazy-sheet trio —
+ * zlsx_book_open_lazy() / zlsx_book_preload_sheet() /
+ * zlsx_book_stream_sheet(), whose comments name the contract — which
+ * follows it too (the S3a structural block sits below and names it
+ * itself):
  *    0  OK
  *   -1  generic error (Zig error name in errbuf)
  *   -2  typed Plane-2 refusal (zlsx_diag_v1 populated when supplied)

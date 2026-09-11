@@ -4412,8 +4412,11 @@ test "fuzz C ABI: interleaved book + rows handles refcount correctly" {
                 rows_handles[ri] = null;
             }
         }
-        // If the refcount underflowed / leaked, testing.allocator's
-        // leak detector catches it at the end of the test.
+        // The C ABI allocates through `smp_allocator`, so
+        // `std.testing.allocator` sees none of the handles: an underflow
+        // is a use-after-free the GPA may or may not trap, and a leak is
+        // invisible here. The S3e lazy-sheets tests pin the balance by
+        // reading `BookState.refcount` directly.
     }
 }
 
@@ -10004,12 +10007,17 @@ test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet
     // The other three stay unloaded — a preload is per sheet.
     for (1..4) |i| try std.testing.expectEqual(@as(usize, 0), zlsx_merged_range_count(book, @intCast(i)));
 
+    const st: *BookState = @ptrCast(@alignCast(book));
     // stream_sheet: the status opener loads sheet 1 and its rows read.
     {
         var rows_slot: ?*Rows = @ptrFromInt(@alignOf(RowsState));
         try std.testing.expectEqual(ZLSX_OK, zlsx_book_stream_sheet(book, 1, &rows_slot, &err_buf, err_buf.len));
         const rows = rows_slot orelse return error.TestUnexpectedResult;
         defer zlsx_rows_close(rows);
+        // The retain is observed while the handle is live (r2 B-TEST-201:
+        // a forgotten fetchAdd would free the book under the first close
+        // and the later "== 1" read would be of freed, unpoisoned memory).
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 1));
         var cells_ptr: [*]const CCell = undefined;
         var cells_len: usize = 0;
@@ -10023,12 +10031,14 @@ test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet
     {
         const rows = zlsx_rows_open(book, 2, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
         defer zlsx_rows_close(rows);
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 2));
     }
     // matrix_open: the bulk read goes through `Book.rows` too.
     {
         const matrix = zlsx_matrix_open(book, 3, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
         defer zlsx_matrix_close(matrix);
+        try std.testing.expectEqual(@as(u32, 2), st.refcount.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, 3));
     }
     for (0..4) |i| try std.testing.expectEqual(@as(usize, 1), zlsx_merged_range_count(book, @intCast(i)));
@@ -10037,7 +10047,6 @@ test "S3e lazy sheets: the lazy opener defers every sheet; preload, stream_sheet
     // one left (the C ABI allocates through `smp_allocator`, so
     // `std.testing.allocator` cannot see a leaked BookState — the
     // refcount is the measurable).
-    const st: *BookState = @ptrCast(@alignCast(book));
     try std.testing.expectEqual(@as(u32, 1), st.refcount.load(.acquire));
 
     // Out of range is -1 SheetIndexOutOfRange on both fallible calls —

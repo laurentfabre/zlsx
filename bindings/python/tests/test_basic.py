@@ -4754,6 +4754,50 @@ def test_eager_books_are_already_loaded_and_the_lazy_methods_are_no_ops(tmp_path
         assert list(book.stream_sheet("Four")) == [["Four", 1]]
 
 
+def test_close_waits_for_in_flight_per_sheet_calls(tmp_path):
+    """Eight threads hammering per-sheet calls on ONE lazy book while the
+    main thread closes it: each worker ends in success or the closed-book
+    error, never a crash (in-house r2 S3E1-REL-201 / THR-201: `close`
+    outside the lock freed the C state under a getter). A regression is
+    a crash of the test process."""
+    _require_lazy_sheets()
+    import threading
+
+    path = tmp_path / "lazy_close_race.xlsx"
+    with zlsx.write(path) as w:
+        for i in range(8):
+            sheet = w.add_sheet(f"S{i}")
+            for r in range(100):
+                sheet.write_row([f"S{i}", r])
+            sheet.add_merged_cell("A1:B1")
+    for _ in range(40):
+        book = zlsx.open_lazy(path)
+        start = threading.Barrier(9)
+        errors = []
+
+        def worker(i):
+            start.wait()
+            try:
+                for k in range(8):
+                    book.merged_ranges((i + k) % 8)
+                    book.preload_sheet((i + k + 1) % 8)
+            except zlsx.ZlsxError as exc:
+                assert "closed" in str(exc)
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        start.wait()
+        book.close()
+        for t in threads:
+            t.join()
+        assert not errors
+        with pytest.raises(zlsx.ZlsxError, match="closed"):
+            book.merged_ranges(0)
+
+
 def test_lazy_sheets_probe_agrees_with_the_library_version():
     """A dylib at or past 0.9.0 exports the trio; a probe that says
     otherwise is a packaging error, not a reason to skip the block
