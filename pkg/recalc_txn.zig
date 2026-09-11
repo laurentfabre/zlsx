@@ -54,7 +54,11 @@
 //! `store.installs` has moved past the count the generation went live
 //! with (`Workbook.generation_installs`, set by `swap`); the staged
 //! deltas the model reads and the save re-emits are not installs, and a
-//! transaction after a transaction stays legal. The remedy is the order:
+//! transaction after a transaction that carried no plans stays legal —
+//! legal, and re-derived from the archive as opened: what the first
+//! run patched and the second finds fresh in the live bytes is not
+//! re-staged (the recorded revert, contract §22; one transaction per
+//! open, or save and re-open between two). The remedy is the order:
 //! run the transaction first, or save and re-open.
 //!
 //! What a candidate carries beyond the run (the save-plan fold)

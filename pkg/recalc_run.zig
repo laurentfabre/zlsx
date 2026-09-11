@@ -1431,6 +1431,8 @@ const metadata_dynamic_array =
 const Fixture = struct {
     sheet: []const u8 = sheet_stale,
     calc_pr: []const u8 = "<calcPr calcId=\"191029\"/>",
+    /// Content ahead of `<sheets>` — a `<bookViews>` block, say.
+    pre_sheets: []const u8 = "",
     /// `xl/metadata.xml`, for the dynamic-array dialect. Absent means
     /// every cell is legacy, which is what a workbook without the part
     /// actually is.
@@ -1457,9 +1459,9 @@ fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f
 
     const wb_xml = try std.fmt.allocPrint(
         gpa,
-        "<workbook xmlns=\"" ++ ns_main ++ "\" xmlns:r=\"" ++ ns_r ++ "\">" ++
+        "<workbook xmlns=\"" ++ ns_main ++ "\" xmlns:r=\"" ++ ns_r ++ "\">{s}" ++
             "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets>{s}</workbook>",
-        .{f.calc_pr},
+        .{ f.pre_sheets, f.calc_pr },
     );
     defer gpa.free(wb_xml);
     try store.addPart("xl/workbook.xml", ct_workbook, wb_xml);
@@ -2820,8 +2822,10 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
     // commute (in-house fold r1 B-DOC-103).
     // The third shape has no `<calcPr>` but a successor of it, so a
     // created `<calcPr>` and the names block must both land before it
-    // (in-house fold r2 B-REL-203).
-    const Shape = struct { sheet: []const u8, calc_pr: []const u8 };
+    // (in-house fold r2 B-REL-203); the fourth nests an `<extLst>`
+    // inside a book view ahead of `<sheets>`, which is not the anchor
+    // (r3 A-REL-301).
+    const Shape = struct { sheet: []const u8, calc_pr: []const u8, pre_sheets: []const u8 = "" };
     for ([_]Shape{
         .{ .sheet = sheet_stale, .calc_pr = "<calcPr calcId=\"191029\"/>" },
         .{ .sheet = sheet_no_formula, .calc_pr = "<calcPr calcId=\"191029\"/>" },
@@ -2829,10 +2833,12 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
         .{ .sheet = sheet_no_formula, .calc_pr = "" },
         .{ .sheet = sheet_stale, .calc_pr = "<extLst/>" },
         .{ .sheet = sheet_no_formula, .calc_pr = "<extLst/>" },
+        .{ .sheet = sheet_stale, .calc_pr = "", .pre_sheets = "<bookViews><workbookView><extLst/></workbookView></bookViews>" },
+        .{ .sheet = sheet_no_formula, .calc_pr = "", .pre_sheets = "<bookViews><workbookView><extLst/></workbookView></bookViews>" },
     }) |shape| {
         const sheet = shape.sheet;
         const stale = sheet.ptr == sheet_stale.ptr;
-        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet, .calc_pr = shape.calc_pr });
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet, .calc_pr = shape.calc_pr, .pre_sheets = shape.pre_sheets });
         defer a.free(path);
         {
             var wb = try Workbook.open(a, io, path);
@@ -2868,7 +2874,11 @@ test "save-plan fold: saveWithRecalc carries a staged cell write and a staged de
             try testing.expect(hasDefinedName(&reopened, "Total"));
             const wb_xml = ((try reopened.store.part("xl/workbook.xml")) orelse return error.TestUnexpectedResult).bytes;
             const names_at = std.mem.indexOf(u8, wb_xml, "<definedNames>") orelse return error.TestUnexpectedResult;
-            if (std.mem.indexOf(u8, wb_xml, "<extLst")) |ext_at| try testing.expect(names_at < ext_at);
+            const sheets_end = std.mem.indexOf(u8, wb_xml, "</sheets>") orelse return error.TestUnexpectedResult;
+            try testing.expect(names_at > sheets_end);
+            if (std.mem.lastIndexOf(u8, wb_xml, "<extLst")) |ext_at| {
+                if (ext_at > sheets_end) try testing.expect(names_at < ext_at);
+            }
             if (std.mem.indexOf(u8, wb_xml, "<calcPr")) |calc_at| try testing.expect(names_at < calc_at);
         }
         // The documented order, byte for byte — and the in-memory

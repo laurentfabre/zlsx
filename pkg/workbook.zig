@@ -1554,7 +1554,13 @@ pub const Workbook = struct {
     /// opened again, could not carry it) — save and re-open, as after
     /// `save`; a transaction that carried nothing leaves the next one
     /// legal, and a workbook with nothing to recalculate keeps its
-    /// `.none` arm. A staged `.formula` delta is
+    /// `.none` arm — legal, and re-derived from the archive as opened:
+    /// a patch the earlier run installed that this run finds fresh in
+    /// the live bytes is not re-staged (the recorded revert, contract
+    /// §22; one transaction per open, or save and re-open between two).
+    /// A pivot cache a staged write lands in takes the refresh marker
+    /// alone, where the plain save also rebuilds it where it can. A
+    /// staged `.formula` delta is
     /// the one the run publishes into: the file carries its formula
     /// cache-free, as `recalculate` then `save` writes it, while the
     /// report counted the value. Appended rows stay refused
@@ -4746,6 +4752,18 @@ pub const Workbook = struct {
             try self.markPivotCachesForCellWritesInto(next, &spliced);
         }
 
+        // Phases 1 and 2 are the sheets': nothing to render, and no
+        // table to parse, when no sheet holds a write (in-house fold r3
+        // A-PERF-302).
+        var any_writes = false;
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0) {
+                any_writes = true;
+                break;
+            }
+        }
+        if (!any_writes) return;
+
         // Phase 1: the SST extension, against the candidate's table.
         var sst_view: ?sst_xml_mod.SstXml = null;
         defer if (sst_view) |*v| v.deinit(a);
@@ -6074,32 +6092,24 @@ pub const Workbook = struct {
                 try out.appendSlice(a, src[close_end..]);
             }
         } else {
-            // No `<definedNames>` block: insert before `<calcPr`, else
-            // before the first of `<calcPr>`'s schema successors the
-            // part has (a `<calcPr>` the calc-state patch creates lands
-            // before that same element, so the two splices commute in
-            // either order — in-house fold r2 B-REL-203), else before
-            // `</workbook>`. This places the block at OOXML's expected
-            // position in the schema sequence.
+            // No `<definedNames>` block: insert before `<calcPr>`, else
+            // where a `<calcPr>` would be created — the calc-state
+            // reader's own slot, before the first root child that
+            // follows `calcPr` in the schema (a nested `<extLst>` inside
+            // a book view is not one), else before `</workbook>`. One
+            // anchor for the two splices, so they commute in either
+            // order (in-house fold r2 B-REL-203, r3 A-REL-301); a part
+            // the reader refuses falls back to `</workbook>` as before.
             const insert_at: usize = blk: {
-                if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i;
-                var first: ?usize = null;
-                for (engine.calc.calc_pr_successors) |succ| {
-                    var from: usize = 0;
-                    while (std.mem.indexOfPos(u8, src, from, "<")) |lt| {
-                        from = lt + 1;
-                        const name_end = lt + 1 + succ.len;
-                        if (name_end >= src.len) break;
-                        if (!std.mem.eql(u8, src[lt + 1 .. name_end], succ)) continue;
-                        switch (src[name_end]) {
-                            ' ', '\t', '\r', '\n', '>', '/' => {},
-                            else => continue,
-                        }
-                        if (first == null or lt < first.?) first = lt;
-                        break;
-                    }
+                var parsed = try engine.calc.parseCalcState(a, src);
+                switch (parsed) {
+                    .ok => |*state| {
+                        defer state.deinit(a);
+                        if (state.spans.element.end > state.spans.element.start) break :blk state.spans.element.start;
+                        if (state.spans.insert_at) |i| break :blk i;
+                    },
+                    .refused => {},
                 }
-                if (first) |i| break :blk i;
                 if (std.mem.indexOf(u8, src, "</workbook>")) |i| break :blk i;
                 return error.MalformedXml;
             };

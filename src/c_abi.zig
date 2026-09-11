@@ -5780,7 +5780,11 @@ export fn zlsx_open_buffer(
 /// transaction on this editor that would build a candidate is -2
 /// `RecalcRequiresReopen` — save and re-open, as after
 /// `zlsx_editor_save` (a workbook with nothing to recalculate keeps
-/// its plain-save arm). Appended rows stay refused
+/// its plain-save arm); a transaction after one that carried nothing
+/// is legal and re-derives the earlier run's patches from the archive
+/// as opened (the recorded revert, contract §22 — one transaction per
+/// open, or save and re-open between two). A pivot cache a staged
+/// write lands in takes the refresh marker alone. Appended rows stay refused
 /// (`SheetHasUnsavedAppends`): the run cannot read them. Over an
 /// embedding write's install the verdict is `RecalcRequiresReopen`.
 export fn zlsx_editor_save_with_recalc(
@@ -12994,6 +12998,11 @@ test "recalc-transaction guard: after add_sheet, insert_row, rename_sheet, set_e
         defer zlsx_editor_close(ed);
         const x = s3cStringCell("x");
         try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 1, 0, &x, &err_buf, err_buf.len));
+        // The read that refuses over a staged write observes the drain.
+        var rows_ptr: ?[*]u8 = null;
+        var rows_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A1:A1", "A", 0, &rows_ptr, &rows_len, null, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedMutations", std.mem.sliceTo(&err_buf, 0));
         var crun = zeroRun();
         var report = std.mem.zeroes(CRecalcReport);
         report.struct_size = @sizeOf(CRecalcReport);
@@ -13001,6 +13010,9 @@ test "recalc-transaction guard: after add_sheet, insert_row, rename_sheet, set_e
         try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_with_recalc(ed, fold_out.ptr, fold_out.len, &crun, &report, &diag, &err_buf, err_buf.len));
         zlsx_recalc_report_release(&report);
         zlsx_diag_release(&diag);
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "A1:A1", "A", 0, &rows_ptr, &rows_len, null, &err_buf));
+        try std.testing.expect(std.mem.indexOf(u8, rows_ptr.?[0..rows_len], "\"text\":\"x\"") != null);
+        zlsx_buffer_release(rows_ptr, rows_len);
         // What it materialized is a save's install: the next
         // transaction on this editor hears the guard.
         diag = freshDiag();

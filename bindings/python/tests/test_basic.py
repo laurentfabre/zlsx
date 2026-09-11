@@ -2572,7 +2572,11 @@ def test_save_with_recalc_carries_a_staged_cell_write(tmp_path, with_formula):
     out = tmp_path / "out.xlsx"
     with zlsx.edit(src) as ed:
         ed.set_cell(0, 1, 0, "seven")
+        # The read that refuses over a staged write observes the drain.
+        with pytest.raises(zlsx.ZlsxError, match="SheetHasUnsavedMutations"):
+            ed.embeddable_rows(0, "A1:A1", "A")
         ed.save_with_recalc(folded)
+        assert [r["text"] for r in ed.embeddable_rows(0, "A1:A1", "A")] == ["seven"]
         # What it materialized is a save's install: the next transaction
         # that builds a candidate hears the guard — save and re-open. A
         # workbook with nothing to recalculate builds none: `recalculate`

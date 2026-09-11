@@ -1797,7 +1797,12 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * does. What either arm materialized is a save's install: the next
  * transaction on this editor that would build a candidate is -2
  * RecalcRequiresReopen — save and re-open, as after zlsx_editor_save
- * (a workbook with nothing to recalculate keeps its plain-save arm). Appended rows stay refused
+ * (a workbook with nothing to recalculate keeps its plain-save arm);
+ * a transaction after one that carried nothing is legal and re-derives
+ * the earlier run's patches from the archive as opened (the recorded
+ * revert, contract §22 — one transaction per open, or save and re-open
+ * between two). A pivot cache a staged write lands in takes the
+ * refresh marker alone. Appended rows stay refused
  * (SheetHasUnsavedAppends): the run cannot read them. Over an
  * embedding write's install the verdict is RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,

@@ -5103,7 +5103,11 @@ class Editor:
         on this editor that would build a candidate raises
         :class:`ZlsxRefusal` ``RecalcRequiresReopen`` — save and re-open,
         as after :meth:`save` (a workbook with nothing to recalculate
-        keeps its plain-save arm). Appended rows (:meth:`append_rows`) stay refused
+        keeps its plain-save arm); a transaction after one that carried
+        nothing is legal and re-derives the earlier run's patches from
+        the archive as opened (the recorded revert — one transaction per
+        open, or save and re-open between two). A pivot cache a staged
+        write lands in takes the refresh marker alone. Appended rows (:meth:`append_rows`) stay refused
         (``SheetHasUnsavedAppends``): the run cannot read them. Over an
         embedding write's install the verdict is
         ``RecalcRequiresReopen``."""
