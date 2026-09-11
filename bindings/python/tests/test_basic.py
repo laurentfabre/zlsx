@@ -4779,8 +4779,18 @@ def test_close_waits_for_in_flight_per_sheet_calls(tmp_path):
             start.wait()
             try:
                 for k in range(8):
-                    book.merged_ranges((i + k) % 8)
-                    book.preload_sheet((i + k + 1) % 8)
+                    j = (i + k) % 8
+                    book.merged_ranges(j)
+                    book.preload_sheet((j + 1) % 8)
+                    # The legacy openers and the workbook-wide getters
+                    # race the close too (in-house r3 S3E1-THR-301 / -302).
+                    it = book.sheet(j).rows()
+                    next(it)
+                    it.close()
+                    book.sheet(f"S{j}").read_all()
+                    book.sheet_state(j)
+                    book.shared_string_at(0)
+                    book.cell_font(0)
             except zlsx.ZlsxError as exc:
                 assert "closed" in str(exc)
             except Exception as exc:  # pragma: no cover — surfaced below
@@ -4796,6 +4806,12 @@ def test_close_waits_for_in_flight_per_sheet_calls(tmp_path):
         assert not errors
         with pytest.raises(zlsx.ZlsxError, match="closed"):
             book.merged_ranges(0)
+    # The public constructor on a closed book is the closed-book error,
+    # not a NULL to the legacy opener (deterministic before r3).
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        zlsx.Rows(book, 0)
+    with pytest.raises(zlsx.ZlsxError, match="closed"):
+        book.sheet_state(0)
 
 
 def test_lazy_sheets_probe_agrees_with_the_library_version():

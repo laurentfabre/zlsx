@@ -2727,10 +2727,23 @@ promise is the slice's; the lock is fetched with `getattr` so a
 close now waits for an in-flight load and every later call raises
 `ZlsxError`), on lazy and eager books alike — an eager book's bulk reads
 of distinct sheets are serialised too, a deliberate trade against a
-`lazy`-conditional lock; a `Rows` iteration is unlocked — one iterator
-per thread, and it outlives a close through the C refcount. Pinned as
-two threaded tests (eight streams + getters on one lazy book; eight
-getter loops racing a close — a regression is a crash of the test
+`lazy`-conditional lock — and, since in-house r3 (B-THR-301 HIGH /
+B-THR-302, both reproduced), by EVERY call that dereferences the book's
+handle: the closed-book check of the legacy openers (`Sheet.rows` /
+`Sheet.read_all` / the public `zlsx.Rows`) moved under the lock (a close
+that won it between the courtesy check and the C call handed
+`zlsx_rows_open` a NULL `*Book`; the public constructor had no check at
+all — deterministic exit 139 after a close), and the workbook-wide
+getters (`sheet_state`, `_sheet_index`'s name lookup, `shared_string_at`,
+`rich_text`, `number_format`, the four style lookups, `is_date_format`)
+are `@_serialized` too (a close under any of them freed the state —
+five of five probed crashed); the docs on every surface say "every call
+on the book" instead of an enumeration; a `Rows` iteration is unlocked —
+one iterator per thread, and it outlives a close through the C refcount.
+Pinned as two threaded tests (eight streams + getters on one lazy book;
+eight worker loops over `rows()` / `read_all` / the per-sheet and
+workbook-wide getters racing a close, plus the deterministic
+`zlsx.Rows(book, 0)` after a close — a regression is a crash of the test
 process, stated), and measured: the probes survive with the lock, abort
 with it replaced by a null context / with `close` outside it. The
 header's preamble names the trio as the status_v1 exports declared above
