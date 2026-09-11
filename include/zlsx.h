@@ -13,7 +13,11 @@
  * from zlsx_book_open_lazy(): its sheets are extracted on first touch
  * (zlsx_book_preload_sheet(), zlsx_book_stream_sheet(), zlsx_rows_open(),
  * zlsx_matrix_open() mutate the book), so two threads reaching for two
- * sheets of one lazy handle need the caller's lock.
+ * sheets of one lazy handle need the caller's lock — and for a handle
+ * from zlsx_book_open_sst_lazy(), whose shared strings are decoded on
+ * first touch (zlsx_shared_string_at(), zlsx_book_shared_string(), a
+ * row iterator or matrix resolving a cell to one mutate the book), so
+ * two threads iterating two sheets of one such handle need it too.
  *
  * The internal refcount lets a zlsx_rows_t* returned by zlsx_rows_open()
  * safely outlive the caller's zlsx_book_t* handle; the last close on
@@ -173,6 +177,62 @@ int32_t zlsx_book_stream_sheet(zlsx_book_t * book,
                                zlsx_rows_t ** out,
                                uint8_t     * err_buf,
                                size_t        err_buf_len);
+
+/*
+ * Open an xlsx file with the shared-string table indexed, not decoded
+ * (S3e slice 2; probe: ZLSX_HAS_LAZY_SST). Every sheet is loaded and
+ * the file released before the call returns — zlsx_book_open()'s shape
+ * — but each shared-string entry's text is decoded into the handle's
+ * storage on first touch (zlsx_shared_string_at(),
+ * zlsx_book_shared_string(), a row iterator or matrix resolving a cell
+ * to it) and cached for the handle's lifetime, so a workbook of
+ * millions of unique strings costs the entries a caller reaches, not
+ * the table. Rich runs, styles, the sheet inventory and every per-sheet
+ * side index are populated at open as on every handle. The deferred
+ * decode removes no validation — neither backend refuses a torn <t>
+ * body — but the two read such a table differently: on
+ * zlsx_book_open() the torn entry swallows markup and the entries
+ * after it up to the next </t> (every later index shifts); this opener
+ * bounds each entry by its </si>, keeps the ordinal and yields the
+ * text before the tear. The one failure the
+ * deferral adds is the allocation — OOM at first touch instead of at
+ * open, which the legacy zlsx_shared_string_at() folds into its -1
+ * beside out-of-range and zlsx_book_shared_string() reports as
+ * ZLSX_NOMEM. A first touch
+ * mutates the handle: same-handle calls are externally synchronized
+ * (the contract at the top of this header).
+ *
+ * zlsx_status_v1: ZLSX_OK with the handle in *out (close with
+ * zlsx_book_close()); ZLSX_ERROR with the reader's error name in errbuf
+ * (no zlsx_diag_v1 — the reader has no typed refusal, the
+ * zlsx_book_open_lazy() shape); ZLSX_NOMEM. *out is NULL on any
+ * non-zero status; a NULL `out` is ZLSX_ERROR NullOutPointer and a NULL
+ * `path` ZLSX_ERROR NullPath, both before the file is touched.
+ */
+int32_t zlsx_book_open_sst_lazy(const char  * path,
+                                zlsx_book_t ** out,
+                                uint8_t     * err_buf,
+                                size_t        err_buf_len);
+
+/*
+ * Shared-string entry `sst_idx` under zlsx_status_v1 — the read
+ * zlsx_shared_string_at() performs, with the failure classified:
+ * ZLSX_ERROR SstIndexOutOfRange for an index past
+ * zlsx_shared_string_count() (judged before the reader, on every
+ * handle); ZLSX_NOMEM for the allocation a handle from
+ * zlsx_book_open_sst_lazy() may fail on the entry's first touch (the
+ * legacy getter's -1 covers both); ZLSX_ERROR InvalidInput for a NULL
+ * book; ZLSX_ERROR NullOutPointer for a NULL `out_ptr` or `out_len`.
+ * On ZLSX_OK the slice points into the handle's storage (valid until
+ * the handle is closed; do not free); on any other status *out_ptr is
+ * "" and *out_len 0.
+ */
+int32_t zlsx_book_shared_string(zlsx_book_t   * book,
+                                size_t          sst_idx,
+                                const uint8_t ** out_ptr,
+                                size_t        * out_len,
+                                uint8_t       * err_buf,
+                                size_t          err_buf_len);
 
 /* Drop the caller's reference to a Book. NULL-safe (no-op). Active
  * row iterators hold their own references, so calling this while rows
@@ -467,7 +527,9 @@ size_t zlsx_shared_string_count(zlsx_book_t * book);
 /*
  * Copy SST entry `sst_idx` into `*out_ptr` / `*out_len`. Slice into
  * Book-owned storage; do not free. Returns 0 on success, -1 on
- * out-of-range.
+ * out-of-range — and, on a handle from zlsx_book_open_sst_lazy(), on
+ * the allocation the entry's first touch may fail; zlsx_book_shared_string()
+ * is the same read with the two told apart.
  */
 int32_t zlsx_shared_string_at(zlsx_book_t *     book,
                               size_t            sst_idx,
@@ -2522,6 +2584,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
 #define ZLSX_HAS_EMBEDDABLE_ROWS  1   /* editor embeddable_rows_ndjson (S3c slice 2) */
 #define ZLSX_HAS_EMBEDDING_SWEEPS 1   /* editor prune_embeddings + strip_embeddings + zlsx_prune_report_v1 (S3c slice 3) */
 #define ZLSX_HAS_LAZY_SHEETS      1   /* reader book_open_lazy + book_preload_sheet + book_stream_sheet (S3e slice 1) */
+#define ZLSX_HAS_LAZY_SST         1   /* reader book_open_sst_lazy + book_shared_string (S3e slice 2) */
 
 
 #ifdef __cplusplus

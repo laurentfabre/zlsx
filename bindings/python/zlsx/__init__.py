@@ -30,6 +30,7 @@ apart (libzlsx 0.9.0+).
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import os
@@ -47,6 +48,7 @@ level may drift when the binding ships a Python-only fix."""
 
 __all__ = [
     "open_lazy",
+    "open_sst_lazy",
     "open",
     "open_bytes",
     "write",
@@ -486,7 +488,9 @@ def _serialized(method):
     call that dereferences the book's handle — the per-sheet loads and
     getters, the workbook-wide getters, the iterator and matrix openers,
     :meth:`Book.close`; a :class:`Rows` iteration is unlocked — one
-    iterator per thread, and it outlives a close through the C refcount."""
+    iterator per thread, and it outlives a close through the C refcount —
+    except on a :func:`open_sst_lazy` book, where each row's read takes
+    the lock too (a first touch of a shared string mutates the handle)."""
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
@@ -496,9 +500,10 @@ def _serialized(method):
 
 class Book:
     """A workbook handle. Use :func:`zlsx.open` (every sheet loaded at
-    open, the file released before it returns), :func:`zlsx.open_bytes`
-    or :func:`zlsx.open_lazy` (sheets loaded on first touch; see
-    :attr:`lazy`) to construct one.
+    open, the file released before it returns), :func:`zlsx.open_bytes`,
+    :func:`zlsx.open_lazy` (sheets loaded on first touch; see
+    :attr:`lazy`) or :func:`zlsx.open_sst_lazy` (shared strings decoded
+    on first touch; see :attr:`sst_lazy`) to construct one.
 
     Also usable as a context manager; exit closes the handle::
 
@@ -515,10 +520,11 @@ class Book:
             raise ZlsxError(f"zlsx_book_open({path!r}): {_decode_err(self._err)}")
         self._attach(handle)
 
-    def _attach(self, handle, lazy: bool = False) -> None:
+    def _attach(self, handle, lazy: bool = False, sst_lazy: bool = False) -> None:
         """Adopt an already-open C handle and cache sheet names — most
         callers enumerate them, and the list is short (<10 in typical
-        workbooks). Shared by the path, buffer and lazy constructors."""
+        workbooks). Shared by the path, buffer and the two lazy
+        constructors."""
         self._handle = handle
         # Re-entrant: `Sheet.read_all` and the iterator constructors take
         # it from inside methods that already hold it.
@@ -534,6 +540,14 @@ class Book:
         #: serialised by a per-book lock (see :func:`open_lazy`); a
         #: :class:`Rows` is one thread's.
         self.lazy: bool = lazy
+        #: ``True`` for a book from :func:`open_sst_lazy` — every sheet
+        #: loaded and the file released at open, the shared-string table
+        #: indexed and each entry decoded on first touch
+        #: (:meth:`shared_string_at`, a row that resolves to it); ``False``
+        #: for every other opener, whose table is decoded at open. A
+        #: :class:`Rows` over such a book takes the per-book lock for each
+        #: row it yields.
+        self.sst_lazy: bool = sst_lazy
         count = _ffi.lib.zlsx_sheet_count(self._handle)
         self.sheets: list[str] = []
         name_buf = ctypes.create_string_buffer(256)
@@ -892,22 +906,42 @@ class Book:
     @_serialized
     def shared_string_at(self, sst_idx: int) -> str:
         """Return shared-string entry ``sst_idx`` as a decoded UTF-8
-        ``str``. Raises :class:`IndexError` on out-of-range.
-        Requires libzlsx 0.2.6+."""
+        ``str``. Raises :class:`IndexError` on out-of-range. On a
+        :func:`open_sst_lazy` book the entry is decoded on its first
+        touch and cached; a failure of that decode (its allocation)
+        raises :class:`ZlsxError` named after the reader's error where
+        the library reports it apart from the bound (libzlsx 0.9.0+,
+        ``zlsx_book_shared_string``; an older dylib folds both into
+        ``IndexError``). Requires libzlsx 0.2.6+."""
         if not self._handle:
             raise ZlsxError("book is closed")
-        if not _ffi._HAS_SST_ENUM:
-            raise RuntimeError(
-                "loaded libzlsx does not expose shared_string_at "
-                "(requires 0.2.6+); upgrade libzlsx"
-            )
         out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
         out_len = ctypes.c_size_t(0)
-        rc = _ffi.lib.zlsx_shared_string_at(
-            self._handle, sst_idx, ctypes.byref(out_ptr), ctypes.byref(out_len)
-        )
-        if rc != 0:
-            raise IndexError(f"sst_idx {sst_idx} out of range")
+        if _ffi._HAS_LAZY_SST:
+            rc = _ffi.lib.zlsx_book_shared_string(
+                self._handle,
+                sst_idx,
+                ctypes.byref(out_ptr),
+                ctypes.byref(out_len),
+                self._err,
+                _ERR_BUF_LEN,
+            )
+            if rc != _ffi.ZLSX_OK:
+                name = _decode_err(self._err)
+                if name == "SstIndexOutOfRange":
+                    raise IndexError(f"sst_idx {sst_idx} out of range")
+                raise ZlsxError(f"zlsx_book_shared_string({sst_idx}): {name}")
+        else:
+            if not _ffi._HAS_SST_ENUM:
+                raise RuntimeError(
+                    "loaded libzlsx does not expose shared_string_at "
+                    "(requires 0.2.6+); upgrade libzlsx"
+                )
+            rc = _ffi.lib.zlsx_shared_string_at(
+                self._handle, sst_idx, ctypes.byref(out_ptr), ctypes.byref(out_len)
+            )
+            if rc != 0:
+                raise IndexError(f"sst_idx {sst_idx} out of range")
         if out_len.value == 0:
             return ""
         return ctypes.string_at(out_ptr, out_len.value).decode("utf-8", errors="replace")
@@ -1373,13 +1407,20 @@ class Rows:
             raise ZlsxError("Rows iterator is closed")
         cells_ptr = _ffi.cell_ptr()
         cells_len = ctypes.c_size_t()
-        rc = _ffi.lib.zlsx_rows_next(
-            self._handle,
-            ctypes.byref(cells_ptr),
-            ctypes.byref(cells_len),
-            self._err,
-            _ERR_BUF_LEN,
-        )
+        # On a book whose shared strings decode on first touch, a row's
+        # read mutates the handle (the resolution cache and its arena),
+        # so two iterators on two threads over one such book race
+        # without the book's lock — a Rows over every other book reads
+        # loaded state and stays unlocked (one iterator per thread).
+        # The lock outlives a close, as the iterator does.
+        with self._book._lock if self._book.sst_lazy else contextlib.nullcontext():
+            rc = _ffi.lib.zlsx_rows_next(
+                self._handle,
+                ctypes.byref(cells_ptr),
+                ctypes.byref(cells_len),
+                self._err,
+                _ERR_BUF_LEN,
+            )
         if rc <= 0:
             # No current row any more — the side-channel accessors
             # (`style_indices`, `formula_strings`, …) answer for the
@@ -1738,7 +1779,8 @@ def open_lazy(path: Union[str, Path]) -> Book:
     alike (a bulk read of one sheet therefore waits for another's on the
     same book; a close waits for the call in flight, and every later call
     raises :class:`ZlsxError`). Iterating a :class:`Rows` is unlocked: one
-    iterator per thread, and it outlives a close through the C refcount.
+    iterator per thread, and it outlives a close through the C refcount
+    (on a :func:`open_sst_lazy` book each row's read takes the lock).
 
     Raises :class:`ZlsxError` on parse failure, named after the reader's
     error. Requires libzlsx 0.9.0+ (``zlsx_book_open_lazy``).
@@ -1758,6 +1800,57 @@ def open_lazy(path: Union[str, Path]) -> Book:
     if rc != _ffi.ZLSX_OK:
         raise ZlsxError(f"zlsx_book_open_lazy({str(path)!r}): {_decode_err(book._err)}")
     book._attach(handle.value, lazy=True)
+    return book
+
+
+def open_sst_lazy(path: Union[str, Path]) -> Book:
+    """Open an ``.xlsx`` file with the shared-string table indexed, not
+    decoded: every sheet is loaded and the file released before this
+    returns (:func:`open`'s shape), but each shared-string entry's text
+    is decoded on first touch — :meth:`Book.shared_string_at`, or a row
+    that resolves a cell to it — and cached for the book's lifetime, so
+    a workbook of millions of unique strings costs the entries the
+    caller reaches, not the table. Rich runs (:meth:`Book.rich_text`),
+    styles, the sheet inventory and every per-sheet side index are
+    populated at open as on every book. The book reads as
+    :attr:`Book.sst_lazy`. A sparse read wins; a full sweep decodes
+    every entry it meets and costs a little more than :func:`open`::
+
+        with zlsx.open_sst_lazy("huge_sst.xlsx") as book:   # book.sst_lazy is True
+            for row in book.sheet("Q3").rows():             # decodes the strings it yields
+                ...
+
+    The deferred decode removes no validation — neither opener refuses
+    a torn entry (a ``<t>`` that never closes) — but the two read such a
+    table differently: on :func:`open` the torn entry swallows markup
+    and the entries after it up to the next ``</t>`` (every later index
+    shifts), while this opener bounds each entry by its ``</si>``, keeps
+    the ordinal and yields the text before the tear. The one failure
+    the deferral adds is the
+    allocation, at first touch instead of at open — :class:`ZlsxError`
+    from :meth:`Book.shared_string_at` or the row iteration. Threads may share the book as they share any other
+    (see :func:`open_lazy`), and here a :class:`Rows` takes the
+    per-book lock for each row it yields, since a first touch mutates
+    the handle.
+
+    Raises :class:`ZlsxError` on parse failure, named after the reader's
+    error. Requires libzlsx 0.9.0+ (``zlsx_book_open_sst_lazy``).
+    """
+    if not _ffi._HAS_LAZY_SST:
+        raise RuntimeError(
+            "loaded libzlsx does not expose open_sst_lazy (requires 0.9.0+); "
+            "upgrade libzlsx"
+        )
+    book = Book.__new__(Book)
+    book._handle = None
+    book._err = ctypes.create_string_buffer(_ERR_BUF_LEN)
+    handle = _ffi.book_handle()
+    rc = _ffi.lib.zlsx_book_open_sst_lazy(
+        str(path).encode("utf-8"), ctypes.byref(handle), book._err, _ERR_BUF_LEN
+    )
+    if rc != _ffi.ZLSX_OK:
+        raise ZlsxError(f"zlsx_book_open_sst_lazy({str(path)!r}): {_decode_err(book._err)}")
+    book._attach(handle.value, sst_lazy=True)
     return book
 
 

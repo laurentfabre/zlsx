@@ -888,8 +888,10 @@ selectors are tolerated and ignored).
 --with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
 --sst-lazy                    # open with Book.openSstLazy — defer SST decode until first
                               # cell access (huge-workbook RAM mitigation; sparse access
-                              # wins, full sweeps cost a bit more). Trade-off: malformed
-                              # <t> in the SST surfaces on first access, not at open.
+                              # wins, full sweeps cost a bit more). Neither backend refuses
+                              # a torn <t>: eager swallows past it up to the next </t>
+                              # (later indices shift), lazy keeps its ordinal; the one added failure
+                              # is the allocation, at first access, not at open.
 ```
 
 **Output modes**:

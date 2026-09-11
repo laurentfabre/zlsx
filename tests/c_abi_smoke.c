@@ -74,6 +74,9 @@
 #if !defined(ZLSX_HAS_LAZY_SHEETS)
 #error "ZLSX_HAS_LAZY_SHEETS missing"
 #endif
+#if !defined(ZLSX_HAS_LAZY_SST)
+#error "ZLSX_HAS_LAZY_SST missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -210,3 +213,12 @@ static const void *const s3e1_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3e1(void);
 const void *zlsx_c_abi_smoke_anchor_s3e1(void) { return s3e1_exports[0]; }
+
+/* S3e slice 2: the lazy SST backend on the reader handle — the two
+ * status exports under one macro. */
+static const void *const s3e2_exports[] = {
+    (const void *)&zlsx_book_open_sst_lazy,
+    (const void *)&zlsx_book_shared_string,
+};
+const void *zlsx_c_abi_smoke_anchor_s3e2(void);
+const void *zlsx_c_abi_smoke_anchor_s3e2(void) { return s3e2_exports[0]; }

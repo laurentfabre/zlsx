@@ -908,12 +908,18 @@ pub const Book = struct {
     /// same slice as the eager backend with the same lifetime
     /// contract.
     ///
-    /// Trade-off: lazy mode defers per-entry plain-text decoding,
-    /// so a malformed `<t>` body inside an `<si>` won't surface at
-    /// `openSstLazy` time — it'll surface as `MalformedXml` from
-    /// `sharedStringAt(idx)` (or, transitively, from a `Rows.next()`
-    /// cell read that resolves to that idx). Callers that need
-    /// "open fails fast on bad SST" should use `Book.open` instead.
+    /// Trade-off: lazy mode defers per-entry plain-text decoding and
+    /// its allocation, so the one failure it can add is `OutOfMemory`
+    /// from `sharedStringAt(idx)` (or, transitively, from a
+    /// `Rows.next()` cell read that resolves to that idx) instead of
+    /// at open. It removes no validation — neither walker refuses a
+    /// torn `<t>` body — but the two read such a table differently:
+    /// the eager walker's `</t>` search runs past the entry, so the
+    /// torn entry swallows markup and the entries after it up to the
+    /// next `</t>` (every later index shifts); the lazy one is bounded
+    /// by its `</si>`, keeps the ordinal and yields the text before
+    /// the tear (the "S3e slice 2" test below). There is no "open
+    /// fails fast on bad SST" to trade away.
     /// Single-threaded contract — the lazy backend mutates internal
     /// state on first-touch. Multi-threaded SST access requires the
     /// caller to serialise externally or to call `Book.open` instead.
@@ -5788,6 +5794,66 @@ test "openSstLazy: lazy SST resolves on demand and matches eager (iter-sst-3b)" 
         // Out-of-range still reports MalformedXml on the lazy backend.
         try std.testing.expectError(error.MalformedXml, book.sharedStringAt(99));
     }
+}
+
+test "S3e slice 2: neither backend refuses a torn entry; the eager walker swallows past it and the lazy one keeps its ordinal" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // One sound entry, one whose `<t>` never closes, one whose second
+    // run is torn, one sound entry after them. Neither walker refuses:
+    // the eager one's `</t>` search is not bounded by the entry, so the
+    // torn entry SWALLOWS markup and the entries after it up to the
+    // next `</t>` (its text carries `<si>` tags, every later index
+    // shifts); the lazy one spans `<si>`…`</si>` first and keeps the
+    // ordinal, decoding the text before the tear — the divergence §24
+    // records (the deferral removes no validation; the two openers
+    // read a torn table differently, a pre-existing reader behaviour,
+    // an owner follow-up).
+    const sst_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"4\" uniqueCount=\"4\">" ++
+        "<si><t>ok &amp; sound</t></si>" ++
+        "<si><t>torn</si>" ++
+        "<si><r><t>first</t></r><r><t>second</si>" ++
+        "<si><t>after</t></si>" ++
+        "</sst>";
+
+    var eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer eager.deinit();
+    eager.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStrings(&eager, eager.shared_strings_xml.?);
+
+    var lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer lazy.deinit();
+    lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, sst_xml);
+    try parseSharedStringsLazy(&lazy, lazy.shared_strings_xml.?);
+    try std.testing.expect(std.meta.activeTag(lazy.sst) == .lazy);
+
+    // Eager: two entries — the sound first one, then the torn one
+    // carrying everything up to the last `</t>`, the two entries in
+    // between gone.
+    try std.testing.expectEqual(@as(usize, 2), eager.sharedStringsCount());
+    try std.testing.expectEqualStrings("ok & sound", try eager.sharedStringAt(0));
+    try std.testing.expectEqualStrings("torn</si><si><r><t>firstsecond</si><si><t>after", try eager.sharedStringAt(1));
+    try std.testing.expectError(error.MalformedXml, eager.sharedStringAt(2));
+    // Lazy: four ordinals, the torn ones the text before the tear —
+    // index 3 is "after".
+    try std.testing.expectEqual(@as(usize, 4), lazy.sharedStringsCount());
+    try std.testing.expectEqualStrings("ok & sound", try lazy.sharedStringAt(0));
+    try std.testing.expectEqualStrings("", try lazy.sharedStringAt(1));
+    try std.testing.expectEqualStrings("first", try lazy.sharedStringAt(2));
+    try std.testing.expectEqualStrings("after", try lazy.sharedStringAt(3));
+    // Past the end is the reader's `MalformedXml` on both, which the C
+    // status read pre-empts as `SstIndexOutOfRange`.
+    try std.testing.expectError(error.MalformedXml, lazy.sharedStringAt(4));
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {

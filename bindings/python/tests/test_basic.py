@@ -4877,3 +4877,208 @@ def test_threads_may_share_one_lazy_book(tmp_path):
         assert not errors and seen == [200] * 8
         assert [len(book.merged_ranges(i)) for i in range(8)] == [1] * 8
         book.close()
+
+
+# ─── S3e slice 2: the lazy SST backend ──────────────────────────────
+
+
+def _sst_workbook(path, sheets=2, rows=3):
+    """`sheets` sheets, `rows` rows each, every string cell distinct
+    across the workbook (plus one string shared by every sheet, one
+    entity-bearing and one empty), one merged range per sheet — the
+    per-sheet side index the SST-lazy opener still parses at open."""
+    with zlsx.write(path) as w:
+        for s in range(sheets):
+            sheet = w.add_sheet(f"S{s}")
+            for r in range(rows):
+                sheet.write_row([f"s{s}r{r}", "shared", r])
+            sheet.write_row(["a & b", ""])
+            sheet.add_merged_cell("A1:B1")
+
+
+def _require_lazy_sst():
+    import zlsx._ffi as ffi
+    if not ffi._HAS_LAZY_SST:
+        pytest.skip("libzlsx lacks zlsx_book_open_sst_lazy (0.9.0+)")
+
+
+def test_open_sst_lazy_loads_every_sheet_and_reads_what_open_reads(tmp_path, monkeypatch):
+    _require_lazy_sst()
+    import zlsx._ffi as ffi
+    path = tmp_path / "sst_lazy.xlsx"
+    _sst_workbook(path)
+    with zlsx.open(path) as eager:
+        expect_rows = [list(eager.sheet(i).rows()) for i in range(2)]
+        expect_sst = eager.shared_strings()
+        assert eager.sst_lazy is False and eager.lazy is False
+
+    # The opener is the status export, not the eager one behind a flag.
+    def no_eager(*args):
+        raise AssertionError("open_sst_lazy must not open through zlsx_book_open")
+    monkeypatch.setattr(ffi.lib, "zlsx_book_open", no_eager)
+    monkeypatch.setattr(ffi.lib, "zlsx_book_open_lazy", no_eager)
+    with zlsx.open_sst_lazy(path) as book:
+        assert book.sst_lazy is True and book.lazy is False
+        assert book.sheets == ["S0", "S1"]
+        # Every sheet is loaded at open: the side indices answer without
+        # a preload, and the slice-1 calls are legal no-ops / hits.
+        assert [len(book.merged_ranges(i)) for i in range(2)] == [1, 1]
+        book.preload_sheet(0)
+        assert list(book.stream_sheet(1)) == expect_rows[1]
+        # The table's count needs no decode; each entry reads as the
+        # eager book's, twice (the second is the cache hit); rows too.
+        assert book.shared_strings_count() == len(expect_sst) == 9
+        assert book.shared_string_at(1) == expect_sst[1]
+        assert book.shared_string_at(1) == expect_sst[1]
+        assert book.shared_strings() == expect_sst
+        assert "a & b" in expect_sst and "" in expect_sst
+        assert [list(book.sheet(i).rows()) for i in range(2)] == expect_rows
+        assert book.sheet(0).read_all() == (None, expect_rows[0])
+        # Out of range is IndexError on both books (the status read's
+        # SstIndexOutOfRange); a negative index wraps through c_size_t
+        # to the far end and is the same statement.
+        for bad in (9, 10 ** 6, -1):
+            with pytest.raises(IndexError):
+                book.shared_string_at(bad)
+    # `stream_sheet`'s iterator outlives the close (the C refcount), and
+    # so does the lock its rows take on this book.
+    book = zlsx.open_sst_lazy(path)
+    rows = book.stream_sheet(0)
+    book.close()
+    assert list(rows) == expect_rows[0]
+    rows.close()
+
+
+def test_shared_string_at_names_a_deferred_decode_failure(tmp_path, monkeypatch):
+    """The status read tells the bound from the decode's allocation:
+    `SstIndexOutOfRange` stays `IndexError` (the shipped contract), any
+    other name is `ZlsxError` named after it — pinned by standing in
+    for the library, since an allocation failure cannot be induced
+    through the dylib."""
+    _require_lazy_sst()
+    import zlsx._ffi as ffi
+    path = tmp_path / "sst_lazy_err.xlsx"
+    _sst_workbook(path)
+
+    def nomem(handle, idx, out_ptr, out_len, err, err_len):
+        err.value = b"OutOfMemory"
+        return ffi.ZLSX_NOMEM
+
+    with zlsx.open_sst_lazy(path) as book:
+        monkeypatch.setattr(ffi.lib, "zlsx_book_shared_string", nomem)
+        with pytest.raises(zlsx.ZlsxError, match="OutOfMemory"):
+            book.shared_string_at(0)
+        # An older dylib: the legacy getter, IndexError for its -1.
+        monkeypatch.setattr(ffi, "_HAS_LAZY_SST", False)
+        assert book.shared_string_at(0) == "s0r0"
+        with pytest.raises(IndexError):
+            book.shared_string_at(99)
+        with pytest.raises(RuntimeError, match="0.9.0"):
+            zlsx.open_sst_lazy(path)
+
+
+def test_open_sst_lazy_failures_are_named_after_the_reader(tmp_path):
+    _require_lazy_sst()
+    with pytest.raises(zlsx.ZlsxError, match="FileNotFound"):
+        zlsx.open_sst_lazy(tmp_path / "missing.xlsx")
+    garbage = tmp_path / "garbage.xlsx"
+    garbage.write_bytes(b"not a zip archive")
+    with pytest.raises(zlsx.ZlsxError, match="BadZip"):
+        zlsx.open_sst_lazy(garbage)
+    # A closed book: every call raises, the SST reads included.
+    path = tmp_path / "sst_lazy_closed.xlsx"
+    _sst_workbook(path)
+    book = zlsx.open_sst_lazy(path)
+    book.close()
+    with pytest.raises(zlsx.ZlsxError):
+        book.shared_string_at(0)
+    with pytest.raises(zlsx.ZlsxError):
+        book.sheet(0).rows()
+
+
+def test_lazy_sst_probe_agrees_with_the_library_version():
+    """A dylib at or past 0.9.0 exports the pair; a probe that says
+    otherwise is a packaging error (the lazy-sheets precedent)."""
+    import zlsx._ffi as ffi
+
+    major, minor = (int(part) for part in ffi.lib.zlsx_version_string().decode("utf-8").split(".")[:2])
+    if (major, minor) >= (0, 9):
+        assert ffi._HAS_LAZY_SST, "libzlsx >= 0.9.0 must export zlsx_book_open_sst_lazy / zlsx_book_shared_string"
+    if ffi._HAS_LAZY_SST:
+        assert all(hasattr(ffi.lib, sym) for sym in ("zlsx_book_open_sst_lazy", "zlsx_book_shared_string"))
+
+
+def test_threads_may_share_one_sst_lazy_book(tmp_path):
+    """Eight threads on ONE SST-lazy book, each iterating its own sheet
+    (every row a first touch of a distinct shared string) while reading
+    entries and rich runs through the book, then the same race with a
+    close in it — the shapes that crash without the lock a `Rows` takes
+    per row on such a book (a first touch mutates the handle's
+    resolution cache, and ctypes releases the GIL around every foreign
+    call). A regression is a crash of the test process, not an
+    assertion."""
+    _require_lazy_sst()
+    import threading
+
+    path = tmp_path / "sst_lazy_threads.xlsx"
+    _sst_workbook(path, sheets=8, rows=200)
+    n_sst = None
+    for _ in range(20):
+        book = zlsx.open_sst_lazy(path)
+        if n_sst is None:
+            n_sst = book.shared_strings_count()
+        seen = [None] * 8
+        errors = []
+
+        def worker(i):
+            try:
+                n = 0
+                for row in book.sheet(i).rows():
+                    if n < 200:
+                        assert row[0] == f"s{i}r{n}" and row[1] == "shared"
+                    n += 1
+                seen[i] = n
+                for k in range(i, n_sst, 8):
+                    book.shared_string_at(k)
+                    book.rich_text(k)
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors and seen == [201] * 8
+        book.close()
+
+    # The close in the race: the iterators keep reading after it (the C
+    # refcount), every call on the book after it raises, and nothing
+    # crashes.
+    for _ in range(20):
+        book = zlsx.open_sst_lazy(path)
+        errors = []
+        counts = [0] * 8
+
+        def racer(i):
+            try:
+                rows = book.sheet(i).rows()
+                for _row in rows:
+                    counts[i] += 1
+                    try:
+                        book.shared_string_at(counts[i] % n_sst)
+                    except zlsx.ZlsxError:
+                        pass  # closed under us — the contract
+            except zlsx.ZlsxError:
+                pass  # `rows()` itself lost the race to the close
+            except Exception as exc:  # pragma: no cover — surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=racer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        book.close()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert all(c in (0, 201) for c in counts)
