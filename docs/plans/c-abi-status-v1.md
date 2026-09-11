@@ -2976,11 +2976,36 @@ pinned); a closed book raises on every call, the SST reads included.
 Older dylibs raise `RuntimeError` on `open_sst_lazy`; a ≥ 0.9 dylib
 without the pair fails the probe test, not skips.
 
+**Round 3 (in-house, A and B both ship-ready; ledger
+`codex_findings_s3e2_r3.md`)**: B-MEM-301 MEDIUM — `materialiseSstEntry`
+reserved in `sst_arena` BEFORE the entity was judged, and the verdict
+is not cached, so every failing touch of a plain entry leaked its
+length into the arena (measured: 20 000 `shared_string_at` calls on a
+64 KiB bad entry, +1.25 GiB RSS — on the handle whose point is memory
+pressure) → the decode runs on the Book's general allocator and only
+a successful result is copied into the arena; pinned (200 failing
+touches, `queryCapacity` unchanged, the map empty); the "cheap; stated"
+clause below retracted. A-REC-301 / B-DOC-302 MEDIUM — the two lazy
+walkers advanced ONE BYTE past unrecognised markup where the eager
+walker skips to the tag's `>`, so a `<t>` inside an XML comment, a
+CDATA section or a processing instruction read on the SST-lazy handle
+alone (`two` vs `xtwo`; a comment carrying `<r><t>` added a rich run)
+— a divergence on WELL-FORMED input, lifted: both lazy `else` branches
+follow the eager rule now, pinned on four shapes for the text and the
+runs (neither walker is comment-aware; both read the same). B-DOC-303
+LOW — a workbook without `xl/sharedStrings.xml` (inline strings only)
+reads the default `.eager` backend on every opener, count 0; the
+`.lazy` pin is a statement about a workbook that has the part, and
+Python's `sst_lazy` stays `True` there (its rows lock for nothing —
+harmless, stated). A-DOC-302 LOW — a fourth stale iter-sst comment
+(`Book.sst`'s) corrected.
+
 **Recorded, not lifted.** The torn-entry divergence above (the eager
-walker's unbounded `</t>` search) — an owner follow-up on
+walker's unbounded closer searches) — an owner follow-up on
 `parseSharedStrings`; the deferred entity verdict is per entry and not
 cached, so a caller sweeping the table re-runs the failing decode on
-every touch of that entry (cheap; stated).
+every touch of that entry — a decode on the general allocator freed on
+exit since round 3, so a re-run costs time, not memory.
 
 **Tests** (`src/c_abi.zig`, "S3e lazy SST: …" — two; `src/xlsx.zig`,
 "S3e slice 2: …" — two; `tests/c_abi_smoke.c` `#error`s without the
