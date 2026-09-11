@@ -5758,7 +5758,9 @@ export fn zlsx_open_buffer(
 /// the prepared candidate, rename, swap in memory between the rename
 /// and the directory fsync. Any failure before the rename leaves BOTH
 /// the destination's prior bytes (or its absence) and the editor's
-/// memory untouched; a directory fsync that fails afterwards is the
+/// memory untouched (the candidate arm's promise; the arm with nothing
+/// to recalculate is a plain save, whose failure leaves the plans
+/// applied in memory); a directory fsync that fails afterwards is the
 /// report's durability warning — the §5.7.9 slot goes live here —
 /// never an error. A -2 refusal carries the refusing cells in the
 /// diag's census (M9a2's seam through `recalc_run.prepare`);
@@ -5767,13 +5769,24 @@ export fn zlsx_open_buffer(
 /// generation since it went live (`zlsx_editor_mark_recalc_on_load`'s
 /// rule) and the run would build a candidate; the destination is left
 /// as it was. A workbook with nothing to recalculate writes the live
-/// store's parts, installs carried — not refused. A staged cell write
-/// on any sheet is -1 `SheetHasUnsavedMutations` before anything runs:
-/// neither arm of this transaction writes it (save first, or
-/// `zlsx_editor_recalculate` then `zlsx_editor_save`); the staged
-/// defined names an embedding write leaves (its recovery carrier) are
-/// the same kind of state, and over that write's install the verdict is
-/// `RecalcRequiresReopen`.
+/// store's parts, installs carried — not refused. The file is the plain
+/// save plus the recalc (the save-plan fold, 2026-09-11): a staged cell
+/// write on any sheet (`zlsx_editor_set_cell`) and the staged defined
+/// names an embedding write leaves (its recovery carrier) go into the
+/// candidate and are drained from the editor at the swap — a failure
+/// before the rename leaves them staged; the arm with nothing to
+/// recalculate applies them to the live store as `zlsx_editor_save`
+/// does. What either arm materialized is a save's install: the next
+/// transaction on this editor that would build a candidate is -2
+/// `RecalcRequiresReopen` — save and re-open, as after
+/// `zlsx_editor_save` (a workbook with nothing to recalculate keeps
+/// its plain-save arm); a transaction after one that carried nothing
+/// is legal and re-derives the earlier run's patches from the archive
+/// as opened (the recorded revert, contract §22 — one transaction per
+/// open, or save and re-open between two). A pivot cache a staged
+/// write lands in takes the refresh marker alone. Appended rows stay refused
+/// (`SheetHasUnsavedAppends`): the run cannot read them. Over an
+/// embedding write's install the verdict is `RecalcRequiresReopen`.
 export fn zlsx_editor_save_with_recalc(
     ed: ?*Editor,
     out_path_ptr: ?[*]const u8,
@@ -9661,7 +9674,6 @@ test "S3a: the structural vocabulary maps to -2 and nothing else does" {
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.MalformedXml));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WriteFailed));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetHasUnsavedMutations));
-    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.WorkbookHasStagedDefinedNames));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.RowEditRequiresCleanSheet));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.SheetIndexOutOfRange));
     try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.InvalidSheetName));
@@ -12975,31 +12987,48 @@ test "recalc-transaction guard: after add_sheet, insert_row, rename_sheet, set_e
         try std.testing.expectEqual(@as(u32, 3), wb.sheetCount());
     }
 
-    // A staged cell write: save_with_recalc's own file would lack it on
-    // either arm, so it is -1 SheetHasUnsavedMutations before anything
-    // runs (in-house r1 B-REL-101); recalculate then save carries it.
+    // A staged cell write: save_with_recalc's file is the plain save
+    // plus the recalc on either arm (the save-plan fold, 2026-09-11) —
+    // the write in the file, drained from the editor, the plain save
+    // after it carrying the same.
+    const fold_out = try tt.path(alloc, io, "rtg_fold_out.xlsx");
+    defer alloc.free(fold_out);
     for ([_][:0]const u8{ formula_src, path }) |src| {
         const ed = zlsx_editor_open(src.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
         defer zlsx_editor_close(ed);
         const x = s3cStringCell("x");
         try std.testing.expectEqual(@as(i32, 0), zlsx_editor_set_cell(ed, 0, 1, 0, &x, &err_buf, err_buf.len));
+        // The read that refuses over a staged write observes the drain.
+        var rows_ptr: ?[*]u8 = null;
+        var rows_len: usize = 0;
+        try std.testing.expectEqual(ZLSX_ERROR, s3cRows(ed, 0, "A1:A1", "A", 0, &rows_ptr, &rows_len, null, &err_buf));
+        try std.testing.expectEqualStrings("SheetHasUnsavedMutations", std.mem.sliceTo(&err_buf, 0));
         var crun = zeroRun();
         var report = std.mem.zeroes(CRecalcReport);
         report.struct_size = @sizeOf(CRecalcReport);
         var diag = freshDiag();
-        try std.testing.expectEqual(ZLSX_ERROR, zlsx_editor_save_with_recalc(ed, refused_out.ptr, refused_out.len, &crun, &report, &diag, &err_buf, err_buf.len));
-        try std.testing.expectEqualStrings("SheetHasUnsavedMutations", std.mem.sliceTo(&err_buf, 0));
-        try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
-        zlsx_diag_release(&diag);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, refused_out, .{}));
-        diag = freshDiag();
-        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_recalculate(ed, &crun, &report, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqual(ZLSX_OK, zlsx_editor_save_with_recalc(ed, fold_out.ptr, fold_out.len, &crun, &report, &diag, &err_buf, err_buf.len));
         zlsx_recalc_report_release(&report);
         zlsx_diag_release(&diag);
+        try std.testing.expectEqual(ZLSX_OK, s3cRows(ed, 0, "A1:A1", "A", 0, &rows_ptr, &rows_len, null, &err_buf));
+        try std.testing.expect(std.mem.indexOf(u8, rows_ptr.?[0..rows_len], "\"text\":\"x\"") != null);
+        zlsx_buffer_release(rows_ptr, rows_len);
+        // What it materialized is a save's install: the next
+        // transaction on this editor hears the guard.
+        diag = freshDiag();
+        try std.testing.expectEqual(ZLSX_REFUSED, zlsx_editor_mark_recalc_on_load(ed, &diag, &err_buf, err_buf.len));
+        try std.testing.expectEqualStrings("RecalcRequiresReopen", diagName(&diag));
+        zlsx_diag_release(&diag);
         try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
-        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
-        defer wb.deinit();
-        const sheet = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
-        try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, ">x<") != null);
+        for ([_][:0]const u8{ fold_out, out }) |saved| {
+            var wb = try zlsx_pkg.Workbook.open(alloc, io, saved);
+            defer wb.deinit();
+            const sheet = (try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, sheet.bytes, ">x<") != null);
+            if (src.ptr == formula_src.ptr) {
+                const second = (try wb.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult;
+                try std.testing.expect(std.mem.indexOf(u8, second.bytes, "<f>1+1</f><v>2</v>") != null);
+            }
+        }
     }
 }

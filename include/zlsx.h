@@ -1777,7 +1777,9 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * candidate, rename, swap in memory between the rename and the
  * directory fsync. Any failure before the rename leaves BOTH the
  * destination's prior bytes (or its absence) and the editor's memory
- * untouched. A directory fsync failing after the rename is
+ * untouched (the candidate arm's promise; the arm with nothing to
+ * recalculate is a plain save, whose failure leaves the plans applied
+ * in memory). A directory fsync failing after the rename is
  * report->durability_warning (+ durability_errno) on a ZLSX_OK return
  * — the §5.7.9 slot goes live here — never an error. A -2 refusal
  * carries the refusing cells in diag->census; RecalcRequiresReopen
@@ -1785,13 +1787,24 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * — a mutator installed into the live generation since it went live
  * (zlsx_editor_mark_recalc_on_load's rule) and the run would build a
  * candidate; a workbook with nothing to recalculate writes the live
- * store's parts, installs carried, not refused. A staged cell write on
- * any sheet is -1 SheetHasUnsavedMutations before anything runs:
- * neither arm of this transaction writes it — save first, or
- * zlsx_editor_recalculate then zlsx_editor_save. The staged defined
- * names an embedding write leaves (its recovery carrier) are the same
- * kind of state; over that write's install the verdict is
- * RecalcRequiresReopen. */
+ * store's parts, installs carried, not refused. The file is the plain
+ * save plus the recalc (the save-plan fold, 2026-09-11): a staged cell
+ * write on any sheet (zlsx_editor_set_cell) and the staged defined
+ * names an embedding write leaves (its recovery carrier) go into the
+ * candidate and are drained from the editor at the swap — a failure
+ * before the rename leaves them staged; the arm with nothing to
+ * recalculate applies them to the live store as zlsx_editor_save
+ * does. What either arm materialized is a save's install: the next
+ * transaction on this editor that would build a candidate is -2
+ * RecalcRequiresReopen — save and re-open, as after zlsx_editor_save
+ * (a workbook with nothing to recalculate keeps its plain-save arm);
+ * a transaction after one that carried nothing is legal and re-derives
+ * the earlier run's patches from the archive as opened (the recorded
+ * revert, contract §22 — one transaction per open, or save and re-open
+ * between two). A pivot cache a staged write lands in takes the
+ * refresh marker alone. Appended rows stay refused
+ * (SheetHasUnsavedAppends): the run cannot read them. Over an
+ * embedding write's install the verdict is RecalcRequiresReopen. */
 int32_t zlsx_editor_save_with_recalc(zlsx_editor_t * ed,
         const uint8_t * out_path_ptr, size_t out_path_len,
         const zlsx_run_v1 * run,

@@ -2567,15 +2567,96 @@ later — the `recovery_in_cells` write stages its record cell AND
 installs, the invisible write its names AND installs, and both say
 `RecalcRequiresReopen` (pinned: a delta plus an added sheet; appended
 rows plus an added sheet; either write over a no-formula workbook). `recalculate` + `save` and mark
-+ `save` stay legal over staged deltas. Folding the deltas into the
-candidate (applying the save plans over `next` before serialising, so
-the transaction's file IS the plain save plus the recalc) is the
-recorded follow-up.
++ `save` stay legal over staged deltas. Folding the plans into the
+candidate shipped on 2026-09-11 — the paragraph after this one; the two
+`-1` names those rounds gated with are history from that date.
+
+**The save-plan fold (2026-09-11)**: `saveWithRecalc`'s file is the plain
+save plus the recalc on both arms, and the two gates above are retired
+(`SheetHasUnsavedMutations` no longer fires from the transaction —
+`appendRows` and `embeddableRows` keep it; `WorkbookHasStagedDefinedNames`
+is gone from `Workbook.Error`, no surface ever crossed it). The candidate
+arm renders the plans over the candidate inside `recalc_txn.prepare`
+(`Workbook.foldSavePlansInto`, `Options.fold_save_plans` — the file
+transaction's alone; `recalculate`, `markRecalcOnLoad` and the exported
+`prepare` carry the run as before and leave the plans for the save after
+them): the staged defined names merged with the block the candidate's own
+`xl/workbook.xml` holds, ahead of the calc-state patch; the refresh marker
+on every pivot cache a staged write lands in; the shared strings extended
+from the candidate's own table (a fresh table, its relationship and its
+content type when the archive has none); every sheet with deltas re-emitted
+over the candidate's bytes, the run's patches already in them — a write over
+a formula cell replaces the recalculated cell as any other. The plans stay
+staged in the workbook until `Candidate.swap` drains them (frees only), so
+a failure anywhere before the rename leaves them where they were, the
+destination absent, the generation unmoved (pinned under
+`checkAllAllocationFailures` over the fold and over the whole transaction).
+The arm with nothing to recalculate is the plain save of the live store,
+`applySavePlans` included — memory as after `save`, its materialization a
+save's install. So is the candidate arm's: the fold's installs are counted
+and kept above the baseline `Candidate.swap` records, so the next
+transaction on that workbook that would build a candidate refuses
+`RecalcRequiresReopen` (over a workbook with nothing to recalculate the
+mark refuses, `recalculate` is a no-op and `save_with_recalc` the plain
+save again, as the guard has always judged that arm) — the next
+candidate, the archive as opened again, could not carry what the fold
+materialized, and a shared string the fold added to the table would
+dangle from the live sheet bytes a later run re-stages (in-house fold r1
+A-REL-101, HIGH: an invalid file behind a successful rename, not the
+value revert below); a transaction that carried nothing leaves the next
+one legal (pinned both ways). A staged `.formula` delta is the one delta
+the run publishes into: the file carries the formula cache-free, as
+`recalculate` then `save` writes it, while the report counted the value
+(r1 A-SEM-105, recorded). The file is byte-identical to `recalculate`
+then `save` (pinned on both arms); the one difference in what is rendered
+is the pivot
+phase: the save also rebuilds an affected cache where it can (S7b-5),
+reading the live sheet views, and the fold's candidate holds recalculated
+bytes those views do not describe, so it takes S7b-3's marker alone — the
+state every shape the rebuild cannot lay out already takes, Excel laying
+the cache out at open either way — a definition already marked
+byte-preserved, as the save preserves it. A mark-only candidate (`keep_stale_and_mark`)
+carries the plans too: §5.7.7's byte identity is against an un-recalculated
+*save*. Appended rows stay refused (`SheetHasUnsavedAppends`,
+`logicalViewGate`): the model cannot read them. On C nothing changes but
+the outcome (no new export or macro — the `abi-no-3file` label again); on
+Python likewise; the CLI never reached either gate. Pinned:
+`pkg/recalc_run.zig` (both arms with a write and a name, byte-identical to
+the documented order, the plans drained, the live views agreeing with the
+file, a transaction after either arm the save's verdict and after a fold
+that carried nothing legal; a shared-string write over a workbook without a table
+on both arms; the mark-only candidate with a parsed view rebuilt over the
+folded part; a write inside a pivot source — the marker in the file, the
+records as they were, a shared string extending the table; the exported
+`prepare` and `recalculate` leaving the write staged across an abandoned
+candidate and a swap; every allocation failure inside the fold and before
+the rename; the run's verdicts ahead of the fold), `src/c_abi.zig` (a
+staged write through `zlsx_editor_save_with_recalc` on both fixtures, in
+the file and in the plain save after it), Python `test_basic.py` (the
+same, both arms).
 
 **Recorded, not done**: building the candidate over the live generation
 (inheriting overrides) would lift the ordering rule instead of policing
 it — the other half of B-REL-201's fix, an owner call on the
-transaction's generation model. `Workbook.empty()` installs its skeleton
+transaction's generation model. **Measured 2026-09-11 (pre-existing,
+unchanged by the fold)**: a transaction after a transaction in ONE open
+re-derives its candidate from the archive as opened, so a patch the first
+transaction installed and the second finds already fresh in the live bytes
+is not re-staged and reverts in the second's output — from Python against
+the `4639582` library, `save_with_recalc(a); save_with_recalc(b)` on a
+workbook whose one formula was stale wrote `<v>2</v>` into `a` and
+`<v>0</v>` into `b` (`sheets_patched` 1 then 0); `recalculate` then `save`
+after the two wrote `2` again. A transaction after one whose fold
+materialized anything is refused (above), so the fold does not widen the
+class; a transaction after one that carried nothing stays admitted (RTG-2)
+and re-derives the run's own patches from the archive — `recalculate`
+then `saveWithRecalc` in one open is that sequence too (the in-memory
+transaction carries nothing, so the file transaction is admitted, and the
+first run's patches the second finds fresh in the live bytes are not
+re-staged; pinned as a measurement, in-house fold r2 A-SEM-202) — the
+inheritance is the fix, and until it the safe order is one transaction per
+open, or save and re-open between two.
+`Workbook.empty()` installs its skeleton
 parts at birth against a baseline of zero, so a fresh-emit workbook
 refuses every transaction until saved and re-opened (pinned; before the
 guard the transaction went to `nextGeneration` over the `fresh()` store's

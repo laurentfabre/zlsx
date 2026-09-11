@@ -54,8 +54,31 @@
 //! `store.installs` has moved past the count the generation went live
 //! with (`Workbook.generation_installs`, set by `swap`); the staged
 //! deltas the model reads and the save re-emits are not installs, and a
-//! transaction after a transaction stays legal. The remedy is the order:
+//! transaction after a transaction that carried no plans stays legal —
+//! legal, and re-derived from the archive as opened: what the first
+//! run patched and the second finds fresh in the live bytes is not
+//! re-staged (the recorded revert, contract §22; one transaction per
+//! open, or save and re-open between two). The remedy is the order:
 //! run the transaction first, or save and re-open.
+//!
+//! What a candidate carries beyond the run (the save-plan fold)
+//! ------------------------------------------------------------
+//! The file transaction's candidate also carries the workbook's staged
+//! save plans — every sheet's cell deltas, the workbook.xml plan's
+//! defined names, the shared strings they extend, the refresh marker on
+//! a pivot cache a write lands in — rendered over the candidate's parts
+//! by `Workbook.foldSavePlansInto` (`Options.fold_save_plans`), so the
+//! file it commits is the plain save plus the recalc. The plans stay
+//! staged in the workbook until `swap` drains them: a transaction that
+//! fails before its rename leaves them where they were. The in-memory
+//! transactions do not fold — after them the plain `save` emits the
+//! plans over whichever generation is live. What the fold installs is a
+//! save's install, not the candidate's build: the swap keeps it above
+//! the baseline, so a transaction after one that carried plans refuses
+//! `RecalcRequiresReopen` — the next candidate, the archive as opened
+//! again, could not carry them, and a shared string the fold added
+//! would dangle from the live bytes the run re-stages. A transaction
+//! after one that folded nothing stays legal.
 //!
 //! Not here
 //! --------
@@ -142,6 +165,14 @@ pub const Options = struct {
     /// §5.7.8's echo. Carried verbatim into the report so a reader can
     /// see what the run was actually given.
     resolved: ?run_inputs.EffectiveRunInputs = null,
+    /// The save-plan fold (2026-09-11): render the workbook's staged
+    /// save plans — every sheet's cell deltas, the workbook.xml plan's
+    /// defined names, the shared strings and pivot markers they imply
+    /// — over the candidate (`Workbook.foldSavePlansInto`), and drain
+    /// them at the swap. The file transaction's, so its file is the
+    /// plain save plus the recalc; the in-memory transactions leave the
+    /// plans staged for the plain `save` that follows them.
+    fold_save_plans: bool = false,
 };
 
 /// One entry of §5.7.7's census: a construct the evaluator could not
@@ -365,6 +396,14 @@ pub const Candidate = struct {
     /// which is worth being able to state.
     retired_bytes: u64,
     report: Report,
+    /// The candidate carries the workbook's staged save plans
+    /// (`Options.fold_save_plans`): the swap drains them, they being in
+    /// the parts it installs.
+    drain_save_plans: bool = false,
+    /// How many of the candidate's installs the fold made: a save's
+    /// installs, kept out of the baseline the swap records so the next
+    /// transaction hears the guard over them.
+    fold_installs: u64 = 0,
     swapped: bool = false,
 
     /// Give up on the candidate. The workbook is exactly as it was.
@@ -443,7 +482,14 @@ pub const Candidate = struct {
         // the calc state, the chain's removal), not a mutator's — so a
         // transaction after a transaction stays legal and the first
         // install a mutator makes afterwards is the one the guard sees.
-        wb.generation_installs = wb.store.installs;
+        // The fold's installs are a save's, not the build's: left above
+        // the baseline, so a transaction after one that carried plans
+        // refuses as one after `save` does.
+        assert(wb.store.installs >= self.fold_installs);
+        wb.generation_installs = wb.store.installs - self.fold_installs;
+        // The deltas and the defined-name plan the fold rendered into
+        // this generation's parts are staged no longer. Frees only.
+        if (self.drain_save_plans) wb.drainSavePlans();
 
         self.gpa.free(self.sheet_views);
         self.swapped = true;
@@ -562,6 +608,31 @@ pub fn prepare(
         calc_chain_removed = try removeCalcChain(gpa, &next);
     }
 
+    // The save-plan fold, on both arms — mark-only included: §5.7.7's
+    // byte-identity claim is against an un-recalculated SAVE, which
+    // carries the plans. Before the calc state below, so the plan it
+    // reads is the candidate's final `xl/workbook.xml` (the names
+    // spliced in); after the staged parts, so a sheet's deltas land
+    // over the run's own patches as a save's land over a recalculated
+    // generation.
+    // The fold's installs are a save's — materialized staged state the
+    // archive as opened does not hold, which the NEXT candidate's
+    // `nextGeneration` would drop (a shared string it added would then
+    // dangle from the live sheet bytes a later run re-stages). Counted
+    // here and kept out of the baseline the swap records, so a
+    // transaction after one that carried plans hears the guard, as one
+    // after `save` does (in-house fold r1 A-REL-101).
+    var fold_installs: u64 = 0;
+    if (opts.fold_save_plans) {
+        // The fold is a stretch of its own (a sheet re-emitted whole):
+        // polled before it as the staged parts were before theirs
+        // (in-house fold r1 B-REL-105).
+        if (cancelled(opts)) return Error.Cancelled;
+        const before = next.installs;
+        try wb.foldSavePlansInto(&next);
+        fold_installs = next.installs - before;
+    }
+
     if (cancelled(opts)) return Error.Cancelled;
 
     // §5.7.6. Read the calc state from the candidate's own
@@ -591,7 +662,7 @@ pub fn prepare(
     if (plan.edits().len > 0) try next.replacePart(workbook_part, plan.bytes);
 
     // Every view the post-swap workbook will read, parsed now.
-    var built = try buildViews(gpa, wb, &next, staged, mark_only);
+    var built = try buildViews(gpa, wb, &next, staged, mark_only, opts.fold_save_plans);
     defer if (!keep) built.deinit(gpa);
 
     var report: Report = .{
@@ -618,6 +689,8 @@ pub fn prepare(
         .retired_slots = built.retired_slots,
         .retired_bytes = retired_bytes,
         .report = report,
+        .drain_save_plans = opts.fold_save_plans,
+        .fold_installs = fold_installs,
     } };
 }
 
@@ -692,6 +765,7 @@ fn buildViews(
     next: *PartStore,
     staged: []const StagedPart,
     mark_only: bool,
+    folded: bool,
 ) Error!BuiltViews {
     const wb_part = (try next.part(workbook_part)) orelse return Error.MissingWorkbookPart;
     var workbook_view = try workbook_xml_mod.parse(gpa, wb_part.bytes);
@@ -708,17 +782,19 @@ fn buildViews(
         }
     };
 
-    if (!mark_only) {
-        for (wb.worksheets, 0..) |*ws, i| {
-            // A sheet nobody has parsed stays unparsed. Its next reader
-            // will build a view over the new bytes, which is the same
-            // answer for less work.
-            if (ws.parsed == null) continue;
-            const name = try ws.resolvePartName();
-            if (!isStaged(staged, name)) continue;
-            const p = (try next.part(name)) orelse return Error.MissingSheetPart;
-            sheet_views[i] = try sheet_xml_mod.parse(gpa, p.bytes);
-        }
+    for (wb.worksheets, 0..) |*ws, i| {
+        // A sheet nobody has parsed stays unparsed. Its next reader
+        // will build a view over the new bytes, which is the same
+        // answer for less work.
+        if (ws.parsed == null) continue;
+        // A part changed by the run's own patch (none on a mark-only
+        // candidate) or by the fold's re-emit of its deltas.
+        const name = try ws.resolvePartName();
+        const patched = !mark_only and isStaged(staged, name);
+        const folded_here = folded and ws.deltas.count() > 0;
+        if (!patched and !folded_here) continue;
+        const p = (try next.part(name)) orelse return Error.MissingSheetPart;
+        sheet_views[i] = try sheet_xml_mod.parse(gpa, p.bytes);
     }
 
     const retired_slots = try gpa.alloc(?sheet_xml_mod.SheetXml, n);

@@ -4999,9 +4999,9 @@ class Editor:
         carry those parts (the recalc-transaction guard; before it the
         wrong order dropped them silently or aborted the process). Mark
         first, or save and re-open. Staged cell writes are not installs:
-        ``set_cell`` then this then :meth:`save` lands both
-        (:meth:`save_with_recalc` alone never writes a staged cell — it
-        refuses ``SheetHasUnsavedMutations``)."""
+        ``set_cell`` then this then :meth:`save` lands both, and
+        :meth:`save_with_recalc` carries a staged cell itself (the
+        save-plan fold)."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_MARK_RECALC:
@@ -5081,7 +5081,9 @@ class Editor:
         """§5.7.9's atomic file transaction: recalculate, write, rename,
         then swap in memory. Any pre-commit failure — refusal, timeout,
         Ctrl-C, I/O error — leaves the destination's prior bytes (or its
-        absence) AND this editor's memory untouched. A cancellation that
+        absence) AND this editor's memory untouched (the candidate arm's
+        promise; the arm with nothing to recalculate is a plain save,
+        whose failure leaves the plans applied in memory). A cancellation that
         lands post-commit returns normally with
         ``report.cancelled_late=True``. A directory fsync failing after
         the rename is ``report.durability_warning``, never an error.
@@ -5090,13 +5092,25 @@ class Editor:
         generation since it went live (:meth:`mark_recalc_on_load`'s
         rule) and the run would build a candidate; a workbook with
         nothing to recalculate writes the live store's parts, installs
-        carried — not refused. A staged :meth:`set_cell` on any sheet
-        raises :class:`ZlsxError` ``SheetHasUnsavedMutations`` before
-        anything runs: neither arm of this transaction writes it —
-        :meth:`save` first, or :meth:`recalculate` then :meth:`save`.
-        The staged defined names :meth:`set_embeddings` leaves (its
-        recovery carrier) are the same kind of state; over that write's
-        install the verdict is ``RecalcRequiresReopen``."""
+        carried — not refused. The file is the plain save plus the
+        recalc (the save-plan fold): a staged :meth:`set_cell` on any
+        sheet, and the staged defined names :meth:`set_embeddings`
+        leaves (its recovery carrier), go into the candidate and are
+        drained from the editor at the swap — a failure before the
+        rename leaves them staged; the arm with nothing to recalculate
+        applies them to the live store as :meth:`save` does. What
+        either arm materialized is a save's install: the next transaction
+        on this editor that would build a candidate raises
+        :class:`ZlsxRefusal` ``RecalcRequiresReopen`` — save and re-open,
+        as after :meth:`save` (a workbook with nothing to recalculate
+        keeps its plain-save arm); a transaction after one that carried
+        nothing is legal and re-derives the earlier run's patches from
+        the archive as opened (the recorded revert — one transaction per
+        open, or save and re-open between two). A pivot cache a staged
+        write lands in takes the refresh marker alone. Appended rows (:meth:`append_rows`) stay refused
+        (``SheetHasUnsavedAppends``): the run cannot read them. Over an
+        embedding write's install the verdict is
+        ``RecalcRequiresReopen``."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SAVE_WITH_RECALC:

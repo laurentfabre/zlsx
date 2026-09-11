@@ -163,14 +163,7 @@ pub const Error = error{
     /// re-open the workbook. (The recalc-transaction guard; S3c slice 1
     /// r2 B-REL-201.)
     RecalcRequiresReopen,
-    /// `saveWithRecalc` was asked for while the workbook.xml plan holds
-    /// a staged defined name (`addDefinedName`; the recovery names an
-    /// embedding write stages): the file transaction serialises its
-    /// candidate, never the save plans, so the name would be absent from
-    /// the file it commits while memory kept it. Save first, or
-    /// `recalculate` then `save`. The sibling of `SheetHasUnsavedMutations`
-    /// for the workbook-scoped axis (in-house RTG r2 A/B-REL-201).
-    WorkbookHasStagedDefinedNames,
+
     /// Style validation failed — empty font name, non-positive font
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
@@ -1535,20 +1528,43 @@ pub const Workbook = struct {
     /// (`pkg/recalc_run.zig`). What a caller needs from here: any failure
     /// before the rename leaves BOTH the destination's prior bytes and
     /// this workbook's memory untouched (or the destination still absent
-    /// if it never existed); a successful rename leaves memory and file
+    /// if it never existed) — the candidate arm's promise; the arm with
+    /// nothing to recalculate is a plain save, whose failure leaves the
+    /// plans applied in memory; a successful rename leaves memory and file
     /// consistent; and a directory fsync that fails afterwards is a
     /// `durability_warning` on the returned report, never an error.
     /// `RecalcRequiresReopen` is one of the failures before the rename:
     /// a mutator installed into the live generation since it went live,
     /// and the candidate — the archive as opened plus the run's own
-    /// patches — could not carry it (`requireGenerationUnmodified`). So
-    /// is `SheetHasUnsavedMutations`: a staged `setCell` on any sheet,
-    /// which neither arm of this transaction writes — save first, or
-    /// `recalculate` then `save` (in-house RTG r1 B-REL-101); and
-    /// `WorkbookHasStagedDefinedNames` for a staged defined name, the
-    /// workbook.xml plan being the other save-plan axis neither arm
-    /// splices (r2 A/B-REL-201). Staged state over an installed-into
-    /// generation hears `RecalcRequiresReopen`.
+    /// patches — could not carry it (`requireGenerationUnmodified`).
+    ///
+    /// The file is the plain save plus the recalc (the save-plan fold,
+    /// 2026-09-11): every staged `setCell` and every staged defined
+    /// name (`addDefinedName`; the recovery names an embedding write
+    /// stages), the shared strings they extend and the refresh marker
+    /// on a pivot cache a write lands in are rendered into the
+    /// candidate (`foldSavePlansInto`) and drained from this workbook at
+    /// the swap — so a failure before the rename leaves them staged as
+    /// they were, and after the rename memory and file agree on them
+    /// too. The arm with nothing to recalculate is the plain save of
+    /// the live store, `applySavePlans` included — memory as after
+    /// `save`. What either arm materialized is a save's install: the
+    /// next transaction on this workbook that would build a candidate
+    /// refuses `RecalcRequiresReopen` (its candidate, the archive as
+    /// opened again, could not carry it) — save and re-open, as after
+    /// `save`; a workbook with nothing to recalculate keeps its `.none`
+    /// arm. A transaction after one that carried nothing is legal, and
+    /// re-derived from the archive as opened: a patch the earlier run
+    /// installed that this run finds fresh in the live bytes is not
+    /// re-staged (the recorded revert, contract §22; one transaction
+    /// per open, or save and re-open between two).
+    /// A pivot cache a staged write lands in takes the refresh marker
+    /// alone, where the plain save also rebuilds it where it can. A
+    /// staged `.formula` delta is
+    /// the one the run publishes into: the file carries its formula
+    /// cache-free, as `recalculate` then `save` writes it, while the
+    /// report counted the value. Appended rows stay refused
+    /// (`SheetHasUnsavedAppends`): the model cannot read them.
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -4579,8 +4595,13 @@ pub const Workbook = struct {
     /// Everything `save` does before bytes leave the process: apply the
     /// workbook.xml plan, extend the SST, emit per-sheet XML for staged
     /// deltas / appended rows into `store.replacePart`, and invalidate
-    /// the typed views those bytes made stale.
-    fn applySavePlans(self: *Workbook) Error!void {
+    /// the typed views those bytes made stale. Public for one caller
+    /// besides the saves: `saveWithRecalc`'s arm with nothing to
+    /// recalculate, which is the plain save over the live store, memory
+    /// included (the save-plan fold, 2026-09-11); the arm that builds a
+    /// candidate renders the same plans over it with
+    /// `foldSavePlansInto` instead.
+    pub fn applySavePlans(self: *Workbook) Error!void {
         // A torn model must not ship (Codex #208 r2 REL-201).
         try self.requireCompleteStructuralState();
         // Phase 0 (B3 iter-wr-3): apply the workbook.xml fresh-emit
@@ -4610,11 +4631,11 @@ pub const Workbook = struct {
         // map covering new strings across all sheets. If any are
         // present, regenerate `xl/sharedStrings.xml` BEFORE per-sheet
         // emit (per-sheet emit needs the assigned indices).
-        var sst_plan = try buildSstExtensionPlan(self);
+        var sst_plan = try buildSstExtensionPlan(self, try self.sst());
         defer sst_plan.deinit(self.allocator);
 
         if (sst_plan.has_new_strings) {
-            try applySstExtensionPlan(self, &sst_plan);
+            try applySstExtensionPlan(self, &self.store, &sst_plan);
         }
 
         for (self.worksheets) |*ws| {
@@ -4673,6 +4694,166 @@ pub const Workbook = struct {
                 self.sst_view = null;
             }
         }
+    }
+
+    /// The save-plan fold (2026-09-11): the plain save's plans rendered
+    /// over `next` — a recalc transaction's candidate — instead of the
+    /// live store, so `saveWithRecalc`'s file is the plain save plus
+    /// the recalc. Reads this workbook's staged state (every sheet's
+    /// deltas, the workbook.xml plan) and `next`'s own parts; writes
+    /// `next` only. Nothing of this workbook changes: the deltas and
+    /// the plan stay staged until `Candidate.swap` drains them
+    /// (`drainSavePlans`), so a transaction that fails before its
+    /// rename leaves them exactly where they were — and its views over
+    /// the live bytes stay valid, the candidate's views being the
+    /// swap's to install.
+    ///
+    /// The phases are `applySavePlans`', in its order, each over
+    /// `next`'s part where the save reads the live one: the names
+    /// merged with the block the candidate's `xl/workbook.xml` holds,
+    /// the shared strings extended from the candidate's table, every
+    /// sheet with deltas re-emitted from the candidate's bytes (the
+    /// run's own patches already in them, so a write over a formula
+    /// cell replaces the recalculated cell as it replaces any other).
+    /// One phase differs: a staged write inside a pivot source takes
+    /// S7b-3's refresh marker alone, where the save also rebuilds the
+    /// cache (S7b-5) — that rebuild reads the live sheet views, which
+    /// here still describe the pre-recalc bytes, and a cache laid out
+    /// from those would be wrong where the marker merely defers. The
+    /// marker is the state every shape the rebuild cannot lay out
+    /// already takes; Excel lays the cache out at open either way.
+    /// Appended rows never reach here — the run's logical-view gate
+    /// refuses them before a candidate exists.
+    pub fn foldSavePlansInto(self: *Workbook, next: *PartStore) Error!void {
+        try self.requireCompleteStructuralState();
+        for (self.worksheets) |*ws| assert(ws.appended_rows.items.len == 0);
+        const a = self.allocator;
+
+        // Phase 0: the workbook.xml plan, merged with the names the
+        // candidate's own part holds (its block, not the live view's —
+        // one rule for what "existing" means on this path).
+        if (self.workbook_xml_plan.defined_names.items.len > 0) {
+            const wb_part = (try next.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+            var existing = try workbook_xml_mod.parse(a, wb_part.bytes);
+            defer existing.deinit(a);
+            try self.renderDefinedNamesPlanInto(next, existing.defined_names);
+        }
+
+        // Phases 0b, 1 and 2 are the writes': nothing to mark or render,
+        // no part to parse, when no sheet holds one (in-house fold r3
+        // A-PERF-302, r4 B-PERF-401).
+        var any_writes = false;
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0) {
+                any_writes = true;
+                break;
+            }
+        }
+        if (!any_writes) return;
+
+        // Phase 0b: the refresh marker on every cache a staged write
+        // lands in — the graph walked over the candidate's workbook.xml
+        // as just spliced, as the save walks it over the re-parsed live
+        // one: a source named by a staged name resolves (in-house fold
+        // r2 A-PAR-203).
+        {
+            const wb_part = (try next.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+            var spliced = try workbook_xml_mod.parse(a, wb_part.bytes);
+            defer spliced.deinit(a);
+            try self.markPivotCachesForCellWritesInto(next, &spliced);
+        }
+
+        // Phase 1: the SST extension, against the candidate's table.
+        var sst_view: ?sst_xml_mod.SstXml = null;
+        defer if (sst_view) |*v| v.deinit(a);
+        if (try next.part("xl/sharedStrings.xml")) |sst_part| {
+            sst_view = try sst_xml_mod.parse(a, sst_part.bytes);
+        }
+        var sst_plan = try buildSstExtensionPlan(self, if (sst_view) |*v| v else null);
+        defer sst_plan.deinit(a);
+        if (sst_plan.has_new_strings) {
+            try applySstExtensionPlan(self, next, &sst_plan);
+        }
+
+        // Phase 2: every sheet with deltas, over the candidate's bytes
+        // — a fresh view of them, since `ws.parsed` describes the live
+        // ones and stays theirs until the swap.
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() == 0) continue;
+            const part_name = try ws.resolvePartName();
+            const source = (try next.part(part_name)) orelse return error.MissingSheetPart;
+            var view = sheet_xml_mod.parse(a, source.bytes) catch |e| switch (e) {
+                error.MalformedXml, error.UnexpectedEof => return error.MalformedSheetXml,
+                else => |x| return x,
+            };
+            defer view.deinit(a);
+            const new_xml = try emitSheetWithDeltas(a, source.bytes, &view, &ws.deltas, &sst_plan);
+            defer a.free(new_xml);
+            try next.replacePart(part_name, new_xml);
+        }
+    }
+
+    /// The fold's pivot phase: S7b-3's marker, for every cache a staged
+    /// cell write lands in, rendered over `store`. The graph is read
+    /// from the live parts over `wb_view` — the candidate's workbook.xml
+    /// with the names spliced, as the save re-parses the live one before
+    /// its walk: a recalc transaction
+    /// never touches a pivot part, and the guard holds when this runs
+    /// (a marker a save or an earlier fold installed keeps the next
+    /// transaction out), so the candidate's definition is the live
+    /// one's bytes — a definition already marked is byte-preserved, as
+    /// the save preserves it. Read best-effort as at save: a graph that
+    /// cannot be read marks nothing, and only a resource failure is the
+    /// transaction's.
+    fn markPivotCachesForCellWritesInto(self: *Workbook, store: *PartStore, wb_view: *const workbook_xml_mod.WorkbookXml) Error!void {
+        var any_writes = false;
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() > 0) {
+                any_writes = true;
+                break;
+            }
+        }
+        if (!any_writes) return;
+        const carries = self.carriesPivotCache() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        if (!carries) return;
+        const a = self.allocator;
+        var p = pivots_mod.collect(a, &self.store, wb_view) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        defer p.deinit();
+        for (p.caches) |*c| {
+            var hit = false;
+            for (self.worksheets) |*ws| {
+                if (ws.deltas.count() == 0) continue;
+                if (try self.sheetWritesChangeCache(ws, c)) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) continue;
+            const marked = (pivots_mod.edit.markForRefresh(a, c) catch |e| return mapPivotEditError(e)) orelse continue;
+            defer a.free(marked);
+            try store.replacePart(c.part_name, marked);
+        }
+    }
+
+    /// The fold's other half, run by `Candidate.swap` once the
+    /// candidate that carried the plans is the live generation: the
+    /// deltas and the workbook.xml plan are in its parts now, so they
+    /// are staged no longer. Frees only — the swap cannot fail, and
+    /// this is one of its moves.
+    pub fn drainSavePlans(self: *Workbook) void {
+        for (self.worksheets) |*ws| {
+            if (ws.deltas.count() == 0) continue;
+            freeDeltaStrings(self.allocator, &ws.deltas);
+            ws.deltas.clearAndFree(self.allocator);
+        }
+        self.workbook_xml_plan.deinit(self.allocator);
+        self.workbook_xml_plan = .{};
     }
 
     /// B3 iter-wr-7: emit a fresh `.xlsx` archive from the workbook's
@@ -5712,7 +5893,7 @@ pub const Workbook = struct {
     /// B3 iter-wr-3: splice the workbook.xml fresh-emit plan's
     /// staged defined names into `xl/workbook.xml`. Validates every
     /// staged `local_sheet_id` against the current sheet count;
-    /// builds the parallel-arrays shape `spliceDefinedNamesBlock`
+    /// builds the parallel-arrays shape `spliceDefinedNamesBlockInto`
     /// expects; clears the plan after a successful splice (saves
     /// are idempotent — re-running shouldn't re-add the same
     /// names).
@@ -5723,6 +5904,36 @@ pub const Workbook = struct {
     /// drained on success, so subsequent rewrites observe the new
     /// names from the re-parsed view.
     fn applyWorkbookXmlPlanDefinedNames(self: *Workbook) Error!void {
+        const a = self.allocator;
+        try self.renderDefinedNamesPlanInto(&self.store, self.workbook.defined_names);
+
+        // Re-parse so subsequent reads of `self.workbook.defined_names`
+        // observe the freshly-spliced block. Mirrors the pattern in
+        // `rewriteAllDefinedNames`.
+        const part = (try self.store.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
+        var fresh = try workbook_xml_mod.parse(a, part.bytes);
+        errdefer fresh.deinit(a);
+        self.workbook.deinit(a);
+        self.workbook = fresh;
+
+        // Drain the plan so a subsequent save (or the C ABI's
+        // save-and-mutate-and-resave loop) doesn't redundantly
+        // re-splice the same names.
+        self.workbook_xml_plan.deinit(a);
+        self.workbook_xml_plan = .{};
+    }
+
+    /// The plan's staged names spliced over `store`'s `xl/workbook.xml`
+    /// — `existing`, the block that part holds, merged with the
+    /// additions. Reads this workbook's plan and sheet count; writes
+    /// `store` only, so it serves the plain save (over the live store,
+    /// `existing` its parsed view) and the save-plan fold (over a recalc
+    /// candidate, `existing` parsed from the candidate's own part).
+    fn renderDefinedNamesPlanInto(
+        self: *Workbook,
+        store: *PartStore,
+        existing: []const workbook_xml_mod.DefinedName,
+    ) Error!void {
         const a = self.allocator;
         const plan = &self.workbook_xml_plan;
         assert(plan.defined_names.items.len > 0);
@@ -5738,11 +5949,10 @@ pub const Workbook = struct {
             }
         }
 
-        // Merge any pre-existing defined names (parsed from the source
-        // workbook.xml) with the plan's staged additions. The splice
-        // helper rewrites the entire block, so dropping the existing
-        // entries would silently delete user-loaded names.
-        const existing = self.workbook.defined_names;
+        // Merge the pre-existing defined names with the plan's staged
+        // additions. The splice helper rewrites the entire block, so
+        // dropping the existing entries would silently delete
+        // user-loaded names.
         const total = existing.len + plan.defined_names.items.len;
 
         var owned_names: std.ArrayList([]u8) = .empty;
@@ -5782,34 +5992,22 @@ pub const Workbook = struct {
             try hiddens.append(a, dn.hidden);
         }
 
-        try self.spliceDefinedNamesBlock(
+        try self.spliceDefinedNamesBlockInto(
+            store,
             owned_names.items,
             owned_formulas.items,
             local_ids.items,
             hiddens.items,
         );
-
-        // Re-parse so subsequent reads of `self.workbook.defined_names`
-        // observe the freshly-spliced block. Mirrors the pattern in
-        // `rewriteAllDefinedNames`.
-        const part = (try self.store.part("xl/workbook.xml")) orelse return error.MissingWorkbookPart;
-        var fresh = try workbook_xml_mod.parse(a, part.bytes);
-        errdefer fresh.deinit(a);
-        self.workbook.deinit(a);
-        self.workbook = fresh;
-
-        // Drain the plan so a subsequent save (or the C ABI's
-        // save-and-mutate-and-resave loop) doesn't redundantly
-        // re-splice the same names.
-        plan.deinit(a);
-        plan.* = .{};
     }
 
-    /// Re-emit `xl/workbook.xml` with a fresh `<definedNames>` block
-    /// built from the parallel arrays (names / formulas / local_ids /
-    /// hiddens — same length, same index ↔ same defined name).
-    fn spliceDefinedNamesBlock(
+    /// Re-emit `store`'s `xl/workbook.xml` with a fresh `<definedNames>`
+    /// block built from the parallel arrays (names / formulas /
+    /// local_ids / hiddens — same length, same index ↔ same defined
+    /// name).
+    fn spliceDefinedNamesBlockInto(
         self: *Workbook,
+        store: *PartStore,
         names: []const []u8,
         formulas: []const []u8,
         local_ids: []const ?u32,
@@ -5820,7 +6018,7 @@ pub const Workbook = struct {
         assert(names.len == hiddens.len);
 
         const a = self.allocator;
-        const part = try self.store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
+        const part = try store.part("xl/workbook.xml") orelse return error.MissingWorkbookPart;
         const src = part.bytes;
         assert(src.len > 0);
 
@@ -5893,11 +6091,27 @@ pub const Workbook = struct {
                 try out.appendSlice(a, src[close_end..]);
             }
         } else {
-            // No `<definedNames>` block: insert before `<calcPr`, or
-            // before `</workbook>` if calcPr is absent. This places the
-            // block at OOXML's expected position in the schema sequence.
+            // No `<definedNames>` block: insert before `<calcPr>`, else
+            // where a `<calcPr>` would be created — the calc-state
+            // reader's own slot, before the first root child that
+            // follows `calcPr` in the schema (a nested `<extLst>` inside
+            // a book view is not one), else before `</workbook>`. One
+            // anchor for the two splices, so they commute in either
+            // order (in-house fold r2 B-REL-203, r3 A-REL-301); a part
+            // the reader refuses (a `fullPrecision="0"` calcPr, say —
+            // a workbook this layer opens and saves) keeps the
+            // `<calcPr` anchor it always had, then `</workbook>` (r4
+            // A-REL-401).
             const insert_at: usize = blk: {
-                if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i;
+                var parsed = try engine.calc.parseCalcState(a, src);
+                switch (parsed) {
+                    .ok => |*state| {
+                        defer state.deinit(a);
+                        if (state.spans.element.end > state.spans.element.start) break :blk state.spans.element.start;
+                        if (state.spans.insert_at) |i| break :blk i;
+                    },
+                    .refused => if (std.mem.indexOf(u8, src, "<calcPr")) |i| break :blk i,
+                }
                 if (std.mem.indexOf(u8, src, "</workbook>")) |i| break :blk i;
                 return error.MalformedXml;
             };
@@ -5906,7 +6120,7 @@ pub const Workbook = struct {
             try out.appendSlice(a, src[insert_at..]);
         }
 
-        try self.store.replacePart("xl/workbook.xml", out.items);
+        try store.replacePart("xl/workbook.xml", out.items);
     }
 
     /// Re-emit the sheet at `sheet_idx`'s XML with a fresh
@@ -7305,24 +7519,23 @@ pub const Workbook = struct {
     /// each shape measured before the guard; every mutation that
     /// installs is in the set — an image added, a doc-props strip
     /// included). Cell writes still staged
-    /// as deltas are NOT installs — the model reads them and `save`
-    /// re-emits them over whichever generation is live — so
-    /// `setCell` + `markRecalcOnLoad` + `save` stays legal, as does a
-    /// transaction after a transaction. (`saveWithRecalc`'s own file
-    /// carries no staged delta on either arm, so that transaction
-    /// refuses `SheetHasUnsavedMutations` over one — its own gate,
-    /// in-house r1 RTG-REL-101/102.) Judged in `recalc_txn.prepare`,
-    /// before anything is built — the one choke point every transaction
-    /// passes — once more in `recalc_run.prepare` after the
-    /// no-formula decision, so no graph is built for a swap that cannot
-    /// happen, and inside `saveWithRecalc`'s save-state gate and the
-    /// run's `logicalViewGate` (appended rows), so staged state over an
+    /// as deltas are NOT installs — the model reads them, `save`
+    /// re-emits them over whichever generation is live, and
+    /// `saveWithRecalc` renders them into its candidate (the save-plan
+    /// fold, `foldSavePlansInto`) — so `setCell` + any transaction
+    /// stays legal, as does a transaction after a transaction that
+    /// carried no plans (what a fold materialized is a save's install,
+    /// kept above the baseline the swap records). Judged
+    /// in `recalc_txn.prepare`, before anything is built — the one
+    /// choke point every transaction passes — once more in
+    /// `recalc_run.prepare` after the no-formula decision, so no graph
+    /// is built for a swap that cannot happen, and inside the run's
+    /// `logicalViewGate` (appended rows), so staged state over an
     /// installed-into generation hears this verdict's complete
-    /// remedy — while
-    /// a run with nothing to recalculate (the `.none` arm,
-    /// which builds no candidate) stays legal: `saveWithRecalc` there
-    /// writes the live store's parts, installs included (and, by its own
-    /// gate, no staged delta pending).
+    /// remedy — while a run with nothing to recalculate (the `.none`
+    /// arm, which builds no candidate) stays legal: `saveWithRecalc`
+    /// there is the plain save of the live store, installs and plans
+    /// included.
     ///
     /// A torn workbook is judged first: its remedy is to discard the
     /// instance, and `RecalcRequiresReopen`'s "save and re-open" would
@@ -11827,7 +12040,10 @@ fn registerExistingMatch(
     try plan.existing_matches.append(wb.allocator, .{ .text = owned, .index = found_idx });
 }
 
-fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
+/// `existing_view` is the shared-string table the plan extends — the
+/// live store's (`wb.sst()`) for a save, a recalc candidate's own for
+/// the save-plan fold — and null when that store has no table.
+fn buildSstExtensionPlan(wb: *Workbook, existing_view: ?*const sst_xml_mod.SstXml) Error!SstExtensionPlan {
     assert(@intFromPtr(wb) != 0);
     assert(@intFromPtr(wb.allocator.vtable) != 0);
 
@@ -11867,7 +12083,6 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
     // slice for de-dup. Rich entries occupy indices but aren't
     // candidates for de-dup; a new string equal to a rich entry's
     // concatenated runs would still allocate a fresh `<si><t>...`.
-    const existing_view = try wb.sst();
     if (existing_view) |view| {
         plan.sst_part_exists = true;
         plan.base_index = @intCast(view.entries.len);
@@ -11983,13 +12198,14 @@ fn buildSstExtensionPlan(wb: *Workbook) Error!SstExtensionPlan {
     return plan;
 }
 
-/// Persist the SST extension plan to the PartStore. When the source
+/// Persist the SST extension plan to `store` — the live one for a
+/// save, a recalc candidate for the save-plan fold. When the source
 /// workbook had an existing `xl/sharedStrings.xml`, regenerate the
 /// part's bytes (existing entries unchanged, new entries appended)
 /// and `replacePart`. When absent, emit a fresh SST + register it via
 /// `PartStore.addPart` + splice a `<Relationship>` into
 /// `xl/_rels/workbook.xml.rels`.
-fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!void {
+fn applySstExtensionPlan(wb: *Workbook, store: *PartStore, plan: *const SstExtensionPlan) Error!void {
     assert(plan.has_new_strings);
     // At least one of the two new-entry axes must be non-empty when
     // `has_new_strings` is true. Plain-only and rich-only and mixed
@@ -11999,7 +12215,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
     if (plan.sst_part_exists) {
         // Re-emit the SST part with the existing entries preserved
         // verbatim and the new entries (plain then rich) appended.
-        const existing_part = try wb.store.part("xl/sharedStrings.xml") orelse
+        const existing_part = try store.part("xl/sharedStrings.xml") orelse
             return Error.MissingWorkbookPart; // sst_part_exists invariant violated
         const new_xml = try emitSstXmlForExtension(
             wb.allocator,
@@ -12009,7 +12225,7 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
             plan.base_index,
         );
         defer wb.allocator.free(new_xml);
-        try wb.store.replacePart("xl/sharedStrings.xml", new_xml);
+        try store.replacePart("xl/sharedStrings.xml", new_xml);
         return;
     }
 
@@ -12023,18 +12239,18 @@ fn applySstExtensionPlan(wb: *Workbook, plan: *const SstExtensionPlan) Error!voi
     );
     defer wb.allocator.free(fresh_xml);
 
-    try wb.store.addPart(
+    try store.addPart(
         "xl/sharedStrings.xml",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
         fresh_xml,
     );
 
     // Splice a `<Relationship>` into `xl/_rels/workbook.xml.rels`.
-    const rels_part = try wb.store.part("xl/_rels/workbook.xml.rels") orelse
+    const rels_part = try store.part("xl/_rels/workbook.xml.rels") orelse
         return Error.MissingWorkbookRels;
     const new_rels = try injectSstRelationship(wb.allocator, rels_part.bytes);
     defer wb.allocator.free(new_rels);
-    try wb.store.replacePart("xl/_rels/workbook.xml.rels", new_rels);
+    try store.replacePart("xl/_rels/workbook.xml.rels", new_rels);
 }
 
 /// Produce a regenerated `xl/sharedStrings.xml` with the original
