@@ -1006,6 +1006,13 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Valid on `cells` and `rows --format jsonl`
         \\                    only; rejected on `rows --header` (no slot
         \\                    in the fields dict) and flat formats.
+        \\  --sst-lazy        (iter-sst-4) open with Book.openSstLazy: the
+        \\                    shared-string table indexed at open, each
+        \\                    entry decoded on first access (workbooks
+        \\                    with millions of unique strings). Accepted
+        \\                    on every sub-command; a no-op where no
+        \\                    reader Book is opened. Mutually exclusive
+        \\                    with --lazy.
         \\  --lazy            (S3e) open with Book.openLazy: extract only
         \\                    the sheets the sub-command visits (the
         \\                    selection above), before the first record.
@@ -1013,10 +1020,11 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    opener on the same selection; a sheet the
         \\                    selection does not visit is never read, so
         \\                    a tear there goes unreported. No gain on
-        \\                    meta (visits every sheet). Mutually
-        \\                    exclusive with --sst-lazy (the lazy shared-
-        \\                    string table; the reader has no opener
-        \\                    with both).
+        \\                    meta (visits every sheet). Accepted on
+        \\                    every sub-command; a no-op where no reader
+        \\                    Book is opened. Mutually exclusive with
+        \\                    --sst-lazy (the reader has no opener with
+        \\                    both).
         \\  --output MODE     (iter60b) wire-shape switch:
         \\                    ndjson           (default) invariant-envelope
         \\                                     NDJSON — every record carries
@@ -12058,9 +12066,14 @@ fn writeS3eLazyFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
     const writer = xlsx.writer_types;
     var w = writer.Writer.init(alloc);
     defer w.deinit();
+    // One registered style on a cell the grid selections reach, so
+    // `styles` streams a record and `--with-styles` decorates a cell
+    // on both openers (r2 TST-201: the styles table is an open-time
+    // part on the lazy book — pinned served, not empty-vs-empty).
+    const bold = try w.addStyle(.{ .font_bold = true });
     {
         var s = try w.addSheet("Alpha");
-        try s.writeRow(&.{ .{ .string = "hdr1" }, .{ .string = "hdr2" } });
+        try s.writeRowStyled(&.{ .{ .string = "hdr1" }, .{ .string = "hdr2" } }, &.{ bold, 0 });
         try s.writeRow(&.{ .{ .number = 1.0 }, .{ .number = 2.0 } });
         try s.writeRow(&.{ .{ .string = "x" }, .{ .number = 3.0 } });
         try s.addMergedCell("A1:B1");
@@ -12323,8 +12336,7 @@ test "S3e slice 3: every read sub-command writes the same bytes and exits the sa
     try s3e3Parity(io, &.{ "meta", p }, 3, true);
     try s3e3Parity(io, &.{ "meta", p, "--output", "pretty-json" }, 3, true);
     try s3e3Parity(io, &.{ "list-sheets", p }, 0, true);
-    // The writer emits no style beyond the defaults: an empty, successful stream on both.
-    try s3e3Parity(io, &.{ "styles", p }, 0, false);
+    try s3e3Parity(io, &.{ "styles", p }, 0, true);
     try s3e3Parity(io, &.{ "sst", p }, 0, true);
     try s3e3Parity(io, &.{ "rows", p, "--list-sheets" }, 0, true);
     // The selection's refusals: the same exit 3, the same message.
