@@ -297,7 +297,8 @@ const Args = struct {
     /// `hyperlinks` / `merges` under a selector on a workbook whose
     /// other sheets are large; `meta` visits every sheet (its
     /// `has_comments` is the OR across all of them), so it gains
-    /// nothing. Accepted on every sub-command as `--sst-lazy` is;
+    /// nothing. Accepted on every sub-command of this grammar as
+    /// `--sst-lazy` is (`eval` / `recalc` / `dbx` own theirs);
     /// ignored where no reader `Book` is opened (the edit family, the
     /// package-layer reads). Mutually exclusive with `--sst-lazy`: the
     /// reader has no public opener with both strategies.
@@ -1010,7 +1011,8 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    shared-string table indexed at open, each
         \\                    entry decoded on first access (workbooks
         \\                    with millions of unique strings). Accepted
-        \\                    on every sub-command; a no-op where no
+        \\                    on every sub-command of this grammar (eval /
+        \\                    recalc / dbx refuse it); a no-op where no
         \\                    reader Book is opened. Mutually exclusive
         \\                    with --lazy.
         \\  --lazy            (S3e) open with Book.openLazy: extract only
@@ -1020,9 +1022,12 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    opener on the same selection; a sheet the
         \\                    selection does not visit is never read, so
         \\                    a tear there goes unreported. No gain on
-        \\                    meta (visits every sheet). Accepted on
-        \\                    every sub-command; a no-op where no reader
-        \\                    Book is opened. Mutually exclusive with
+        \\                    meta, nor on comments / validations /
+        \\                    hyperlinks / merges without a selector
+        \\                    (they visit every sheet). Accepted on
+        \\                    every sub-command of this grammar (eval /
+        \\                    recalc / dbx refuse it); a no-op where no
+        \\                    reader Book is opened. Mutually exclusive with
         \\                    --sst-lazy (the reader has no opener with
         \\                    both).
         \\  --output MODE     (iter60b) wire-shape switch:

@@ -888,9 +888,11 @@ selectors are tolerated and ignored).
 --with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
 ```
 
-**Opening strategies** (accepted on every sub-command; they shape the reader
-`Book` the read family opens, so they are no-ops on the edit family and the
-package-layer reads; mutually exclusive with each other):
+**Opening strategies** (accepted on every sub-command of this grammar — `eval`
+/ `recalc` / `dbx` have their own and refuse them; they shape the reader `Book`
+the read family opens, so they are no-ops on the edit family and on the
+package-layer reads unless the legacy `--list-sheets` routes those through the
+reader; mutually exclusive with each other):
 
 ```bash
 --sst-lazy                    # open with Book.openSstLazy — defer SST decode until first
