@@ -2992,7 +2992,8 @@ CDATA section or a processing instruction read on the SST-lazy handle
 alone (`two` vs `xtwo`; a comment carrying `<r><t>` added a rich run)
 — a divergence on WELL-FORMED input, lifted: both lazy `else` branches
 follow the eager rule now, pinned on four shapes for the text and the
-runs (neither walker is comment-aware; both read the same). B-DOC-303
+runs (neither walker is comment-aware; the inner walk reads the same —
+the entry-spanning step is another matter, round 4 below). B-DOC-303
 LOW — a workbook without `xl/sharedStrings.xml` (inline strings only)
 reads the default `.eager` backend on every opener, count 0; the
 `.lazy` pin is a statement about a workbook that has the part, and
@@ -3008,13 +3009,38 @@ arena copy could fail and orphan the copy → the slot reserved first,
 the insert infallible; A-DOC-402 — the census; A-DOC-403 — a fourth
 torn mechanism recorded below.
 
-**Recorded, not lifted.** The torn-entry divergence above (the eager
+**Round 4, reviewer B (ship-ready; three parity MEDIUMs answered in
+the fold, ledger `codex_findings_s3e2_r4.md`)**: B-SST-411 — the lazy
+decode had no `<rPr>` branch where the eager walker and the rich-run
+walk have one, so a `<t>` inside run properties read on the SST-lazy
+handle alone (and, with a malformed entity in it, refused an entry
+`Book.open` read) → the branch added, pinned. B-SST-414 — `<rPr/>` is
+schema-valid and neither `<rPr>` branch checked the self-close: the
+rich-run walk now does (pinned: the unstyled run and the text), and
+the EAGER walker's own misread — the text after a `<rPr/>` lost or the
+entry dropped, silently, through the default opener — is a
+pre-existing defect of `parseSharedStrings` recorded as its own owner
+follow-up (the remedy: the self-close check its `<rPh>` branch has).
+B-SST-412 — `parseSharedStringsLazy` spans an entry by a raw `</si>`
+text search where the eager walker reaches the closer by walking
+tags, so a `</si>` inside a comment, a CDATA section or an attribute
+value ends the entry on the lazy backend alone (`two` vs `twox`) —
+recorded, not lifted: the remedy is a tag-walking span, the follow-up
+below. B-DOC-413 — "torn" is too narrow a trigger: XML-legal
+whitespace in an end tag (`</t >`) and the bare-opener family (`<rPh`,
+`<rPr`) reach the same mechanisms on well-formed input; the record
+reads "torn or otherwise unrecognised".
+
+**Recorded, not lifted.** The torn-or-otherwise-unrecognised-entry
+divergence above (the eager
 walker's unbounded closer searches — and a fourth mechanism, in-house
 r4 A-DOC-403: a bare `<t` or `<r` with no `>` at the end of a body
 makes the eager `else` skip consume the `</si>` and merge two entries
 where the lazy walker keeps the ordinal, so the remedy is bounding the
-closer searches AND the skip by the entry) — an owner follow-up on
-`parseSharedStrings`; the deferred entity verdict is per entry and not
+closer searches AND the skip by the entry; the lazy walker's raw
+`</si>` span, r4 B-SST-412; the eager walker's `<rPr/>` misread, r4
+B-SST-414) — an owner follow-up on `parseSharedStrings` and
+`parseSharedStringsLazy`; the deferred entity verdict is per entry and not
 cached, so a caller sweeping the table re-runs the failing decode on
 every touch of that entry — a decode on the general allocator freed on
 exit since round 3, so a re-run costs time, not memory.

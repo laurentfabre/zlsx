@@ -4481,7 +4481,17 @@ fn parseSstRichRunsForBody(book: *Book, body: []const u8, sst_idx: usize) !void 
         } else if (c1 == 'r' and next_lt + 3 < body.len and
             body[next_lt + 2] == 'P' and body[next_lt + 3] == 'r')
         {
-            const rpr_close = std.mem.indexOfPos(u8, body, next_lt, "</rPr>") orelse break;
+            // `<rPr/>` is schema-valid: an unstyled run, skipped past
+            // its tag (in-house r4 B-SST-414 — searching `</rPr>` past
+            // it swallowed the run's text or the entry).
+            const rpr_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 4, '>') orelse break;
+            if (rpr_gt > 0 and body[rpr_gt - 1] == '/') {
+                pending_flags = .{ .text = "" };
+                j = rpr_gt + 1;
+                std.debug.assert(j > j_prev);
+                continue;
+            }
+            const rpr_close = std.mem.indexOfPos(u8, body, rpr_gt + 1, "</rPr>") orelse break;
             pending_flags = try parseRprFlags(book, arena, body[next_lt .. rpr_close + "</rPr>".len]);
             j = rpr_close + "</rPr>".len;
         } else if (c1 == 'r' and next_lt + 4 <= body.len and
@@ -4631,6 +4641,23 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
             } else {
                 const rph_close = std.mem.indexOfPos(u8, body, rph_open_gt + 1, "</rPh>") orelse break;
                 j = rph_close + "</rPh>".len;
+            }
+        } else if (c1 == 'r' and next_lt + 4 <= body.len and
+            body[next_lt + 2] == 'P' and body[next_lt + 3] == 'r' and
+            (next_lt + 4 == body.len or body[next_lt + 4] == '>' or body[next_lt + 4] == ' ' or body[next_lt + 4] == '/'))
+        {
+            // `<rPr>…</rPr>` — run properties, no text: skipped whole,
+            // as the eager walker and the rich-run walk skip it, so a
+            // `<t>` inside it does not read on this backend alone
+            // (in-house r4 B-SST-411). `<rPr/>` is schema-valid and
+            // skipped past its tag — the check the eager walker lacks
+            // (B-SST-414, recorded).
+            const rpr_gt = std.mem.indexOfScalarPos(u8, body, next_lt + 4, '>') orelse break;
+            if (rpr_gt > 0 and body[rpr_gt - 1] == '/') {
+                j = rpr_gt + 1;
+            } else {
+                const rpr_close = std.mem.indexOfPos(u8, body, rpr_gt + 1, "</rPr>") orelse break;
+                j = rpr_close + "</rPr>".len;
             }
         } else {
             // Any other markup: skip to the tag's end — the eager
@@ -6023,6 +6050,44 @@ test "S3e slice 2: markup neither walker recognises is skipped to its end on bot
     for (0..200) |_| try std.testing.expectError(error.MalformedXml, bad.sharedStringAt(0));
     try std.testing.expectEqual(arena_before, bad.sst_arena.queryCapacity());
     try std.testing.expectEqual(@as(u32, 0), bad.sst.lazy.resolved.count());
+
+    // A `<t>` inside `<rPr>` is skipped with the element on both
+    // backends (in-house r4 B-SST-411: the lazy decode had no `<rPr>`
+    // branch and read `hidtwo`; with a malformed entity in it, refused
+    // an entry `Book.open` read). And `<rPr/>`, schema-valid: the lazy
+    // backend reads the text and the unstyled run (B-SST-414; the eager
+    // walker's own `<rPr/>` misread — text lost or the entry dropped —
+    // is a pre-existing defect recorded in §24, not pinned here).
+    const rpr_xml =
+        "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\" uniqueCount=\"2\">" ++
+        "<si><r><rPr><t>hid &#x110000;</t><b/></rPr><t>two</t></r></si>" ++
+        "<si><r><rPr/><t>plain</t></r><r><rPr><b/></rPr><t>bold</t></r></si>" ++
+        "</sst>";
+    var rpr_eager: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rpr_eager.deinit();
+    rpr_eager.shared_strings_xml = try std.testing.allocator.dupe(u8, rpr_xml);
+    try parseSharedStrings(&rpr_eager, rpr_eager.shared_strings_xml.?);
+    try std.testing.expectEqualStrings("two", try rpr_eager.sharedStringAt(0));
+    var rpr_lazy: Book = .{
+        .io = io,
+        .allocator = std.testing.allocator,
+        .sst_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer rpr_lazy.deinit();
+    rpr_lazy.shared_strings_xml = try std.testing.allocator.dupe(u8, rpr_xml);
+    try parseSharedStringsLazy(&rpr_lazy, rpr_lazy.shared_strings_xml.?);
+    try std.testing.expectEqualStrings("two", try rpr_lazy.sharedStringAt(0));
+    try std.testing.expectEqualStrings("plainbold", try rpr_lazy.sharedStringAt(1));
+    const runs = rpr_lazy.richRuns(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expectEqualStrings("plain", runs[0].text);
+    try std.testing.expect(!runs[0].bold);
+    try std.testing.expectEqualStrings("bold", runs[1].text);
+    try std.testing.expect(runs[1].bold);
 }
 
 test "openSstLazy: rich-runs eagerly captured on lazy backend (iter-sst-3b)" {
