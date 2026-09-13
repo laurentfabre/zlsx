@@ -190,6 +190,38 @@ if _HAS_LAZY_SHEETS:
     ]
     lib.zlsx_book_stream_sheet.restype = ctypes.c_int32
 
+# S3e slice 2 (0.9.0+): the lazy SST backend on the reader handle —
+# `Book.openSstLazy` as a zlsx_status_v1 opener (every sheet loaded and
+# the file released, the shared-string table indexed and each entry
+# decoded on first touch) plus the status read of one entry, whose
+# out-of-range is `SharedStringIndexOutOfRange`, whose deferred entity
+# verdict (a plain entry's, on an SST-lazy book) is `MalformedXml` and
+# whose deferred allocation failure is ZLSX_NOMEM, where the legacy
+# getter folds all three into -1. One capability, two symbols. `zlsx.open_sst_lazy` raises
+# RuntimeError without it; `Book.shared_string_at` falls back to the
+# legacy getter.
+_HAS_LAZY_SST = (
+    hasattr(lib, "zlsx_book_open_sst_lazy")
+    and hasattr(lib, "zlsx_book_shared_string")
+)
+if _HAS_LAZY_SST:
+    lib.zlsx_book_open_sst_lazy.argtypes = [
+        ctypes.c_char_p,               # path (null-terminated)
+        ctypes.POINTER(book_handle),   # out
+        ctypes.c_char_p,               # err_buf
+        ctypes.c_size_t,               # err_buf_len
+    ]
+    lib.zlsx_book_open_sst_lazy.restype = ctypes.c_int32
+    lib.zlsx_book_shared_string.argtypes = [
+        book_handle,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),   # out_ptr
+        ctypes.POINTER(ctypes.c_size_t),                  # out_len
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_book_shared_string.restype = ctypes.c_int32
+
 lib.zlsx_rows_open.argtypes = [
     book_handle,
     ctypes.c_uint32,
