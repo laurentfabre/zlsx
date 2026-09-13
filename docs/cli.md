@@ -886,6 +886,15 @@ selectors are tolerated and ignored).
 ```bash
 --include-blanks              # emit t:"blank" records for empty cells
 --with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
+```
+
+**Opening strategies** (accepted on every sub-command of this grammar — `eval`
+/ `recalc` / `dbx` have their own and refuse them; they shape the reader `Book`
+the read family opens, so they are no-ops on the edit family and on the
+package-layer reads unless the legacy `--list-sheets` routes those through the
+reader; mutually exclusive with each other):
+
+```bash
 --sst-lazy                    # open with Book.openSstLazy — defer SST decode until first
                               # cell access (huge-workbook RAM mitigation; sparse access
                               # wins, full sweeps cost a bit more). Neither backend refuses
@@ -893,6 +902,18 @@ selectors are tolerated and ignored).
                               # (later indices shift), lazy keeps its ordinal. A plain entry's
                               # malformed entity (MalformedXml) and the allocation surface at
                               # first access instead of at open (rich-run entries decode at open).
+--lazy                        # open with Book.openLazy — extract only the sheets the
+                              # sub-command visits under its selector (rows / cells: the
+                              # selected sheets; comments / validations / hyperlinks / merges:
+                              # the selected sheets, every sheet without a selector; meta:
+                              # every sheet; list-sheets / styles / sst: none), before the
+                              # first record. Same bytes and exit codes as the default
+                              # opener on the same selection: a sheet part the default
+                              # opener refuses at open (missing, malformed side index) is
+                              # refused at the same exit code, the sheet named on stderr,
+                              # nothing written — but only when the selection reaches it;
+                              # a tear in an unvisited sheet goes unreported. With
+                              # --sst-lazy: exit 1 (the reader has no opener with both).
 ```
 
 **Output modes**:
@@ -982,6 +1003,12 @@ degrade to empty / partial metadata. In practice:
   `{"kind":"error","scope":"sheet","code":"MalformedXml",…}` record —
   processing continues with neighbour sheets. Filter with
   `jq 'select(.kind!="error")'` for the data-only stream.
+- Under `--lazy` the open-time parsers run on the sheets the sub-command
+  visits only — extracted before its first record — so "`Book.open` fails"
+  reads "the open, or the extraction of a visited sheet, fails": the same
+  exit 2 (exit 4 for a decompression limit), the sheet named on stderr, no
+  stdout stream. A sheet outside the selection is never extracted, so its
+  malformation is not reported by that run.
 
 Scripts that need a precise part-by-part failure map should read the reader
 source (`src/xlsx.zig`) — the design-doc "Operational guarantees" section
@@ -1016,7 +1043,7 @@ specific command they use.
 |---|---|
 | 0 | Success (inline `error` records may still have been emitted for recoverable sheet-level MalformedXml) |
 | 1 | Bad CLI arguments |
-| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet part the strict walk cannot prove whole — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a duplicate attribute on the rule machinery — or a sqref / rule type / formula / sheet-name carrier that does not decode or is not UTF-8 — its contract above) — or, on `sheet-props`, a sheet part the strict walk cannot prove a pane / extent for (a second `<dimension>` / `<sheetViews>` / first-view `<pane>`, a duplicate attribute on that machinery, an MCE construct at a recognized slot, or a `ref` / pane carrier that does not decode or is not UTF-8 — its contract above) — or, on `calc-props`, a `<calcPr>` slot the read cannot report faithfully (two at the slot, one an MCE branch could project there, a duplicate attribute, a carrier that does not decode — its contract above) |
+| 2 | Could not open the input: missing file, permission denied, not a valid xlsx archive, malformed parts at open time (under `--lazy`, a visited sheet's part missing or malformed when it is extracted, before the first record) — or, on `pivots`, a pivot graph that cannot be read whole (a named part missing or unreadable, a cache identity that disagrees) — or, on `defined-names`, a name inventory the read cannot serve faithfully (a carrier that does not decode, malformed UTF-8, a body with embedded markup — its contract above) — or, on `merges`, a selected sheet with merges under a non-UTF-8 name — or, on `doc-props`, a docProps part the store cannot read or a field value that is not UTF-8 — or, on `anchors`, an anchor inventory the read cannot serve faithfully (a sheet the read cannot place, a drawing / image / chart relationship that dangles, an anchor that does not parse, a carrier that does not decode, malformed UTF-8, a series ref with embedded markup — its contract above) — or, on `conditional-formats`, a rule inventory the read cannot serve faithfully (a sheet part the strict walk cannot prove whole — mismatched nesting, a namespace shape that could ghost a rule, an unterminated or markup-carrying formula, a duplicate attribute on the rule machinery — or a sqref / rule type / formula / sheet-name carrier that does not decode or is not UTF-8 — its contract above) — or, on `sheet-props`, a sheet part the strict walk cannot prove a pane / extent for (a second `<dimension>` / `<sheetViews>` / first-view `<pane>`, a duplicate attribute on that machinery, an MCE construct at a recognized slot, or a `ref` / pane carrier that does not decode or is not UTF-8 — its contract above) — or, on `calc-props`, a `<calcPr>` slot the read cannot report faithfully (two at the slot, one an MCE branch could project there, a duplicate attribute, a carrier that does not decode — its contract above) |
 | 3 | Sheet not found (by name / index). A `--sheet-glob` matching zero sheets is an empty *successful* stream (exit 0), not an error |
 | 4 | A decompression limit was breached (`ZipBombSuspected`): a part declared past the per-part cap, past the ratio cap, or a whole archive declared past the aggregate budget — checked on the central directory before anything is inflated, so no partial output precedes it. Numbers in [Pipeline safety](#pipeline-safety). The embed family also returns 4 on a vector-buffer allocation failure |
 | 5 | OS error writing output (stdout write failure, disk full, mutation-save I/O) |

@@ -194,6 +194,11 @@ jobs:
           set -euo pipefail
           ./zig-out/bin/zlsx.exe list-sheets tests/corpus/frictionless_2sheets.xlsx
           ./zig-out/bin/zlsx.exe meta tests/corpus/frictionless_2sheets.xlsx
+          # S3e slice 3: `meta --lazy` opens the package layer on a path the
+          # reader's archive still holds — the one lane where a share-mode
+          # refusal could show; the two runs must agree byte for byte.
+          ./zig-out/bin/zlsx.exe meta tests/corpus/frictionless_2sheets.xlsx --lazy > meta_lazy.ndjson
+          ./zig-out/bin/zlsx.exe meta tests/corpus/frictionless_2sheets.xlsx | cmp - meta_lazy.ndjson
           ./zig-out/bin/zlsx.exe cells tests/corpus/frictionless_2sheets.xlsx --take 3
           # The embed family end to end (S3c slice 5): a write with the
           # Numbers-durable carrier; the hidden sheet shows in the listing.
