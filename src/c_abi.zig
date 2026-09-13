@@ -10448,10 +10448,20 @@ test "S3e lazy SST: the opener indexes the table and loads every sheet; each tou
         try std.testing.expectEqual(@as(i32, 0), zlsx_rows_next(rows, &cells_ptr, &cells_len, &err_buf, err_buf.len));
     }
     try std.testing.expectEqual(@as(u32, 6), st.inner.sst.lazy.resolved.count());
-    // The bulk read reaches the same cache.
+    // The bulk read reaches the same cache — on a COLD one, or the pin
+    // is vacuous (in-house r4 A-TST-401: every entry was resolved by
+    // then): a second handle, its first touch the matrix of sheet Two,
+    // resolves exactly that sheet's four strings.
     {
-        const matrix = zlsx_matrix_open(book, 1, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+        var cold_slot: ?*Book = null;
+        try std.testing.expectEqual(ZLSX_OK, zlsx_book_open_sst_lazy(path, &cold_slot, &err_buf, err_buf.len));
+        const cold = cold_slot orelse return error.TestUnexpectedResult;
+        defer zlsx_book_close(cold);
+        const cst: *BookState = @ptrCast(@alignCast(cold));
+        try std.testing.expectEqual(@as(u32, 0), cst.inner.sst.lazy.resolved.count());
+        const matrix = zlsx_matrix_open(cold, 1, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
         defer zlsx_matrix_close(matrix);
+        try std.testing.expectEqual(@as(u32, 4), cst.inner.sst.lazy.resolved.count());
         try std.testing.expectEqual(@as(u32, 6), st.inner.sst.lazy.resolved.count());
     }
     // The slice-1 exports are legal on the handle: every sheet is

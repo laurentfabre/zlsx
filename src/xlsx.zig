@@ -4643,6 +4643,10 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
         }
     }
 
+    // The cache slot is reserved before the arena copy, so the insert
+    // cannot fail after the copy and orphan it until close (in-house r4
+    // A-MEM-401).
+    try lazy.resolved.ensureUnusedCapacity(book.allocator, 1);
     const arena = book.sst_arena.allocator();
     const decoded: []const u8 = if (t_count == 0) "" else if (t_count == 1) blk: {
         if (first_has_ent) {
@@ -4656,7 +4660,7 @@ fn materialiseSstEntry(book: *Book, idx: usize) ![]const u8 {
         }
     } else try arena.dupe(u8, buf.items);
 
-    try lazy.resolved.put(book.allocator, @intCast(idx), decoded);
+    lazy.resolved.putAssumeCapacity(@intCast(idx), decoded);
     return decoded;
 }
 

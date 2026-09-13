@@ -3000,15 +3000,27 @@ Python's `sst_lazy` stays `True` there (its rows lock for nothing —
 harmless, stated). A-DOC-302 LOW — a fourth stale iter-sst comment
 (`Book.sst`'s) corrected.
 
+**Round 4 (in-house, A and B both ship-ready — CONVERGED; ledger
+`codex_findings_s3e2_r4.md`)**: A-TST-401 — the C "bulk read reaches the
+cache" pin ran on a warm cache → a second handle's cold matrix read
+pinned (four of six resolved); A-MEM-401 — the cache insert after the
+arena copy could fail and orphan the copy → the slot reserved first,
+the insert infallible; A-DOC-402 — the census; A-DOC-403 — a fourth
+torn mechanism recorded below.
+
 **Recorded, not lifted.** The torn-entry divergence above (the eager
-walker's unbounded closer searches) — an owner follow-up on
+walker's unbounded closer searches — and a fourth mechanism, in-house
+r4 A-DOC-403: a bare `<t` or `<r` with no `>` at the end of a body
+makes the eager `else` skip consume the `</si>` and merge two entries
+where the lazy walker keeps the ordinal, so the remedy is bounding the
+closer searches AND the skip by the entry) — an owner follow-up on
 `parseSharedStrings`; the deferred entity verdict is per entry and not
 cached, so a caller sweeping the table re-runs the failing decode on
 every touch of that entry — a decode on the general allocator freed on
 exit since round 3, so a re-run costs time, not memory.
 
 **Tests** (`src/c_abi.zig`, "S3e lazy SST: …" — two; `src/xlsx.zig`,
-"S3e slice 2: …" — two; `tests/c_abi_smoke.c` `#error`s without the
+"S3e slice 2: …" — three; `tests/c_abi_smoke.c` `#error`s without the
 macro and takes the two addresses; `test_basic.py`, the "S3e slice 2"
 section — six: `open_sst_lazy_loads_every_sheet` /
 `shared_string_at_names` / `open_sst_lazy_defers_the_entity_verdict` /
