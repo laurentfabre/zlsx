@@ -2820,7 +2820,8 @@ probe order and the older-dylib branch.
 `--sst-lazy` on the CLI) is S3e's second slice; a lazy opener over a
 buffer has no Zig primitive (the `.buffer` source's borrow ends at the
 open call, so a lazy buffer handle would have to copy); the CLI leg of
-per-sheet loading (the matrix's fourth column) stays `— S3e`.
+per-sheet loading (the matrix's fourth column) is S3e's third slice
+(`--lazy`, 2026-09-13; matrix footnote ²⁹ — no C change).
 
 ## 24. S3e slice 2 — the lazy SST backend on the reader handle (2026-09-11)
 
@@ -3083,4 +3084,6 @@ pinned from `_ffi.py`'s source.
 public Zig entry point; a buffer opener with a lazy SST likewise (the
 `.buffer` borrow ends at the open call). `--sst-lazy` on the CLI
 predates the slice; the CLI leg of per-sheet loading (the matrix's
-fourth column) stays `— S3e`.
+fourth column) is S3e's third slice (`--lazy`, 2026-09-13; matrix
+footnote ²⁹ — no C change; `--lazy --sst-lazy` refused there for the
+same missing primitive).

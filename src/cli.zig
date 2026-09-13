@@ -289,6 +289,19 @@ const Args = struct {
     /// `meta` / `list-sheets` / `styles` / `sst` (those are
     /// workbook-scoped and don't benefit from per-cell laziness).
     sst_lazy: bool = false,
+    /// S3e slice 3: open through `Book.openLazy` — the inventory, the
+    /// shared strings, styles and theme at open, each sheet's XML and
+    /// side indices extracted only for the sheets the sub-command
+    /// visits, before its first record (`preloadVisitedSheets`). The
+    /// win is `rows` / `cells` / `comments` / `validations` /
+    /// `hyperlinks` / `merges` under a selector on a workbook whose
+    /// other sheets are large; `meta` visits every sheet (its
+    /// `has_comments` is the OR across all of them), so it gains
+    /// nothing. Accepted on every sub-command as `--sst-lazy` is;
+    /// ignored where no reader `Book` is opened (the edit family, the
+    /// package-layer reads). Mutually exclusive with `--sst-lazy`: the
+    /// reader has no public opener with both strategies.
+    lazy: bool = false,
 };
 
 const ArgError = error{
@@ -300,6 +313,8 @@ const ArgError = error{
     BadSheetIndex,
     BadArgValue,
     SheetArgConflict,
+    /// S3e slice 3: `--lazy` and `--sst-lazy` on one invocation.
+    LazyStrategyConflict,
     TooManyArgs,
 };
 
@@ -392,7 +407,7 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
     const boolean_flags = [_][]const u8{
         "--list-sheets", "--header",     "--include-blanks", "--with-styles",
         "--sst-lazy",    "--all-sheets", "--help",           "--strip",
-        "--prune",       "--extract",    "--dump",
+        "--prune",       "--extract",    "--dump",           "--lazy",
     };
     // Value-bearing flags: the file-scope `value_flags` table.
     // Context-aware splitter: the token IMMEDIATELY following a
@@ -485,6 +500,8 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
             out.with_styles = true;
         } else if (std.mem.eql(u8, a, "--sst-lazy")) {
             out.sst_lazy = true;
+        } else if (std.mem.eql(u8, a, "--lazy")) {
+            out.lazy = true;
         } else if (std.mem.eql(u8, a, "--out")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
@@ -879,6 +896,11 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         => {},
         else => return ArgError.BadArgValue,
     };
+    // S3e slice 3: the reader has no public opener with lazy sheets
+    // AND a lazy SST (`openLazyWithSst(.path, .lazy)` without the
+    // eager facade is private), so the pair is refused before any
+    // file is touched rather than one flag silently winning.
+    if (out.lazy and out.sst_lazy) return ArgError.LazyStrategyConflict;
     return out;
 }
 
@@ -981,6 +1003,17 @@ fn writeUsage(w: *std.Io.Writer) !void {
         \\                    Valid on `cells` and `rows --format jsonl`
         \\                    only; rejected on `rows --header` (no slot
         \\                    in the fields dict) and flat formats.
+        \\  --lazy            (S3e) open with Book.openLazy: extract only
+        \\                    the sheets the sub-command visits (the
+        \\                    selection above), before the first record.
+        \\                    Same output and exit codes as the default
+        \\                    opener on the same selection; a sheet the
+        \\                    selection does not visit is never read, so
+        \\                    a tear there goes unreported. No gain on
+        \\                    meta (visits every sheet). Mutually
+        \\                    exclusive with --sst-lazy (the lazy shared-
+        \\                    string table; the reader has no opener
+        \\                    with both).
         \\  --output MODE     (iter60b) wire-shape switch:
         \\                    ndjson           (default) invariant-envelope
         \\                                     NDJSON — every record carries
@@ -2138,6 +2171,7 @@ fn runMain(init: std.process.Init) !u8 {
         ArgError.BadSheetIndex,
         ArgError.BadArgValue,
         ArgError.SheetArgConflict,
+        ArgError.LazyStrategyConflict,
         ArgError.TooManyArgs,
         => {
             try err.print("zlsx: bad arguments ({s})\n\n", .{@errorName(e)});
@@ -2196,19 +2230,146 @@ fn runMain(init: std.process.Init) !u8 {
         else => {},
     }
 
-    // iter-sst-4: dispatch on --sst-lazy.
+    var book = switch (try openReadBook(alloc, proc_io, args, err)) {
+        .exit => |code| return code,
+        .book => |b| b,
+    };
+    defer book.deinit();
+    return try runBookCommand(out, err, &book, args, alloc, proc_io);
+}
+
+/// The reader `Book` behind every read sub-command, or the exit code
+/// its failure maps to (the diagnostic already written to `err`).
+const OpenOutcome = union(enum) {
+    book: xlsx.Book,
+    exit: u8,
+};
+
+/// iter-sst-4 / S3e slice 3: ONE opener for the read family, chosen by
+/// the strategy flags — `Book.open` (everything at open, the file
+/// released), `--sst-lazy` → `Book.openSstLazy`, `--lazy` →
+/// `Book.openLazy` with the sheets the sub-command visits preloaded
+/// here, before any record is written, so a sheet part the eager
+/// opener refuses at open is refused at the same exit code on the
+/// lazy one, and the sub-command's output is what the eager opener
+/// would have produced on the same selection. A sheet the selection
+/// does not visit is never extracted — that is the flag's point and
+/// its trade-off (a tear there goes unreported). `parseArgs` refused
+/// `--lazy --sst-lazy` already.
+fn openReadBook(alloc: std.mem.Allocator, io: std.Io, args: Args, err: *std.Io.Writer) !OpenOutcome {
     var book = if (args.sst_lazy)
-        xlsx.Book.openSstLazy(alloc, proc_io, args.file) catch |e| {
+        xlsx.Book.openSstLazy(alloc, io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
-            return openFailureExit(e);
+            return .{ .exit = openFailureExit(e) };
+        }
+    else if (args.lazy)
+        xlsx.Book.openLazy(alloc, io, args.file) catch |e| {
+            try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
+            return .{ .exit = openFailureExit(e) };
         }
     else
-        xlsx.Book.open(alloc, proc_io, args.file) catch |e| {
+        xlsx.Book.open(alloc, io, args.file) catch |e| {
             try err.print("zlsx: cannot open '{s}': {s}\n", .{ args.file, @errorName(e) });
-            return openFailureExit(e);
+            return .{ .exit = openFailureExit(e) };
         };
-    defer book.deinit();
+    if (args.lazy) {
+        var failed_sheet: []const u8 = "";
+        preloadVisitedSheets(&book, args, &failed_sheet) catch |e| {
+            // A mapped failure is a plain return, so the book is
+            // released by this block's defer, not by an errdefer (the
+            // torn-sheet test leaked through one) — after the print,
+            // since `failed_sheet` borrows the book's sheet name. The
+            // exit code is the opener's: `MissingSheet` /
+            // `MalformedXml` are what `Book.open` refuses with (exit
+            // 2); a limit breach is exit 4. The eager message cannot
+            // name a sheet (it loads them all); this one can.
+            defer book.deinit();
+            try err.print("zlsx: cannot open '{s}': {s} (sheet '{s}')\n", .{ args.file, @errorName(e), failed_sheet });
+            return .{ .exit = openFailureExit(e) };
+        };
+    }
+    return .{ .book = book };
+}
 
+/// S3e slice 3: extract, on a `--lazy` book, exactly the sheets the
+/// sub-command is about to visit — the same predicates the emitters
+/// walk with (`sheetSelectedForCellsRows` for the grid family,
+/// `sheetVisitedByObjectCommand` for the per-object family, every
+/// sheet for `meta`, none for the workbook-wide reports) — so every
+/// per-sheet getter the emitters read (`comments`, `dataValidations`,
+/// `hyperlinks`, `mergedRanges`: the empty slice on a sheet not yet
+/// loaded) is populated before the first record. A no-op on the eager
+/// openers' books (every sheet is a hashmap hit). Idempotent. On a
+/// failure `failed_sheet` names the sheet (a Zig error carries no
+/// payload) and the reader's error is returned as is.
+fn preloadVisitedSheets(book: *xlsx.Book, args: Args, failed_sheet: *[]const u8) !void {
+    for (book.sheets, 0..) |s, idx| {
+        const visited = if (args.list_sheets)
+            false
+        else switch (args.subcommand) {
+            .meta => true,
+            .list_sheets, .styles, .sst => false,
+            .rows, .cells => sheetSelectedForCellsRows(args, s.name, idx),
+            .comments, .validations, .hyperlinks, .merges => sheetVisitedByObjectCommand(args, null, s.name, idx),
+            // Dispatched before the reader `Book` is opened.
+            .append_rows,
+            .set_cell,
+            .insert_row,
+            .delete_row,
+            .insert_column,
+            .delete_column,
+            .add_sheet,
+            .rename_sheet,
+            .delete_sheet,
+            .rename_table_column,
+            .scrub_metadata,
+            .embed,
+            .pivots,
+            .defined_names,
+            .doc_props,
+            .anchors,
+            .conditional_formats,
+            .sheet_props,
+            .calc_props,
+            => unreachable,
+        };
+        if (!visited) continue;
+        book.preloadSheet(s) catch |e| {
+            failed_sheet.* = s.name;
+            return e;
+        };
+    }
+}
+
+/// iter59c / S3e slice 3: ONE selection predicate for the per-object
+/// family (`comments` / `validations` / `hyperlinks` / `merges`),
+/// walked by their emitters and by `preloadVisitedSheets`. `filter`
+/// is the index `resolveSheetFilter` narrowed to (the emitters'
+/// path); with `filter` null the selector flags decide directly (the
+/// preload's path, before the selection is judged — an index or name
+/// that matches no sheet visits nothing, and the emitter's exit 3
+/// follows). Without a selector the family streams every sheet — it
+/// has no natural "sheet 0 only" anchor.
+fn sheetVisitedByObjectCommand(args: Args, filter: ?usize, sheet_name: []const u8, sheet_idx: usize) bool {
+    if (filter) |f| return sheet_idx == f;
+    if (args.sheet_index) |idx| return sheet_idx == idx;
+    if (args.sheet_name) |n| return std.mem.eql(u8, sheet_name, n);
+    if (args.sheet_glob != null or args.all_sheets) return isSheetIncluded(args, sheet_name, sheet_idx);
+    return true;
+}
+
+/// Every read sub-command over an opened reader `Book` — the tail of
+/// `runMain` from the open onward, one body so a test can drive the
+/// production dispatch (the selection checks, the sheet-scoped
+/// fences, the emitters) on a book opened either way.
+fn runBookCommand(
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+    book: *xlsx.Book,
+    args: Args,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+) !u8 {
     if (args.list_sheets) {
         for (book.sheets) |s| {
             if (signals.shouldStop()) return 0;
@@ -2242,54 +2403,54 @@ fn runMain(init: std.process.Init) !u8 {
             // some archives the package layer refuses (ZIP data
             // descriptors, for one), so a failure here degrades to
             // `"doc_props": null` rather than failing `meta` outright.
-            var dp_wb: ?zlsx_pkg.Workbook = zlsx_pkg.Workbook.open(alloc, proc_io, args.file) catch null;
+            var dp_wb: ?zlsx_pkg.Workbook = zlsx_pkg.Workbook.open(alloc, io, args.file) catch null;
             defer if (dp_wb) |*w| w.deinit();
             const dp: ?zlsx_pkg.DocProps = if (dp_wb) |*w| (w.docProps() catch null) else null;
 
-            try runMetaCommand(out, &book, path_opt, args.output, dp);
+            try runMetaCommand(out, book, path_opt, args.output, dp);
             return 0;
         },
         .list_sheets => {
-            try runListSheetsCommand(out, &book, args.output);
+            try runListSheetsCommand(out, book, args.output);
             return 0;
         },
         .comments => {
-            const filter = resolveSheetFilter(&book, args) catch {
+            const filter = resolveSheetFilter(book, args) catch {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runCommentsCommand(out, &book, filter, args, args.skip, args.take, args.start_row, args.end_row);
+            try runCommentsCommand(out, book, filter, args, args.skip, args.take, args.start_row, args.end_row);
             return 0;
         },
         .validations => {
-            const filter = resolveSheetFilter(&book, args) catch {
+            const filter = resolveSheetFilter(book, args) catch {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runValidationsCommand(out, &book, filter, args, args.skip, args.take);
+            try runValidationsCommand(out, book, filter, args, args.skip, args.take);
             return 0;
         },
         .hyperlinks => {
-            const filter = resolveSheetFilter(&book, args) catch {
+            const filter = resolveSheetFilter(book, args) catch {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            try runHyperlinksCommand(out, &book, filter, args, args.skip, args.take);
+            try runHyperlinksCommand(out, book, filter, args, args.skip, args.take);
             return 0;
         },
         .merges => {
-            const filter = resolveSheetFilter(&book, args) catch {
+            const filter = resolveSheetFilter(book, args) catch {
                 try err.writeAll("zlsx: sheet not found\n");
                 return 3;
             };
-            return try runMergesCommand(out, err, &book, filter, args, args.skip, args.take);
+            return try runMergesCommand(out, err, book, filter, args, args.skip, args.take);
         },
         .styles => {
-            try runStylesCommand(out, &book, args.skip, args.take);
+            try runStylesCommand(out, book, args.skip, args.take);
             return 0;
         },
         .sst => {
-            try runSstCommand(out, &book, args.skip, args.take);
+            try runSstCommand(out, book, args.skip, args.take);
             return 0;
         },
         // Editor-route subcommands all dispatched before the Book open.
@@ -2345,8 +2506,8 @@ fn runMain(init: std.process.Init) !u8 {
     }
 
     switch (args.subcommand) {
-        .rows => try runRowsAcrossSheets(out, &book, args, alloc),
-        .cells => try runCellsAcrossSheets(out, &book, args, alloc),
+        .rows => try runRowsAcrossSheets(out, book, args, alloc),
+        .cells => try runCellsAcrossSheets(out, book, args, alloc),
         // Handled by the workbook-scoped early return above.
         .meta,
         .list_sheets,
@@ -4295,14 +4456,7 @@ fn runCommentsCommand(
     var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
-        if (filter) |f| {
-            if (sheet_idx != f) continue;
-        } else if (args.sheet_glob != null or args.all_sheets) {
-            // iter59c: honour the glob/--all-sheets pair. When neither
-            // is set, the legacy "iterate every sheet" default is kept
-            // (this sub-command has no natural `sheet 0 only` anchor).
-            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
-        }
+        if (!sheetVisitedByObjectCommand(args, filter, s.name, sheet_idx)) continue;
         for (book.comments(s)) |c| {
             // Comments are not guaranteed monotonic by row across a
             // sheet's comment list (OOXML preserves author/insertion
@@ -4363,11 +4517,7 @@ fn runValidationsCommand(
     var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
-        if (filter) |f| {
-            if (sheet_idx != f) continue;
-        } else if (args.sheet_glob != null or args.all_sheets) {
-            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
-        }
+        if (!sheetVisitedByObjectCommand(args, filter, s.name, sheet_idx)) continue;
         for (book.dataValidations(s)) |dv| {
             if (signals.shouldStop()) return;
             switch (pg.consume()) {
@@ -4431,11 +4581,7 @@ fn runHyperlinksCommand(
     var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return;
-        if (filter) |f| {
-            if (sheet_idx != f) continue;
-        } else if (args.sheet_glob != null or args.all_sheets) {
-            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
-        }
+        if (!sheetVisitedByObjectCommand(args, filter, s.name, sheet_idx)) continue;
         for (book.hyperlinks(s)) |h| {
             if (signals.shouldStop()) return;
             switch (pg.consume()) {
@@ -4583,11 +4729,7 @@ fn runMergesCommand(
     // name the stream cannot carry; a bad-named sheet with no merges
     // emits nothing and does not lie.
     for (book.sheets, 0..) |s, sheet_idx| {
-        if (filter) |f| {
-            if (sheet_idx != f) continue;
-        } else if (args.sheet_glob != null or args.all_sheets) {
-            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
-        }
+        if (!sheetVisitedByObjectCommand(args, filter, s.name, sheet_idx)) continue;
         if (book.mergedRanges(s).len == 0) continue;
         if (!std.unicode.utf8ValidateSlice(s.name)) {
             try err.print(
@@ -4604,11 +4746,7 @@ fn runMergesCommand(
     var last_prologue: ?usize = null;
     for (book.sheets, 0..) |s, sheet_idx| {
         if (signals.shouldStop()) return 0;
-        if (filter) |f| {
-            if (sheet_idx != f) continue;
-        } else if (args.sheet_glob != null or args.all_sheets) {
-            if (!isSheetIncluded(args, s.name, sheet_idx)) continue;
-        }
+        if (!sheetVisitedByObjectCommand(args, filter, s.name, sheet_idx)) continue;
         for (book.mergedRanges(s)) |m| {
             if (signals.shouldStop()) return 0;
             switch (pg.consume()) {
@@ -11903,4 +12041,345 @@ test "S3c slice 6: embed --dump — every allocation failure on the path exits n
         try wb.save(io, out_stripped);
     }
     try std.testing.checkAllAllocationFailures(a, s3c6DumpForFailures, .{ io, @as([]const u8, out_stripped) });
+}
+
+// ── S3e slice 3: lazy per-sheet loading on the CLI (`--lazy`) ──────────
+
+/// Three sheets, every per-sheet side index populated on two of them,
+/// so a sheet the lazy preload missed would drop records from every
+/// per-object family.
+fn writeS3eLazyFixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    const writer = xlsx.writer_types;
+    var w = writer.Writer.init(alloc);
+    defer w.deinit();
+    {
+        var s = try w.addSheet("Alpha");
+        try s.writeRow(&.{ .{ .string = "hdr1" }, .{ .string = "hdr2" } });
+        try s.writeRow(&.{ .{ .number = 1.0 }, .{ .number = 2.0 } });
+        try s.writeRow(&.{ .{ .string = "x" }, .{ .number = 3.0 } });
+        try s.addMergedCell("A1:B1");
+        try s.addHyperlink("A2", "https://example.com/a");
+        try s.addComment("A1", "Alice", "needs review");
+        try s.addDataValidationList("B2:B100", &.{ "apple", "banana" });
+    }
+    {
+        var s = try w.addSheet("Beta");
+        try s.writeRow(&.{.{ .string = "x" }});
+        try s.writeRow(&.{.{ .number = 42.0 }});
+        try s.addComment("B2", "Bob", "hi");
+        try s.addMergedCell("A3:B3");
+    }
+    {
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .string = "d1" }, .{ .string = "d2" }, .{ .string = "d3" } });
+        try s.writeRow(&.{ .{ .number = 7.0 }, .{ .number = 8.0 }, .{ .number = 9.0 } });
+        try s.addHyperlink("A1", "https://example.com/d");
+        try s.addDataValidationList("C1:C9", &.{ "one", "two" });
+    }
+    try w.save(io, path);
+    return path;
+}
+
+/// One CLI run through the production parser, opener and dispatch,
+/// with what the book looked like right after the open (before the
+/// emitters ran) and right before it was closed.
+const S3e3Run = struct {
+    out: std.Io.Writer.Allocating,
+    err: std.Io.Writer.Allocating,
+    code: u8,
+    lazy_flag: bool,
+    opened: bool,
+    sheets: usize,
+    /// Sheets extracted after the open (the preload's set on `--lazy`).
+    loaded_before: usize,
+    /// Sheets extracted after the emitters ran — equal to
+    /// `loaded_before` iff the preload covered every sheet they touched.
+    loaded_after: usize,
+    /// Bit i set iff `sheets[i]` was extracted after the open.
+    loaded_mask: u64,
+    archive_open: bool,
+    sst_lazy_backend: bool,
+
+    fn deinit(self: *S3e3Run) void {
+        self.out.deinit();
+        self.err.deinit();
+    }
+};
+
+fn s3e3Run(io: std.Io, argv: []const []const u8) !S3e3Run {
+    const alloc = std.testing.allocator;
+    const args = try parseArgs(argv);
+    var run: S3e3Run = .{
+        .out = .init(alloc),
+        .err = .init(alloc),
+        .code = 0,
+        .lazy_flag = args.lazy,
+        .opened = false,
+        .sheets = 0,
+        .loaded_before = 0,
+        .loaded_after = 0,
+        .loaded_mask = 0,
+        .archive_open = false,
+        .sst_lazy_backend = false,
+    };
+    errdefer run.deinit();
+    switch (try openReadBook(alloc, io, args, &run.err.writer)) {
+        .exit => |code| run.code = code,
+        .book => |b| {
+            var book = b;
+            defer book.deinit();
+            run.opened = true;
+            run.sheets = book.sheets.len;
+            run.loaded_before = book.sheet_data.count();
+            for (book.sheets, 0..) |s, i| {
+                if (book.sheet_data.contains(s.path)) run.loaded_mask |= @as(u64, 1) << @intCast(i);
+            }
+            run.archive_open = book.archive != null;
+            run.sst_lazy_backend = std.meta.activeTag(book.sst) == .lazy;
+            run.code = try runBookCommand(&run.out.writer, &run.err.writer, &book, args, alloc, io);
+            run.loaded_after = book.sheet_data.count();
+        },
+    }
+    return run;
+}
+
+/// `argv` as given and with `--lazy` appended: the same stdout, the
+/// same stderr, the same exit code; the eager book loaded every sheet,
+/// the lazy one exactly `expect_loaded`, and nothing more during the
+/// run.
+fn s3e3Parity(io: std.Io, argv: []const []const u8, expect_loaded: usize, expect_output: bool) !void {
+    var lazy_buf: [32][]const u8 = undefined;
+    std.debug.assert(argv.len < lazy_buf.len);
+    @memcpy(lazy_buf[0..argv.len], argv);
+    lazy_buf[argv.len] = "--lazy";
+
+    var eager = try s3e3Run(io, argv);
+    defer eager.deinit();
+    var lazy = try s3e3Run(io, lazy_buf[0 .. argv.len + 1]);
+    defer lazy.deinit();
+    try std.testing.expect(!eager.lazy_flag);
+    try std.testing.expect(lazy.lazy_flag);
+    try std.testing.expectEqual(eager.code, lazy.code);
+    try std.testing.expectEqualStrings(eager.out.written(), lazy.out.written());
+    try std.testing.expectEqualStrings(eager.err.written(), lazy.err.written());
+    try std.testing.expectEqual(expect_output, eager.out.written().len != 0);
+    try std.testing.expect(eager.opened and lazy.opened);
+    try std.testing.expectEqual(eager.sheets, eager.loaded_before);
+    try std.testing.expect(!eager.archive_open);
+    try std.testing.expect(lazy.archive_open);
+    try std.testing.expectEqual(expect_loaded, lazy.loaded_before);
+    try std.testing.expectEqual(lazy.loaded_before, lazy.loaded_after);
+}
+
+test "S3e slice 3: parseArgs — --lazy is a boolean flag accepted on every sub-command, before or after the token; --lazy with --sst-lazy is refused in either order; the `=` spelling is refused" {
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.lazy);
+        try std.testing.expect(!a.sst_lazy);
+    }
+    {
+        const argv = [_][]const u8{ "--lazy", "cells", "f.xlsx" };
+        try std.testing.expect((try parseArgs(&argv)).lazy);
+    }
+    {
+        const argv = [_][]const u8{"f.xlsx"};
+        try std.testing.expect(!(try parseArgs(&argv)).lazy);
+    }
+    for ([_][]const u8{ "meta", "list-sheets", "comments", "validations", "hyperlinks", "merges", "styles", "sst", "pivots", "defined-names", "doc-props", "anchors", "conditional-formats", "sheet-props", "calc-props" }) |sub| {
+        const argv = [_][]const u8{ sub, "f.xlsx", "--lazy" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.lazy);
+    }
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy", "--sst-lazy" };
+        try std.testing.expectError(ArgError.LazyStrategyConflict, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "sst", "f.xlsx", "--sst-lazy", "--lazy" };
+        try std.testing.expectError(ArgError.LazyStrategyConflict, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy=1" };
+        try std.testing.expectError(ArgError.BadArgValue, parseArgs(&argv));
+    }
+}
+
+test "S3e slice 3: openReadBook — the strategy flags pick the opener; --lazy keeps the archive open and extracts exactly the sheets the sub-command visits under its selector, none for the workbook-wide reports" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const p = try writeS3eLazyFixture(io, &tt, "s3e3_open.xlsx");
+    defer std.testing.allocator.free(p);
+
+    // The eager opener: every sheet, the file released, the eager table.
+    {
+        var r = try s3e3Run(io, &.{ "rows", p });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.loaded_before);
+        try std.testing.expect(!r.archive_open);
+        try std.testing.expect(!r.sst_lazy_backend);
+    }
+    // `--sst-lazy`: every sheet, the file released, the lazy table.
+    {
+        var r = try s3e3Run(io, &.{ "rows", p, "--sst-lazy" });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.loaded_before);
+        try std.testing.expect(!r.archive_open);
+        try std.testing.expect(r.sst_lazy_backend);
+    }
+    // `--lazy`: the archive kept, the eager table, the visited sheets.
+    const Case = struct { argv: []const []const u8, mask: u64, code: u8 };
+    const cases = [_]Case{
+        .{ .argv = &.{ "rows", p, "--lazy" }, .mask = 0b001, .code = 0 },
+        .{ .argv = &.{ p, "--lazy" }, .mask = 0b001, .code = 0 },
+        .{ .argv = &.{ "rows", p, "--lazy", "--sheet", "2" }, .mask = 0b100, .code = 0 },
+        .{ .argv = &.{ "cells", p, "--lazy", "--name", "Beta" }, .mask = 0b010, .code = 0 },
+        .{ .argv = &.{ "cells", p, "--lazy", "--sheet-glob", "D*" }, .mask = 0b100, .code = 0 },
+        .{ .argv = &.{ "rows", p, "--lazy", "--all-sheets" }, .mask = 0b111, .code = 0 },
+        .{ .argv = &.{ "rows", p, "--lazy", "--sheet", "7" }, .mask = 0, .code = 3 },
+        .{ .argv = &.{ "cells", p, "--lazy", "--name", "Nope" }, .mask = 0, .code = 3 },
+        // The per-object family streams every sheet without a selector.
+        .{ .argv = &.{ "comments", p, "--lazy" }, .mask = 0b111, .code = 0 },
+        .{ .argv = &.{ "validations", p, "--lazy", "--sheet", "2" }, .mask = 0b100, .code = 0 },
+        .{ .argv = &.{ "hyperlinks", p, "--lazy", "--name", "Alpha" }, .mask = 0b001, .code = 0 },
+        .{ .argv = &.{ "merges", p, "--lazy", "--sheet-glob", "?eta" }, .mask = 0b010, .code = 0 },
+        .{ .argv = &.{ "merges", p, "--lazy", "--all-sheets" }, .mask = 0b111, .code = 0 },
+        .{ .argv = &.{ "comments", p, "--lazy", "--name", "Nope" }, .mask = 0, .code = 3 },
+        .{ .argv = &.{ "hyperlinks", p, "--lazy", "--sheet", "9" }, .mask = 0, .code = 3 },
+        // `meta` reads every sheet's comments; the workbook-wide
+        // reports read no sheet, the legacy flag neither.
+        .{ .argv = &.{ "meta", p, "--lazy" }, .mask = 0b111, .code = 0 },
+        .{ .argv = &.{ "list-sheets", p, "--lazy" }, .mask = 0, .code = 0 },
+        .{ .argv = &.{ "styles", p, "--lazy" }, .mask = 0, .code = 0 },
+        .{ .argv = &.{ "sst", p, "--lazy" }, .mask = 0, .code = 0 },
+        .{ .argv = &.{ "rows", p, "--lazy", "--list-sheets" }, .mask = 0, .code = 0 },
+        .{ .argv = &.{ "pivots", p, "--lazy", "--list-sheets" }, .mask = 0, .code = 0 },
+    };
+    for (cases) |c| {
+        var r = try s3e3Run(io, c.argv);
+        defer r.deinit();
+        try std.testing.expect(r.opened);
+        try std.testing.expect(r.archive_open);
+        try std.testing.expect(!r.sst_lazy_backend);
+        try std.testing.expectEqual(c.mask, r.loaded_mask);
+        try std.testing.expectEqual(@popCount(c.mask), r.loaded_before);
+        try std.testing.expectEqual(r.loaded_before, r.loaded_after);
+        try std.testing.expectEqual(c.code, r.code);
+    }
+}
+
+test "S3e slice 3: every read sub-command writes the same bytes and exits the same under --lazy as under the eager opener, on the same selection — the preload covers every sheet the emitters touch" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const p = try writeS3eLazyFixture(io, &tt, "s3e3_parity.xlsx");
+    defer std.testing.allocator.free(p);
+
+    try s3e3Parity(io, &.{ "rows", p }, 1, true);
+    try s3e3Parity(io, &.{ "rows", p, "--sheet", "1", "--output", "compact-ndjson" }, 1, true);
+    try s3e3Parity(io, &.{ "rows", p, "--all-sheets", "--header" }, 3, true);
+    try s3e3Parity(io, &.{ "rows", p, "--name", "Data", "--format", "csv" }, 1, true);
+    try s3e3Parity(io, &.{ "rows", p, "--range", "A1:B2", "--with-styles" }, 1, true);
+    try s3e3Parity(io, &.{ "cells", p, "--sheet-glob", "D*", "--include-blanks" }, 1, true);
+    try s3e3Parity(io, &.{ "cells", p, "--all-sheets", "--skip", "1", "--take", "3" }, 3, true);
+    try s3e3Parity(io, &.{ "comments", p }, 3, true);
+    try s3e3Parity(io, &.{ "comments", p, "--name", "Beta", "--output", "compact-ndjson" }, 1, true);
+    try s3e3Parity(io, &.{ "validations", p }, 3, true);
+    try s3e3Parity(io, &.{ "validations", p, "--sheet-glob", "*a" }, 3, true);
+    try s3e3Parity(io, &.{ "hyperlinks", p, "--sheet", "2" }, 1, true);
+    try s3e3Parity(io, &.{ "hyperlinks", p, "--all-sheets" }, 3, true);
+    try s3e3Parity(io, &.{ "merges", p }, 3, true);
+    try s3e3Parity(io, &.{ "merges", p, "--sheet", "0" }, 1, true);
+    try s3e3Parity(io, &.{ "meta", p }, 3, true);
+    try s3e3Parity(io, &.{ "meta", p, "--output", "pretty-json" }, 3, true);
+    try s3e3Parity(io, &.{ "list-sheets", p }, 0, true);
+    // The writer emits no style beyond the defaults: an empty, successful stream on both.
+    try s3e3Parity(io, &.{ "styles", p }, 0, false);
+    try s3e3Parity(io, &.{ "sst", p }, 0, true);
+    try s3e3Parity(io, &.{ "rows", p, "--list-sheets" }, 0, true);
+    // The selection's refusals: the same exit 3, the same message.
+    try s3e3Parity(io, &.{ "rows", p, "--sheet", "7" }, 0, false);
+    try s3e3Parity(io, &.{ "comments", p, "--name", "Nope" }, 0, false);
+}
+
+test "S3e slice 3: on a workbook whose second sheet part is missing, --lazy reads the sheets it is asked for and refuses, before any record and at the eager exit code, when the selection reaches the torn one — the eager opener refuses every selection" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = std.testing.allocator;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const intact = try writeS3eLazyFixture(io, &tt, "s3e3_intact.xlsx");
+    defer alloc.free(intact);
+    const torn = try tt.path(alloc, io, "s3e3_torn.xlsx");
+    defer alloc.free(torn);
+    {
+        var probe = try xlsx.Book.open(alloc, io, intact);
+        defer probe.deinit();
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, intact);
+        defer wb.deinit();
+        try wb.store.removePart(probe.sheets[1].path);
+        try wb.save(io, torn);
+    }
+    try std.testing.expectError(error.MissingSheet, xlsx.Book.open(alloc, io, torn));
+
+    // The eager opener: exit 2 whatever the selection, nothing written.
+    for ([_][]const []const u8{ &.{ "rows", torn }, &.{ "list-sheets", torn }, &.{ "comments", torn, "--name", "Alpha" } }) |argv| {
+        var r = try s3e3Run(io, argv);
+        defer r.deinit();
+        try std.testing.expect(!r.opened);
+        try std.testing.expectEqual(@as(u8, 2), r.code);
+        try std.testing.expectEqual(@as(usize, 0), r.out.written().len);
+        try std.testing.expect(std.mem.indexOf(u8, r.err.written(), "cannot open") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.err.written(), "MissingSheet") != null);
+    }
+    // `--lazy` on a selection that never touches the torn sheet: the
+    // bytes the eager opener writes for the intact file.
+    const Served = struct { torn_argv: []const []const u8, intact_argv: []const []const u8 };
+    for ([_]Served{
+        .{ .torn_argv = &.{ "rows", torn, "--lazy" }, .intact_argv = &.{ "rows", intact } },
+        .{ .torn_argv = &.{ "cells", torn, "--lazy", "--sheet", "2" }, .intact_argv = &.{ "cells", intact, "--sheet", "2" } },
+        .{ .torn_argv = &.{ "comments", torn, "--lazy", "--name", "Alpha" }, .intact_argv = &.{ "comments", intact, "--name", "Alpha" } },
+        .{ .torn_argv = &.{ "hyperlinks", torn, "--lazy", "--sheet-glob", "D*" }, .intact_argv = &.{ "hyperlinks", intact, "--sheet-glob", "D*" } },
+        .{ .torn_argv = &.{ "list-sheets", torn, "--lazy" }, .intact_argv = &.{ "list-sheets", intact } },
+        .{ .torn_argv = &.{ "sst", torn, "--lazy" }, .intact_argv = &.{ "sst", intact } },
+    }) |c| {
+        var on_torn = try s3e3Run(io, c.torn_argv);
+        defer on_torn.deinit();
+        var on_intact = try s3e3Run(io, c.intact_argv);
+        defer on_intact.deinit();
+        try std.testing.expect(on_torn.opened);
+        try std.testing.expectEqual(@as(u8, 0), on_torn.code);
+        try std.testing.expectEqual(@as(u8, 0), on_intact.code);
+        try std.testing.expect(on_intact.out.written().len != 0);
+        try std.testing.expectEqualStrings(on_intact.out.written(), on_torn.out.written());
+        try std.testing.expectEqual(@as(usize, 0), on_torn.err.written().len);
+        try std.testing.expectEqual(@as(u64, 0), on_torn.loaded_mask & 0b010);
+    }
+    // `--lazy` on a selection that reaches it: the opener's exit code,
+    // the sheet named, nothing written.
+    for ([_][]const []const u8{
+        &.{ "rows", torn, "--lazy", "--sheet", "1" },
+        &.{ "cells", torn, "--lazy", "--name", "Beta" },
+        &.{ "rows", torn, "--lazy", "--all-sheets" },
+        &.{ "comments", torn, "--lazy" },
+        &.{ "merges", torn, "--lazy", "--sheet-glob", "B*" },
+        &.{ "meta", torn, "--lazy" },
+    }) |argv| {
+        var r = try s3e3Run(io, argv);
+        defer r.deinit();
+        try std.testing.expect(!r.opened);
+        try std.testing.expectEqual(@as(u8, 2), r.code);
+        try std.testing.expectEqual(@as(usize, 0), r.out.written().len);
+        try std.testing.expect(std.mem.indexOf(u8, r.err.written(), "cannot open") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.err.written(), "MissingSheet (sheet 'Beta')") != null);
+    }
 }
