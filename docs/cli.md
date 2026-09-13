@@ -886,6 +886,13 @@ selectors are tolerated and ignored).
 ```bash
 --include-blanks              # emit t:"blank" records for empty cells
 --with-styles                 # attach terse style: {bold?, italic?, fg?, bg?, nf?, border?}
+```
+
+**Opening strategies** (accepted on every sub-command; they shape the reader
+`Book` the read family opens, so they are no-ops on the edit family and the
+package-layer reads; mutually exclusive with each other):
+
+```bash
 --sst-lazy                    # open with Book.openSstLazy — defer SST decode until first
                               # cell access (huge-workbook RAM mitigation; sparse access
                               # wins, full sweeps cost a bit more). Neither backend refuses
@@ -903,11 +910,8 @@ selectors are tolerated and ignored).
                               # opener refuses at open (missing, malformed side index) is
                               # refused at the same exit code, the sheet named on stderr,
                               # nothing written — but only when the selection reaches it;
-                              # a tear in an unvisited sheet goes unreported. Accepted on
-                              # every sub-command, a no-op where no reader Book is opened
-                              # (the edit family, the package-layer reads). Mutually
-                              # exclusive with --sst-lazy (exit 1: the reader has no opener
-                              # with both strategies).
+                              # a tear in an unvisited sheet goes unreported. With
+                              # --sst-lazy: exit 1 (the reader has no opener with both).
 ```
 
 **Output modes**:

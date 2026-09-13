@@ -499,8 +499,16 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         } else if (std.mem.eql(u8, a, "--with-styles")) {
             out.with_styles = true;
         } else if (std.mem.eql(u8, a, "--sst-lazy")) {
+            // S3e slice 3: the reader has no public opener with lazy
+            // sheets AND a lazy SST (`openLazyWithSst(.path, .lazy)`
+            // without the eager facade is private), so the pair is
+            // refused at the second flag — inside the scan, where
+            // `SheetArgConflict` is judged, so a later `--help` cannot
+            // outrank it (r1 ARG-102) — rather than one flag winning.
+            if (out.lazy) return ArgError.LazyStrategyConflict;
             out.sst_lazy = true;
         } else if (std.mem.eql(u8, a, "--lazy")) {
+            if (out.sst_lazy) return ArgError.LazyStrategyConflict;
             out.lazy = true;
         } else if (std.mem.eql(u8, a, "--out")) {
             i += 1;
@@ -896,11 +904,6 @@ fn parseArgs(raw_argv: []const []const u8) ArgError!Args {
         => {},
         else => return ArgError.BadArgValue,
     };
-    // S3e slice 3: the reader has no public opener with lazy sheets
-    // AND a lazy SST (`openLazyWithSst(.path, .lazy)` without the
-    // eager facade is private), so the pair is refused before any
-    // file is touched rather than one flag silently winning.
-    if (out.lazy and out.sst_lazy) return ArgError.LazyStrategyConflict;
     return out;
 }
 
@@ -12194,6 +12197,14 @@ test "S3e slice 3: parseArgs — --lazy is a boolean flag accepted on every sub-
         const a = try parseArgs(&argv);
         try std.testing.expect(a.lazy);
     }
+    // The edit family and `embed` accept it too (a no-op there: no
+    // reader `Book` is opened) — the docs claim "every sub-command"
+    // (r1 TST-103).
+    for ([_][]const u8{ "append-rows", "set-cell", "insert-row", "delete-row", "insert-column", "delete-column", "add-sheet", "rename-sheet", "delete-sheet", "rename-table-column", "scrub-metadata", "embed" }) |sub| {
+        const argv = [_][]const u8{ sub, "f.xlsx", "--out", "o.xlsx", "--lazy" };
+        const a = try parseArgs(&argv);
+        try std.testing.expect(a.lazy);
+    }
     {
         const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy", "--sst-lazy" };
         try std.testing.expectError(ArgError.LazyStrategyConflict, parseArgs(&argv));
@@ -12201,6 +12212,17 @@ test "S3e slice 3: parseArgs — --lazy is a boolean flag accepted on every sub-
     {
         const argv = [_][]const u8{ "sst", "f.xlsx", "--sst-lazy", "--lazy" };
         try std.testing.expectError(ArgError.LazyStrategyConflict, parseArgs(&argv));
+    }
+    // Judged at the second flag, inside the scan: a `--help` behind the
+    // pair does not outrank it, as it does not outrank
+    // `SheetArgConflict` (r1 ARG-102).
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy", "--sst-lazy", "--help" };
+        try std.testing.expectError(ArgError.LazyStrategyConflict, parseArgs(&argv));
+    }
+    {
+        const argv = [_][]const u8{ "rows", "f.xlsx", "--sheet", "1", "--all-sheets", "--help" };
+        try std.testing.expectError(ArgError.SheetArgConflict, parseArgs(&argv));
     }
     {
         const argv = [_][]const u8{ "rows", "f.xlsx", "--lazy=1" };
