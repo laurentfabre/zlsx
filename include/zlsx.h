@@ -2613,10 +2613,16 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * The recalc transactions carry the registrations (the save-plan
  * fold): zlsx_editor_save_with_recalc writes them beside the recalc,
  * zlsx_editor_recalculate leaves them staged for the save after it.
- * Structural edits (insert_row, …) and append_row on a sheet with a
- * staged cell style refuse as they do for a staged cell write
- * (SheetHasUnsavedMutations); a cell style on a sheet with appended
- * rows refuses SheetHasUnsavedAppends. */
+ * Structural edits (insert_row, …), append_row and
+ * embeddable_rows_ndjson on a sheet with a staged cell style refuse as
+ * they do for a staged cell write (SheetHasUnsavedMutations); a cell
+ * style on a sheet with appended rows refuses SheetHasUnsavedAppends.
+ * A sheet with a staged cell style is re-emitted at save as a sheet
+ * with a staged cell write is: its <sheetData> regenerated from the
+ * typed view — row attributes (ht, customHeight, hidden, spans, a
+ * row's own s) and shared-formula group attributes are not carried
+ * (zlsx_editor_set_cell's rule, pre-existing) — so a style alone costs
+ * what a value write costs. */
 int32_t zlsx_editor_add_style(zlsx_editor_t * ed,
         const zlsx_style_t * spec, uint32_t * out_index,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

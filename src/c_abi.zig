@@ -11786,6 +11786,10 @@ export fn zlsx_editor_add_style(
     err_buf: ?[*]u8,
     err_buf_len: usize,
 ) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const s = spec orelse {
         writeError(err_buf, err_buf_len, "InvalidInput");
@@ -11796,7 +11800,6 @@ export fn zlsx_editor_add_style(
         return ZLSX_ERROR;
     };
     out.* = 0;
-    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const style = styleFromC(s, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const idx = state.inner.workbook.addStyle(style) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
@@ -11818,6 +11821,10 @@ export fn zlsx_editor_add_dxf(
     err_buf: ?[*]u8,
     err_buf_len: usize,
 ) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const d = dxf orelse {
         writeError(err_buf, err_buf_len, "InvalidInput");
@@ -11828,7 +11835,6 @@ export fn zlsx_editor_add_dxf(
         return ZLSX_ERROR;
     };
     out.* = 0;
-    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const id = state.inner.workbook.addDxf(dxfFromC(d)) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
     };
@@ -11851,6 +11857,10 @@ export fn zlsx_editor_intern_num_fmt(
     err_buf: ?[*]u8,
     err_buf_len: usize,
 ) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     const out = out_id orelse {
         writeError(err_buf, err_buf_len, "InvalidInput");
@@ -11858,7 +11868,6 @@ export fn zlsx_editor_intern_num_fmt(
     };
     out.* = 0;
     const code = bytesArg(ptr, len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
-    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
     const id = state.inner.workbook.internNumFmt(code) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
     };
@@ -11886,8 +11895,11 @@ export fn zlsx_editor_set_cell_style(
     err_buf: ?[*]u8,
     err_buf_len: usize,
 ) callconv(.c) i32 {
-    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
     if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
     state.inner.setCellStyle(sheet_idx, row, col, style_idx) catch |e| {
         return failMapped(e, diag, err_buf, err_buf_len);
     };
@@ -14117,21 +14129,23 @@ test "S3d slice 1 editor styles: statements about the call are -1 with the name 
     var dxf = s3d1Dxf();
     var idx: u32 = 99;
 
-    // A verdict before the diag is prepped (a NULL handle, spec or out)
-    // leaves it as the caller built it; one after carries plane NONE
-    // and no name. Each case starts from a fresh diag.
+    // The diag is prepped before any verdict — a NULL handle, spec or
+    // out included — so every `-1` leaves it at plane NONE with no
+    // name, never an earlier call's refusal. Each case starts from a
+    // diag that carries one, to prove the prep.
     const expectCase = struct {
         fn run(status: i32, name: []const u8, err: []const u8, diag: *CDiag) !void {
             try std.testing.expectEqual(ZLSX_ERROR, status);
             try std.testing.expectEqualStrings(name, std.mem.sliceTo(err, 0));
-            const prepped = !std.mem.eql(u8, name, "InvalidInput");
-            try std.testing.expectEqual(if (prepped) plane_none else @as(u32, 0), diag.plane);
+            try std.testing.expectEqual(plane_none, diag.plane);
             try std.testing.expectEqual(@as(usize, 0), diagName(diag).len);
             diag.* = freshDiag();
+            diag.plane = 7;
+            diagSetError(diag, "MalformedStylesXml");
         }
     }.run;
     var diag = freshDiag();
-    try std.testing.expectEqual(@as(u32, 0), diag.plane);
+    diagSetError(&diag, "MalformedStylesXml");
     // NULL handle / spec / out.
     try expectCase(zlsx_editor_add_style(null, &spec, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
     try expectCase(zlsx_editor_add_style(ed, null, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);

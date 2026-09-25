@@ -469,7 +469,10 @@ appends a second record). A save drains the registrations; the next one reads
 the extended part afresh, so indices keep counting up across saves in one
 editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
 
-A staged style is a staged cell write to the structural edits and
+A sheet with a staged style is re-emitted at save as a sheet with a `set_cell`
+is (row heights / hidden flags / spans and shared-formula group attributes are
+not carried — `set_cell`'s pre-existing rule). A staged style is a staged cell
+write to the structural edits and
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is

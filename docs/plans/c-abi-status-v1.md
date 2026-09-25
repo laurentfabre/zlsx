@@ -3209,6 +3209,23 @@ reserved its slot, fixed). Python: `Editor.add_style` / `add_dxf` /
 writer's `_style_spec` / `_dxf_spec` marshalling shared (factored out
 of `Writer.add_style` / `add_dxf`, unchanged behaviour).
 
+**What a cell style costs.** A sheet with a staged cell style is
+re-emitted at save as a sheet with a staged cell write is: its
+`<sheetData>` regenerated from the typed view by the delta emitter —
+row attributes (`ht`, `customHeight`, `hidden`, `spans`, a row's own
+`s` / `customFormat`), shared-formula group attributes (`t="shared"
+ref si`, the follower's empty `<f>`) and rich inline runs are not
+carried, and `<dimension>` is not widened — pre-existing since the
+delta emitter (`setCell` does the same), newly reachable from a call
+that changes only a style (in-house r2 A/B-EMT-202, measured on
+`worldbank_catalog.xlsx`: the header row's `s="3" customFormat="1"`
+and 161 `spans` gone; `phpoi_test1.xlsx`: `ht="30"`), stated on every
+new surface; the fix — a byte-preserving cell patch, or a row-attribute
+carrying re-emit — is an owner follow-up on the delta emitter, not this
+slice's. On a pivot host sheet whose staged writes the pivot render
+splices, a staged style stays for the sheet phase, which re-emits the
+spliced bytes once more with the `s` on top (r2 B-PIV-204).
+
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
 spells is appended a second time (a read-back of the part's records as
@@ -3227,7 +3244,22 @@ mark-recalc; the CLI leg of the trio; dedup against the part's records.
 (`dxfIdBound`, the baseline read whether or not a registration cached
 it — in-house r1 B-DXF-103), so an id the part holds and an `addDxf` id
 are both accepted by `addConditionalFormat*` on an opened workbook,
-though the rule itself still lands on the fresh path only. The
+though the rule itself still lands on the fresh path only. On the
+fresh path, `Workbook.empty` + `internNumFmt` alone reports
+`hasUnsavedChanges` while `saveFreshEmit` (gated on the plan's
+`isEmpty`, which ignores the format pool) writes no styles part — the
+drop is pre-existing, the predicate now names the staged work (r2
+B-FRESH-207; the opened path lands it). The Python surfaces differ on
+one name: `Writer.add_style(Style(font_size=0))` raises the writer's
+`InvalidFontSize`, `Editor.add_style` the editor's `InvalidStyle`
+(`Workbook.addStyle`'s fold) — stated on the docstring (r2 B-DOC-206).
+A part whose `numFmtId`s leave no room for one more format refuses
+`MalformedStylesXml` at the registration, judged before the plan takes
+it (r2 A/B-OVF-201: the mapping's add panicked on `4294967294` plus
+two formats); an entity-spelled `numFmtId` is read as the number it is
+(r2 A-FMT-203); a cell style alone maps against the part's records —
+no slot 0 on an empty `<cellXfs>` — and a part moved underneath it
+refuses at the save too (r2 A-IDX-205). The
 transaction's view rebuild (`recalc_txn.buildViews`) counts a staged
 style as staged cell work (in-house r1 A/B-TXN-101: a style-only sheet
 folded through a candidate kept its pre-swap view, and the next plain

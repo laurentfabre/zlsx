@@ -5359,7 +5359,9 @@ class Editor:
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
-        non-positive font size."""
+        non-positive font size — where :meth:`Writer.add_style` names
+        the writer's ``InvalidFontSize``: the editor folds the plan's
+        verdicts as ``Workbook.addStyle`` does."""
         self._styles_available()
         spec, keepalive = _style_spec(style)
         out = ctypes.c_uint32(0)
@@ -5423,8 +5425,14 @@ class Editor:
         blank Excel writes); a cell with a value, staged or not, keeps
         it; the last call for a cell wins, and a delete of the cell wins
         over its style. A staged style is a staged cell write to the
-        structural edits and :meth:`append_rows` (``SheetHasUnsavedMutations``);
-        on a sheet with appended rows it refuses ``SheetHasUnsavedAppends``.
+        structural edits, :meth:`append_rows` and :meth:`embeddable_rows`
+        (``SheetHasUnsavedMutations``); on a sheet with appended rows it
+        refuses ``SheetHasUnsavedAppends``. The sheet is re-emitted at
+        save as a sheet with a :meth:`set_cell` is — its ``<sheetData>``
+        regenerated from the typed view, row attributes (heights, hidden,
+        spans) and shared-formula group attributes not carried
+        (:meth:`set_cell`'s rule, pre-existing) — so a style alone costs
+        what a value write costs.
 
         Raises :class:`ZlsxError` ``UnknownStyleIndex`` past both ranges
         (judged before anything is staged), ``SheetIndexOutOfRange``,
