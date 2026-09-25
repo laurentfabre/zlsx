@@ -3056,6 +3056,134 @@ SheetWriter.add_conditional_format_color_scale = _sheet_add_conditional_format_c
 SheetWriter.add_conditional_format_data_bar = _sheet_add_conditional_format_data_bar  # type: ignore[attr-defined]
 
 
+def _border_style_code(side: "BorderSide") -> int:
+    if side.style not in _BORDER_STYLE_VALUES:
+        raise ValueError(f"unknown border style: {side.style!r}")
+    return _BORDER_STYLE_VALUES[side.style]
+
+
+def _style_spec(style: "Style"):
+    """A :class:`Style` as the ``zlsx_style_t`` the C ABI reads — the one
+    marshalling :meth:`Writer.add_style` and :meth:`Editor.add_style`
+    share. Returns ``(spec, keepalive)``: hold ``keepalive`` until the
+    call returns (the spec borrows the two string buffers)."""
+    flags = 0
+    if style.font_size is not None:
+        flags |= _ffi.FONT_SIZE_SET
+    if style.font_color_argb is not None:
+        flags |= _ffi.FONT_COLOR_SET
+    if style.fill_fg_argb is not None:
+        flags |= _ffi.FILL_FG_SET
+    if style.fill_bg_argb is not None:
+        flags |= _ffi.FILL_BG_SET
+
+    # Distinguish "unset" (None) from "empty string" — the latter
+    # is invalid and must reach the Zig side as font_name_len=0
+    # with an explicit sentinel that triggers InvalidFontName.
+    if style.font_name is None:
+        name_bytes = b""
+    elif style.font_name == "":
+        raise ZlsxError("InvalidFontName")
+    else:
+        name_bytes = style.font_name.encode("utf-8")
+
+    if style.number_format is None:
+        num_fmt_bytes = b""
+    elif style.number_format == "":
+        raise ZlsxError("InvalidNumberFormat")
+    else:
+        num_fmt_bytes = style.number_format.encode("utf-8")
+    # Keep the bytes buffer alive through the FFI call.
+    name_buf = (ctypes.c_ubyte * max(len(name_bytes), 1)).from_buffer_copy(
+        name_bytes or b"\x00"
+    )
+    num_fmt_buf = (ctypes.c_ubyte * max(len(num_fmt_bytes), 1)).from_buffer_copy(
+        num_fmt_bytes or b"\x00"
+    )
+
+    if style.alignment_horizontal not in _HALIGN_VALUES:
+        raise ValueError(
+            f"unknown alignment_horizontal: {style.alignment_horizontal!r}"
+        )
+    if style.fill_pattern not in _PATTERN_VALUES:
+        raise ValueError(
+            f"unknown fill_pattern: {style.fill_pattern!r}"
+        )
+
+    flags2 = 0
+    if style.border_left.color_argb is not None:
+        flags2 |= _ffi.BORDER_LEFT_COLOR_SET
+    if style.border_right.color_argb is not None:
+        flags2 |= _ffi.BORDER_RIGHT_COLOR_SET
+    if style.border_top.color_argb is not None:
+        flags2 |= _ffi.BORDER_TOP_COLOR_SET
+    if style.border_bottom.color_argb is not None:
+        flags2 |= _ffi.BORDER_BOTTOM_COLOR_SET
+    if style.border_diagonal.color_argb is not None:
+        flags2 |= _ffi.BORDER_DIAGONAL_COLOR_SET
+
+    spec = _ffi.CStyle(
+        font_bold=1 if style.font_bold else 0,
+        font_italic=1 if style.font_italic else 0,
+        alignment_horizontal=_HALIGN_VALUES[style.alignment_horizontal],
+        wrap_text=1 if style.wrap_text else 0,
+        flags=flags,
+        fill_pattern=_PATTERN_VALUES[style.fill_pattern],
+        flags2=flags2,
+        font_size=float(style.font_size or 0.0),
+        font_color_argb=_check_argb("font_color_argb", style.font_color_argb),
+        fill_fg_argb=_check_argb("fill_fg_argb", style.fill_fg_argb),
+        fill_bg_argb=_check_argb("fill_bg_argb", style.fill_bg_argb),
+        border_left_style=_border_style_code(style.border_left),
+        border_right_style=_border_style_code(style.border_right),
+        border_top_style=_border_style_code(style.border_top),
+        border_bottom_style=_border_style_code(style.border_bottom),
+        border_diagonal_style=_border_style_code(style.border_diagonal),
+        diagonal_up=1 if style.diagonal_up else 0,
+        diagonal_down=1 if style.diagonal_down else 0,
+        border_left_color_argb=_check_argb("border_left.color_argb", style.border_left.color_argb),
+        border_right_color_argb=_check_argb("border_right.color_argb", style.border_right.color_argb),
+        border_top_color_argb=_check_argb("border_top.color_argb", style.border_top.color_argb),
+        border_bottom_color_argb=_check_argb("border_bottom.color_argb", style.border_bottom.color_argb),
+        border_diagonal_color_argb=_check_argb("border_diagonal.color_argb", style.border_diagonal.color_argb),
+        font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        font_name_len=len(name_bytes),
+        num_fmt_ptr=ctypes.cast(num_fmt_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        num_fmt_len=len(num_fmt_bytes),
+    )
+    return spec, (name_buf, num_fmt_buf)
+
+
+def _dxf_spec(dxf: "Dxf") -> "_ffi.CDxf":
+    """A :class:`Dxf` as the ``zlsx_dxf_t`` the C ABI reads — shared by
+    :meth:`Writer.add_dxf` and :meth:`Editor.add_dxf`."""
+    def _side(s: "BorderSide") -> "_ffi.CDxfBorderSide":
+        style_code = _BORDER_STYLE_VALUES.get(s.style, 0)
+        return _ffi.CDxfBorderSide(
+            style=style_code,
+            has_color=1 if s.color_argb is not None else 0,
+            _pad=(ctypes.c_uint8 * 2)(0, 0),
+            color_argb=s.color_argb or 0,
+        )
+
+    c = _ffi.CDxf(
+        bold=1 if dxf.font_bold else 0,
+        italic=1 if dxf.font_italic else 0,
+        has_color=1 if dxf.font_color_argb is not None else 0,
+        has_fill=1 if dxf.fill_fg_argb is not None else 0,
+        color_argb=dxf.font_color_argb or 0,
+        fill_fg_argb=dxf.fill_fg_argb or 0,
+        has_size=1 if dxf.font_size is not None else 0,
+        _pad=(ctypes.c_uint8 * 3)(0, 0, 0),
+        size=dxf.font_size if dxf.font_size is not None else 0.0,
+        border_left=_side(dxf.border_left),
+        border_right=_side(dxf.border_right),
+        border_top=_side(dxf.border_top),
+        border_bottom=_side(dxf.border_bottom),
+    )
+    return c
+
+
 class Writer:
     """A xlsx workbook under construction.
 
@@ -3227,95 +3355,7 @@ class Writer:
                 "(requires 0.2.4+) — stage-2 style fields need the newer dylib"
             )
 
-        flags = 0
-        if style.font_size is not None:
-            flags |= _ffi.FONT_SIZE_SET
-        if style.font_color_argb is not None:
-            flags |= _ffi.FONT_COLOR_SET
-        if style.fill_fg_argb is not None:
-            flags |= _ffi.FILL_FG_SET
-        if style.fill_bg_argb is not None:
-            flags |= _ffi.FILL_BG_SET
-
-        # Distinguish "unset" (None) from "empty string" — the latter
-        # is invalid and must reach the Zig side as font_name_len=0
-        # with an explicit sentinel that triggers InvalidFontName.
-        if style.font_name is None:
-            name_bytes = b""
-        elif style.font_name == "":
-            raise ZlsxError("InvalidFontName")
-        else:
-            name_bytes = style.font_name.encode("utf-8")
-
-        if style.number_format is None:
-            num_fmt_bytes = b""
-        elif style.number_format == "":
-            raise ZlsxError("InvalidNumberFormat")
-        else:
-            num_fmt_bytes = style.number_format.encode("utf-8")
-        # Keep the bytes buffer alive through the FFI call.
-        name_buf = (ctypes.c_ubyte * max(len(name_bytes), 1)).from_buffer_copy(
-            name_bytes or b"\x00"
-        )
-        num_fmt_buf = (ctypes.c_ubyte * max(len(num_fmt_bytes), 1)).from_buffer_copy(
-            num_fmt_bytes or b"\x00"
-        )
-
-        if style.alignment_horizontal not in _HALIGN_VALUES:
-            raise ValueError(
-                f"unknown alignment_horizontal: {style.alignment_horizontal!r}"
-            )
-        if style.fill_pattern not in _PATTERN_VALUES:
-            raise ValueError(
-                f"unknown fill_pattern: {style.fill_pattern!r}"
-            )
-
-        def _bstyle(side: BorderSide) -> int:
-            if side.style not in _BORDER_STYLE_VALUES:
-                raise ValueError(f"unknown border style: {side.style!r}")
-            return _BORDER_STYLE_VALUES[side.style]
-
-        flags2 = 0
-        if style.border_left.color_argb is not None:
-            flags2 |= _ffi.BORDER_LEFT_COLOR_SET
-        if style.border_right.color_argb is not None:
-            flags2 |= _ffi.BORDER_RIGHT_COLOR_SET
-        if style.border_top.color_argb is not None:
-            flags2 |= _ffi.BORDER_TOP_COLOR_SET
-        if style.border_bottom.color_argb is not None:
-            flags2 |= _ffi.BORDER_BOTTOM_COLOR_SET
-        if style.border_diagonal.color_argb is not None:
-            flags2 |= _ffi.BORDER_DIAGONAL_COLOR_SET
-
-        spec = _ffi.CStyle(
-            font_bold=1 if style.font_bold else 0,
-            font_italic=1 if style.font_italic else 0,
-            alignment_horizontal=_HALIGN_VALUES[style.alignment_horizontal],
-            wrap_text=1 if style.wrap_text else 0,
-            flags=flags,
-            fill_pattern=_PATTERN_VALUES[style.fill_pattern],
-            flags2=flags2,
-            font_size=float(style.font_size or 0.0),
-            font_color_argb=_check_argb("font_color_argb", style.font_color_argb),
-            fill_fg_argb=_check_argb("fill_fg_argb", style.fill_fg_argb),
-            fill_bg_argb=_check_argb("fill_bg_argb", style.fill_bg_argb),
-            border_left_style=_bstyle(style.border_left),
-            border_right_style=_bstyle(style.border_right),
-            border_top_style=_bstyle(style.border_top),
-            border_bottom_style=_bstyle(style.border_bottom),
-            border_diagonal_style=_bstyle(style.border_diagonal),
-            diagonal_up=1 if style.diagonal_up else 0,
-            diagonal_down=1 if style.diagonal_down else 0,
-            border_left_color_argb=_check_argb("border_left.color_argb", style.border_left.color_argb),
-            border_right_color_argb=_check_argb("border_right.color_argb", style.border_right.color_argb),
-            border_top_color_argb=_check_argb("border_top.color_argb", style.border_top.color_argb),
-            border_bottom_color_argb=_check_argb("border_bottom.color_argb", style.border_bottom.color_argb),
-            border_diagonal_color_argb=_check_argb("border_diagonal.color_argb", style.border_diagonal.color_argb),
-            font_name_ptr=ctypes.cast(name_buf, ctypes.POINTER(ctypes.c_ubyte)),
-            font_name_len=len(name_bytes),
-            num_fmt_ptr=ctypes.cast(num_fmt_buf, ctypes.POINTER(ctypes.c_ubyte)),
-            num_fmt_len=len(num_fmt_bytes),
-        )
+        spec, keepalive = _style_spec(style)
         rc = _ffi.lib.zlsx_writer_add_style_ex(
             self._handle,
             ctypes.byref(spec),
@@ -3323,8 +3363,8 @@ class Writer:
             self._err,
             _ERR_BUF_LEN,
         )
-        # Keep name_buf alive until the call returns.
-        del name_buf
+        # The spec borrows the string buffers until the call returns.
+        del keepalive
         if rc != 0:
             raise ZlsxError(f"zlsx_writer_add_style_ex: {_decode_err(self._err)}")
         return int(out_idx.value)
@@ -3437,30 +3477,7 @@ class Writer:
                 "(requires 0.2.6+); upgrade libzlsx"
             )
 
-        def _side(s: "BorderSide") -> "_ffi.CDxfBorderSide":
-            style_code = _BORDER_STYLE_VALUES.get(s.style, 0)
-            return _ffi.CDxfBorderSide(
-                style=style_code,
-                has_color=1 if s.color_argb is not None else 0,
-                _pad=(ctypes.c_uint8 * 2)(0, 0),
-                color_argb=s.color_argb or 0,
-            )
-
-        c = _ffi.CDxf(
-            bold=1 if dxf.font_bold else 0,
-            italic=1 if dxf.font_italic else 0,
-            has_color=1 if dxf.font_color_argb is not None else 0,
-            has_fill=1 if dxf.fill_fg_argb is not None else 0,
-            color_argb=dxf.font_color_argb or 0,
-            fill_fg_argb=dxf.fill_fg_argb or 0,
-            has_size=1 if dxf.font_size is not None else 0,
-            _pad=(ctypes.c_uint8 * 3)(0, 0, 0),
-            size=dxf.font_size if dxf.font_size is not None else 0.0,
-            border_left=_side(dxf.border_left),
-            border_right=_side(dxf.border_right),
-            border_top=_side(dxf.border_top),
-            border_bottom=_side(dxf.border_bottom),
-        )
+        c = _dxf_spec(dxf)
         out_id = ctypes.c_uint32(0)
         rc = _ffi.lib.zlsx_writer_add_dxf(
             self._handle,
@@ -5296,6 +5313,127 @@ class Editor:
             return ctypes.string_at(out_ptr, out_len.value)
         finally:
             _ffi.lib.zlsx_buffer_release(out_ptr, out_len)
+
+    # ── S3d slice 1: styles on an opened workbook ─────────────────────
+
+    def _styles_available(self) -> None:
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EDITOR_STYLES:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_add_style / "
+                "add_dxf / intern_num_fmt / set_cell_style (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+
+    def _style_status(self, fn_name: str, rc: int, diag) -> None:
+        try:
+            if rc == _ffi.ZLSX_REFUSED:
+                raise _refusal_from_diag(diag)
+            if rc != _ffi.ZLSX_OK:
+                raise ZlsxError(f"{fn_name}: {_decode_err(self._err)}")
+        finally:
+            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
+
+    def add_style(self, style: "Style") -> int:
+        """Register a cell style on this workbook and return the
+        ``s="…"`` index its record takes in the saved ``xl/styles.xml``
+        — the slot after the records the part already holds (the part is
+        extended at :meth:`save` / :meth:`save_to_buffer` /
+        :meth:`save_with_recalc`, every other byte preserved; a
+        workbook without the part gets it whole). Feed the index to
+        :meth:`set_cell_style`. The fresh writer's :class:`Style`, the
+        same fields and the same bytes in the file.
+
+        Dedup is within one save, against this editor's registrations —
+        never against the part's own records: registering a style the
+        workbook already spells appends a second record. A save drains
+        the registrations; the next one reads the extended part afresh,
+        so indices keep counting up across saves in one editor.
+
+        Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
+        staged, the editor still saves the passthrough — when the
+        workbook's styles part cannot take an extension (no
+        ``<styleSheet>`` root, a table that never closes or sits out of
+        the schema's order, a ``numFmtId`` with no id above it);
+        :class:`ZlsxError` ``InvalidStyle`` for an empty font name or
+        format string, or a non-positive font size."""
+        self._styles_available()
+        spec, keepalive = _style_spec(style)
+        out = ctypes.c_uint32(0)
+        _report, diag = _fresh_report_and_diag()
+        rc = _ffi.lib.zlsx_editor_add_style(
+            self._handle, ctypes.byref(spec), ctypes.byref(out), ctypes.byref(diag), self._err, _ERR_BUF_LEN
+        )
+        del keepalive
+        self._style_status("zlsx_editor_add_style", rc, diag)
+        return int(out.value)
+
+    def add_dxf(self, dxf: "Dxf") -> int:
+        """Register a differential format on this workbook and return
+        the ``dxfId`` its record takes in the saved part — after the
+        ``<dxf>`` records it already holds. :meth:`add_style`'s rules
+        (dedup within the save, the refusal, the drain at save)."""
+        self._styles_available()
+        c = _dxf_spec(dxf)
+        out = ctypes.c_uint32(0)
+        _report, diag = _fresh_report_and_diag()
+        rc = _ffi.lib.zlsx_editor_add_dxf(
+            self._handle, ctypes.byref(c), ctypes.byref(out), ctypes.byref(diag), self._err, _ERR_BUF_LEN
+        )
+        self._style_status("zlsx_editor_add_dxf", rc, diag)
+        return int(out.value)
+
+    def intern_num_fmt(self, format_code: str) -> int:
+        """Intern an OOXML number format (``"0.00"``, ``"m/d/yyyy"``) on
+        this workbook and return the ``numFmtId`` it takes in the saved
+        part: the first free id above every ``<numFmt>`` the part holds,
+        164 at least; the same id for the same string within one save.
+        A :class:`Style` with ``number_format`` set interns its format
+        by itself — this is for a caller writing ``numFmtId`` elsewhere.
+        :meth:`add_style`'s refusal; :class:`ZlsxError` ``InvalidStyle``
+        for an empty string."""
+        self._styles_available()
+        code = format_code.encode("utf-8")
+        buf = (ctypes.c_ubyte * max(len(code), 1)).from_buffer_copy(code or b"\x00")
+        out = ctypes.c_uint32(0)
+        _report, diag = _fresh_report_and_diag()
+        rc = _ffi.lib.zlsx_editor_intern_num_fmt(
+            self._handle,
+            ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+            len(code),
+            ctypes.byref(out),
+            ctypes.byref(diag),
+            self._err,
+            _ERR_BUF_LEN,
+        )
+        del buf
+        self._style_status("zlsx_editor_intern_num_fmt", rc, diag)
+        return int(out.value)
+
+    def set_cell_style(self, sheet_idx: int, row: int, col: int, style_idx: int) -> None:
+        """Stage a style on the cell at (``row``, ``col``) of
+        ``sheet_idx`` — :meth:`set_cell`'s spelling: ``row`` 1-based,
+        ``col`` 0-based. After the save the cell's ``s="…"`` is
+        ``style_idx``: a slot the workbook's ``<cellXfs>`` already
+        holds, or one :meth:`add_style` returned for this save. A cell
+        the sheet lacks is created empty with the style (the formatted
+        blank Excel writes); a cell with a value, staged or not, keeps
+        it; the last call for a cell wins, and a delete of the cell wins
+        over its style. A staged style is a staged cell write to the
+        structural edits and :meth:`append_rows` (``SheetHasUnsavedMutations``);
+        on a sheet with appended rows it refuses ``SheetHasUnsavedAppends``.
+
+        Raises :class:`ZlsxError` ``UnknownStyleIndex`` past both ranges
+        (judged before anything is staged), ``SheetIndexOutOfRange``,
+        ``RowIndexOutOfRange``, ``ColumnIndexOutOfRange``; the
+        :class:`ZlsxRefusal` of :meth:`add_style`."""
+        self._styles_available()
+        _report, diag = _fresh_report_and_diag()
+        rc = _ffi.lib.zlsx_editor_set_cell_style(
+            self._handle, int(sheet_idx), int(row), int(col), int(style_idx), ctypes.byref(diag), self._err, _ERR_BUF_LEN
+        )
+        self._style_status("zlsx_editor_set_cell_style", rc, diag)
 
     def mark_recalc_on_load(self) -> None:
         """§5.7.7's mark-only transaction: keep every cached value, set

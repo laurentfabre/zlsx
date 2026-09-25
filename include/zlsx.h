@@ -2580,6 +2580,80 @@ int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
 int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* ── S3d slice 1: styles on the editor handle (probe: ZLSX_HAS_EDITOR_STYLES) ──
+ *
+ * The fresh writer's registrations on an OPENED workbook. A style, a
+ * dxf or a number format registered here lands in the workbook's
+ * xl/styles.xml at the next zlsx_editor_save / save_to_buffer /
+ * save_with_recalc: each table of the part extended after the records
+ * it already holds (a table the part lacks is created at its schema
+ * slot with the OOXML defaults in front; a workbook without the part
+ * gets it whole, with its relationship and content type), every other
+ * byte of the part preserved. The index returned is the slot the
+ * record takes in the SAVED part — feed it to
+ * zlsx_editor_set_cell_style, or to a cell's s="…" by other means.
+ * Dedup is within one save, against this save's registrations, never
+ * against the part's own records: registering a style the part
+ * already spells appends a second record. The save drains the
+ * registrations; a registration after it reads the extended part
+ * afresh, so indices keep counting up across saves in one editor.
+ *
+ * Statuses (status_v1): 0 with the out written; -1 a statement about
+ * the call — InvalidInput (a NULL handle, spec or out; a NULL format
+ * pointer with a non-zero length), BadAlignmentValue / BadFillPattern
+ * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
+ * InvalidStyle (an empty font name or format, a non-positive font
+ * size) — the out is 0; -2 MalformedStylesXml, the name in the diag
+ * with plane NONE: the part's <styleSheet> is missing or self-closed,
+ * a table never closes, a table sits out of the schema's order, or a
+ * numFmtId leaves no id above it — judged at the FIRST registration
+ * (or cell style) before anything is staged, so a refused editor
+ * saves the passthrough; -3 OutOfMemory. diag is optional (NULL ok).
+ *
+ * The recalc transactions carry the registrations (the save-plan
+ * fold): zlsx_editor_save_with_recalc writes them beside the recalc,
+ * zlsx_editor_recalculate leaves them staged for the save after it.
+ * Structural edits (insert_row, …) and append_row on a sheet with a
+ * staged cell style refuse as they do for a staged cell write
+ * (SheetHasUnsavedMutations); a cell style on a sheet with appended
+ * rows refuses SheetHasUnsavedAppends. */
+int32_t zlsx_editor_add_style(zlsx_editor_t * ed,
+        const zlsx_style_t * spec, uint32_t * out_index,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Register a differential format: *out_dxf_id is the dxfId the record
+ * takes in the saved part (after the <dxf> records it holds). A border
+ * code the header does not spell reads as none, as the writer reads
+ * it. Statuses as zlsx_editor_add_style's. */
+int32_t zlsx_editor_add_dxf(zlsx_editor_t * ed,
+        const zlsx_dxf_t * dxf, uint32_t * out_dxf_id,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Intern a number format (`ptr`, `len` bytes, not null-terminated):
+ * *out_id is the numFmtId it takes in the saved part — the first free
+ * id above every <numFmt> the part holds, 164 at least — the same id
+ * for the same bytes within one save. Statuses as
+ * zlsx_editor_add_style's; an empty format is InvalidStyle. */
+int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
+        const uint8_t * ptr, size_t len, uint32_t * out_id,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
+/* Stage a style on the cell at (`row`, `col`) of `sheet_idx` —
+ * zlsx_editor_set_cell's spelling: `row` 1-based, `col` 0-based.
+ * After the save the cell's s="…" is `style_idx`: a slot the
+ * workbook's <cellXfs> already holds, or one zlsx_editor_add_style
+ * returned for this save. A cell the sheet lacks is created empty
+ * with the style (the formatted blank Excel writes); a cell with a
+ * value, staged or not, keeps it; the last call for a cell wins, and
+ * a delete of the cell wins over its style. -1: InvalidInput (NULL
+ * handle), SheetIndexOutOfRange, RowIndexOutOfRange,
+ * ColumnIndexOutOfRange, UnknownStyleIndex (past both ranges —
+ * judged before anything is staged), SheetHasUnsavedAppends;
+ * -2 MalformedStylesXml; -3 OutOfMemory. */
+int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
+        uint32_t sheet_idx, uint32_t row, uint32_t col, uint32_t style_idx,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
@@ -2594,6 +2668,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
 #define ZLSX_HAS_EMBEDDING_SWEEPS 1   /* editor prune_embeddings + strip_embeddings + zlsx_prune_report_v1 (S3c slice 3) */
 #define ZLSX_HAS_LAZY_SHEETS      1   /* reader book_open_lazy + book_preload_sheet + book_stream_sheet (S3e slice 1) */
 #define ZLSX_HAS_LAZY_SST         1   /* reader book_open_sst_lazy + book_shared_string (S3e slice 2) */
+#define ZLSX_HAS_EDITOR_STYLES    1   /* editor add_style + add_dxf + intern_num_fmt + set_cell_style (S3d slice 1) */
 
 
 #ifdef __cplusplus

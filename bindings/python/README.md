@@ -436,6 +436,50 @@ the grid (a split pane is the one such an edit refuses,
 `full_calc_on_load` in place; staged cell writes never touch the
 extent, the views or `<calcPr>`.
 
+## Styles on an existing workbook
+
+libzlsx 0.9.0+ exports the fresh writer's style registrations on an *opened*
+workbook (S3d slice 1). `Editor.add_style` / `add_dxf` / `intern_num_fmt`
+return the slot the record takes in the saved `xl/styles.xml` — the part is
+extended after the records it already holds, every other byte preserved —
+and `Editor.set_cell_style` puts the index on a cell (a cell the sheet lacks
+is created empty with it; a value keeps its value). The `Style` / `Dxf` /
+`BorderSide` classes are the writer's (see *Style cheat sheet*).
+
+```python
+from zlsx import BorderSide, Style
+
+with zlsx.edit("report.xlsx") as ed:
+    highlight = ed.add_style(Style(
+        font_bold=True,
+        fill_pattern="solid", fill_fg_argb=0xFFFFFF00,
+        border_top=BorderSide(style="thin"),
+        number_format="yyyy-mm-dd",
+    ))                                     # the index of the NEW <xf>, after the part's own
+    ed.set_cell_style(0, 2, 0, highlight)  # sheet 0, row 2, column A
+    ed.set_cell(0, 2, 1, 42.5)
+    ed.set_cell_style(0, 2, 1, highlight)  # a staged value takes the style too
+    ed.set_cell_style(0, 9, 0, 0)          # any slot the part already holds
+    ed.save("styled.xlsx")
+```
+
+Dedup is within one save, against this editor's registrations — never against
+the part's own records (registering a style the workbook already spells
+appends a second record). A save drains the registrations; the next one reads
+the extended part afresh, so indices keep counting up across saves in one
+editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
+
+A staged style is a staged cell write to the structural edits and
+`append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
+refuses `SheetHasUnsavedAppends`; an index past the part and the
+registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
+staged. A styles part the extension cannot read (no `<styleSheet>` root, a
+table that never closes or sits out of the schema's order) raises
+`ZlsxRefusal` `MalformedStylesXml` at the first registration — nothing
+staged, the editor still saves the passthrough. The per-sheet layout
+registrations (column widths, panes, merges, hyperlinks, comments, DV / CF)
+on an opened sheet are the next S3d slice.
+
 ## Embeddings
 
 libzlsx 0.9.0+ writes the embedding set the E5 read surface reports:
@@ -756,6 +800,9 @@ with zlsx.write("out.xlsx") as w:
   formulas, pivot locations and sources); what cannot be kept consistent
   refuses with a typed
   `ZlsxRefusal` — see *Structural edits & pivots*
+- Styles on an existing workbook (0.9.0+): `Editor.add_style` / `add_dxf` /
+  `intern_num_fmt` return the slot in the saved `xl/styles.xml`,
+  `Editor.set_cell_style` puts it on a cell — see *Styles on an existing workbook*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts
 - Defined names, typed read (0.9.0+): `Editor.defined_names()` /

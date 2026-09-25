@@ -3087,3 +3087,135 @@ predates the slice; the CLI leg of per-sheet loading (the matrix's
 fourth column) is S3e's third slice (`--lazy`, 2026-09-13; matrix
 footnote ²⁹ — no C change; `--lazy --sst-lazy` refused there for the
 same missing primitive).
+
+
+## 25. S3d slice 1 — styles on the editor handle (2026-09-25)
+
+Four exports on the EDITOR handle, `zlsx_status_v1`, one macro, one
+probe, no release function, the `zlsx_diag_v1` for the one refusal.
+The row's Zig surface is `Workbook.addStyle` / `addDxf` /
+`internNumFmt` — the fresh writer's registrations — and the NEW
+`Worksheet.setCellStyle`; what the slice made true first is that the
+registrations land on an OPENED workbook: before it they reached the
+fresh-emit plan only (`saveFreshEmit`'s input) and `Workbook.save` on an
+opened archive never read it — the index came back fresh-relative
+(1-based over an empty table) and the saved `xl/styles.xml` was
+byte-identical to the source (measured on `main`, pinned). Now the save
+renders the plan INTO the existing part, and the index a registration
+returns is the slot its record takes there.
+
+| Export | Zig | Probe (`_ffi.py`) | Header macro |
+|---|---|---|---|
+| `zlsx_editor_add_style(ed, spec, out_index, diag, errbuf, len) → int32_t` | `Workbook.addStyle` | `_HAS_EDITOR_STYLES` | `ZLSX_HAS_EDITOR_STYLES` |
+| `zlsx_editor_add_dxf(ed, dxf, out_dxf_id, diag, errbuf, len) → int32_t` | `Workbook.addDxf` | (same) | (same) |
+| `zlsx_editor_intern_num_fmt(ed, ptr, len, out_id, diag, errbuf, len) → int32_t` | `Workbook.internNumFmt` | (same) | (same) |
+| `zlsx_editor_set_cell_style(ed, sheet_idx, row, col, style_idx, diag, errbuf, len) → int32_t` | `Editor.setCellStyle` → `Worksheet.setCellStyle` | (same) | (same) |
+
+**What the index is.** The part's tables are read once per save —
+`scanStylesPart`, one lexical walk on the workbook scanner
+(`findTagOpen` / `findClosingTag`: comment / CDATA / PI decoys skipped,
+quoted `>` respected), the CHILDREN of `<numFmts>` / `<fonts>` /
+`<fills>` / `<borders>` / `<cellXfs>` / `<dxfs>` counted, never a
+`count` attribute — into a `styles_plan.Base`: the slot each table's
+next record takes, and the first free `numFmtId` above every `<numFmt>`
+present (164 at least). `addStyle` returns `base.cell_xfs + position`,
+`addDxf` `base.dxfs + position`, `internNumFmt` `base.num_fmt_next +
+position`; the fresh layout (`Base.fresh`: one font, two fills, one
+border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
+so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
+unchanged byte for byte (its parity pins hold). The walk's agreement
+with the typed parser (`styles_xml.parse`) is pinned over the corpus:
+on every fixture with a styles part the index equals the parser's
+`cell_xfs.len`, and after the save the parser's tables have grown by
+exactly the plan and the new `<xf>` names the new font, fill and
+border. The base is cached while the plan is staged (nothing moves the
+part underneath a staged plan — a recalc transaction never touches it;
+the splice asserts the layout it reads is the one the registrations
+mapped against) and forgotten when the plan drains.
+
+**What the save writes.** `applySavePlans` (the plain save, the
+buffer save, `saveWithRecalc`'s `.none` arm) and `foldSavePlansInto`
+(the candidate arms) call one renderer, `applyStylesPlanInto(store)`:
+`StylesPlan.emitFragments(base)` — the emitter the fresh part uses,
+factored so each table's children come out separately with every
+cross-table id (`fontId`, `fillId`, `borderId`, `numFmtId`) offset by
+the base — spliced by `spliceStylesFragments`: an owned table with
+records to add is rewritten in place (its own children verbatim, the
+plan's after, its `count` rewritten where it spells one and left absent
+where not); a table the part lacks is created at its schema slot
+(after the nearest present predecessor, else right after the root's
+open tag) with the fresh defaults in front; a present table holding no
+record likewise takes the defaults in front — a `<cellXfs>` that
+started with our record would make it every unstyled cell's, a
+`<fonts>` without a record at 0 would leave `fontId="0"` dangling;
+`<cellStyleXfs>` / `<cellStyles>` are seeded when an `<xf>` is added
+and the part lacks them (`xfId="0"`); a self-closed table
+(`<dxfs count="0"/>`) is opened; every other byte of the part is
+preserved (pinned: the bytes before the first table and after the last
+one equal the writer's). A workbook without the part gets the fresh
+emitter's part, its relationship in `xl/_rels/workbook.xml.rels`
+(`injectWorkbookRelationship`, the SST's injector generalized) and its
+content type. Then the sheets: `Worksheet.cell_styles` (a `CellRef →
+u32` map beside `deltas`) folds into `emitSheetData` — a staged style
+replaces the cell's own `s`, a delta cell takes it, a cell the sheet
+lacks is created as `<c r="…" s="…"/>` (the formatted blank Excel
+writes), `deleteCell` wins whichever came first; a sheet with a style
+alone is re-emitted. The map is drained with the deltas (the save, the
+swap's `drainSavePlans`), joins `hasUnsavedChanges` /
+`hasStagedStyleWork` (the Editor's passthrough condition), and is
+excluded by appended rows and the structural edits as a staged value is
+(`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends`; the Editor's
+`sheetHasWorkbookDeltas` / `workbookHasAnyDeltas` count it). The fold
+pin: `saveWithRecalc` with a registration and a cell style is
+byte-identical to `recalculate` then `save` on both arms, the part
+present or created, the plan drained at the swap, the next transaction
+hearing the guard (the fold's installs are a save's).
+
+**Statuses.** `0` with the out written. `-1`, a statement about the
+call — `InvalidInput` (a NULL handle, spec or out; a NULL format pointer
+with a non-zero length), the writer's enum verdicts
+`BadAlignmentValue` / `BadFillPattern` / `BadBorderStyle` (the
+`zlsx_style_t` reading is `styleFromC`, factored out of
+`zlsx_writer_add_style_ex` — one reading, the writer's error names
+unchanged; the `zlsx_dxf_t` reading `dxfFromC` likewise, a border code
+the header does not spell reading as none), `InvalidStyle` (an empty
+font name or format, a non-positive font size), and on the cell style
+`SheetIndexOutOfRange` / `RowIndexOutOfRange` / `ColumnIndexOutOfRange`
+/ `UnknownStyleIndex` (past the part's `<cellXfs>` and this save's
+registrations — judged before anything is staged) /
+`SheetHasUnsavedAppends`; the out is 0 on every failure past the NULL
+checks. `-2` `MalformedStylesXml`, the name in the diag, plane NONE, in
+`structural_refusals`: the part's `<styleSheet>` missing or
+self-closed, a table that never closes inside the root, a table out of
+the schema's order (the splice's slots would be ambiguous), a
+`numFmtId` at `maxInt(u32)` — judged at the FIRST registration or cell
+style, nothing staged, so a refused editor saves the passthrough
+(pinned on C and Python: byte-identical to the source). `-3`
+`OutOfMemory` (the Zig sweep: every allocation failure across the open,
+the three registrations, the cell style and the save's plans leaks
+nothing — it found a pre-existing double free in
+`StylesPlan.internNumFmt`, the pool taking the string before the index
+reserved its slot, fixed). Python: `Editor.add_style` / `add_dxf` /
+`intern_num_fmt` / `set_cell_style` — `ZlsxRefusal` with the
+`error_name` for the part, `ZlsxError` with the name for the call, the
+writer's `_style_spec` / `_dxf_spec` marshalling shared (factored out
+of `Writer.add_style` / `add_dxf`, unchanged behaviour).
+
+**Dedup.** Within one save, against this editor's registrations —
+never against the part's own records: a style the workbook already
+spells is appended a second time (a read-back of the part's records as
+`Style` values is not in the slice; the reader's typed view is the way
+to inspect them). The save drains the registrations; the next one reads
+the extended part afresh, so indices keep counting up across saves in
+one editor (pinned: 3, then 5 after a save that added two).
+
+**Not in this slice.** The per-sheet registrations (`Worksheet.set*`
+/ `add*` — column widths, panes, merges, hyperlinks, comments, DV, CF)
+on an opened sheet: the same fresh-emit shape, dropped by `save` today
+(the matrix marks them `~`); `addDefinedName` → C + Py (it already
+lands on an opened workbook); `deleteCell` → C + Py + CLI; a standalone
+mark-recalc; the CLI leg of the trio; dedup against the part's records.
+`sheet_state`'s dxf bound now counts the part's `<dxf>` records
+(`dxfIdBound`), so an `addDxf` id on an opened workbook is accepted by
+`addConditionalFormat*`, though the rule itself still lands on the
+fresh path only.

@@ -2033,3 +2033,55 @@ if _HAS_EMBEDDING_SWEEPS:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_strip_embeddings.restype = ctypes.c_int32
+
+# S3d slice 1: styles on the editor handle — `Workbook.addStyle` /
+# `addDxf` / `internNumFmt` / `Worksheet.setCellStyle` behind four
+# status_v1 exports under one macro, the header's ZLSX_HAS_EDITOR_STYLES.
+# The `zlsx_style_t` / `zlsx_dxf_t` structs are the writer's.
+_EDITOR_STYLE_SYMBOLS = (
+    "zlsx_editor_add_style",
+    "zlsx_editor_add_dxf",
+    "zlsx_editor_intern_num_fmt",
+    "zlsx_editor_set_cell_style",
+)
+_HAS_EDITOR_STYLES = _HAS_DIAG_RELEASE and all(hasattr(lib, s) for s in _EDITOR_STYLE_SYMBOLS)
+if _HAS_EDITOR_STYLES:
+    lib.zlsx_editor_add_style.argtypes = [
+        editor_handle,
+        ctypes.POINTER(CStyle),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_add_style.restype = ctypes.c_int32
+    lib.zlsx_editor_add_dxf.argtypes = [
+        editor_handle,
+        ctypes.POINTER(CDxf),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_add_dxf.restype = ctypes.c_int32
+    lib.zlsx_editor_intern_num_fmt.argtypes = [
+        editor_handle,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_intern_num_fmt.restype = ctypes.c_int32
+    lib.zlsx_editor_set_cell_style.argtypes = [
+        editor_handle,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(DiagV1),
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.zlsx_editor_set_cell_style.restype = ctypes.c_int32

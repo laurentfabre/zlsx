@@ -536,6 +536,7 @@ pub const Editor = struct {
     pub fn save(self: *Editor, io: std.Io, out_path: []const u8) !void {
         if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
+            !self.workbook.hasStagedStyleWork() and
             !self.workbook.store.hasUnsavedChanges())
         {
             var write_buf: [4096]u8 = undefined;
@@ -557,6 +558,7 @@ pub const Editor = struct {
     pub fn saveToOwnedBuffer(self: *Editor, allocator: Allocator) ![]u8 {
         if (!self.workbookHasAnyDeltas() and
             !self.workbookHasAnyAppendedRows() and
+            !self.workbook.hasStagedStyleWork() and
             !self.workbook.store.hasUnsavedChanges())
         {
             return allocator.dupe(u8, self.src_buf);
@@ -576,7 +578,7 @@ pub const Editor = struct {
         // round-trip would produce.
         if (sheet_idx < self.workbook.sheetCount()) {
             const ws = try self.workbook.sheet(sheet_idx);
-            if (ws.deltas.count() > 0) {
+            if (ws.hasStagedCellWork()) {
                 const xml = try ws.emitWithDeltas(self.allocator);
                 errdefer self.allocator.free(xml);
                 const cells = try scanWorksheetXml(self.allocator, xml);
@@ -700,6 +702,30 @@ pub const Editor = struct {
         // typed-overlay branch always fires. The legacy
         // pending_mutations path is unreachable.
         unreachable;
+    }
+
+    /// Stage a style on the cell at (`row`, `col`) of `sheet_idx` (S3d
+    /// slice 1): `Worksheet.setCellStyle` behind `setCell`'s bounds —
+    /// `row` 1-based, `col` 0-based as the C ABI spells them. The
+    /// index is one `Workbook.addStyle` returned for this save or a
+    /// slot the workbook's `<cellXfs>` already holds; past both
+    /// `UnknownStyleIndex`. Refuses `SheetHasUnsavedAppends` as
+    /// `setCell` does.
+    pub fn setCellStyle(
+        self: *Editor,
+        sheet_idx: u32,
+        row: u32,
+        col: u32,
+        style_idx: u32,
+    ) !void {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        if (self.sheetHasWorkbookAppendedRows(sheet_idx)) return error.SheetHasUnsavedAppends;
+        if (row == 0 or row > max_row) return error.RowIndexOutOfRange;
+        if (col >= max_col_1based) return error.ColumnIndexOutOfRange;
+        var ref_buf: [16]u8 = undefined;
+        const ref = try xlsx.formatCellRef(&ref_buf, row, col);
+        const ws = try self.workbook.sheet(sheet_idx);
+        try ws.setCellStyle(ref, style_idx);
     }
 
     pub fn setCells(
@@ -1050,7 +1076,7 @@ pub const Editor = struct {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
             const ws = self.workbook.sheet(i) catch unreachable;
-            if (ws.deltas.count() > 0) return true;
+            if (ws.hasStagedCellWork()) return true;
         }
         return false;
     }
@@ -1061,7 +1087,7 @@ pub const Editor = struct {
     fn sheetHasWorkbookDeltas(self: *Editor, sheet_idx: u32) bool {
         if (sheet_idx >= self.workbook.sheetCount()) return false;
         const ws = self.workbook.sheet(sheet_idx) catch return false;
-        return ws.deltas.count() > 0;
+        return ws.hasStagedCellWork();
     }
 
     /// True iff any worksheet in the embedded workbook has staged
@@ -11563,4 +11589,55 @@ test "S3c slice 4: Editor.setEmbeddingsOpts adds the hidden cells sheet through 
         try std.testing.expectEqual(@as(u32, 2), ed.workbook.sheetCount());
         try std.testing.expect((try ed.workbook.embeddings()) == .present);
     }
+}
+
+test "S3d slice 1: Editor.setCellStyle stages a style behind setCell's bounds — a style alone is not the passthrough, the file carries it; UnknownStyleIndex past the part and the plan; the index the workbook hands out" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(a, io, "s3d1_editor_src.xlsx");
+    defer a.free(src_path);
+    const dst_path = try tt.path(a, io, "s3d1_editor_dst.xlsx");
+    defer a.free(dst_path);
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        const bold = try w.addStyle(.{ .font_bold = true });
+        var s = try w.addSheet("Data");
+        try s.writeRowStyled(&.{ .{ .string = "h" }, .{ .integer = 42 } }, &.{ bold, 0 });
+        try w.save(io, src_path);
+    }
+    var ed = try Editor.open(a, io, src_path);
+    defer ed.deinit();
+    // Bounds first, the style index last — nothing staged by a refusal.
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.setCellStyle(1, 1, 0, 1));
+    try std.testing.expectError(error.RowIndexOutOfRange, ed.setCellStyle(0, 0, 0, 1));
+    try std.testing.expectError(error.ColumnIndexOutOfRange, ed.setCellStyle(0, 1, max_col_1based, 1));
+    try std.testing.expectError(error.UnknownStyleIndex, ed.setCellStyle(0, 1, 0, 2));
+    try std.testing.expect(!ed.workbook.hasUnsavedChanges());
+    const idx = try ed.workbook.addStyle(.{ .font_italic = true });
+    try std.testing.expectEqual(@as(u32, 2), idx);
+    try ed.setCellStyle(0, 1, 1, idx);
+    try ed.setCellStyle(0, 1, 0, 0);
+    try ed.setCellStyle(0, 3, 2, 1);
+    try std.testing.expect(ed.workbook.hasUnsavedChanges());
+    try ed.save(io, dst_path);
+
+    var book = try xlsx.Book.open(a, io, dst_path);
+    defer book.deinit();
+    var rows = try book.rows(book.sheets[0], a);
+    defer rows.deinit();
+    const r1 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), r1.len);
+    try std.testing.expectEqual(@as(?u32, 0), rows.styleIndices()[0]);
+    try std.testing.expectEqual(@as(?u32, 2), rows.styleIndices()[1]);
+    try std.testing.expect(book.cellFont(2).?.italic);
+    // Row 2 does not exist: the reader's next row is the third.
+    const r3 = (try rows.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), r3.len);
+    try std.testing.expectEqual(@as(?u32, 1), rows.styleIndices()[2]);
+    try std.testing.expect(book.cellFont(1).?.bold);
 }

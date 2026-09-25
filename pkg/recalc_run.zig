@@ -1444,6 +1444,9 @@ const Fixture = struct {
     /// `xl/calcChain.xml` plus its rel and content type, so §5.7.5's
     /// removal has something to remove.
     calc_chain: bool = false,
+    /// `xl/styles.xml` plus its rel, for the styles plan's fold (S3d
+    /// slice 1). Absent means the fold creates the part.
+    styles: ?[]const u8 = null,
 };
 
 fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f: Fixture) ![]u8 {
@@ -1474,6 +1477,9 @@ fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f
         try rels.appendSlice(gpa, "<Relationship Id=\"rId2\" Type=\"" ++
             recalc_txn.calc_chain_rel_type ++ "\" Target=\"calcChain.xml\"/>");
     }
+    if (f.styles != null) {
+        try rels.appendSlice(gpa, "<Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+    }
     try rels.appendSlice(gpa, "</Relationships>");
     try store.addPart("xl/_rels/workbook.xml.rels", ct_rels, rels.items);
 
@@ -1486,6 +1492,7 @@ fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f
         );
     }
     if (f.metadata) |m| try store.addPart("xl/metadata.xml", ct_metadata, m);
+    if (f.styles) |s| try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", s);
     if (f.embeddings) try addEmbeddingParts(gpa, &store);
 
     try store.save(io, path);
@@ -3546,4 +3553,84 @@ test "refusal_out: the census crosses the seam with the refusing cell" {
     // And the workbook is untouched, refusal_out or not.
     try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
     try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "S3d slice 1: saveWithRecalc carries the styles plan and the cell styles on both arms — the part extended, or created with its relationship, in the file; byte-identical to recalculate then save; drained at the swap, the base re-read; the next transaction hears the guard" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    const two_xfs = "<styleSheet xmlns=\"" ++ ns_main ++ "\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>" ++
+        "<cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"2\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>";
+    const Shape = struct { sheet: []const u8, styles: ?[]const u8, expect_idx: u32 };
+    for ([_]Shape{
+        .{ .sheet = sheet_stale, .styles = two_xfs, .expect_idx = 2 },
+        .{ .sheet = sheet_no_formula, .styles = two_xfs, .expect_idx = 2 },
+        .{ .sheet = sheet_stale, .styles = null, .expect_idx = 1 },
+        .{ .sheet = sheet_no_formula, .styles = null, .expect_idx = 1 },
+    }) |shape| {
+        const stale = shape.sheet.ptr == sheet_stale.ptr;
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = shape.sheet, .styles = shape.styles });
+        defer a.free(path);
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            _ = try (try wb.sheet(0)).ensureParsed();
+            const idx = try wb.addStyle(.{ .font_bold = true, .number_format = "0.0" });
+            try testing.expectEqual(shape.expect_idx, idx);
+            try (try wb.sheet(0)).setCellStyle("A1", idx);
+            try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+            var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+            r.deinit(a);
+            try testing.expect(!wb.hasStagedStyleWork());
+            try testing.expect(wb.styles_base == null);
+            try testing.expectEqual(@as(usize, 0), (try wb.sheet(0)).deltas.count());
+            try testing.expectEqualStrings("1", try cellCache(try wb.sheet(0), "A1"));
+            try testing.expectEqualStrings(if (stale) "2" else "999", try cellCache(try wb.sheet(0), "B1"));
+            // The base is the extended part's: the next style lands after.
+            try testing.expectEqual(shape.expect_idx + 1, try wb.addStyle(.{ .font_italic = true }));
+            try testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        }
+        {
+            var reopened = try Workbook.open(a, io, out);
+            defer reopened.deinit();
+            const cell = (try (try reopened.sheet(0)).cellByRef("A1")) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(?u32, shape.expect_idx), cell.style_idx);
+            try testing.expectEqualStrings("1", try cellCache(try reopened.sheet(0), "A1"));
+            try testing.expectEqualStrings(if (stale) "2" else "999", try cellCache(try reopened.sheet(0), "B1"));
+            const sv = (try reopened.styles()) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(usize, shape.expect_idx + 1), sv.cell_xfs.len);
+            try testing.expect(sv.fonts[sv.cell_xfs[shape.expect_idx].font_id.?].bold);
+            try testing.expectEqual(@as(?u32, 164), sv.cell_xfs[shape.expect_idx].num_fmt_id);
+            const rels = ((try reopened.store.part("xl/_rels/workbook.xml.rels")) orelse return error.TestUnexpectedResult).bytes;
+            try testing.expect(std.mem.indexOf(u8, rels, "/relationships/styles\" Target=\"styles.xml\"") != null);
+        }
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            const idx = try wb.addStyle(.{ .font_bold = true, .number_format = "0.0" });
+            try (try wb.sheet(0)).setCellStyle("A1", idx);
+            try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+            var r = try wb.recalculate(a, io, fixed_run, .{});
+            r.deinit(a);
+            // The in-memory transaction leaves the plan staged.
+            try testing.expect(wb.hasStagedStyleWork());
+            try wb.save(io, ordered);
+        }
+        const folded = try readAll(a, io, out);
+        defer a.free(folded);
+        const by_order = try readAll(a, io, ordered);
+        defer a.free(by_order);
+        try testing.expectEqualSlices(u8, by_order, folded);
+    }
 }
