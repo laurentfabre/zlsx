@@ -3273,10 +3273,20 @@ two formats); an entity-spelled `numFmtId` is read as the number it is
 no slot 0 on an empty `<cellXfs>` — and a part moved underneath it
 refuses at the save too (r2 A-IDX-205). Round 3: the pivot rebuild
 reads a staged style as the cell's (`sheetWritesChangeCache` hears a
-style on a source cell, the grid's date check sees it — a date style
-this save registered is past the part's records and refuses
-`PivotEditUnsafe`, as any style the check cannot read; a style-only
-write marks the cache; in-house r3 B-PIV-301); the CF forwarders' bound
+style on a source cell — and the per-sheet filters ahead of it count a
+style-only sheet, in-house r4 A/B-PIV-401 — and the grid's date check
+sees it: a date style this save registered is already in the part when
+the rebuild reads it, phase 0a rendering the plan before phase 0b, so
+it reads as any date style and refuses the rebuild, the save taking
+the marker alone; a style-only write marks the cache; in-house r3
+B-PIV-301); the relationship injector reads the rels part through the
+shared scanner — the exact type, the ids by attribute, either quote —
+where a substring scan injected a duplicate into a single-quoted part
+(r4 A-REL-402; the SST's injector shares it); the read-only dxf bound
+resolves the part's name without caching it, so a part moved after a
+rule alone is the one a later registration extends (r4 B-NAM-402); the
+relationship lands with the extension, never on a save that renders
+nothing (r4 B-INS-403); the CF forwarders' bound
 reads the part without arming the save's re-read (A/B-BASE-302); the
 `count` rewrite reads the attribute through the shared scanner, quoted
 sibling values skipped (A/B-SPL-302/303); a padded `numFmtId` is
