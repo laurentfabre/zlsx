@@ -5356,8 +5356,10 @@ class Editor:
         workbook's styles part cannot take an extension (no
         ``<styleSheet>`` root, a table that never closes or sits out of
         the schema's order, a ``numFmtId`` with no id above it);
-        :class:`ZlsxError` ``InvalidStyle`` for an empty font name or
-        format string, or a non-positive font size."""
+        :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
+        for an empty font name or format string (judged here, as
+        :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
+        non-positive font size."""
         self._styles_available()
         spec, keepalive = _style_spec(style)
         out = ctypes.c_uint32(0)

@@ -11641,3 +11641,37 @@ test "S3d slice 1: Editor.setCellStyle stages a style behind setCell's bounds �
     try std.testing.expectEqual(@as(?u32, 1), rows.styleIndices()[2]);
     try std.testing.expect(book.cellFont(1).?.bold);
 }
+
+test "S3d slice 1: a registration alone — no cell style, no delta — is not the passthrough: the file and the buffer carry the extended part (r1 A-PIN-105)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(a, io, "s3d1_plan_only_src.xlsx");
+    defer a.free(src_path);
+    const dst_path = try tt.path(a, io, "s3d1_plan_only_dst.xlsx");
+    defer a.free(dst_path);
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{.{ .integer = 1 }});
+        try w.save(io, src_path);
+    }
+    var ed = try Editor.open(a, io, src_path);
+    defer ed.deinit();
+    try std.testing.expectEqual(@as(u32, 164), try ed.workbook.internNumFmt("0.0"));
+    try std.testing.expect(ed.workbook.hasUnsavedChanges());
+    const buf = try ed.saveToOwnedBuffer(a);
+    defer a.free(buf);
+    try std.testing.expect(!std.mem.eql(u8, buf, ed.src_buf));
+    try std.testing.expectEqual(@as(u32, 0), try ed.workbook.addDxf(.{ .font_bold = true }));
+    try ed.save(io, dst_path);
+    var wb = try Workbook.open(a, io, dst_path);
+    defer wb.deinit();
+    const styles = ((try wb.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).bytes;
+    try std.testing.expect(std.mem.indexOf(u8, styles, "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.0\"/></numFmts>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styles, "<dxfs count=\"1\">") != null);
+}

@@ -2602,8 +2602,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * the call — InvalidInput (a NULL handle, spec or out; a NULL format
  * pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
- * InvalidStyle (an empty font name or format, a non-positive font
- * size) — the out is 0; -2 MalformedStylesXml, the name in the diag
+ * InvalidStyle (a non-positive font size; an empty font name or
+ * format is "unset" at this boundary, `*_len == 0`) — the out is 0; -2 MalformedStylesXml, the name in the diag
  * with plane NONE: the part's <styleSheet> is missing or self-closed,
  * a table never closes, a table sits out of the schema's order, or a
  * numFmtId leaves no id above it — judged at the FIRST registration

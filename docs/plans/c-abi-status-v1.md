@@ -3128,10 +3128,15 @@ with the typed parser (`styles_xml.parse`) is pinned over the corpus:
 on every fixture with a styles part the index equals the parser's
 `cell_xfs.len`, and after the save the parser's tables have grown by
 exactly the plan and the new `<xf>` names the new font, fill and
-border. The base is cached while the plan is staged (nothing moves the
-part underneath a staged plan — a recalc transaction never touches it;
-the splice asserts the layout it reads is the one the registrations
-mapped against) and forgotten when the plan drains.
+border. The base is cached while the plan is staged and forgotten when
+the plan drains. A recalc transaction never touches the part, but the
+store is a public Zig surface (`PartStore.replacePart` / `removePart`),
+so the splice re-reads the layout and refuses `StylesPartChanged` (-1
+on C, unreachable there — no part export) when it is no longer the one
+the registrations mapped against: the indices handed out could not be
+honoured, and an assert would have been reachable (in-house r1
+A-BASE-103). A part that appeared with exactly the fresh layout is
+honoured.
 
 **What the save writes.** `applySavePlans` (the plain save, the
 buffer save, `saveWithRecalc`'s `.none` arm) and `foldSavePlansInto`
@@ -3178,8 +3183,11 @@ with a non-zero length), the writer's enum verdicts
 `zlsx_style_t` reading is `styleFromC`, factored out of
 `zlsx_writer_add_style_ex` — one reading, the writer's error names
 unchanged; the `zlsx_dxf_t` reading `dxfFromC` likewise, a border code
-the header does not spell reading as none), `InvalidStyle` (an empty
-font name or format, a non-positive font size), and on the cell style
+the header does not spell reading as none), `InvalidStyle` (a non-positive font size — an empty font name or
+format is "unset" at the C boundary, `*_len == 0`, and Python raises
+the writer's `InvalidFontName` / `InvalidNumberFormat` before the call;
+`zlsx_editor_intern_num_fmt` alone reaches `InvalidStyle` with an empty
+format), and on the cell style
 `SheetIndexOutOfRange` / `RowIndexOutOfRange` / `ColumnIndexOutOfRange`
 / `UnknownStyleIndex` (past the part's `<cellXfs>` and this save's
 registrations — judged before anything is staged) /
@@ -3215,7 +3223,13 @@ on an opened sheet: the same fresh-emit shape, dropped by `save` today
 (the matrix marks them `~`); `addDefinedName` → C + Py (it already
 lands on an opened workbook); `deleteCell` → C + Py + CLI; a standalone
 mark-recalc; the CLI leg of the trio; dedup against the part's records.
-`sheet_state`'s dxf bound now counts the part's `<dxf>` records
-(`dxfIdBound`), so an `addDxf` id on an opened workbook is accepted by
-`addConditionalFormat*`, though the rule itself still lands on the
-fresh path only.
+`sheet_state`'s dxf bound now reads the part's `<dxf>` records
+(`dxfIdBound`, the baseline read whether or not a registration cached
+it — in-house r1 B-DXF-103), so an id the part holds and an `addDxf` id
+are both accepted by `addConditionalFormat*` on an opened workbook,
+though the rule itself still lands on the fresh path only. The
+transaction's view rebuild (`recalc_txn.buildViews`) counts a staged
+style as staged cell work (in-house r1 A/B-TXN-101: a style-only sheet
+folded through a candidate kept its pre-swap view, and the next plain
+save re-emitted the sheet from it, dropping the style the fold wrote —
+measured, pinned on the mark-only arm with the sheet parsed before).

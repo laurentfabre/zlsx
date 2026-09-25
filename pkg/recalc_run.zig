@@ -3634,3 +3634,38 @@ test "S3d slice 1: saveWithRecalc carries the styles plan and the cell styles on
         try testing.expectEqualSlices(u8, by_order, folded);
     }
 }
+
+test "S3d slice 1: a style alone on a sheet a mark-only candidate does not patch — the live view rebuilt over the folded part at the swap, the next plain save keeping the style (r1 A-TXN-101)" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const again = try std.fs.path.join(a, &.{ dir, "again.xlsx" });
+    defer a.free(again);
+    const unregistered = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+        "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>NOSUCHFN(A1)</f><v>999</v></c>" ++
+        "</row></sheetData></worksheet>";
+    const src = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = unregistered });
+    defer a.free(src);
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    // Parsed before the transaction: the view the swap must replace.
+    _ = try (try wb.sheet(0)).ensureParsed();
+    const idx = try wb.addStyle(.{ .font_bold = true });
+    try (try wb.sheet(0)).setCellStyle("A1", idx);
+    var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{ .on_unsupported = .keep_stale_and_mark });
+    r.deinit(a);
+    try testing.expectEqual(@as(?u32, idx), (try (try wb.sheet(0)).cellByRef("A1")).?.style_idx);
+    try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+    try wb.save(io, again);
+    var re = try Workbook.open(a, io, again);
+    defer re.deinit();
+    try testing.expectEqual(@as(?u32, idx), (try (try re.sheet(0)).cellByRef("A1")).?.style_idx);
+    try testing.expectEqualStrings("7", (try (try re.sheet(0)).cellByRef("C1")).?.raw_value.?);
+}

@@ -788,10 +788,13 @@ fn buildViews(
         // answer for less work.
         if (ws.parsed == null) continue;
         // A part changed by the run's own patch (none on a mark-only
-        // candidate) or by the fold's re-emit of its deltas.
+        // candidate) or by the fold's re-emit of its deltas — a staged
+        // cell style alone included (in-house S3d slice 1 r1 A-TXN-101:
+        // the view kept answering the old `s`, and the next save
+        // re-emitted the sheet from it, dropping the style the fold wrote).
         const name = try ws.resolvePartName();
         const patched = !mark_only and isStaged(staged, name);
-        const folded_here = folded and ws.deltas.count() > 0;
+        const folded_here = folded and ws.hasStagedCellWork();
         if (!patched and !folded_here) continue;
         const p = (try next.part(name)) orelse return Error.MissingSheetPart;
         sheet_views[i] = try sheet_xml_mod.parse(gpa, p.bytes);

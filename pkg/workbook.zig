@@ -179,6 +179,14 @@ pub const Error = error{
     /// `<cellXfs>` does not hold and no `addStyle` of this save
     /// returned.
     UnknownStyleIndex,
+    /// `xl/styles.xml` changed underneath a staged styles plan — a
+    /// `PartStore.replacePart` / `removePart` / `addPart` of the part
+    /// between a registration and the save — so the indices the
+    /// registrations handed out name slots the part no longer has.
+    /// The save refuses rather than splice against a moved layout;
+    /// discard the workbook or re-open (in-house S3d slice 1 r1
+    /// A-BASE-103).
+    StylesPartChanged,
     MissingWorkbookPart,
     MissingSheetPart,
     MissingRelationship,
@@ -1675,11 +1683,13 @@ pub const Workbook = struct {
     }
 
     /// One past the last dxfId a conditional-format rule may name: the
-    /// part's `<dxf>` records plus this save's registrations. Reads the
-    /// cached layout only — no dxf is registered without one, and with
-    /// none registered the bound is what the fresh emitter's would be.
-    fn dxfIdBound(self: *const Workbook) usize {
-        const base = self.styles_base orelse styles_plan_mod.Base.fresh;
+    /// part's `<dxf>` records plus this save's registrations — the
+    /// part's read whether or not a registration cached it, so the
+    /// bound does not depend on the order of calls (in-house S3d slice
+    /// 1 r1 B-DXF-103). A part the walk cannot read counts as the
+    /// fresh layout here; the refusal is the next registration's.
+    fn dxfIdBound(self: *Workbook) usize {
+        const base = self.stylesBaseline() catch styles_plan_mod.Base.fresh;
         return @as(usize, base.dxfs) + self.styles_plan.dxfs.items.len;
     }
 
@@ -1702,7 +1712,9 @@ pub const Workbook = struct {
     /// relationship and content type. Run by `applySavePlans` over the
     /// live store and by `foldSavePlansInto` over a candidate — the
     /// same bytes either way, since a recalc transaction never touches
-    /// the part. Frees nothing: the swap or the save drains the plan.
+    /// the part. A part whose layout is no longer the one the
+    /// registrations mapped against refuses `StylesPartChanged`. Frees
+    /// nothing: the swap or the save drains the plan.
     fn applyStylesPlanInto(self: *Workbook, store: *PartStore) Error!void {
         if (!self.styles_plan.hasWork()) return;
         const a = self.allocator;
@@ -1711,9 +1723,9 @@ pub const Workbook = struct {
 
         const part = try store.part(styles_part_name) orelse {
             // The fresh part: the plan's records after the OOXML
-            // defaults, which is the layout the registrations mapped
-            // against (`Base.fresh`).
-            assert(std.meta.eql(base, styles_plan_mod.Base.fresh));
+            // defaults — the layout the registrations mapped against,
+            // unless the part was removed underneath them.
+            if (!std.meta.eql(base, styles_plan_mod.Base.fresh)) return error.StylesPartChanged;
             var bytes: std.ArrayListUnmanaged(u8) = .empty;
             defer bytes.deinit(a);
             try self.styles_plan.emit(a, &bytes);
@@ -1725,9 +1737,11 @@ pub const Workbook = struct {
             return;
         };
         const layout = try scanStylesPart(part.bytes);
-        // Nothing moves the part underneath a staged plan: the layout
-        // the registrations mapped against is the one the splice reads.
-        assert(std.meta.eql(layout.base(), base));
+        // The layout the registrations mapped against must be the one
+        // the splice reads: the store is a public surface
+        // (`replacePart` / `removePart`), so a moved part is refused,
+        // never spliced against.
+        if (!std.meta.eql(layout.base(), base)) return error.StylesPartChanged;
         var frags = try self.styles_plan.emitFragments(a, base);
         defer frags.deinit(a);
         const spliced = try spliceStylesFragments(a, part.bytes, &layout, &frags);
@@ -11951,13 +11965,16 @@ fn emitSheetData(
     var dit = deltas.iterator();
     while (dit.next()) |entry| {
         if (seen.contains(entry.key_ptr.*)) continue;
+        // A deletion of a cell the sheet lacks elides nothing — and
+        // wins over a style staged on the same ref (step 2b reads
+        // `seen`; in-house S3d slice 1 r1 A-EMT-102).
+        try seen.put(allocator, entry.key_ptr.*, {});
         if (entry.value_ptr.* == .deleted) continue;
         try merged.append(allocator, .{
             .ref = entry.key_ptr.*,
             .style_idx = cell_styles.get(entry.key_ptr.*),
             .payload = .{ .delta = entry.value_ptr.* },
         });
-        try seen.put(allocator, entry.key_ptr.*, {});
     }
 
     // 2b. A style staged on a cell the sheet does not hold and no
@@ -13182,10 +13199,14 @@ fn spliceStylesFragments(
             else => unreachable,
         };
         const held = layout.records(t);
-        // An `<xf>` names `xfId="0"`: the two style tables it needs
-        // are seeded when the part lacks them, as the fresh part has
-        // them.
-        const seed = held == 0 and (added > 0 or ((t == .cell_style_xfs or t == .cell_styles) and frags.cell_xfs_added > 0));
+        // An `<xf>` names `fontId` / `fillId` / `borderId` 0 and
+        // `xfId="0"`: every table it points into is seeded when the
+        // part lacks it or holds it empty, as the fresh part has them
+        // all (in-house S3d slice 1 r1 A-SPL-104 for fills / borders).
+        const seed = held == 0 and (added > 0 or (frags.cell_xfs_added > 0 and switch (t) {
+            .fonts, .fills, .borders, .cell_style_xfs, .cell_styles => true,
+            else => false,
+        }));
         if (added > 0 or seed) {
             const total = std.math.add(u32, if (held == 0) t.defaultsCount() else held, added) catch
                 return error.MalformedStylesXml;
@@ -32039,6 +32060,40 @@ test "S3d slice 1: a table the part lacks is created at its schema slot with the
         "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>" ++
         "<dxfs count=\"0\"/><tableStyles count=\"0\" defaultTableStyle=\"TableStyleMedium2\"/></styleSheet>";
     const bare = "<styleSheet " ++ s3d1_ns ++ "></styleSheet>";
+    // A style that names no fill and no border still needs the tables
+    // its `<xf>` points into (r1 A-SPL-104).
+    {
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_font_only.xlsx", bare);
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(after);
+        try std.testing.expectEqualStrings(
+            "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>" ++
+                "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>" ++
+                "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>" ++
+                "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>" ++
+                "<cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/></cellXfs>" ++
+                "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>",
+            after,
+        );
+        // A dxf alone seeds nothing: no `<xf>` points anywhere.
+        var wb2 = try Workbook.open(a, io, path);
+        defer wb2.deinit();
+        try std.testing.expectEqual(@as(u32, 0), try wb2.addDxf(.{ .font_bold = true }));
+        const bytes = try wb2.saveToOwnedBuffer(a);
+        defer a.free(bytes);
+        var re2 = try Workbook.openBuffer(a, io, bytes);
+        defer re2.deinit();
+        const dxf_only = try s3d1PartBytes(a, &re2, "xl/styles.xml");
+        defer a.free(dxf_only);
+        try std.testing.expectEqualStrings("<styleSheet " ++ s3d1_ns ++ "><dxfs count=\"1\"><dxf><font><b/></font></dxf></dxfs></styleSheet>", dxf_only);
+    }
 
     for ([_]?[]const u8{ minimal, bare, null }, 0..) |styles, shape| {
         const path = try writeS3d1WithStyles(a, io, dir, "s3d1_created.xlsx", styles);
@@ -32144,6 +32199,52 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         try std.testing.expectEqual(@as(usize, 0), (try wb.sheet(1)).cell_styles.count());
         try std.testing.expect(!wb.hasUnsavedChanges());
     }
+    // The part moved underneath a staged plan — replaced, or removed —
+    // refuses at the save rather than splice against the old layout
+    // (r1 A-BASE-103); a plan staged over an absent part that gains
+    // one likewise.
+    {
+        const path = try writeS3d1Fixture(a, io, dir, "s3d1_moved.xlsx");
+        defer a.free(path);
+        const one_xf = "<styleSheet " ++ s3d1_ns ++ ">" ++ xf ++ "</styleSheet>";
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
+        try wb.store.replacePart("xl/styles.xml", one_xf);
+        try std.testing.expectError(error.StylesPartChanged, wb.applySavePlans());
+        var wb2 = try Workbook.open(a, io, path);
+        defer wb2.deinit();
+        try std.testing.expectEqual(@as(u32, 1), try wb2.addDxf(.{ .font_bold = true }));
+        try wb2.store.removePart("xl/styles.xml");
+        try std.testing.expectError(error.StylesPartChanged, wb2.applySavePlans());
+        // A part that appeared with exactly the fresh layout the
+        // registrations mapped against is honoured: the index is still
+        // the slot.
+        const absent = try writeS3d1WithStyles(a, io, dir, "s3d1_gained.xlsx", null);
+        defer a.free(absent);
+        var wb3 = try Workbook.open(a, io, absent);
+        defer wb3.deinit();
+        try std.testing.expectEqual(@as(u32, 1), try wb3.addStyle(.{ .font_bold = true }));
+        try wb3.store.addPart("xl/styles.xml", styles_content_type, one_xf);
+        try wb3.applySavePlans();
+        const gained = ((try wb3.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).bytes;
+        try std.testing.expect(std.mem.indexOf(u8, gained, "<cellXfs count=\"2\">") != null);
+    }
+    // The CF forwarders' dxf bound reads the part: an id the part holds
+    // is accepted before any registration, one past it refused, and a
+    // registration widens it (r1 B-DXF-103).
+    {
+        const path = try writeS3d1Fixture(a, io, dir, "s3d1_dxf_bound.xlsx");
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        const ws = try wb.sheet(1);
+        try ws.addConditionalFormatCellIs("A1:A2", .greater_than, "0", null, 0);
+        try std.testing.expectError(error.UnknownDxfId, ws.addConditionalFormatExpression("A1:A2", "A1>0", 1));
+        try std.testing.expectEqual(@as(u32, 1), try wb.addDxf(.{ .font_italic = true }));
+        try ws.addConditionalFormatExpression("A1:A2", "A1>0", 1);
+        try std.testing.expectError(error.UnknownDxfId, ws.addConditionalFormatExpression("A1:A2", "A1>0", 2));
+    }
 }
 
 test "S3d slice 1: a style alone re-emits the sheet; a deleteCell on the ref wins over the style either way; a staged style excludes appended rows and a structural edit as a staged value does; the fresh path keeps its 1-based identity" {
@@ -32170,6 +32271,11 @@ test "S3d slice 1: a style alone re-emits the sheet; a deleteCell on the ref win
         try s.setCellStyle("A1", 2);
         try s.setCellStyle("A3", 2);
         try s.deleteCell("A3");
+        // A cell the sheet lacks, both orders (r1 A-EMT-102).
+        try s.setCellStyle("Z9", 1);
+        try s.deleteCell("Z9");
+        try s.deleteCell("Y9");
+        try s.setCellStyle("Y9", 1);
         try wb.save(io, out);
         var re = try Workbook.open(a, io, out);
         defer re.deinit();
@@ -32178,6 +32284,9 @@ test "S3d slice 1: a style alone re-emits the sheet; a deleteCell on the ref win
         try std.testing.expectEqualStrings("5", t1.raw_value.?);
         try std.testing.expect((try (try re.sheet(0)).cellByRef("A1")) == null);
         try std.testing.expect((try (try re.sheet(0)).cellByRef("A3")) == null);
+        try std.testing.expect((try (try re.sheet(0)).cellByRef("Z9")) == null);
+        try std.testing.expect((try (try re.sheet(0)).cellByRef("Y9")) == null);
+        try std.testing.expect(std.mem.indexOf(u8, ((try re.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).bytes, "9\"") == null);
         // The writer spells no `s` for style 0; untouched, it stays so.
         try std.testing.expectEqual(@as(?u32, null), (try (try re.sheet(0)).cellByRef("A2")).?.style_idx);
     }
