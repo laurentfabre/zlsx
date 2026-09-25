@@ -239,24 +239,33 @@ const STYLES_HEAD: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 ;
-const STYLES_FONTS_DEFAULT: []const u8 =
+// The default records `Base.fresh` counts — public so the extension of
+// an existing part seeds an absent or empty table with the SAME bytes
+// (`Workbook`'s splice reads them here; a drift is one definition).
+pub const default_font_record: []const u8 =
     \\<font><sz val="11"/><name val="Calibri"/></font>
 ;
-const STYLES_FILLS_DEFAULT: []const u8 =
+pub const default_fill_records: []const u8 =
     \\<fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>
 ;
-const STYLES_BORDER_DEFAULT: []const u8 =
+pub const default_border_record: []const u8 =
     \\<border><left/><right/><top/><bottom/><diagonal/></border>
 ;
-const STYLES_CELL_STYLE_XFS: []const u8 =
-    \\<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+pub const default_cell_style_xf_record: []const u8 =
+    \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
 ;
-const STYLES_DEFAULT_CELL_XF: []const u8 =
+pub const default_cell_xf_record: []const u8 =
     \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
 ;
-const STYLES_CELL_STYLES: []const u8 =
-    \\<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+pub const default_cell_style_record: []const u8 =
+    \\<cellStyle name="Normal" xfId="0" builtinId="0"/>
 ;
+const STYLES_FONTS_DEFAULT = default_font_record;
+const STYLES_FILLS_DEFAULT = default_fill_records;
+const STYLES_BORDER_DEFAULT = default_border_record;
+const STYLES_CELL_STYLE_XFS: []const u8 = "<cellStyleXfs count=\"1\">" ++ default_cell_style_xf_record ++ "</cellStyleXfs>";
+const STYLES_DEFAULT_CELL_XF = default_cell_xf_record;
+const STYLES_CELL_STYLES: []const u8 = "<cellStyles count=\"1\">" ++ default_cell_style_record ++ "</cellStyles>";
 const STYLES_TAIL: []const u8 = "</styleSheet>";
 
 // ─── Helper functions ───────────────────────────────────────────────

@@ -2584,7 +2584,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  *
  * The fresh writer's registrations on an OPENED workbook. A style, a
  * dxf or a number format registered here lands in the workbook's
- * xl/styles.xml at the next zlsx_editor_save / save_to_buffer /
+ * styles part — the target of the workbook's styles relationship,
+ * xl/styles.xml when none names one — at the next zlsx_editor_save / save_to_buffer /
  * save_with_recalc: each table of the part extended after the records
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part

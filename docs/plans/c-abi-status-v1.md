@@ -3111,6 +3111,18 @@ returns is the slot its record takes there.
 | `zlsx_editor_intern_num_fmt(ed, ptr, len, out_id, diag, errbuf, len) → int32_t` | `Workbook.internNumFmt` | (same) | (same) |
 | `zlsx_editor_set_cell_style(ed, sheet_idx, row, col, style_idx, diag, errbuf, len) → int32_t` | `Editor.setCellStyle` → `Worksheet.setCellStyle` | (same) | (same) |
 
+**Which part.** The styles part is the target of the workbook's
+`…/relationships/styles` relationship — OPC addresses it there, and
+`xl/styles.xml` is the convention, not the rule (in-house r3
+A-PART-301: a package holding it as `xl/style2.xml` got an orphan
+`xl/styles.xml` and indices mapped against the fresh layout, so the
+cell styled italic rendered bold in any consumer that follows the
+relationship) — resolved through the store's relationship map at the
+first registration, `xl/styles.xml` when no relationship names one; a
+part the workbook holds without its relationship gains the
+relationship with the extension. The reader and `Workbook.styles()`
+still address the conventional name (pre-existing, recorded).
+
 **What the index is.** The part's tables are read once per save —
 `scanStylesPart`, one lexical walk on the workbook scanner
 (`findTagOpen` / `findClosingTag`: comment / CDATA / PI decoys skipped,
@@ -3259,7 +3271,18 @@ it (r2 A/B-OVF-201: the mapping's add panicked on `4294967294` plus
 two formats); an entity-spelled `numFmtId` is read as the number it is
 (r2 A-FMT-203); a cell style alone maps against the part's records —
 no slot 0 on an empty `<cellXfs>` — and a part moved underneath it
-refuses at the save too (r2 A-IDX-205). The
+refuses at the save too (r2 A-IDX-205). Round 3: the pivot rebuild
+reads a staged style as the cell's (`sheetWritesChangeCache` hears a
+style on a source cell, the grid's date check sees it — a date style
+this save registered is past the part's records and refuses
+`PivotEditUnsafe`, as any style the check cannot read; a style-only
+write marks the cache; in-house r3 B-PIV-301); the CF forwarders' bound
+reads the part without arming the save's re-read (A/B-BASE-302); the
+`count` rewrite reads the attribute through the shared scanner, quoted
+sibling values skipped (A/B-SPL-302/303); a padded `numFmtId` is
+trimmed (A/B-FMT-304); the seeded defaults are `styles_plan`'s own
+public records (A-DUP-305); an empty table keeps what it holds behind
+the seeded defaults (A-BYT-306). The
 transaction's view rebuild (`recalc_txn.buildViews`) counts a staged
 style as staged cell work (in-house r1 A/B-TXN-101: a style-only sheet
 folded through a candidate kept its pre-swap view, and the next plain

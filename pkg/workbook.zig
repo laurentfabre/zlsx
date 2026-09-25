@@ -1171,6 +1171,12 @@ pub const Workbook = struct {
     /// `styleIndexBound`'s floor while no style is registered (a
     /// workbook without the part: 0).
     styles_xfs_held: u32 = 0,
+    /// The styles part's name, resolved through the workbook's
+    /// `…/relationships/styles` relationship (OPC addresses it there;
+    /// `xl/styles.xml` is the convention, not the rule — in-house r3
+    /// A-PART-301) — `xl/styles.xml` when no relationship names one.
+    /// Owned; read with the layout, freed with it.
+    styles_part_resolved: ?[]const u8 = null,
 
     /// Workbook.xml fresh-emit plan (B3 iter-wr-3). Today's only axis
     /// is defined names, registered through `Workbook.addDefinedName`.
@@ -1445,6 +1451,7 @@ pub const Workbook = struct {
     pub fn deinit(self: *Workbook) void {
         for (self.worksheets) |*ws| ws.deinit(self.allocator);
         self.allocator.free(self.worksheets);
+        if (self.styles_part_resolved) |n| self.allocator.free(n);
 
         if (self.sst_view) |*v| {
             var view = v.*;
@@ -1691,16 +1698,53 @@ pub const Workbook = struct {
     /// splice asserts against.
     fn stylesBaseline(self: *Workbook) Error!styles_plan_mod.Base {
         if (self.styles_base) |b| return b;
-        var held: u32 = 0;
-        const b = blk: {
-            const part = try self.store.part(styles_part_name) orelse break :blk styles_plan_mod.Base.fresh;
-            const layout = try scanStylesPart(part.bytes);
-            held = layout.records(.cell_xfs);
-            break :blk layout.base();
-        };
-        self.styles_base = b;
-        self.styles_xfs_held = held;
-        return b;
+        const read = try self.readStylesBaseline();
+        self.styles_base = read.base;
+        self.styles_xfs_held = read.held;
+        return read.base;
+    }
+
+    const StylesBaselineRead = struct { base: styles_plan_mod.Base, held: u32 };
+
+    /// The part's layout as it stands, uncached: what `stylesBaseline`
+    /// records, and what a read-only bound (`dxfIdBound`) asks without
+    /// arming the save's re-read (in-house r3 A/B-BASE-302).
+    fn readStylesBaseline(self: *Workbook) Error!StylesBaselineRead {
+        const name = try self.stylesPartName();
+        const part = try self.store.part(name) orelse return .{ .base = styles_plan_mod.Base.fresh, .held = 0 };
+        const layout = try scanStylesPart(part.bytes);
+        return .{ .base = layout.base(), .held = layout.records(.cell_xfs) };
+    }
+
+    /// The styles part's name: the target of the workbook's
+    /// `…/relationships/styles` relationship, else the conventional
+    /// `xl/styles.xml` (a workbook that holds the part without the
+    /// relationship, or neither). Cached with the layout.
+    fn stylesPartName(self: *Workbook) Error![]const u8 {
+        if (self.styles_part_resolved) |n| return n;
+        var resolved: ?[]const u8 = null;
+        for (self.store.rels("xl/workbook.xml")) |rel| {
+            if (rel.target_mode != .internal) continue;
+            if (!std.mem.endsWith(u8, rel.type, "/relationships/styles")) continue;
+            resolved = try self.store.resolve("xl/workbook.xml", rel.target);
+            break;
+        }
+        const owned = try self.allocator.dupe(u8, resolved orelse styles_part_name);
+        self.styles_part_resolved = owned;
+        return owned;
+    }
+
+    /// The workbook's `…/relationships/styles` relationship to `name`,
+    /// added when none is there (the injector is a no-op otherwise —
+    /// a resolved name came FROM one).
+    fn ensureStylesRelationship(self: *Workbook, store: *PartStore, name: []const u8) Error!void {
+        const a = self.allocator;
+        const target = if (std.mem.startsWith(u8, name, "xl/")) name["xl/".len..] else name;
+        const rels = try store.part(workbook_rels_part_name) orelse return error.MissingWorkbookRels;
+        const patched = try injectWorkbookRelationship(a, rels.bytes, "/relationships/styles\"", styles_rel_type, target);
+        defer a.free(patched);
+        if (std.mem.eql(u8, patched, rels.bytes)) return;
+        try store.replacePart(workbook_rels_part_name, patched);
     }
 
     /// One past the last `s="…"` index a cell may take: the part's
@@ -1722,7 +1766,7 @@ pub const Workbook = struct {
     /// 1 r1 B-DXF-103). A part the walk cannot read counts as the
     /// fresh layout here; the refusal is the next registration's.
     fn dxfIdBound(self: *Workbook) usize {
-        const base = self.stylesBaseline() catch styles_plan_mod.Base.fresh;
+        const base = if (self.styles_base) |b| b else (self.readStylesBaseline() catch StylesBaselineRead{ .base = styles_plan_mod.Base.fresh, .held = 0 }).base;
         return @as(usize, base.dxfs) + self.styles_plan.dxfs.items.len;
     }
 
@@ -1753,8 +1797,9 @@ pub const Workbook = struct {
         // staged anything; nothing mapped, nothing to render or check.
         const base = self.styles_base orelse return;
         const a = self.allocator;
+        const name = self.styles_part_resolved.?;
 
-        const part = try store.part(styles_part_name) orelse {
+        const part = try store.part(name) orelse {
             // The fresh part: the plan's records after the OOXML
             // defaults — the layout the registrations mapped against,
             // unless the part was removed underneath them.
@@ -1763,13 +1808,14 @@ pub const Workbook = struct {
             var bytes: std.ArrayListUnmanaged(u8) = .empty;
             defer bytes.deinit(a);
             try self.styles_plan.emit(a, &bytes);
-            const rels = try store.part(workbook_rels_part_name) orelse return error.MissingWorkbookRels;
-            const patched = try injectWorkbookRelationship(a, rels.bytes, "/relationships/styles\"", styles_rel_type, "styles.xml");
-            defer a.free(patched);
-            try store.replacePart(workbook_rels_part_name, patched);
-            try store.addPart(styles_part_name, styles_content_type, bytes.items);
+            try self.ensureStylesRelationship(store, name);
+            try store.addPart(name, styles_content_type, bytes.items);
             return;
         };
+        // A part the workbook holds without its relationship is a part
+        // Excel never loads: the relationship lands with the extension
+        // (in-house r3 A-PART-301, the present branch).
+        try self.ensureStylesRelationship(store, name);
         const layout = try scanStylesPart(part.bytes);
         // The layout the registrations mapped against must be the one
         // the splice reads: the store is a public surface
@@ -1783,7 +1829,7 @@ pub const Workbook = struct {
         defer frags.deinit(a);
         const spliced = try spliceStylesFragments(a, part.bytes, &layout, &frags);
         defer a.free(spliced);
-        try store.replacePart(styles_part_name, spliced);
+        try store.replacePart(name, spliced);
     }
 
     pub fn sheetCount(self: *const Workbook) u32 {
@@ -4994,7 +5040,7 @@ pub const Workbook = struct {
     fn markPivotCachesForCellWritesInto(self: *Workbook, store: *PartStore, wb_view: *const workbook_xml_mod.WorkbookXml) Error!void {
         var any_writes = false;
         for (self.worksheets) |*ws| {
-            if (ws.deltas.count() > 0) {
+            if (ws.hasStagedCellWork()) {
                 any_writes = true;
                 break;
             }
@@ -5051,6 +5097,10 @@ pub const Workbook = struct {
         self.styles_plan.deinit(self.allocator);
         self.styles_plan = .{};
         self.styles_base = null;
+        if (self.styles_part_resolved) |n| {
+            self.allocator.free(n);
+            self.styles_part_resolved = null;
+        }
         if (self.styles_view) |*v| {
             var view = v.*;
             view.deinit(self.allocator);
@@ -10297,8 +10347,17 @@ pub const Workbook = struct {
                 // not as what it was (Codex #206 r5 REL-502): its
                 // style still counts, for a number's date check.
                 const replaced = with_writes and ws.deltas.contains(.{ .row = row.row_idx, .col = col });
-                if (with_writes) try styles_in_rect.put(arena, .{ .row = row.row_idx, .col = col }, cell.style_idx);
-                if (!replaced) grid[gi][ci] = try self.pivotSourceValue(arena, cell, &date_styles);
+                // A staged style is the cell's style for the date
+                // check (in-house S3d slice 1 r3 B-PIV-301): one this
+                // save registered is past the part's records, which
+                // `styleDescribesDate` refuses as it refuses any it
+                // cannot read.
+                var effective = cell;
+                if (with_writes) {
+                    if (ws.cell_styles.get(.{ .row = row.row_idx, .col = col })) |st| effective.style_idx = st;
+                }
+                if (with_writes) try styles_in_rect.put(arena, .{ .row = row.row_idx, .col = col }, effective.style_idx);
+                if (!replaced) grid[gi][ci] = try self.pivotSourceValue(arena, effective, &date_styles);
             }
         }
         if (with_writes) try self.overlayStagedWrites(arena, ws, rect, grid, blank_row, &styles_in_rect, &date_styles);
@@ -10347,7 +10406,7 @@ pub const Workbook = struct {
                 .string, .shared_string => |txt| .{ .string = txt },
                 .number => |x| blk: {
                     if (!std.math.isFinite(x)) return error.PivotEditUnsafe;
-                    const style: ?u32 = (styles_in_rect.get(ref) orelse null) orelse if ((try self.styles()) != null) @as(?u32, 0) else null;
+                    const style: ?u32 = ws.cell_styles.get(ref) orelse (styles_in_rect.get(ref) orelse null) orelse if ((try self.styles()) != null) @as(?u32, 0) else null;
                     if (style) |st| if (try self.styleDescribesDate(arena, st, date_styles)) return error.PivotEditUnsafe;
                     break :blk .{ .number = try std.fmt.allocPrint(arena, "{d}", .{x}) };
                 },
@@ -10589,7 +10648,7 @@ pub const Workbook = struct {
     fn refreshPivotCachesForCellWrites(self: *Workbook) Error!void {
         var any_writes = false;
         for (self.worksheets) |*ws| {
-            if (ws.deltas.count() > 0 or ws.appended_rows.items.len > 0) {
+            if (ws.hasStagedCellWork() or ws.appended_rows.items.len > 0) {
                 any_writes = true;
                 break;
             }
@@ -10914,6 +10973,12 @@ pub const Workbook = struct {
 
         var keys = ws.deltas.keyIterator();
         while (keys.next()) |ref| {
+            if (cacheReadsCell(c, sheet_idx, ref.row, ref.col)) return true;
+        }
+        // A staged style on a source cell changes what the cache reads
+        // — a number's date-ness (in-house S3d slice 1 r3 B-PIV-301).
+        var style_keys = ws.cell_styles.keyIterator();
+        while (style_keys.next()) |ref| {
             if (cacheReadsCell(c, sheet_idx, ref.row, ref.col)) return true;
         }
         if (ws.appended_rows.items.len == 0) return false;
@@ -13034,12 +13099,12 @@ const StylesTable = enum(u8) {
     /// a `<fonts>` without a record at 0 leaves `fontId="0"` dangling.
     fn defaults(self: StylesTable) []const u8 {
         return switch (self) {
-            .fonts => "<font><sz val=\"11\"/><name val=\"Calibri\"/></font>",
-            .fills => "<fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill>",
-            .borders => "<border><left/><right/><top/><bottom/><diagonal/></border>",
-            .cell_style_xfs => "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/>",
-            .cell_xfs => "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>",
-            .cell_styles => "<cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/>",
+            .fonts => styles_plan_mod.default_font_record,
+            .fills => styles_plan_mod.default_fill_records,
+            .borders => styles_plan_mod.default_border_record,
+            .cell_style_xfs => styles_plan_mod.default_cell_style_xf_record,
+            .cell_xfs => styles_plan_mod.default_cell_xf_record,
+            .cell_styles => styles_plan_mod.default_cell_style_record,
             else => "",
         };
     }
@@ -13158,7 +13223,8 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                                 // in-house r2 A-FMT-203); an id the type
                                 // cannot read collides with nothing.
                                 var id_buf: [32]u8 = undefined;
-                                const spelled = workbook_xml_mod.decodeScalarAttr(&id_buf, raw) orelse raw;
+                                const decoded = workbook_xml_mod.decodeScalarAttr(&id_buf, raw) orelse raw;
+                                const spelled = std.mem.trim(u8, decoded, " \t\r\n");
                                 if (std.fmt.parseInt(u32, spelled, 10)) |id| {
                                     if (id == std.math.maxInt(u32)) return error.MalformedStylesXml;
                                     if (layout.max_num_fmt_id == null or id > layout.max_num_fmt_id.?) layout.max_num_fmt_id = id;
@@ -13189,25 +13255,13 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
 /// The value span of attribute `name` inside `attrs` (a tag's
 /// attribute region), quotes excluded; null when absent.
 fn attrValueSpan(attrs: []const u8, name: []const u8) ?struct { start: usize, end: usize } {
-    var i: usize = 0;
-    while (i + name.len < attrs.len) {
-        const pos = std.mem.indexOfPos(u8, attrs, i, name) orelse return null;
-        const before_ok = pos == 0 or std.ascii.isWhitespace(attrs[pos - 1]);
-        var j = pos + name.len;
-        while (j < attrs.len and std.ascii.isWhitespace(attrs[j])) : (j += 1) {}
-        if (before_ok and j < attrs.len and attrs[j] == '=') {
-            j += 1;
-            while (j < attrs.len and std.ascii.isWhitespace(attrs[j])) : (j += 1) {}
-            if (j < attrs.len and (attrs[j] == '"' or attrs[j] == '\'')) {
-                const q = attrs[j];
-                const vstart = j + 1;
-                const vend = std.mem.indexOfScalarPos(u8, attrs, vstart, q) orelse return null;
-                return .{ .start = vstart, .end = vend };
-            }
-        }
-        i = pos + 1;
-    }
-    return null;
+    // The workbook scanner's attribute reader: quoted values skipped
+    // whole, so a `count="…"` inside another attribute's value is
+    // not the table's (in-house r3 A/B-SPL-302/303). Its slice is a
+    // subslice of `attrs`; the span is its offset.
+    const v = workbook_xml_mod.getAttr(attrs, name) orelse return null;
+    const start = @intFromPtr(v.ptr) - @intFromPtr(attrs.ptr);
+    return .{ .start = start, .end = start + v.len };
 }
 
 /// Render `frags` into `xml` over `layout`: every owned table with
@@ -13274,11 +13328,11 @@ fn spliceStylesFragments(
                     try out.appendSlice(a, attrs);
                 }
                 try out.append(a, '>');
-                if (held == 0) {
-                    try out.appendSlice(a, t.defaults());
-                } else if (b.close_lt) |cl| {
-                    try out.appendSlice(a, xml[b.open.after_tag_close..cl]);
-                }
+                // A table holding no record takes the defaults in
+                // front of whatever it holds (a comment, a PI — kept,
+                // in-house r3 A-BYT-306); one with records keeps them.
+                if (held == 0) try out.appendSlice(a, t.defaults());
+                if (b.close_lt) |cl| try out.appendSlice(a, xml[b.open.after_tag_close..cl]);
                 try out.appendSlice(a, add);
                 try out.appendSlice(a, t.closeTag());
                 cursor = b.end;
@@ -32433,4 +32487,192 @@ test "S3d slice 1: every allocation failure across open, the registrations, the 
         }
     };
     try std.testing.checkAllAllocationFailures(a, H.run, .{ io, path });
+}
+
+test "S3d slice 1 r3: the styles part is the workbook relationship's target — a part under another name is the one extended, no orphan created; a part without its relationship gains one; a stray count in a sibling attribute, a padded numFmtId, a comment in an empty table (A-PART-301, A/B-SPL-302, A/B-FMT-304, A-BYT-306)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r3_out.xlsx" });
+    defer a.free(out);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r3_src.xlsx");
+    defer a.free(src);
+    // The part under another name, the relationship and the content
+    // type pointing there.
+    {
+        const moved = try std.fs.path.join(a, &.{ dir, "s3d1_r3_moved.xlsx" });
+        defer a.free(moved);
+        {
+            var wb = try Workbook.open(a, io, src);
+            defer wb.deinit();
+            const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+            defer a.free(styles);
+            try wb.store.addPart("xl/style2.xml", styles_content_type, styles);
+            try wb.store.removePart("xl/styles.xml");
+            const rels = try s3d1PartBytes(a, &wb, "xl/_rels/workbook.xml.rels");
+            defer a.free(rels);
+            const patched = try std.mem.replaceOwned(u8, a, rels, "Target=\"styles.xml\"", "Target=\"style2.xml\"");
+            defer a.free(patched);
+            try std.testing.expect(!std.mem.eql(u8, rels, patched));
+            try wb.store.replacePart("xl/_rels/workbook.xml.rels", patched);
+            try wb.save(io, moved);
+        }
+        var wb = try Workbook.open(a, io, moved);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_italic = true }));
+        try (try wb.sheet(0)).setCellStyle("A1", 3);
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        try std.testing.expect(!re.store.hasPart("xl/styles.xml"));
+        const s2 = try s3d1PartBytes(a, &re, "xl/style2.xml");
+        defer a.free(s2);
+        try std.testing.expect(std.mem.indexOf(u8, s2, "<cellXfs count=\"4\">") != null);
+        const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+        defer a.free(ct);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+        const rels = try s3d1PartBytes(a, &re, "xl/_rels/workbook.xml.rels");
+        defer a.free(rels);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "/relationships/styles\""));
+        try std.testing.expectEqual(@as(?u32, 3), (try (try re.sheet(0)).cellByRef("A1")).?.style_idx);
+    }
+    // The part without its relationship: extended, and the
+    // relationship lands.
+    {
+        const unlinked = try std.fs.path.join(a, &.{ dir, "s3d1_r3_unlinked.xlsx" });
+        defer a.free(unlinked);
+        {
+            var wb = try Workbook.open(a, io, src);
+            defer wb.deinit();
+            const rels = try s3d1PartBytes(a, &wb, "xl/_rels/workbook.xml.rels");
+            defer a.free(rels);
+            const type_at = std.mem.indexOf(u8, rels, "/relationships/styles\"").?;
+            const at = std.mem.lastIndexOf(u8, rels[0..type_at], "<Relationship ").?;
+            const end = std.mem.indexOfPos(u8, rels, at, "/>").? + 2;
+            const patched = try std.mem.concat(a, u8, &.{ rels[0..at], rels[end..] });
+            defer a.free(patched);
+            try wb.store.replacePart("xl/_rels/workbook.xml.rels", patched);
+            try wb.save(io, unlinked);
+        }
+        var wb = try Workbook.open(a, io, unlinked);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_italic = true }));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const rels = try s3d1PartBytes(a, &re, "xl/_rels/workbook.xml.rels");
+        defer a.free(rels);
+        try std.testing.expect(std.mem.indexOf(u8, rels, "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "/relationships/styles\""));
+        const styles = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(styles);
+        try std.testing.expect(std.mem.indexOf(u8, styles, "<cellXfs count=\"4\">") != null);
+    }
+    // A `count` decoy inside a sibling attribute, a padded numFmtId, a
+    // comment inside an empty table.
+    {
+        const part = "<styleSheet " ++ s3d1_ns ++ "><numFmts count=\"1\"><numFmt numFmtId=\" 170 \" formatCode=\"0\"/></numFmts>" ++
+            "<fonts desc='a count=\"5\" b' count=\"1\"><font/></fonts><fills count=\"0\"><!-- keep me --></fills>" ++
+            "<cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>";
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_r3_decoy.xlsx", part);
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 171), try wb.internNumFmt("0.0"));
+        try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<fonts desc='a count=\"5\" b' count=\"2\"><font/><font><b/>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill><!-- keep me --></fills>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<numFmt numFmtId=\"171\" formatCode=\"0.0\"/>") != null);
+    }
+    // The CF forwarders' bound reads the part without arming the save:
+    // a rule alone, then the part replaced, then a save — no refusal.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try (try wb.sheet(1)).addConditionalFormatCellIs("A1:A2", .greater_than, "0", null, 0);
+        try std.testing.expect(wb.styles_base == null);
+        try wb.store.replacePart("xl/styles.xml", "<styleSheet " ++ s3d1_ns ++ "></styleSheet>");
+        try (try wb.sheet(1)).setCell("B1", .{ .number = 1 });
+        try wb.save(io, out);
+    }
+}
+
+test "S3d slice 1 r3: a staged style on a pivot source cell is what the rebuild reads — a style that changes no value leaves the records as they were, a date style this save registered on a new number keeps the rebuild off (the marker alone), the same number without it rebuilds (B-PIV-301)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "s3d1_pivot.xlsx" });
+    defer a.free(path);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_pivot_out.xlsx" });
+    defer a.free(out);
+    try pivots_mod.fixture.write(a, io, path, .sheet_ref);
+    const records_part = "xl/pivotCache/pivotCacheRecords1.xml";
+    // A style that changes no value: the cache hears the write, the
+    // rebuild it runs reads the same numbers — the records as they
+    // were, the style landed.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        const before = try s3d1PartBytes(a, &wb, records_part);
+        defer a.free(before);
+        const plain = try wb.addStyle(.{ .font_bold = true });
+        try (try wb.sheet(0)).setCellStyle("B2", plain);
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, records_part);
+        defer a.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        try std.testing.expectEqual(@as(?u32, plain), (try (try re.sheet(0)).cellByRef("B2")).?.style_idx);
+    }
+    // A new number under a date style this save registered: the
+    // rebuild's date check reads the staged style, cannot read a
+    // record the part does not hold yet, and refuses — the save takes
+    // the marker alone, the records as they were. The same number
+    // without the style rebuilds them.
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        const before = try s3d1PartBytes(a, &wb, records_part);
+        defer a.free(before);
+        const idx = try wb.addStyle(.{ .number_format = "yyyy-mm-dd" });
+        try (try wb.sheet(0)).setCell("B2", .{ .number = 12345 });
+        try (try wb.sheet(0)).setCellStyle("B2", idx);
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const def = try s3d1PartBytes(a, &re, "xl/pivotCache/pivotCacheDefinition1.xml");
+        defer a.free(def);
+        try std.testing.expect(std.mem.indexOf(u8, def, "refreshOnLoad=\"1\"") != null);
+        const after = try s3d1PartBytes(a, &re, records_part);
+        defer a.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "12345") == null);
+    }
+    {
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try (try wb.sheet(0)).setCell("B2", .{ .number = 12345 });
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, records_part);
+        defer a.free(after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "12345") != null);
+    }
 }
