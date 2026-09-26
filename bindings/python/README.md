@@ -442,8 +442,11 @@ extent, the views or `<calcPr>`.
 libzlsx 0.9.0+ exports the fresh writer's style registrations on an *opened*
 workbook (S3d slice 1). `Editor.add_style` / `add_dxf` / `intern_num_fmt`
 return the slot the record takes in the saved `xl/styles.xml` — the part is
-extended after the records it already holds, every other byte preserved —
-and `Editor.set_cell_style` puts the index on a cell (a cell the sheet lacks
+extended after the records it already holds, every other byte preserved; a
+workbook without the part gets it whole with its relationship and content
+type, a part held without either gains it, one declared under another type
+keeps that declaration — and `Editor.set_cell_style` puts the index on a cell
+(a cell the sheet lacks
 is created empty with it; a value keeps its value). The `Style` / `Dxf` /
 `BorderSide` classes are the writer's (see *Style cheat sheet*).
 

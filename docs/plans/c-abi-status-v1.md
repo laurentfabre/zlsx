@@ -3128,8 +3128,12 @@ spelling: the part is extended in place (a non-ASCII name — its
 archive entry flagged UTF-8 on the rewrite — a trailing slash, a
 numeric reference; refusing a real part's name for its spelling would
 orphan it), and it gains the styles content-type `<Override>` when the
-package resolves it to another type through a Default; a held part
-that is no stylesheet refuses `MalformedStylesXml`. A target naming
+package resolves it to another type through a Default, or to nothing
+(r19 A-DOC-1908) — a part the package declares under another type
+keeps that declaration (an owner ruling: the extension then lands in
+a part a content-type-checking consumer does not read as the
+stylesheet; openpyxl and LibreOffice do not check — r19 A-CT-1909,
+open); a held part that is no stylesheet refuses `MalformedStylesXml`. A target naming
 no part is the name the
 slice would CREATE at, and it creates only where (i) the resolver
 answers a name at all (not empty, a scheme, a backslash or
@@ -3139,7 +3143,8 @@ forward-slash UNC, a drive letter, a package-escaping or root-naming
 Part 2 §9.1.1: ASCII pchar; a percent escape of two hex digits
 spelling neither an unreserved character nor a slash; no `\`, `#`,
 `?`, space; no segment ending in `.`; no byte above ASCII — the
-archive could not flag it UTF-8), and (iv) no entry sits under the
+grammar's own rule, a name no consumer addresses as the package
+spells it), and (iv) no entry sits under the
 name and no part with bytes sits over it (a zero-length entry beside
 `xl/…` is a directory marker, no part). Otherwise `xl/styles.xml`,
 extended when held, created when not; a part the workbook holds
@@ -3486,9 +3491,13 @@ spelling neither an unreserved character nor a slash (`styles%2Exml`
 is `styles.xml` to a normalizing consumer and another name to a
 literal one — B-REL-1602); a byte above ASCII names no part to
 create (the grammar wants it escaped; and, as recorded then, the
-archive writer never set the UTF-8 name bit for any rewritten entry
-— B-PKG-1605, a pre-existing package-layer item closed in round 18
-once r17 made a held part at such a name reachable); a network-path
+store's rewriting emitter never set the UTF-8 name bit for any
+rewritten entry — B-PKG-1605, a pre-existing package-layer item
+closed in round 18 for that emitter once r17 made a held part at such
+a name reachable; the fresh writer `pkg/zip.zig` behind
+`Workbook.empty` / the `zlsx_writer` surface still writes flag 0 by
+its documented contract, and nothing reachable hands it a non-ASCII
+part name); a network-path
 target (`//host/path`) is external to the resolver, as the
 backslash UNC is (B-REL-1603; A-REL-1601 found both faces). The
 injector decodes a `Type` and a `Target` into a buffer the raw
@@ -3548,6 +3557,38 @@ across the extension); the create-side rule (iii) keeps refusing an
 unescaped name, the grammar's own reason. The "no stylesheet" shape
 reached every refusal-shape list and footnote ³⁰'s identity summary
 (B-DOC-1804).
+
+**Round 19.** The held-part question took the FIRST case-insensitive
+match: a case-variant twin entry ahead of the real part in the
+archive hijacked the resolution — a junk twin refused the feature, a
+well-formed one took the style while the cell's index meant another
+record in the part every consumer reads (in-house r19 B-PART-1901, a
+regression over r18) → the exact spelling first, then any case
+(pinned, a twin ahead and behind). The conventional fallback asked
+the byte-exact question: a part held at `xl/Styles.xml` with no
+styles relationship got a case-equivalent twin (B-PART-1902) → the
+fallback goes through the same held question, the store's spelling
+extended and its relationship injected (pinned). The content-type
+guard's literal `PartName="` needle missed `PartName = "…"` and an
+entity-spelled name — a second `<Override>` for one part (B-CT-1903)
+→ read as the store's reader reads (whitespace, entities, either
+quote; pinned). The UTF-8 name bit was asserted from the byte range:
+a latin-1 name flagged made `zipfile` refuse the whole archive
+(B-PKG-1904) → only a name that IS UTF-8 is flagged (pinned).
+`addPart`'s rewritten `[Content_Types].xml` records its size too
+(B-STORE-1907). Docs: rule (iii)'s reason is the grammar's own, the
+B-PKG-1605 closure names the store's emitter and leaves the fresh
+writer `pkg/zip.zig` at its documented flag 0 (B-DOC-1905); the
+`<Override>` a held-but-undeclared part gains, and the declaration a
+part under another type keeps, on the header, footnote ³⁰, the
+Python docstring and README (B-DOC-1906). A: the content-type guard
+reads through the store's own lexer — live markup only, a `>` inside
+a sibling value kept, the decode gated on `&` (A-CT-1904); the
+create-side case rules and the content-type stage-and-commit pinned
+(A-PIN-1905 / A-PIN-1906: the fold's sweep runs over an undeclared
+part too); the `<Override>` scope names "or to nothing" (A-DOC-1908);
+a part declared under another type recorded as an open owner call
+(A-CT-1909).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

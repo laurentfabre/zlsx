@@ -816,6 +816,7 @@ pub const PartStore = struct {
         self.overrides[ct_idx] = ct_new_override;
         self.parts[ct_idx].bytes = ct_new_part_bytes;
         self.parts[ct_idx].compression_method = ct_new_override.compressed.compression_method;
+        self.parts[ct_idx].uncompressed_size = @intCast(ct_new_part_bytes.len);
     }
 
     const StagedContentTypeUpdate = struct {
@@ -1526,7 +1527,7 @@ pub const PartStore = struct {
             if (std.mem.eql(u8, ct, content_type)) return;
         }
         const ct_idx = self.findIndex("[Content_Types].xml") orelse return error.MissingContentTypes;
-        if (overrideNamesPart(self.parts[ct_idx].bytes, name)) return;
+        if (try self.overrideNamesPart(self.parts[ct_idx].bytes, name)) return;
         self.mutations += 1;
         const staged = try self.stageContentTypeOverride(name, content_type, .none);
         const ar_alloc = self.arena.allocator();
@@ -1548,6 +1549,11 @@ pub const PartStore = struct {
     /// at `xl/stylés.xml` lost whole (S3d slice 1 r18 B-PKG-1801;
     /// r16 B-PKG-1605 recorded the same for a created one).
     fn nameFlags(name: []const u8) u16 {
+        // The bit is a claim the name IS UTF-8: a name that is not
+        // (a latin-1 entry a producer wrote) keeps the source's own
+        // labelling — flagged, `zipfile` refused the whole archive
+        // (r19 B-PKG-1904).
+        if (!std.unicode.utf8ValidateSlice(name)) return 0;
         for (name) |c| {
             if (c >= 0x80) return 0x0800;
         }
@@ -1556,18 +1562,30 @@ pub const PartStore = struct {
 
     /// Whether `[Content_Types].xml` holds an `<Override>` whose
     /// `PartName` is `/name` (part names compare ASCII
-    /// case-insensitively, ECMA-376 Part 2 §9.1.1).
-    fn overrideNamesPart(ct_xml: []const u8, name: []const u8) bool {
+    /// case-insensitively, ECMA-376 Part 2 §9.1.1). Read as the
+    /// store's own content-type reader reads: legal whitespace
+    /// around the `=`, the value entity-decoded (a literal
+    /// `PartName="` needle missed `PartName = "…"` and an
+    /// entity-spelled name, and a second `<Override>` for one part
+    /// followed — r19 B-CT-1903).
+    fn overrideNamesPart(self: *const PartStore, ct_xml: []const u8, name: []const u8) !bool {
         var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, ct_xml, pos, "PartName=")) |at| {
-            pos = at + "PartName=".len;
-            if (pos >= ct_xml.len) return false;
-            const q = ct_xml[pos];
-            if (q != '"' and q != '\'') continue;
-            const end = std.mem.indexOfScalarPos(u8, ct_xml, pos + 1, q) orelse return false;
-            const value = ct_xml[pos + 1 .. end];
+        // The reader's own lexer: live markup only (a commented-out
+        // `<Override>` is none), the tag's end past a `>` inside a
+        // sibling value, the attribute by the lexer that reads every
+        // other content-type attribute (r19 A-CT-1904).
+        while (liveIndexOfPos(ct_xml, pos, "<Override")) |tag_at| {
+            const after = tag_at + "<Override".len;
+            const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse return false;
+            pos = tag_end + 1;
+            if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+            const raw = xmlAttrValue(ct_xml[tag_at..tag_end], "PartName") orelse continue;
+            // Decoded only when spelled with a reference (r17
+            // A-PIN-1704's invariant).
+            const owned: ?[]u8 = if (std.mem.indexOfScalar(u8, raw, '&') != null) try decodeXmlEntities(self.allocator, raw) else null;
+            defer if (owned) |o| self.allocator.free(o);
+            const value = owned orelse raw;
             if (value.len == name.len + 1 and value[0] == '/' and std.ascii.eqlIgnoreCase(value[1..], name)) return true;
-            pos = end + 1;
         }
         return false;
     }
@@ -3680,7 +3698,20 @@ test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeO
     try std.testing.expectEqual(before_len, (try store.part("[Content_Types].xml")).?.bytes.len);
     try std.testing.expectEqualStrings("application/xml", (try store.part("xl/added.xml")).?.content_type.?);
     const by_default = "xl/_rels/workbook.xml.rels";
-    try std.testing.expect(!PartStore.overrideNamesPart(ct_before, by_default));
+    try std.testing.expect(!try store.overrideNamesPart(ct_before, by_default));
+    // The guard reads a declaration as the store's reader does: spaces
+    // around the `=`, an entity-spelled name, either quote; a name
+    // inside `xPartName` or a different part is none (r19 B-CT-1903).
+    try std.testing.expect(try store.overrideNamesPart("<Types><Override ContentType=\"a/b\" PartName = \"/xl/styles.xml\"/></Types>", "xl/styles.xml"));
+    try std.testing.expect(try store.overrideNamesPart("<Types><Override PartName='/xl/a&amp;b.xml' ContentType=\"a/b\"/></Types>", "xl/a&b.xml"));
+    try std.testing.expect(try store.overrideNamesPart("<Types><Override PartName=\"/XL/Styles.xml\"/></Types>", "xl/styles.xml"));
+    try std.testing.expect(!try store.overrideNamesPart("<Types><Override xPartName=\"/xl/styles.xml\" PartName=\"/xl/other.xml\"/></Types>", "xl/styles.xml"));
+    try std.testing.expect(!try store.overrideNamesPart("<Types><Default Extension=\"xml\" PartName=\"/xl/styles.xml\"/></Types>", "xl/styles.xml"));
+    // A commented-out declaration is none; a `>` inside a sibling
+    // value does not end the tag (r19 A-CT-1904).
+    try std.testing.expect(!try store.overrideNamesPart("<Types><!-- <Override PartName=\"/xl/styles.xml\"/> --></Types>", "xl/styles.xml"));
+    try std.testing.expect(try store.overrideNamesPart("<Types><Override ContentType=\"a>b\" PartName=\"/xl/styles.xml\"/></Types>", "xl/styles.xml"));
+    try std.testing.expect(!try store.overrideNamesPart("<Types><OverrideX PartName=\"/xl/styles.xml\"/></Types>", "xl/styles.xml"));
     try store.ensureContentTypeOverride(by_default, "application/x-test");
     try store.ensureContentTypeOverride(by_default, "application/x-test");
     const ct_after = (try store.part("[Content_Types].xml")).?.bytes;

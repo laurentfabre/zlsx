@@ -2593,7 +2593,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * save_with_recalc: each table of the part extended after the records
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part
- * gets it whole, with its relationship and content type), every other
+ * gets it whole, with its relationship and content type; a part held
+ * without its relationship or without a content-type Override gains
+ * them — a part the package declares under another type keeps that
+ * declaration), every other
  * byte of the part preserved. The index returned is the slot the
  * record takes in the SAVED part — feed it to
  * zlsx_editor_set_cell_style, or to a cell's s="…" by other means.

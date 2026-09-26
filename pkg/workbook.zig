@@ -1761,10 +1761,14 @@ pub const Workbook = struct {
         }
         // The conventional name under the same test the relationship's
         // was — the two answers cannot disagree (in-house r16
-        // B-PART-1601): held, it is the part; absent, a part may be
+        // B-PART-1601): held under any case, it is the part, in the
+        // store's spelling (r19 B-PART-1902); absent, a part may be
         // created there unless an entry sits under `xl/styles.xml/`
         // (a package the opener admits — r17 B-DOC-1723).
-        if (!self.store.hasPart(styles_part_name) and !partNameCreatable(&self.store, styles_part_name)) return error.MalformedStylesXml;
+        if (heldPartIndex(&self.store, styles_part_name)) |i| {
+            if (!isDirectoryMarker(&self.store, i)) return try self.allocator.dupe(u8, self.store.partNameAt(i));
+        }
+        if (!partNameCreatable(&self.store, styles_part_name)) return error.MalformedStylesXml;
         return try self.allocator.dupe(u8, styles_part_name);
     }
 
@@ -1821,10 +1825,16 @@ pub const Workbook = struct {
         return name;
     }
 
-    /// The index of the entry named `name` under any ASCII case, if
-    /// the store holds one.
+    /// The index of the entry named `name`: the exact spelling first
+    /// — the part the producer and every consumer address — then any
+    /// ASCII case (in-house r19 B-PART-1901: a case-variant twin ahead
+    /// of the real part in the archive had hijacked the resolution).
     fn heldPartIndex(store: *const PartStore, name: []const u8) ?usize {
         var i: usize = 0;
+        while (i < store.partCount()) : (i += 1) {
+            if (std.mem.eql(u8, store.partNameAt(i), name)) return i;
+        }
+        i = 0;
         while (i < store.partCount()) : (i += 1) {
             if (std.ascii.eqlIgnoreCase(store.partNameAt(i), name)) return i;
         }
@@ -1893,7 +1903,8 @@ pub const Workbook = struct {
     /// consumer and another name to a literal one — in-house r16
     /// B-REL-1602); no segment empty or ending in `.`; no byte above
     /// ASCII (the grammar wants it escaped; an unescaped one names an
-    /// entry the archive cannot flag as UTF-8 — r16 B-PKG-1605).
+    /// entry no consumer addresses by the name the package spells —
+    /// r16 B-PKG-1605, r19 B-DOC-1905).
     fn partNameSpellable(name: []const u8) bool {
         var it = std.mem.splitScalar(u8, name, '/');
         while (it.next()) |seg| {
@@ -32531,6 +32542,28 @@ fn writeS3d1WithStyles(a: Allocator, io: std.Io, dir: []const u8, name: []const 
     return path;
 }
 
+/// The fixture with its styles part's `<Override>` removed from
+/// `[Content_Types].xml` (the part resolves through the `xml`
+/// Default), saved to `name`.
+fn writeS3d1Undeclared(a: Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_src_for_undeclared.xlsx");
+    defer a.free(src);
+    const path = try std.fs.path.join(a, &.{ dir, name });
+    errdefer a.free(path);
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const ct = try s3d1PartBytes(a, &wb, "[Content_Types].xml");
+    defer a.free(ct);
+    const at = std.mem.indexOf(u8, ct, "PartName=\"/xl/styles.xml\"") orelse return error.TestUnexpectedResult;
+    const open_at = std.mem.lastIndexOf(u8, ct[0..at], "<Override") orelse return error.TestUnexpectedResult;
+    const close_at = (std.mem.indexOfPos(u8, ct, at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+    const stripped = try std.mem.concat(a, u8, &.{ ct[0..open_at], ct[close_at..] });
+    defer a.free(stripped);
+    try wb.store.replacePart("[Content_Types].xml", stripped);
+    try wb.save(io, path);
+    return path;
+}
+
 fn s3d1PartBytes(a: Allocator, wb: *Workbook, name: []const u8) ![]u8 {
     const p = (try wb.store.part(name)) orelse return error.TestUnexpectedResult;
     return try a.dupe(u8, p.bytes);
@@ -33073,6 +33106,12 @@ test "S3d slice 1: every allocation failure across open, the registrations, the 
         }
     };
     try std.testing.checkAllAllocationFailures(a, H.run, .{ io, path });
+    // The same sweep over a part the package never declared: the
+    // content-type stage-and-commit under every failure (r19
+    // A-PIN-1906).
+    const undeclared = try writeS3d1Undeclared(a, io, dir, "s3d1_oom_undeclared.xlsx");
+    defer a.free(undeclared);
+    try std.testing.checkAllAllocationFailures(a, H.run, .{ io, undeclared });
 }
 
 test "S3d slice 1 r3: the styles part is the workbook relationship's target — a part under another name is the one extended, no orphan created; a part without its relationship gains one; a stray count in a sibling attribute, a padded numFmtId, a comment in an empty table (A-PART-301, A/B-SPL-302, A/B-FMT-304, A-BYT-306)" {
@@ -33742,7 +33781,7 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
     defer a.free(src);
     const out = try std.fs.path.join(a, &.{ dir, "s3d1_r17_out.xlsx" });
     defer a.free(out);
-    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", remove: bool, idx: u32, part: []const u8, absent: []const u8, rels: usize };
+    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", twin_first: bool = false, remove: bool, idx: u32, part: []const u8, absent: []const u8, rels: usize };
     const arms = [_]Arm{
         // The part lives at a non-ASCII name: extended there.
         .{ .target = "stylés.xml", .moved_to = "xl/stylés.xml", .stray = null, .remove = false, .idx = 3, .part = "xl/stylés.xml", .absent = "xl/styles.xml", .rels = 1 },
@@ -33752,6 +33791,12 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         .{ .target = "workbook.xml/styles.xml", .moved_to = null, .stray = "xl/workbook.xml/x", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/workbook.xml/styles.xml", .rels = 2 },
         // An interior empty segment names no part to create: the conventional one is created and addressed.
         .{ .target = "sub//styles.xml", .moved_to = null, .stray = null, .remove = true, .idx = 1, .part = "xl/styles.xml", .absent = "xl/sub/styles.xml", .rels = 2 },
+        // A case-variant twin AHEAD of the real part in the archive: the exact spelling wins (r19 B-PART-1901).
+        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .twin_first = true, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 1 },
+        // The create-side prefix tests under any case: a name under the real part spelled otherwise, a marker spelled `XL` (r19 A-PIN-1905).
+        .{ .target = "WORKBOOK.XML/styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/WORKBOOK.XML/styles.xml", .rels = 2 },
+        .{ .target = "/XL", .moved_to = null, .stray = "XL", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
         // A `.` or `/xl` beside a bare `xl` entry names the marker, no part: the conventional part (r15 × r16).
         .{ .target = ".", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
         .{ .target = "/xl", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
@@ -33772,6 +33817,13 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
                 try wb.store.removePart("xl/styles.xml");
             }
             if (arm.stray) |name| try wb.store.addPart(name, "application/octet-stream", arm.stray_bytes);
+            if (arm.twin_first) {
+                // Re-added after the twin: the archive lists the twin first.
+                const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+                defer a.free(styles);
+                try wb.store.removePart("xl/styles.xml");
+                try wb.store.addPart("xl/styles.xml", styles_content_type, styles);
+            }
             if (arm.remove) try wb.store.removePart("xl/styles.xml");
             const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
             defer a.free(rels);
@@ -33779,7 +33831,7 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
             defer a.free(retargeted);
             const patched = try std.mem.replaceOwned(u8, a, rels, "Target=\"styles.xml\"", retargeted);
             defer a.free(patched);
-            try std.testing.expect(!std.mem.eql(u8, rels, patched));
+            try std.testing.expect(std.mem.eql(u8, arm.target, "styles.xml") or !std.mem.eql(u8, rels, patched));
             try wb.store.replacePart(workbook_rels_part_name, patched);
             try wb.save(io, in_path);
         }
@@ -33934,4 +33986,77 @@ test "S3d slice 1: a rewritten entry whose name is not ASCII carries the UTF-8 n
         }
     }
     try std.testing.expectEqual(@as(usize, 2), seen2);
+    // A name that is not UTF-8 (a latin-1 producer's) is not flagged —
+    // the bit is a claim, and a false one refuses the whole archive
+    // to a `zipfile` consumer (r19 B-PKG-1904).
+    const latin = "xl/styl\xe9s.xml";
+    {
+        var wb3 = try Workbook.open(a, io, src);
+        defer wb3.deinit();
+        try wb3.store.addPart(latin, "application/xml", "<a/>");
+        try wb3.save(io, out);
+    }
+    const raw3 = try std.Io.Dir.cwd().readFileAlloc(io, out, a, .limited(1 << 24));
+    defer a.free(raw3);
+    var seen3: usize = 0;
+    pos = 0;
+    while (std.mem.indexOfPos(u8, raw3, pos, latin)) |at| : (pos = at + latin.len) {
+        if (at >= 30 and std.mem.eql(u8, raw3[at - 30 .. at - 26], "PK\x03\x04")) {
+            try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw3[at - 24 ..][0..2], .little) & 0x0800);
+            seen3 += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen3);
+}
+
+test "S3d slice 1: the conventional fallback finds the part held under another case — no styles relationship, the part at xl/Styles.xml is extended in place and gains the relationship (r19 B-PART-1902)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r19_src.xlsx");
+    defer a.free(src);
+    const upper = try std.fs.path.join(a, &.{ dir, "s3d1_r19_upper.xlsx" });
+    defer a.free(upper);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r19_out.xlsx" });
+    defer a.free(out);
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+        defer a.free(styles);
+        try wb.store.addPart("xl/Styles.xml", styles_content_type, styles);
+        try wb.store.removePart("xl/styles.xml");
+        const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+        defer a.free(rels);
+        const at = std.mem.indexOf(u8, rels, "Target=\"styles.xml\"") orelse return error.TestUnexpectedResult;
+        const open_at = std.mem.lastIndexOf(u8, rels[0..at], "<Relationship") orelse return error.TestUnexpectedResult;
+        const close_at = (std.mem.indexOfPos(u8, rels, at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+        const without = try std.mem.concat(a, u8, &.{ rels[0..open_at], rels[close_at..] });
+        defer a.free(without);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, without, "relationships/styles\""));
+        try wb.store.replacePart(workbook_rels_part_name, without);
+        try wb.save(io, upper);
+    }
+    var wb = try Workbook.open(a, io, upper);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true, .font_italic = true }));
+    try wb.save(io, out);
+    var re = try Workbook.open(a, io, out);
+    defer re.deinit();
+    try std.testing.expect(!re.store.hasPart("xl/styles.xml"));
+    const styles = try s3d1PartBytes(a, &re, "xl/Styles.xml");
+    defer a.free(styles);
+    try std.testing.expect(std.mem.indexOf(u8, styles, "<cellXfs count=\"4\">") != null);
+    const rels = try s3d1PartBytes(a, &re, workbook_rels_part_name);
+    defer a.free(rels);
+    try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"Styles.xml\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "relationships/styles\""));
+    const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+    defer a.free(ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
 }
