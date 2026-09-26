@@ -446,7 +446,8 @@ extended after the records it already holds, every other byte preserved; a
 workbook without the part gets it whole with its relationship and content
 type (an `<Override>` the package already holds for the name is re-typed, unless
 it is a case-variant twin's, which stays), a
-part held without either gains it, one declared under another type
+part held without either, or with a declaration lacking its `ContentType`,
+gains it, one declared under another type
 keeps that declaration — and `Editor.set_cell_style` puts the index on a cell
 (a cell the sheet lacks
 is created empty with it; a value keeps its value). The `Style` / `Dxf` /
@@ -486,7 +487,11 @@ write to the structural edits (`RowEditRequiresCleanSheet` /
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
-staged. A styles part the extension cannot read (no `<styleSheet>` root, a
+staged. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
+registration mapped against is no longer the one the package resolves to, or
+one the extension can read — a structural edit created the part the styles
+relationship names (`add_sheet` on a package whose relationship targets a
+missing worksheet name); re-open and register again. A styles part the extension cannot read (no `<styleSheet>` root, a
 self-closed one or one whose default namespace is not the main spreadsheetml
 one (Transitional or ISO-Strict), an element that never closes, a stray closing tag between
 tables or records, a table out of the schema's order, a table or a record under

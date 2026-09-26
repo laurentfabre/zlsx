@@ -5254,7 +5254,17 @@ class Editor:
 
     def save(self, out_path: Union[str, Path]) -> None:
         """Write the (mutated) workbook atomically to ``out_path``.
-        Pass the same path as the source to overwrite in place."""
+        Pass the same path as the source to overwrite in place.
+
+        Raises :class:`ZlsxError` on failure — among its names
+        ``StylesPartChanged``: a style registered here (:meth:`add_style`
+        / :meth:`add_dxf` / :meth:`intern_num_fmt` / :meth:`set_cell_style`)
+        mapped against a styles part the package no longer resolves to,
+        or one the extension can no longer read, at the save — a
+        structural edit created the part the workbook's styles
+        relationship names (:meth:`add_sheet` on a package whose
+        relationship targets a missing worksheet name). Re-open and
+        register again."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         encoded = str(out_path).encode("utf-8")
@@ -5338,7 +5348,8 @@ class Editor:
         workbook without the part gets it whole, with its relationship
         and content type — an ``<Override>`` the package already holds
         for the name is re-typed, unless it is a case-variant twin's,
-        which stays; a part held without either gains it — one the
+        which stays; a part held without either, or with a declaration
+        lacking its ``ContentType``, gains it — one the
         package declares under another type keeps that declaration).
         Feed the index to
         :meth:`set_cell_style`. The fresh writer's :class:`Style`, the

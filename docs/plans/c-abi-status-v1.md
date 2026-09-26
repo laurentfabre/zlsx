@@ -3200,9 +3200,16 @@ on every fixture with a styles part the index equals the parser's
 exactly the plan and the new `<xf>` names the new font, fill and
 border. The base is cached while the plan is staged and forgotten when
 the plan drains. A recalc transaction never touches the part, but the
-store is a public Zig surface (`PartStore.replacePart` / `removePart`),
-so the splice re-reads the layout and refuses `StylesPartChanged` (-1
-on C, unreachable there — no part export) when it is no longer the one
+store is a public Zig surface (`PartStore.replacePart` / `removePart` /
+`addPart`) and a structural edit can create the very part the styles
+relationship names (`add_sheet` on a package whose relationship
+targets a missing worksheet name — in-house r24 B-DOC-2402), so the
+splice resolves the part and re-reads the layout and refuses
+`StylesPartChanged` (-1 on C and `ZlsxError` on Python, reachable
+there through that edit; named on `zlsx_editor_save`, the Python
+`save` docstring and README; kept a -1 as an owner ruling — a
+statement about this editor's sequencing, as the row edits' refusals
+are, not about the workbook as opened) when it is no longer the one
 the registrations mapped against: the indices handed out could not be
 honoured, and an assert would have been reachable (in-house r1
 A-BASE-103). A part that appeared with exactly the fresh layout is
@@ -3703,6 +3710,32 @@ name it. `overridePartNameOf` borrows unless a reference is spelled
 (A-PIN-2306); the twin qualifier on the last two surfaces, the
 created part's content-type rule in "Which part" (A-DOC-2307 /
 B-DOC-2304).
+
+**Round 24.** The remover's live end-tag scan was a byte literal, so
+a legal `</Override >` was not found and the start tag alone was cut
+— the manifest ill-formed again (in-house r24 A-CT-2401) → a loose
+live close tag (`liveCloseTagEnd`). The manifest's append slot was a
+raw last `</Types>`: an epilog comment stole it, a legal `</Types >`
+refused every declaring `addPart` (A-CT-2403) → the live, loosely
+spelled root close tag. The extend path handed `holdsVariantOf` no
+exception while the part IS held, so every case-variant declaration
+was kept and a `ContentType`-less one left the part undeclared
+(A-CT-2402) → the part being declared is excepted. The retired guard
+(`overrideNamesPart` / `overrideTagNamesPart`, a third "is it
+declared" answer with no production caller) removed with its pins
+(A-DEAD-2406). Pins: the third-case twin isolates the held test, the
+decoded keep, the loose end and root tags, the variant typeless
+extend (A-PIN-2404 / A-PIN-2405); the extend path's typeless gain on
+the header, docstring, README and footnote ³⁰ (A-DOC-2407). B: a
+NESTED `<Override>` (well-formed, no schema) closed the outer's live
+end scan early — the outer's end tag dangling, the manifest
+ill-formed; an unterminated element ate the next one (B-CT-2401) →
+`overrideElementEnd`, depth-aware over live markup, stepping over a
+comment, CDATA or PI whole (pinned four shapes). `StylesPartChanged`
+was called unreachable from C/Python where `add_sheet` creating the
+part the styles relationship names reaches it (B-DOC-2402) → named on
+every save surface, the -1 ruling recorded; the two save-time
+mappings pinned (B-PIN-2405).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

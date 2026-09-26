@@ -1540,7 +1540,15 @@ int32_t zlsx_editor_set_cell(
 
 /* Save the workbook (with any pending appends applied) atomically
  * to `out_path` (`out_path_len` bytes; not null-terminated). Returns
- * 0 on success, -1 on failure with `err_buf` populated.
+ * 0 on success, -1 on failure with `err_buf` populated — among the
+ * names: StylesPartChanged, when a style registered here
+ * (zlsx_editor_add_style / add_dxf / intern_num_fmt / set_cell_style)
+ * mapped against a styles part the package no longer resolves to,
+ * or one the walk can no longer read, at the save: a structural edit
+ * created the part the workbook's styles relationship names
+ * (zlsx_editor_add_sheet on a package whose relationship targets a
+ * missing worksheet name), or the Zig store surface replaced /
+ * removed / added under it. Re-open and register again.
  */
 int32_t zlsx_editor_save(
     zlsx_editor_t * ed,
@@ -2596,7 +2604,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * gets it whole, with its relationship and content type — an Override
  * the package already holds for the name is re-typed, unless it is a
  * case-variant twin's, which stays; a part held
- * without its relationship or without a content-type Override gains
+ * without its relationship or without a content-type Override (or with
+ * one lacking its ContentType) gains
  * them — a part the package declares under another type keeps that
  * declaration), every other
  * byte of the part preserved. The index returned is the slot the
@@ -2688,7 +2697,8 @@ int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
  * handle), SheetIndexOutOfRange, RowIndexOutOfRange,
  * ColumnIndexOutOfRange, UnknownStyleIndex (past both ranges —
  * judged before anything is staged), SheetHasUnsavedAppends;
- * -2 MalformedStylesXml; -3 OutOfMemory. */
+ * -2 MalformedStylesXml; -3 OutOfMemory. The save itself may
+ * refuse -1 StylesPartChanged (see zlsx_editor_save). */
 int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
         uint32_t sheet_idx, uint32_t row, uint32_t col, uint32_t style_idx,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

@@ -34322,6 +34322,29 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         try held.store.addPart("xl/styles.xml", styles_content_type, "<styleSheet " ++ s3d1_ns ++ "/>");
         try std.testing.expectError(error.StylesPartChanged, held.save(io, out));
     }
+    // The two save-time refusals read `StylesPartChanged` (r24
+    // B-PIN-2405): the part absent at the registration and an entry
+    // added under the conventional name before the save (r22
+    // A-DOC-2205); the part replaced by bytes the walk cannot read
+    // (r23 A-DOC-2308).
+    {
+        var absent = try Workbook.open(a, io, src);
+        defer absent.deinit();
+        try absent.store.removePart("xl/styles.xml");
+        try absent.save(io, variant);
+        var wb = try Workbook.open(a, io, variant);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
+        try wb.store.addPart("xl/styles.xml/junk", "application/octet-stream", "x");
+        try std.testing.expectError(error.StylesPartChanged, wb.save(io, out));
+    }
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
+        try wb.store.replacePart("xl/styles.xml", "<worksheet " ++ s3d1_ns ++ "/>");
+        try std.testing.expectError(error.StylesPartChanged, wb.save(io, out));
+    }
     // A name outside the workbook's directory is injected absolute
     // (the fixture's own styles relationship removed first).
     {
