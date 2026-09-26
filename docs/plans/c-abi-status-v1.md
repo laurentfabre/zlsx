@@ -3125,8 +3125,12 @@ still address the conventional name (pre-existing, recorded).
 
 **What the index is.** The part's tables are read once per save —
 `scanStylesPart`, one lexical walk on the workbook scanner
-(`findTagOpen` / `findClosingTag`: comment / CDATA / PI decoys skipped,
-quoted `>` respected), the CHILDREN of `<numFmts>` / `<fonts>` /
+(`findTagOpen` / `findCloseTagLoose`: comment / CDATA / PI decoys
+skipped, quoted `>` respected, whitespace before a closing `>`
+allowed) over the root's DIRECT children — a known table recorded, any
+other element skipped whole, so a table's name inside an `<extLst>`
+extension is never the stylesheet's (in-house r6 B-SCN-601) — the
+direct CHILDREN of `<numFmts>` / `<fonts>` /
 `<fills>` / `<borders>` / `<cellXfs>` / `<dxfs>` counted, never a
 `count` attribute — into a `styles_plan.Base`: the slot each table's
 next record takes, and the first free `numFmtId` above every `<numFmt>`
@@ -3237,6 +3241,32 @@ carrying re-emit — is an owner follow-up on the delta emitter, not this
 slice's. On a pivot host sheet whose staged writes the pivot render
 splices, a staged style stays for the sheet phase, which re-emits the
 spliced bytes once more with the `s` on top (r2 B-PIV-204).
+
+**Record 0.** A style that sets no fill or border names the part's
+records 0 — `fillId="0"`, `borderId="0"`, and every `<xf>` names
+`xfId="0"` — the none fill, the empty border and the Normal cell style
+every known producer writes there (Excel, openpyxl, xlsxwriter, the
+fresh writer): the OOXML convention Excel itself relies on. A part
+whose record 0 is something else (in-house r6 A-SPL-602 built one:
+fills[0] solid red) gives such a style that record; the seed rule
+covers an absent or empty table, not a table whose first record is
+not the default. Stated on the header and the Python docstring;
+resolving "none" against the part's own records — appending a none
+fill / empty border where record 0 is not one — is an owner call
+recorded here, not this slice's. The delta emitter locates
+`<sheetData>` by substring (pre-existing; a comment spelling one ahead
+of the real element takes the whole re-emit — r6 A-EMT-603), one more
+item of "what a cell style costs", the same follow-up.
+
+**Round 6.** `Editor.set_cell_style`'s four indices go through the
+class's `_u32` guard (`2**32` is `ValueError`, never a wrap to another
+sheet, row or style — r6 A-PY-601 / B-PY-602; `set_cell`'s three, the
+same pre-existing gap, with them). A created part's content-type
+override rides `PartStore.addPart` (pre-existing: a package that
+already declares an override for the name gets a second — r6
+B-CT-603, recorded). A save that rendered the plan invalidates the
+view `Workbook.styles()` handed out, as an SST extension invalidates
+`sst()`'s (r6 B-VIEW-604, stated here).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

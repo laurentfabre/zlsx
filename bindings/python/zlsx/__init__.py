@@ -4168,9 +4168,9 @@ class Editor:
         cell_ref = _ffi.Cell.from_buffer_copy(bytes(cell))
         rc = _ffi.lib.zlsx_editor_set_cell(
             self._handle,
-            int(sheet_idx),
-            int(row),
-            int(col),
+            self._u32("sheet_idx", sheet_idx),
+            self._u32("row", row),
+            self._u32("col", col),
             ctypes.byref(cell_ref),
             self._err,
             _ERR_BUF_LEN,
@@ -5423,10 +5423,26 @@ class Editor:
         Raises :class:`ZlsxError` ``UnknownStyleIndex`` past both ranges
         (judged before anything is staged), ``SheetIndexOutOfRange``,
         ``RowIndexOutOfRange``, ``ColumnIndexOutOfRange``; the
-        :class:`ZlsxRefusal` of :meth:`add_style`."""
+        :class:`ZlsxRefusal` of :meth:`add_style`. The four indices are
+        bounded before ``ctypes`` narrows them (``2**32`` is
+        ``ValueError``, ``1.9`` ``TypeError`` — :meth:`insert_row`'s
+        rule), never wrapped to another sheet, row or style.
+
+        A style that sets no fill or border names the part's records 0
+        (``fillId="0"``, ``borderId="0"``, and ``xfId="0"``) — the none
+        fill, the empty border and the Normal cell style every known
+        producer writes there, the OOXML convention Excel relies on; a
+        part whose record 0 is something else would give such a style
+        that record."""
         self._styles_available()
         self._structural_call(
-            "zlsx_editor_set_cell_style", _ffi.lib.zlsx_editor_set_cell_style, self._handle, int(sheet_idx), int(row), int(col), int(style_idx)
+            "zlsx_editor_set_cell_style",
+            _ffi.lib.zlsx_editor_set_cell_style,
+            self._handle,
+            self._u32("sheet_idx", sheet_idx),
+            self._u32("row", row),
+            self._u32("col", col),
+            self._u32("style_idx", style_idx),
         )
 
     def mark_recalc_on_load(self) -> None:

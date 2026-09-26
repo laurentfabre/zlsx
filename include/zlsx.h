@@ -2593,6 +2593,11 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * byte of the part preserved. The index returned is the slot the
  * record takes in the SAVED part — feed it to
  * zlsx_editor_set_cell_style, or to a cell's s="…" by other means.
+ * A style that sets no fill or border names the part's records 0
+ * (fillId="0", borderId="0", and xfId="0"): the none fill, the empty
+ * border and the Normal cell style every known producer writes there
+ * — the OOXML convention Excel relies on; a part whose record 0 is
+ * something else gives such a style that record.
  * Dedup is within one save, against this save's registrations, never
  * against the part's own records: registering a style the part
  * already spells appends a second record. The save drains the

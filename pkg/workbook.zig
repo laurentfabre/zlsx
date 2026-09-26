@@ -13231,12 +13231,66 @@ fn findCloseTagLoose(xml: []const u8, from: usize, tag: []const u8) ?CloseTagHit
     return null;
 }
 
-/// Read the layout of a styles part. Refuses `MalformedStylesXml`:
-/// no `<styleSheet>` root, a self-closed root (a part that holds no
-/// table — no producer writes one), a table the walk cannot close
-/// inside the root, a table out of the schema's order (the splice's
-/// slots would be ambiguous), or a `numFmtId` at `maxInt(u32)` (no
-/// id above it).
+/// The next element open from `from` as real markup — decoys skipped;
+/// null at a closing tag (the enclosing element's end) or the end of
+/// the part. `name` is the tag's whole name, prefix included.
+const StylesElementHit = struct { open: workbook_xml_mod.TagHit, name: []const u8 };
+
+fn nextStylesElement(xml: []const u8, from: usize) ?StylesElementHit {
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = workbook_xml_mod.skipNonElement(xml, lt) catch return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        if (lt + 1 < xml.len and xml[lt + 1] == '/') return null;
+        var j = lt + 1;
+        while (j < xml.len and !std.ascii.isWhitespace(xml[j]) and xml[j] != '/' and xml[j] != '>') : (j += 1) {}
+        if (j == lt + 1) return null;
+        const name = xml[lt + 1 .. j];
+        const hit = (workbook_xml_mod.findTagOpen(xml, lt, name) catch return null) orelse return null;
+        if (hit.open_lt != lt) return null;
+        return .{ .open = hit, .name = name };
+    }
+    return null;
+}
+
+/// One past the end of the element `hit` opens: its own `>` when
+/// self-closing, else past its matching close — same-name nesting
+/// counted, so a child of the same name never closes its parent.
+fn stylesElementEnd(xml: []const u8, hit: StylesElementHit) ?usize {
+    if (hit.open.self_closing) return hit.open.after_tag_close;
+    var depth: usize = 1;
+    var cursor = hit.open.after_tag_close;
+    while (depth > 0) {
+        const close = findCloseTagLoose(xml, cursor, hit.name) orelse return null;
+        // Opens of the same name before that close deepen it.
+        var probe = cursor;
+        while (workbook_xml_mod.findTagOpen(xml, probe, hit.name) catch return null) |inner| {
+            if (inner.open_lt >= close.lt) break;
+            if (!inner.self_closing) depth += 1;
+            probe = inner.after_tag_close;
+        }
+        depth -= 1;
+        cursor = close.end;
+    }
+    return cursor;
+}
+
+/// Read the layout of a styles part: the root's DIRECT children,
+/// walked in order — a known table recorded with its records counted
+/// among ITS direct children, any other element skipped whole, so a
+/// table's name inside an `<extLst>` extension (an unprefixed
+/// `<dxfs>` under an `<ext>` that redeclares the default namespace —
+/// legal, `##other`) is never the stylesheet's (in-house r6
+/// B-SCN-601; the class #223 closed for drawings). Refuses
+/// `MalformedStylesXml`: no `<styleSheet>` root, a self-closed root
+/// (a part that holds no table — no producer writes one), an element
+/// the walk cannot close inside the root, a known table out of the
+/// schema's order (the splice's slots would be ambiguous), or a
+/// `numFmtId` at `maxInt(u32)` (no id above it).
 fn scanStylesPart(xml: []const u8) Error!StylesLayout {
     const root = (workbook_xml_mod.findTagOpen(xml, 0, "styleSheet") catch return error.MalformedStylesXml) orelse
         return error.MalformedStylesXml;
@@ -13249,60 +13303,75 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
         .blocks = .{null} ** StylesTable.count,
         .max_num_fmt_id = null,
     };
+    var next_table: usize = 0;
     var cursor: usize = root.after_tag_close;
-    inline for (@typeInfo(StylesTable).@"enum".fields) |f| {
-        const t: StylesTable = @enumFromInt(f.value);
-        if (cursor < root_close) blk: {
-            const hit = (workbook_xml_mod.findTagOpen(xml, cursor, t.tag()) catch return error.MalformedStylesXml) orelse
-                break :blk;
-            if (hit.open_lt >= root_close) break :blk;
-            var b: StylesTableBlock = .{ .open = hit, .close_lt = null, .end = hit.after_tag_close, .children = 0 };
-            if (!hit.self_closing) {
-                const closing = findCloseTagLoose(xml, hit.after_tag_close, t.tag()) orelse
-                    return error.MalformedStylesXml;
-                const close = closing.lt;
-                if (close >= root_close) return error.MalformedStylesXml;
-                b.close_lt = close;
-                b.end = closing.end;
+    while (cursor < root_close) {
+        const el = nextStylesElement(xml, cursor) orelse break;
+        if (el.open.open_lt >= root_close) break;
+        const end = stylesElementEnd(xml, el) orelse return error.MalformedStylesXml;
+        if (end > root_close) return error.MalformedStylesXml;
+        var known: ?usize = null;
+        inline for (@typeInfo(StylesTable).@"enum".fields) |f| {
+            const t: StylesTable = @enumFromInt(f.value);
+            if (std.mem.eql(u8, el.name, t.tag())) known = f.value;
+        }
+        if (known) |k| {
+            if (k < next_table) return error.MalformedStylesXml;
+            const t: StylesTable = @enumFromInt(k);
+            var b: StylesTableBlock = .{ .open = el.open, .close_lt = null, .end = end, .children = 0 };
+            if (!el.open.self_closing) {
+                // `end` is past the close tag; its `<` is the last one
+                // before `end` that closes this name.
+                b.close_lt = lastCloseBefore(xml, el.open.after_tag_close, end, t.tag()) orelse return error.MalformedStylesXml;
                 if (t.child()) |child| {
-                    var c = hit.after_tag_close;
-                    while ((workbook_xml_mod.findTagOpen(xml, c, child) catch return error.MalformedStylesXml)) |ch| {
-                        if (ch.open_lt >= close) break;
-                        b.children = std.math.add(u32, b.children, 1) catch return error.MalformedStylesXml;
-                        if (t == .num_fmts) {
-                            if (workbook_xml_mod.getAttr(xml[ch.attrs_start..ch.attrs_end], "numFmtId")) |raw| {
-                                // The value the schema types, not its
-                                // spelling (`&#49;&#54;&#52;` is 164 —
-                                // in-house r2 A-FMT-203); an id the type
-                                // cannot read collides with nothing.
-                                var id_buf: [32]u8 = undefined;
-                                const decoded = workbook_xml_mod.decodeScalarAttr(&id_buf, raw) orelse raw;
-                                const spelled = std.mem.trim(u8, decoded, " \t\r\n");
-                                if (std.fmt.parseInt(u32, spelled, 10)) |id| {
-                                    if (id == std.math.maxInt(u32)) return error.MalformedStylesXml;
-                                    if (layout.max_num_fmt_id == null or id > layout.max_num_fmt_id.?) layout.max_num_fmt_id = id;
-                                } else |_| {}
+                    const close_lt = b.close_lt.?;
+                    var c = el.open.after_tag_close;
+                    while (c < close_lt) {
+                        const ch = nextStylesElement(xml, c) orelse break;
+                        if (ch.open.open_lt >= close_lt) break;
+                        const ch_end = stylesElementEnd(xml, ch) orelse return error.MalformedStylesXml;
+                        if (std.mem.eql(u8, ch.name, child)) {
+                            b.children = std.math.add(u32, b.children, 1) catch return error.MalformedStylesXml;
+                            if (t == .num_fmts) {
+                                if (workbook_xml_mod.getAttr(xml[ch.open.attrs_start..ch.open.attrs_end], "numFmtId")) |raw| {
+                                    // The value the schema types, not its
+                                    // spelling (`&#49;&#54;&#52;` is 164 —
+                                    // in-house r2 A-FMT-203); an id the type
+                                    // cannot read collides with nothing.
+                                    var id_buf: [32]u8 = undefined;
+                                    const decoded = workbook_xml_mod.decodeScalarAttr(&id_buf, raw) orelse raw;
+                                    const spelled = std.mem.trim(u8, decoded, " \t\r\n");
+                                    if (std.fmt.parseInt(u32, spelled, 10)) |id| {
+                                        if (id == std.math.maxInt(u32)) return error.MalformedStylesXml;
+                                        if (layout.max_num_fmt_id == null or id > layout.max_num_fmt_id.?) layout.max_num_fmt_id = id;
+                                    } else |_| {}
+                                }
                             }
                         }
-                        c = ch.after_tag_close;
+                        c = ch_end;
                     }
                 }
             }
-            layout.blocks[f.value] = b;
-            cursor = b.end;
+            layout.blocks[k] = b;
+            next_table = k + 1;
         }
-    }
-    // A table the walk did not place from its predecessor's end, yet
-    // the root holds: out of the schema's order.
-    inline for (@typeInfo(StylesTable).@"enum".fields[0..StylesTable.owned_count]) |f| {
-        const t: StylesTable = @enumFromInt(f.value);
-        if (layout.blocks[f.value] == null) {
-            if ((workbook_xml_mod.findTagOpen(xml, root.after_tag_close, t.tag()) catch return error.MalformedStylesXml)) |stray| {
-                if (stray.open_lt < root_close) return error.MalformedStylesXml;
-            }
-        }
+        cursor = end;
     }
     return layout;
+}
+
+/// The `<` of the closing tag of `tag` that ends at `end` — the last
+/// real `</tag …>` between `from` and `end`.
+fn lastCloseBefore(xml: []const u8, from: usize, end: usize, tag: []const u8) ?usize {
+    var cursor = from;
+    var last: ?usize = null;
+    while (findCloseTagLoose(xml, cursor, tag)) |c| {
+        if (c.end > end) break;
+        last = c.lt;
+        cursor = c.end;
+        if (c.end == end) break;
+    }
+    return last;
 }
 
 /// The value span of attribute `name` inside `attrs` (a tag's
@@ -32751,6 +32820,30 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         defer a.free(after);
         try std.testing.expect(std.mem.indexOf(u8, after, "<fonts count=\"2\"><font/><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills") != null);
         try std.testing.expect(std.mem.endsWith(u8, after, "</cellStyles></styleSheet >"));
+    }
+    // A table's name inside an extension is not the stylesheet's: an
+    // unprefixed `<dxfs>` under an `<ext>` redeclaring the default
+    // namespace, with no top-level `<dxfs>`, and an unprefixed
+    // `<numFmts>` there too — the registrations start from nothing,
+    // the tables are created BEFORE `<extLst>`, the extension's bytes
+    // untouched (r6 B-SCN-601).
+    {
+        const ext = "<extLst><ext uri=\"{x}\" xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2010/11/main\"><numFmts count=\"1\"><numFmt numFmtId=\"200\" formatCode=\"0\"/></numFmts><dxfs count=\"1\"><dxf><font><i/></font></dxf></dxfs></ext></extLst>";
+        const part = "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs>" ++ ext ++ "</styleSheet>";
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_r6_ext.xlsx", part);
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 0), try wb.addDxf(.{ .font_bold = true }));
+        try std.testing.expectEqual(@as(u32, 164), try wb.internNumFmt("0.0"));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.0\"/></numFmts><fonts") != null);
+        try std.testing.expect(std.mem.indexOf(u8, after, "</cellXfs><dxfs count=\"1\"><dxf><font><b/></font></dxf></dxfs>" ++ ext ++ "</styleSheet>") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "<dxf><font><i/></font></dxf>"));
     }
     // A `count` decoy inside a sibling attribute, a padded numFmtId, a
     // comment inside an empty table.
