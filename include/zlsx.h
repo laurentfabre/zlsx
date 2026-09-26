@@ -2612,8 +2612,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * format is "unset" at this boundary, `*_len == 0`) — the out is 0 on
  * every failure past the NULL checks (a NULL handle, spec or out leaves
  * it untouched); -2 MalformedStylesXml, the name in the diag
- * with plane NONE: the part's <styleSheet> is missing or self-closed,
- * an element under it never closes, a stray closing tag sits between
+ * with plane NONE: the part's <styleSheet> is missing or self-closed
+ * or its default namespace is not the main spreadsheetml one
+ * (Transitional or ISO-Strict), an
+ * element under it never closes, a stray closing tag sits between
  * tables or between a table's records, a table sits out of the
  * schema's order, a table or a record carries a prefix, sits inside a
  * markup-compatibility element (AlternateContent, Choice, Fallback)
@@ -2635,9 +2637,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * with a staged cell write is: its <sheetData> regenerated from the
  * typed view — row attributes (ht, customHeight, hidden, spans, a
  * row's own s) and shared-formula group attributes are not carried,
- * and a cell without an r attribute or a row holding no cell is
- * dropped (zlsx_editor_set_cell's rule, pre-existing) — so a style
- * alone costs what a value write costs. */
+ * a rich inline string keeps its first run's text only, <dimension>
+ * is not widened, and a cell without an r attribute or a row holding
+ * no cell is dropped (zlsx_editor_set_cell's rule, pre-existing) — so
+ * a style alone costs what a value write costs. */
 int32_t zlsx_editor_add_style(zlsx_editor_t * ed,
         const zlsx_style_t * spec, uint32_t * out_index,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

@@ -3218,8 +3218,10 @@ format), and on the cell style
 registrations — judged before anything is staged) /
 `SheetHasUnsavedAppends`; the out is 0 on every failure past the NULL
 checks. `-2` `MalformedStylesXml`, the name in the diag, plane NONE, in
-`structural_refusals`: the part's `<styleSheet>` missing or
-self-closed, an element under it that never closes, a stray closing
+`structural_refusals`: the part's `<styleSheet>` missing, self-closed
+or under a default namespace that is not the main one — Transitional
+or ISO-Strict, entity-decoded (absent, or another URI), an element
+under it that never closes, a stray closing
 tag between tables or between a table's records, a table out of the
 schema's order (the splice's slots would be ambiguous), a table or a
 record under a prefix, inside a markup-compatibility element
@@ -3244,8 +3246,9 @@ re-emitted at save as a sheet with a staged cell write is: its
 `<sheetData>` regenerated from the typed view by the delta emitter —
 row attributes (`ht`, `customHeight`, `hidden`, `spans`, a row's own
 `s` / `customFormat`), shared-formula group attributes (`t="shared"
-ref si`, the follower's empty `<f>`) and rich inline runs are not
-carried, a positional `<c>` (no `r`) and a `<row>` holding no cell are
+ref si`, the follower's empty `<f>`) are not carried, a rich inline
+string keeps its first run's text only (`bo` + `ld` → `bo` — r11
+B-EMT-1102), a positional `<c>` (no `r`) and a `<row>` holding no cell are
 DROPPED (values, not only formatting — in-house r7 B-EMT-702; the read
 path's rule for a positional cell is a `MalformedSheetXml` refusal,
 `embeddableRows`), and `<dimension>` is not widened — pre-existing since the
@@ -3338,6 +3341,28 @@ internal one is added beside it (B-REL-1001); the root's default
 namespace must be the main one, absent or another URI refusing —
 the third level of the namespace class (B-SCN-1002); the ladder row's
 "Zig-only today" now governs only the unshipped list (B-DOC-1004).
+
+**Round 11.** The injector decodes the `Type` and `TargetMode` values
+before comparing them, as the store's relationship reader does
+(in-house r11 A-REL-1101); the styles relationship is matched by its
+EXACT type, never a suffix (A-PART-1102: a vendor type ending the same
+way made an orphan); the root-namespace refusal carried to every
+caller-facing list and the four doc comments that under-stated their
+code (A-DOC-1103 / 1104); the accept sides pinned — an explicit,
+entity-spelled `TargetMode="Internal"` and a single-quoted, spaced
+root declaration (A-PIN-1105). B: the ISO-Strict spellings of the main
+namespace and of the styles relationship type are accepted at every
+level — a Strict part is extended as a Transitional one is, every
+byte the splice writes being unprefixed and namespace-free, as the
+package layer admits Strict by contract (B-SCN-1101; the earlier
+rationale withdrawn); an entity-spelled namespace URI is decoded
+before the compare (B-SCN-1105); an `<xf>` naming a custom `numFmtId`
+the `<numFmts>` table never defined reserves it, so an interned format
+never takes an id that would re-format existing cells (B-FMT-1104,
+pinned: `170` on an `<xf>` → the next format is `171`); the rich
+inline string's truncation and the unwidened `<dimension>` carried to
+every cost list (B-EMT-1102 / B-DOC-1103); the `MalformedStylesXml`
+doc comment (B-DOC-1106).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

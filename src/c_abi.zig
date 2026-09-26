@@ -2575,7 +2575,8 @@ comptime {
 /// `zlsx_style_t` → `Style`, the one reading `zlsx_writer_add_style_ex`
 /// and `zlsx_editor_add_style` share. Null on a contract violation —
 /// an enum value the header does not spell (`BadAlignmentValue`,
-/// `BadFillPattern`, `BadBorderStyle`), the name in errbuf.
+/// `BadFillPattern`, `BadBorderStyle`), or a NULL string pointer with
+/// a non-zero length (`InvalidInput`) — the name in errbuf.
 fn styleFromC(spec: *const CStyle, err_buf: ?[*]u8, err_buf_len: usize) ?writer_mod.Style {
     const halign: writer_mod.HAlign = switch (spec.alignment_horizontal) {
         0 => .general,
@@ -11784,7 +11785,8 @@ export fn zlsx_editor_strip_embeddings(
 
 /// Register a cell style on the editor's workbook. `*out_index` is
 /// the `s="…"` slot the record takes in the saved part; dedup within
-/// the save. -1: InvalidInput (a NULL handle, spec or out), the enum
+/// the save. -1: InvalidInput (a NULL handle, spec or out; a NULL
+/// font-name or format pointer with a non-zero length), the enum
 /// verdicts `styleFromC` names, InvalidStyle (a non-positive font size
 /// — an empty font name or format is "unset" here, `*_len == 0`); -2 MalformedStylesXml with the name
 /// in the diag and no plane, nothing staged; -3 OutOfMemory.

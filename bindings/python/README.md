@@ -471,15 +471,17 @@ editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
 
 A sheet with a staged style is re-emitted at save as a sheet with a `set_cell`
 is (row heights / hidden flags / spans and shared-formula group attributes are
-not carried; a cell without an `r` attribute or a row holding no cell is
+not carried, a rich inline string keeps its first run's text only, `<dimension>`
+is not widened; a cell without an `r` attribute or a row holding no cell is
 dropped — `set_cell`'s pre-existing rule). A staged style is a staged cell
 write to the structural edits (`RowEditRequiresCleanSheet` /
 `ColEditRequiresCleanSheet`, as for a staged value) and
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
-staged. A styles part the extension cannot read (no `<styleSheet>` root or a
-self-closed one, an element that never closes, a stray closing tag between
+staged. A styles part the extension cannot read (no `<styleSheet>` root, a
+self-closed one or one whose default namespace is not the main spreadsheetml
+one (Transitional or ISO-Strict), an element that never closes, a stray closing tag between
 tables or records, a table out of the schema's order, a table or a record under
 a prefix, inside a markup-compatibility element or redeclaring its default
 namespace to another URI, a `numFmtId` with no id above it) raises

@@ -5345,7 +5345,9 @@ class Editor:
         Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
         staged, the editor still saves the passthrough — when the
         workbook's styles part cannot take an extension (no
-        ``<styleSheet>`` root or a self-closed one, an element that never closes, a stray
+        ``<styleSheet>`` root, a self-closed one or one whose default
+        namespace is not the main spreadsheetml one (Transitional or
+        ISO-Strict), an element that never closes, a stray
         closing tag between tables or records, a table out of the
         schema's order, a table or a record under a prefix, inside a
         markup-compatibility element (``AlternateContent`` / ``Choice``
@@ -5423,10 +5425,11 @@ class Editor:
         refuses ``SheetHasUnsavedAppends``. The sheet is re-emitted at
         save as a sheet with a :meth:`set_cell` is — its ``<sheetData>``
         regenerated from the typed view, row attributes (heights, hidden,
-        spans) and shared-formula group attributes not carried, a cell
-        without an ``r`` attribute or a row holding no cell dropped
-        (:meth:`set_cell`'s rule, pre-existing) — so a style alone costs
-        what a value write costs.
+        spans) and shared-formula group attributes not carried, a rich
+        inline string keeping its first run's text only, ``<dimension>``
+        not widened, a cell without an ``r`` attribute or a row holding
+        no cell dropped (:meth:`set_cell`'s rule, pre-existing) — so a
+        style alone costs what a value write costs.
 
         Raises :class:`ZlsxError` ``UnknownStyleIndex`` past both ranges
         (judged before anything is staged), ``SheetIndexOutOfRange``,
