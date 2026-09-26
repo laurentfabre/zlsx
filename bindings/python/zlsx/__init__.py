@@ -3077,9 +3077,11 @@ def _style_spec(style: "Style"):
     if style.fill_bg_argb is not None:
         flags |= _ffi.FILL_BG_SET
 
-    # Distinguish "unset" (None) from "empty string" — the latter
-    # is invalid and must reach the Zig side as font_name_len=0
-    # with an explicit sentinel that triggers InvalidFontName.
+    # Distinguish "unset" (None) from "empty string": the C boundary
+    # reads `*_len == 0` as unset, so the empty string — invalid — is
+    # refused HERE, before any part is read, under the writer's own
+    # name (InvalidFontName / InvalidNumberFormat); every other text
+    # rule is the Zig side's (r33 A-PY-3304).
     if style.font_name is None:
         name_bytes = b""
     elif style.font_name == "":
@@ -3304,12 +3306,13 @@ class Writer:
         stage-1 ``zlsx_writer_add_style`` for backward compatibility with
         libzlsx 0.2.3. Any stage-2 field (size, name, color, alignment,
         wrap_text) promotes the call to ``zlsx_writer_add_style_ex``
-        (libzlsx 0.2.4+). Raises :class:`ZlsxError` ``InvalidFontSize``
-        for a non-finite or non-positive font size, ``InvalidFontName`` /
-        ``InvalidNumberFormat`` for a name or format that is not XML text
-        throughout (a C0 control other than tab, LF or CR, U+FFFE /
-        U+FFFF; 0.9.0+) — the same rules :meth:`Editor.add_style` folds
-        to ``InvalidStyle``."""
+        (libzlsx 0.2.4+). Raises :class:`ZlsxError` ``InvalidFontName`` /
+        ``InvalidNumberFormat`` for an empty font name or format (judged
+        here, before any call — on C an empty value is "unset") and for
+        one that is not XML text throughout (a C0 control other than
+        tab, LF or CR, U+FFFE / U+FFFF; 0.9.0+), ``InvalidFontSize`` for
+        a non-finite or non-positive font size — the text and size rules
+        :meth:`Editor.add_style` folds to ``InvalidStyle``."""
         if not _ffi._HAS_STYLES:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_writer_add_style "
@@ -5401,9 +5404,10 @@ class Editor:
         conventional name);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
-        :meth:`Writer.add_style` judges them); ``InvalidStyle`` for one
-        that is not XML text throughout (a C0 control other than tab,
-        LF or CR, U+FFFE / U+FFFF; a ``str`` is valid UTF-8 already) and
+        :meth:`Writer.add_style` judges them — before the part);
+        ``InvalidStyle`` for one that is not XML text throughout (a C0
+        control other than tab, LF or CR, U+FFFE / U+FFFF; a ``str`` is
+        valid UTF-8 already) and
         ``InvalidStyle`` for a
         non-finite or non-positive font size — where :meth:`Writer.add_style` names
         the writer's ``InvalidFontSize``: the editor folds the plan's

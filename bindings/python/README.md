@@ -446,15 +446,14 @@ extended after the records it already holds, every other byte preserved; a
 workbook without the part gets it whole with its relationship and content
 type (an `<Override>` the package already holds for the name is re-typed, unless
 it is a case-variant twin's, which stays, typing the twin — the created part then
-takes the manifest's `Default` for its extension; the reader — `Book`, `zlsx
-styles` — still addresses `xl/styles.xml` literally, so an index registered
-against a part under another name resolves to none there, pre-existing), a
-part held without either, or with a declaration lacking its `ContentType`,
-gains it (unless a `Default` already types it as the stylesheet), one declared
-under another type
-keeps that declaration — and `Editor.set_cell_style` puts the index on a cell
+takes the manifest's `Default` for its extension), a part held without either,
+or with a declaration lacking its `ContentType`, gains them (unless a `Default`
+already types it as the stylesheet), one declared under another type keeps that
+declaration — and `Editor.set_cell_style` puts the index on a cell
 (a cell the sheet lacks
-is created empty with it; a value keeps its value). The `Style` / `Dxf` /
+is created empty with it; a value keeps its value). The reader — `Book`, `zlsx styles` — still
+addresses `xl/styles.xml` literally, so an index registered against a part
+under another name resolves to none there (pre-existing). The `Style` / `Dxf` /
 `BorderSide` classes are the writer's (see *Style cheat sheet*).
 
 ```python
@@ -496,7 +495,8 @@ not XML text throughout (a C0 control other than tab, LF or CR, U+FFFE /
 U+FFFF) is `ZlsxError` `InvalidStyle`, judged after the part; an empty font
 name or format is `InvalidFontName` / `InvalidNumberFormat`, judged in Python
 before the part (as `Writer.add_style` judges it — on C an empty value is
-"unset") — the fresh `Writer` names the same text and size refusals
+"unset"); an empty format on `intern_num_fmt` is `InvalidStyle`, judged after
+the part — the fresh `Writer` names the same text and size refusals
 `InvalidFontSize` / `InvalidFontName` / `InvalidNumberFormat`. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
 registration mapped against is no longer the one the package resolves to, or
 one the extension can read — a structural edit created the part the styles

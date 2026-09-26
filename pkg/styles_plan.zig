@@ -967,6 +967,9 @@ test "StylesPlan: addStyle rejects invalid inputs" {
     // A-PIN-3205 / A-PIN-3206).
     _ = try plan.internNumFmt(a, "0\n0\r");
     _ = try plan.addStyle(a, .{ .font_name = "Ärial" });
+    // A code point whose LOW byte is C0 (U+041F, 0x1F) is text — the
+    // guard is on the code point, not its truncation (r33 A-PIN-3303).
+    _ = try plan.addStyle(a, .{ .font_name = "Пример" });
     emitted.clearRetainingCapacity();
     try plan.emit(a, &emitted);
     try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#10;0&#13;\"") != null);

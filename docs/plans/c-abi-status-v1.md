@@ -3202,8 +3202,11 @@ border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
 so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
 unchanged byte for byte for every value XML carries literally (its
 parity pins hold); a tab, LF or CR in a name or format is spelled as
-a character reference since r31, which every reader decodes (r32
-A-DOC-3202). The walk's agreement
+a character reference since r31, which `Book` and `zlsx styles`
+decode (r32 A-DOC-3202) — the typed overlay `styles_xml.parse` hands
+every attribute raw, as it always has: `Worksheet.cellStyle` /
+`Workbook.numberFormatFor` / `formatCellValue` see the reference
+(pre-existing, r33 A-TXT-3302). The walk's agreement
 with the typed parser (`styles_xml.parse`) is pinned over the corpus:
 on every fixture with a styles part the index equals the parser's
 `cell_xfs.len`, and after the save the parser's tables have grown by
@@ -3886,6 +3889,21 @@ part (B-DOC-3201); the writer's own two surfaces —
 `zlsx_writer_add_style_ex`'s export doc and matrix row 93 — name the
 r30/r31 writer rule, a change to the shipped 0.8.0 writer (a tab in a
 name a reference now, a C0 control or U+FFFE refused; B-DOC-3202).
+
+**Round 33.** The empty-value clause on footnote ³⁰ and the README
+carried `add_style`'s rule alone — `intern_num_fmt`'s empty format is
+`InvalidStyle` after the part (in-house r33 A-DOC-3301); "which every
+reader decodes" was false for the typed overlay, which hands every
+attribute raw (A-TXT-3302); the accept-side pin survived a
+`@truncate` of the C0 guard — a code point whose low byte is C0
+pinned (A-PIN-3303); `_style_spec`'s comment states what its lines do
+(A-PY-3304); the `add_style` docstring states its order — the Python
+empty check, the part, the argument (A-PY-3305). B: the `add_style`
+export doc had attached "after the part" to the enum verdicts, which
+are the boundary's own readings and come first (B-ABI-3302); the
+README's created-part parenthetical un-spliced from the reader
+caveat, "gains them" (B-DOC-3303); `Writer.add_style`'s docstring
+names the empty-value rule `Editor.add_style` defers to (B-DOC-3304).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
