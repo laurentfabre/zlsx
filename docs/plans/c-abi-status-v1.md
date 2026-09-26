@@ -3189,8 +3189,12 @@ alone is re-emitted. The map is drained with the deltas (the save, the
 swap's `drainSavePlans`), joins `hasUnsavedChanges` /
 `hasStagedStyleWork` (the Editor's passthrough condition), and is
 excluded by appended rows and the structural edits as a staged value is
-(`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends`; the Editor's
-`sheetHasWorkbookDeltas` / `workbookHasAnyDeltas` count it). The fold
+(`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends` on the Workbook
+— the Editor's row / column edits fold the first into
+`RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` and
+`deleteSheet` into `SheetDeleteRequiresCleanState`, as for a staged
+value, r10 A-DOC-1005 / B-DOC-1003; its `sheetHasWorkbookDeltas` /
+`workbookHasAnyDeltas` count it). The fold
 pin: `saveWithRecalc` with a registration and a cell style is
 byte-identical to `recalculate` then `save` on both arms, the part
 present or created, the plan drained at the swap, the next transaction
@@ -3216,10 +3220,12 @@ registrations — judged before anything is staged) /
 checks. `-2` `MalformedStylesXml`, the name in the diag, plane NONE, in
 `structural_refusals`: the part's `<styleSheet>` missing or
 self-closed, an element under it that never closes, a stray closing
-tag between tables, a table out of the schema's order (the splice's
-slots would be ambiguous), a table or a record under a prefix or
-inside `mc:AlternateContent` (the splice cannot rewrite it in place —
-r7 / r8), a `numFmtId` at `maxInt(u32)` — judged at the FIRST
+tag between tables or between a table's records, a table out of the
+schema's order (the splice's slots would be ambiguous), a table or a
+record under a prefix, inside a markup-compatibility element
+(`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
+its default namespace to another URI (the splice cannot rewrite it in
+place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)` — judged at the FIRST
 registration or cell
 style, nothing staged, so a refused editor saves the passthrough
 (pinned on C and Python: byte-identical to the source). `-3`
@@ -3319,6 +3325,19 @@ foreign element and the `<xf>` naming it dangled (B-SCN-904); the
 scanner's own doc list, the Python surfaces' shape list (a self-closed
 root) and the header's out-zeroing sentence carried (B-DOC-902 /
 B-ABI-903).
+
+**Round 10.** A bare `Choice` / `Fallback` reached directly refuses as
+`AlternateContent` does (in-house r10 A-SCN-1001); a record redeclaring
+its default namespace to another URI is not one of the table's
+(A-SCN-1002); the accept side pinned — a table and a record spelling
+the main namespace explicitly are the stylesheet's (A-PIN-1003); the
+two new shapes and the structural edits' actual names carried to every
+caller-facing list (A-DOC-1004 / 1005). B: an external-mode styles
+relationship no longer satisfies the injector's presence test — the
+internal one is added beside it (B-REL-1001); the root's default
+namespace must be the main one, absent or another URI refusing —
+the third level of the namespace class (B-SCN-1002); the ladder row's
+"Zig-only today" now governs only the unshipped list (B-DOC-1004).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

@@ -13002,7 +13002,11 @@ fn injectWorkbookRelationship(
     while (workbook_xml_mod.findTagOpen(xml, cursor, "Relationship") catch return error.MalformedWorkbookRels) |hit| {
         const attrs = xml[hit.attrs_start..hit.attrs_end];
         if (workbook_xml_mod.getAttr(attrs, "Type")) |t| {
-            if (std.mem.eql(u8, t, type_uri)) return try allocator.dupe(u8, xml);
+            // An external-mode relationship names no part of the
+            // package (in-house r10 B-REL-1001): the internal one is
+            // still to be added.
+            const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m| std.mem.eql(u8, m, "External") else false;
+            if (std.mem.eql(u8, t, type_uri) and !external) return try allocator.dupe(u8, xml);
         }
         if (workbook_xml_mod.getAttr(attrs, "Id")) |id| {
             if (std.mem.startsWith(u8, id, "rId")) {
@@ -13306,6 +13310,12 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
     const root = (workbook_xml_mod.findTagOpen(xml, 0, "styleSheet") catch return error.MalformedStylesXml) orelse
         return error.MalformedStylesXml;
     if (root.self_closing) return error.MalformedStylesXml;
+    // The root's default namespace is the stylesheet's: absent or
+    // another URI, its tables are not the ones the splice extends
+    // (in-house r10 B-SCN-1002 — the third level of the class).
+    const root_ns = workbook_xml_mod.getAttr(xml[root.attrs_start..root.attrs_end], "xmlns") orelse
+        return error.MalformedStylesXml;
+    if (!std.mem.eql(u8, root_ns, "http://schemas.openxmlformats.org/spreadsheetml/2006/main")) return error.MalformedStylesXml;
     const root_close = (findCloseTagLoose(xml, root.after_tag_close, "styleSheet") orelse
         return error.MalformedStylesXml).lt;
 
@@ -13341,8 +13351,10 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
             }
         }
         // Prefixed or bound through a default namespace declaration —
-        // the same element to an MC processor (in-house r9 A-SCN-901).
-        if (std.mem.eql(u8, local, "AlternateContent")) return error.MalformedStylesXml;
+        // the same element to an MC processor (in-house r9 A-SCN-901);
+        // a bare Choice / Fallback reached directly likewise (r10
+        // A-SCN-1001).
+        if (isMcElement(local)) return error.MalformedStylesXml;
         var known: ?usize = null;
         inline for (@typeInfo(StylesTable).@"enum".fields) |f| {
             const t: StylesTable = @enumFromInt(f.value);
@@ -13384,7 +13396,15 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                         // prefix is (r7 A-SCN-701).
                         const ch_local = if (std.mem.lastIndexOfScalar(u8, ch.name, ':')) |cc| ch.name[cc + 1 ..] else ch.name;
                         if (ch_local.len != ch.name.len and std.mem.eql(u8, ch_local, child)) return error.MalformedStylesXml;
-                        if (std.mem.eql(u8, ch_local, "AlternateContent")) return error.MalformedStylesXml;
+                        if (isMcElement(ch_local)) return error.MalformedStylesXml;
+                        // A record redeclaring its default namespace to
+                        // another URI is not one of the table's (r10
+                        // A-SCN-1002, the mirror of r9 B-SCN-904).
+                        if (std.mem.eql(u8, ch.name, child)) {
+                            if (workbook_xml_mod.getAttr(xml[ch.open.attrs_start..ch.open.attrs_end], "xmlns")) |ns| {
+                                if (!std.mem.eql(u8, ns, "http://schemas.openxmlformats.org/spreadsheetml/2006/main")) return error.MalformedStylesXml;
+                            }
+                        }
                         if (std.mem.eql(u8, ch.name, child)) {
                             b.children = std.math.add(u32, b.children, 1) catch return error.MalformedStylesXml;
                             if (t == .num_fmts) {
@@ -13413,6 +13433,13 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
         cursor = end;
     }
     return layout;
+}
+
+/// A markup-compatibility element by local name — `AlternateContent`,
+/// or a `Choice` / `Fallback` reached directly: content the splice
+/// cannot place, prefixed or not.
+fn isMcElement(local: []const u8) bool {
+    return std.mem.eql(u8, local, "AlternateContent") or std.mem.eql(u8, local, "Choice") or std.mem.eql(u8, local, "Fallback");
 }
 
 /// The next `<` that opens real markup from `from` — decoys skipped.
@@ -32502,8 +32529,17 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><AlternateContent xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><Choice Requires=\"x14ac\"><xf xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></Choice></AlternateContent></cellXfs></styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"2\"></bogus><font/><font/></fonts>" ++ xf ++ "</styleSheet>",
         // A table redeclaring its default namespace to another URI is
-        // not the stylesheet's (r9 B-SCN-904).
+        // not the stylesheet's (r9 B-SCN-904); a record likewise (r10
+        // A-SCN-1002); a bare Choice / Fallback at either level (r10
+        // A-SCN-1001).
         "<styleSheet " ++ s3d1_ns ++ "><fonts xmlns=\"urn:other\" count=\"1\"><font/></fonts>" ++ xf ++ "</styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font xmlns=\"urn:other\"/></fonts>" ++ xf ++ "</styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ " xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice Requires=\"x14ac\"><fonts count=\"1\"><font/></fonts></mc:Choice>" ++ xf ++ "</styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><Fallback xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><font/></Fallback></fonts>" ++ xf ++ "</styleSheet>",
+        // The root's default namespace absent, or another URI (r10
+        // B-SCN-1002).
+        "<styleSheet>" ++ xf ++ "</styleSheet>",
+        "<styleSheet xmlns=\"urn:other\">" ++ xf ++ "</styleSheet>",
     }) |styles| {
         // (the refusal shapes)
         const path = try writeS3d1WithStyles(a, io, dir, "s3d1_refused.xlsx", styles);
@@ -32918,7 +32954,15 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const empty = try injectWorkbookRelationship(a, "<Relationships></Relationships>", styles_rel_type, "styles.xml");
         defer a.free(empty);
         try std.testing.expect(std.mem.startsWith(u8, empty, "<Relationships><Relationship Id=\"rId1\""));
-        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_r5_loose.xlsx", "<styleSheet " ++ s3d1_ns ++ " ><fonts count=\"1\"><font/></fonts ><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet >");
+        // An external-mode styles relationship is not the part's: the
+        // internal one is added beside it (r10 B-REL-1001).
+        const ext_rel = "<Relationships><Relationship Id=\"rId7\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"http://example.com/s.xml\" TargetMode=\"External\"/></Relationships>";
+        const with_internal = try injectWorkbookRelationship(a, ext_rel, styles_rel_type, "styles.xml");
+        defer a.free(with_internal);
+        try std.testing.expect(std.mem.indexOf(u8, with_internal, "<Relationship Id=\"rId8\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
+        // A table and a record spelling the MAIN namespace explicitly
+        // are the stylesheet's own (r10 A-PIN-1003).
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_r5_loose.xlsx", "<styleSheet " ++ s3d1_ns ++ " ><fonts " ++ s3d1_ns ++ " count=\"1\"><font " ++ s3d1_ns ++ "/></fonts ><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet >");
         defer a.free(path);
         var wb = try Workbook.open(a, io, path);
         defer wb.deinit();
@@ -32928,7 +32972,7 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         defer re.deinit();
         const after = try s3d1PartBytes(a, &re, "xl/styles.xml");
         defer a.free(after);
-        try std.testing.expect(std.mem.indexOf(u8, after, "<fonts count=\"2\"><font/><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills") != null);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<fonts " ++ s3d1_ns ++ " count=\"2\"><font " ++ s3d1_ns ++ "/><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills") != null);
         try std.testing.expect(std.mem.endsWith(u8, after, "</cellStyles></styleSheet >"));
     }
     // A table's name inside an extension is not the stylesheet's: an

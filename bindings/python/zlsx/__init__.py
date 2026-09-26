@@ -5346,9 +5346,11 @@ class Editor:
         staged, the editor still saves the passthrough — when the
         workbook's styles part cannot take an extension (no
         ``<styleSheet>`` root or a self-closed one, an element that never closes, a stray
-        closing tag between tables, a table out of the schema's order,
-        a table or a record under a prefix or inside
-        ``mc:AlternateContent``, a ``numFmtId`` with no id above it);
+        closing tag between tables or records, a table out of the
+        schema's order, a table or a record under a prefix, inside a
+        markup-compatibility element (``AlternateContent`` / ``Choice``
+        / ``Fallback``) or redeclaring its default namespace to another
+        URI, a ``numFmtId`` with no id above it);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
@@ -5414,7 +5416,9 @@ class Editor:
         blank Excel writes); a cell with a value, staged or not, keeps
         it; the last call for a cell wins, and a delete of the cell wins
         over its style. A staged style is a staged cell write to the
-        structural edits, :meth:`append_rows` and :meth:`embeddable_rows`
+        structural edits (``RowEditRequiresCleanSheet`` /
+        ``ColEditRequiresCleanSheet``, as for a staged value),
+        :meth:`append_rows` and :meth:`embeddable_rows`
         (``SheetHasUnsavedMutations``); on a sheet with appended rows it
         refuses ``SheetHasUnsavedAppends``. The sheet is re-emitted at
         save as a sheet with a :meth:`set_cell` is — its ``<sheetData>``

@@ -2614,9 +2614,11 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * it untouched); -2 MalformedStylesXml, the name in the diag
  * with plane NONE: the part's <styleSheet> is missing or self-closed,
  * an element under it never closes, a stray closing tag sits between
- * tables, a table sits out of the schema's order, a table or a record
- * carries a prefix (or sits inside mc:AlternateContent) the splice
- * cannot rewrite in place, or a numFmtId leaves no id above it —
+ * tables or between a table's records, a table sits out of the
+ * schema's order, a table or a record carries a prefix, sits inside a
+ * markup-compatibility element (AlternateContent, Choice, Fallback)
+ * or redeclares its default namespace to another URI — the splice
+ * cannot rewrite it in place — or a numFmtId leaves no id above it —
  * judged at the FIRST registration
  * (or cell style) before anything is staged, so a refused editor
  * saves the passthrough; -3 OutOfMemory. diag is optional (NULL ok).
@@ -2624,9 +2626,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * The recalc transactions carry the registrations (the save-plan
  * fold): zlsx_editor_save_with_recalc writes them beside the recalc,
  * zlsx_editor_recalculate leaves them staged for the save after it.
- * Structural edits (insert_row, …), append_row and
- * embeddable_rows_ndjson on a sheet with a staged cell style refuse as
- * they do for a staged cell write (SheetHasUnsavedMutations); a cell
+ * Structural edits (insert_row, …: RowEditRequiresCleanSheet /
+ * ColEditRequiresCleanSheet, the editor's fold), append_row and
+ * embeddable_rows_ndjson (SheetHasUnsavedMutations) on a sheet with a
+ * staged cell style refuse as they do for a staged cell write; a cell
  * style on a sheet with appended rows refuses SheetHasUnsavedAppends.
  * A sheet with a staged cell style is re-emitted at save as a sheet
  * with a staged cell write is: its <sheetData> regenerated from the
