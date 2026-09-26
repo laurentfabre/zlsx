@@ -3136,10 +3136,11 @@ direct CHILDREN of `<numFmts>` / `<fonts>` /
 `<cellStyleXfs>` / `<cellStyles>` drive the seed decision alone), never a `count`
 attribute — into a `styles_plan.Base`: the slot each table's
 next record takes, and the first free `numFmtId` above every `<numFmt>`
-of the `<numFmts>` table (164 at least). `addStyle` returns `base.cell_xfs + position`,
+of the `<numFmts>` table and every custom id an `<xf>` names (164 at
+least). `addStyle` returns `base.cell_xfs + position`,
 `addDxf` `base.dxfs + position`, `internNumFmt` `base.num_fmt_next +
 position` (the first free id above every `<numFmt>` of the part's
-`<numFmts>` table — a `<dxf>`'s own inline `<numFmt>` is not a table
+`<numFmts>` table and every custom id an `<xf>` names — a `<dxf>`'s own inline `<numFmt>` is not a table
 record and is not counted, r7 B-DOC-705); the fresh layout (`Base.fresh`: one font, two fills, one
 border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
 so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
@@ -3363,6 +3364,25 @@ pinned: `170` on an `<xf>` → the next format is `171`); the rich
 inline string's truncation and the unwidened `<dimension>` carried to
 every cost list (B-EMT-1102 / B-DOC-1103); the `MalformedStylesXml`
 doc comment (B-DOC-1106).
+
+**Round 12.** Below the root, a table's or a record's `xmlns` must be
+the ROOT's own URI — the other main spelling is not this
+stylesheet's (in-house r12 A-NS-1201); a Strict package gets a Strict
+part and a Strict relationship when the slice creates them (the fresh
+head's one declaration respelled; A-NS-1202); the `internNumFmt` floor
+sentence on every surface names the `<xf>`-reserved ids (A-DOC-1203);
+the resolver's comment (A-DOC-1204). B: the Strict respelling touches
+the head's declaration only, never a caller's font name or format
+spelling the URI (B-NS-1201, pinned); the injector decodes `Id` as it
+decodes `Type` (B-REL-1202, pinned); the Python docstring states what
+the transactions do with the registrations (B-DOC-1203). Recorded,
+pre-existing and outside the slice: the reader's fonts loop drops a
+self-closed `<font/>` (`src/xlsx.zig`), so `Book.cellFont` /
+`zlsx_cell_font` / `zlsx styles` resolve the wrong font or none on
+such a part (`frictionless_2sheets.xlsx`) — the saved file is right
+(openpyxl and LibreOffice resolve it), the read-back of the index this
+slice hands out is not; the typed view counts it correctly, so the
+corpus pin cannot see the divergence (B-RD-1204, owner follow-up).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

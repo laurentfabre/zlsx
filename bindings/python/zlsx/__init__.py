@@ -5341,6 +5341,10 @@ class Editor:
         workbook already spells appends a second record. A save drains
         the registrations; the next one reads the extended part afresh,
         so indices keep counting up across saves in one editor.
+        :meth:`save_to_buffer` and :meth:`save_with_recalc` carry the
+        registrations as :meth:`save` does; :meth:`recalculate` and
+        :meth:`mark_recalc_on_load` leave them staged for the save
+        after them.
 
         Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
         staged, the editor still saves the passthrough — when the
@@ -5385,7 +5389,8 @@ class Editor:
         """Intern an OOXML number format (``"0.00"``, ``"m/d/yyyy"``) on
         this workbook and return the ``numFmtId`` it takes in the saved
         part: the first free id above every ``<numFmt>`` of the part's
-        ``<numFmts>`` table (a dxf's inline format is not counted), 164
+        ``<numFmts>`` table and every custom id an ``<xf>`` names (a
+        dxf's inline format is not counted), 164
         at least; the same id for the same string within one save.
         A :class:`Style` with ``number_format`` set interns its format
         by itself — this is for a caller writing ``numFmtId`` elsewhere.

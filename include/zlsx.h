@@ -2655,7 +2655,8 @@ int32_t zlsx_editor_add_dxf(zlsx_editor_t * ed,
 
 /* Intern a number format (`ptr`, `len` bytes, not null-terminated):
  * *out_id is the numFmtId it takes in the saved part — the first free
- * id above every <numFmt> of the part's <numFmts> table (a dxf's own
+ * id above every <numFmt> of the part's <numFmts> table and every
+ * custom id an <xf> names (a dxf's own
  * inline numFmt is not counted), 164 at least — the same id
  * for the same bytes within one save. Statuses as
  * zlsx_editor_add_style's; an empty format is InvalidStyle. */
