@@ -444,7 +444,8 @@ workbook (S3d slice 1). `Editor.add_style` / `add_dxf` / `intern_num_fmt`
 return the slot the record takes in the saved `xl/styles.xml` — the part is
 extended after the records it already holds, every other byte preserved; a
 workbook without the part gets it whole with its relationship and content
-type, a part held without either gains it, one declared under another type
+type (an `<Override>` the package already holds for the name is re-typed), a
+part held without either gains it, one declared under another type
 keeps that declaration — and `Editor.set_cell_style` puts the index on a cell
 (a cell the sheet lacks
 is created empty with it; a value keeps its value). The `Style` / `Dxf` /

@@ -750,11 +750,13 @@ pub const PartStore = struct {
         // replacePart — we don't want to commit that mutation until
         // we know the array reallocs below also succeed.
         // A package that already declares the name in an `<Override>`
-        // keeps that one — a second element for one `PartName` is no
-        // package (S3d slice 1 r6 B-CT-603, closed r20 B-CT-2004).
+        // has that one re-typed to the part zlsx creates — a second
+        // element for one `PartName` is no package (S3d slice 1 r6
+        // B-CT-603, closed r20 B-CT-2004), and the stale type is not
+        // the created part's (r21 A-CT-2101).
         const ct_idx_now = self.findIndex("[Content_Types].xml") orelse return error.MissingContentTypes;
-        const ct_staging: ?StagedContentTypeUpdate = if (try self.overrideNamesPart(self.parts[ct_idx_now].bytes, name))
-            null
+        const ct_staging: StagedContentTypeUpdate = if (try self.retypeOverride(self.parts[ct_idx_now].bytes, name, content_type)) |retyped|
+            try self.stageContentTypesXml(ct_idx_now, retyped, poller)
         else
             try self.stageContentTypeOverride(name, content_type, poller);
 
@@ -816,13 +818,11 @@ pub const PartStore = struct {
         self.entries = grown_entries;
         self.parts = grown_parts;
         self.overrides = grown_overrides;
-        // Apply the staged content-types update, if one was needed.
-        if (ct_staging) |st| {
-            self.overrides[st.idx] = st.new_override;
-            self.parts[st.idx].bytes = st.new_part_bytes;
-            self.parts[st.idx].compression_method = st.new_override.compressed.compression_method;
-            self.parts[st.idx].uncompressed_size = @intCast(st.new_part_bytes.len);
-        }
+        // Apply the staged content-types update.
+        self.overrides[ct_staging.idx] = ct_staging.new_override;
+        self.parts[ct_staging.idx].bytes = ct_staging.new_part_bytes;
+        self.parts[ct_staging.idx].compression_method = ct_staging.new_override.compressed.compression_method;
+        self.parts[ct_staging.idx].uncompressed_size = @intCast(ct_staging.new_part_bytes.len);
     }
 
     const StagedContentTypeUpdate = struct {
@@ -861,7 +861,13 @@ pub const PartStore = struct {
         try buf.appendSlice(ar_alloc, "\"/>");
         try buf.appendSlice(ar_alloc, old_xml[close_pos..]);
         const new_xml = try buf.toOwnedSlice(ar_alloc);
+        return self.stageContentTypesXml(ct_idx, new_xml, poller);
+    }
 
+    /// Stage `new_xml` as the next `[Content_Types].xml` (at `ct_idx`):
+    /// compressed, nothing mutated — the caller commits.
+    fn stageContentTypesXml(self: *PartStore, ct_idx: usize, new_xml: []u8, poller: Poller) !StagedContentTypeUpdate {
+        const ar_alloc = self.arena.allocator();
         // Bound the uncompressed-size field too. The compressed
         // check below would catch anything that didn't shrink, but
         // a payload that compresses smaller while its uncompressed
@@ -1590,15 +1596,44 @@ pub const PartStore = struct {
             const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse return false;
             pos = tag_end + 1;
             if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
-            const raw = xmlAttrValue(ct_xml[tag_at..tag_end], "PartName") orelse continue;
-            // Decoded only when spelled with a reference (r17
-            // A-PIN-1704's invariant).
-            const owned: ?[]u8 = if (std.mem.indexOfScalar(u8, raw, '&') != null) try decodeXmlEntities(self.allocator, raw) else null;
-            defer if (owned) |o| self.allocator.free(o);
-            const value = owned orelse raw;
-            if (value.len == name.len + 1 and value[0] == '/' and std.ascii.eqlIgnoreCase(value[1..], name)) return true;
+            if (try overrideTagNamesPart(self.allocator, ct_xml[tag_at..tag_end], name, false)) return true;
         }
         return false;
+    }
+
+    /// `[Content_Types].xml` with the `<Override>` naming `name`
+    /// re-typed to `content_type` — for a part zlsx CREATES at a name
+    /// the package already declared (a tool that dropped the part
+    /// without cleaning the manifest): the bytes are zlsx's, so is the
+    /// declaration, and one `<Override>` per `PartName` is the rule
+    /// (r20 B-CT-2004 staged none and let the stale type stand — r21
+    /// A-CT-2101). The EXACT spelling only: a case-variant
+    /// declaration belongs to a case-variant twin the package holds
+    /// (no package, but one the store admits), and re-typing it would
+    /// take the twin's declaration. Null when no `<Override>` names
+    /// the part so. Arena memory.
+    fn retypeOverride(self: *PartStore, ct_xml: []const u8, name: []const u8, content_type: []const u8) !?[]u8 {
+        var pos: usize = 0;
+        while (liveIndexOfPos(ct_xml, pos, "<Override")) |tag_at| {
+            const after = tag_at + "<Override".len;
+            const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse return null;
+            pos = tag_end + 1;
+            if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+            const tag = ct_xml[tag_at..tag_end];
+            if (!try overrideTagNamesPart(self.allocator, tag, name, true)) continue;
+            const ct_raw = xmlAttrValue(tag, "ContentType") orelse return null;
+            // The value's span inside the tag: `xmlAttrValue` hands
+            // back a slice of `tag`.
+            const v_start = @intFromPtr(ct_raw.ptr) - @intFromPtr(ct_xml.ptr);
+            const v_end = v_start + ct_raw.len;
+            const ar_alloc = self.arena.allocator();
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            try buf.appendSlice(ar_alloc, ct_xml[0..v_start]);
+            try appendXmlEscaped(ar_alloc, &buf, content_type);
+            try buf.appendSlice(ar_alloc, ct_xml[v_end..]);
+            return try buf.toOwnedSlice(ar_alloc);
+        }
+        return null;
     }
 
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
@@ -2336,10 +2371,24 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
         const ct = try decodeXmlEntities(arena, ct_raw);
         // PartName starts with `/`; strip to match part.name.
         const stripped = if (part_name.len > 0 and part_name[0] == '/') part_name[1..] else part_name;
+        // The exact spelling first, then any ASCII case — part names
+        // compare so (ECMA-376 Part 2 §9.1.1; S3d slice 1 r21
+        // A-CT-2101: a case-variant `<Override>` left its part
+        // undeclared to every reader of `Part.content_type`).
+        var matched = false;
         for (parts) |*p| {
             if (std.mem.eql(u8, p.name, stripped)) {
                 p.content_type = ct;
+                matched = true;
                 break;
+            }
+        }
+        if (!matched) {
+            for (parts) |*p| {
+                if (std.ascii.eqlIgnoreCase(p.name, stripped)) {
+                    p.content_type = ct;
+                    break;
+                }
             }
         }
         i = end + 1;
@@ -2502,10 +2551,45 @@ fn removeContentTypeOverride(
     ct_xml: []const u8,
     part_name: []const u8,
 ) ![]u8 {
-    // OOXML writes override targets absolute-from-package-root.
-    const needle = try std.fmt.allocPrint(allocator, "PartName=\"/{s}\"", .{part_name});
-    defer allocator.free(needle);
-    return removeSelfClosingElementContaining(allocator, ct_xml, "<Override", needle);
+    // Read as the resolver reads (S3d slice 1 r21 A-CT-2101): live
+    // markup, the tag's end past a `>` in a value, the attribute by
+    // the shared lexer, the name entity-decoded and compared under any
+    // ASCII case — a literal `PartName="/…"` needle left a loosely
+    // spelled declaration behind, which a later `addPart` then took
+    // for its own.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var copied: usize = 0;
+    var pos: usize = 0;
+    while (liveIndexOfPos(ct_xml, pos, "<Override")) |tag_at| {
+        const after = tag_at + "<Override".len;
+        const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse break;
+        pos = tag_end + 1;
+        if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+        if (!try overrideTagNamesPart(allocator, ct_xml[tag_at..tag_end], part_name, false)) continue;
+        // The element: self-closing, or through its own end tag.
+        var elem_end = tag_end + 1;
+        if (ct_xml[tag_end - 1] != '/') {
+            elem_end = if (std.mem.indexOfPos(u8, ct_xml, elem_end, "</Override>")) |c| c + "</Override>".len else ct_xml.len;
+        }
+        try out.appendSlice(allocator, ct_xml[copied..tag_at]);
+        copied = elem_end;
+        pos = elem_end;
+    }
+    try out.appendSlice(allocator, ct_xml[copied..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Whether an `<Override` start tag (without its `>`) names `/name`
+/// — exactly, or under any ASCII case — its value entity-decoded when
+/// spelled with a reference.
+fn overrideTagNamesPart(allocator: std.mem.Allocator, tag: []const u8, name: []const u8, exact: bool) !bool {
+    const raw = xmlAttrValue(tag, "PartName") orelse return false;
+    const owned: ?[]u8 = if (std.mem.indexOfScalar(u8, raw, '&') != null) try decodeXmlEntities(allocator, raw) else null;
+    defer if (owned) |o| allocator.free(o);
+    const value = owned orelse raw;
+    if (value.len != name.len + 1 or value[0] != '/') return false;
+    return if (exact) std.mem.eql(u8, value[1..], name) else std.ascii.eqlIgnoreCase(value[1..], name);
 }
 
 /// Remove every `<Relationship … Target="…"/>` whose target resolves to
@@ -3738,7 +3822,21 @@ test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeO
     defer std.testing.allocator.free(declared);
     try store.replacePart("[Content_Types].xml", declared);
     try store.addPart("xl/added.xml", "application/x-test", "<c/>");
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "/xl/added.xml"));
+    const ct_retyped = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_retyped, "/xl/added.xml"));
+    // …and that one is re-typed to the created part's (r21 A-CT-2101).
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_retyped, "x-declared"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_retyped, "ContentType=\"application/x-test\" PartName = \"/xl/added.xml\"") + std.mem.count(u8, ct_retyped, "PartName = \"/xl/added.xml\" ContentType=\"application/x-test\""));
+    // The plural mutator records its sizes too (r20 A-STORE-2002,
+    // pinned r21 A-PIN-2104).
+    try store.replaceParts(&.{.{ .name = "xl/added.xml", .bytes = "" }});
+    try std.testing.expect(store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    try store.replaceParts(&.{.{ .name = "xl/added.xml", .bytes = "<d/>" }});
+    try std.testing.expect(!store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    // A loosely spelled declaration is removed with its part (r21
+    // A-CT-2101).
+    try store.removePart("xl/added.xml");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "/xl/added.xml"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {

@@ -3152,8 +3152,17 @@ name and no part with bytes sits over it (a zero-length entry beside
 extended when held under any case (the store's spelling), created
 when not; a part the workbook holds without its relationship — and a
 created part — gains the internal relationship with the extension,
-its target relative to the workbook part's directory under any case
-of it (r20 A-REL-2001). A relationship whose target named no part is
+its target relative to the workbook part's directory when the name
+sits under `xl/` as spelled, any other name — a case-variant
+directory such as `XL/` included — spelled absolute, which a
+case-sensitive consumer resolves to the held entry too (r20
+A-REL-2001, r21 B-REL-2101: `Target="styles.xml"` for a part at
+`XL/styles.xml` left LibreOffice with no stylesheet; r21 A-PIN-2103:
+pinned directly and through the held case-variant). At the
+splice the name is resolved again: a case-variant twin `addPart`ed
+underneath the staged plan moves which part the relationship names,
+and the save refuses `StylesPartChanged` (r21 A-PART-2106). A
+relationship whose target named no part is
 left as the producer wrote it: the saved package then carries two
 styles relationships, the internal one beside it (r10 B-REL-1001's
 ruling, pinned in the r17 arms). The reader and `Workbook.styles()`
@@ -3616,6 +3625,33 @@ package declaring it had got a second element (B-CT-2004, r6
 B-CT-603 closed; pinned in the store); the UTF-8 flag's rule and the
 exact-spelling-first precedence on `nameFlags`' doc, "Which part" and
 footnote ³⁰ (B-DOC-2002 / B-DOC-2003).
+
+**Round 21.** "Does the package declare this name" had three
+answers in one store: the r20 `addPart` gate lenient, the content-type
+resolver byte-exact, the remover a literal needle — a case-variant
+`<Override>` left its part undeclared to every reader of
+`Part.content_type` (r18 A-CT-1802 reopened one case wide), a loosely
+spelled one survived `removePart` and then typed the part zlsx
+created next (in-house r21 A-CT-2101) → the resolver matches the exact
+spelling first then any ASCII case, the remover reads through the
+shared lexer, and a part zlsx CREATES re-types an `<Override>` already
+naming it exactly (the bytes are zlsx's, so is the declaration; a
+case-variant declaration is a twin's and is left alone). The injector
+reads `TargetMode` and `Id` through the store's decoder and counts a
+relationship without an `Id` as none, as the store's reader does
+(A-REL-2105). The splice resolves the part's name again and refuses
+`StylesPartChanged` when a case-variant twin moved it (A-PART-2106).
+Pins: the absolute half of the injected target, `replaceParts`'
+sizes (A-PIN-2103 / A-PIN-2104); the created part's re-typed
+declaration stated on the header, README, footnote ³⁰ and the Zig doc
+(A-DOC-2102 / B-DOC-2102). B: the injected target stripped `xl/`
+under any case, so a part held at `XL/styles.xml` was given
+`Target="styles.xml"` — zlsx resolves it (any case), LibreOffice does
+not: no stylesheet, the registered style lost (B-REL-2101, the r20
+fix's other half) → relative only when the name sits under `xl/` as
+spelled, absolute otherwise (the r20 two-session pin now asserts
+`/XL/styles.xml`); an `Id`-less relationship satisfies the presence
+test no more (B-REL-2103 = A-REL-2105).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

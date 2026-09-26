@@ -1946,16 +1946,20 @@ pub const Workbook = struct {
     /// a resolved name came FROM one).
     fn ensureStylesRelationship(self: *Workbook, store: *PartStore, name: []const u8, rel_type: []const u8) Error!void {
         const a = self.allocator;
-        // Relative to the workbook part's directory under any case of
-        // it (a held `XL/styles.xml` had been given `Target=
-        // "XL/styles.xml"`, which resolves to `xl/XL/styles.xml` — the
-        // next session created a second part there; in-house r20
-        // A-REL-2001); a name elsewhere is spelled absolute.
-        const target = if (std.ascii.startsWithIgnoreCase(name, "xl/"))
+        // Relative to the workbook part's directory when the name sits
+        // under it AS SPELLED (a held `XL/styles.xml` had been given
+        // `Target="XL/styles.xml"`, which resolves to `xl/XL/styles.xml`
+        // — the next session created a second part there; in-house r20
+        // A-REL-2001 — and then `Target="styles.xml"`, which a
+        // case-sensitive consumer resolves to a part the package does
+        // not hold: LibreOffice found no stylesheet; r21 B-REL-2101);
+        // any other name, a case-variant directory included, is spelled
+        // absolute, which every consumer resolves to the held entry.
+        const target = if (std.mem.startsWith(u8, name, "xl/"))
             name["xl/".len..]
         else
             try std.mem.concat(a, u8, &.{ "/", name });
-        defer if (!std.ascii.startsWithIgnoreCase(name, "xl/")) a.free(target);
+        defer if (!std.mem.startsWith(u8, name, "xl/")) a.free(target);
         const rels = try store.part(workbook_rels_part_name) orelse return error.MissingWorkbookRels;
         const patched = try injectWorkbookRelationship(a, store, rels.bytes, rel_type, target);
         defer a.free(patched);
@@ -2022,7 +2026,8 @@ pub const Workbook = struct {
     /// byte outside the tables' children and `count` attributes
     /// preserved; a table the part lacks created at its schema slot; a
     /// missing part created whole, the fresh emitter's bytes, with its
-    /// relationship and content type. Run by `applySavePlans` over the
+    /// relationship and content type (an `<Override>` the package
+    /// already holds for the name is re-typed). Run by `applySavePlans` over the
     /// live store and by `foldSavePlansInto` over a candidate — the
     /// same bytes either way, since a recalc transaction never touches
     /// the part. A part whose layout is no longer the one the
@@ -2034,6 +2039,16 @@ pub const Workbook = struct {
         const base = self.styles_base orelse return;
         const a = self.allocator;
         const name = self.styles_part_resolved.?;
+        // The part the package resolves to NOW must be the one the
+        // registrations mapped against: a case-variant twin added
+        // underneath (`PartStore.addPart`) moved which part the saved
+        // relationship names with no change to the cached part's
+        // bytes (r21 A-PART-2106).
+        {
+            const now = try self.resolveStylesPartName();
+            defer a.free(now);
+            if (!std.mem.eql(u8, now, name)) return error.StylesPartChanged;
+        }
 
         const part = try store.part(name) orelse {
             // The fresh part: the plan's records after the OOXML
@@ -13261,9 +13276,18 @@ fn injectWorkbookRelationship(
             const t_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, t_raw, '&') != null) try store_mod.decodeXmlEntities(allocator, t_raw) else null;
             defer if (t_owned) |b| allocator.free(b);
             const t = t_owned orelse t_raw;
-            var m_buf: [32]u8 = undefined;
-            const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| std.mem.eql(u8, workbook_xml_mod.decodeScalarAttr(&m_buf, m_raw) orelse m_raw, "External") else false;
-            const same = std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t));
+            // `TargetMode` through the same decoder (r21 A-REL-2105:
+            // the scalar one read `&#X45;xternal` as internal where the
+            // store's reader had it external). A relationship without
+            // an `Id` is one the store's reader drops: it names the
+            // part to nobody, so it does not satisfy the presence test.
+            const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| blk: {
+                const m_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, m_raw, '&') != null) try store_mod.decodeXmlEntities(allocator, m_raw) else null;
+                defer if (m_owned) |b| allocator.free(b);
+                break :blk std.mem.eql(u8, m_owned orelse m_raw, "External");
+            } else false;
+            const has_id = workbook_xml_mod.getAttr(attrs, "Id") != null;
+            const same = has_id and (std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t)));
             // A target that names no part the slice could create is
             // not the part's either — the same test the part's name
             // is resolved by (`resolvePartTarget`: the resolver's own
@@ -13285,8 +13309,9 @@ fn injectWorkbookRelationship(
             }
         }
         if (workbook_xml_mod.getAttr(attrs, "Id")) |id_raw| {
-            var id_buf: [64]u8 = undefined;
-            const id = workbook_xml_mod.decodeScalarAttr(&id_buf, id_raw) orelse id_raw;
+            const id_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, id_raw, '&') != null) try store_mod.decodeXmlEntities(allocator, id_raw) else null;
+            defer if (id_owned) |b| allocator.free(b);
+            const id = id_owned orelse id_raw;
             if (std.mem.startsWith(u8, id, "rId")) {
                 if (std.fmt.parseInt(u32, id["rId".len..], 10)) |n| {
                     if (n > max_id) max_id = n;
@@ -33374,6 +33399,23 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const held_same = try injectWorkbookRelationship(a, &rs2.store, spelled_target, styles_rel_type, "stylés.xml");
         defer a.free(held_same);
         try std.testing.expectEqualStrings(spelled_target, held_same);
+        // A styles relationship without an `Id` is none to the store's
+        // reader: the internal one is added; `TargetMode` spelled with
+        // an uppercase hex reference is decoded as the store decodes it
+        // (external → added); an `Id` spelled so counts toward the next
+        // id (r21 A-REL-2105).
+        const no_id = "<Relationships><Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships>";
+        const with_id = try injectWorkbookRelationship(a, &rs.store, no_id, styles_rel_type, "styles.xml");
+        defer a.free(with_id);
+        try std.testing.expect(std.mem.indexOf(u8, with_id, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
+        const upper_hex_mode = "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"http://example.com/s.xml\" TargetMode=\"&#X45;xternal\"/></Relationships>";
+        const beside_ext = try injectWorkbookRelationship(a, &rs.store, upper_hex_mode, styles_rel_type, "styles.xml");
+        defer a.free(beside_ext);
+        try std.testing.expect(std.mem.indexOf(u8, beside_ext, "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
+        const upper_hex_id = "<Relationships><Relationship Id=\"&#X72;Id5\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
+        const past5 = try injectWorkbookRelationship(a, &rs.store, upper_hex_id, styles_rel_type, "styles.xml");
+        defer a.free(past5);
+        try std.testing.expect(std.mem.indexOf(u8, past5, "Id=\"rId6\"") != null);
         // An entity-spelled Id counts toward the next id (r12
         // B-REL-1202).
         const spelled = "<Relationships><Relationship Id=\"&#114;Id3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
@@ -34114,7 +34156,9 @@ test "S3d slice 1: a part held at XL/styles.xml with no relationship gains one t
     defer re.deinit();
     const rels = try s3d1PartBytes(a, &re, workbook_rels_part_name);
     defer a.free(rels);
-    try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"styles.xml\"") != null);
+    // Spelled absolute: a case-sensitive consumer resolves it to the
+    // held entry too (r21 B-REL-2101).
+    try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"/XL/styles.xml\"") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "relationships/styles\""));
     // The second session resolves the relationship to the same part.
     try std.testing.expectEqual(@as(u32, 4), try re.addStyle(.{ .font_italic = true }));
@@ -34154,7 +34198,7 @@ test "S3d slice 1: a created styles part in a package that already declares the 
         defer a.free(ct);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct, "/xl/styles.xml"));
         const close_at = std.mem.lastIndexOf(u8, ct, "</Types>") orelse return error.TestUnexpectedResult;
-        const with = try std.mem.concat(a, u8, &.{ ct[0..close_at], "<Override PartName = \"/xl/styles.xml\" ContentType=\"" ++ styles_content_type ++ "\"/>", ct[close_at..] });
+        const with = try std.mem.concat(a, u8, &.{ ct[0..close_at], "<Override PartName = \"/xl/styles.xml\" ContentType=\"application/x-other\"/>", ct[close_at..] });
         defer a.free(with);
         try wb.store.replacePart("[Content_Types].xml", with);
         try wb.save(io, declared);
@@ -34169,5 +34213,90 @@ test "S3d slice 1: a created styles part in a package that already declares the 
     const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
     defer a.free(ct);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "/xl/styles.xml"));
+    // …re-typed to the created part's (r21 A-CT-2101).
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct, "x-other"));
+    try std.testing.expectEqualStrings(styles_content_type, ((try re.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).content_type.?);
+}
+
+test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spelled one leaves with it; a twin added under a staged plan refuses; a name outside the workbook's directory is injected absolute (A-CT-2101 / A-PART-2106 / A-PIN-2103)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r21_src.xlsx");
+    defer a.free(src);
+    const variant = try std.fs.path.join(a, &.{ dir, "s3d1_r21_variant.xlsx" });
+    defer a.free(variant);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r21_out.xlsx" });
+    defer a.free(out);
+    // The declaration spelled `/XL/Styles.xml` with spaces around its `=`.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const ct = try s3d1PartBytes(a, &wb, "[Content_Types].xml");
+        defer a.free(ct);
+        const respelled = try std.mem.replaceOwned(u8, a, ct, "PartName=\"/xl/styles.xml\"", "PartName = \"/XL/Styles.xml\"");
+        defer a.free(respelled);
+        try std.testing.expect(!std.mem.eql(u8, ct, respelled));
+        try wb.store.replacePart("[Content_Types].xml", respelled);
+        try wb.save(io, variant);
+    }
+    {
+        var wb = try Workbook.open(a, io, variant);
+        defer wb.deinit();
+        // The resolver reads it as the part's declaration…
+        try std.testing.expectEqualStrings(styles_content_type, ((try wb.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).content_type.?);
+        // …so the extension adds no second one.
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+        defer a.free(ct);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+        // …and leaves with its part.
+        try re.store.removePart("xl/styles.xml");
+        const ct2 = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+        defer a.free(ct2);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct2, "Styles.xml"));
+    }
+    // A case-variant twin added between the registration and the save
+    // moves the relationship's part: refused.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+        defer a.free(styles);
+        try wb.store.addPart("xl/Styles.xml", styles_content_type, styles);
+        try wb.store.removePart("xl/styles.xml");
+        try wb.save(io, variant);
+        var held = try Workbook.open(a, io, variant);
+        defer held.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try held.addStyle(.{ .font_bold = true }));
+        try held.store.addPart("xl/styles.xml", styles_content_type, "<styleSheet " ++ s3d1_ns ++ "/>");
+        try std.testing.expectError(error.StylesPartChanged, held.save(io, out));
+    }
+    // A name outside the workbook's directory is injected absolute
+    // (the fixture's own styles relationship removed first).
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const had = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+        defer a.free(had);
+        const at = std.mem.indexOf(u8, had, "Target=\"styles.xml\"") orelse return error.TestUnexpectedResult;
+        const open_at = std.mem.lastIndexOf(u8, had[0..at], "<Relationship") orelse return error.TestUnexpectedResult;
+        const close_at = (std.mem.indexOfPos(u8, had, at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+        const without = try std.mem.concat(a, u8, &.{ had[0..open_at], had[close_at..] });
+        defer a.free(without);
+        try wb.store.replacePart(workbook_rels_part_name, without);
+        try wb.ensureStylesRelationship(&wb.store, "styles.xml", styles_rel_type);
+        const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+        defer a.free(rels);
+        try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"/styles.xml\"") != null);
+    }
 }
