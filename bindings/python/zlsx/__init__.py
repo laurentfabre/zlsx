@@ -5349,10 +5349,12 @@ class Editor:
         workbook without the part gets it whole, with its relationship
         and content type — an ``<Override>`` the package already holds
         for the name is re-typed, unless it is a case-variant twin's,
-        which stays and types the created part; a part held without
-        either, or with a declaration
-        lacking its ``ContentType``, gains it — one the
-        package declares under another type keeps that declaration).
+        which stays, typing the twin — the created part then takes the
+        manifest's ``Default`` for its extension; a part held without
+        either, or with a declaration lacking its ``ContentType``, gains
+        it (unless a ``Default`` already types it as the stylesheet) —
+        one the package declares under another type keeps that
+        declaration).
         Feed the index to
         :meth:`set_cell_style`. The fresh writer's :class:`Style`, the
         same fields and the same bytes in the file.

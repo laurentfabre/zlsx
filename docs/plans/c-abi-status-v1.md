@@ -3154,12 +3154,14 @@ when not; a part the workbook holds without its relationship — and a
 created part — gains the internal relationship with the extension
 (a created part its content-type `<Override>` too: one the package
 already holds for the name is re-typed, or given the attribute it
-lacks, unless it is a held case-variant twin's, which stays and
-types the created part (r26 B-DOC-2603) — r21 A-CT-2101, r22
+lacks, unless it is a held case-variant twin's, which stays, typing
+the twin — the created part then takes the manifest's `Default` for
+its extension (r26 B-DOC-2603, r27 B-DOC-2701) — r21 A-CT-2101, r22
 A-CT-2201, r23 A-CT-2301 / B-CT-2302; a held part
 without its `<Override>`, or with one lacking its `ContentType`,
-gains it, one declared under another type keeps that declaration —
-r18 A-CT-1802, r23 B-CT-2303, r24 A-CT-2402, r25 B-DOC-2503),
+gains it (unless a `Default` already types it as the stylesheet —
+r27 A-DOC-2704), one declared under another type keeps that
+declaration — r18 A-CT-1802, r23 B-CT-2303, r24 A-CT-2402, r25 B-DOC-2503),
 its target relative to the workbook part's directory when the name
 sits under `xl/` as spelled, any other name — a case-variant
 directory such as `XL/` included — spelled absolute, which a
@@ -3764,11 +3766,24 @@ narrower (in-house r26 A-PIN-2601 / A-DUP-2602 / A-PIN-2603 /
 A-DOC-2604). B: the extend path short-circuited on the content type
 cached at open, so a declaration a later manifest rewrite removed
 (`removePart`'s collateral over a nested declaration) left the part
-saved undeclared (B-CT-2602) → the manifest is asked; the cache keeps
-one say, a `Default` already typing the part. The `.keep` arm types
+saved undeclared (B-CT-2602) → the manifest is asked, a `Default`
+already typing the part read from its bytes too (r27 A-DOC-2702). The `.keep` arm types
 the created part by the twin's declaration — stated on the five
 surfaces (B-DOC-2603); the buffer save's and `applySavePlans`' doc
 enumerations name the styles work (B-DOC-2601).
+
+**Round 27.** `addDxf` accepted the font size `addStyle` refuses
+(`<sz val="nan"/>` in the part — in-house r27 A-DXF-2701) → the same
+rule, `InvalidStyle`, pinned. `heldPartIndex` took the first
+case-insensitive entry and only then asked whether it was a marker,
+so a marker spelled in one case hid a real case-variant part —
+`MalformedStylesXml` in one archive order, extended in the other
+(B-PART-2702) → a marker is skipped in both passes, the first
+non-marker match wins (pinned). Docs: the `Default` exception on the
+five surfaces and `defaultTypesPart`'s accept arm pinned (A-DOC-2704
+/ A-PIN-2703 / A-DOC-2702); the twin's declaration types the twin,
+the created part taking the manifest's `Default` (B-DOC-2701);
+`applySavePlans`' doc lists its phases in their order (B-DOC-2703).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

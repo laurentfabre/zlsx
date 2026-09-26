@@ -4263,6 +4263,14 @@ test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeO
     try std.testing.expectEqualStrings(styles_ct, (try store.part("xl/styles.xml")).?.content_type.?);
     try store.ensureContentTypeOverride("xl/styles.xml", styles_ct);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "PartName=\"/xl/styles.xml\""));
+    // …and a `Default` already typing the part as the stylesheet
+    // means no `<Override>` at all (r27 A-PIN-2703).
+    const by_default_ct = try std.mem.replaceOwned(u8, std.testing.allocator, no_styles_decl, "<Default ContentType=\"application/xml\" Extension=\"xml\"/>", "<Default ContentType=\"" ++ styles_ct ++ "\" Extension=\"xml\"/>");
+    defer std.testing.allocator.free(by_default_ct);
+    try std.testing.expect(!std.mem.eql(u8, no_styles_decl, by_default_ct));
+    try store.replacePart("[Content_Types].xml", by_default_ct);
+    try store.ensureContentTypeOverride("xl/styles.xml", styles_ct);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "PartName=\"/xl/styles.xml\""));
     try store.replacePart("[Content_Types].xml", ct_24);
     // Back for the plural mutator's pin below.
     try store.addPart("xl/added.xml", "application/x-test", "<c/>");
