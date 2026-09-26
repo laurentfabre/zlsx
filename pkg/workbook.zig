@@ -1888,14 +1888,9 @@ pub const Workbook = struct {
     /// `xl/workbook.xml/x` had made `xl/workbook.xml/styles.xml`
     /// creatable).
     fn isDirectoryMarker(store: *const PartStore, i: usize) bool {
-        if (!store.partEmptyAt(i)) return false;
-        const entry = store.partNameAt(i);
-        var k: usize = 0;
-        while (k < store.partCount()) : (k += 1) {
-            const p = store.partNameAt(k);
-            if (p.len > entry.len and p[entry.len] == '/' and std.ascii.startsWithIgnoreCase(p, entry)) return true;
-        }
-        return false;
+        // The store's own predicate — one answer for the styles
+        // resolution and the manifest's twin rule (r26 A-DUP-2602).
+        return store.entryIsDirectoryMarker(i);
     }
 
     /// Whether every segment of a resolved name is one the OPC part
@@ -5088,8 +5083,9 @@ pub const Workbook = struct {
     }
 
     /// `save` into caller-owned memory (M9a2, §5.10). The same staged
-    /// state the file save writes — deltas, appends, SST extension,
-    /// defined names — lands in the store's override map first, so a
+    /// state the file save writes — deltas, cell styles, the styles
+    /// plan, appends, SST extension, defined names — lands in the
+    /// store's override map first, so a
     /// later `save` to a path writes byte-identical content. The
     /// returned bytes are the caller's, freed with `allocator`.
     pub fn saveToOwnedBuffer(self: *Workbook, allocator: Allocator) Error![]u8 {
@@ -5097,9 +5093,10 @@ pub const Workbook = struct {
         return self.store.saveToOwnedBuffer(allocator, .none);
     }
 
-    /// Everything `save` does before bytes leave the process: apply the
-    /// workbook.xml plan, extend the SST, emit per-sheet XML for staged
-    /// deltas / appended rows into `store.replacePart`, and invalidate
+    /// Everything `save` does before bytes leave the process: render
+    /// the styles plan into the styles part, apply the workbook.xml
+    /// plan, extend the SST, emit per-sheet XML for staged deltas /
+    /// cell styles / appended rows into `store.replacePart`, and invalidate
     /// the typed views those bytes made stale. Public for one caller
     /// besides the saves: `saveWithRecalc`'s arm with nothing to
     /// recalculate, which is the plain save over the live store, memory

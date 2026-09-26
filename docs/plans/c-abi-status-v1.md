@@ -3154,8 +3154,9 @@ when not; a part the workbook holds without its relationship — and a
 created part — gains the internal relationship with the extension
 (a created part its content-type `<Override>` too: one the package
 already holds for the name is re-typed, or given the attribute it
-lacks, unless it is a held case-variant twin's, which stays — r21
-A-CT-2101, r22 A-CT-2201, r23 A-CT-2301 / B-CT-2302; a held part
+lacks, unless it is a held case-variant twin's, which stays and
+types the created part (r26 B-DOC-2603) — r21 A-CT-2101, r22
+A-CT-2201, r23 A-CT-2301 / B-CT-2302; a held part
 without its `<Override>`, or with one lacking its `ContentType`,
 gains it, one declared under another type keeps that declaration —
 r18 A-CT-1802, r23 B-CT-2303, r24 A-CT-2402, r25 B-DOC-2503),
@@ -3755,6 +3756,19 @@ and the Python `set_cell_style` name the save-time refusal
 (B-DOC-2502); "Which part" and `applyStylesPlanInto`'s doc state the
 extend path's `<Override>` rule beside the created part's
 (B-DOC-2503).
+
+**Round 26.** `entryIsDirectoryMarker`'s two rules and the remover's
+half of the marker rule pinned, the marker predicate one (the
+workbook's calls the store's), the three twin-rule contracts one case
+narrower (in-house r26 A-PIN-2601 / A-DUP-2602 / A-PIN-2603 /
+A-DOC-2604). B: the extend path short-circuited on the content type
+cached at open, so a declaration a later manifest rewrite removed
+(`removePart`'s collateral over a nested declaration) left the part
+saved undeclared (B-CT-2602) → the manifest is asked; the cache keeps
+one say, a `Default` already typing the part. The `.keep` arm types
+the created part by the twin's declaration — stated on the five
+surfaces (B-DOC-2603); the buffer save's and `applySavePlans`' doc
+enumerations name the styles work (B-DOC-2601).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
