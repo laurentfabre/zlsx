@@ -2031,7 +2031,10 @@ pub const Workbook = struct {
     /// missing part created whole, the fresh emitter's bytes, with its
     /// relationship and content type (an `<Override>` the package
     /// already holds for the name is re-typed, unless it is a
-    /// case-variant twin's, which stays). Run by `applySavePlans` over the
+    /// case-variant twin's, which stays); a held part without its
+    /// relationship or its `<Override>` — or with one lacking its
+    /// `ContentType` — gains them, one declared under another type
+    /// keeps that declaration. Run by `applySavePlans` over the
     /// live store and by `foldSavePlansInto` over a candidate — the
     /// same bytes either way, since a recalc transaction never touches
     /// the part. A part whose layout is no longer the one the

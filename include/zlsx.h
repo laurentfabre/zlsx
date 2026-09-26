@@ -1918,7 +1918,8 @@ void zlsx_buffer_release(uint8_t * ptr, size_t len);
 /* Serialize the editor's current state — staged mutations included —
  * into a library-allocated buffer (§5.10). An untouched editor hands
  * back the source bytes verbatim. On non-zero status *out_ptr is NULL
- * and *out_len is 0. Release with zlsx_buffer_release. */
+ * and *out_len is 0 — among the names, StylesPartChanged as for
+ * zlsx_editor_save. Release with zlsx_buffer_release. */
 int32_t zlsx_editor_save_to_buffer(zlsx_editor_t * ed,
         uint8_t ** out_ptr, size_t * out_len,
         char * errbuf, size_t errbuf_len);
@@ -2645,6 +2646,9 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * — judged at the FIRST registration
  * (or cell style) before anything is staged, so a refused editor
  * saves the passthrough; -3 OutOfMemory. diag is optional (NULL ok).
+ * The save itself may refuse -1 StylesPartChanged when the part these
+ * registrations mapped against moved underneath them (see
+ * zlsx_editor_save).
  *
  * The recalc transactions carry the registrations (the save-plan
  * fold): zlsx_editor_save_with_recalc writes them beside the recalc,

@@ -5304,7 +5304,8 @@ class Editor:
     def save_to_buffer(self) -> bytes:
         """Serialize the editor's current state — staged mutations
         included — to memory. An untouched editor returns the source
-        bytes verbatim."""
+        bytes verbatim. Raises :class:`ZlsxError` as :meth:`save` does
+        (``StylesPartChanged`` among the names)."""
         if not self._handle:
             raise ZlsxError("editor is closed")
         if not _ffi._HAS_SAVE_BUFFER:
@@ -5364,6 +5365,10 @@ class Editor:
         registrations as :meth:`save` does; :meth:`recalculate` and
         :meth:`mark_recalc_on_load` leave them staged for the save
         after them.
+
+        The save itself may raise :class:`ZlsxError` ``StylesPartChanged``
+        when the part this registration mapped against moved underneath
+        it (see :meth:`save`).
 
         Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
         staged, the editor still saves the passthrough — when the
@@ -5466,7 +5471,8 @@ class Editor:
         :class:`ZlsxRefusal` of :meth:`add_style`. The four indices are
         bounded before ``ctypes`` narrows them (``2**32`` is
         ``ValueError``, ``1.9`` ``TypeError`` — :meth:`insert_row`'s
-        rule), never wrapped to another sheet, row or style.
+        rule), never wrapped to another sheet, row or style. The save
+        itself may raise ``StylesPartChanged`` (see :meth:`save`).
 
         A style that sets no fill or border names the part's records 0
         (``fillId="0"``, ``borderId="0"``, and ``xfId="0"``) — the none

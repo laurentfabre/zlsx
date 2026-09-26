@@ -1666,11 +1666,25 @@ pub const PartStore = struct {
     /// Whether a part other than `except` is held under `spelled`'s
     /// name in any ASCII case.
     fn holdsVariantOf(self: *const PartStore, spelled: []const u8, except: ?[]const u8) bool {
-        for (self.parts) |p| {
+        for (self.parts, 0..) |p, i| {
             if (except) |x| {
                 if (std.mem.eql(u8, p.name, x)) continue;
             }
-            if (std.ascii.eqlIgnoreCase(p.name, spelled)) return true;
+            // A directory marker (a zero-length entry another sits
+            // under) is no part, so no twin — as every resolver of
+            // the styles part reads it (r25 A-CT-2502).
+            if (std.ascii.eqlIgnoreCase(p.name, spelled) and !self.entryIsDirectoryMarker(i)) return true;
+        }
+        return false;
+    }
+
+    /// A zero-length entry some other entry sits under: a directory
+    /// spelled as an entry, which OPC has no part for.
+    fn entryIsDirectoryMarker(self: *const PartStore, i: usize) bool {
+        if (!self.partEmptyAt(i)) return false;
+        const entry = self.parts[i].name;
+        for (self.parts) |p| {
+            if (p.name.len > entry.len and p.name[entry.len] == '/' and std.ascii.startsWithIgnoreCase(p.name, entry)) return true;
         }
         return false;
     }
@@ -2689,7 +2703,10 @@ fn overrideElementEnd(xml: []const u8, from: usize) ?usize {
         if (std.mem.startsWith(u8, xml[lt..], "<Override")) {
             const after = lt + "<Override".len;
             const tag_end = xmlStartTagEnd(xml, lt) orelse return null;
-            if (after < tag_end and (std.ascii.isWhitespace(xml[after]) or xml[after] == '/')) {
+            // The element-name boundary: `<Override>` (no attributes),
+            // `<Override …>` or `<Override/>` — not `<OverrideX>` (r25
+            // A-CT-2501: the attribute-less child went uncounted).
+            if (after == tag_end or std.ascii.isWhitespace(xml[after]) or xml[after] == '/') {
                 if (xml[tag_end - 1] != '/') depth += 1;
             }
             pos = tag_end + 1;
@@ -2715,12 +2732,6 @@ fn liveCloseTagStart(xml: []const u8, from: usize, name: []const u8) ?usize {
         pos = at + 2;
     }
     return null;
-}
-
-/// One past the `>` of the first LIVE `</name>` at or after `from`.
-fn liveCloseTagEnd(xml: []const u8, from: usize, name: []const u8) ?usize {
-    const at = liveCloseTagStart(xml, from, name) orelse return null;
-    return (std.mem.indexOfScalarPos(u8, xml, at + 2 + name.len, '>') orelse return null) + 1;
 }
 
 /// The part name an `<Override` start tag (without its `>`) declares,
@@ -4139,6 +4150,37 @@ test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeO
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_18, "open.xml"));
     try std.testing.expect(std.mem.indexOf(u8, ct_18, "<Override PartName=\"/xl/keep.xml\" ContentType=\"a/k\"/><Override PartName=\"/xl/next.xml\" ContentType=\"a/x\"></Override></Types>") != null);
     try store.removePart("xl/keep.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // An attribute-less nested `<Override>` counts toward the depth
+    // too (r25 A-CT-2501).
+    const c14c_at = std.mem.lastIndexOf(u8, ct_14, "</Types>") orelse return error.TestUnexpectedResult;
+    const bare_child = try std.mem.concat(std.testing.allocator, u8, &.{ ct_14[0..c14c_at], "<Override PartName=\"/xl/p.xml\" ContentType=\"a/p\"><Override></Override></Override><Override PartName=\"/xl/q.xml\" ContentType=\"a/q\"/>", ct_14[c14c_at..] });
+    defer std.testing.allocator.free(bare_child);
+    try store.replacePart("[Content_Types].xml", bare_child);
+    try store.addPart("xl/p.xml", "a/p", "<p/>");
+    try store.addPart("xl/q.xml", "a/q", "<q/>");
+    try store.removePart("xl/p.xml");
+    const ct_19 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_19, "</Override>"));
+    try std.testing.expect(std.mem.indexOf(u8, ct_19, "<Override PartName=\"/xl/q.xml\" ContentType=\"a/q\"/></Types>") != null);
+    try store.removePart("xl/q.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // A directory marker spelling the declaration's name is no twin:
+    // the stale case-variant declaration is re-typed (r25 A-CT-2502).
+    try store.addPart("xl/TWIN.xml", "application/octet-stream", "");
+    try store.addPart("xl/TWIN.xml/child.xml", "application/x-child", "<c/>");
+    const ct_20 = (try store.part("[Content_Types].xml")).?.bytes;
+    const marker_decl = try std.mem.replaceOwned(u8, std.testing.allocator, ct_20, "<Override ContentType=\"application/octet-stream\" PartName=\"/xl/TWIN.xml\"/>", "<Override PartName=\"/xl/Twin.xml\" ContentType=\"application/x-stale\"/>");
+    defer std.testing.allocator.free(marker_decl);
+    try std.testing.expect(!std.mem.eql(u8, ct_20, marker_decl));
+    try store.replacePart("[Content_Types].xml", marker_decl);
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    const ct_21 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_21, "x-stale"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_21, "/xl/Twin.xml") + std.mem.count(u8, ct_21, "/xl/twin.xml"));
+    try store.removePart("xl/twin.xml");
+    try store.removePart("xl/TWIN.xml/child.xml");
+    try store.removePart("xl/TWIN.xml");
     try store.replacePart("[Content_Types].xml", ct_14);
     // Back for the plural mutator's pin below.
     try store.addPart("xl/added.xml", "application/x-test", "<c/>");

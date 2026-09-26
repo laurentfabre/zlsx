@@ -3155,7 +3155,10 @@ created part — gains the internal relationship with the extension
 (a created part its content-type `<Override>` too: one the package
 already holds for the name is re-typed, or given the attribute it
 lacks, unless it is a held case-variant twin's, which stays — r21
-A-CT-2101, r22 A-CT-2201, r23 A-CT-2301 / B-CT-2302),
+A-CT-2101, r22 A-CT-2201, r23 A-CT-2301 / B-CT-2302; a held part
+without its `<Override>`, or with one lacking its `ContentType`,
+gains it, one declared under another type keeps that declaration —
+r18 A-CT-1802, r23 B-CT-2303, r24 A-CT-2402, r25 B-DOC-2503),
 its target relative to the workbook part's directory when the name
 sits under `xl/` as spelled, any other name — a case-variant
 directory such as `XL/` included — spelled absolute, which a
@@ -3206,8 +3209,9 @@ relationship names (`add_sheet` on a package whose relationship
 targets a missing worksheet name — in-house r24 B-DOC-2402), so the
 splice resolves the part and re-reads the layout and refuses
 `StylesPartChanged` (-1 on C and `ZlsxError` on Python, reachable
-there through that edit; named on `zlsx_editor_save`, the Python
-`save` docstring and README; kept a -1 as an owner ruling — a
+there through that edit; named on `zlsx_editor_save` and
+`zlsx_editor_save_to_buffer`, the Python `save` / `save_to_buffer`
+docstrings and README (r25 B-DOC-2502); kept a -1 as an owner ruling — a
 statement about this editor's sequencing, as the row edits' refusals
 are, not about the workbook as opened) when it is no longer the one
 the registrations mapped against: the indices handed out could not be
@@ -3714,7 +3718,7 @@ B-DOC-2304).
 **Round 24.** The remover's live end-tag scan was a byte literal, so
 a legal `</Override >` was not found and the start tag alone was cut
 — the manifest ill-formed again (in-house r24 A-CT-2401) → a loose
-live close tag (`liveCloseTagEnd`). The manifest's append slot was a
+live close tag (`overrideElementEnd` over `liveCloseTagStart`). The manifest's append slot was a
 raw last `</Types>`: an epilog comment stole it, a legal `</Types >`
 refused every declaring `addPart` (A-CT-2403) → the live, loosely
 spelled root close tag. The extend path handed `holdsVariantOf` no
@@ -3734,8 +3738,23 @@ ill-formed; an unterminated element ate the next one (B-CT-2401) →
 comment, CDATA or PI whole (pinned four shapes). `StylesPartChanged`
 was called unreachable from C/Python where `add_sheet` creating the
 part the styles relationship names reaches it (B-DOC-2402) → named on
-every save surface, the -1 ruling recorded; the two save-time
+every save surface (`save_to_buffer` and the Python `set_cell_style`
+in round 25, B-DOC-2502), the -1 ruling recorded; the two save-time
 mappings pinned (B-PIN-2405).
+
+**Round 25.** `overrideElementEnd` reused the declaration boundary
+test, so an attribute-less nested `<Override>` went uncounted and the
+outer's end tag was left dangling again (in-house r25 A-CT-2501) →
+the element-name boundary. `holdsVariantOf` counted a directory
+marker as a held twin where every resolver of the styles part
+excludes one (A-CT-2502) → excluded. The unused `liveCloseTagEnd`
+removed and the r24 note corrected (A-DEAD-2503); the save-time
+`StylesPartChanged` on the registrations' header block and
+docstrings too (A-DOC-2504). B: `save_to_buffer` on C and Python
+and the Python `set_cell_style` name the save-time refusal
+(B-DOC-2502); "Which part" and `applyStylesPlanInto`'s doc state the
+extend path's `<Override>` rule beside the created part's
+(B-DOC-2503).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
