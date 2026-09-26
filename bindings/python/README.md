@@ -470,7 +470,8 @@ the extended part afresh, so indices keep counting up across saves in one
 editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
 
 A sheet with a staged style is re-emitted at save as a sheet with a `set_cell`
-is (row heights / hidden flags / spans and shared-formula group attributes are
+is (row heights / hidden flags / spans, shared- and array-formula group
+attributes and cell metadata attributes are
 not carried, a rich inline string keeps its first run's text only, `<dimension>`
 is not widened; a cell without an `r` attribute or a row holding no cell is
 dropped — `set_cell`'s pre-existing rule). A staged style is a staged cell

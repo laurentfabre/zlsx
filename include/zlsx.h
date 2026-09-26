@@ -1939,8 +1939,10 @@ int32_t zlsx_open_buffer(const uint8_t * data, size_t data_len,
  * candidate; a workbook with nothing to recalculate writes the live
  * store's parts, installs carried, not refused. The file is the plain
  * save plus the recalc (the save-plan fold, 2026-09-11): a staged cell
- * write on any sheet (zlsx_editor_set_cell) and the staged defined
- * names an embedding write leaves (its recovery carrier) go into the
+ * write on any sheet (zlsx_editor_set_cell), a staged cell style and
+ * the registrations of zlsx_editor_add_style / add_dxf /
+ * intern_num_fmt (S3d slice 1), and the staged defined names an
+ * embedding write leaves (its recovery carrier) go into the
  * candidate and are drained from the editor at the swap — a failure
  * before the rename leaves them staged; the arm with nothing to
  * recalculate applies them to the live store as zlsx_editor_save
@@ -2636,7 +2638,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * A sheet with a staged cell style is re-emitted at save as a sheet
  * with a staged cell write is: its <sheetData> regenerated from the
  * typed view — row attributes (ht, customHeight, hidden, spans, a
- * row's own s) and shared-formula group attributes are not carried,
+ * row's own s), shared- and array-formula group attributes and a
+ * cell's metadata attributes (cm, vm, ph) are not carried,
  * a rich inline string keeps its first run's text only, <dimension>
  * is not widened, and a cell without an r attribute or a row holding
  * no cell is dropped (zlsx_editor_set_cell's rule, pre-existing) — so

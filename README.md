@@ -80,7 +80,8 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   hyperlinks, the full data-validation family, conditional formatting,
   comments, rich-text cells, defined names, formulas with cached values.
 - **Editor** (load-modify-save) — append rows, `setCell`, cell styles
-  (`addStyle` / `setCellStyle` extend the workbook's own `styles.xml`),
+  (`addStyle` extends the workbook's own `styles.xml`, `setCellStyle` puts
+  the index on a cell),
   insert/delete rows and columns, add/rename/delete sheets on an *existing*
   workbook.
   ZIP-substitution

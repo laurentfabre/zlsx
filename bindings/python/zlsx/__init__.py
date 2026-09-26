@@ -5430,7 +5430,8 @@ class Editor:
         refuses ``SheetHasUnsavedAppends``. The sheet is re-emitted at
         save as a sheet with a :meth:`set_cell` is — its ``<sheetData>``
         regenerated from the typed view, row attributes (heights, hidden,
-        spans) and shared-formula group attributes not carried, a rich
+        spans), shared- and array-formula group attributes and a cell's
+        metadata attributes not carried, a rich
         inline string keeping its first run's text only, ``<dimension>``
         not widened, a cell without an ``r`` attribute or a row holding
         no cell dropped (:meth:`set_cell`'s rule, pre-existing) — so a

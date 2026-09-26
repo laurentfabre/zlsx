@@ -1070,7 +1070,8 @@ pub const Editor = struct {
     }
 
     /// True iff any worksheet in the embedded workbook has staged
-    /// `setCell`/`deleteCell` deltas. B2 iter-er-2 replacement for
+    /// `setCell`/`deleteCell` deltas or `setCellStyle` styles (S3d
+    /// slice 1). B2 iter-er-2 replacement for
     /// the retired `self.pending_mutations.count() > 0` check.
     fn workbookHasAnyDeltas(self: *Editor) bool {
         var i: u32 = 0;
@@ -1082,7 +1083,7 @@ pub const Editor = struct {
     }
 
     /// True iff the worksheet at `sheet_idx` has staged
-    /// `setCell`/`deleteCell` deltas. B2 iter-er-2 replacement for
+    /// `setCell`/`deleteCell` deltas or `setCellStyle` styles. B2 iter-er-2 replacement for
     /// `self.pending_mutations.contains(sheet_idx)`.
     fn sheetHasWorkbookDeltas(self: *Editor, sheet_idx: u32) bool {
         if (sheet_idx >= self.workbook.sheetCount()) return false;

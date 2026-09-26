@@ -197,6 +197,8 @@ fn takeRefusal(wb: *Workbook, opts: Options, refusal: recalc_txn.Refusal) workbo
 }
 
 /// §5.7.9's file transaction, in the order §5.7.9 makes normative.
+/// The candidate carries the save plans (the fold): every sheet's cell
+/// deltas and cell styles, the styles plan, the defined names.
 ///
 /// The bytes written are serialized from the prepared candidate, not
 /// from the workbook: the swap has not happened yet and must not, so
@@ -2799,6 +2801,10 @@ test "recalc guard: an added sheet or a moved row refuses recalculate before the
 fn stageBoth(wb: *Workbook) !void {
     try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
     try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
+    // The styles plan and a cell style ride the same fold (S3d slice 1;
+    // in-house r14 A-PIN-1406: the allocation sweeps stage them too).
+    const idx = try wb.addStyle(.{ .font_bold = true });
+    try (try wb.sheet(0)).setCellStyle("A1", idx);
 }
 
 fn hasDefinedName(wb: *const Workbook, name: []const u8) bool {
@@ -3225,7 +3231,7 @@ fn foldPassUnderFailure(a: Allocator, io: std.Io, path: []const u8) !void {
     try testing.expectEqual(installs, wb.store.installs);
     try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
     const folded = (try next.part(sheet_part)) orelse return error.TestUnexpectedResult;
-    try testing.expect(std.mem.indexOf(u8, folded.bytes, "<c r=\"A1\"><v>41</v></c>") != null);
+    try testing.expect(std.mem.indexOf(u8, folded.bytes, "<c r=\"A1\" s=\"1\"><v>41</v></c>") != null);
 }
 
 /// The fold over the pivot fixture — a table to extend, a cache to

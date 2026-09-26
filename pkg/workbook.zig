@@ -1771,7 +1771,7 @@ pub const Workbook = struct {
         const a = self.allocator;
         const target = if (std.mem.startsWith(u8, name, "xl/")) name["xl/".len..] else name;
         const rels = try store.part(workbook_rels_part_name) orelse return error.MissingWorkbookRels;
-        const patched = try injectWorkbookRelationship(a, rels.bytes, rel_type, target);
+        const patched = try injectWorkbookRelationship(a, store, rels.bytes, rel_type, target);
         defer a.free(patched);
         if (std.mem.eql(u8, patched, rels.bytes)) return;
         try store.replacePart(workbook_rels_part_name, patched);
@@ -1781,13 +1781,15 @@ pub const Workbook = struct {
     /// namespace. A Strict package is given Strict parts and
     /// relationships when the slice creates them (in-house r12
     /// A-NS-1202).
-    fn packageIsStrict(self: *const Workbook, store: *const PartStore) bool {
+    fn packageIsStrict(self: *const Workbook, store: *const PartStore) Error!bool {
         _ = self;
         // The workbook part's own root namespace — what the package
         // speaks, not any one relationship's spelling (a purl-typed
         // decoy on a Transitional package made a Strict part registered
-        // Transitional; in-house r13 A-NS-1301).
-        const part = (store.part("xl/workbook.xml") catch return false) orelse return false;
+        // Transitional; in-house r13 A-NS-1301). The part's read
+        // propagates — an allocation failure is never "Transitional"
+        // (the fold's allocation sweep).
+        const part = (try store.part("xl/workbook.xml")) orelse return false;
         const root = (workbook_xml_mod.findTagOpen(part.bytes, 0, "workbook") catch return false) orelse return false;
         const ns_raw = workbook_xml_mod.getAttr(part.bytes[root.attrs_start..root.attrs_end], "xmlns") orelse return false;
         var buf: [128]u8 = undefined;
@@ -1859,7 +1861,7 @@ pub const Workbook = struct {
             // A Strict package gets a Strict part and a Strict
             // relationship (in-house r12 A-NS-1202): the head's one
             // namespace declaration respelled, nothing else changes.
-            const strict = self.packageIsStrict(store);
+            const strict = try self.packageIsStrict(store);
             // The FIRST occurrence — the root's declaration — never a
             // caller's font name or format spelling the URI (in-house
             // r12 B-NS-1201).
@@ -1886,7 +1888,7 @@ pub const Workbook = struct {
         // Excel never loads: the relationship lands with the extension
         // (in-house r3 A-PART-301, the present branch) — with it, not
         // on a save that renders nothing (r4 B-INS-403).
-        try self.ensureStylesRelationship(store, name, if (self.packageIsStrict(store)) strict_styles_rel_type else styles_rel_type);
+        try self.ensureStylesRelationship(store, name, if (try self.packageIsStrict(store)) strict_styles_rel_type else styles_rel_type);
         var frags = try self.styles_plan.emitFragments(a, base);
         defer frags.deinit(a);
         const spliced = try spliceStylesFragments(a, part.bytes, &layout, &frags);
@@ -12614,7 +12616,7 @@ fn applySstExtensionPlan(wb: *Workbook, store: *PartStore, plan: *const SstExten
     // Splice a `<Relationship>` into `xl/_rels/workbook.xml.rels`.
     const rels_part = try store.part("xl/_rels/workbook.xml.rels") orelse
         return Error.MissingWorkbookRels;
-    const new_rels = try injectSstRelationship(wb.allocator, rels_part.bytes);
+    const new_rels = try injectSstRelationship(wb.allocator, store, rels_part.bytes);
     defer wb.allocator.free(new_rels);
     try store.replacePart("xl/_rels/workbook.xml.rels", new_rels);
 }
@@ -13010,9 +13012,10 @@ fn countSiOpens(xml: []const u8) u32 {
 /// `xl/_rels/workbook.xml.rels`. Picks an Id that doesn't collide
 /// with existing `rIdN` values. No-op (returns the original bytes
 /// duped) if a sharedStrings relationship already exists.
-fn injectSstRelationship(allocator: Allocator, xml: []const u8) Error![]u8 {
+fn injectSstRelationship(allocator: Allocator, store: *const PartStore, xml: []const u8) Error![]u8 {
     return injectWorkbookRelationship(
         allocator,
+        store,
         xml,
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
         "sharedStrings.xml",
@@ -13032,6 +13035,7 @@ fn injectSstRelationship(allocator: Allocator, xml: []const u8) Error![]u8 {
 /// styles part's one splice.
 fn injectWorkbookRelationship(
     allocator: Allocator,
+    store: *const PartStore,
     xml: []const u8,
     type_uri: []const u8,
     target: []const u8,
@@ -13058,13 +13062,17 @@ fn injectWorkbookRelationship(
             const t = workbook_xml_mod.decodeScalarAttr(&t_buf, t_raw) orelse t_raw;
             var m_buf: [32]u8 = undefined;
             const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| std.mem.eql(u8, workbook_xml_mod.decodeScalarAttr(&m_buf, m_raw) orelse m_raw, "External") else false;
-            // A target that names no part — empty, or a URI — is what
-            // the resolver rejects (`resolveOwned`); such a relationship
-            // is not the part's either (in-house r13 A-REL-1302).
+            // A target that names no part is what the resolver rejects
+            // — the resolver's own rules, not a copy of them (in-house
+            // r13 A-REL-1302, r14 A-REL-1401: a bare scheme, a UNC or
+            // drive-letter target, a package-escaping `../..`); such a
+            // relationship is not the part's either.
             var tg_buf: [512]u8 = undefined;
             const target_ok = if (workbook_xml_mod.getAttr(attrs, "Target")) |tg_raw| blk: {
                 const tg = workbook_xml_mod.decodeScalarAttr(&tg_buf, tg_raw) orelse tg_raw;
-                break :blk tg.len > 0 and std.mem.indexOf(u8, tg, "://") == null;
+                const resolved = try store.resolveOwned(allocator, "xl/workbook.xml", tg);
+                if (resolved) |r| allocator.free(r);
+                break :blk resolved != null;
             } else false;
             const same = std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t));
             if (same and !external and target_ok) return try allocator.dupe(u8, xml);
@@ -13457,8 +13465,9 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
         if (known) |k| {
             if (k < next_table) return error.MalformedStylesXml;
             // A table's name under a default namespace redeclared to
-            // another URI is not the stylesheet's table (in-house r9
-            // B-SCN-904): refused, never extended.
+            // a URI other than the root's is not the stylesheet's table
+            // (in-house r9 B-SCN-904, r12 A-NS-1201): refused, never
+            // extended.
             if (workbook_xml_mod.getAttr(xml[el.open.attrs_start..el.open.attrs_end], "xmlns")) |ns| {
                 if (!isRootNamespace(ns, root_ns)) return error.MalformedStylesXml;
             }
@@ -13497,8 +13506,8 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                         if (ch_local.len != ch.name.len and std.mem.eql(u8, ch_local, child)) return error.MalformedStylesXml;
                         if (isMcElement(ch_local)) return error.MalformedStylesXml;
                         // A record redeclaring its default namespace to
-                        // another URI is not one of the table's (r10
-                        // A-SCN-1002, the mirror of r9 B-SCN-904).
+                        // a URI other than the root's is not one of the
+                        // table's (r10 A-SCN-1002, r12 A-NS-1201).
                         if (std.mem.eql(u8, ch.name, child)) {
                             if (workbook_xml_mod.getAttr(xml[ch.open.attrs_start..ch.open.attrs_end], "xmlns")) |ns| {
                                 if (!isRootNamespace(ns, root_ns)) return error.MalformedStylesXml;
@@ -13634,9 +13643,11 @@ fn spliceStylesFragments(
         };
         const held = layout.records(t);
         // An `<xf>` names `fontId` / `fillId` / `borderId` 0 and
-        // `xfId="0"`: every table it points into is seeded when the
-        // part lacks it or holds it empty, as the fresh part has them
-        // all (in-house S3d slice 1 r1 A-SPL-104 for fills / borders).
+        // `xfId="0"` (a `<cellStyleXfs>` record, which a `<cellStyles>`
+        // entry names in turn): every table it points into is seeded
+        // when the part lacks it or holds it empty, as the fresh part
+        // has them all (in-house S3d slice 1 r1 A-SPL-104 for fills /
+        // borders; r14 A-DOC-1405 for the cellStyles reason).
         const seed = held == 0 and (added > 0 or (frags.cell_xfs_added > 0 and switch (t) {
             .fonts, .fills, .borders, .cell_style_xfs, .cell_styles => true,
             else => false,
@@ -32989,7 +33000,7 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const end = std.mem.indexOfPos(u8, rels, at, "/>").? + 2;
         const stripped = try std.mem.concat(a, u8, &.{ rels[0..at], rels[end..] });
         defer a.free(stripped);
-        const injected = try injectWorkbookRelationship(a, stripped, styles_rel_type, "styles.xml");
+        const injected = try injectWorkbookRelationship(a, &wb.store, stripped, styles_rel_type, "styles.xml");
         defer a.free(injected);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, injected, "relationships/styles"));
         try std.testing.expect(std.mem.indexOf(u8, injected, "Id=\"rId4\"") != null);
@@ -33058,21 +33069,25 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
     // (r5 A-REL-501); `</fonts >` reads as the table's close (r5
     // A-SCN-503).
     {
+        // The injector resolves targets through a store (r14
+        // A-REL-1401): any opened workbook's serves the literal parts.
+        var rs = try Workbook.open(a, io, src);
+        defer rs.deinit();
         const rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><!-- </Relationships> --><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships >";
-        const injected = try injectWorkbookRelationship(a, rels, styles_rel_type, "styles.xml");
+        const injected = try injectWorkbookRelationship(a, &rs.store, rels, styles_rel_type, "styles.xml");
         defer a.free(injected);
         try std.testing.expectEqualStrings(
             "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><!-- </Relationships> --><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
                 "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships >",
             injected,
         );
-        const empty = try injectWorkbookRelationship(a, "<Relationships></Relationships>", styles_rel_type, "styles.xml");
+        const empty = try injectWorkbookRelationship(a, &rs.store, "<Relationships></Relationships>", styles_rel_type, "styles.xml");
         defer a.free(empty);
         try std.testing.expect(std.mem.startsWith(u8, empty, "<Relationships><Relationship Id=\"rId1\""));
         // An explicit internal mode, entity-spelled or not, IS the
         // part's: nothing added (r11 A-PIN-1105 / A-REL-1101).
         const int_rel = "<Relationships><Relationship Id=\"rId7\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\" TargetMode=\"Inter&#110;al\"/></Relationships>";
-        const untouched = try injectWorkbookRelationship(a, int_rel, styles_rel_type, "styles.xml");
+        const untouched = try injectWorkbookRelationship(a, &rs.store, int_rel, styles_rel_type, "styles.xml");
         defer a.free(untouched);
         try std.testing.expectEqualStrings(int_rel, untouched);
         // A styles relationship whose target names no part — empty or
@@ -33081,20 +33096,20 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         for ([_][]const u8{ "", "http://example.com/s.xml" }) |bad| {
             const no_part = try std.fmt.allocPrint(a, "<Relationships><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"{s}\"/></Relationships>", .{bad});
             defer a.free(no_part);
-            const fixed = try injectWorkbookRelationship(a, no_part, styles_rel_type, "styles.xml");
+            const fixed = try injectWorkbookRelationship(a, &rs.store, no_part, styles_rel_type, "styles.xml");
             defer a.free(fixed);
             try std.testing.expect(std.mem.indexOf(u8, fixed, "Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
         }
         // An entity-spelled Id counts toward the next id (r12
         // B-REL-1202).
         const spelled = "<Relationships><Relationship Id=\"&#114;Id3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
-        const past3 = try injectWorkbookRelationship(a, spelled, styles_rel_type, "styles.xml");
+        const past3 = try injectWorkbookRelationship(a, &rs.store, spelled, styles_rel_type, "styles.xml");
         defer a.free(past3);
         try std.testing.expect(std.mem.indexOf(u8, past3, "Id=\"rId4\"") != null);
         // An external-mode styles relationship is not the part's: the
         // internal one is added beside it (r10 B-REL-1001).
         const ext_rel = "<Relationships><Relationship Id=\"rId7\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"http://example.com/s.xml\" TargetMode=\"External\"/></Relationships>";
-        const with_internal = try injectWorkbookRelationship(a, ext_rel, styles_rel_type, "styles.xml");
+        const with_internal = try injectWorkbookRelationship(a, &rs.store, ext_rel, styles_rel_type, "styles.xml");
         defer a.free(with_internal);
         try std.testing.expect(std.mem.indexOf(u8, with_internal, "<Relationship Id=\"rId8\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
         // A table and a record spelling the MAIN namespace explicitly

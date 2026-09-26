@@ -3246,8 +3246,11 @@ of `Writer.add_style` / `add_dxf`, unchanged behaviour).
 re-emitted at save as a sheet with a staged cell write is: its
 `<sheetData>` regenerated from the typed view by the delta emitter —
 row attributes (`ht`, `customHeight`, `hidden`, `spans`, a row's own
-`s` / `customFormat`), shared-formula group attributes (`t="shared"
-ref si`, the follower's empty `<f>`) are not carried, a rich inline
+`s` / `customFormat`), shared- and array-formula group attributes
+(`t="shared" ref si`, the follower's empty `<f>`; `t="array" ref` —
+the spill rectangle collapses, the follower keeping a stale `<v>` —
+and `ca`), a cell's metadata attributes (`cm`, `vm`, `ph`; r14
+B-EMT-1401) are not carried, a rich inline
 string keeps its first run's text only (`bo` + `ld` → `bo` — r11
 B-EMT-1102), a positional `<c>` (no `r`) and a `<row>` holding no cell are
 DROPPED (values, not only formatting — in-house r7 B-EMT-702; the read
@@ -3400,6 +3403,17 @@ ISO-Strict package (bisected to the Strict main namespace on
 over a Strict package — the fold over Strict is pinned through the
 mark-only arm; an owner follow-up, `docs/package-layer.md` admitting
 Strict by contract (B r13, unverified note).
+
+**Round 14.** The injector's target test is the resolver's own
+(`resolveOwned`: a bare scheme, a UNC or drive-letter target, a
+package-escaping `../..` name no part — in-house r14 A-REL-1401);
+the array-formula group and cell-metadata attributes join every cost
+list (B-EMT-1401); footnote ³⁰'s splice scope reads eight tables
+(B-DOC-1402); the README splits `addStyle` from `setCellStyle`
+(B-DOC-1403); the fold's allocation sweeps stage a style too
+(A-PIN-1406); the remaining "another URI" comments, the Editor's
+predicate docs, the `<cellStyles>` seed reason, `saveWithRecalc`'s
+header and Zig paragraphs and footnote ²⁶ carried (A-DOC-1402..1405).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
