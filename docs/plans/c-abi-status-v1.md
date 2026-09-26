@@ -3122,10 +3122,12 @@ first registration, in two questions (`resolvePartTarget`; in-house
 r13 A-REL-1302, r14 A-REL-1401, r15 A-PART-1501 / B-REL-1501, r16
 B-PART-1601 / B-REL-1602 / B-REL-1603, r17 A-PART-1701 / A-PART-1702 /
 A-REL-1703; r18 A-PART-1801 / A-CT-1802 / A-REL-1803 / B-PKG-1801). A
-target naming a part the package HOLDS — under any ASCII case, the
-store's own spelling handed on — names it, whatever the target's
-spelling: the part is extended in place (a non-ASCII name — its
-archive entry flagged UTF-8 on the rewrite — a trailing slash, a
+target naming a part the package HOLDS — the exact spelling first,
+then any ASCII case (r19 B-PART-1901: of two case-variant twins the
+one the relationship spells wins), the store's own spelling handed on
+— names it, whatever the target's spelling: the part is extended in
+place (a non-ASCII name — its archive entry flagged UTF-8 on the
+rewrite when its bytes are UTF-8 — a trailing slash, a
 numeric reference; refusing a real part's name for its spelling would
 orphan it), and it gains the styles content-type `<Override>` when the
 package resolves it to another type through a Default, or to nothing
@@ -3147,9 +3149,14 @@ grammar's own rule, a name no consumer addresses as the package
 spells it), and (iv) no entry sits under the
 name and no part with bytes sits over it (a zero-length entry beside
 `xl/…` is a directory marker, no part). Otherwise `xl/styles.xml`,
-extended when held, created when not; a part the workbook holds
-without its relationship — and a created part — gains the internal
-relationship with the extension. The reader and `Workbook.styles()`
+extended when held under any case (the store's spelling), created
+when not; a part the workbook holds without its relationship — and a
+created part — gains the internal relationship with the extension,
+its target relative to the workbook part's directory under any case
+of it (r20 A-REL-2001). A relationship whose target named no part is
+left as the producer wrote it: the saved package then carries two
+styles relationships, the internal one beside it (r10 B-REL-1001's
+ruling, pinned in the r17 arms). The reader and `Workbook.styles()`
 still address the conventional name (pre-existing, recorded).
 
 **What the index is.** The part's tables are read once per save —
@@ -3324,8 +3331,9 @@ class's `_u32` guard (`2**32` is `ValueError`, never a wrap to another
 sheet, row or style — r6 A-PY-601 / B-PY-602; `set_cell`'s three, the
 same pre-existing gap, with them). A created part's content-type
 override rides `PartStore.addPart` (pre-existing: a package that
-already declares an override for the name gets a second — r6
-B-CT-603, recorded). A save that rendered the plan invalidates the
+already declared an override for the name got a second — r6
+B-CT-603, recorded then; closed in round 20, `addPart` staging none
+when the package already names the part — B-CT-2004). A save that rendered the plan invalidates the
 view `Workbook.styles()` handed out, as an SST extension invalidates
 `sst()`'s (r6 B-VIEW-605, stated here).
 
@@ -3585,10 +3593,29 @@ Python docstring and README (B-DOC-1906). A: the content-type guard
 reads through the store's own lexer — live markup only, a `>` inside
 a sibling value kept, the decode gated on `&` (A-CT-1904); the
 create-side case rules and the content-type stage-and-commit pinned
-(A-PIN-1905 / A-PIN-1906: the fold's sweep runs over an undeclared
-part too); the `<Override>` scope names "or to nothing" (A-DOC-1908);
+(A-PIN-1905 / A-PIN-1906: the plain save's allocation sweep runs
+over an undeclared part too — the fold's own sweeps still see a
+declared one); the `<Override>` scope names "or to nothing" (A-DOC-1908);
 a part declared under another type recorded as an open owner call
 (A-CT-1909).
+
+**Round 20.** The injected relationship's target stripped `xl/`
+byte-exactly where the fallback now hands on a held name under any
+case: a part at `XL/styles.xml` was extended and given
+`Target="XL/styles.xml"` (→ `xl/XL/styles.xml`), so the next session
+mapped against the fresh base and created a second part there
+(in-house r20 A-REL-2001) → the target is relative to the workbook's
+directory under any case of it, a name elsewhere spelled absolute
+(pinned across two sessions). `replaceParts` records its sizes as
+its singular twin does (A-STORE-2002); the "Which part" fallback
+clause reads "held under any case", the r19 sweep sentence names the
+plain save's, and the two-relationship outcome of a target naming no
+part is stated (A-DOC-2003). B: `addPart` stages no `<Override>` for
+a name the package already declares — a CREATED styles part in a
+package declaring it had got a second element (B-CT-2004, r6
+B-CT-603 closed; pinned in the store); the UTF-8 flag's rule and the
+exact-spelling-first precedence on `nameFlags`' doc, "Which part" and
+footnote ³⁰ (B-DOC-2002 / B-DOC-2003).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

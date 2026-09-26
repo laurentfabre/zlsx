@@ -1946,7 +1946,16 @@ pub const Workbook = struct {
     /// a resolved name came FROM one).
     fn ensureStylesRelationship(self: *Workbook, store: *PartStore, name: []const u8, rel_type: []const u8) Error!void {
         const a = self.allocator;
-        const target = if (std.mem.startsWith(u8, name, "xl/")) name["xl/".len..] else name;
+        // Relative to the workbook part's directory under any case of
+        // it (a held `XL/styles.xml` had been given `Target=
+        // "XL/styles.xml"`, which resolves to `xl/XL/styles.xml` — the
+        // next session created a second part there; in-house r20
+        // A-REL-2001); a name elsewhere is spelled absolute.
+        const target = if (std.ascii.startsWithIgnoreCase(name, "xl/"))
+            name["xl/".len..]
+        else
+            try std.mem.concat(a, u8, &.{ "/", name });
+        defer if (!std.ascii.startsWithIgnoreCase(name, "xl/")) a.free(target);
         const rels = try store.part(workbook_rels_part_name) orelse return error.MissingWorkbookRels;
         const patched = try injectWorkbookRelationship(a, store, rels.bytes, rel_type, target);
         defer a.free(patched);
@@ -34058,5 +34067,107 @@ test "S3d slice 1: the conventional fallback finds the part held under another c
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "relationships/styles\""));
     const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
     defer a.free(ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+}
+
+test "S3d slice 1: a part held at XL/styles.xml with no relationship gains one that resolves to it — the next session extends the same part (r20 A-REL-2001)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r20_src.xlsx");
+    defer a.free(src);
+    const upper = try std.fs.path.join(a, &.{ dir, "s3d1_r20_upper.xlsx" });
+    defer a.free(upper);
+    const out1 = try std.fs.path.join(a, &.{ dir, "s3d1_r20_out1.xlsx" });
+    defer a.free(out1);
+    const out2 = try std.fs.path.join(a, &.{ dir, "s3d1_r20_out2.xlsx" });
+    defer a.free(out2);
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+        defer a.free(styles);
+        try wb.store.addPart("XL/styles.xml", styles_content_type, styles);
+        try wb.store.removePart("xl/styles.xml");
+        const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+        defer a.free(rels);
+        const at = std.mem.indexOf(u8, rels, "Target=\"styles.xml\"") orelse return error.TestUnexpectedResult;
+        const open_at = std.mem.lastIndexOf(u8, rels[0..at], "<Relationship") orelse return error.TestUnexpectedResult;
+        const close_at = (std.mem.indexOfPos(u8, rels, at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+        const without = try std.mem.concat(a, u8, &.{ rels[0..open_at], rels[close_at..] });
+        defer a.free(without);
+        try wb.store.replacePart(workbook_rels_part_name, without);
+        try wb.save(io, upper);
+    }
+    {
+        var wb = try Workbook.open(a, io, upper);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
+        try wb.save(io, out1);
+    }
+    var re = try Workbook.open(a, io, out1);
+    defer re.deinit();
+    const rels = try s3d1PartBytes(a, &re, workbook_rels_part_name);
+    defer a.free(rels);
+    try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"styles.xml\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rels, "relationships/styles\""));
+    // The second session resolves the relationship to the same part.
+    try std.testing.expectEqual(@as(u32, 4), try re.addStyle(.{ .font_italic = true }));
+    try re.save(io, out2);
+    var re2 = try Workbook.open(a, io, out2);
+    defer re2.deinit();
+    try std.testing.expect(!re2.store.hasPart("xl/styles.xml"));
+    try std.testing.expect(!re2.store.hasPart("xl/XL/styles.xml"));
+    const styles = try s3d1PartBytes(a, &re2, "XL/styles.xml");
+    defer a.free(styles);
+    try std.testing.expect(std.mem.indexOf(u8, styles, "<cellXfs count=\"5\">") != null);
+    const ct = try s3d1PartBytes(a, &re2, "[Content_Types].xml");
+    defer a.free(ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+}
+
+test "S3d slice 1: a created styles part in a package that already declares the name gains no second content-type override (r20 B-CT-2004)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r20b_src.xlsx");
+    defer a.free(src);
+    const declared = try std.fs.path.join(a, &.{ dir, "s3d1_r20b_declared.xlsx" });
+    defer a.free(declared);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r20b_out.xlsx" });
+    defer a.free(out);
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try wb.store.removePart("xl/styles.xml");
+        const ct = try s3d1PartBytes(a, &wb, "[Content_Types].xml");
+        defer a.free(ct);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct, "/xl/styles.xml"));
+        const close_at = std.mem.lastIndexOf(u8, ct, "</Types>") orelse return error.TestUnexpectedResult;
+        const with = try std.mem.concat(a, u8, &.{ ct[0..close_at], "<Override PartName = \"/xl/styles.xml\" ContentType=\"" ++ styles_content_type ++ "\"/>", ct[close_at..] });
+        defer a.free(with);
+        try wb.store.replacePart("[Content_Types].xml", with);
+        try wb.save(io, declared);
+    }
+    var wb = try Workbook.open(a, io, declared);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
+    try wb.save(io, out);
+    var re = try Workbook.open(a, io, out);
+    defer re.deinit();
+    try std.testing.expect(re.store.hasPart("xl/styles.xml"));
+    const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+    defer a.free(ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "/xl/styles.xml"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
 }

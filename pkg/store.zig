@@ -749,10 +749,14 @@ pub const PartStore = struct {
         // Stage the [Content_Types].xml update WITHOUT calling
         // replacePart — we don't want to commit that mutation until
         // we know the array reallocs below also succeed.
-        const ct_staging = try self.stageContentTypeOverride(name, content_type, poller);
-        const ct_idx = ct_staging.idx;
-        const ct_new_part_bytes = ct_staging.new_part_bytes;
-        const ct_new_override = ct_staging.new_override;
+        // A package that already declares the name in an `<Override>`
+        // keeps that one — a second element for one `PartName` is no
+        // package (S3d slice 1 r6 B-CT-603, closed r20 B-CT-2004).
+        const ct_idx_now = self.findIndex("[Content_Types].xml") orelse return error.MissingContentTypes;
+        const ct_staging: ?StagedContentTypeUpdate = if (try self.overrideNamesPart(self.parts[ct_idx_now].bytes, name))
+            null
+        else
+            try self.stageContentTypeOverride(name, content_type, poller);
 
         // Synthetic ZipEntry for the new part — save() rebuilds
         // LFH/CDFH from the override slot, so source-offset fields
@@ -812,11 +816,13 @@ pub const PartStore = struct {
         self.entries = grown_entries;
         self.parts = grown_parts;
         self.overrides = grown_overrides;
-        // Apply the staged content-types update.
-        self.overrides[ct_idx] = ct_new_override;
-        self.parts[ct_idx].bytes = ct_new_part_bytes;
-        self.parts[ct_idx].compression_method = ct_new_override.compressed.compression_method;
-        self.parts[ct_idx].uncompressed_size = @intCast(ct_new_part_bytes.len);
+        // Apply the staged content-types update, if one was needed.
+        if (ct_staging) |st| {
+            self.overrides[st.idx] = st.new_override;
+            self.parts[st.idx].bytes = st.new_part_bytes;
+            self.parts[st.idx].compression_method = st.new_override.compressed.compression_method;
+            self.parts[st.idx].uncompressed_size = @intCast(st.new_part_bytes.len);
+        }
     }
 
     const StagedContentTypeUpdate = struct {
@@ -1062,6 +1068,10 @@ pub const PartStore = struct {
         for (staged) |st| {
             self.overrides[st.idx] = .pending;
             self.parts[st.idx].bytes = st.bytes;
+            // The size the record reports without materializing
+            // (r18 A-STORE-1804; the plural mutator too — r20
+            // A-STORE-2002).
+            self.parts[st.idx].uncompressed_size = @intCast(st.bytes.len);
             if (st.owner) |o| self.rels_by_owner.putAssumeCapacity(o, st.rels);
         }
     }
@@ -1543,7 +1553,8 @@ pub const PartStore = struct {
 
     /// The general-purpose flags a fresh header carries for an entry
     /// named `name`: bit 11 (APPNOTE §4.4.4, the name is UTF-8) when
-    /// any byte is above ASCII, else none. A rewritten entry lost the
+    /// any byte is above ASCII AND the bytes are UTF-8, else none (a
+    /// latin-1 name keeps flag 0 — r19 B-PKG-1904). A rewritten entry lost the
     /// bit its source carried, so a `zipfile` consumer listed the
     /// name as CP437 and found no such part — an extended styles part
     /// at `xl/stylés.xml` lost whole (S3d slice 1 r18 B-PKG-1801;
@@ -3718,6 +3729,16 @@ test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeO
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_after, "PartName=\"/xl/_rels/workbook.xml.rels\""));
     try std.testing.expectEqualStrings("application/x-test", (try store.part(by_default)).?.content_type.?);
     try std.testing.expectError(error.PartNotFound, store.ensureContentTypeOverride("xl/none.xml", "application/x-test"));
+    // A created part the package already declares gains no second
+    // `<Override>` (r6 B-CT-603, closed r20 B-CT-2004).
+    try store.removePart("xl/added.xml");
+    const ct_now = (try store.part("[Content_Types].xml")).?.bytes;
+    const close_at = std.mem.lastIndexOf(u8, ct_now, "</Types>") orelse return error.TestUnexpectedResult;
+    const declared = try std.mem.concat(std.testing.allocator, u8, &.{ ct_now[0..close_at], "<Override PartName = \"/xl/added.xml\" ContentType=\"application/x-declared\"/>", ct_now[close_at..] });
+    defer std.testing.allocator.free(declared);
+    try store.replacePart("[Content_Types].xml", declared);
+    try store.addPart("xl/added.xml", "application/x-test", "<c/>");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "/xl/added.xml"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {
