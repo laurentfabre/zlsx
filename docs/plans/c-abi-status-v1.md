@@ -3124,8 +3124,9 @@ B-PART-1601 / B-REL-1602 / B-REL-1603, r17 A-PART-1701 / A-PART-1702 /
 A-REL-1703; r18 A-PART-1801 / A-CT-1802 / A-REL-1803 / B-PKG-1801). A
 target naming a part the package HOLDS — the exact spelling first,
 then any ASCII case (r19 B-PART-1901: of two case-variant twins the
-one the relationship spells wins), the store's own spelling handed on
-— names it, whatever the target's spelling: the part is extended in
+one the relationship spells wins), a zero-length directory entry
+being no part in either pass (r27 B-PART-2702), the store's own
+spelling handed on — names it, whatever the target's spelling: the part is extended in
 place (a non-ASCII name — its archive entry flagged UTF-8 on the
 rewrite when its bytes are UTF-8 — a trailing slash, a
 numeric reference; refusing a real part's name for its spelling would
@@ -3272,7 +3273,7 @@ writer's export with it, r8 B-DOC-803), the writer's enum verdicts
 `zlsx_style_t` reading is `styleFromC`, factored out of
 `zlsx_writer_add_style_ex` — one reading, the writer's error names
 unchanged; the `zlsx_dxf_t` reading `dxfFromC` likewise, a border code
-the header does not spell reading as none), `InvalidStyle` (a non-positive font size — an empty font name or
+the header does not spell reading as none), `InvalidStyle` (a non-finite or non-positive font size, judged after the part is read — an empty font name or
 format is "unset" at the C boundary, `*_len == 0`, and Python raises
 the writer's `InvalidFontName` / `InvalidNumberFormat` before the call;
 `zlsx_editor_intern_num_fmt` alone reaches `InvalidStyle` with an empty
@@ -3784,6 +3785,21 @@ five surfaces and `defaultTypesPart`'s accept arm pinned (A-DOC-2704
 / A-PIN-2703 / A-DOC-2702); the twin's declaration types the twin,
 the created part taking the manifest's `Default` (B-DOC-2701);
 `applySavePlans`' doc lists its phases in their order (B-DOC-2703).
+
+**Round 28.** The dxf font-size rule moved into the plan
+(`StylesPlan.addDxf`, `InvalidFontSize`), so the fresh writer refuses
+it as `addStyle` does and the editor folds it to `InvalidStyle` — the
+"mirrors `Writer.addDxf`" line true again (in-house r28 A-DOC-2804);
+every registration judges the part before the argument (a torn part
+refuses `MalformedStylesXml` whatever the argument — A-ABI-2806,
+pinned); the case-insensitive marker skip pinned with the marker
+listed ahead (A-PIN-2801); the dxf rule pinned on Python
+(A-PIN-2807); the two redundant marker checks behind `heldPartIndex`
+removed (A-DUP-2805); `applyStylesPlanInto`'s doc and the
+`InvalidStyle` doc carry the r27 rules and the size predicate as
+"non-finite or non-positive" on every surface (A-DOC-2802 /
+A-DOC-2803). B: the held-side marker rule on "Which part", footnote
+³⁰ and the header (B-DOC-2805); the rest converging with A's.
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

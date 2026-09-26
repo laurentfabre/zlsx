@@ -158,6 +158,11 @@ def test_statements_about_the_call_stage_nothing(tmp_path):
         # The same guard on the two writers that shared the gap (r6/r7).
         with pytest.raises(ValueError):
             ed.append_rows(2**32, [[9]])
+        # A dxf keeps add_style's font-size rule (r27 A-DXF-2701, r28
+        # A-PIN-2807): non-finite or non-positive is InvalidStyle.
+        for bad in (float("nan"), float("inf"), -3.0, 0.0):
+            with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
+                ed.add_dxf(Dxf(font_size=bad))
         with pytest.raises(ValueError):
             ed.set_cell(2**32, 1, 0, 1)
         with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):

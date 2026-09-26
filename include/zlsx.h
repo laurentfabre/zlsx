@@ -1416,7 +1416,9 @@ typedef struct {
 } zlsx_dxf_t;
 
 /* Register a dxf on the workbook-wide `<dxfs>` table. Returns 0 on
- * success with `*out_dxf_id` set; -1 on alloc. Content-dedup'd. */
+ * success with `*out_dxf_id` set; -1 on alloc, or with
+ * err="InvalidFontSize" for a non-finite or non-positive font size (the
+ * rule zlsx_writer_add_style_ex keeps; S3d slice 1 r28). Content-dedup'd. */
 int32_t zlsx_writer_add_dxf(zlsx_writer_t *   w,
                             const zlsx_dxf_t* dxf,
                             uint32_t *        out_dxf_id,
@@ -2597,8 +2599,9 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  *
  * The fresh writer's registrations on an OPENED workbook. A style, a
  * dxf or a number format registered here lands in the workbook's
- * styles part — the target of the workbook's styles relationship,
- * xl/styles.xml when none names one — at the next zlsx_editor_save / save_to_buffer /
+ * styles part — the target of the workbook's styles relationship (a
+ * part the package holds under any case; a zero-length directory entry
+ * is none), xl/styles.xml when none names one — at the next zlsx_editor_save / save_to_buffer /
  * save_with_recalc: each table of the part extended after the records
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part
@@ -2629,7 +2632,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * the call — InvalidInput (a NULL handle, spec or out; a NULL font-name
  * or format pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
- * InvalidStyle (a non-positive font size; an empty font name or
+ * InvalidStyle (a non-finite or non-positive font size; an empty font name or
  * format is "unset" at this boundary, `*_len == 0`) — the out is 0 on
  * every failure past the NULL checks (a NULL handle, spec or out leaves
  * it untouched); -2 MalformedStylesXml, the name in the diag

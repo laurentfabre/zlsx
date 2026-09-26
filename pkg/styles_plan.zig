@@ -562,6 +562,13 @@ pub const StylesPlan = struct {
     /// 0-based dxfId. Linear dedup by content equality — Dxfs carry
     /// no owned slices, so a `std.meta.eql` is sufficient.
     pub fn addDxf(self: *StylesPlan, allocator: Allocator, dxf: Dxf) Error!u32 {
+        // The font-size rule `addStyle` keeps: a non-finite or
+        // non-positive size is `InvalidFontSize`, never `<sz
+        // val="nan"/>` in the part — on the fresh writer and the
+        // editor alike (S3d slice 1 r27 A-DXF-2701, r28 A-DOC-2804).
+        if (dxf.font_size) |s| {
+            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
+        }
         for (self.dxfs.items, 0..) |existing, i| {
             if (std.meta.eql(existing, dxf)) return @intCast(i);
         }

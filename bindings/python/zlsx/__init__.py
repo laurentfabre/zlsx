@@ -3470,7 +3470,9 @@ class Writer:
     def add_dxf(self, dxf: "Dxf") -> int:
         """Register a differential format for conditional-formatting
         rules and return its dxf id. Content-dedup'd — same
-        :class:`Dxf` returns the same id. Requires libzlsx 0.2.6+."""
+        :class:`Dxf` returns the same id. Requires libzlsx 0.2.6+.
+        A non-finite or non-positive font size raises :class:`ZlsxError`
+        ``InvalidFontSize`` (the rule :meth:`add_style` keeps; 0.9.0+)."""
         if not _ffi._HAS_CONDITIONAL_FORMAT:
             raise RuntimeError(
                 "loaded libzlsx does not expose add_dxf "
@@ -5391,7 +5393,7 @@ class Editor:
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
-        non-positive font size — where :meth:`Writer.add_style` names
+        non-finite or non-positive font size — where :meth:`Writer.add_style` names
         the writer's ``InvalidFontSize``: the editor folds the plan's
         verdicts as ``Workbook.addStyle`` does."""
         self._styles_available()

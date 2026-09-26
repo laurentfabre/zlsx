@@ -164,9 +164,11 @@ pub const Error = error{
     /// r2 B-REL-201.)
     RecalcRequiresReopen,
 
-    /// Style validation failed — empty font name, non-positive font
-    /// size, or empty number format string. Surfaces from
-    /// `Workbook.addStyle` / `Workbook.internNumFmt`.
+    /// Style validation failed — empty font name, non-finite or
+    /// non-positive font size, or empty number format string. Surfaces
+    /// from `Workbook.addStyle` / `Workbook.addDxf` /
+    /// `Workbook.internNumFmt`, after the part has been read (the part
+    /// first, then the argument — r28 A-ABI-2806).
     InvalidStyle,
     /// The workbook's styles part cannot take the styles plan: no
     /// `<styleSheet>` root, a self-closed one or one whose default
@@ -1673,17 +1675,15 @@ pub const Workbook = struct {
     /// without the part. Dedupes by content against this save's plan.
     /// Mirrors `xlsx.Writer.addDxf` byte-for-byte.
     pub fn addDxf(self: *Workbook, dxf: Dxf) Error!u32 {
-        // The font-size rule `addStyle` keeps (the header promises
-        // its statuses): a non-finite or non-positive size is
-        // `InvalidStyle`, never `<sz val="nan"/>` in the part
-        // (in-house r27 A-DXF-2701).
-        if (dxf.font_size) |s| {
-            if (!std.math.isFinite(s) or s <= 0) return error.InvalidStyle;
-        }
+        // The part first, then the argument — the order every
+        // registration keeps (r28 A-ABI-2806); the plan's font-size
+        // rule folds to `InvalidStyle` as `addStyle`'s does (r27
+        // A-DXF-2701).
         const base = try self.stylesBaseline();
         _ = std.math.add(u32, base.dxfs, @intCast(self.styles_plan.dxfs.items.len)) catch return error.MalformedStylesXml;
         const fresh_id = self.styles_plan.addDxf(self.allocator, dxf) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidFontSize => return error.InvalidStyle,
             else => unreachable,
         };
         return base.dxfId(fresh_id);
@@ -1697,8 +1697,9 @@ pub const Workbook = struct {
     /// `NUM_FMT_BASE`, 164, at least — fresh workbooks start there),
     /// the same id for the same `format_code` within a save.
     pub fn internNumFmt(self: *Workbook, format_code: []const u8) Error!u32 {
-        if (format_code.len == 0) return error.InvalidStyle;
+        // The part first, then the argument (r28 A-ABI-2806).
         const base = try self.stylesBaseline();
+        if (format_code.len == 0) return error.InvalidStyle;
         try self.requireNumFmtRoom(base, format_code);
         const fresh_id = self.styles_plan.internNumFmt(self.allocator, format_code) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1775,9 +1776,7 @@ pub const Workbook = struct {
         // store's spelling (r19 B-PART-1902); absent, a part may be
         // created there unless an entry sits under `xl/styles.xml/`
         // (a package the opener admits — r17 B-DOC-1723).
-        if (heldPartIndex(&self.store, styles_part_name)) |i| {
-            if (!isDirectoryMarker(&self.store, i)) return try self.allocator.dupe(u8, self.store.partNameAt(i));
-        }
+        if (heldPartIndex(&self.store, styles_part_name)) |i| return try self.allocator.dupe(u8, self.store.partNameAt(i));
         if (!partNameCreatable(&self.store, styles_part_name)) return error.MalformedStylesXml;
         return try self.allocator.dupe(u8, styles_part_name);
     }
@@ -1819,14 +1818,12 @@ pub const Workbook = struct {
         // store's own spelling, the one its lookups take (r18
         // A-PART-1801: `Styles.xml` had created a twin part).
         if (heldPartIndex(store, name)) |i| {
-            if (!isDirectoryMarker(store, i)) {
-                const held = allocator.dupe(u8, store.partNameAt(i)) catch |e| {
-                    allocator.free(name);
-                    return e;
-                };
+            const held = allocator.dupe(u8, store.partNameAt(i)) catch |e| {
                 allocator.free(name);
-                return held;
-            }
+                return e;
+            };
+            allocator.free(name);
+            return held;
         }
         if (!targetSpellsPart(target) or !partNameCreatable(store, name)) {
             allocator.free(name);
@@ -2037,10 +2034,12 @@ pub const Workbook = struct {
     /// missing part created whole, the fresh emitter's bytes, with its
     /// relationship and content type (an `<Override>` the package
     /// already holds for the name is re-typed, unless it is a
-    /// case-variant twin's, which stays); a held part without its
-    /// relationship or its `<Override>` — or with one lacking its
-    /// `ContentType` — gains them, one declared under another type
-    /// keeps that declaration. Run by `applySavePlans` over the
+    /// case-variant twin's, which stays, typing the twin — the created
+    /// part then takes the manifest's `Default`); a held part without
+    /// its relationship or its `<Override>` — or with one lacking its
+    /// `ContentType` — gains them unless a `Default` already types it
+    /// as the stylesheet, one declared under another type keeps that
+    /// declaration. Run by `applySavePlans` over the
     /// live store and by `foldSavePlansInto` over a candidate — the
     /// same bytes either way, since a recalc transaction never touches
     /// the part. A part whose layout is no longer the one the
@@ -33864,7 +33863,7 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
     defer a.free(src);
     const out = try std.fs.path.join(a, &.{ dir, "s3d1_r17_out.xlsx" });
     defer a.free(out);
-    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", stray_ct: []const u8 = "application/octet-stream", stray_child: bool = false, twin_first: bool = false, remove: bool, idx: u32, part: []const u8, absent: []const u8, rels: usize };
+    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", stray_ct: []const u8 = "application/octet-stream", stray_child: bool = false, marker_first: bool = false, twin_first: bool = false, remove: bool, idx: u32, part: []const u8, absent: []const u8, rels: usize };
     const arms = [_]Arm{
         // The part lives at a non-ASCII name: extended there.
         .{ .target = "stylés.xml", .moved_to = "xl/stylés.xml", .stray = null, .remove = false, .idx = 3, .part = "xl/stylés.xml", .absent = "xl/styles.xml", .rels = 1 },
@@ -33888,7 +33887,11 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         // (The marker's own declaration spells the stylesheet type: a
         // declaration under another type would be the producer's
         // statement about the OPC-equivalent name and would stay.)
-        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = "xl/styles.xml/x", .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = "xl/x", .rels = 1 },
+        // …and the same entries with the marker listed AHEAD of the
+        // real part: the case-insensitive pass skips it too (r28
+        // A-PIN-2801).
+        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .marker_first = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = "xl/x", .rels = 1 },
         // The held part under another case is the part (r18 A-PART-1801).
         .{ .target = "Styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/Styles.xml", .rels = 1 },
         .{ .target = "/XL/styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "XL/styles.xml", .rels = 1 },
@@ -33899,18 +33902,32 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         {
             var wb = try Workbook.open(a, io, src);
             defer wb.deinit();
-            if (arm.moved_to) |to| {
+            if (arm.marker_first) {
+                // The original removed, the marker (and its child) added
+                // first, the moved part after: the archive lists the
+                // marker ahead.
                 const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
                 defer a.free(styles);
-                try wb.store.addPart(to, styles_content_type, styles);
                 try wb.store.removePart("xl/styles.xml");
-            }
-            if (arm.stray) |name| try wb.store.addPart(name, arm.stray_ct, arm.stray_bytes);
-            if (arm.stray_child) {
-                // The stray a directory marker: an entry under it.
+                try wb.store.addPart(arm.stray.?, arm.stray_ct, arm.stray_bytes);
                 const child = try std.fmt.allocPrint(a, "{s}/marker_child.bin", .{arm.stray.?});
                 defer a.free(child);
                 try wb.store.addPart(child, "application/octet-stream", "c");
+                try wb.store.addPart(arm.moved_to.?, styles_content_type, styles);
+            } else {
+                if (arm.moved_to) |to| {
+                    const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+                    defer a.free(styles);
+                    try wb.store.addPart(to, styles_content_type, styles);
+                    try wb.store.removePart("xl/styles.xml");
+                }
+                if (arm.stray) |name| try wb.store.addPart(name, arm.stray_ct, arm.stray_bytes);
+                if (arm.stray_child) {
+                    // The stray a directory marker: an entry under it.
+                    const child = try std.fmt.allocPrint(a, "{s}/marker_child.bin", .{arm.stray.?});
+                    defer a.free(child);
+                    try wb.store.addPart(child, "application/octet-stream", "c");
+                }
             }
             if (arm.twin_first) {
                 // Re-added after the twin: the archive lists the twin first.
@@ -34371,6 +34388,20 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
         try wb.store.replacePart("xl/styles.xml", "<worksheet " ++ s3d1_ns ++ "/>");
         try std.testing.expectError(error.StylesPartChanged, wb.save(io, out));
+    }
+    // The part first, then the argument, on every registration: a
+    // torn part refuses `MalformedStylesXml` whatever the argument
+    // (r28 A-ABI-2806).
+    {
+        const torn = try writeS3d1WithStyles(a, io, dir, "s3d1_r28_torn.xlsx", "<notAStyleSheet/>");
+        defer a.free(torn);
+        var wb = try Workbook.open(a, io, torn);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedStylesXml, wb.addStyle(.{ .font_size = -1 }));
+        try std.testing.expectError(error.MalformedStylesXml, wb.addDxf(.{ .font_size = -3 }));
+        try std.testing.expectError(error.MalformedStylesXml, wb.internNumFmt(""));
+        try std.testing.expectError(error.MalformedStylesXml, (try wb.sheet(0)).setCellStyle("A1", 99));
+        try std.testing.expect(!wb.hasStagedStyleWork());
     }
     // A name outside the workbook's directory is injected absolute
     // (the fixture's own styles relationship removed first).
