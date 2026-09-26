@@ -77,6 +77,9 @@
 #if !defined(ZLSX_HAS_LAZY_SST)
 #error "ZLSX_HAS_LAZY_SST missing"
 #endif
+#if !defined(ZLSX_HAS_EDITOR_STYLES)
+#error "ZLSX_HAS_EDITOR_STYLES missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -222,3 +225,14 @@ static const void *const s3e2_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3e2(void);
 const void *zlsx_c_abi_smoke_anchor_s3e2(void) { return s3e2_exports[0]; }
+
+/* S3d slice 1: styles on the editor handle — the four status exports
+ * under one macro. */
+static const void *const s3d1_exports[] = {
+    (const void *)&zlsx_editor_add_style,
+    (const void *)&zlsx_editor_add_dxf,
+    (const void *)&zlsx_editor_intern_num_fmt,
+    (const void *)&zlsx_editor_set_cell_style,
+};
+const void *zlsx_c_abi_smoke_anchor_s3d1(void);
+const void *zlsx_c_abi_smoke_anchor_s3d1(void) { return s3d1_exports[0]; }

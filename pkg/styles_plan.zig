@@ -177,6 +177,8 @@ pub const Dxf = struct {
     /// Font size in points. Rare in CF rules but cheap to support —
     /// the `<sz val="…"/>` child renders the differential font at
     /// an explicit pt size instead of inheriting the cell style.
+    /// Finite and positive, as `Style.font_size` — `addDxf` refuses
+    /// `InvalidFontSize` otherwise (S3d slice 1 r28).
     font_size: ?f32 = null,
     fill_fg_argb: ?u32 = null,
     /// Per-side border overrides — emitted inside the dxf's
@@ -239,18 +241,33 @@ const STYLES_HEAD: []const u8 =
     \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     \\<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 ;
-const STYLES_FONTS_DEFAULT: []const u8 =
+// The default records `Base.fresh` counts — public so the extension of
+// an existing part seeds an absent or empty table with the SAME bytes
+// (`Workbook`'s splice reads them here; a drift is one definition).
+pub const default_font_record: []const u8 =
     \\<font><sz val="11"/><name val="Calibri"/></font>
 ;
-const STYLES_CELL_STYLE_XFS: []const u8 =
-    \\<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+pub const default_fill_records: []const u8 =
+    \\<fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>
 ;
-const STYLES_DEFAULT_CELL_XF: []const u8 =
+pub const default_border_record: []const u8 =
+    \\<border><left/><right/><top/><bottom/><diagonal/></border>
+;
+pub const default_cell_style_xf_record: []const u8 =
+    \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+;
+pub const default_cell_xf_record: []const u8 =
     \\<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
 ;
-const STYLES_CELL_STYLES: []const u8 =
-    \\<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+pub const default_cell_style_record: []const u8 =
+    \\<cellStyle name="Normal" xfId="0" builtinId="0"/>
 ;
+const STYLES_FONTS_DEFAULT = default_font_record;
+const STYLES_FILLS_DEFAULT = default_fill_records;
+const STYLES_BORDER_DEFAULT = default_border_record;
+const STYLES_CELL_STYLE_XFS: []const u8 = "<cellStyleXfs count=\"1\">" ++ default_cell_style_xf_record ++ "</cellStyleXfs>";
+const STYLES_DEFAULT_CELL_XF = default_cell_xf_record;
+const STYLES_CELL_STYLES: []const u8 = "<cellStyles count=\"1\">" ++ default_cell_style_record ++ "</cellStyles>";
 const STYLES_TAIL: []const u8 = "</styleSheet>";
 
 // ─── Helper functions ───────────────────────────────────────────────
@@ -312,10 +329,11 @@ fn patternTypeName(p: PatternType) []const u8 {
 }
 
 /// Append `s` to `out`, escaping XML metacharacters (`<`, `>`, `&`,
-/// `"`, `'`). Mirrors the writer-side `appendXmlEscaped` helper.
-/// Caller is responsible for ensuring `s` carries no XML 1.0
-/// forbidden control bytes — that's a writer-side intake concern,
-/// not a styles emit one.
+/// `"`, `'`) and spelling tab, LF and CR as character references —
+/// every value this writes is an attribute, whose normalisation
+/// would fold a literal one to a space (r31 A-TXT-3102). Mirrors the
+/// writer-side `appendXmlEscaped` helper. `xmlTextValid` at intake
+/// keeps every other non-`Char` byte out.
 fn appendXmlEscaped(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -327,6 +345,9 @@ fn appendXmlEscaped(
         '&' => try out.appendSlice(alloc, "&amp;"),
         '"' => try out.appendSlice(alloc, "&quot;"),
         '\'' => try out.appendSlice(alloc, "&apos;"),
+        '\t' => try out.appendSlice(alloc, "&#9;"),
+        '\n' => try out.appendSlice(alloc, "&#10;"),
+        '\r' => try out.appendSlice(alloc, "&#13;"),
         else => try out.append(alloc, b),
     };
 }
@@ -372,6 +393,74 @@ fn emitDxfBorderSide(
     }
     try buf.print(alloc, "</{s}>", .{tag});
 }
+
+/// Where a plan's records land in a stylesheet: the id the first
+/// record of each table takes. `fresh` is the fresh part's layout —
+/// the OOXML default records in the first slots (`emit` writes them:
+/// one font, the two conventional fills, one border, one `<xf>`, no
+/// dxf) and custom number formats from `NUM_FMT_BASE`. An existing
+/// part's extension starts each table at the count it already holds
+/// (`Workbook.stylesBaseline`), so the index `addStyle` hands out is
+/// the slot the record takes in the saved part, whichever part that
+/// is. The plan itself stays fresh-relative; the mappers translate.
+pub const Base = struct {
+    /// The `numFmtId` the first interned format takes.
+    num_fmt_next: u32 = NUM_FMT_BASE,
+    fonts: u32 = 1,
+    fills: u32 = 2,
+    borders: u32 = 1,
+    cell_xfs: u32 = 1,
+    dxfs: u32 = 0,
+
+    pub const fresh: Base = .{};
+
+    /// The saved `s="…"` index of the style `addStyle` returned
+    /// `fresh_idx` (1-based) for. Identity on `fresh`.
+    pub fn xfIndex(self: Base, fresh_idx: u32) u32 {
+        assert(fresh_idx >= 1);
+        return self.cell_xfs + (fresh_idx - 1);
+    }
+
+    /// The saved dxfId of the dxf `addDxf` returned `fresh_id` for.
+    pub fn dxfId(self: Base, fresh_id: u32) u32 {
+        return self.dxfs + fresh_id;
+    }
+
+    /// The saved numFmtId of the format `internNumFmt` returned
+    /// `fresh_id` for.
+    pub fn numFmtId(self: Base, fresh_id: u32) u32 {
+        assert(fresh_id >= NUM_FMT_BASE);
+        return self.num_fmt_next + (fresh_id - NUM_FMT_BASE);
+    }
+};
+
+/// `emitFragments`' output: the children each table gains, and how
+/// many — the `count` attribute a table carries is the base plus the
+/// added.
+pub const Fragments = struct {
+    num_fmts: std.ArrayListUnmanaged(u8) = .empty,
+    fonts: std.ArrayListUnmanaged(u8) = .empty,
+    fills: std.ArrayListUnmanaged(u8) = .empty,
+    borders: std.ArrayListUnmanaged(u8) = .empty,
+    cell_xfs: std.ArrayListUnmanaged(u8) = .empty,
+    dxfs: std.ArrayListUnmanaged(u8) = .empty,
+    num_fmts_added: u32 = 0,
+    fonts_added: u32 = 0,
+    fills_added: u32 = 0,
+    borders_added: u32 = 0,
+    cell_xfs_added: u32 = 0,
+    dxfs_added: u32 = 0,
+
+    pub fn deinit(self: *Fragments, allocator: Allocator) void {
+        self.num_fmts.deinit(allocator);
+        self.fonts.deinit(allocator);
+        self.fills.deinit(allocator);
+        self.borders.deinit(allocator);
+        self.cell_xfs.deinit(allocator);
+        self.dxfs.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 // ─── StylesPlan registry ────────────────────────────────────────────
 
@@ -424,6 +513,51 @@ pub const StylesPlan = struct {
         return self.styles.items.len == 0 and self.dxfs.items.len == 0;
     }
 
+    /// Whether a save has records to render — a style, a dxf or a
+    /// number format. (`isEmpty` is the fresh emitter's question: a
+    /// plan holding formats alone writes no part there.)
+    pub fn hasWork(self: *const StylesPlan) bool {
+        return self.styles.items.len > 0 or self.dxfs.items.len > 0 or self.num_fmts.items.len > 0;
+    }
+
+    /// The one font-size rule, a style's and a dxf's: finite and
+    /// positive (S3d slice 1 r30 A-PIN-3002 tied the two copies).
+    fn fontSizeValid(s: f32) bool {
+        return std.math.isFinite(s) and s > 0;
+    }
+
+    /// A font name or format code the part can carry: non-empty and
+    /// XML 1.0 `Char` throughout — valid UTF-8, no forbidden control
+    /// byte (`isForbiddenXmlByte` below — the sheet writers' rule in
+    /// `sheet_plan`, which this module cannot import: the two are
+    /// separate build modules; r31 A-DUP-3103), neither U+FFFE nor
+    /// U+FFFF (valid
+    /// UTF-8, outside `Char`: written verbatim they made the part
+    /// ill-formed through the very rule that closed the control bytes
+    /// — r30 B-TXT-3001, r31 A-TXT-3101). Tab, LF and CR are `Char`
+    /// and pass; the escaper spells them as references so an
+    /// attribute value keeps them (r31 A-TXT-3102).
+    fn xmlTextValid(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (!std.unicode.utf8ValidateSlice(s)) return false;
+        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        while (it.nextCodepoint()) |cp| {
+            if (cp < 0x80 and isForbiddenXmlByte(@intCast(cp))) return false;
+            if (cp == 0xFFFE or cp == 0xFFFF) return false;
+        }
+        return true;
+    }
+
+    /// XML 1.0 §2.2 `Char` on one byte: a C0 control other than tab,
+    /// LF, CR is none. The same switch as `sheet_plan.isForbiddenXmlByte`
+    /// (a separate build module — kept in step by hand).
+    fn isForbiddenXmlByte(c: u8) bool {
+        return switch (c) {
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => true,
+            else => false,
+        };
+    }
+
     /// Register a cell style and return its `s="…"` index. Dedupes
     /// structurally (including content-comparing `font_name` /
     /// `number_format`, not just slice-header comparing). Returning
@@ -433,16 +567,14 @@ pub const StylesPlan = struct {
     /// Side effect: when `style.number_format` is set, the format
     /// string is registered into the numFmt pool *before* dedup of
     /// the parent Style runs, so a rejected style doesn't pollute
-    /// the format pool.
+    /// the format pool — and the format's own text rule is judged
+    /// there (one rule, `internNumFmt`'s; r31 A-PIN-3106).
     pub fn addStyle(self: *StylesPlan, allocator: Allocator, style: Style) Error!u32 {
         if (style.font_size) |s| {
-            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
+            if (!fontSizeValid(s)) return error.InvalidFontSize;
         }
         if (style.font_name) |n| {
-            if (n.len == 0) return error.InvalidFontName;
-        }
-        if (style.number_format) |n| {
-            if (n.len == 0) return error.InvalidNumberFormat;
+            if (!xmlTextValid(n)) return error.InvalidFontName;
         }
 
         if (style.number_format) |fmt| {
@@ -472,6 +604,13 @@ pub const StylesPlan = struct {
     /// 0-based dxfId. Linear dedup by content equality — Dxfs carry
     /// no owned slices, so a `std.meta.eql` is sufficient.
     pub fn addDxf(self: *StylesPlan, allocator: Allocator, dxf: Dxf) Error!u32 {
+        // The font-size rule `addStyle` keeps: a non-finite or
+        // non-positive size is `InvalidFontSize`, never `<sz
+        // val="nan"/>` in the part — on the fresh writer and the
+        // editor alike (S3d slice 1 r27 A-DXF-2701, r28 A-DOC-2804).
+        if (dxf.font_size) |s| {
+            if (!fontSizeValid(s)) return error.InvalidFontSize;
+        }
         for (self.dxfs.items, 0..) |existing, i| {
             if (std.meta.eql(existing, dxf)) return @intCast(i);
         }
@@ -483,17 +622,27 @@ pub const StylesPlan = struct {
     /// `NUM_FMT_BASE` (164) on first sight. Subsequent calls with the
     /// same content return the same id.
     pub fn internNumFmt(self: *StylesPlan, allocator: Allocator, fmt: []const u8) Error!u32 {
+        if (!xmlTextValid(fmt)) return error.InvalidNumberFormat;
         if (self.num_fmt_index.get(fmt)) |id| return id;
         const owned = try allocator.dupe(u8, fmt);
         errdefer allocator.free(owned);
         const id: u32 = @intCast(NUM_FMT_BASE + self.num_fmts.items.len);
+        // The index's slot is reserved before the pool takes the string:
+        // once appended, the pool owns it, and a failing `put` after the
+        // append left the `errdefer` freeing what `deinit` frees again
+        // (S3d slice 1's allocation sweep).
+        try self.num_fmt_index.ensureUnusedCapacity(allocator, 1);
         try self.num_fmts.append(allocator, owned);
-        try self.num_fmt_index.put(allocator, owned, id);
+        self.num_fmt_index.putAssumeCapacity(owned, id);
         return id;
     }
 
-    /// Emit `xl/styles.xml` to `out`. Byte-identical to the
-    /// pre-iter-wr-2 `emitStylesXml` function from `src/writer.zig`.
+    /// Emit `xl/styles.xml` to `out` — the fresh part: the OOXML
+    /// default records in the first slots of every table, then this
+    /// plan's records after them (`Base.fresh`). Byte-identical to the
+    /// pre-iter-wr-2 `emitStylesXml` function from `src/writer.zig` for
+    /// every value XML carries literally — a tab, LF or CR in a name or
+    /// format is spelled as a character reference since S3d slice 1 r31.
     /// Caller owns `out`; this function only appends.
     ///
     /// Element order (rigid OOXML `CT_Stylesheet` schema):
@@ -506,29 +655,95 @@ pub const StylesPlan = struct {
         allocator: Allocator,
         out: *std.ArrayListUnmanaged(u8),
     ) Allocator.Error!void {
-        const styles = self.styles.items;
-        const num_fmts: []const []u8 = self.num_fmts.items;
-        const dxfs = self.dxfs.items;
+        var frags = try self.emitFragments(allocator, Base.fresh);
+        defer frags.deinit(allocator);
 
         try out.appendSlice(allocator, STYLES_HEAD);
 
         // <numFmts> — emitted only when the user registered any custom
         // format. Built-ins (General / 0..=49) don't go here.
-        if (num_fmts.len > 0) {
-            try out.print(allocator, "<numFmts count=\"{d}\">", .{num_fmts.len});
-            for (num_fmts, 0..) |fmt, i| {
-                const id: u32 = @intCast(NUM_FMT_BASE + i);
-                try out.print(allocator, "<numFmt numFmtId=\"{d}\" formatCode=\"", .{id});
-                try appendXmlEscaped(allocator, out, fmt);
-                try out.appendSlice(allocator, "\"/>");
-            }
+        if (frags.num_fmts_added > 0) {
+            try out.print(allocator, "<numFmts count=\"{d}\">", .{frags.num_fmts_added});
+            try out.appendSlice(allocator, frags.num_fmts.items);
             try out.appendSlice(allocator, "</numFmts>");
         }
 
         // <fonts>: default at index 0 + one per user style.
-        try out.print(allocator, "<fonts count=\"{d}\">", .{styles.len + 1});
+        try out.print(allocator, "<fonts count=\"{d}\">", .{Base.fresh.fonts + frags.fonts_added});
         try out.appendSlice(allocator, STYLES_FONTS_DEFAULT);
+        try out.appendSlice(allocator, frags.fonts.items);
+        try out.appendSlice(allocator, "</fonts>");
+
+        // <fills>: 2 reserved slots (none, gray125 — conventional OOXML
+        // defaults), then one user fill per style that sets any fill
+        // field. Styles without a fill reference fillId=0.
+        try out.print(allocator, "<fills count=\"{d}\">", .{Base.fresh.fills + frags.fills_added});
+        try out.appendSlice(allocator, STYLES_FILLS_DEFAULT);
+        try out.appendSlice(allocator, frags.fills.items);
+        try out.appendSlice(allocator, "</fills>");
+
+        // <borders>: default empty border at index 0, then one per
+        // style that touches any border field. Styles without borders
+        // keep borderId=0.
+        try out.print(allocator, "<borders count=\"{d}\">", .{Base.fresh.borders + frags.borders_added});
+        try out.appendSlice(allocator, STYLES_BORDER_DEFAULT);
+        try out.appendSlice(allocator, frags.borders.items);
+        try out.appendSlice(allocator, "</borders>");
+        try out.appendSlice(allocator, STYLES_CELL_STYLE_XFS);
+
+        // <cellXfs>: default at index 0 + one per user style.
+        try out.print(allocator, "<cellXfs count=\"{d}\">", .{Base.fresh.cell_xfs + frags.cell_xfs_added});
+        try out.appendSlice(allocator, STYLES_DEFAULT_CELL_XF);
+        try out.appendSlice(allocator, frags.cell_xfs.items);
+        try out.appendSlice(allocator, "</cellXfs>");
+
+        // <cellStyles> sits between <cellXfs> and <dxfs> per the
+        // OOXML stylesheet element-order schema. Strict-mode
+        // validators reject styles.xml without it.
+        try out.appendSlice(allocator, STYLES_CELL_STYLES);
+
+        // <dxfs> — differential formats for conditional-formatting
+        // rules. Emitted last per the schema.
+        if (frags.dxfs_added > 0) {
+            try out.print(allocator, "<dxfs count=\"{d}\">", .{frags.dxfs_added});
+            try out.appendSlice(allocator, frags.dxfs.items);
+            try out.appendSlice(allocator, "</dxfs>");
+        }
+
+        try out.appendSlice(allocator, STYLES_TAIL);
+    }
+
+    /// This plan's records as the children each stylesheet table
+    /// gains, every cross-table id resolved against `base`: the font,
+    /// fill and border a style's `<xf>` names are the ones this call
+    /// appends, numbered from the slot each table's next record takes.
+    /// The fresh part (`emit`) lays them after the OOXML defaults; an
+    /// existing part's extension (`Workbook.save`) lays them after the
+    /// records it already holds. One emitter for both, so a registered
+    /// style is the same bytes whichever part it lands in — the fresh
+    /// parity pins hold the extension to the writer's output.
+    pub fn emitFragments(
+        self: *const StylesPlan,
+        allocator: Allocator,
+        base: Base,
+    ) Allocator.Error!Fragments {
+        const styles = self.styles.items;
+        const num_fmts: []const []u8 = self.num_fmts.items;
+        const dxfs = self.dxfs.items;
+
+        var frags: Fragments = .{};
+        errdefer frags.deinit(allocator);
+
+        for (num_fmts, 0..) |fmt, i| {
+            const id: u32 = base.num_fmt_next + @as(u32, @intCast(i));
+            try frags.num_fmts.print(allocator, "<numFmt numFmtId=\"{d}\" formatCode=\"", .{id});
+            try appendXmlEscaped(allocator, &frags.num_fmts, fmt);
+            try frags.num_fmts.appendSlice(allocator, "\"/>");
+        }
+        frags.num_fmts_added = @intCast(num_fmts.len);
+
         for (styles) |s| {
+            const out = &frags.fonts;
             try out.appendSlice(allocator, "<font>");
             if (s.font_bold) try out.appendSlice(allocator, "<b/>");
             if (s.font_italic) try out.appendSlice(allocator, "<i/>");
@@ -547,14 +762,13 @@ pub const StylesPlan = struct {
             }
             try out.appendSlice(allocator, "\"/></font>");
         }
-        try out.appendSlice(allocator, "</fonts>");
+        frags.fonts_added = @intCast(styles.len);
 
-        // <fills>: 2 reserved slots (none, gray125 — conventional OOXML
-        // defaults), then one user fill per style that sets any fill
-        // field. Styles without a fill reference fillId=0.
+        // One user fill per style that sets any fill field; styles
+        // without a fill reference fillId=0.
         var fill_ids = try allocator.alloc(u32, styles.len);
         defer allocator.free(fill_ids);
-        var next_user_fill_id: u32 = 2;
+        var next_user_fill_id: u32 = base.fills;
         for (styles, 0..) |s, i| {
             if (s.fill_pattern != .none or s.fill_fg_argb != null or s.fill_bg_argb != null) {
                 fill_ids[i] = next_user_fill_id;
@@ -563,10 +777,8 @@ pub const StylesPlan = struct {
                 fill_ids[i] = 0;
             }
         }
-        try out.print(allocator, "<fills count=\"{d}\">", .{next_user_fill_id});
-        try out.appendSlice(allocator, "<fill><patternFill patternType=\"none\"/></fill>");
-        try out.appendSlice(allocator, "<fill><patternFill patternType=\"gray125\"/></fill>");
         for (styles) |s| {
+            const out = &frags.fills;
             if (s.fill_pattern == .none and s.fill_fg_argb == null and s.fill_bg_argb == null) continue;
             try out.print(
                 allocator,
@@ -582,14 +794,13 @@ pub const StylesPlan = struct {
                 try out.appendSlice(allocator, "</patternFill></fill>");
             }
         }
-        try out.appendSlice(allocator, "</fills>");
+        frags.fills_added = next_user_fill_id - base.fills;
 
-        // <borders>: default empty border at index 0, then one per
-        // style that touches any border field. Styles without borders
-        // keep borderId=0.
+        // One border per style that touches any border field; styles
+        // without borders keep borderId=0.
         var border_ids = try allocator.alloc(u32, styles.len);
         defer allocator.free(border_ids);
-        var next_user_border_id: u32 = 1;
+        var next_user_border_id: u32 = base.borders;
         for (styles, 0..) |s, i| {
             if (hasBorder(s)) {
                 border_ids[i] = next_user_border_id;
@@ -598,9 +809,8 @@ pub const StylesPlan = struct {
                 border_ids[i] = 0;
             }
         }
-        try out.print(allocator, "<borders count=\"{d}\">", .{next_user_border_id});
-        try out.appendSlice(allocator, "<border><left/><right/><top/><bottom/><diagonal/></border>");
         for (styles) |s| {
+            const out = &frags.borders;
             if (!hasBorder(s)) continue;
             try out.appendSlice(allocator, "<border");
             if (s.diagonal_up) try out.appendSlice(allocator, " diagonalUp=\"1\"");
@@ -613,24 +823,24 @@ pub const StylesPlan = struct {
             try emitBorderSide(allocator, out, "diagonal", s.border_diagonal);
             try out.appendSlice(allocator, "</border>");
         }
-        try out.appendSlice(allocator, "</borders>");
-        try out.appendSlice(allocator, STYLES_CELL_STYLE_XFS);
+        frags.borders_added = next_user_border_id - base.borders;
 
-        // <cellXfs>: default at index 0 + one per user style.
-        try out.print(allocator, "<cellXfs count=\"{d}\">", .{styles.len + 1});
-        try out.appendSlice(allocator, STYLES_DEFAULT_CELL_XF);
+        // One <xf> per style, in registration order — the slot each
+        // takes is `base.cell_xfs + i`, the index `addStyle` mapped.
         for (styles, 0..) |s, i| {
+            const out = &frags.cell_xfs;
             const has_alignment = s.alignment_horizontal != .general or s.wrap_text;
             const fill_id = fill_ids[i];
             const border_id = border_ids[i];
             const num_fmt_id: u32 = if (s.number_format) |fmt|
-                (self.num_fmt_index.get(fmt) orelse 0)
+                (if (self.num_fmt_index.get(fmt)) |fresh| base.numFmtId(fresh) else 0)
             else
                 0;
+            const font_id: u32 = base.fonts + @as(u32, @intCast(i));
             try out.print(
                 allocator,
                 "<xf numFmtId=\"{d}\" fontId=\"{d}\" fillId=\"{d}\" borderId=\"{d}\" xfId=\"0\" applyFont=\"1\"",
-                .{ num_fmt_id, i + 1, fill_id, border_id },
+                .{ num_fmt_id, font_id, fill_id, border_id },
             );
             if (num_fmt_id != 0) try out.appendSlice(allocator, " applyNumberFormat=\"1\"");
             if (fill_id != 0) try out.appendSlice(allocator, " applyFill=\"1\"");
@@ -646,58 +856,49 @@ pub const StylesPlan = struct {
                 try out.appendSlice(allocator, "/>");
             }
         }
-        try out.appendSlice(allocator, "</cellXfs>");
+        frags.cell_xfs_added = @intCast(styles.len);
 
-        // <cellStyles> sits between <cellXfs> and <dxfs> per the
-        // OOXML stylesheet element-order schema. Strict-mode
-        // validators reject styles.xml without it.
-        try out.appendSlice(allocator, STYLES_CELL_STYLES);
-
-        // <dxfs> — differential formats for conditional-formatting
-        // rules. Emitted last per the schema.
-        if (dxfs.len > 0) {
-            try out.print(allocator, "<dxfs count=\"{d}\">", .{dxfs.len});
-            for (dxfs) |dxf| {
-                try out.appendSlice(allocator, "<dxf>");
-                const has_font = dxf.font_bold or dxf.font_italic or
-                    dxf.font_color_argb != null or dxf.font_size != null;
-                if (has_font) {
-                    try out.appendSlice(allocator, "<font>");
-                    if (dxf.font_bold) try out.appendSlice(allocator, "<b/>");
-                    if (dxf.font_italic) try out.appendSlice(allocator, "<i/>");
-                    if (dxf.font_color_argb) |c| {
-                        try out.print(allocator, "<color rgb=\"{X:0>8}\"/>", .{c});
-                    }
-                    if (dxf.font_size) |sz| {
-                        try out.print(allocator, "<sz val=\"{d}\"/>", .{sz});
-                    }
-                    try out.appendSlice(allocator, "</font>");
+        for (dxfs) |dxf| {
+            const out = &frags.dxfs;
+            try out.appendSlice(allocator, "<dxf>");
+            const has_font = dxf.font_bold or dxf.font_italic or
+                dxf.font_color_argb != null or dxf.font_size != null;
+            if (has_font) {
+                try out.appendSlice(allocator, "<font>");
+                if (dxf.font_bold) try out.appendSlice(allocator, "<b/>");
+                if (dxf.font_italic) try out.appendSlice(allocator, "<i/>");
+                if (dxf.font_color_argb) |c| {
+                    try out.print(allocator, "<color rgb=\"{X:0>8}\"/>", .{c});
                 }
-                if (dxf.fill_fg_argb) |fg| {
-                    try out.print(
-                        allocator,
-                        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{X:0>8}\"/><bgColor rgb=\"{X:0>8}\"/></patternFill></fill>",
-                        .{ fg, fg },
-                    );
+                if (dxf.font_size) |sz| {
+                    try out.print(allocator, "<sz val=\"{d}\"/>", .{sz});
                 }
-                const has_dxf_border = dxf.border_left.style != .none or
-                    dxf.border_right.style != .none or
-                    dxf.border_top.style != .none or
-                    dxf.border_bottom.style != .none;
-                if (has_dxf_border) {
-                    try out.appendSlice(allocator, "<border>");
-                    try emitDxfBorderSide(allocator, out, "left", dxf.border_left);
-                    try emitDxfBorderSide(allocator, out, "right", dxf.border_right);
-                    try emitDxfBorderSide(allocator, out, "top", dxf.border_top);
-                    try emitDxfBorderSide(allocator, out, "bottom", dxf.border_bottom);
-                    try out.appendSlice(allocator, "</border>");
-                }
-                try out.appendSlice(allocator, "</dxf>");
+                try out.appendSlice(allocator, "</font>");
             }
-            try out.appendSlice(allocator, "</dxfs>");
+            if (dxf.fill_fg_argb) |fg| {
+                try out.print(
+                    allocator,
+                    "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{X:0>8}\"/><bgColor rgb=\"{X:0>8}\"/></patternFill></fill>",
+                    .{ fg, fg },
+                );
+            }
+            const has_dxf_border = dxf.border_left.style != .none or
+                dxf.border_right.style != .none or
+                dxf.border_top.style != .none or
+                dxf.border_bottom.style != .none;
+            if (has_dxf_border) {
+                try out.appendSlice(allocator, "<border>");
+                try emitDxfBorderSide(allocator, out, "left", dxf.border_left);
+                try emitDxfBorderSide(allocator, out, "right", dxf.border_right);
+                try emitDxfBorderSide(allocator, out, "top", dxf.border_top);
+                try emitDxfBorderSide(allocator, out, "bottom", dxf.border_bottom);
+                try out.appendSlice(allocator, "</border>");
+            }
+            try out.appendSlice(allocator, "</dxf>");
         }
+        frags.dxfs_added = @intCast(dxfs.len);
 
-        try out.appendSlice(allocator, STYLES_TAIL);
+        return frags;
     }
 };
 
@@ -739,6 +940,44 @@ test "StylesPlan: addStyle rejects invalid inputs" {
         error.InvalidFontSize,
         plan.addStyle(a, .{ .font_size = -1.0 }),
     );
+    // A dxf keeps the same size rule on the plan itself — the fresh
+    // writer's half (S3d slice 1 r28 A-DOC-2804, pinned r29 A-PIN-2901).
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = -3.0 }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.inf(f32) }));
+    // A control byte or invalid UTF-8 in a name or a format is no
+    // text the part can carry (r30 B-TXT-3001).
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "Ari\x01al" }));
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "Ar\xffial" }));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.addStyle(a, .{ .number_format = "0\x00" }));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "0\x0b"));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "\xc3"));
+    try std.testing.expectEqual(@as(usize, 0), plan.num_fmts.items.len);
+    // U+FFFE / U+FFFF: valid UTF-8, no XML `Char` (r31 A-TXT-3101).
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "0\xef\xbf\xbe"));
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "A\xef\xbf\xbf" }));
+    // Tab, LF and CR are XML's own whitespace: carried, spelled as
+    // references so the attribute keeps them (r31 A-TXT-3102).
+    _ = try plan.internNumFmt(a, "0\t0");
+    var emitted: std.ArrayListUnmanaged(u8) = .empty;
+    defer emitted.deinit(a);
+    try plan.emit(a, &emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#9;0\"") != null);
+    // …LF and CR too, and a non-ASCII name is XML text (r32
+    // A-PIN-3205 / A-PIN-3206).
+    _ = try plan.internNumFmt(a, "0\n0\r");
+    _ = try plan.addStyle(a, .{ .font_name = "Ärial" });
+    // A code point whose LOW byte is C0 (U+041F, 0x1F) is text — the
+    // guard is on the code point, not its truncation (r33 A-PIN-3303).
+    _ = try plan.addStyle(a, .{ .font_name = "Пример" });
+    emitted.clearRetainingCapacity();
+    try plan.emit(a, &emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#10;0&#13;\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "<name val=\"Ärial\"/>") != null);
+    // The boundary itself: 0 is refused, on both (r30 A-PIN-3002).
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = 0 }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addStyle(a, .{ .font_size = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), plan.dxfs.items.len);
     try std.testing.expectError(
         error.InvalidFontName,
         plan.addStyle(a, .{ .font_name = "" }),
@@ -839,4 +1078,46 @@ test "StylesPlan: emit styles with custom number_format registers numFmt at id 1
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "<numFmts count=\"1\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "numFmtId=\"164\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "formatCode=\"0.00%\"") != null);
+}
+
+test "StylesPlan: emitFragments against an existing part's layout numbers every cross-table id from the base" {
+    const a = std.testing.allocator;
+    var plan: StylesPlan = .{};
+    defer plan.deinit(a);
+    _ = try plan.addStyle(a, .{ .font_bold = true, .fill_pattern = .solid, .fill_fg_argb = 0xFF0000FF, .border_bottom = .{ .style = .dashed }, .number_format = "0.0" });
+    _ = try plan.addStyle(a, .{ .font_italic = true });
+    _ = try plan.addDxf(a, .{ .font_bold = true });
+    const base: Base = .{ .num_fmt_next = 170, .fonts = 5, .fills = 3, .borders = 2, .cell_xfs = 7, .dxfs = 4 };
+    var frags = try plan.emitFragments(a, base);
+    defer frags.deinit(a);
+    try std.testing.expectEqualStrings("<numFmt numFmtId=\"170\" formatCode=\"0.0\"/>", frags.num_fmts.items);
+    try std.testing.expectEqualStrings(
+        "<xf numFmtId=\"170\" fontId=\"5\" fillId=\"3\" borderId=\"2\" xfId=\"0\" applyFont=\"1\" applyNumberFormat=\"1\" applyFill=\"1\" applyBorder=\"1\"/>" ++
+            "<xf numFmtId=\"0\" fontId=\"6\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>",
+        frags.cell_xfs.items,
+    );
+    try std.testing.expectEqual(@as(u32, 1), frags.num_fmts_added);
+    try std.testing.expectEqual(@as(u32, 2), frags.fonts_added);
+    try std.testing.expectEqual(@as(u32, 1), frags.fills_added);
+    try std.testing.expectEqual(@as(u32, 1), frags.borders_added);
+    try std.testing.expectEqual(@as(u32, 2), frags.cell_xfs_added);
+    try std.testing.expectEqual(@as(u32, 1), frags.dxfs_added);
+    // The mappers: the index the registrations return for those slots.
+    try std.testing.expectEqual(@as(u32, 7), base.xfIndex(1));
+    try std.testing.expectEqual(@as(u32, 8), base.xfIndex(2));
+    try std.testing.expectEqual(@as(u32, 4), base.dxfId(0));
+    try std.testing.expectEqual(@as(u32, 170), base.numFmtId(NUM_FMT_BASE));
+    // The fresh base is the identity, and the fresh emit is the
+    // fragments behind the defaults.
+    try std.testing.expectEqual(@as(u32, 1), Base.fresh.xfIndex(1));
+    try std.testing.expectEqual(@as(u32, 0), Base.fresh.dxfId(0));
+    try std.testing.expectEqual(NUM_FMT_BASE, Base.fresh.numFmtId(NUM_FMT_BASE));
+    var fresh_frags = try plan.emitFragments(a, Base.fresh);
+    defer fresh_frags.deinit(a);
+    var whole: std.ArrayListUnmanaged(u8) = .empty;
+    defer whole.deinit(a);
+    try plan.emit(a, &whole);
+    try std.testing.expect(std.mem.indexOf(u8, whole.items, fresh_frags.cell_xfs.items) != null);
+    try std.testing.expect(std.mem.indexOf(u8, whole.items, fresh_frags.fonts.items) != null);
+    try std.testing.expect(std.mem.indexOf(u8, whole.items, fresh_frags.dxfs.items) != null);
 }

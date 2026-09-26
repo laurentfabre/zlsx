@@ -749,10 +749,18 @@ pub const PartStore = struct {
         // Stage the [Content_Types].xml update WITHOUT calling
         // replacePart — we don't want to commit that mutation until
         // we know the array reallocs below also succeed.
-        const ct_staging = try self.stageContentTypeOverride(name, content_type, poller);
-        const ct_idx = ct_staging.idx;
-        const ct_new_part_bytes = ct_staging.new_part_bytes;
-        const ct_new_override = ct_staging.new_override;
+        // A package that already declares the name in an `<Override>`
+        // has that one re-typed to the part zlsx creates — a second
+        // element for one `PartName` is no package (S3d slice 1 r6
+        // B-CT-603, closed r20 B-CT-2004), and the stale type is not
+        // the created part's (r21 A-CT-2101) — unless the declaration
+        // is a held case-variant twin's, which stays (r22 A-CT-2201).
+        const ct_idx_now = self.findIndex("[Content_Types].xml") orelse return error.MissingContentTypes;
+        const ct_staging: ?StagedContentTypeUpdate = switch (try self.retypeOverride(self.parts[ct_idx_now].bytes, name, content_type, false, null)) {
+            .retyped => |xml| try self.stageContentTypesXml(ct_idx_now, xml, poller),
+            .none => try self.stageContentTypeOverride(name, content_type, poller),
+            .keep => null,
+        };
 
         // Synthetic ZipEntry for the new part — save() rebuilds
         // LFH/CDFH from the override slot, so source-offset fields
@@ -776,6 +784,11 @@ pub const PartStore = struct {
             .content_type = owned_ct,
             .bytes = owned_user_bytes,
             .compression_method = method,
+            // The size a reader of the record sees without
+            // materializing — `partEmptyAt` (S3d slice 1 r18
+            // A-STORE-1804: left at the default 0, an added part read
+            // as a directory marker).
+            .uncompressed_size = @intCast(bytes.len),
         };
         const new_override: Override = .{ .compressed = .{
             .payload = owned_payload,
@@ -807,10 +820,13 @@ pub const PartStore = struct {
         self.entries = grown_entries;
         self.parts = grown_parts;
         self.overrides = grown_overrides;
-        // Apply the staged content-types update.
-        self.overrides[ct_idx] = ct_new_override;
-        self.parts[ct_idx].bytes = ct_new_part_bytes;
-        self.parts[ct_idx].compression_method = ct_new_override.compressed.compression_method;
+        // Apply the staged content-types update, if one was needed.
+        if (ct_staging) |st| {
+            self.overrides[st.idx] = st.new_override;
+            self.parts[st.idx].bytes = st.new_part_bytes;
+            self.parts[st.idx].compression_method = st.new_override.compressed.compression_method;
+            self.parts[st.idx].uncompressed_size = @intCast(st.new_part_bytes.len);
+        }
     }
 
     const StagedContentTypeUpdate = struct {
@@ -833,8 +849,11 @@ pub const PartStore = struct {
             return error.MissingContentTypes;
         const ct_part = self.parts[ct_idx];
         const old_xml = ct_part.bytes;
-        const close_tag = "</Types>";
-        const close_pos = std.mem.lastIndexOf(u8, old_xml, close_tag) orelse
+        // The live root close tag, `</Types >` spelled loosely too — a
+        // raw last-`</Types>` search landed the declaration inside an
+        // epilog comment, and refused a legal spacing (S3d slice 1 r24
+        // A-CT-2403).
+        const close_pos = liveCloseTagStart(old_xml, 0, "Types") orelse
             return error.MalformedContentTypes;
 
         const ar_alloc = self.arena.allocator();
@@ -849,7 +868,13 @@ pub const PartStore = struct {
         try buf.appendSlice(ar_alloc, "\"/>");
         try buf.appendSlice(ar_alloc, old_xml[close_pos..]);
         const new_xml = try buf.toOwnedSlice(ar_alloc);
+        return self.stageContentTypesXml(ct_idx, new_xml, poller);
+    }
 
+    /// Stage `new_xml` as the next `[Content_Types].xml` (at `ct_idx`):
+    /// compressed, nothing mutated — the caller commits.
+    fn stageContentTypesXml(self: *PartStore, ct_idx: usize, new_xml: []u8, poller: Poller) !StagedContentTypeUpdate {
+        const ar_alloc = self.arena.allocator();
         // Bound the uncompressed-size field too. The compressed
         // check below would catch anything that didn't shrink, but
         // a payload that compresses smaller while its uncompressed
@@ -929,7 +954,7 @@ pub const PartStore = struct {
         // 1. Content-type override, if the part had one.
         if (self.findIndex("[Content_Types].xml")) |ct_idx| {
             const ct = try self.part("[Content_Types].xml") orelse return Error.MissingContentTypes;
-            const stripped = try removeContentTypeOverride(ar_alloc, ct.bytes, name);
+            const stripped = try removeContentTypeOverride(self, ar_alloc, ct.bytes, name);
             defer ar_alloc.free(stripped);
             if (!std.mem.eql(u8, stripped, ct.bytes)) {
                 // Guard against removing the CT part itself, which
@@ -1056,6 +1081,10 @@ pub const PartStore = struct {
         for (staged) |st| {
             self.overrides[st.idx] = .pending;
             self.parts[st.idx].bytes = st.bytes;
+            // The size the record reports without materializing
+            // (r18 A-STORE-1804; the plural mutator too — r20
+            // A-STORE-2002).
+            self.parts[st.idx].uncompressed_size = @intCast(st.bytes.len);
             if (st.owner) |o| self.rels_by_owner.putAssumeCapacity(o, st.rels);
         }
     }
@@ -1149,6 +1178,8 @@ pub const PartStore = struct {
         // the field, because a caller reading the public `Part` can see
         // that pair before any save makes it coherent.
         self.parts[idx].bytes = dupe_bytes;
+        // The size, by contrast, is the bytes' own (r18 A-STORE-1804).
+        self.parts[idx].uncompressed_size = @intCast(bytes.len);
 
         // Rels-cache refresh: when the replaced part is itself a
         // `_rels/<base>.rels` file, re-parse its relationships so
@@ -1361,7 +1392,7 @@ pub const PartStore = struct {
                 var lfh_bytes: [30]u8 = undefined;
                 std.mem.writeInt(u32, lfh_bytes[0..4], lfh_signature, .little);
                 std.mem.writeInt(u16, lfh_bytes[4..6], 20, .little); // version
-                std.mem.writeInt(u16, lfh_bytes[6..8], 0, .little); // flags
+                std.mem.writeInt(u16, lfh_bytes[6..8], nameFlags(e.name), .little); // flags
                 std.mem.writeInt(u16, lfh_bytes[8..10], c.compression_method, .little);
                 std.mem.writeInt(u16, lfh_bytes[10..12], 0, .little); // mod time
                 std.mem.writeInt(u16, lfh_bytes[12..14], 0x21, .little); // mod date (1980-01-01)
@@ -1414,7 +1445,7 @@ pub const PartStore = struct {
                 std.mem.writeInt(u32, cdfh_bytes[0..4], cdfh_signature, .little);
                 std.mem.writeInt(u16, cdfh_bytes[4..6], 20, .little); // version made by
                 std.mem.writeInt(u16, cdfh_bytes[6..8], 20, .little); // version needed
-                std.mem.writeInt(u16, cdfh_bytes[8..10], 0, .little); // flags
+                std.mem.writeInt(u16, cdfh_bytes[8..10], nameFlags(e.name), .little); // flags
                 std.mem.writeInt(u16, cdfh_bytes[10..12], c.compression_method, .little);
                 std.mem.writeInt(u16, cdfh_bytes[12..14], 0, .little);
                 std.mem.writeInt(u16, cdfh_bytes[14..16], 0x21, .little);
@@ -1494,6 +1525,201 @@ pub const PartStore = struct {
 
     pub fn partNameAt(self: *const PartStore, i: usize) []const u8 {
         return self.parts[i].name;
+    }
+
+    /// Whether the entry at `i` holds no bytes — read without
+    /// materializing it (the archive's own size; an added or replaced
+    /// part records its bytes' length at the mutation). A zero-length
+    /// entry another entry sits under is a directory spelled as an
+    /// entry, no part (S3d slice 1 r17 A-PART-1702).
+    pub fn partEmptyAt(self: *const PartStore, i: usize) bool {
+        return self.parts[i].uncompressed_size == 0;
+    }
+
+    /// Declare `name`'s content type through an `<Override>` when the
+    /// package resolves it to another (a Default by extension, or
+    /// nothing). A part the package already names in an `<Override>`
+    /// — under any content type — keeps the producer's statement (a
+    /// second element for one `PartName` is no package). A held
+    /// styles part the package never declared was extended and stayed
+    /// `application/xml` — a relationship a consumer that checks
+    /// content types drops (S3d slice 1 r18 A-CT-1802).
+    pub fn ensureContentTypeOverride(self: *PartStore, name: []const u8, content_type: []const u8) !void {
+        const idx = self.findIndex(name) orelse return error.PartNotFound;
+        const ct_idx = self.findIndex("[Content_Types].xml") orelse return error.MissingContentTypes;
+        self.mutations += 1;
+        // The MANIFEST is asked, not the type cached at open: a
+        // declaration a later rewrite removed (`removePart`'s
+        // collateral, a caller's `replacePart` of the manifest) left
+        // the cache saying "declared" and the part saved undeclared
+        // (r26 B-CT-2602). A declaration under another type is the
+        // producer's statement and stays; one without a `ContentType`
+        // gains the attribute (r23 B-CT-2303); none → one appended,
+        // unless a `Default` in the manifest already types the part so.
+        const staged: StagedContentTypeUpdate = switch (try self.retypeOverride(self.parts[ct_idx].bytes, name, content_type, true, name)) {
+            .retyped => |xml| try self.stageContentTypesXml(ct_idx, xml, .none),
+            .none => blk: {
+                if (try self.defaultTypesPart(self.parts[ct_idx].bytes, name, content_type)) return;
+                break :blk try self.stageContentTypeOverride(name, content_type, .none);
+            },
+            .keep => return,
+        };
+        const ar_alloc = self.arena.allocator();
+        const owned_ct = try ar_alloc.dupe(u8, content_type);
+        // Commit: infallible from here.
+        self.installs += 1;
+        self.overrides[staged.idx] = staged.new_override;
+        self.parts[staged.idx].bytes = staged.new_part_bytes;
+        self.parts[staged.idx].compression_method = staged.new_override.compressed.compression_method;
+        self.parts[staged.idx].uncompressed_size = @intCast(staged.new_part_bytes.len);
+        self.parts[idx].content_type = owned_ct;
+    }
+
+    /// The general-purpose flags a fresh header carries for an entry
+    /// named `name`: bit 11 (APPNOTE §4.4.4, the name is UTF-8) when
+    /// any byte is above ASCII AND the bytes are UTF-8, else none (a
+    /// latin-1 name keeps flag 0 — r19 B-PKG-1904). A rewritten entry lost the
+    /// bit its source carried, so a `zipfile` consumer listed the
+    /// name as CP437 and found no such part — an extended styles part
+    /// at `xl/stylés.xml` lost whole (S3d slice 1 r18 B-PKG-1801;
+    /// r16 B-PKG-1605 recorded the same for a created one).
+    fn nameFlags(name: []const u8) u16 {
+        // The bit is a claim the name IS UTF-8: a name that is not
+        // (a latin-1 entry a producer wrote) keeps the source's own
+        // labelling — flagged, `zipfile` refused the whole archive
+        // (r19 B-PKG-1904).
+        if (!std.unicode.utf8ValidateSlice(name)) return 0;
+        for (name) |c| {
+            if (c >= 0x80) return 0x0800;
+        }
+        return 0;
+    }
+
+    /// `[Content_Types].xml` with the `<Override>` naming `name`
+    /// re-typed to `content_type` — for a part zlsx CREATES at a name
+    /// the package already declared (a tool that dropped the part
+    /// without cleaning the manifest): the bytes are zlsx's, so is the
+    /// declaration, and one `<Override>` per `PartName` is the rule
+    /// (r20 B-CT-2004 staged none and let the stale type stand — r21
+    /// A-CT-2101). The exact spelling first; a case-variant
+    /// declaration is re-typed too unless a part is HELD at its own
+    /// spelling — then it is that twin's, kept as it is and nothing
+    /// staged for the new part (its name is the twin's to OPC; r22
+    /// A-CT-2201 / A-CT-2202). A declaration already carrying the
+    /// type stages nothing (A-CT-2206); one without a `ContentType`
+    /// gains the attribute. With `typed_stays`, a declaration under
+    /// another type is kept too — the extend path's rule, the
+    /// producer's statement (r23 B-CT-2303). A twin is any HELD part
+    /// spelling the declaration's name under any case — a third case
+    /// is a twin's too (r23 A-CT-2301), a directory marker is nobody's
+    /// (r25 A-CT-2502) — the part being declared excepted on the
+    /// extend path, where it IS held (r24 A-CT-2402).
+    /// Arena memory.
+    const Retype = union(enum) { retyped: []u8, keep, none };
+    fn retypeOverride(self: *PartStore, ct_xml: []const u8, name: []const u8, content_type: []const u8, typed_stays: bool, except: ?[]const u8) !Retype {
+        var exact_at: ?usize = null;
+        var variant_at: ?usize = null;
+        var variant_held = false;
+        var pos: usize = 0;
+        while (liveIndexOfPos(ct_xml, pos, "<Override")) |tag_at| {
+            const after = tag_at + "<Override".len;
+            const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse break;
+            pos = tag_end + 1;
+            if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+            const tag = ct_xml[tag_at..tag_end];
+            const ref = try overridePartNameOf(self.allocator, tag) orelse continue;
+            defer if (ref.owned) |o| self.allocator.free(o);
+            if (std.mem.eql(u8, ref.name, name)) {
+                if (exact_at == null) exact_at = tag_at;
+            } else if (std.ascii.eqlIgnoreCase(ref.name, name)) {
+                if (variant_at == null) {
+                    variant_at = tag_at;
+                    variant_held = self.holdsVariantOf(ref.name, except);
+                }
+            }
+        }
+        const at = exact_at orelse (variant_at orelse return .none);
+        if (exact_at == null and variant_held) return .keep;
+        const tag_end = xmlStartTagEnd(ct_xml, at).?;
+        const tag = ct_xml[at..tag_end];
+        const ar_alloc = self.arena.allocator();
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        if (xmlAttrValue(tag, "ContentType")) |ct_raw| {
+            // Compared decoded, as the resolver reads it (r23
+            // A-CT-2305).
+            const ct_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, ct_raw, '&') != null) try decodeXmlEntities(self.allocator, ct_raw) else null;
+            defer if (ct_owned) |o| self.allocator.free(o);
+            if (std.mem.eql(u8, ct_owned orelse ct_raw, content_type)) return .keep;
+            if (typed_stays) return .keep;
+            // The value's span inside the tag: `xmlAttrValue` hands
+            // back a slice of `tag`.
+            const v_start = @intFromPtr(ct_raw.ptr) - @intFromPtr(ct_xml.ptr);
+            const v_end = v_start + ct_raw.len;
+            try buf.appendSlice(ar_alloc, ct_xml[0..v_start]);
+            try appendXmlEscaped(ar_alloc, &buf, content_type);
+            try buf.appendSlice(ar_alloc, ct_xml[v_end..]);
+        } else {
+            const insert_at = if (ct_xml[tag_end - 1] == '/') tag_end - 1 else tag_end;
+            try buf.appendSlice(ar_alloc, ct_xml[0..insert_at]);
+            try buf.appendSlice(ar_alloc, " ContentType=\"");
+            try appendXmlEscaped(ar_alloc, &buf, content_type);
+            try buf.appendSlice(ar_alloc, "\"");
+            try buf.appendSlice(ar_alloc, ct_xml[insert_at..]);
+        }
+        return .{ .retyped = try buf.toOwnedSlice(ar_alloc) };
+    }
+
+    /// Whether a `<Default>` in the manifest types `name` (by its
+    /// extension) as `content_type` — read from the bytes, as the
+    /// resolver reads it, not from the type cached at open.
+    fn defaultTypesPart(self: *const PartStore, ct_xml: []const u8, name: []const u8, content_type: []const u8) !bool {
+        var pos: usize = 0;
+        while (liveIndexOfPos(ct_xml, pos, "<Default")) |tag_at| {
+            const after = tag_at + "<Default".len;
+            const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse return false;
+            pos = tag_end + 1;
+            if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+            const tag = ct_xml[tag_at..tag_end];
+            const ext_raw = xmlAttrValue(tag, "Extension") orelse continue;
+            const ct_raw = xmlAttrValue(tag, "ContentType") orelse continue;
+            const ext_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, ext_raw, '&') != null) try decodeXmlEntities(self.allocator, ext_raw) else null;
+            defer if (ext_owned) |o| self.allocator.free(o);
+            if (!extensionEql(name, ext_owned orelse ext_raw)) continue;
+            const ct_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, ct_raw, '&') != null) try decodeXmlEntities(self.allocator, ct_raw) else null;
+            defer if (ct_owned) |o| self.allocator.free(o);
+            // The first Default for an extension is the one the
+            // resolver applies.
+            return std.mem.eql(u8, ct_owned orelse ct_raw, content_type);
+        }
+        return false;
+    }
+
+    /// Whether a part other than `except` is held under `spelled`'s
+    /// name in any ASCII case — a directory marker being no part.
+    fn holdsVariantOf(self: *const PartStore, spelled: []const u8, except: ?[]const u8) bool {
+        for (self.parts, 0..) |p, i| {
+            if (except) |x| {
+                if (std.mem.eql(u8, p.name, x)) continue;
+            }
+            // A directory marker (a zero-length entry another sits
+            // under) is no part, so no twin — as every resolver of
+            // the styles part reads it (r25 A-CT-2502).
+            if (std.ascii.eqlIgnoreCase(p.name, spelled) and !self.entryIsDirectoryMarker(i)) return true;
+        }
+        return false;
+    }
+
+    /// A zero-length entry some other entry sits under: a directory
+    /// spelled as an entry, which OPC has no part for. The one
+    /// predicate — the workbook's styles resolution reads it too (r26
+    /// A-DUP-2602).
+    pub fn entryIsDirectoryMarker(self: *const PartStore, i: usize) bool {
+        if (!self.partEmptyAt(i)) return false;
+        const entry = self.parts[i].name;
+        for (self.parts) |p| {
+            if (p.name.len > entry.len and p.name[entry.len] == '/' and std.ascii.startsWithIgnoreCase(p.name, entry)) return true;
+        }
+        return false;
     }
 
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
@@ -1659,7 +1885,8 @@ pub const PartStore = struct {
     /// External detection is heuristic on the target string itself
     /// because this method takes a raw target rather than a full
     /// Relationship. It catches URL schemes (`https://`, `mailto:`,
-    /// `file://`), UNC paths (`\\server\share`), and Windows drive
+    /// `file://`), UNC paths (`\\server\share`), network-path
+    /// references (`//host/path`, RFC 3986 §4.2) and Windows drive
     /// letters (`C:\foo`) — the shapes that external relationships
     /// actually take in real workbooks. Callers that already have a
     /// Relationship and want to be exact should branch on
@@ -1696,12 +1923,13 @@ pub const PartStore = struct {
     ) std.mem.Allocator.Error!?[]const u8 {
         if (target.len == 0) return null;
         if (looksExternal(target)) return null;
-        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".
-        if (target[0] == '/') {
-            return try out_alloc.dupe(u8, target[1..]);
-        }
+        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml" —
+        // collapsed like a relative one from an empty stack, so a
+        // `/..` escapes and a `/.` names the root as a relative target
+        // does (in-house S3d slice 1 r15 A-PART-1501).
+        const absolute = target[0] == '/';
         // Relative target: collapse against owner's parent dir.
-        const owner_dir = parentDir(owner_part_name);
+        const owner_dir = if (absolute) "" else parentDir(owner_part_name);
         var stack: std.ArrayListUnmanaged([]const u8) = .empty;
         defer stack.deinit(self.allocator);
         // Seed stack with owner_dir segments.
@@ -1723,6 +1951,11 @@ pub const PartStore = struct {
             }
             try stack.append(self.allocator, seg);
         }
+        // A target that collapses to nothing (`..` from `xl/`, `/`,
+        // `./..`) names the package root, which is no part: the
+        // resolver's answer is "none", not the empty name a caller
+        // would look up — or create a part at (r15 A-PART-1501).
+        if (stack.items.len == 0) return null;
         // Join with `/`. Total length = sum + (n-1) separators.
         var total: usize = 0;
         for (stack.items, 0..) |s, i| {
@@ -1752,12 +1985,17 @@ pub const PartStore = struct {
 /// joined with a part-name parent directory. The shapes covered are:
 ///   - URL schemes:    `https://...`, `mailto:...`, `file:///...`
 ///   - UNC paths:      `\\server\share\...`
+///   - Network paths:  `//host/path` (RFC 3986 §4.2, an authority)
 ///   - Drive letters:  `C:\foo` or `C:/foo`
 /// Anything else is treated as a relative or absolute package path
-/// (the `/`-rooted branch in `resolve`).
+/// (a single leading `/` roots it at the package).
 fn looksExternal(target: []const u8) bool {
     if (target.len < 2) return false;
     if (target[0] == '\\' and target[1] == '\\') return true;
+    // A network-path reference (RFC 3986 §4.2: `//host/path`) names
+    // an authority, nothing in the package — the forward-slash UNC
+    // (in-house S3d slice 1 r16 B-REL-1603).
+    if (target[0] == '/' and target[1] == '/') return true;
     if (target.len >= 3 and isAsciiAlpha(target[0]) and target[1] == ':' and
         (target[2] == '\\' or target[2] == '/'))
     {
@@ -2176,9 +2414,20 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
     // Phase 2: collect Override partName → content type.
     // Phase 3: assign each part's content_type (Override wins).
 
+    // Exact declarations win over case-variant ones wherever they
+    // stand in the manifest (r22 A-CT-2203: a later loose one had
+    // overwritten an earlier exact one); an element named `<DefaultX`
+    // / `<OverrideX` is neither.
+    const exact_set = try arena.alloc(bool, parts.len);
+    @memset(exact_set, false);
     var i: usize = 0;
     while (liveIndexOfPos(xml, i, "<Default")) |pos| {
         const end = xmlStartTagEnd(xml, pos) orelse break;
+        const after = pos + "<Default".len;
+        if (after >= end or !(std.ascii.isWhitespace(xml[after]) or xml[after] == '/')) {
+            i = end + 1;
+            continue;
+        }
         const attrs = xml[pos..end];
         const ext_raw = attrAtSlice(attrs, "Extension") orelse {
             i = end + 1;
@@ -2200,6 +2449,11 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
     i = 0;
     while (liveIndexOfPos(xml, i, "<Override")) |pos| {
         const end = xmlStartTagEnd(xml, pos) orelse break;
+        const after = pos + "<Override".len;
+        if (after >= end or !(std.ascii.isWhitespace(xml[after]) or xml[after] == '/')) {
+            i = end + 1;
+            continue;
+        }
         const attrs = xml[pos..end];
         const part_name_raw = attrAtSlice(attrs, "PartName") orelse {
             i = end + 1;
@@ -2219,10 +2473,25 @@ fn resolveContentTypes(arena: std.mem.Allocator, parts: []Part) !void {
         const ct = try decodeXmlEntities(arena, ct_raw);
         // PartName starts with `/`; strip to match part.name.
         const stripped = if (part_name.len > 0 and part_name[0] == '/') part_name[1..] else part_name;
-        for (parts) |*p| {
+        // The exact spelling first, then any ASCII case — part names
+        // compare so (ECMA-376 Part 2 §9.1.1; S3d slice 1 r21
+        // A-CT-2101: a case-variant `<Override>` left its part
+        // undeclared to every reader of `Part.content_type`).
+        var matched = false;
+        for (parts, 0..) |*p, pi| {
             if (std.mem.eql(u8, p.name, stripped)) {
                 p.content_type = ct;
+                exact_set[pi] = true;
+                matched = true;
                 break;
+            }
+        }
+        if (!matched) {
+            for (parts, 0..) |*p, pi| {
+                if (!exact_set[pi] and std.ascii.eqlIgnoreCase(p.name, stripped)) {
+                    p.content_type = ct;
+                    break;
+                }
             }
         }
         i = end + 1;
@@ -2378,17 +2647,144 @@ fn extensionEql(name: []const u8, ext: []const u8) bool {
 ///   "xl/_rels/workbook.xml.rels"     → "xl/workbook.xml"
 ///   "xl/worksheets/_rels/sheet1.xml.rels" → "xl/worksheets/sheet1.xml"
 /// Returns null if `name` isn't a `_rels/<base>.rels` shape.
-/// Remove `<Override PartName="/<name>" …/>` from a `[Content_Types].xml`
-/// body. Returns allocator-owned bytes; unchanged input yields a copy.
+/// Remove every `<Override>` declaring `part_name` from a
+/// `[Content_Types].xml` body — read as the resolver reads (S3d slice
+/// 1 r21 A-CT-2101: live markup, the tag's end past a `>` in a value,
+/// the attribute by the shared lexer, the name entity-decoded, any
+/// whitespace around the `=`, either quote; a literal `PartName="/…"`
+/// needle left a loosely spelled declaration behind, which a later
+/// `addPart` then took for its own): the exact spelling always, a
+/// case-variant spelling only when no part is held at it (a directory
+/// marker is none, r25 A-CT-2502) — held, it is that twin's
+/// declaration (r22 A-CT-2202). A non-self-closing
+/// element is removed through its `</Override>`; one without an end
+/// tag loses its start tag alone. Returns allocator-owned bytes;
+/// unchanged input yields a copy.
 fn removeContentTypeOverride(
+    self: *const PartStore,
     allocator: std.mem.Allocator,
     ct_xml: []const u8,
     part_name: []const u8,
 ) ![]u8 {
-    // OOXML writes override targets absolute-from-package-root.
-    const needle = try std.fmt.allocPrint(allocator, "PartName=\"/{s}\"", .{part_name});
-    defer allocator.free(needle);
-    return removeSelfClosingElementContaining(allocator, ct_xml, "<Override", needle);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var copied: usize = 0;
+    var pos: usize = 0;
+    while (liveIndexOfPos(ct_xml, pos, "<Override")) |tag_at| {
+        const after = tag_at + "<Override".len;
+        const tag_end = xmlStartTagEnd(ct_xml, tag_at) orelse break;
+        pos = tag_end + 1;
+        if (after >= tag_end or !(std.ascii.isWhitespace(ct_xml[after]) or ct_xml[after] == '/')) continue;
+        const ref = try overridePartNameOf(allocator, ct_xml[tag_at..tag_end]) orelse continue;
+        defer if (ref.owned) |o| allocator.free(o);
+        const exact = std.mem.eql(u8, ref.name, part_name);
+        if (!exact and !std.ascii.eqlIgnoreCase(ref.name, part_name)) continue;
+        if (!exact and self.holdsVariantOf(ref.name, part_name)) continue;
+        // The element: self-closing, or through its own LIVE end tag
+        // (a `</Override>` inside a comment is none — r23 B-CT-2301 /
+        // A-CT-2304).
+        var elem_end = tag_end + 1;
+        if (ct_xml[tag_end - 1] != '/') {
+            // Its OWN end tag: a nested `<Override>` (well-formed, no
+            // schema) opens and closes inside it, and the first live
+            // `</Override>` was the child's — the outer's left dangling
+            // (r24 B-CT-2401); `</Override >` spelled loosely too
+            // (A-CT-2401). Unterminated, the start tag alone goes.
+            if (overrideElementEnd(ct_xml, elem_end)) |e| elem_end = e;
+        }
+        try out.appendSlice(allocator, ct_xml[copied..tag_at]);
+        copied = elem_end;
+        pos = elem_end;
+    }
+    try out.appendSlice(allocator, ct_xml[copied..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// One past the `>` of the end tag closing an `<Override>` whose start
+/// tag ended just before `from` — nested `<Override>` elements
+/// counted, live markup only, the end tag spelled loosely; null when
+/// the element never closes.
+fn overrideElementEnd(xml: []const u8, from: usize) ?usize {
+    var depth: usize = 1;
+    var pos = from;
+    while (pos < xml.len) {
+        const lt = liveIndexOfPos(xml, pos, "<") orelse return null;
+        // A special region's opener: step over the whole region, never
+        // into it (a `</Override>` inside a comment is none).
+        if (std.mem.startsWith(u8, xml[lt..], "<!--")) {
+            pos = (std.mem.indexOfPos(u8, xml, lt + 4, "-->") orelse return null) + 3;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], "<![CDATA[")) {
+            pos = (std.mem.indexOfPos(u8, xml, lt + 9, "]]>") orelse return null) + 3;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], "<?")) {
+            pos = (std.mem.indexOfPos(u8, xml, lt + 2, "?>") orelse return null) + 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], "</")) {
+            if (liveCloseTagStart(xml, lt, "Override") == lt) {
+                const end = (std.mem.indexOfScalarPos(u8, xml, lt + 2, '>') orelse return null) + 1;
+                depth -= 1;
+                if (depth == 0) return end;
+                pos = end;
+                continue;
+            }
+            pos = lt + 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, xml[lt..], "<Override")) {
+            const after = lt + "<Override".len;
+            const tag_end = xmlStartTagEnd(xml, lt) orelse return null;
+            // The element-name boundary: `<Override>` (no attributes),
+            // `<Override …>` or `<Override/>` — not `<OverrideX>` (r25
+            // A-CT-2501: the attribute-less child went uncounted).
+            if (after == tag_end or std.ascii.isWhitespace(xml[after]) or xml[after] == '/') {
+                if (xml[tag_end - 1] != '/') depth += 1;
+            }
+            pos = tag_end + 1;
+            continue;
+        }
+        pos = lt + 1;
+    }
+    return null;
+}
+
+/// The start of the first LIVE `</name>` at or after `from`, its `>`
+/// after optional whitespace (XML 1.0 §3.1 `ETag`); null when none.
+fn liveCloseTagStart(xml: []const u8, from: usize, name: []const u8) ?usize {
+    var pos = from;
+    while (pos < xml.len) {
+        const at = liveIndexOfPos(xml, pos, "</") orelse return null;
+        var k = at + 2;
+        if (k + name.len <= xml.len and std.mem.eql(u8, xml[k .. k + name.len], name)) {
+            k += name.len;
+            while (k < xml.len and std.ascii.isWhitespace(xml[k])) k += 1;
+            if (k < xml.len and xml[k] == '>') return at;
+        }
+        pos = at + 2;
+    }
+    return null;
+}
+
+/// The part name an `<Override` start tag (without its `>`) declares,
+/// without its leading `/` when it has one (the resolver takes a
+/// slash-less `PartName` as a declaration too — r23 B-CT-2302 /
+/// A-CT-2303), entity-decoded only when spelled with a reference
+/// (`owned` then, to free — r23 A-MEM-2302); null when the tag
+/// carries no `PartName` or an empty one.
+const PartNameRef = struct { name: []const u8, owned: ?[]u8 };
+fn overridePartNameOf(allocator: std.mem.Allocator, tag: []const u8) !?PartNameRef {
+    const raw = xmlAttrValue(tag, "PartName") orelse return null;
+    const owned: ?[]u8 = if (std.mem.indexOfScalar(u8, raw, '&') != null) try decodeXmlEntities(allocator, raw) else null;
+    const value = owned orelse raw;
+    const name = if (value.len > 0 and value[0] == '/') value[1..] else value;
+    if (name.len == 0) {
+        if (owned) |o| allocator.free(o);
+        return null;
+    }
+    return .{ .name = name, .owned = owned };
 }
 
 /// Remove every `<Relationship … Target="…"/>` whose target resolves to
@@ -2763,6 +3159,18 @@ test "PartStore.resolve: relative + absolute targets" {
     // Absolute: "/xl/workbook.xml" → "xl/workbook.xml".
     const r3 = (try store.resolve("anywhere", "/xl/workbook.xml")).?;
     try std.testing.expectEqualStrings("xl/workbook.xml", r3);
+
+    // A target that collapses to the package root names no part —
+    // relative or absolute (in-house S3d slice 1 r15 A-PART-1501);
+    // an absolute target collapses its own `.` and `..` segments.
+    for ([_][]const u8{ "..", "./..", "/", "/.", "/..", "/xl/..", "../.", "//styles.xml", "//srv/share/x", "///a.xml" }) |root_target| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/workbook.xml", root_target));
+    }
+    const r4 = (try store.resolve("anywhere", "/xl/./worksheets/../styles.xml")).?;
+    try std.testing.expectEqualStrings("xl/styles.xml", r4);
+    // `.` alone is the owner's directory: a name, not a part's.
+    const r5 = (try store.resolve("xl/workbook.xml", ".")).?;
+    try std.testing.expectEqualStrings("xl", r5);
 }
 
 test "PartStore.imageParts: extract embedded images (C2a MVP)" {
@@ -3549,6 +3957,334 @@ test "decodeXmlEntities decodes the five canonical entities" {
     try std.testing.expectEqualStrings("&#+38;", try decodeXmlEntities(a, "&#+38;"));
     try std.testing.expectEqualStrings("&#3_8;", try decodeXmlEntities(a, "&#3_8;"));
     try std.testing.expectEqualStrings("&#x2_6;", try decodeXmlEntities(a, "&#x2_6;"));
+}
+
+test "partEmptyAt reads an added or replaced part's own size; ensureContentTypeOverride declares an undeclared part once (S3d slice 1 r18 A-STORE-1804 / A-CT-1802)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fixture = "tests/corpus/frictionless_2sheets.xlsx";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    var store = try PartStore.open(std.testing.allocator, io, fixture);
+    defer store.deinit();
+    const styles_idx = store.findIndex("xl/styles.xml") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!store.partEmptyAt(styles_idx));
+    try store.addPart("xl/added.xml", "application/xml", "<a>eighteen bytes</a>");
+    try std.testing.expect(!store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    try store.addPart("xl", "application/octet-stream", "");
+    try std.testing.expect(store.partEmptyAt(store.findIndex("xl").?));
+    try store.replacePart("xl/added.xml", "");
+    try std.testing.expect(store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    try store.replacePart("xl/added.xml", "<b/>");
+    try std.testing.expect(!store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    // A declared part keeps its declaration (the one `addPart` staged
+    // too, under any type); a part the package resolves through a
+    // Default gains exactly one `<Override>`, and a second call adds
+    // none.
+    const ct_before = (try store.part("[Content_Types].xml")).?.bytes;
+    const before_len = ct_before.len;
+    try store.ensureContentTypeOverride("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml");
+    try store.ensureContentTypeOverride("xl/added.xml", "application/x-test");
+    try std.testing.expectEqual(before_len, (try store.part("[Content_Types].xml")).?.bytes.len);
+    try std.testing.expectEqualStrings("application/xml", (try store.part("xl/added.xml")).?.content_type.?);
+    const by_default = "xl/_rels/workbook.xml.rels";
+    try store.ensureContentTypeOverride(by_default, "application/x-test");
+    try store.ensureContentTypeOverride(by_default, "application/x-test");
+    const ct_after = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_after, "PartName=\"/xl/_rels/workbook.xml.rels\""));
+    try std.testing.expectEqualStrings("application/x-test", (try store.part(by_default)).?.content_type.?);
+    try std.testing.expectError(error.PartNotFound, store.ensureContentTypeOverride("xl/none.xml", "application/x-test"));
+    // A created part the package already declares gains no second
+    // `<Override>` (r6 B-CT-603, closed r20 B-CT-2004).
+    try store.removePart("xl/added.xml");
+    const ct_now = (try store.part("[Content_Types].xml")).?.bytes;
+    const close_at = std.mem.lastIndexOf(u8, ct_now, "</Types>") orelse return error.TestUnexpectedResult;
+    const declared = try std.mem.concat(std.testing.allocator, u8, &.{ ct_now[0..close_at], "<Override PartName = \"/xl/added.xml\" ContentType=\"application/x-declared\"/>", ct_now[close_at..] });
+    defer std.testing.allocator.free(declared);
+    try store.replacePart("[Content_Types].xml", declared);
+    try store.addPart("xl/added.xml", "application/x-test", "<c/>");
+    const ct_retyped = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_retyped, "/xl/added.xml"));
+    // …and that one is re-typed to the created part's (r21 A-CT-2101).
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_retyped, "x-declared"));
+    // A declaration already carrying the type stages nothing (r22
+    // A-CT-2206): the manifest's bytes stay.
+    try store.removePart("xl/added.xml");
+    const ct_r = (try store.part("[Content_Types].xml")).?.bytes;
+    const c_at = std.mem.lastIndexOf(u8, ct_r, "</Types>") orelse return error.TestUnexpectedResult;
+    const same_typed = try std.mem.concat(std.testing.allocator, u8, &.{ ct_r[0..c_at], "<Override ContentType=\"application/x-test\" PartName=\"/xl/added.xml\"/>", ct_r[c_at..] });
+    defer std.testing.allocator.free(same_typed);
+    try store.replacePart("[Content_Types].xml", same_typed);
+    const same_ptr = (try store.part("[Content_Types].xml")).?.bytes.ptr;
+    try store.addPart("xl/added.xml", "application/x-test", "<c/>");
+    try std.testing.expectEqualStrings(same_typed, (try store.part("[Content_Types].xml")).?.bytes);
+    // …and stages nothing at all: the same bytes, not a rewrite (r23
+    // A-CT-2305).
+    try std.testing.expect(same_ptr == (try store.part("[Content_Types].xml")).?.bytes.ptr);
+    // A case-variant declaration with NO part at its spelling is a
+    // stale one: re-typed, no second element (r22 A-CT-2201 a); a
+    // `ContentType`-less one gains the attribute (A-CT-2201 b).
+    try store.removePart("xl/added.xml");
+    const ct_s = (try store.part("[Content_Types].xml")).?.bytes;
+    const s_at = std.mem.lastIndexOf(u8, ct_s, "</Types>") orelse return error.TestUnexpectedResult;
+    const stale = try std.mem.concat(std.testing.allocator, u8, &.{ ct_s[0..s_at], "<Override PartName=\"/xl/Added.xml\" ContentType=\"application/x-stale\"/><Override PartName=\"/xl/typeless.xml\"/>", ct_s[s_at..] });
+    defer std.testing.allocator.free(stale);
+    try store.replacePart("[Content_Types].xml", stale);
+    try store.addPart("xl/added.xml", "application/x-test", "<c/>");
+    try store.addPart("xl/typeless.xml", "application/x-typed", "<t/>");
+    const ct_v = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_v, "x-stale"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_v, "/xl/Added.xml") + std.mem.count(u8, ct_v, "/xl/added.xml"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_v, "/xl/typeless.xml"));
+    try std.testing.expect(std.mem.indexOf(u8, ct_v, "<Override PartName=\"/xl/typeless.xml\" ContentType=\"application/x-typed\"/>") != null);
+    // A case-variant declaration whose spelling HOLDS a part is the
+    // twin's: kept, nothing staged for the new part (A-CT-2201 a);
+    // and `removePart` of the new part leaves the twin's declaration
+    // (A-CT-2202).
+    try store.removePart("xl/added.xml");
+    try store.removePart("xl/typeless.xml");
+    try store.addPart("xl/Twin.xml", "application/x-twin", "<w/>");
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    const ct_t = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_t, "/xl/Twin.xml") + std.mem.count(u8, ct_t, "/xl/twin.xml"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_t, "x-twin"));
+    try store.removePart("xl/twin.xml");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "/xl/Twin.xml"));
+    try store.removePart("xl/Twin.xml");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "Twin.xml"));
+    // A twin in a THIRD case is a twin still: `xl/TWIN.xml` held, the
+    // declaration `/xl/Twin.xml`, the new part `xl/twin.xml` — kept,
+    // and kept again by the removal (r23 A-CT-2301).
+    try store.addPart("xl/TWIN.xml", "application/x-twin", "<w/>");
+    const ct_3 = (try store.part("[Content_Types].xml")).?.bytes;
+    // TWIN's own declaration stripped: the third-case one is the only
+    // declaration, and only a case-insensitive held test keeps it
+    // (r24 A-PIN-2404).
+    const ct_3s = try std.mem.replaceOwned(u8, std.testing.allocator, ct_3, "<Override ContentType=\"application/x-twin\" PartName=\"/xl/TWIN.xml\"/>", "");
+    defer std.testing.allocator.free(ct_3s);
+    try std.testing.expect(!std.mem.eql(u8, ct_3, ct_3s));
+    const c3_at = std.mem.lastIndexOf(u8, ct_3s, "</Types>") orelse return error.TestUnexpectedResult;
+    const third = try std.mem.concat(std.testing.allocator, u8, &.{ ct_3s[0..c3_at], "<Override PartName=\"/xl/Twin.xml\" ContentType=\"application/x-third\"/>", ct_3s[c3_at..] });
+    defer std.testing.allocator.free(third);
+    try store.replacePart("[Content_Types].xml", third);
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "x-third"));
+    try store.removePart("xl/twin.xml");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "x-third"));
+    try store.removePart("xl/TWIN.xml");
+    // A `</Override>` inside a comment does not end the element; an
+    // element without an end tag loses its start tag alone (r23
+    // B-CT-2301 / A-CT-2304 / A-PIN-2306).
+    const ct_4 = (try store.part("[Content_Types].xml")).?.bytes;
+    const c4_at = std.mem.lastIndexOf(u8, ct_4, "</Types>") orelse return error.TestUnexpectedResult;
+    const commented = try std.mem.concat(std.testing.allocator, u8, &.{ ct_4[0..c4_at], "<Override PartName=\"/xl/c.xml\" ContentType=\"a/b\"><!-- </Override> --></Override><Override PartName=\"/xl/u.xml\" ContentType=\"a/b\">", ct_4[c4_at..] });
+    defer std.testing.allocator.free(commented);
+    try store.replacePart("[Content_Types].xml", commented);
+    try store.addPart("xl/c.xml", "a/b", "<c/>");
+    try store.addPart("xl/u.xml", "a/b", "<u/>");
+    try store.removePart("xl/c.xml");
+    const ct_5 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_5, "c.xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_5, "</Override>"));
+    try store.removePart("xl/u.xml");
+    const ct_6 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_6, "u.xml"));
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, ct_6, " \n"), "</Types>"));
+    // A slash-less `PartName` is a declaration to every reader (r23
+    // B-CT-2302): re-typed by the create path, removed with the part.
+    const ct_7 = (try store.part("[Content_Types].xml")).?.bytes;
+    const c7_at = std.mem.lastIndexOf(u8, ct_7, "</Types>") orelse return error.TestUnexpectedResult;
+    const slashless = try std.mem.concat(std.testing.allocator, u8, &.{ ct_7[0..c7_at], "<Override PartName=\"xl/s.xml\" ContentType=\"a/old\"/>", ct_7[c7_at..] });
+    defer std.testing.allocator.free(slashless);
+    try store.replacePart("[Content_Types].xml", slashless);
+    try store.addPart("xl/s.xml", "a/new", "<s/>");
+    const ct_8 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_8, "xl/s.xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_8, "a/old"));
+    try store.removePart("xl/s.xml");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "xl/s.xml"));
+    // The extend path gives a `ContentType`-less declaration the
+    // attribute (r23 B-CT-2303) and leaves a typed one alone.
+    try store.addPart("xl/e.xml", "a/b", "<e/>");
+    const ct_9 = (try store.part("[Content_Types].xml")).?.bytes;
+    const typeless = try std.mem.replaceOwned(u8, std.testing.allocator, ct_9, "<Override ContentType=\"a/b\" PartName=\"/xl/e.xml\"/>", "<Override PartName=\"/xl/e.xml\"/>");
+    defer std.testing.allocator.free(typeless);
+    try std.testing.expect(!std.mem.eql(u8, ct_9, typeless));
+    try store.replacePart("[Content_Types].xml", typeless);
+    try store.ensureContentTypeOverride("xl/e.xml", "a/ensured");
+    const ct_10 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, ct_10, "<Override PartName=\"/xl/e.xml\" ContentType=\"a/ensured\"/>") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_10, "/xl/e.xml"));
+    try store.ensureContentTypeOverride("xl/e.xml", "a/other");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "a/other"));
+    // A `ContentType`-less CASE-VARIANT declaration of the held part
+    // gains the attribute on the extend path too — the part is its
+    // own, not a twin's (r24 A-CT-2402).
+    const ct_11 = (try store.part("[Content_Types].xml")).?.bytes;
+    const variant_typeless = try std.mem.replaceOwned(u8, std.testing.allocator, ct_11, "<Override PartName=\"/xl/e.xml\" ContentType=\"a/ensured\"/>", "<Override PartName=\"/xl/E.xml\"/>");
+    defer std.testing.allocator.free(variant_typeless);
+    try std.testing.expect(!std.mem.eql(u8, ct_11, variant_typeless));
+    try store.replacePart("[Content_Types].xml", variant_typeless);
+    try store.ensureContentTypeOverride("xl/e.xml", "a/variant");
+    const ct_12 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, ct_12, "<Override PartName=\"/xl/E.xml\" ContentType=\"a/variant\"/>") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_12, "/xl/E.xml") + std.mem.count(u8, ct_12, "/xl/e.xml"));
+    try store.removePart("xl/e.xml");
+    // The keep compares the declaration's type DECODED (r24
+    // A-PIN-2405): `a/b&amp;c` is `a/b&c`, nothing staged.
+    const ct_13 = (try store.part("[Content_Types].xml")).?.bytes;
+    const c13_at = std.mem.lastIndexOf(u8, ct_13, "</Types>") orelse return error.TestUnexpectedResult;
+    const amp_typed = try std.mem.concat(std.testing.allocator, u8, &.{ ct_13[0..c13_at], "<Override PartName=\"/xl/amp.xml\" ContentType=\"a/b&amp;c\"/>", ct_13[c13_at..] });
+    defer std.testing.allocator.free(amp_typed);
+    try store.replacePart("[Content_Types].xml", amp_typed);
+    const amp_ptr = (try store.part("[Content_Types].xml")).?.bytes.ptr;
+    try store.addPart("xl/amp.xml", "a/b&c", "<a/>");
+    try std.testing.expect(amp_ptr == (try store.part("[Content_Types].xml")).?.bytes.ptr);
+    try store.removePart("xl/amp.xml");
+    // A loosely spelled `</Override >` ends the element (r24
+    // A-CT-2401); an epilog comment spelling `</Types>` is not the
+    // append slot, and a loosely spelled `</Types >` is (A-CT-2403).
+    const ct_14 = (try store.part("[Content_Types].xml")).?.bytes;
+    const c14_at = std.mem.lastIndexOf(u8, ct_14, "</Types>") orelse return error.TestUnexpectedResult;
+    const loose = try std.mem.concat(std.testing.allocator, u8, &.{ ct_14[0..c14_at], "<Override PartName=\"/xl/l.xml\" ContentType=\"a/b\"></Override ></Types ><!-- </Types> -->" });
+    defer std.testing.allocator.free(loose);
+    try store.replacePart("[Content_Types].xml", loose);
+    try store.addPart("xl/l.xml", "a/b", "<l/>");
+    try store.addPart("xl/m.xml", "a/m", "<m/>");
+    const ct_15 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expect(std.mem.indexOf(u8, ct_15, "PartName=\"/xl/m.xml\"/></Types >") != null);
+    try store.removePart("xl/l.xml");
+    const ct_16 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_16, "l.xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_16, "</Override"));
+    try std.testing.expect(std.mem.endsWith(u8, ct_16, "</Types ><!-- </Types> -->"));
+    try store.removePart("xl/m.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // A nested `<Override>` (well-formed, no schema) closes inside the
+    // element: the outer's own end tag goes with it, the nested
+    // sibling declaration is not swallowed, and an unterminated
+    // element followed by another loses its start tag alone (r24
+    // B-CT-2401).
+    const c14b_at = std.mem.lastIndexOf(u8, ct_14, "</Types>") orelse return error.TestUnexpectedResult;
+    const nested = try std.mem.concat(std.testing.allocator, u8, &.{ ct_14[0..c14b_at], "<Override PartName=\"/xl/n.xml\" ContentType=\"a/b\"><Override PartName=\"/xl/inner.xml\" ContentType=\"a/i\"></Override><Override PartName=\"/xl/leaf.xml\" ContentType=\"a/l\"/></Override><Override PartName=\"/xl/keep.xml\" ContentType=\"a/k\"/><Override PartName=\"/xl/open.xml\" ContentType=\"a/o\"><Override PartName=\"/xl/next.xml\" ContentType=\"a/x\"></Override>", ct_14[c14b_at..] });
+    defer std.testing.allocator.free(nested);
+    try store.replacePart("[Content_Types].xml", nested);
+    try store.addPart("xl/n.xml", "a/b", "<n/>");
+    try store.addPart("xl/keep.xml", "a/k", "<k/>");
+    try store.addPart("xl/open.xml", "a/o", "<o/>");
+    try store.removePart("xl/n.xml");
+    const ct_17 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_17, "/xl/n.xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_17, "inner.xml"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_17, "leaf.xml"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_17, "/xl/keep.xml"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_17, "<Override PartName=\"/xl/keep.xml\" ContentType=\"a/k\"/><Override PartName=\"/xl/open.xml\""));
+    try store.removePart("xl/open.xml");
+    const ct_18 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_18, "open.xml"));
+    try std.testing.expect(std.mem.indexOf(u8, ct_18, "<Override PartName=\"/xl/keep.xml\" ContentType=\"a/k\"/><Override PartName=\"/xl/next.xml\" ContentType=\"a/x\"></Override></Types>") != null);
+    try store.removePart("xl/keep.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // An attribute-less nested `<Override>` counts toward the depth
+    // too (r25 A-CT-2501).
+    const c14c_at = std.mem.lastIndexOf(u8, ct_14, "</Types>") orelse return error.TestUnexpectedResult;
+    const bare_child = try std.mem.concat(std.testing.allocator, u8, &.{ ct_14[0..c14c_at], "<Override PartName=\"/xl/p.xml\" ContentType=\"a/p\"><Override></Override></Override><Override PartName=\"/xl/q.xml\" ContentType=\"a/q\"/>", ct_14[c14c_at..] });
+    defer std.testing.allocator.free(bare_child);
+    try store.replacePart("[Content_Types].xml", bare_child);
+    try store.addPart("xl/p.xml", "a/p", "<p/>");
+    try store.addPart("xl/q.xml", "a/q", "<q/>");
+    try store.removePart("xl/p.xml");
+    const ct_19 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_19, "</Override>"));
+    try std.testing.expect(std.mem.indexOf(u8, ct_19, "<Override PartName=\"/xl/q.xml\" ContentType=\"a/q\"/></Types>") != null);
+    try store.removePart("xl/q.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // A directory marker spelling the declaration's name is no twin:
+    // the stale case-variant declaration is re-typed (r25 A-CT-2502).
+    try store.addPart("xl/TWIN.xml", "application/octet-stream", "");
+    try store.addPart("xl/TWIN.xml/child.xml", "application/x-child", "<c/>");
+    const ct_20 = (try store.part("[Content_Types].xml")).?.bytes;
+    const marker_decl = try std.mem.replaceOwned(u8, std.testing.allocator, ct_20, "<Override ContentType=\"application/octet-stream\" PartName=\"/xl/TWIN.xml\"/>", "<Override PartName=\"/xl/Twin.xml\" ContentType=\"application/x-stale\"/>");
+    defer std.testing.allocator.free(marker_decl);
+    try std.testing.expect(!std.mem.eql(u8, ct_20, marker_decl));
+    try store.replacePart("[Content_Types].xml", marker_decl);
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    const ct_21 = (try store.part("[Content_Types].xml")).?.bytes;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ct_21, "x-stale"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_21, "/xl/Twin.xml") + std.mem.count(u8, ct_21, "/xl/twin.xml"));
+    try store.removePart("xl/twin.xml");
+    try store.removePart("xl/TWIN.xml/child.xml");
+    try store.removePart("xl/TWIN.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // The marker's two rules (r26 A-PIN-2601): a NON-empty entry with
+    // an entry under it is a part, so a twin — kept; a zero-length
+    // entry with a descendant spelled under another case is a marker
+    // — re-typed. And the remover's half (A-PIN-2603): removing the
+    // new part beside a marker takes the stale declaration too.
+    try store.addPart("xl/TWIN.xml", "application/x-twin", "<w/>");
+    try store.addPart("xl/TWIN.xml/child.xml", "application/x-child", "<c/>");
+    const ct_22 = (try store.part("[Content_Types].xml")).?.bytes;
+    const nonempty_decl = try std.mem.replaceOwned(u8, std.testing.allocator, ct_22, "<Override ContentType=\"application/x-twin\" PartName=\"/xl/TWIN.xml\"/>", "<Override PartName=\"/xl/Twin.xml\" ContentType=\"application/x-twins\"/>");
+    defer std.testing.allocator.free(nonempty_decl);
+    try std.testing.expect(!std.mem.eql(u8, ct_22, nonempty_decl));
+    try store.replacePart("[Content_Types].xml", nonempty_decl);
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "x-twins"));
+    try store.removePart("xl/twin.xml");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "x-twins"));
+    try store.removePart("xl/TWIN.xml/child.xml");
+    try store.removePart("xl/TWIN.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    try store.addPart("xl/TWIN.xml", "application/octet-stream", "");
+    try store.addPart("XL/twin.xml/child.xml", "application/x-child", "<c/>");
+    const ct_23 = (try store.part("[Content_Types].xml")).?.bytes;
+    const case_desc = try std.mem.replaceOwned(u8, std.testing.allocator, ct_23, "<Override ContentType=\"application/octet-stream\" PartName=\"/xl/TWIN.xml\"/>", "<Override PartName=\"/xl/Twin.xml\" ContentType=\"application/x-stale2\"/>");
+    defer std.testing.allocator.free(case_desc);
+    try std.testing.expect(!std.mem.eql(u8, ct_23, case_desc));
+    try store.replacePart("[Content_Types].xml", case_desc);
+    try store.addPart("xl/twin.xml", "application/x-new", "<n/>");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "x-stale2"));
+    try store.removePart("xl/twin.xml");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "Twin.xml"));
+    try store.removePart("XL/twin.xml/child.xml");
+    try store.removePart("xl/TWIN.xml");
+    try store.replacePart("[Content_Types].xml", ct_14);
+    // The extend path asks the manifest, not the type cached at open:
+    // the styles declaration removed by a manifest rewrite is added
+    // back (r26 B-CT-2602); one a `Default` provides is not doubled.
+    const ct_24 = (try store.part("[Content_Types].xml")).?.bytes;
+    const styles_ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
+    const decl_at = std.mem.indexOf(u8, ct_24, "PartName=\"/xl/styles.xml\"") orelse return error.TestUnexpectedResult;
+    const decl_open = std.mem.lastIndexOf(u8, ct_24[0..decl_at], "<Override") orelse return error.TestUnexpectedResult;
+    const decl_close = (std.mem.indexOfPos(u8, ct_24, decl_at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+    const no_styles_decl = try std.mem.concat(std.testing.allocator, u8, &.{ ct_24[0..decl_open], ct_24[decl_close..] });
+    defer std.testing.allocator.free(no_styles_decl);
+    try store.replacePart("[Content_Types].xml", no_styles_decl);
+    try std.testing.expectEqualStrings(styles_ct, (try store.part("xl/styles.xml")).?.content_type.?);
+    try store.ensureContentTypeOverride("xl/styles.xml", styles_ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "PartName=\"/xl/styles.xml\""));
+    // …and a `Default` already typing the part as the stylesheet
+    // means no `<Override>` at all (r27 A-PIN-2703).
+    const by_default_ct = try std.mem.replaceOwned(u8, std.testing.allocator, no_styles_decl, "<Default ContentType=\"application/xml\" Extension=\"xml\"/>", "<Default ContentType=\"" ++ styles_ct ++ "\" Extension=\"xml\"/>");
+    defer std.testing.allocator.free(by_default_ct);
+    try std.testing.expect(!std.mem.eql(u8, no_styles_decl, by_default_ct));
+    try store.replacePart("[Content_Types].xml", by_default_ct);
+    try store.ensureContentTypeOverride("xl/styles.xml", styles_ct);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "PartName=\"/xl/styles.xml\""));
+    try store.replacePart("[Content_Types].xml", ct_24);
+    // Back for the plural mutator's pin below.
+    try store.addPart("xl/added.xml", "application/x-test", "<c/>");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct_retyped, "ContentType=\"application/x-test\" PartName = \"/xl/added.xml\"") + std.mem.count(u8, ct_retyped, "PartName = \"/xl/added.xml\" ContentType=\"application/x-test\""));
+    // The plural mutator records its sizes too (r20 A-STORE-2002,
+    // pinned r21 A-PIN-2104).
+    try store.replaceParts(&.{.{ .name = "xl/added.xml", .bytes = "" }});
+    try std.testing.expect(store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    try store.replaceParts(&.{.{ .name = "xl/added.xml", .bytes = "<d/>" }});
+    try std.testing.expect(!store.partEmptyAt(store.findIndex("xl/added.xml").?));
+    // A loosely spelled declaration is removed with its part (r21
+    // A-CT-2101).
+    try store.removePart("xl/added.xml");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, (try store.part("[Content_Types].xml")).?.bytes, "/xl/added.xml"));
 }
 
 test "looksExternal classifies URL / UNC / drive-letter targets" {

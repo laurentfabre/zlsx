@@ -79,8 +79,11 @@ and *edits* as well as reads, and ships as one small static binary or wheel.
   heights, freeze panes, auto-filter, merged ranges, internal + external
   hyperlinks, the full data-validation family, conditional formatting,
   comments, rich-text cells, defined names, formulas with cached values.
-- **Editor** (load-modify-save) — append rows, `setCell`, insert/delete
-  rows and columns, add/rename/delete sheets on an *existing* workbook.
+- **Editor** (load-modify-save) — append rows, `setCell`, cell styles
+  (`addStyle` extends the workbook's own `styles.xml`, `setCellStyle` puts
+  the index on a cell),
+  insert/delete rows and columns, add/rename/delete sheets on an *existing*
+  workbook.
   ZIP-substitution
   architecture: untouched entries pass through verbatim, only patched parts
   re-deflate — a 67 KB workbook round-trips in ~5 ms. Structural edits shift
@@ -163,7 +166,7 @@ zlsx_book_close(book);
 
 Link the released library from any tarball — `cc app.c -Iinclude -Llib
 -lzlsx`. The row reader and the fresh writer are exported nearly one-for-one,
-plus the editor (append rows, `set_cell`, the structural edits — rows,
+plus the editor (append rows, `set_cell`, `add_style` / `set_cell_style`, the structural edits — rows,
 columns, sheets, table columns — with their typed refusals, the `pivots`
 read, save, docProps read/strip, recalc / evaluate) — what each surface
 has and lacks, per entry point, is

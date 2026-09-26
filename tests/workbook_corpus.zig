@@ -146,3 +146,54 @@ test "WDI Excel — the embed read refuses a positional sheet rather than serve 
     const target = try ws.embeddingTarget();
     try std.testing.expectError(error.MalformedSheetXml, wb.embeddableRows(alloc, target, "A2:A5", "A", false));
 }
+
+test "S3d slice 1 corpus sweep — the styles baseline agrees with the typed view on every fixture, and the extension lands where the index said" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = std.testing.allocator;
+    var swept: u32 = 0;
+    var saved: u32 = 0;
+    for (fixtures) |name| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ corpus_dir, name });
+        std.Io.Dir.cwd().access(io, path, .{}) catch continue;
+        var wb = pkg.Workbook.open(alloc, io, path) catch continue;
+        defer wb.deinit();
+        const sv = (try wb.styles()) orelse continue;
+        const xfs_before = sv.cell_xfs.len;
+        const fonts_before = sv.fonts.len;
+        const fills_before = sv.fills.len;
+        const borders_before = sv.borders.len;
+        // The walk's count and the parser's agree, so the index is the
+        // slot the record takes.
+        const idx = try wb.addStyle(.{ .font_bold = true, .font_name = "zlsx S3d", .fill_pattern = .solid, .fill_fg_argb = 0xFF112233, .border_top = .{ .style = .thin } });
+        try std.testing.expectEqual(@as(u32, @intCast(xfs_before)), idx);
+        swept += 1;
+        // The re-zip of a large archive is the corpus lane's minute:
+        // the extension itself is pinned on the small ones.
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        const size = (try file.stat(io)).size;
+        file.close(io);
+        if (size > 8 * 1024 * 1024) continue;
+        const bytes = try wb.saveToOwnedBuffer(alloc);
+        defer alloc.free(bytes);
+        var re = try pkg.Workbook.openBuffer(alloc, io, bytes);
+        defer re.deinit();
+        const sv2 = (try re.styles()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(xfs_before + 1, sv2.cell_xfs.len);
+        try std.testing.expectEqual(fonts_before + 1, sv2.fonts.len);
+        try std.testing.expectEqual(fills_before + 1, sv2.fills.len);
+        try std.testing.expectEqual(borders_before + 1, sv2.borders.len);
+        const xf = sv2.cell_xfs[idx];
+        try std.testing.expectEqual(@as(?u32, @intCast(fonts_before)), xf.font_id);
+        try std.testing.expectEqual(@as(?u32, @intCast(fills_before)), xf.fill_id);
+        try std.testing.expectEqual(@as(?u32, @intCast(borders_before)), xf.border_id);
+        try std.testing.expect(sv2.fonts[fonts_before].bold);
+        try std.testing.expectEqualStrings("zlsx S3d", sv2.fonts[fonts_before].name.?);
+        try std.testing.expectEqualStrings("solid", sv2.fills[fills_before].pattern);
+        try std.testing.expectEqualStrings("thin", sv2.borders[borders_before].top.style.?);
+        saved += 1;
+    }
+    if (swept > 0) try std.testing.expect(saved > 0);
+}

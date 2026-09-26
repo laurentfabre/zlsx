@@ -197,6 +197,8 @@ fn takeRefusal(wb: *Workbook, opts: Options, refusal: recalc_txn.Refusal) workbo
 }
 
 /// §5.7.9's file transaction, in the order §5.7.9 makes normative.
+/// The candidate carries the save plans (the fold): every sheet's cell
+/// deltas and cell styles, the styles plan, the defined names.
 ///
 /// The bytes written are serialized from the prepared candidate, not
 /// from the workbook: the swap has not happened yet and must not, so
@@ -1444,6 +1446,9 @@ const Fixture = struct {
     /// `xl/calcChain.xml` plus its rel and content type, so §5.7.5's
     /// removal has something to remove.
     calc_chain: bool = false,
+    /// `xl/styles.xml` plus its rel, for the styles plan's fold (S3d
+    /// slice 1). Absent means the fold creates the part.
+    styles: ?[]const u8 = null,
 };
 
 fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f: Fixture) ![]u8 {
@@ -1474,6 +1479,9 @@ fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f
         try rels.appendSlice(gpa, "<Relationship Id=\"rId2\" Type=\"" ++
             recalc_txn.calc_chain_rel_type ++ "\" Target=\"calcChain.xml\"/>");
     }
+    if (f.styles != null) {
+        try rels.appendSlice(gpa, "<Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+    }
     try rels.appendSlice(gpa, "</Relationships>");
     try store.addPart("xl/_rels/workbook.xml.rels", ct_rels, rels.items);
 
@@ -1486,6 +1494,7 @@ fn writeFixture(gpa: Allocator, io: std.Io, dir: []const u8, name: []const u8, f
         );
     }
     if (f.metadata) |m| try store.addPart("xl/metadata.xml", ct_metadata, m);
+    if (f.styles) |s| try store.addPart("xl/styles.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", s);
     if (f.embeddings) try addEmbeddingParts(gpa, &store);
 
     try store.save(io, path);
@@ -2792,6 +2801,10 @@ test "recalc guard: an added sheet or a moved row refuses recalculate before the
 fn stageBoth(wb: *Workbook) !void {
     try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
     try wb.addDefinedName("Total", "Sheet1!$A$1", .{});
+    // The styles plan and a cell style ride the same fold (S3d slice 1;
+    // in-house r14 A-PIN-1406: the allocation sweeps stage them too).
+    const idx = try wb.addStyle(.{ .font_bold = true });
+    try (try wb.sheet(0)).setCellStyle("A1", idx);
 }
 
 fn hasDefinedName(wb: *const Workbook, name: []const u8) bool {
@@ -3174,6 +3187,10 @@ test "save-plan fold: the exported prepare and recalculate carry the run alone �
     var wb = try Workbook.open(a, io, path);
     defer wb.deinit();
     try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+    // A style registered and staged rides along: an abandoned
+    // candidate and the in-memory swap both leave it staged (r15
+    // A-PIN-1503).
+    try (try wb.sheet(0)).setCellStyle("A1", try wb.addStyle(.{ .font_bold = true }));
     for (0..2) |pass| {
         var prepared = try prepare(&wb, a, io, fixed_run, .{});
         switch (prepared) {
@@ -3189,6 +3206,8 @@ test "save-plan fold: the exported prepare and recalculate carry the run alone �
             else => return error.TestUnexpectedResult,
         }
         try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).deltas.count());
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
     }
     // The run modeled the write (B1 = A1 + 1 over the staged 41) and
     // materialized none of it.
@@ -3211,14 +3230,19 @@ fn foldPassUnderFailure(a: Allocator, io: std.Io, path: []const u8) !void {
     wb.foldSavePlansInto(&next) catch |e| {
         try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
         try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
+        // The styles plan and the cell style survive the failure too
+        // (in-house S3d slice 1 r15 A-PIN-1503).
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
         try testing.expectEqual(installs, wb.store.installs);
         try testing.expectEqualStrings("1", try cellCache(try wb.sheet(0), "A1"));
         return e;
     };
     try testing.expectEqual(installs, wb.store.installs);
     try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
+    try testing.expect(wb.hasStagedStyleWork());
     const folded = (try next.part(sheet_part)) orelse return error.TestUnexpectedResult;
-    try testing.expect(std.mem.indexOf(u8, folded.bytes, "<c r=\"A1\"><v>41</v></c>") != null);
+    try testing.expect(std.mem.indexOf(u8, folded.bytes, "<c r=\"A1\" s=\"1\"><v>41</v></c>") != null);
 }
 
 /// The fold over the pivot fixture — a table to extend, a cache to
@@ -3286,6 +3310,8 @@ fn transactionPassUnderFailure(a: Allocator, io: std.Io, path: []const u8, out: 
     var r = wb.saveWithRecalc(a, io, out, fixed_run, .{}) catch |e| {
         try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).deltas.count());
         try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
         try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
         try testing.expectEqual(wb.generation_installs, wb.store.installs);
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
@@ -3295,6 +3321,7 @@ fn transactionPassUnderFailure(a: Allocator, io: std.Io, path: []const u8, out: 
     r.deinit(a);
     try testing.expectEqual(@as(usize, 0), (try wb.sheet(0)).deltas.count());
     try testing.expectEqual(@as(usize, 0), wb.workbook_xml_plan.defined_names.items.len);
+    try testing.expect(!wb.hasStagedStyleWork());
 }
 
 test "save-plan fold: every allocation failure before the rename leaves the write and the name staged, the destination absent and the generation unmoved" {
@@ -3546,4 +3573,119 @@ test "refusal_out: the census crosses the seam with the refusing cell" {
     // And the workbook is untouched, refusal_out or not.
     try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
     try testing.expectEqualStrings("999", try cellCache(try wb.sheet(0), "B1"));
+}
+
+test "S3d slice 1: saveWithRecalc carries the styles plan and the cell styles on both arms — the part extended, or created with its relationship, in the file; byte-identical to recalculate then save; drained at the swap, the base re-read; the next transaction hears the guard" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    const two_xfs = "<styleSheet xmlns=\"" ++ ns_main ++ "\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>" ++
+        "<cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"2\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>";
+    const Shape = struct { sheet: []const u8, styles: ?[]const u8, expect_idx: u32 };
+    for ([_]Shape{
+        .{ .sheet = sheet_stale, .styles = two_xfs, .expect_idx = 2 },
+        .{ .sheet = sheet_no_formula, .styles = two_xfs, .expect_idx = 2 },
+        .{ .sheet = sheet_stale, .styles = null, .expect_idx = 1 },
+        .{ .sheet = sheet_no_formula, .styles = null, .expect_idx = 1 },
+    }) |shape| {
+        const stale = shape.sheet.ptr == sheet_stale.ptr;
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = shape.sheet, .styles = shape.styles });
+        defer a.free(path);
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            _ = try (try wb.sheet(0)).ensureParsed();
+            const idx = try wb.addStyle(.{ .font_bold = true, .number_format = "0.0" });
+            try testing.expectEqual(shape.expect_idx, idx);
+            try (try wb.sheet(0)).setCellStyle("A1", idx);
+            try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+            var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+            r.deinit(a);
+            try testing.expect(!wb.hasStagedStyleWork());
+            try testing.expect(wb.styles_base == null);
+            try testing.expectEqual(@as(usize, 0), (try wb.sheet(0)).deltas.count());
+            try testing.expectEqualStrings("1", try cellCache(try wb.sheet(0), "A1"));
+            try testing.expectEqualStrings(if (stale) "2" else "999", try cellCache(try wb.sheet(0), "B1"));
+            // The base is the extended part's: the next style lands after.
+            try testing.expectEqual(shape.expect_idx + 1, try wb.addStyle(.{ .font_italic = true }));
+            try testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        }
+        {
+            var reopened = try Workbook.open(a, io, out);
+            defer reopened.deinit();
+            const cell = (try (try reopened.sheet(0)).cellByRef("A1")) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(?u32, shape.expect_idx), cell.style_idx);
+            try testing.expectEqualStrings("1", try cellCache(try reopened.sheet(0), "A1"));
+            try testing.expectEqualStrings(if (stale) "2" else "999", try cellCache(try reopened.sheet(0), "B1"));
+            const sv = (try reopened.styles()) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(usize, shape.expect_idx + 1), sv.cell_xfs.len);
+            try testing.expect(sv.fonts[sv.cell_xfs[shape.expect_idx].font_id.?].bold);
+            try testing.expectEqual(@as(?u32, 164), sv.cell_xfs[shape.expect_idx].num_fmt_id);
+            const rels = ((try reopened.store.part("xl/_rels/workbook.xml.rels")) orelse return error.TestUnexpectedResult).bytes;
+            try testing.expect(std.mem.indexOf(u8, rels, "/relationships/styles\" Target=\"styles.xml\"") != null);
+        }
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            const idx = try wb.addStyle(.{ .font_bold = true, .number_format = "0.0" });
+            try (try wb.sheet(0)).setCellStyle("A1", idx);
+            try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+            var r = try wb.recalculate(a, io, fixed_run, .{});
+            r.deinit(a);
+            // The in-memory transaction leaves the plan staged.
+            try testing.expect(wb.hasStagedStyleWork());
+            try wb.save(io, ordered);
+        }
+        const folded = try readAll(a, io, out);
+        defer a.free(folded);
+        const by_order = try readAll(a, io, ordered);
+        defer a.free(by_order);
+        try testing.expectEqualSlices(u8, by_order, folded);
+    }
+}
+
+test "S3d slice 1: a style alone on a sheet a mark-only candidate does not patch — the live view rebuilt over the folded part at the swap, the next plain save keeping the style (r1 A-TXN-101)" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const again = try std.fs.path.join(a, &.{ dir, "again.xlsx" });
+    defer a.free(again);
+    const unregistered = "<worksheet xmlns=\"" ++ ns_main ++ "\"><sheetData><row r=\"1\">" ++
+        "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>NOSUCHFN(A1)</f><v>999</v></c>" ++
+        "</row></sheetData></worksheet>";
+    const src = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = unregistered });
+    defer a.free(src);
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    // Parsed before the transaction: the view the swap must replace.
+    _ = try (try wb.sheet(0)).ensureParsed();
+    const idx = try wb.addStyle(.{ .font_bold = true });
+    try (try wb.sheet(0)).setCellStyle("A1", idx);
+    var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{ .on_unsupported = .keep_stale_and_mark });
+    r.deinit(a);
+    try testing.expectEqual(@as(?u32, idx), (try (try wb.sheet(0)).cellByRef("A1")).?.style_idx);
+    try (try wb.sheet(0)).setCell("C1", .{ .number = 7 });
+    try wb.save(io, again);
+    var re = try Workbook.open(a, io, again);
+    defer re.deinit();
+    try testing.expectEqual(@as(?u32, idx), (try (try re.sheet(0)).cellByRef("A1")).?.style_idx);
+    try testing.expectEqualStrings("7", (try (try re.sheet(0)).cellByRef("C1")).?.raw_value.?);
 }

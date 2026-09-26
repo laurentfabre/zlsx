@@ -2571,7 +2571,7 @@ rows plus an added sheet; either write over a no-formula workbook). `recalculate
 candidate shipped on 2026-09-11 — the paragraph after this one; the two
 `-1` names those rounds gated with are history from that date.
 
-**The save-plan fold (2026-09-11)**: `saveWithRecalc`'s file is the plain
+**The save-plan fold (2026-09-11; widened by S3d slice 1, 2026-09-25, to the styles plan and the staged cell styles — §25)**: `saveWithRecalc`'s file is the plain
 save plus the recalc on both arms, and the two gates above are retired
 (`SheetHasUnsavedMutations` no longer fires from the transaction —
 `appendRows` and `embeddableRows` keep it; `WorkbookHasStagedDefinedNames`
@@ -3087,3 +3087,890 @@ predates the slice; the CLI leg of per-sheet loading (the matrix's
 fourth column) is S3e's third slice (`--lazy`, 2026-09-13; matrix
 footnote ²⁹ — no C change; `--lazy --sst-lazy` refused there for the
 same missing primitive).
+
+
+## 25. S3d slice 1 — styles on the editor handle (2026-09-25)
+
+Four exports on the EDITOR handle, `zlsx_status_v1`, one macro, one
+probe, no release function, the `zlsx_diag_v1` for the one refusal.
+The row's Zig surface is `Workbook.addStyle` / `addDxf` /
+`internNumFmt` — the fresh writer's registrations — and the NEW
+`Worksheet.setCellStyle`; what the slice made true first is that the
+registrations land on an OPENED workbook: before it they reached the
+fresh-emit plan only (`saveFreshEmit`'s input) and `Workbook.save` on an
+opened archive never read it — the index came back fresh-relative
+(1-based over an empty table) and the saved `xl/styles.xml` was
+byte-identical to the source (measured on `main`, pinned). Now the save
+renders the plan INTO the existing part, and the index a registration
+returns is the slot its record takes there.
+
+| Export | Zig | Probe (`_ffi.py`) | Header macro |
+|---|---|---|---|
+| `zlsx_editor_add_style(ed, spec, out_index, diag, errbuf, len) → int32_t` | `Workbook.addStyle` | `_HAS_EDITOR_STYLES` | `ZLSX_HAS_EDITOR_STYLES` |
+| `zlsx_editor_add_dxf(ed, dxf, out_dxf_id, diag, errbuf, len) → int32_t` | `Workbook.addDxf` | (same) | (same) |
+| `zlsx_editor_intern_num_fmt(ed, ptr, len, out_id, diag, errbuf, len) → int32_t` | `Workbook.internNumFmt` | (same) | (same) |
+| `zlsx_editor_set_cell_style(ed, sheet_idx, row, col, style_idx, diag, errbuf, len) → int32_t` | `Editor.setCellStyle` → `Worksheet.setCellStyle` | (same) | (same) |
+
+**Which part.** The styles part is the target of the workbook's
+`…/relationships/styles` relationship — OPC addresses it there, and
+`xl/styles.xml` is the convention, not the rule (in-house r3
+A-PART-301: a package holding it as `xl/style2.xml` got an orphan
+`xl/styles.xml` and indices mapped against the fresh layout, so the
+cell styled italic rendered bold in any consumer that follows the
+relationship) — resolved through the store's relationship map at the
+first registration, in two questions (`resolvePartTarget`; in-house
+r13 A-REL-1302, r14 A-REL-1401, r15 A-PART-1501 / B-REL-1501, r16
+B-PART-1601 / B-REL-1602 / B-REL-1603, r17 A-PART-1701 / A-PART-1702 /
+A-REL-1703; r18 A-PART-1801 / A-CT-1802 / A-REL-1803 / B-PKG-1801). A
+target naming a part the package HOLDS — the exact spelling first,
+then any ASCII case (r19 B-PART-1901: of two case-variant twins the
+one the relationship spells wins), a zero-length directory entry
+being no part in either pass (r27 B-PART-2702), the store's own
+spelling handed on — names it, whatever the target's spelling: the part is extended in
+place (a non-ASCII name — its archive entry flagged UTF-8 on the
+rewrite when its bytes are UTF-8 — a trailing slash, a
+numeric reference; refusing a real part's name for its spelling would
+orphan it), and it gains the styles content-type `<Override>` when the
+package resolves it to another type through a Default, or to nothing
+(r19 A-DOC-1908) — a part the package declares under another type
+keeps that declaration (an owner ruling: the extension then lands in
+a part a content-type-checking consumer does not read as the
+stylesheet; openpyxl and LibreOffice do not check — r19 A-CT-1909,
+open); a held part that is no stylesheet refuses `MalformedStylesXml`. A target naming
+no part is the name the
+slice would CREATE at, and it creates only where (i) the resolver
+answers a name at all (not empty, a scheme, a backslash or
+forward-slash UNC, a drive letter, a package-escaping or root-naming
+`..`), (ii) the relationship spells that name (no empty segment —
+`sub//styles.xml`), (iii) the part-name grammar spells it (ECMA-376
+Part 2 §9.1.1: ASCII pchar; a percent escape of two hex digits
+spelling neither an unreserved character nor a slash; no `\`, `#`,
+`?`, space; no segment ending in `.`; no byte above ASCII — the
+grammar's own rule, a name no consumer addresses as the package
+spells it), and (iv) no entry sits under the
+name and no part with bytes sits over it (a zero-length entry beside
+`xl/…` is a directory marker, no part). Otherwise `xl/styles.xml`,
+extended when held under any case (the store's spelling), created
+when not; a part the workbook holds without its relationship — and a
+created part — gains the internal relationship with the extension
+(a created part its content-type `<Override>` too: one the package
+already holds for the name is re-typed, or given the attribute it
+lacks, unless it is a held case-variant twin's, which stays, typing
+the twin — the created part then takes the manifest's `Default` for
+its extension (r26 B-DOC-2603, r27 B-DOC-2701) — r21 A-CT-2101, r22
+A-CT-2201, r23 A-CT-2301 / B-CT-2302; a held part
+without its `<Override>`, or with one lacking its `ContentType`,
+gains it (unless a `Default` already types it as the stylesheet —
+r27 A-DOC-2704), one declared under another type keeps that
+declaration — r18 A-CT-1802, r23 B-CT-2303, r24 A-CT-2402, r25 B-DOC-2503),
+its target relative to the workbook part's directory when the name
+sits under `xl/` as spelled, any other name — a case-variant
+directory such as `XL/` included — spelled absolute, which a
+case-sensitive consumer resolves to the held entry too (r20
+A-REL-2001, r21 B-REL-2101: `Target="styles.xml"` for a part at
+`XL/styles.xml` left LibreOffice with no stylesheet; r21 A-PIN-2103:
+pinned directly and through the held case-variant). At the
+splice the name is resolved again: a case-variant twin `addPart`ed
+underneath the staged plan moves which part the relationship names,
+and the save refuses `StylesPartChanged` (r21 A-PART-2106). A
+relationship whose target named no part is
+left as the producer wrote it: the saved package then carries two
+styles relationships, the internal one beside it (r10 B-REL-1001's
+ruling, pinned in the r17 arms). The reader and `Workbook.styles()`
+still address the conventional name (pre-existing, recorded).
+
+**What the index is.** The part's tables are read once per save —
+`scanStylesPart`, one lexical walk on the workbook scanner
+(`findTagOpen` / `findCloseTagLoose`: comment / CDATA / PI decoys
+skipped, quoted `>` respected, whitespace before a closing `>`
+allowed) over the root's DIRECT children — a known table recorded, any
+other element skipped whole, so a table's name inside an `<extLst>`
+extension is never the stylesheet's (in-house r6 B-SCN-601) — the
+direct CHILDREN of `<numFmts>` / `<fonts>` /
+`<fills>` / `<borders>` / `<cellStyleXfs>` / `<cellXfs>` /
+`<cellStyles>` / `<dxfs>` counted (the eight the fresh emitter owns;
+`<cellStyleXfs>` / `<cellStyles>` drive the seed decision alone), never a `count`
+attribute — into a `styles_plan.Base`: the slot each table's
+next record takes, and the first free `numFmtId` above every `<numFmt>`
+of the `<numFmts>` table and every custom id an `<xf>` names (164 at
+least). `addStyle` returns `base.cell_xfs + position`,
+`addDxf` `base.dxfs + position`, `internNumFmt` `base.num_fmt_next +
+position` (the first free id above every `<numFmt>` of the part's
+`<numFmts>` table and every custom id an `<xf>` names — a `<dxf>`'s own inline `<numFmt>` is not a table
+record and is not counted, r7 B-DOC-705); the fresh layout (`Base.fresh`: one font, two fills, one
+border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
+so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
+unchanged byte for byte for every value XML carries literally (its
+parity pins hold); a tab, LF or CR in a name or format is spelled as
+a character reference since r31, which `Book` and `zlsx styles`
+decode (r32 A-DOC-3202) — the typed overlay `styles_xml.parse` hands
+every attribute raw, as it always has: `Worksheet.cellStyle` /
+`Workbook.numberFormatFor` / `formatCellValue` see the reference
+(pre-existing, r33 A-TXT-3302). The walk's agreement
+with the typed parser (`styles_xml.parse`) is pinned over the corpus:
+on every fixture with a styles part the index equals the parser's
+`cell_xfs.len`, and after the save the parser's tables have grown by
+exactly the plan and the new `<xf>` names the new font, fill and
+border. The base is cached while the plan is staged and forgotten when
+the plan drains. A recalc transaction never touches the part, but the
+store is a public Zig surface (`PartStore.replacePart` / `removePart` /
+`addPart`) and a structural edit can create the very part the styles
+relationship names (`add_sheet` on a package whose relationship
+targets a missing worksheet name — in-house r24 B-DOC-2402), so the
+splice resolves the part and re-reads the layout and refuses
+`StylesPartChanged` (-1 on C and `ZlsxError` on Python, reachable
+there through that edit; named on `zlsx_editor_save` and
+`zlsx_editor_save_to_buffer`, the Python `save` / `save_to_buffer`
+docstrings and README (r25 B-DOC-2502); kept a -1 as an owner ruling — a
+statement about this editor's sequencing, as the row edits' refusals
+are, not about the workbook as opened) when it is no longer the one
+the registrations mapped against: the indices handed out could not be
+honoured, and an assert would have been reachable (in-house r1
+A-BASE-103). A part that appeared with exactly the fresh layout is
+honoured.
+
+**What the save writes.** `applySavePlans` (the plain save, the
+buffer save, `saveWithRecalc`'s `.none` arm) and `foldSavePlansInto`
+(the candidate arms) call one renderer, `applyStylesPlanInto(store)`:
+`StylesPlan.emitFragments(base)` — the emitter the fresh part uses,
+factored so each table's children come out separately with every
+cross-table id (`fontId`, `fillId`, `borderId`, `numFmtId`) offset by
+the base — spliced by `spliceStylesFragments`: an owned table with
+records to add is rewritten in place (its own children verbatim, the
+plan's after, its `count` rewritten where it spells one and left absent
+where not); a table the part lacks is created at its schema slot
+(after the nearest present predecessor, else right after the root's
+open tag) with the fresh defaults in front; a present table holding no
+record likewise takes the defaults in front — a `<cellXfs>` that
+started with our record would make it every unstyled cell's, a
+`<fonts>` without a record at 0 would leave `fontId="0"` dangling;
+`<cellStyleXfs>` / `<cellStyles>` are seeded when an `<xf>` is added
+and the part lacks them or holds them empty (`xfId="0"`); a self-closed table
+(`<dxfs count="0"/>`) is opened; every other byte of the part is
+preserved (pinned: the bytes before the first table and after the last
+one equal the writer's). A workbook without the part gets the fresh
+emitter's part, its relationship in `xl/_rels/workbook.xml.rels`
+(`injectWorkbookRelationship`, the SST's injector generalized) and its
+content type. Then the sheets: `Worksheet.cell_styles` (a `CellRef →
+u32` map beside `deltas`) folds into `emitSheetData` — a staged style
+replaces the cell's own `s`, a delta cell takes it, a cell the sheet
+lacks is created as `<c r="…" s="…"/>` (the formatted blank Excel
+writes), `deleteCell` wins whichever came first; a sheet with a style
+alone is re-emitted. The map is drained with the deltas (the save, the
+swap's `drainSavePlans`), joins `hasUnsavedChanges` /
+`hasStagedStyleWork` (the Editor's passthrough condition), and is
+excluded by appended rows and the structural edits as a staged value is
+(`SheetHasUnsavedMutations` / `SheetHasUnsavedAppends` on the Workbook
+— the Editor's row / column edits fold the first into
+`RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` and
+`deleteSheet` into `SheetDeleteRequiresCleanState`, as for a staged
+value, r10 A-DOC-1005 / B-DOC-1003; its `sheetHasWorkbookDeltas` /
+`workbookHasAnyDeltas` count it). The fold
+pin: `saveWithRecalc` with a registration and a cell style is
+byte-identical to `recalculate` then `save` on both arms, the part
+present or created, the plan drained at the swap, the next transaction
+hearing the guard (the fold's installs are a save's).
+
+**Statuses.** `0` with the out written. `-1`, a statement about the
+call — `InvalidInput` (a NULL handle, spec or out; a NULL font-name or
+format pointer with a non-zero length — judged in `styleFromC`, the
+writer's export with it, r8 B-DOC-803), the writer's enum verdicts
+`BadAlignmentValue` / `BadFillPattern` / `BadBorderStyle` (the
+`zlsx_style_t` reading is `styleFromC`, factored out of
+`zlsx_writer_add_style_ex` — one reading, the writer's error names
+unchanged; the `zlsx_dxf_t` reading `dxfFromC` likewise, a border code
+the header does not spell reading as none), `InvalidStyle` (a non-finite or non-positive font size, judged after the part is read; a font name or format that is not XML text throughout — a C0 control other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF — an empty font name or
+format is "unset" at the C boundary, `*_len == 0`, and Python raises
+the writer's `InvalidFontName` / `InvalidNumberFormat` before the call;
+`zlsx_editor_intern_num_fmt` alone reaches `InvalidStyle` with an empty
+format), and on the cell style
+`SheetIndexOutOfRange` / `RowIndexOutOfRange` / `ColumnIndexOutOfRange`
+/ `UnknownStyleIndex` (past the part's `<cellXfs>` and this save's
+registrations — judged before anything is staged) /
+`SheetHasUnsavedAppends`; the out is 0 on every failure past the NULL
+checks. `-2` `MalformedStylesXml`, the name in the diag, plane NONE, in
+`structural_refusals`: the part's `<styleSheet>` missing, self-closed
+or under a default namespace that is not the main one — Transitional
+or ISO-Strict, entity-decoded (absent, or another URI), an element
+under it that never closes, a stray closing
+tag between tables or between a table's records, a table out of the
+schema's order (the splice's slots would be ambiguous), a table or a
+record under a prefix, inside a markup-compatibility element
+(`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
+its default namespace to a URI other than the root's (the splice cannot rewrite it in
+place — r7 / r8 / r9 / r10), numFmt ids leaving no room for the
+format — the next id past `maxInt(u32)` (r2 A-OVF-201, on every
+caller list since r30 B-DOC-3005), the
+relationship's target a part the package holds that is no stylesheet
+(`sharedStrings.xml`, `workbook.xml` — the scan refuses its root; r18
+B-DOC-1804), or — the part absent — an entry under `xl/styles.xml/`
+so no part may be created at the conventional name (r16 B-PART-1601 /
+r17 B-DOC-1723) — judged at the FIRST
+registration or cell
+style, nothing staged, so a refused editor saves the passthrough
+(pinned on C and Python: byte-identical to the source). `-3`
+`OutOfMemory` (the Zig sweep: every allocation failure across the open,
+the three registrations, the cell style and the save's plans leaks
+nothing — it found a pre-existing double free in
+`StylesPlan.internNumFmt`, the pool taking the string before the index
+reserved its slot, fixed). Python: `Editor.add_style` / `add_dxf` /
+`intern_num_fmt` / `set_cell_style` — `ZlsxRefusal` with the
+`error_name` for the part, `ZlsxError` with the name for the call, the
+writer's `_style_spec` / `_dxf_spec` marshalling shared (factored out
+of `Writer.add_style` / `add_dxf`, unchanged behaviour).
+
+**What a cell style costs.** A sheet with a staged cell style is
+re-emitted at save as a sheet with a staged cell write is: its
+`<sheetData>` regenerated from the typed view by the delta emitter —
+row attributes (`ht`, `customHeight`, `hidden`, `spans`, a row's own
+`s` / `customFormat`), shared- and array-formula group attributes
+(`t="shared" ref si`, the follower's empty `<f>`; `t="array" ref` —
+the spill rectangle collapses, the follower keeping a stale `<v>` —
+and `ca`), a cell's metadata attributes (`cm`, `vm`, `ph`; r14
+B-EMT-1401) are not carried, a rich inline
+string keeps its first run's text only (`bo` + `ld` → `bo` — r11
+B-EMT-1102), a positional `<c>` (no `r`) and a `<row>` holding no cell are
+DROPPED (values, not only formatting — in-house r7 B-EMT-702; the read
+path's rule for a positional cell is a `MalformedSheetXml` refusal,
+`embeddableRows`), and `<dimension>` is not widened — pre-existing since the
+delta emitter (`setCell` does the same), newly reachable from a call
+that changes only a style (in-house r2 A/B-EMT-202, measured on
+`worldbank_catalog.xlsx`: the header row's `s="3" customFormat="1"`
+and 161 `spans` gone; `phpoi_test1.xlsx`: `ht="30"`), stated on every
+new surface; the fix — a byte-preserving cell patch, or a row-attribute
+carrying re-emit — is an owner follow-up on the delta emitter, not this
+slice's. On a pivot host sheet whose staged writes the pivot render
+splices, a staged style stays for the sheet phase, which re-emits the
+spliced bytes once more with the `s` on top (r2 B-PIV-204).
+
+**Record 0.** A style that sets no fill or border names the part's
+records 0 — `fillId="0"`, `borderId="0"`, and every `<xf>` names
+`xfId="0"` — the none fill, the empty border and the Normal cell style
+every known producer writes there (Excel, openpyxl, xlsxwriter, the
+fresh writer): the OOXML convention Excel itself relies on. A part
+whose record 0 is something else (in-house r6 A-SPL-602 built one:
+fills[0] solid red) gives such a style that record; the seed rule
+covers an absent or empty table, not a table whose first record is
+not the default. Stated on the header and the Python docstring;
+resolving "none" against the part's own records — appending a none
+fill / empty border where record 0 is not one — is an owner call
+recorded here, not this slice's. The delta emitter locates
+`<sheetData>` by substring (pre-existing; a comment spelling one ahead
+of the real element takes the whole re-emit INTO the comment: the
+comment is never closed, the real open tag is consumed, the sheet's
+own cells end up inside the comment and the part is not well-formed —
+r6 A-EMT-603 / r7 B-DOC-706 / r8 B-DOC-802, measured), one more item
+of "what a cell style costs", the same follow-up.
+
+**Round 6.** `Editor.set_cell_style`'s four indices go through the
+class's `_u32` guard (`2**32` is `ValueError`, never a wrap to another
+sheet, row or style — r6 A-PY-601 / B-PY-602; `set_cell`'s three, the
+same pre-existing gap, with them). A created part's content-type
+override rides `PartStore.addPart` (pre-existing: a package that
+already declared an override for the name got a second — r6
+B-CT-603, recorded then; closed in round 20, `addPart` staging none
+when the package already names the part — B-CT-2004). A save that rendered the plan invalidates the
+view `Workbook.styles()` handed out, as an SST extension invalidates
+`sst()`'s (r6 B-VIEW-605, stated here).
+
+**Round 7.** A root's direct child whose LOCAL name is an owned
+table's under a prefix (`<x:fonts>` bound to the main namespace), or
+an `mc:AlternateContent` that could hold one, refuses
+`MalformedStylesXml` — the walk read it as absent and the save wrote a
+second table beside it, schema-invalid (in-house r7 A-SCN-701; the
+one-prefix-resolution rewrite #223 gave the drawings is the follow-up
+that would extend such a part instead). A stray closing tag between
+tables refuses rather than being stepped over (A-SCN-705).
+`Editor.append_rows`' sheet index goes through `_u32` too (A-PY-702 —
+the last bare `int()` under `c_uint32` on the editor). Seeding an
+empty table gives the part's dangling ids (`fontId="1"` in an existing
+`<xf>` over a `<fonts>` holding nothing) this save's records — the
+mirror of the record-0 statement (A-SPL-706).
+
+**Round 8.** A record under a prefix bound to the main namespace, or
+wrapped in `mc:AlternateContent`, inside an owned table refuses as the
+table's own prefix does — the table would have read as EMPTY and the
+seed rule would have put the defaults in front of its records, shifting
+every existing index (in-house r8 A-SCN-801). The save's phase 0a
+renders and re-reads only with style work staged: a baseline a REFUSED
+registration armed is forgotten at the save, so a save with nothing
+staged never refuses `StylesPartChanged` (A-BASE-802). `append_rows`'
+guard pinned (A-PIN-803); the `<numFmts>`-table scope and the
+refusal-shape lists carried to every surface (A-DOC-804/805,
+B-DOC-801); the NULL-string guard on `styleFromC` (B-DOC-803).
+
+**Round 9.** `AlternateContent` is judged by its local name whether
+prefixed or bound through a default namespace declaration — the same
+element to an MC processor — at the table level and the record level
+(in-house r9 A-SCN-901); a stray closing tag inside a table refuses as
+one under the root does, where the child loop broke and truncated the
+count (A-SCN-902). A known table redeclaring its default namespace to
+another URI refuses — the new record would have landed inside the
+foreign element and the `<xf>` naming it dangled (B-SCN-904); the
+scanner's own doc list, the Python surfaces' shape list (a self-closed
+root) and the header's out-zeroing sentence carried (B-DOC-902 /
+B-ABI-903).
+
+**Round 10.** A bare `Choice` / `Fallback` reached directly refuses as
+`AlternateContent` does (in-house r10 A-SCN-1001); a record redeclaring
+its default namespace to a URI other than the root's is not one of the table's
+(A-SCN-1002); the accept side pinned — a table and a record spelling
+the main namespace explicitly are the stylesheet's (A-PIN-1003); the
+two new shapes and the structural edits' actual names carried to every
+caller-facing list (A-DOC-1004 / 1005). B: an external-mode styles
+relationship no longer satisfies the injector's presence test — the
+internal one is added beside it (B-REL-1001); the root's default
+namespace must be the main one, absent or another URI refusing —
+the third level of the namespace class (B-SCN-1002); the ladder row's
+"Zig-only today" now governs only the unshipped list (B-DOC-1004).
+
+**Round 11.** The injector decodes the `Type` and `TargetMode` values
+before comparing them, as the store's relationship reader does
+(in-house r11 A-REL-1101); the styles relationship is matched by its
+EXACT type, never a suffix (A-PART-1102: a vendor type ending the same
+way made an orphan); the root-namespace refusal carried to every
+caller-facing list and the four doc comments that under-stated their
+code (A-DOC-1103 / 1104); the accept sides pinned — an explicit,
+entity-spelled `TargetMode="Internal"` and a single-quoted, spaced
+root declaration (A-PIN-1105). B: the ISO-Strict spellings of the main
+namespace and of the styles relationship type are accepted at every
+level — a Strict part is extended as a Transitional one is, every
+byte the splice writes being unprefixed and namespace-free, as the
+package layer admits Strict by contract (B-SCN-1101; the earlier
+rationale withdrawn); an entity-spelled namespace URI is decoded
+before the compare (B-SCN-1105); an `<xf>` naming a custom `numFmtId`
+the `<numFmts>` table never defined reserves it, so an interned format
+never takes an id that would re-format existing cells (B-FMT-1104,
+pinned: `170` on an `<xf>` → the next format is `171`); the rich
+inline string's truncation and the unwidened `<dimension>` carried to
+every cost list (B-EMT-1102 / B-DOC-1103); the `MalformedStylesXml`
+doc comment (B-DOC-1106).
+
+**Round 12.** Below the root, a table's or a record's `xmlns` must be
+the ROOT's own URI — the other main spelling is not this
+stylesheet's (in-house r12 A-NS-1201); a Strict package gets a Strict
+part and a Strict relationship when the slice creates them (the fresh
+head's one declaration respelled; A-NS-1202); the `internNumFmt` floor
+sentence on every surface names the `<xf>`-reserved ids (A-DOC-1203);
+the resolver's comment (A-DOC-1204). B: the Strict respelling touches
+the head's declaration only, never a caller's font name or format
+spelling the URI (B-NS-1201, pinned); the injector decodes `Id` as it
+decodes `Type` (B-REL-1202, pinned); the Python docstring states what
+the transactions do with the registrations (B-DOC-1203). Recorded,
+pre-existing and outside the slice: the reader's fonts loop drops a
+self-closed `<font/>` (`src/xlsx.zig`), so `Book.cellFont` /
+`zlsx_cell_font` / `zlsx styles` resolve the wrong font or none on
+such a part (`frictionless_2sheets.xlsx`) — the saved file is right
+(openpyxl and LibreOffice resolve it), the read-back of the index this
+slice hands out is not; the typed view counts it correctly, so the
+corpus pin cannot see the divergence (B-RD-1204, owner follow-up).
+
+**Round 13.** The package's conformance is the workbook part's own
+root namespace, not any one relationship's spelling (a purl-typed
+decoy on a Transitional package made a Strict part registered
+Transitional — in-house r13 A-NS-1301, pinned); a styles relationship
+whose target names no part (empty, or a URI) does not satisfy the
+injector's presence test, as the resolver rejects it (A-REL-1302,
+pinned); the below-root namespace rule reads "a URI other than the
+root's" on every surface (A-DOC-1303). B: the eight enumerations of
+what the fold carries and what `hasUnsavedChanges` reports name the
+styles work now (B-DOC-1302). Recorded, pre-existing and outside the
+diff: the recalc engine refuses `FormulaUnsupportedConstruct` on any
+ISO-Strict package (bisected to the Strict main namespace on
+`xl/workbook.xml`), so `saveWithRecalc`'s candidate arm is unreachable
+over a Strict package — the fold over Strict is pinned through the
+mark-only arm; an owner follow-up, `docs/package-layer.md` admitting
+Strict by contract (B r13, unverified note).
+
+**Round 14.** The injector's target test is the resolver's own
+(`resolveOwned`: a bare scheme, a UNC or drive-letter target, a
+package-escaping `../..` name no part — in-house r14 A-REL-1401);
+the array-formula group and cell-metadata attributes join every cost
+list (B-EMT-1401); footnote ³⁰'s splice scope reads eight tables
+(B-DOC-1402); the README splits `addStyle` from `setCellStyle`
+(B-DOC-1403); the fold's allocation sweeps stage a style too
+(A-PIN-1406); the remaining "another URI" comments, the Editor's
+predicate docs, the `<cellStyles>` seed reason, `saveWithRecalc`'s
+header and Zig paragraphs and footnote ²⁶ carried (A-DOC-1402..1405).
+
+**Round 15.** A styles relationship whose target collapses to the
+package root (`..`, `./..`, `/`) or to the owner's directory (`.` →
+`xl`) resolved to a name no part can take: the save created a part
+named `""` or `xl` (a ZIP entry the package cannot hold, an
+`<Override PartName="/"/>`), left the real part untouched, the style
+lost, the cell stamped with a fresh-base index that resolves to
+ANOTHER style in the untouched part (in-house r15 A-PART-1501, the
+accept side of the r13/r14 family) → the resolver answers "none" for
+the root (and collapses an absolute target's `.`/`..` segments); one
+creator-side test (`resolvePartTarget`: the resolver's answer minus
+a name an existing part sits under or over, minus a name whose
+segment spells a character the part-name grammar excludes — `\\`,
+`#`, `?`, a space, a segment ending in `.`: `sub\\styles.xml` made a
+file LibreOffice refused to load, `styles.xml#frag` one that lost the
+style; B-REL-1501) decides both the part's name and the injector's
+presence test (pinned end to end over ten targets). The injector
+judges a target only on a relationship of the type (A-REL-1502: no
+allocation, no OOM path from the others); the fold and transaction
+sweeps assert the styles plan and the cell style survive the failure,
+an abandoned candidate leaves them staged (A-PIN-1503). B: the
+receiving surfaces' refusal enumerations (the structural edits',
+`delete_sheet`'s, `embeddable_rows`' and `strip_embeddings`' contracts
+on the header, the Editor, the Python docstrings and README) name the
+staged cell style beside the writes and the appends (B-DOC-1503); the
+ladder row no longer counts mark-recalc-on-load as Zig-only
+(B-DOC-1502).
+
+**Round 16.** The r15 prefix rule judged every ZIP entry: a
+zero-length `xl` entry beside `xl/…` (the directory spelled without
+its slash, as a producer may) made every name under `xl/` uncreatable
+— a moved styles part orphaned again, a second part created, two
+internal relationships, and the conventional fallback created at a
+name the rule had just refused (in-house r16 B-PART-1601, a
+regression over r15) → an entry another entry sits under is a
+directory marker, no part (`isDirectoryMarker`); the conventional
+fallback passes the same test the relationship's name did, else
+`MalformedStylesXml` (pinned: the moved and the conventional part
+beside a bare `xl` entry). A percent escape must be two hex digits
+spelling neither an unreserved character nor a slash (`styles%2Exml`
+is `styles.xml` to a normalizing consumer and another name to a
+literal one — B-REL-1602); a byte above ASCII names no part to
+create (the grammar wants it escaped; and, as recorded then, the
+store's rewriting emitter never set the UTF-8 name bit for any
+rewritten entry — B-PKG-1605, a pre-existing package-layer item
+closed in round 18 for that emitter once r17 made a held part at such
+a name reachable; the fresh writer `pkg/zip.zig` behind
+`Workbook.empty` / the `zlsx_writer` surface still writes flag 0 by
+its documented contract, and nothing reachable hands it a non-ASCII
+part name); a network-path
+target (`//host/path`) is external to the resolver, as the
+backslash UNC is (B-REL-1603; A-REL-1601 found both faces). The
+injector decodes a `Type` and a `Target` into a buffer the raw
+spelling always fits, as the store's reader does — the fixed buffer's
+overflow fell back to the raw text, whose `#` read as unspellable and
+a second relationship was injected, its target written unescaped, a
+rels part no XML parser reads (A-REL-1602: escaped now, pinned). The
+three pivot-read sentences name the staged cell style among what
+reaches the pivot graph at save (B-DOC-1604).
+
+**Round 17.** The r16 rules judged a real part's name by the same
+predicate as a name to create at: a styles part living at a non-ASCII
+name (or under a stray entry) was refused for its spelling and the
+conventional name created beside it — two parts, two relationships,
+the cell against the wrong base (in-house r17 A-PART-1701) → a part
+the package holds is the part, whatever its spelling; the create-side
+rules apply to a name no part sits at. `isDirectoryMarker` read any
+entry with a descendant as a marker, so a stray `xl/workbook.xml/x`
+made `xl/workbook.xml/styles.xml` creatable (A-PART-1702) → a marker
+is a ZERO-LENGTH entry another sits under (`PartStore.partEmptyAt`).
+An interior or trailing empty segment (`sub//styles.xml`) resolved to
+a part the relationship does not address (A-REL-1703) → a created
+name must be one the relationship spells. The injector's heap decode
+runs only on a spelling holding `&` (r15's invariant; A-PIN-1704, the
+`Type` half pinned past 256 raw bytes). This "Which part" paragraph
+and the `styles_part_resolved` doc carry every rule; the
+name-based `MalformedStylesXml` — the part absent, an entry under
+`xl/styles.xml/` — is on every refusal-shape list (A-DOC-1705,
+B-DOC-1723); a `.` or `/xl` beside a bare `xl` entry names the marker,
+no part — the conventional part (B's cross of r15 and r16, pinned);
+the resolver's two doc lists name the forward-slash network path
+(B-DOC-1724).
+
+**Round 18.** The held-part question compared names byte-exactly
+where OPC compares ASCII case-insensitively: `Styles.xml` created a
+twin part beside `xl/styles.xml`, two overrides, the cell against the
+fresh base (in-house r18 A-PART-1801) → held under any case, the
+store's own spelling handed on, the create-side prefix tests
+case-insensitive too. A held styles part the package resolved to
+`application/xml` through a Default was extended and never declared
+(A-CT-1802) → `PartStore.ensureContentTypeOverride`: one `<Override>`
+when the package names the part in none (a part it names under any
+type keeps the producer's statement). The injector decoded through
+the ASCII-only scalar decoder where the resolver had the store's:
+`styl&#233;s.xml` naming a held `xl/stylés.xml` gained a second
+relationship (A-REL-1803 / B-REL-1802) → the store's decoder, gated
+on `&`. `partEmptyAt` read a size `addPart` never set and
+`replacePart` never updated — an added part read as a directory
+marker, a name under it creatable (A-STORE-1804 / B-PART-1803) → both
+mutators record their bytes' length, pinned. The archive writer
+hard-coded the general-purpose flags to zero, so rewriting a held
+part at a non-ASCII name stripped the UTF-8 name bit its source
+carried — the whole stylesheet lost to a `zipfile` consumer
+(B-PKG-1801, r16 B-PKG-1605 made reachable by r17) → a fresh header
+carries bit 11 for a name above ASCII (pinned on both headers, and
+across the extension); the create-side rule (iii) keeps refusing an
+unescaped name, the grammar's own reason. The "no stylesheet" shape
+reached every refusal-shape list and footnote ³⁰'s identity summary
+(B-DOC-1804).
+
+**Round 19.** The held-part question took the FIRST case-insensitive
+match: a case-variant twin entry ahead of the real part in the
+archive hijacked the resolution — a junk twin refused the feature, a
+well-formed one took the style while the cell's index meant another
+record in the part every consumer reads (in-house r19 B-PART-1901, a
+regression over r18) → the exact spelling first, then any case
+(pinned, a twin ahead and behind). The conventional fallback asked
+the byte-exact question: a part held at `xl/Styles.xml` with no
+styles relationship got a case-equivalent twin (B-PART-1902) → the
+fallback goes through the same held question, the store's spelling
+extended and its relationship injected (pinned). The content-type
+guard's literal `PartName="` needle missed `PartName = "…"` and an
+entity-spelled name — a second `<Override>` for one part (B-CT-1903)
+→ read as the store's reader reads (whitespace, entities, either
+quote; pinned). The UTF-8 name bit was asserted from the byte range:
+a latin-1 name flagged made `zipfile` refuse the whole archive
+(B-PKG-1904) → only a name that IS UTF-8 is flagged (pinned).
+`addPart`'s rewritten `[Content_Types].xml` records its size too
+(B-STORE-1907). Docs: rule (iii)'s reason is the grammar's own, the
+B-PKG-1605 closure names the store's emitter and leaves the fresh
+writer `pkg/zip.zig` at its documented flag 0 (B-DOC-1905); the
+`<Override>` a held-but-undeclared part gains, and the declaration a
+part under another type keeps, on the header, footnote ³⁰, the
+Python docstring and README (B-DOC-1906). A: the content-type guard
+reads through the store's own lexer — live markup only, a `>` inside
+a sibling value kept, the decode gated on `&` (A-CT-1904); the
+create-side case rules and the content-type stage-and-commit pinned
+(A-PIN-1905 / A-PIN-1906: the plain save's allocation sweep runs
+over an undeclared part too — the fold's own sweeps still see a
+declared one); the `<Override>` scope names "or to nothing" (A-DOC-1908);
+a part declared under another type recorded as an open owner call
+(A-CT-1909).
+
+**Round 20.** The injected relationship's target stripped `xl/`
+byte-exactly where the fallback now hands on a held name under any
+case: a part at `XL/styles.xml` was extended and given
+`Target="XL/styles.xml"` (→ `xl/XL/styles.xml`), so the next session
+mapped against the fresh base and created a second part there
+(in-house r20 A-REL-2001) → the target is relative to the workbook's
+directory under any case of it, a name elsewhere spelled absolute
+(pinned across two sessions). `replaceParts` records its sizes as
+its singular twin does (A-STORE-2002); the "Which part" fallback
+clause reads "held under any case", the r19 sweep sentence names the
+plain save's, and the two-relationship outcome of a target naming no
+part is stated (A-DOC-2003). B: `addPart` stages no `<Override>` for
+a name the package already declares — a CREATED styles part in a
+package declaring it had got a second element (B-CT-2004, r6
+B-CT-603 closed; pinned in the store); the UTF-8 flag's rule and the
+exact-spelling-first precedence on `nameFlags`' doc, "Which part" and
+footnote ³⁰ (B-DOC-2002 / B-DOC-2003).
+
+**Round 21.** "Does the package declare this name" had three
+answers in one store: the r20 `addPart` gate lenient, the content-type
+resolver byte-exact, the remover a literal needle — a case-variant
+`<Override>` left its part undeclared to every reader of
+`Part.content_type` (r18 A-CT-1802 reopened one case wide), a loosely
+spelled one survived `removePart` and then typed the part zlsx
+created next (in-house r21 A-CT-2101) → the resolver matches the exact
+spelling first then any ASCII case, the remover reads through the
+shared lexer, and a part zlsx CREATES re-types an `<Override>` already
+naming it exactly (the bytes are zlsx's, so is the declaration; a
+case-variant declaration is a twin's and is left alone). The injector
+reads `TargetMode` and `Id` through the store's decoder and counts a
+relationship without an `Id` as none, as the store's reader does
+(A-REL-2105). The splice resolves the part's name again and refuses
+`StylesPartChanged` when a case-variant twin moved it (A-PART-2106).
+Pins: the absolute half of the injected target, `replaceParts`'
+sizes (A-PIN-2103 / A-PIN-2104); the created part's re-typed
+declaration stated on the header, README, footnote ³⁰ and the Zig doc
+(A-DOC-2102 / B-DOC-2102). B: the injected target stripped `xl/`
+under any case, so a part held at `XL/styles.xml` was given
+`Target="styles.xml"` — zlsx resolves it (any case), LibreOffice does
+not: no stylesheet, the registered style lost (B-REL-2101, the r20
+fix's other half) → relative only when the name sits under `xl/` as
+spelled, absolute otherwise (the r20 two-session pin now asserts
+`/XL/styles.xml`); an `Id`-less relationship satisfies the presence
+test no more (B-REL-2103 = A-REL-2105).
+
+**Round 22.** The r21 retype answered null for a case-variant or a
+`ContentType`-less declaration and the appender then wrote a second
+`<Override>` — r20 B-CT-2004 reopened two spellings wide (in-house
+r22 A-CT-2201) → `retypeOverride` is tri-state: the exact declaration
+re-typed (or given the attribute it lacked), a case-variant one
+re-typed when no part is held at its spelling (a stale manifest) and
+kept — nothing staged — when one is (a twin's, A-CT-2202's mirror), a
+declaration already carrying the type staged not at all (A-CT-2206).
+The remover took a held twin's declaration with the part it removed
+(A-CT-2202) → the exact spelling always, a case-variant one only when
+its spelling holds no part; an unterminated element loses its start
+tag alone. The resolver's "exact first" was per-declaration, so a
+later loose one overwrote an earlier exact one (A-CT-2203) → exact
+declarations win wherever they stand; `<OverrideX` / `<DefaultX`
+declare nothing there too. The save-time re-resolution's own refusal
+(an entry added under `xl/styles.xml/`) reads `StylesPartChanged`,
+the package having moved (A-DOC-2205); `applyStylesPlanInto` states
+that it resolves against the workbook's store, the fold's candidate
+being the same generation by the transaction guard. Pins: the
+`TargetMode` decoder isolated (a target that names a part), the
+retype's three states, the remover's twin rule, the resolver's
+precedence (A-PIN-2204).
+
+**Round 23.** The remover ended a non-self-closing `<Override>` at
+the first RAW `</Override>`: a comment inside the element made
+`removePart` cut mid-comment and the saved manifest ill-formed —
+openpyxl refused the workbook (in-house r23 B-CT-2301 / A-CT-2304) →
+the live end tag. A slash-less `PartName` was a declaration to the
+resolver and to nothing else — a second element appended, a stale
+one left behind (B-CT-2302 / A-CT-2303) → the resolver's rule
+everywhere. The twin rule asked `findIndex` byte-exactly, so a twin
+in a THIRD case was re-typed and then deleted (A-CT-2301) → a twin is
+any held part spelling the declaration's name under any case. The
+extend path counted a `ContentType`-less declaration as one and
+staged nothing (B-CT-2303) → it gains the attribute, a typed one
+stays (the producer's). The `.keep` compared a raw value to a decoded
+type (A-CT-2305) → decoded, and the keep pinned by the bytes'
+identity. A part replaced unreadable under a staged plan refused
+`MalformedStylesXml` at the save where the contract says
+`StylesPartChanged` (A-DOC-2308 / B-DOC-2305) → the walk's refusal at
+the splice reads `StylesPartChanged`, the `Error` doc and footnote ³⁰
+name it. `overridePartNameOf` borrows unless a reference is spelled
+(A-MEM-2302); `<DefaultX` and the unterminated element pinned
+(A-PIN-2306); the twin qualifier on the last two surfaces, the
+created part's content-type rule in "Which part" (A-DOC-2307 /
+B-DOC-2304).
+
+**Round 24.** The remover's live end-tag scan was a byte literal, so
+a legal `</Override >` was not found and the start tag alone was cut
+— the manifest ill-formed again (in-house r24 A-CT-2401) → a loose
+live close tag (`overrideElementEnd` over `liveCloseTagStart`). The manifest's append slot was a
+raw last `</Types>`: an epilog comment stole it, a legal `</Types >`
+refused every declaring `addPart` (A-CT-2403) → the live, loosely
+spelled root close tag. The extend path handed `holdsVariantOf` no
+exception while the part IS held, so every case-variant declaration
+was kept and a `ContentType`-less one left the part undeclared
+(A-CT-2402) → the part being declared is excepted. The retired guard
+(`overrideNamesPart` / `overrideTagNamesPart`, a third "is it
+declared" answer with no production caller) removed with its pins
+(A-DEAD-2406). Pins: the third-case twin isolates the held test, the
+decoded keep, the loose end and root tags, the variant typeless
+extend (A-PIN-2404 / A-PIN-2405); the extend path's typeless gain on
+the header, docstring, README and footnote ³⁰ (A-DOC-2407). B: a
+NESTED `<Override>` (well-formed, no schema) closed the outer's live
+end scan early — the outer's end tag dangling, the manifest
+ill-formed; an unterminated element ate the next one (B-CT-2401) →
+`overrideElementEnd`, depth-aware over live markup, stepping over a
+comment, CDATA or PI whole (pinned four shapes). `StylesPartChanged`
+was called unreachable from C/Python where `add_sheet` creating the
+part the styles relationship names reaches it (B-DOC-2402) → named on
+every save surface (`save_to_buffer` and the Python `set_cell_style`
+in round 25, B-DOC-2502), the -1 ruling recorded; the two save-time
+mappings pinned (B-PIN-2405).
+
+**Round 25.** `overrideElementEnd` reused the declaration boundary
+test, so an attribute-less nested `<Override>` went uncounted and the
+outer's end tag was left dangling again (in-house r25 A-CT-2501) →
+the element-name boundary. `holdsVariantOf` counted a directory
+marker as a held twin where every resolver of the styles part
+excludes one (A-CT-2502) → excluded. The unused `liveCloseTagEnd`
+removed and the r24 note corrected (A-DEAD-2503); the save-time
+`StylesPartChanged` on the registrations' header block and
+docstrings too (A-DOC-2504). B: `save_to_buffer` on C and Python
+and the Python `set_cell_style` name the save-time refusal
+(B-DOC-2502); "Which part" and `applyStylesPlanInto`'s doc state the
+extend path's `<Override>` rule beside the created part's
+(B-DOC-2503).
+
+**Round 26.** `entryIsDirectoryMarker`'s two rules and the remover's
+half of the marker rule pinned, the marker predicate one (the
+workbook's calls the store's), the three twin-rule contracts one case
+narrower (in-house r26 A-PIN-2601 / A-DUP-2602 / A-PIN-2603 /
+A-DOC-2604). B: the extend path short-circuited on the content type
+cached at open, so a declaration a later manifest rewrite removed
+(`removePart`'s collateral over a nested declaration) left the part
+saved undeclared (B-CT-2602) → the manifest is asked, a `Default`
+already typing the part read from its bytes too (r27 A-DOC-2702). The `.keep` arm types
+the created part by the twin's declaration — stated on the five
+surfaces (B-DOC-2603); the buffer save's and `applySavePlans`' doc
+enumerations name the styles work (B-DOC-2601).
+
+**Round 27.** `addDxf` accepted the font size `addStyle` refuses
+(`<sz val="nan"/>` in the part — in-house r27 A-DXF-2701) → the same
+rule, `InvalidStyle`, pinned. `heldPartIndex` took the first
+case-insensitive entry and only then asked whether it was a marker,
+so a marker spelled in one case hid a real case-variant part —
+`MalformedStylesXml` in one archive order, extended in the other
+(B-PART-2702) → a marker is skipped in both passes, the first
+non-marker match wins (pinned). Docs: the `Default` exception on the
+five surfaces and `defaultTypesPart`'s accept arm pinned (A-DOC-2704
+/ A-PIN-2703 / A-DOC-2702); the twin's declaration types the twin,
+the created part taking the manifest's `Default` (B-DOC-2701);
+`applySavePlans`' doc lists its phases in their order (B-DOC-2703).
+
+**Round 28.** The dxf font-size rule moved into the plan
+(`StylesPlan.addDxf`, `InvalidFontSize`), so the fresh writer refuses
+it as `addStyle` does and the editor folds it to `InvalidStyle` — the
+"mirrors `Writer.addDxf`" line true again (in-house r28 A-DOC-2804);
+every registration judges the part before the argument the Zig call
+receives (a torn part refuses `MalformedStylesXml` whatever that
+argument — A-ABI-2806, pinned; the C boundary's own readings — a
+NULL pointer with a length, an enum it does not spell — are `-1`
+before the call, r29 B-ABI-2904); the case-insensitive marker skip pinned with the marker
+listed ahead (A-PIN-2801); the dxf rule pinned on Python
+(A-PIN-2807); the two redundant marker checks behind `heldPartIndex`
+removed (A-DUP-2805); `applyStylesPlanInto`'s doc and the
+`InvalidStyle` doc carry the r27 rules and the size predicate as
+"non-finite or non-positive" on every surface (A-DOC-2802 /
+A-DOC-2803). B: the held-side marker rule on "Which part", footnote
+³⁰ and the header (B-DOC-2805); the rest converging with A's.
+
+**Round 29.** The dxf size rule pinned on the plan and on the Python
+writer (A-PIN-2901 / B-PIN-2901); `internNumFmt` judges the part's
+numFmt room before the empty argument, as `addStyle` does (A-ABI-2903
+/ B-ABI-2905); the `set_cell_style` order stated — the address, the
+part, the style index (A-ABI-2903); `Dxf.font_size`'s field doc, the
+writer's fuzz comment, `Writer.addDxf`'s doc, `Editor.add_dxf`'s
+docstring and matrix row 101 name the rule (A-DOC-2904 / B-DOC-2903);
+the C boundary's own readings stated ahead of the part (B-ABI-2904);
+the marker arms assert no vacuous absence (A-PIN-2905). Owner ruling
+recorded (B-PART-2906): the held-side marker rule extends a
+case-variant part a case-sensitive consumer cannot reach behind a
+marker spelled as the conventional name — LibreOffice renders the
+sheet unstyled, openpyxl refuses — not a regression (the source is
+already so), left as it is. The reader's conventional-name rule on
+the caller surfaces (B-DOC-2907).
+
+**Round 30.** A C0 control byte or invalid UTF-8 in a font name or
+a format was written verbatim into the part — ill-formed XML, openpyxl
+refusing the workbook — where the sheet writers refuse the same byte
+(in-house r30 B-TXT-3001) → the plan's one text rule (`xmlTextValid`:
+non-empty, valid UTF-8, no forbidden byte) on `addStyle`'s name and
+format and on `internNumFmt`, `InvalidFontName` / `InvalidNumberFormat`
+on the writer and `InvalidStyle` on the editor, pinned on the plan,
+the workbook and Python. The one font-size predicate for a style and
+a dxf, the `0` boundary pinned (A-PIN-3002); the numFmt-room refusal
+pinned ahead of the empty argument (A-PIN-3001); `set_cell_style`'s
+real order — the sheet index, the appends guard, the row, the column,
+the part, the style index — on the header, the export's doc and the
+docstring (A-ABI-3004 / B-DOC-3004); the numFmt-ROOM refusal on every
+caller list (B-DOC-3005); the header's S3d block reworded — the reader
+clause at its end, the exact-spelling-first precedence, the verb
+beside its object — and its one round citation a version (A-DOC-3005
+/ A-DOC-3006 / B-DOC-3002 / B-DOC-3003 / B-DOC-3006);
+`zlsx_writer_add_dxf`'s Zig doc names `InvalidFontSize` (A-DOC-3003).
+
+**Round 31.** `xmlTextValid` admitted U+FFFE / U+FFFF — valid UTF-8
+outside XML 1.0 `Char`, written verbatim, expat refusing the part
+(in-house r31 A-TXT-3101) → the rule walks code points: the C0 set,
+the two noncharacters. The two guarded values are attributes, whose
+normalisation folds a literal tab, LF or CR to a space (A-TXT-3102) →
+the plan's escaper spells the three as character references (pinned
+on the emit). The byte switch a third copy of
+`sheet_plan.isForbiddenXmlByte` (A-DUP-3103) — the two are separate
+build modules and cannot import each other, so the copy stays, named
+and kept in step. `addStyle`'s dominated format check removed, one
+rule — `internNumFmt`'s (A-PIN-3106); the r30 helpers moved out of
+`addStyle`'s doc comment, the escaper's comment true (A-DOC-3104);
+the text rule on every `InvalidStyle` enumeration and the
+part-before-argument precedence on the `add_style` / `add_dxf`
+status blocks (A-DOC-3105 / A-DOC-3107). B converged on the three
+defects (B-TXT-3101 / B-TXT-3102 / B-DUP-3106) and the split doc
+(B-DOC-3105); the text rule on the last caller surfaces — footnote
+³⁰, the Python README, `Workbook.addStyle`'s doc — reads "a C0
+control other than tab, LF or CR" (B-DOC-3103); the writer half named
+on `zlsx_writer_add_style_ex` and `Writer.add_style` (B-DOC-3104).
+
+**Round 32.** The text rule reached every `add_style` surface and no
+`intern_num_fmt` surface (in-house r32 A-DOC-3201) → all four; the
+fresh path's "unchanged byte for byte" qualified for the three
+characters now spelled as references (A-DOC-3202); the `add_style`
+docstring's duplicated clause (A-PY-3203); the writer block's
+unreachable "empty" status dropped (A-ABI-3204); the escaper's LF /
+CR arms and the code-point walk's accept side pinned (A-PIN-3205 /
+A-PIN-3206). Recorded, pre-existing and outside the diff, as owner
+follow-ups: the reader's `parseStyles` scans with a raw `indexOf`
+where `scanStylesPart` reads live markup — on a commented-out
+`<cellXfs>` decoy the saved file is right (openpyxl reads the new
+format) but `zlsx styles` reports the decoy and `Book.number_format`
+none (A-RD-3207); the sibling channels (`set_cell`, `write_row`,
+`add_sheet`) refuse the C0 set but write U+FFFE / U+FFFF verbatim into
+a sheet part, one class narrower than this slice's rule (A-TXT-3208).
+B: the "empty is `InvalidStyle` after the part" clause on footnote ³⁰
+and the Python README was false — empty is "unset" at the C boundary
+and `InvalidFontName` / `InvalidNumberFormat` on Python before the
+part (B-DOC-3201); the writer's own two surfaces —
+`zlsx_writer_add_style_ex`'s export doc and matrix row 93 — name the
+r30/r31 writer rule, a change to the shipped 0.8.0 writer (a tab in a
+name a reference now, a C0 control or U+FFFE refused; B-DOC-3202).
+
+**Round 33.** The empty-value clause on footnote ³⁰ and the README
+carried `add_style`'s rule alone — `intern_num_fmt`'s empty format is
+`InvalidStyle` after the part (in-house r33 A-DOC-3301); "which every
+reader decodes" was false for the typed overlay, which hands every
+attribute raw (A-TXT-3302); the accept-side pin survived a
+`@truncate` of the C0 guard — a code point whose low byte is C0
+pinned (A-PIN-3303); `_style_spec`'s comment states what its lines do
+(A-PY-3304); the `add_style` docstring states its order — the Python
+empty check, the part, the argument (A-PY-3305). B: the `add_style`
+export doc had attached "after the part" to the enum verdicts, which
+are the boundary's own readings and come first (B-ABI-3302); the
+README's created-part parenthetical un-spliced from the reader
+caveat, "gains them" (B-DOC-3303); `Writer.add_style`'s docstring
+names the empty-value rule `Editor.add_style` defers to (B-DOC-3304).
+
+**Dedup.** Within one save, against this editor's registrations —
+never against the part's own records: a style the workbook already
+spells is appended a second time (a read-back of the part's records as
+`Style` values is not in the slice; the reader's typed view is the way
+to inspect them). The save drains the registrations; the next one reads
+the extended part afresh, so indices keep counting up across saves in
+one editor (pinned: 3, then 5 after a save that added two).
+
+**Not in this slice.** The per-sheet registrations (`Worksheet.set*`
+/ `add*` — column widths, panes, merges, hyperlinks, comments, DV, CF)
+on an opened sheet: the same fresh-emit shape, dropped by `save` today
+(the matrix marks them `~`); `addDefinedName` → C + Py (it already
+lands on an opened workbook); `deleteCell` → C + Py + CLI; a standalone
+mark-recalc; the CLI leg of the trio; dedup against the part's records.
+`sheet_state`'s dxf bound now reads the part's `<dxf>` records
+(`dxfIdBound`, the baseline read whether or not a registration cached
+it — in-house r1 B-DXF-103), so an id the part holds and an `addDxf` id
+are both accepted by `addConditionalFormat*` on an opened workbook,
+though the rule itself still lands on the fresh path only. On the
+fresh path, `Workbook.empty` + `internNumFmt` alone reports
+`hasUnsavedChanges` while `saveFreshEmit` (gated on the plan's
+`isEmpty`, which ignores the format pool) writes no styles part — the
+drop is pre-existing, the predicate now names the staged work (r2
+B-FRESH-207; the opened path lands it). The Python surfaces differ on
+one name: `Writer.add_style(Style(font_size=0))` raises the writer's
+`InvalidFontSize`, `Editor.add_style` the editor's `InvalidStyle`
+(`Workbook.addStyle`'s fold) — stated on the docstring (r2 B-DOC-206).
+A part whose `numFmtId`s leave no room for one more format refuses
+`MalformedStylesXml` at the registration, judged before the plan takes
+it (r2 A/B-OVF-201: the mapping's add panicked on `4294967294` plus
+two formats); an entity-spelled `numFmtId` is read as the number it is
+(r2 A-FMT-203); a cell style alone maps against the part's records —
+no slot 0 on an empty `<cellXfs>` — and a part moved underneath it
+refuses at the save too (r2 A-IDX-205). Round 3: the pivot rebuild
+reads a staged style as the cell's (`sheetWritesChangeCache` hears a
+style on a source cell — and the per-sheet filters ahead of it count a
+style-only sheet, in-house r4 A/B-PIV-401 — and the grid's date check
+sees it: a date style this save registered is already in the part when
+the rebuild reads it, phase 0a rendering the plan before phase 0b, so
+it reads as any date style and refuses the rebuild, the save taking
+the marker alone; a style-only write marks the cache; in-house r3
+B-PIV-301); the relationship injector reads the rels part through the
+shared scanner — the exact type, the ids by attribute, either quote —
+where a substring scan injected a duplicate into a single-quoted part
+(r4 A-REL-402; the SST's injector shares it); the read-only dxf bound
+resolves the part's name without caching it, so a part moved after a
+rule alone is the one a later registration extends (r4 B-NAM-402); the
+relationship lands with the extension, never on a save that renders
+nothing (r4 B-INS-403); round 5: the injector's new element lands after
+the last relationship the walk saw, never at a closing tag found by
+substring (a comment can spell one, legal whitespace respells it — r5
+A-REL-501); the tables' and the root's closing tags are matched as
+markup with whitespace allowed before the `>` (`</fonts >`, r5
+A-SCN-503), so "a table that never closes" is what the refusal means;
+`maxInt(u32)` is never handed out as a `numFmtId` (the walk could not
+read it back — r5 B-FMT-501); a refused registration caches no part
+name (r5 B-NAM-502); the Python methods share `_structural_call` (r5
+A-PY-504); the CF forwarders' bound
+reads the part without arming the save's re-read (A/B-BASE-302); the
+`count` rewrite reads the attribute through the shared scanner, quoted
+sibling values skipped (A/B-SPL-302/303); a padded `numFmtId` is
+trimmed (A/B-FMT-304); the seeded defaults are `styles_plan`'s own
+public records (A-DUP-305); an empty table keeps what it holds behind
+the seeded defaults (A-BYT-306). The
+transaction's view rebuild (`recalc_txn.buildViews`) counts a staged
+style as staged cell work (in-house r1 A/B-TXN-101: a style-only sheet
+folded through a candidate kept its pre-swap view, and the next plain
+save re-emitted the sheet from it, dropping the style the fold wrote —
+measured, pinned on the mark-only arm with the sheet parsed before).

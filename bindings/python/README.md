@@ -357,8 +357,8 @@ plain `ZlsxError`s named after the cause: `SheetIndexOutOfRange`,
 selector that names nothing, like a sheet index), and the sequencing errors
 `RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` /
 `SheetDeleteRequiresCleanState` — a structural edit needs the sheet (the
-workbook, for a sheet delete) free of unsaved `set_cell` / `append_rows`
-writes; save first. Indices are integers (`operator.index`; a float, a
+workbook, for a sheet delete) free of unsaved `set_cell` / `set_cell_style` /
+`append_rows` writes; save first. Indices are integers (`operator.index`; a float, a
 string or a bool is a `TypeError`) in `[0, 2**32)` (`ValueError`),
 checked before the call — ctypes would otherwise truncate or wrap them.
 
@@ -368,8 +368,9 @@ checked before the call — ctypes would otherwise truncate or wrap them.
 `{"kind": "pivot_cache", …}` per cache no table reads; `[]` for a
 workbook without pivots. It reads the editor's current workbook state:
 structural edits are visible immediately — rename the host sheet and
-the record names it — while staged `set_cell` / `append_rows` writes
-reach the pivot graph at `save`, where a cache whose source they change
+the record names it — while staged `set_cell` / `set_cell_style` /
+`append_rows` writes reach the pivot graph at `save`, where a cache
+whose source they change
 is rebuilt or marked; save, then read, to see them.
 
 `Editor.defined_names()` / `zlsx.defined_names(path)` are the same
@@ -436,6 +437,85 @@ the grid (a split pane is the one such an edit refuses,
 `full_calc_on_load` in place; staged cell writes never touch the
 extent, the views or `<calcPr>`.
 
+## Styles on an existing workbook
+
+libzlsx 0.9.0+ exports the fresh writer's style registrations on an *opened*
+workbook (S3d slice 1). `Editor.add_style` / `add_dxf` / `intern_num_fmt`
+return the slot the record takes in the saved `xl/styles.xml` — the part is
+extended after the records it already holds, every other byte preserved; a
+workbook without the part gets it whole with its relationship and content
+type (an `<Override>` the package already holds for the name is re-typed, unless
+it is a case-variant twin's, which stays, typing the twin — the created part then
+takes the manifest's `Default` for its extension), a part held without either,
+or with a declaration lacking its `ContentType`, gains them (unless a `Default`
+already types it as the stylesheet), one declared under another type keeps that
+declaration — and `Editor.set_cell_style` puts the index on a cell
+(a cell the sheet lacks
+is created empty with it; a value keeps its value). The reader — `Book`, `zlsx styles` — still
+addresses `xl/styles.xml` literally, so an index registered against a part
+under another name resolves to none there (pre-existing). The `Style` / `Dxf` /
+`BorderSide` classes are the writer's (see *Style cheat sheet*).
+
+```python
+from zlsx import BorderSide, Style
+
+with zlsx.edit("report.xlsx") as ed:
+    highlight = ed.add_style(Style(
+        font_bold=True,
+        fill_pattern="solid", fill_fg_argb=0xFFFFFF00,
+        border_top=BorderSide(style="thin"),
+        number_format="yyyy-mm-dd",
+    ))                                     # the index of the NEW <xf>, after the part's own
+    ed.set_cell_style(0, 2, 0, highlight)  # sheet 0, row 2, column A
+    ed.set_cell(0, 2, 1, 42.5)
+    ed.set_cell_style(0, 2, 1, highlight)  # a staged value takes the style too
+    ed.set_cell_style(0, 9, 0, 0)          # any slot the part already holds
+    ed.save("styled.xlsx")
+```
+
+Dedup is within one save, against this editor's registrations — never against
+the part's own records (registering a style the workbook already spells
+appends a second record). A save drains the registrations; the next one reads
+the extended part afresh, so indices keep counting up across saves in one
+editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
+
+A sheet with a staged style is re-emitted at save as a sheet with a `set_cell`
+is (row heights / hidden flags / spans, shared- and array-formula group
+attributes and cell metadata attributes are
+not carried, a rich inline string keeps its first run's text only, `<dimension>`
+is not widened; a cell without an `r` attribute or a row holding no cell is
+dropped — `set_cell`'s pre-existing rule). A staged style is a staged cell
+write to the structural edits (`RowEditRequiresCleanSheet` /
+`ColEditRequiresCleanSheet`, as for a staged value) and
+`append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
+refuses `SheetHasUnsavedAppends`; an index past the part and the
+registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
+staged; a font size not finite and positive, or a font name or format that is
+not XML text throughout (a C0 control other than tab, LF or CR, U+FFFE /
+U+FFFF) is `ZlsxError` `InvalidStyle`, judged after the part; an empty font
+name or format is `InvalidFontName` / `InvalidNumberFormat`, judged in Python
+before the part (as `Writer.add_style` judges it — on C an empty value is
+"unset"); an empty format on `intern_num_fmt` is `InvalidStyle`, judged after
+the part — the fresh `Writer` names the same text and size refusals
+`InvalidFontSize` / `InvalidFontName` / `InvalidNumberFormat`. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
+registration mapped against is no longer the one the package resolves to, or
+one the extension can read — a structural edit created the part the styles
+relationship names (`add_sheet` on a package whose relationship targets a
+missing worksheet name); re-open and register again. A styles part the extension cannot read (no `<styleSheet>` root, a
+self-closed one or one whose default namespace is not the main spreadsheetml
+one (Transitional or ISO-Strict), an element that never closes, a stray closing tag between
+tables or records, a table out of the schema's order, a table or a record under
+a prefix, inside a markup-compatibility element or redeclaring its default
+namespace to a URI other than the root's, numFmt ids leaving no room for the
+format (the next id past 4294967295) — or
+the relationship's target is a part the package holds that is no stylesheet — or,
+the part absent, an entry under `xl/styles.xml/` so no part may be created at the
+conventional name) raises
+`ZlsxRefusal` `MalformedStylesXml` at the first registration — nothing
+staged, the editor still saves the passthrough. The per-sheet layout
+registrations (column widths, panes, merges, hyperlinks, comments, DV / CF)
+on an opened sheet are the next S3d slice.
+
 ## Embeddings
 
 libzlsx 0.9.0+ writes the embedding set the E5 read surface reports:
@@ -480,8 +560,8 @@ cell (a shared or inline string's runs joined, entities resolved; a number's
 `[0, 2**64)` — and omits rows with nothing embeddable (`[]` for a range
 with none); `include_formulas` admits formula cells with a cached value, the
 coverage flag's reading. A sheet the editor holds staged `set_cell` writes
-(or the header cell `rename_table_column` stages) or `append_rows` for
-refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
+(or the header cell `rename_table_column` stages), `set_cell_style` or
+`append_rows` for refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
 / `SheetHasUnsavedAppends` — the parsed view the read walks does not carry
 them; save and re-open, or read first); `InvalidRange` (the range, or a
 column outside it) and `SheetIndexOutOfRange` are the call's; a workbook
@@ -756,6 +836,9 @@ with zlsx.write("out.xlsx") as w:
   formulas, pivot locations and sources); what cannot be kept consistent
   refuses with a typed
   `ZlsxRefusal` — see *Structural edits & pivots*
+- Styles on an existing workbook (0.9.0+): `Editor.add_style` / `add_dxf` /
+  `intern_num_fmt` return the slot in the saved `xl/styles.xml`,
+  `Editor.set_cell_style` puts it on a cell — see *Styles on an existing workbook*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts
 - Defined names, typed read (0.9.0+): `Editor.defined_names()` /

@@ -2572,19 +2572,12 @@ comptime {
     std.debug.assert(@offsetOf(CStyle, "border_diagonal_color_argb") == 48);
 }
 
-/// Register a style with all stage-2 fields. Pass a NULL/zero
-/// `font_name_*` plus cleared flag bits to opt out of any field.
-/// The ABI is additive on top of zlsx_writer_add_style — existing
-/// callers that only need bold/italic keep using the simpler function.
-export fn zlsx_writer_add_style_ex(
-    w: *Writer,
-    spec: *const CStyle,
-    out_index: *u32,
-    err_buf: ?[*]u8,
-    err_buf_len: usize,
-) callconv(.c) i32 {
-    const state: *WriterState = @ptrCast(@alignCast(w));
-
+/// `zlsx_style_t` → `Style`, the one reading `zlsx_writer_add_style_ex`
+/// and `zlsx_editor_add_style` share. Null on a contract violation —
+/// an enum value the header does not spell (`BadAlignmentValue`,
+/// `BadFillPattern`, `BadBorderStyle`), or a NULL string pointer with
+/// a non-zero length (`InvalidInput`) — the name in errbuf.
+fn styleFromC(spec: *const CStyle, err_buf: ?[*]u8, err_buf_len: usize) ?writer_mod.Style {
     const halign: writer_mod.HAlign = switch (spec.alignment_horizontal) {
         0 => .general,
         1 => .left,
@@ -2596,7 +2589,7 @@ export fn zlsx_writer_add_style_ex(
         7 => .distributed,
         else => {
             writeError(err_buf, err_buf_len, "BadAlignmentValue");
-            return -1;
+            return null;
         },
     };
 
@@ -2612,7 +2605,7 @@ export fn zlsx_writer_add_style_ex(
     if (spec.flags & FILL_BG_SET != 0) style.fill_bg_argb = spec.fill_bg_argb;
     if (spec.fill_pattern > 18) {
         writeError(err_buf, err_buf_len, "BadFillPattern");
-        return -1;
+        return null;
     }
     style.fill_pattern = @enumFromInt(spec.fill_pattern);
 
@@ -2627,7 +2620,7 @@ export fn zlsx_writer_add_style_ex(
     for (sides) |side| {
         if (side.tag > 13) {
             writeError(err_buf, err_buf_len, "BadBorderStyle");
-            return -1;
+            return null;
         }
         side.out.style = @enumFromInt(side.tag);
         if (spec.flags2 & side.flag != 0) side.out.color_argb = side.color;
@@ -2635,13 +2628,46 @@ export fn zlsx_writer_add_style_ex(
     style.diagonal_up = spec.diagonal_up != 0;
     style.diagonal_down = spec.diagonal_down != 0;
 
+    // A NULL string pointer with a non-zero length is a statement
+    // about the call, never a slice (in-house S3d slice 1 r8
+    // B-DOC-803: the header promised it; the two exports share it).
     if (spec.font_name_len > 0) {
+        if (@intFromPtr(spec.font_name_ptr) == 0) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        }
         style.font_name = spec.font_name_ptr[0..spec.font_name_len];
     }
     if (spec.num_fmt_len > 0) {
+        if (@intFromPtr(spec.num_fmt_ptr) == 0) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        }
         style.number_format = spec.num_fmt_ptr[0..spec.num_fmt_len];
     }
 
+    return style;
+}
+
+/// Register a style with all stage-2 fields. Pass a NULL/zero
+/// `font_name_*` plus cleared flag bits to opt out of any field.
+/// The ABI is additive on top of zlsx_writer_add_style — existing
+/// callers that only need bold/italic keep using the simpler function.
+/// -1 with err="InvalidFontSize" for a non-finite or non-positive
+/// font size, "InvalidFontName" / "InvalidNumberFormat" for a name or
+/// format that is not XML text throughout (a C0 control other than
+/// tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF; a NULL pointer with
+/// a length is InvalidInput); tab, LF and CR are carried as character
+/// references (S3d slice 1 r30–r32).
+export fn zlsx_writer_add_style_ex(
+    w: *Writer,
+    spec: *const CStyle,
+    out_index: *u32,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state: *WriterState = @ptrCast(@alignCast(w));
+    const style = styleFromC(spec, err_buf, err_buf_len) orelse return -1;
     const idx = state.inner.addStyle(style) catch |e| {
         writeError(err_buf, err_buf_len, @errorName(e));
         return -1;
@@ -3098,8 +3124,9 @@ pub const CDxf = extern struct {
 
 /// Register a differential format on the workbook-wide `<dxfs>`
 /// table. Returns 0 on success with `*out_dxf_id` set; -1 on
-/// alloc failure. Content-dedup'd: repeat registrations with the
-/// same CDxf return the same id.
+/// alloc failure or with err="InvalidFontSize" for a non-finite or
+/// non-positive font size (S3d slice 1 r28). Content-dedup'd: repeat
+/// registrations with the same CDxf return the same id.
 export fn zlsx_writer_add_dxf(
     w: *Writer,
     dxf: *const CDxf,
@@ -3108,7 +3135,19 @@ export fn zlsx_writer_add_dxf(
     err_buf_len: usize,
 ) callconv(.c) i32 {
     const state: *WriterState = @ptrCast(@alignCast(w));
-    const z_dxf: writer_mod.Dxf = .{
+    const id = state.inner.addDxf(dxfFromC(dxf)) catch |e| {
+        writeError(err_buf, err_buf_len, @errorName(e));
+        return -1;
+    };
+    out_dxf_id.* = id;
+    return 0;
+}
+
+/// `zlsx_dxf_t` → `Dxf`, the one reading `zlsx_writer_add_dxf` and
+/// `zlsx_editor_add_dxf` share. Infallible: a border code the header
+/// does not spell reads as `.none` (`cDxfBorderToZig`'s rule).
+fn dxfFromC(dxf: *const CDxf) writer_mod.Dxf {
+    return .{
         .font_bold = dxf.bold != 0,
         .font_italic = dxf.italic != 0,
         .font_color_argb = if (dxf.has_color != 0) dxf.color_argb else null,
@@ -3119,12 +3158,6 @@ export fn zlsx_writer_add_dxf(
         .border_top = cDxfBorderToZig(dxf.border_top),
         .border_bottom = cDxfBorderToZig(dxf.border_bottom),
     };
-    const id = state.inner.addDxf(z_dxf) catch |e| {
-        writeError(err_buf, err_buf_len, @errorName(e));
-        return -1;
-    };
-    out_dxf_id.* = id;
-    return 0;
 }
 
 fn cDxfBorderToZig(s: CDxfBorderSide) writer_mod.BorderSide {
@@ -6392,6 +6425,9 @@ const structural_refusals = [_]anyerror{
     // `MalformedExtensionXml` (the S2 shape) and folded into the two
     // `*UnsafeForSheet` names by the editor's row / column pre-flights.
     error.MalformedChartXml,
+    // S3d slice 1: a styles part the extension cannot read — judged at
+    // the registration or the cell style, nothing staged.
+    error.MalformedStylesXml,
     error.MalformedSheetRels,
     error.MalformedWorkbookRels,
     error.MalformedDrawingRels,
@@ -11745,6 +11781,161 @@ export fn zlsx_editor_strip_embeddings(
     return ZLSX_OK;
 }
 
+// ─── S3d slice 1: styles on the editor handle ───────────────────────
+//
+// `Workbook.addStyle` / `addDxf` / `internNumFmt` and `Worksheet.
+// setCellStyle` behind status_v1 exports: the record lands in the
+// workbook's `xl/styles.xml` at save — the part extended after the
+// records it holds, or created whole — and the returned index is the
+// slot it takes there. One macro, `ZLSX_HAS_EDITOR_STYLES`. The
+// `zlsx_style_t` / `zlsx_dxf_t` readings are the writer's.
+
+/// Register a cell style on the editor's workbook. `*out_index` is
+/// the `s="…"` slot the record takes in the saved part; dedup within
+/// the save. -1: InvalidInput (a NULL handle, spec or out; a NULL
+/// font-name or format pointer with a non-zero length) and the enum
+/// verdicts `styleFromC` names — the boundary's own readings, judged
+/// BEFORE the part; then -2 for a torn part whatever the argument;
+/// then InvalidStyle (a non-finite or non-positive font size;
+/// a font name or format that is not XML text throughout — a C0 control other
+/// than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF
+/// — an empty font name or format is "unset" here, `*_len == 0`); -2 MalformedStylesXml with the name
+/// in the diag and no plane, nothing staged; -3 OutOfMemory.
+/// `*out_index` is 0 on every failure past the NULL checks.
+export fn zlsx_editor_add_style(
+    ed: ?*Editor,
+    spec: ?*const CStyle,
+    out_index: ?*u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const s = spec orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = out_index orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    out.* = 0;
+    const style = styleFromC(s, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const idx = state.inner.workbook.addStyle(style) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    out.* = idx;
+    return ZLSX_OK;
+}
+
+/// Register a differential format on the editor's workbook.
+/// `*out_dxf_id` is the dxfId the record takes in the saved part —
+/// after the `<dxf>` records it holds. Statuses as
+/// `zlsx_editor_add_style`'s — the part first, then the dxf's own font
+/// size — without the enum verdicts (a border code the header does
+/// not spell reads as none).
+export fn zlsx_editor_add_dxf(
+    ed: ?*Editor,
+    dxf: ?*const CDxf,
+    out_dxf_id: ?*u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const d = dxf orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    const out = out_dxf_id orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    out.* = 0;
+    const id = state.inner.workbook.addDxf(dxfFromC(d)) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    out.* = id;
+    return ZLSX_OK;
+}
+
+/// Intern a number format on the editor's workbook. `*out_id` is the
+/// numFmtId the format takes in the saved part — the first free id
+/// above every `<numFmt>` of its `<numFmts>` table and every custom
+/// id an `<xf>` names (a dxf's inline format is not counted), 164 at
+/// least; the same id for the
+/// same bytes within a save. -1: InvalidInput (a NULL handle or out,
+/// a NULL `ptr` with a non-zero `len`), InvalidStyle (an empty
+/// format, or one that is not XML text throughout — a C0 control
+/// other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF — judged
+/// after the part); -2 / -3 as `zlsx_editor_add_style`'s.
+export fn zlsx_editor_intern_num_fmt(
+    ed: ?*Editor,
+    ptr: ?[*]const u8,
+    len: usize,
+    out_id: ?*u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const out = out_id orelse {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    out.* = 0;
+    const code = bytesArg(ptr, len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const id = state.inner.workbook.internNumFmt(code) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    out.* = id;
+    return ZLSX_OK;
+}
+
+/// Stage a style on the cell at (`row`, `col`) of `sheet_idx` —
+/// `zlsx_editor_set_cell`'s spelling: `row` 1-based, `col` 0-based.
+/// After the save the cell's `s="…"` is `style_idx`: a slot the
+/// workbook's `<cellXfs>` holds, or one `zlsx_editor_add_style`
+/// returned for this save; a cell the sheet lacks is created empty
+/// with it, a cell with a value keeps the value; the last call for a
+/// cell wins. In order: -1 InvalidInput (a NULL handle),
+/// SheetIndexOutOfRange, SheetHasUnsavedAppends, RowIndexOutOfRange,
+/// ColumnIndexOutOfRange; then -2 MalformedStylesXml (the part); then
+/// -1 UnknownStyleIndex (past both ranges — judged before anything is
+/// staged); -3 OutOfMemory (r30 A-ABI-3004).
+export fn zlsx_editor_set_cell_style(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    row: u32,
+    col: u32,
+    style_idx: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    // The diag first, as every status export preps it: a `-1` never
+    // leaves a reused diag carrying an earlier call's refusal
+    // (in-house r2 B-ABI-203).
+    if (!prepDiag(diag, err_buf, err_buf_len)) return ZLSX_ERROR;
+    const state = editorStateOrNull(ed, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.setCellStyle(sheet_idx, row, col, style_idx) catch |e| {
+        return failMapped(e, diag, err_buf, err_buf_len);
+    };
+    return ZLSX_OK;
+}
+
 // ── S3c slice 1 tests ─────────────────────────────────────────────────
 
 /// Two sheets — three text rows under a header on `Docs`, one row on
@@ -13752,4 +13943,336 @@ test "recalc-transaction guard: after add_sheet, insert_row, rename_sheet, set_e
             }
         }
     }
+}
+
+// ── S3d slice 1 tests ─────────────────────────────────────────────────
+
+/// Two sheets from the fresh writer — the Zig pins' fixture: `S` a bold
+/// header, a plain number and an italic `0.00` cell under a bold-dxf
+/// rule; `T` one number. The part: one `<numFmt>` (164), three fonts,
+/// two fills, one border, three `<xf>`, one `<dxf>`.
+fn writeS3d1Fixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = writer_mod.Writer.init(alloc);
+    defer w.deinit();
+    const bold = try w.addStyle(.{ .font_bold = true });
+    const italic = try w.addStyle(.{ .font_italic = true, .number_format = "0.00" });
+    const dxf = try w.addDxf(.{ .font_bold = true });
+    const s = try w.addSheet("S");
+    try s.writeRowStyled(&.{.{ .string = "h" }}, &.{bold});
+    try s.writeRowStyled(&.{.{ .number = 1 }}, &.{0});
+    try s.writeRowStyled(&.{.{ .string = "x" }}, &.{italic});
+    try s.addConditionalFormatCellIs("A2:A3", .greater_than, "0", null, dxf);
+    const t = try w.addSheet("T");
+    try t.writeRow(&.{.{ .number = 5 }});
+    try w.save(io, path);
+    return path;
+}
+
+/// The fixture with its styles part replaced by `styles`.
+fn writeS3d1WithStyles(io: std.Io, tt: *TestTmp, name: []const u8, styles: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const src = try writeS3d1Fixture(io, tt, "s3d1_c_src_styles.xlsx");
+    defer alloc.free(src);
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var wb = try zlsx_pkg.Workbook.open(alloc, io, src);
+    defer wb.deinit();
+    try wb.store.replacePart("xl/styles.xml", styles);
+    try wb.save(io, path);
+    return path;
+}
+
+/// A `zlsx_style_t` with every field unset — the C caller's zeroed
+/// struct, the two string pointers non-null.
+fn s3d1Spec() CStyle {
+    return .{
+        .font_bold = 0,
+        .font_italic = 0,
+        .alignment_horizontal = 0,
+        .wrap_text = 0,
+        .flags = 0,
+        .fill_pattern = 0,
+        .flags2 = 0,
+        ._pad0 = .{0},
+        .font_size = 0,
+        .font_color_argb = 0,
+        .fill_fg_argb = 0,
+        .fill_bg_argb = 0,
+        .border_left_style = 0,
+        .border_right_style = 0,
+        .border_top_style = 0,
+        .border_bottom_style = 0,
+        .border_diagonal_style = 0,
+        .diagonal_up = 0,
+        .diagonal_down = 0,
+        ._pad1 = .{0},
+        .border_left_color_argb = 0,
+        .border_right_color_argb = 0,
+        .border_top_color_argb = 0,
+        .border_bottom_color_argb = 0,
+        .border_diagonal_color_argb = 0,
+        .font_name_ptr = "".ptr,
+        .font_name_len = 0,
+        .num_fmt_ptr = "".ptr,
+        .num_fmt_len = 0,
+    };
+}
+
+fn s3d1Dxf() CDxf {
+    return .{
+        .bold = 0,
+        .italic = 0,
+        .has_color = 0,
+        .has_fill = 0,
+        .color_argb = 0,
+        .fill_fg_argb = 0,
+        .has_size = 0,
+        ._pad = .{ 0, 0, 0 },
+        .size = 0,
+        .border_left = .{ .style = 0, .has_color = 0, ._pad = .{ 0, 0 }, .color_argb = 0 },
+        .border_right = .{ .style = 0, .has_color = 0, ._pad = .{ 0, 0 }, .color_argb = 0 },
+        .border_top = .{ .style = 0, .has_color = 0, ._pad = .{ 0, 0 }, .color_argb = 0 },
+        .border_bottom = .{ .style = 0, .has_color = 0, ._pad = .{ 0, 0 }, .color_argb = 0 },
+    };
+}
+
+fn s3d1Staged(ed: *Editor) bool {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    return state.inner.workbook.hasStagedStyleWork();
+}
+
+test "S3d slice 1 editor styles: the registrations extend the part at save — each index the slot its record takes, the cell styles landed, the reader resolving them; dedup within the save; the base re-read after the save" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3d1Fixture(io, &tt, "s3d1_c.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3d1_c_out.xlsx");
+    defer alloc.free(out);
+
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var spec = s3d1Spec();
+    spec.font_bold = 1;
+    spec.flags = FILL_FG_SET;
+    spec.fill_pattern = 1;
+    spec.fill_fg_argb = 0xFFFFFF00;
+    spec.border_top_style = 1;
+    spec.num_fmt_ptr = "yyyy-mm-dd".ptr;
+    spec.num_fmt_len = "yyyy-mm-dd".len;
+    var idx: u32 = 99;
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 3), idx);
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+    zlsx_diag_release(&diag);
+    // Dedup within the save; the diag optional.
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_style(ed, &spec, &idx, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 3), idx);
+    var italic = s3d1Spec();
+    italic.font_italic = 1;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_style(ed, &italic, &idx, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 4), idx);
+    var dxf = s3d1Dxf();
+    dxf.italic = 1;
+    var dxf_id: u32 = 99;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_dxf(ed, &dxf, &dxf_id, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 1), dxf_id);
+    var fmt_id: u32 = 99;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_intern_num_fmt(ed, "0%", 2, &fmt_id, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 166), fmt_id);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_intern_num_fmt(ed, "yyyy-mm-dd", 10, &fmt_id, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 165), fmt_id);
+    try std.testing.expect(s3d1Staged(ed));
+
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_cell_style(ed, 0, 2, 0, 3, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    zlsx_diag_release(&diag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_cell_style(ed, 0, 7, 2, 4, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_cell_style(ed, 0, 1, 0, 0, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    try std.testing.expect(!s3d1Staged(ed));
+    // The base is the extended part's now.
+    var wrap = s3d1Spec();
+    wrap.wrap_text = 1;
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_style(ed, &wrap, &idx, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 5), idx);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_dxf(ed, &dxf, &dxf_id, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 2), dxf_id);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_intern_num_fmt(ed, "0.0", 3, &fmt_id, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(@as(u32, 167), fmt_id);
+
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        const sv = (try wb.styles()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 5), sv.cell_xfs.len);
+        try std.testing.expectEqual(@as(?u32, 3), sv.cell_xfs[3].font_id);
+        try std.testing.expectEqual(@as(?u32, 2), sv.cell_xfs[3].fill_id);
+        try std.testing.expectEqual(@as(?u32, 1), sv.cell_xfs[3].border_id);
+        try std.testing.expectEqual(@as(?u32, 165), sv.cell_xfs[3].num_fmt_id);
+        try std.testing.expect(sv.fonts[3].bold);
+        try std.testing.expect(sv.fonts[4].italic);
+        const styles = ((try wb.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).bytes;
+        try std.testing.expect(std.mem.indexOf(u8, styles, "<dxfs count=\"2\"><dxf><font><b/></font></dxf><dxf><font><i/></font></dxf></dxfs>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, styles, "<numFmt numFmtId=\"166\" formatCode=\"0%\"/>") != null);
+        const ws = try wb.sheet(0);
+        try std.testing.expectEqual(@as(?u32, 3), (try ws.cellByRef("A2")).?.style_idx);
+        try std.testing.expectEqual(@as(?u32, 0), (try ws.cellByRef("A1")).?.style_idx);
+        const c7 = (try ws.cellByRef("C7")).?;
+        try std.testing.expectEqual(@as(?u32, 4), c7.style_idx);
+        try std.testing.expect(c7.raw_value == null);
+    }
+    // The reader resolves the new records as any producer's.
+    {
+        var book = try xlsx.Book.open(alloc, io, out);
+        defer book.deinit();
+        try std.testing.expect(book.cellFont(3).?.bold);
+        try std.testing.expectEqualStrings("yyyy-mm-dd", book.numberFormat(3).?);
+        try std.testing.expect(book.cellFont(4).?.italic);
+    }
+}
+
+test "S3d slice 1 editor styles: statements about the call are -1 with the name in errbuf, the out 0, the diag as prep left it, nothing staged — the save the passthrough" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3d1Fixture(io, &tt, "s3d1_c_calls.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3d1_c_calls_out.xlsx");
+    defer alloc.free(out);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var spec = s3d1Spec();
+    var dxf = s3d1Dxf();
+    var idx: u32 = 99;
+
+    // The diag is prepped before any verdict — a NULL handle, spec or
+    // out included — so every `-1` leaves it at plane NONE with no
+    // name, never an earlier call's refusal. Each case starts from a
+    // diag that carries one, to prove the prep.
+    const expectCase = struct {
+        fn run(status: i32, name: []const u8, err: []const u8, diag: *CDiag) !void {
+            try std.testing.expectEqual(ZLSX_ERROR, status);
+            try std.testing.expectEqualStrings(name, std.mem.sliceTo(err, 0));
+            try std.testing.expectEqual(plane_none, diag.plane);
+            try std.testing.expectEqual(@as(usize, 0), diagName(diag).len);
+            diag.* = freshDiag();
+            diag.plane = 7;
+            diagSetError(diag, "MalformedStylesXml");
+        }
+    }.run;
+    var diag = freshDiag();
+    diagSetError(&diag, "MalformedStylesXml");
+    // NULL handle / spec / out.
+    try expectCase(zlsx_editor_add_style(null, &spec, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_style(ed, null, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_style(ed, &spec, null, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_dxf(null, &dxf, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_dxf(ed, null, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_dxf(ed, &dxf, null, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_intern_num_fmt(null, "0", 1, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_intern_num_fmt(ed, "0", 1, null, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_intern_num_fmt(ed, null, 1, &idx, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_cell_style(null, 0, 1, 0, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    // The writer's enum verdicts, and the plan's.
+    spec.fill_pattern = 19;
+    idx = 99;
+    try expectCase(zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len), "BadFillPattern", &err_buf, &diag);
+    try std.testing.expectEqual(@as(u32, 0), idx);
+    spec = s3d1Spec();
+    spec.alignment_horizontal = 8;
+    try expectCase(zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len), "BadAlignmentValue", &err_buf, &diag);
+    spec = s3d1Spec();
+    spec.border_diagonal_style = 14;
+    try expectCase(zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len), "BadBorderStyle", &err_buf, &diag);
+    spec = s3d1Spec();
+    spec.flags = FONT_SIZE_SET;
+    spec.font_size = 0;
+    try expectCase(zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len), "InvalidStyle", &err_buf, &diag);
+    idx = 99;
+    try expectCase(zlsx_editor_intern_num_fmt(ed, "", 0, &idx, &diag, &err_buf, err_buf.len), "InvalidStyle", &err_buf, &diag);
+    try std.testing.expectEqual(@as(u32, 0), idx);
+    // The cell style's bounds, the index last: three records in the
+    // part, none registered.
+    for ([_]struct { sheet: u32, row: u32, col: u32, style: u32, name: []const u8 }{
+        .{ .sheet = 2, .row = 1, .col = 0, .style = 0, .name = "SheetIndexOutOfRange" },
+        .{ .sheet = 0, .row = 0, .col = 0, .style = 0, .name = "RowIndexOutOfRange" },
+        .{ .sheet = 0, .row = 1, .col = 16384, .style = 0, .name = "ColumnIndexOutOfRange" },
+        .{ .sheet = 0, .row = 1, .col = 0, .style = 3, .name = "UnknownStyleIndex" },
+    }) |c| {
+        try expectCase(zlsx_editor_set_cell_style(ed, c.sheet, c.row, c.col, c.style, &diag, &err_buf, err_buf.len), c.name, &err_buf, &diag);
+    }
+    // Appended rows on the sheet.
+    const cell: CCell = .{ .tag = @intFromEnum(CellTag.number), .str_len = 0, .str_ptr = null, .i = 0, .f = 9, .b = 0, ._pad = .{0} ** 7 };
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_append_row(ed, 1, @ptrCast(&cell), 1, &err_buf, err_buf.len));
+    try expectCase(zlsx_editor_set_cell_style(ed, 1, 1, 0, 0, &diag, &err_buf, err_buf.len), "SheetHasUnsavedAppends", &err_buf, &diag);
+    try std.testing.expect(!s3d1Staged(ed));
+    // A second editor over the same source, untouched: the passthrough.
+    const ed2 = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed2);
+    try expectCase(zlsx_editor_set_cell_style(ed2, 0, 1, 0, 3, &diag, &err_buf, err_buf.len), "UnknownStyleIndex", &err_buf, &diag);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed2, out.ptr, out.len, &err_buf, err_buf.len));
+    try expectSameBytes(io, path, out);
+}
+
+test "S3d slice 1 editor styles: a styles part the extension cannot read is -2 MalformedStylesXml on every export — the name in the diag, plane NONE, errbuf agreeing, nothing staged, the save the passthrough" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3d1WithStyles(io, &tt, "s3d1_c_torn.xlsx", "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font/></styleSheet>");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3d1_c_torn_out.xlsx");
+    defer alloc.free(out);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var spec = s3d1Spec();
+    spec.font_bold = 1;
+    var dxf = s3d1Dxf();
+    var idx: u32 = 99;
+    var diag = freshDiag();
+    const statuses = [_]i32{
+        zlsx_editor_add_style(ed, &spec, &idx, &diag, &err_buf, err_buf.len),
+        zlsx_editor_add_dxf(ed, &dxf, &idx, &diag, &err_buf, err_buf.len),
+        zlsx_editor_intern_num_fmt(ed, "0", 1, &idx, &diag, &err_buf, err_buf.len),
+        zlsx_editor_set_cell_style(ed, 0, 1, 0, 0, &diag, &err_buf, err_buf.len),
+    };
+    for (statuses) |status| try std.testing.expectEqual(ZLSX_REFUSED, status);
+    try std.testing.expectEqualStrings("MalformedStylesXml", diagName(&diag));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqualStrings("MalformedStylesXml", std.mem.sliceTo(&err_buf, 0));
+    try std.testing.expectEqual(@as(u32, 0), idx);
+    zlsx_diag_release(&diag);
+    try std.testing.expect(!s3d1Staged(ed));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    try expectSameBytes(io, path, out);
+}
+
+test "S3d slice 1 editor styles: the plane of every verdict — MalformedStylesXml a refusal with no plane, the call's names -1, OutOfMemory -3" {
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedStylesXml));
+    for ([_]anyerror{ error.UnknownStyleIndex, error.InvalidStyle, error.SheetHasUnsavedAppends, error.RowIndexOutOfRange, error.ColumnIndexOutOfRange, error.SheetIndexOutOfRange }) |e| {
+        try std.testing.expectEqual(ZLSX_ERROR, statusOf(e));
+    }
+    try std.testing.expectEqual(ZLSX_NOMEM, statusOf(error.OutOfMemory));
+    var diag = freshDiag();
+    try std.testing.expect(prepDiag(&diag, null, 0));
+    diagSetError(&diag, "MalformedStylesXml");
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqualStrings("MalformedStylesXml", diagName(&diag));
 }
