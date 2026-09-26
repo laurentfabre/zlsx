@@ -163,13 +163,6 @@ def test_statements_about_the_call_stage_nothing(tmp_path):
         for bad in (float("nan"), float("inf"), -3.0, 0.0):
             with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
                 ed.add_dxf(Dxf(font_size=bad))
-    # …and the fresh writer keeps the same rule under its own name (r28
-    # A-DOC-2804, pinned r29 B-PIN-2901).
-    with zlsx.Writer(tmp_path / "w.xlsx") as w:
-        for bad in (float("nan"), float("inf"), -3.0, 0.0):
-            with pytest.raises(zlsx.ZlsxError, match="InvalidFontSize"):
-                w.add_dxf(Dxf(font_size=bad))
-        w.add_sheet("S").write_row([1])
         with pytest.raises(ValueError):
             ed.set_cell(2**32, 1, 0, 1)
         with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
@@ -196,6 +189,13 @@ def test_statements_about_the_call_stage_nothing(tmp_path):
             ed.insert_row(0, 1)
         with pytest.raises(zlsx.ZlsxError, match="SheetHasUnsavedMutations"):
             ed.append_rows(0, [[9]])
+    # …and the fresh writer keeps the same rule under its own name (r28
+    # A-DOC-2804, pinned r29 B-PIN-2901).
+    with zlsx.Writer(tmp_path / "w.xlsx") as w:
+        for bad in (float("nan"), float("inf"), -3.0, 0.0):
+            with pytest.raises(zlsx.ZlsxError, match="InvalidFontSize"):
+                w.add_dxf(Dxf(font_size=bad))
+        w.add_sheet("S").write_row([1])
 
 
 def test_a_styles_part_the_extension_cannot_read_refuses_before_anything_is_staged(tmp_path):

@@ -5358,7 +5358,10 @@ class Editor:
         one the package declares under another type keeps that
         declaration).
         Feed the index to
-        :meth:`set_cell_style`. The fresh writer's :class:`Style`, the
+        :meth:`set_cell_style`. The reader (:class:`Book`, ``zlsx
+        styles``) still addresses ``xl/styles.xml`` literally: an index
+        registered against a part under another name resolves to none
+        there (pre-existing). The fresh writer's :class:`Style`, the
         same fields and the same bytes in the file.
 
         Dedup is within one save, against this editor's registrations —
