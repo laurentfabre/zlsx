@@ -2044,8 +2044,16 @@ pub const Workbook = struct {
         // underneath (`PartStore.addPart`) moved which part the saved
         // relationship names with no change to the cached part's
         // bytes (r21 A-PART-2106).
+        // Resolved against the workbook's own store; the fold's
+        // candidate is the same generation by the transaction guard
+        // (`RecalcRequiresReopen` when an install moved it). A package
+        // the resolution now refuses (an entry under `xl/styles.xml/`
+        // added underneath) moved too (r22 A-DOC-2205).
         {
-            const now = try self.resolveStylesPartName();
+            const now = self.resolveStylesPartName() catch |e| switch (e) {
+                error.MalformedStylesXml => return error.StylesPartChanged,
+                else => return e,
+            };
             defer a.free(now);
             if (!std.mem.eql(u8, now, name)) return error.StylesPartChanged;
         }
@@ -33408,7 +33416,7 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const with_id = try injectWorkbookRelationship(a, &rs.store, no_id, styles_rel_type, "styles.xml");
         defer a.free(with_id);
         try std.testing.expect(std.mem.indexOf(u8, with_id, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
-        const upper_hex_mode = "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"http://example.com/s.xml\" TargetMode=\"&#X45;xternal\"/></Relationships>";
+        const upper_hex_mode = "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\" TargetMode=\"&#X45;xternal\"/></Relationships>";
         const beside_ext = try injectWorkbookRelationship(a, &rs.store, upper_hex_mode, styles_rel_type, "styles.xml");
         defer a.free(beside_ext);
         try std.testing.expect(std.mem.indexOf(u8, beside_ext, "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
@@ -34245,6 +34253,23 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         try std.testing.expect(!std.mem.eql(u8, ct, respelled));
         try wb.store.replacePart("[Content_Types].xml", respelled);
         try wb.save(io, variant);
+    }
+    // An exact declaration wins over a LATER case-variant one, and an
+    // `<OverrideX>` declares nothing (r22 A-CT-2203).
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const ct = try s3d1PartBytes(a, &wb, "[Content_Types].xml");
+        defer a.free(ct);
+        const close_at = std.mem.lastIndexOf(u8, ct, "</Types>") orelse return error.TestUnexpectedResult;
+        const loose_after = try std.mem.concat(a, u8, &.{ ct[0..close_at], "<Override PartName=\"/xl/STYLES.xml\" ContentType=\"application/x-loose\"/><OverrideX PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/x-x\"/>", ct[close_at..] });
+        defer a.free(loose_after);
+        try wb.store.replacePart("[Content_Types].xml", loose_after);
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        try std.testing.expectEqualStrings(styles_content_type, ((try re.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).content_type.?);
+        try std.testing.expect(std.mem.indexOf(u8, ((try re.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).content_type.?, "x-x") == null);
     }
     {
         var wb = try Workbook.open(a, io, variant);

@@ -3653,6 +3653,29 @@ spelled, absolute otherwise (the r20 two-session pin now asserts
 `/XL/styles.xml`); an `Id`-less relationship satisfies the presence
 test no more (B-REL-2103 = A-REL-2105).
 
+**Round 22.** The r21 retype answered null for a case-variant or a
+`ContentType`-less declaration and the appender then wrote a second
+`<Override>` — r20 B-CT-2004 reopened two spellings wide (in-house
+r22 A-CT-2201) → `retypeOverride` is tri-state: the exact declaration
+re-typed (or given the attribute it lacked), a case-variant one
+re-typed when no part is held at its spelling (a stale manifest) and
+kept — nothing staged — when one is (a twin's, A-CT-2202's mirror), a
+declaration already carrying the type staged not at all (A-CT-2206).
+The remover took a held twin's declaration with the part it removed
+(A-CT-2202) → the exact spelling always, a case-variant one only when
+its spelling holds no part; an unterminated element loses its start
+tag alone. The resolver's "exact first" was per-declaration, so a
+later loose one overwrote an earlier exact one (A-CT-2203) → exact
+declarations win wherever they stand; `<OverrideX` / `<DefaultX`
+declare nothing there too. The save-time re-resolution's own refusal
+(an entry added under `xl/styles.xml/`) reads `StylesPartChanged`,
+the package having moved (A-DOC-2205); `applyStylesPlanInto` states
+that it resolves against the workbook's store, the fold's candidate
+being the same generation by the transaction guard. Pins: the
+`TargetMode` decoder isolated (a target that names a part), the
+retype's three states, the remover's twin rule, the resolver's
+precedence (A-PIN-2204).
+
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
 spells is appended a second time (a read-back of the part's records as

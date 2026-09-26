@@ -5336,9 +5336,11 @@ class Editor:
         extended at :meth:`save` / :meth:`save_to_buffer` /
         :meth:`save_with_recalc`, every other byte preserved; a
         workbook without the part gets it whole, with its relationship
-        and content type; a part held without either gains it — one
-        the package declares under another type keeps that
-        declaration). Feed the index to
+        and content type — an ``<Override>`` the package already holds
+        for the name is re-typed, unless it is a case-variant twin's,
+        which stays; a part held without either gains it — one the
+        package declares under another type keeps that declaration).
+        Feed the index to
         :meth:`set_cell_style`. The fresh writer's :class:`Style`, the
         same fields and the same bytes in the file.
 

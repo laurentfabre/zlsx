@@ -2594,7 +2594,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part
  * gets it whole, with its relationship and content type — an Override
- * the package already holds for the name is re-typed; a part held
+ * the package already holds for the name is re-typed, unless it is a
+ * case-variant twin's, which stays; a part held
  * without its relationship or without a content-type Override gains
  * them — a part the package declares under another type keeps that
  * declaration), every other
