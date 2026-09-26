@@ -3187,6 +3187,10 @@ test "save-plan fold: the exported prepare and recalculate carry the run alone â
     var wb = try Workbook.open(a, io, path);
     defer wb.deinit();
     try (try wb.sheet(0)).setCell("A1", .{ .number = 41 });
+    // A style registered and staged rides along: an abandoned
+    // candidate and the in-memory swap both leave it staged (r15
+    // A-PIN-1503).
+    try (try wb.sheet(0)).setCellStyle("A1", try wb.addStyle(.{ .font_bold = true }));
     for (0..2) |pass| {
         var prepared = try prepare(&wb, a, io, fixed_run, .{});
         switch (prepared) {
@@ -3202,6 +3206,8 @@ test "save-plan fold: the exported prepare and recalculate carry the run alone â
             else => return error.TestUnexpectedResult,
         }
         try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).deltas.count());
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
     }
     // The run modeled the write (B1 = A1 + 1 over the staged 41) and
     // materialized none of it.
@@ -3224,12 +3230,17 @@ fn foldPassUnderFailure(a: Allocator, io: std.Io, path: []const u8) !void {
     wb.foldSavePlansInto(&next) catch |e| {
         try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
         try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
+        // The styles plan and the cell style survive the failure too
+        // (in-house S3d slice 1 r15 A-PIN-1503).
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
         try testing.expectEqual(installs, wb.store.installs);
         try testing.expectEqualStrings("1", try cellCache(try wb.sheet(0), "A1"));
         return e;
     };
     try testing.expectEqual(installs, wb.store.installs);
     try testing.expectEqual(@as(usize, 2), (try wb.sheet(0)).deltas.count());
+    try testing.expect(wb.hasStagedStyleWork());
     const folded = (try next.part(sheet_part)) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, folded.bytes, "<c r=\"A1\" s=\"1\"><v>41</v></c>") != null);
 }
@@ -3299,6 +3310,8 @@ fn transactionPassUnderFailure(a: Allocator, io: std.Io, path: []const u8, out: 
     var r = wb.saveWithRecalc(a, io, out, fixed_run, .{}) catch |e| {
         try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).deltas.count());
         try testing.expectEqual(@as(usize, 1), wb.workbook_xml_plan.defined_names.items.len);
+        try testing.expect(wb.styles_plan.hasWork());
+        try testing.expectEqual(@as(usize, 1), (try wb.sheet(0)).cell_styles.count());
         try testing.expectEqual(@as(usize, 0), wb.retained.items.len);
         try testing.expectEqual(wb.generation_installs, wb.store.installs);
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
@@ -3308,6 +3321,7 @@ fn transactionPassUnderFailure(a: Allocator, io: std.Io, path: []const u8, out: 
     r.deinit(a);
     try testing.expectEqual(@as(usize, 0), (try wb.sheet(0)).deltas.count());
     try testing.expectEqual(@as(usize, 0), wb.workbook_xml_plan.defined_names.items.len);
+    try testing.expect(!wb.hasStagedStyleWork());
 }
 
 test "save-plan fold: every allocation failure before the rename leaves the write and the name staged, the destination absent and the generation unmoved" {

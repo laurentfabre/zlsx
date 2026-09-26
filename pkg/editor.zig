@@ -943,8 +943,9 @@ pub const Editor = struct {
 
     /// Delete a sheet (Phase 3e, iter-sheet-3). Contract:
     ///   - Refuses if it's the only remaining sheet.
-    ///   - Refuses if there are staged setCell deltas or appended
-    ///     rows on ANY sheet (caller must `save` first then
+    ///   - Refuses if there are staged setCell deltas, cell styles
+    ///     (`setCellStyle`) or appended rows on ANY sheet (caller
+    ///     must `save` first then
     ///     re-open) — the delete rebuilds `sheet_paths`, and queued
     ///     mutations hold raw indices into it.
     ///   - Delegates to `Workbook.deleteSheet` (workbook.xml, rels

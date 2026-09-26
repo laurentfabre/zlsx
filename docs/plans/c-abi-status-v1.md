@@ -3118,10 +3118,16 @@ A-PART-301: a package holding it as `xl/style2.xml` got an orphan
 `xl/styles.xml` and indices mapped against the fresh layout, so the
 cell styled italic rendered bold in any consumer that follows the
 relationship) — resolved through the store's relationship map at the
-first registration, `xl/styles.xml` when no relationship names one; a
-part the workbook holds without its relationship gains the
-relationship with the extension. The reader and `Workbook.styles()`
-still address the conventional name (pre-existing, recorded).
+first registration, `xl/styles.xml` when no relationship names a part
+the slice could read or create (the resolver's own "none": empty, a
+scheme, a UNC or drive-letter target, a package-escaping or
+root-naming `..`; plus the OPC prefix rule — a name an existing part
+sits under, `xl` from a `.`, or over, `xl/workbook.xml/x` — which no
+part may take, §M1.11; in-house r13 A-REL-1302, r14 A-REL-1401, r15
+A-PART-1501); a part the workbook holds without its relationship
+gains the relationship with the extension. The reader and
+`Workbook.styles()` still address the conventional name
+(pre-existing, recorded).
 
 **What the index is.** The part's tables are read once per save —
 `scanStylesPart`, one lexical walk on the workbook scanner
@@ -3414,6 +3420,33 @@ list (B-EMT-1401); footnote ³⁰'s splice scope reads eight tables
 (A-PIN-1406); the remaining "another URI" comments, the Editor's
 predicate docs, the `<cellStyles>` seed reason, `saveWithRecalc`'s
 header and Zig paragraphs and footnote ²⁶ carried (A-DOC-1402..1405).
+
+**Round 15.** A styles relationship whose target collapses to the
+package root (`..`, `./..`, `/`) or to the owner's directory (`.` →
+`xl`) resolved to a name no part can take: the save created a part
+named `""` or `xl` (a ZIP entry the package cannot hold, an
+`<Override PartName="/"/>`), left the real part untouched, the style
+lost, the cell stamped with a fresh-base index that resolves to
+ANOTHER style in the untouched part (in-house r15 A-PART-1501, the
+accept side of the r13/r14 family) → the resolver answers "none" for
+the root (and collapses an absolute target's `.`/`..` segments); one
+creator-side test (`resolvePartTarget`: the resolver's answer minus
+a name an existing part sits under or over, minus a name whose
+segment spells a character the part-name grammar excludes — `\\`,
+`#`, `?`, a space, a segment ending in `.`: `sub\\styles.xml` made a
+file LibreOffice refused to load, `styles.xml#frag` one that lost the
+style; B-REL-1501) decides both the part's name and the injector's
+presence test (pinned end to end over ten targets). The injector
+judges a target only on a relationship of the type (A-REL-1502: no
+allocation, no OOM path from the others); the fold and transaction
+sweeps assert the styles plan and the cell style survive the failure,
+an abandoned candidate leaves them staged (A-PIN-1503). B: the
+receiving surfaces' refusal enumerations (the structural edits',
+`delete_sheet`'s, `embeddable_rows`' and `strip_embeddings`' contracts
+on the header, the Editor, the Python docstrings and README) name the
+staged cell style beside the writes and the appends (B-DOC-1503); the
+ladder row no longer counts mark-recalc-on-load as Zig-only
+(B-DOC-1502).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

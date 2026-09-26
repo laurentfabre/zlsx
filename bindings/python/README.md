@@ -357,8 +357,8 @@ plain `ZlsxError`s named after the cause: `SheetIndexOutOfRange`,
 selector that names nothing, like a sheet index), and the sequencing errors
 `RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet` /
 `SheetDeleteRequiresCleanState` — a structural edit needs the sheet (the
-workbook, for a sheet delete) free of unsaved `set_cell` / `append_rows`
-writes; save first. Indices are integers (`operator.index`; a float, a
+workbook, for a sheet delete) free of unsaved `set_cell` / `set_cell_style` /
+`append_rows` writes; save first. Indices are integers (`operator.index`; a float, a
 string or a bool is a `TypeError`) in `[0, 2**32)` (`ValueError`),
 checked before the call — ctypes would otherwise truncate or wrap them.
 
@@ -535,8 +535,8 @@ cell (a shared or inline string's runs joined, entities resolved; a number's
 `[0, 2**64)` — and omits rows with nothing embeddable (`[]` for a range
 with none); `include_formulas` admits formula cells with a cached value, the
 coverage flag's reading. A sheet the editor holds staged `set_cell` writes
-(or the header cell `rename_table_column` stages) or `append_rows` for
-refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
+(or the header cell `rename_table_column` stages), `set_cell_style` or
+`append_rows` for refuses with a `ZlsxError` (`SheetHasUnsavedMutations`
 / `SheetHasUnsavedAppends` — the parsed view the read walks does not carry
 them; save and re-open, or read first); `InvalidRange` (the range, or a
 column outside it) and `SheetIndexOutOfRange` are the call's; a workbook

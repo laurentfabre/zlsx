@@ -1750,9 +1750,68 @@ pub const Workbook = struct {
             // ending the same way is another relationship (in-house
             // r11 A-PART-1102 / B-SCN-1101).
             if (!isStylesRelType(rel.type)) continue;
-            if (try self.store.resolveOwned(self.allocator, "xl/workbook.xml", rel.target)) |n| return n;
+            if (try resolvePartTarget(self.allocator, &self.store, rel.target)) |n| return n;
         }
         return try self.allocator.dupe(u8, styles_part_name);
+    }
+
+    /// A workbook relationship's target as the name of a part the
+    /// slice may read or CREATE: the resolver's answer (a bare scheme,
+    /// a UNC or drive-letter target, a package-escaping or root-naming
+    /// target resolve to none — in-house r13 A-REL-1302, r14
+    /// A-REL-1401, r15 A-PART-1501), minus a name an existing part
+    /// sits under or over. OPC (§M1.11) forbids a part name derived
+    /// from another's by appending segments, so a target collapsing
+    /// to `xl` (a `.`) or to `xl/styles.xml/x` names nothing a part
+    /// can be created at — the save would have written a ZIP entry
+    /// named `xl` beside `xl/…` and an `<Override PartName="/xl"/>`,
+    /// the real part untouched, the cell stamped with a fresh-base
+    /// index. Nor a name whose segment spells a character the part
+    /// name grammar excludes (ECMA-376 Part 2 §9.1.1: a `\`, `#`, `?`,
+    /// a space, a bracket, a quote, a control byte; a segment ending
+    /// in `.`) — `sub\styles.xml` / `styles.xml#frag` resolved to a
+    /// name a part was created at, one LibreOffice then refused to
+    /// load or one that lost the style (in-house r15 B-REL-1501).
+    /// Owned by the caller.
+    fn resolvePartTarget(allocator: Allocator, store: *const PartStore, target: []const u8) Error!?[]const u8 {
+        const name = try store.resolveOwned(allocator, "xl/workbook.xml", target) orelse return null;
+        if (!partNameSpellable(name)) {
+            allocator.free(name);
+            return null;
+        }
+        var i: usize = 0;
+        while (i < store.partCount()) : (i += 1) {
+            const p = store.partNameAt(i);
+            const under = p.len > name.len and p[name.len] == '/' and std.mem.startsWith(u8, p, name);
+            const over = name.len > p.len and name[p.len] == '/' and std.mem.startsWith(u8, name, p);
+            if (under or over) {
+                allocator.free(name);
+                return null;
+            }
+        }
+        return name;
+    }
+
+    /// Whether every segment of a resolved name is one the OPC part
+    /// name grammar admits: the ASCII pchar set (unreserved,
+    /// sub-delims, `:` `@` and a percent escape), no segment ending
+    /// in `.`; a byte above ASCII is left to the producer that wrote
+    /// it unencoded (the grammar wants it escaped, a consumer reads
+    /// it as the IRI it is — refusing it would orphan a real part).
+    fn partNameSpellable(name: []const u8) bool {
+        var it = std.mem.splitScalar(u8, name, '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0) return false;
+            if (seg[seg.len - 1] == '.') return false;
+            for (seg) |c| {
+                const ok = std.ascii.isAlphanumeric(c) or c >= 0x80 or switch (c) {
+                    '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '@', '%' => true,
+                    else => false,
+                };
+                if (!ok) return false;
+            }
+        }
+        return true;
     }
 
     /// `resolveStylesPartName`, cached with the layout — read by a
@@ -13062,20 +13121,25 @@ fn injectWorkbookRelationship(
             const t = workbook_xml_mod.decodeScalarAttr(&t_buf, t_raw) orelse t_raw;
             var m_buf: [32]u8 = undefined;
             const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| std.mem.eql(u8, workbook_xml_mod.decodeScalarAttr(&m_buf, m_raw) orelse m_raw, "External") else false;
-            // A target that names no part is what the resolver rejects
-            // — the resolver's own rules, not a copy of them (in-house
-            // r13 A-REL-1302, r14 A-REL-1401: a bare scheme, a UNC or
-            // drive-letter target, a package-escaping `../..`); such a
-            // relationship is not the part's either.
-            var tg_buf: [512]u8 = undefined;
-            const target_ok = if (workbook_xml_mod.getAttr(attrs, "Target")) |tg_raw| blk: {
-                const tg = workbook_xml_mod.decodeScalarAttr(&tg_buf, tg_raw) orelse tg_raw;
-                const resolved = try store.resolveOwned(allocator, "xl/workbook.xml", tg);
-                if (resolved) |r| allocator.free(r);
-                break :blk resolved != null;
-            } else false;
             const same = std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t));
-            if (same and !external and target_ok) return try allocator.dupe(u8, xml);
+            // A target that names no part the slice could create is
+            // not the part's either — the same test the part's name
+            // is resolved by (`resolvePartTarget`: the resolver's own
+            // rules plus the OPC prefix rule; in-house r13 A-REL-1302,
+            // r14 A-REL-1401, r15 A-PART-1501). Judged only on a
+            // relationship of the type, after the cheap tests (r15
+            // A-REL-1502): the other relationships' targets neither
+            // allocate nor abort the save.
+            if (same and !external) {
+                if (workbook_xml_mod.getAttr(attrs, "Target")) |tg_raw| {
+                    var tg_buf: [512]u8 = undefined;
+                    const tg = workbook_xml_mod.decodeScalarAttr(&tg_buf, tg_raw) orelse tg_raw;
+                    if (try Workbook.resolvePartTarget(allocator, store, tg)) |resolved| {
+                        allocator.free(resolved);
+                        return try allocator.dupe(u8, xml);
+                    }
+                }
+            }
         }
         if (workbook_xml_mod.getAttr(attrs, "Id")) |id_raw| {
             var id_buf: [64]u8 = undefined;
@@ -33090,10 +33154,11 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const untouched = try injectWorkbookRelationship(a, &rs.store, int_rel, styles_rel_type, "styles.xml");
         defer a.free(untouched);
         try std.testing.expectEqualStrings(int_rel, untouched);
-        // A styles relationship whose target names no part — empty or
-        // a URI — is not the part's: the internal one is added (r13
-        // A-REL-1302).
-        for ([_][]const u8{ "", "http://example.com/s.xml" }) |bad| {
+        // A styles relationship whose target names no part — empty, a
+        // URI, the package root, the owner's directory, a name under
+        // an existing part — is not the part's: the internal one is
+        // added (r13 A-REL-1302, r15 A-PART-1501).
+        for ([_][]const u8{ "", "http://example.com/s.xml", "..", "./..", "/", "/..", ".", "/xl", "workbook.xml/styles.xml", "sub\\styles.xml", "styles.xml#frag", "styles.xml?x=1", "a b.xml", "styles." }) |bad| {
             const no_part = try std.fmt.allocPrint(a, "<Relationships><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"{s}\"/></Relationships>", .{bad});
             defer a.free(no_part);
             const fixed = try injectWorkbookRelationship(a, &rs.store, no_part, styles_rel_type, "styles.xml");
@@ -33377,5 +33442,73 @@ test "S3d slice 1 r3: a staged style on a pivot source cell is what the rebuild 
         const after = try s3d1PartBytes(a, &re, records_part);
         defer a.free(after);
         try std.testing.expect(std.mem.indexOf(u8, after, "12345") != null);
+    }
+}
+
+test "S3d slice 1: a styles relationship targeting the package root, the owner's directory, a name under a part or a name the part grammar cannot spell is not the part's — the conventional part is extended, the internal relationship added, no entry the package cannot hold (r15 A-PART-1501)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r15_src.xlsx");
+    defer a.free(src);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r15_out.xlsx" });
+    defer a.free(out);
+    for ([_][]const u8{ "..", "./..", "/", "/..", ".", "/xl", "workbook.xml/styles.xml", "sub\\styles.xml", "styles.xml#frag", "styles.xml?x=1" }, 0..) |bad, i| {
+        // The fixture's styles relationship retargeted; its part stays.
+        const in_path = try std.fmt.allocPrint(a, "{s}/s3d1_r15_in{d}.xlsx", .{ dir, i });
+        defer a.free(in_path);
+        {
+            var wb = try Workbook.open(a, io, src);
+            defer wb.deinit();
+            const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+            defer a.free(rels);
+            const needle = "Target=\"styles.xml\"";
+            try std.testing.expect(std.mem.indexOf(u8, rels, needle) != null);
+            const retargeted = try std.fmt.allocPrint(a, "Target=\"{s}\"", .{bad});
+            defer a.free(retargeted);
+            const patched = try std.mem.replaceOwned(u8, a, rels, needle, retargeted);
+            defer a.free(patched);
+            try wb.store.replacePart(workbook_rels_part_name, patched);
+            try wb.save(io, in_path);
+        }
+        var wb = try Workbook.open(a, io, in_path);
+        defer wb.deinit();
+        // The base is the conventional part's (three `<xf>`), not the
+        // fresh one.
+        const idx = try wb.addStyle(.{ .font_bold = true, .font_italic = true });
+        try std.testing.expectEqual(@as(u32, 3), idx);
+        try (try wb.sheet(0)).setCellStyle("A2", idx);
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        var k: usize = 0;
+        while (k < re.store.partCount()) : (k += 1) {
+            const n = re.store.partNameAt(k);
+            try std.testing.expect(n.len > 0);
+            try std.testing.expect(!std.mem.eql(u8, n, "xl"));
+            try std.testing.expect(!std.mem.startsWith(u8, n, "xl/workbook.xml/"));
+            try std.testing.expect(std.mem.indexOfAny(u8, n, "\\#?") == null);
+        }
+        const styles = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(styles);
+        try std.testing.expect(std.mem.indexOf(u8, styles, "<cellXfs count=\"4\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, styles, "<font><b/><i/>") != null);
+        const rels = try s3d1PartBytes(a, &re, workbook_rels_part_name);
+        defer a.free(rels);
+        try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"styles.xml\"") != null);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rels, "relationships/styles\""));
+        const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+        defer a.free(ct);
+        try std.testing.expect(std.mem.indexOf(u8, ct, "PartName=\"/\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, ct, "PartName=\"/xl\"") == null);
+        try std.testing.expectEqual(@as(u32, 3), try re.styleIndexBound() - 1);
+        const sheet = try s3d1PartBytes(a, &re, "xl/worksheets/sheet1.xml");
+        defer a.free(sheet);
+        try std.testing.expect(std.mem.indexOf(u8, sheet, "<c r=\"A2\" s=\"3\">") != null);
     }
 }

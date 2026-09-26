@@ -1696,12 +1696,13 @@ pub const PartStore = struct {
     ) std.mem.Allocator.Error!?[]const u8 {
         if (target.len == 0) return null;
         if (looksExternal(target)) return null;
-        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml".
-        if (target[0] == '/') {
-            return try out_alloc.dupe(u8, target[1..]);
-        }
+        // Absolute target (rare): "/xl/foo.xml" → "xl/foo.xml" —
+        // collapsed like a relative one from an empty stack, so a
+        // `/..` escapes and a `/.` names the root as a relative target
+        // does (in-house S3d slice 1 r15 A-PART-1501).
+        const absolute = target[0] == '/';
         // Relative target: collapse against owner's parent dir.
-        const owner_dir = parentDir(owner_part_name);
+        const owner_dir = if (absolute) "" else parentDir(owner_part_name);
         var stack: std.ArrayListUnmanaged([]const u8) = .empty;
         defer stack.deinit(self.allocator);
         // Seed stack with owner_dir segments.
@@ -1723,6 +1724,11 @@ pub const PartStore = struct {
             }
             try stack.append(self.allocator, seg);
         }
+        // A target that collapses to nothing (`..` from `xl/`, `/`,
+        // `./..`) names the package root, which is no part: the
+        // resolver's answer is "none", not the empty name a caller
+        // would look up — or create a part at (r15 A-PART-1501).
+        if (stack.items.len == 0) return null;
         // Join with `/`. Total length = sum + (n-1) separators.
         var total: usize = 0;
         for (stack.items, 0..) |s, i| {
@@ -2763,6 +2769,18 @@ test "PartStore.resolve: relative + absolute targets" {
     // Absolute: "/xl/workbook.xml" → "xl/workbook.xml".
     const r3 = (try store.resolve("anywhere", "/xl/workbook.xml")).?;
     try std.testing.expectEqualStrings("xl/workbook.xml", r3);
+
+    // A target that collapses to the package root names no part —
+    // relative or absolute (in-house S3d slice 1 r15 A-PART-1501);
+    // an absolute target collapses its own `.` and `..` segments.
+    for ([_][]const u8{ "..", "./..", "/", "/.", "/..", "/xl/..", "../." }) |root_target| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/workbook.xml", root_target));
+    }
+    const r4 = (try store.resolve("anywhere", "/xl/./worksheets/../styles.xml")).?;
+    try std.testing.expectEqualStrings("xl/styles.xml", r4);
+    // `.` alone is the owner's directory: a name, not a part's.
+    const r5 = (try store.resolve("xl/workbook.xml", ".")).?;
+    try std.testing.expectEqualStrings("xl", r5);
 }
 
 test "PartStore.imageParts: extract embedded images (C2a MVP)" {

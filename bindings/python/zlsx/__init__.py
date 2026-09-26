@@ -4277,7 +4277,8 @@ class Editor:
         Errors (:class:`ZlsxError`): ``SheetIndexOutOfRange``,
         ``RowIndexOutOfRange`` (0 or past 1048576), and
         ``RowEditRequiresCleanSheet`` — the sheet has unsaved
-        :meth:`set_cell` / :meth:`append_rows` writes; save first.
+        :meth:`set_cell` / :meth:`set_cell_style` / :meth:`append_rows`
+        writes; save first.
         Indices outside ``[0, 2**32)`` raise ``ValueError`` before the
         call."""
         self._require_structural("zlsx_editor_insert_row")
@@ -4356,8 +4357,8 @@ class Editor:
         collapse to ``#REF!``; every index above it shifts down by one.
         A pivot cache that read the deleted sheet by name keeps the
         stale spelling (see :meth:`rename_sheet`).
-        Needs a clean editor — no unsaved cell writes or appended rows
-        on any sheet (``SheetDeleteRequiresCleanState``, a
+        Needs a clean editor — no unsaved cell writes, cell styles or
+        appended rows on any sheet (``SheetDeleteRequiresCleanState``, a
         :class:`ZlsxError`: save first)."""
         self._require_structural("zlsx_editor_delete_sheet")
         self._structural_call(
@@ -4964,8 +4965,9 @@ class Editor:
 
         Read over the editor's current parts. A sheet this editor
         holds staged cell writes (:meth:`set_cell`, or the header cell
-        :meth:`rename_table_column` stages on the host sheet) or
-        appended rows (:meth:`append_rows`) for refuses with a
+        :meth:`rename_table_column` stages on the host sheet), cell
+        styles (:meth:`set_cell_style`) or appended rows
+        (:meth:`append_rows`) for refuses with a
         :class:`ZlsxError`
         named ``SheetHasUnsavedMutations`` / ``SheetHasUnsavedAppends``
         — the parsed view the read walks does not carry them, so a row
@@ -5132,8 +5134,8 @@ class Editor:
         editor's own :meth:`delete_sheet` path so sheet indices stay
         honest, and only then do its rules apply — judged before the
         first part is removed: :class:`ZlsxError`
-        ``SheetDeleteRequiresCleanState`` (staged cell writes or
-        appended rows on any sheet — save first), :class:`ZlsxRefusal`
+        ``SheetDeleteRequiresCleanState`` (staged cell writes, cell
+        styles or appended rows on any sheet — save first), :class:`ZlsxRefusal`
         ``CannotDeleteLastSheet``, and every index above the deleted
         sheet's shifts down by one; :class:`ZlsxError`
         ``StructuralEditIncomplete`` is an editor holding a torn

@@ -2066,7 +2066,8 @@ int32_t zlsx_sheet_writer_write_row_with_formulas_v2(zlsx_sheet_writer_t * sw,
  * where bytes are required), and the sequencing errors RowEditRequiresCleanSheet /
  * ColEditRequiresCleanSheet / SheetDeleteRequiresCleanState — a
  * structural edit needs the sheet (the workbook, for a sheet delete)
- * free of staged cell writes and appended rows: save first. The
+ * free of staged cell writes, cell styles and appended rows: save
+ * first. The
  * converse order has its own -2: after any of these edits (or an
  * embedding write / prune / strip, a doc-props strip that changed a
  * part, or a save that materialized cell writes) the recalc transactions — zlsx_editor_mark_recalc_on_load,
@@ -2448,7 +2449,8 @@ int32_t zlsx_editor_set_embeddings(zlsx_editor_t * ed,
  *
  * Read over the editor's current parts. A sheet the editor holds
  * staged cell writes (zlsx_editor_set_cell; the header cell
- * zlsx_editor_rename_table_column stages on the host sheet) or
+ * zlsx_editor_rename_table_column stages on the host sheet), cell
+ * styles (zlsx_editor_set_cell_style) or
  * appended rows (zlsx_editor_append_rows) for refuses — the parsed view this read
  * walks does not carry them, so a row would answer with its saved
  * content and a hash the staged value turns stale the moment it
@@ -2557,7 +2559,7 @@ int32_t zlsx_editor_prune_embeddings(zlsx_editor_t * ed,
  * editor's own zlsx_editor_delete_sheet path so sheet indices stay
  * honest, and only then do its rules apply — judged before the first
  * part is removed: -1 SheetDeleteRequiresCleanState (staged cell
- * writes or appended rows on any sheet — save first), -2
+ * writes, cell styles or appended rows on any sheet — save first), -2
  * CannotDeleteLastSheet, and every index above the deleted sheet's
  * shifts down by one. -1 otherwise: InvalidInput (NULL handle),
  * StructSizeTooSmall, StructuralEditIncomplete (the editor holds a
