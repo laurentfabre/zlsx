@@ -3133,7 +3133,7 @@ extension is never the stylesheet's (in-house r6 B-SCN-601) — the
 direct CHILDREN of `<numFmts>` / `<fonts>` /
 `<fills>` / `<borders>` / `<cellStyleXfs>` / `<cellXfs>` /
 `<cellStyles>` / `<dxfs>` counted (the eight the fresh emitter owns;
-the last two drive the seed decision alone), never a `count`
+`<cellStyleXfs>` / `<cellStyles>` drive the seed decision alone), never a `count`
 attribute — into a `styles_plan.Base`: the slot each table's
 next record takes, and the first free `numFmtId` above every `<numFmt>`
 of the `<numFmts>` table (164 at least). `addStyle` returns `base.cell_xfs + position`,
@@ -3174,7 +3174,7 @@ record likewise takes the defaults in front — a `<cellXfs>` that
 started with our record would make it every unstyled cell's, a
 `<fonts>` without a record at 0 would leave `fontId="0"` dangling;
 `<cellStyleXfs>` / `<cellStyles>` are seeded when an `<xf>` is added
-and the part lacks them (`xfId="0"`); a self-closed table
+and the part lacks them or holds them empty (`xfId="0"`); a self-closed table
 (`<dxfs count="0"/>`) is opened; every other byte of the part is
 preserved (pinned: the bytes before the first table and after the last
 one equal the writer's). A workbook without the part gets the fresh
@@ -3307,6 +3307,18 @@ staged never refuses `StylesPartChanged` (A-BASE-802). `append_rows`'
 guard pinned (A-PIN-803); the `<numFmts>`-table scope and the
 refusal-shape lists carried to every surface (A-DOC-804/805,
 B-DOC-801); the NULL-string guard on `styleFromC` (B-DOC-803).
+
+**Round 9.** `AlternateContent` is judged by its local name whether
+prefixed or bound through a default namespace declaration — the same
+element to an MC processor — at the table level and the record level
+(in-house r9 A-SCN-901); a stray closing tag inside a table refuses as
+one under the root does, where the child loop broke and truncated the
+count (A-SCN-902). A known table redeclaring its default namespace to
+another URI refuses — the new record would have landed inside the
+foreign element and the `<xf>` naming it dangled (B-SCN-904); the
+scanner's own doc list, the Python surfaces' shape list (a self-closed
+root) and the header's out-zeroing sentence carried (B-DOC-902 /
+B-ABI-903).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

@@ -5345,7 +5345,7 @@ class Editor:
         Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
         staged, the editor still saves the passthrough — when the
         workbook's styles part cannot take an extension (no
-        ``<styleSheet>`` root, an element that never closes, a stray
+        ``<styleSheet>`` root or a self-closed one, an element that never closes, a stray
         closing tag between tables, a table out of the schema's order,
         a table or a record under a prefix or inside
         ``mc:AlternateContent``, a ``numFmtId`` with no id above it);

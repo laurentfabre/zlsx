@@ -2609,7 +2609,9 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * or format pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
  * InvalidStyle (a non-positive font size; an empty font name or
- * format is "unset" at this boundary, `*_len == 0`) — the out is 0; -2 MalformedStylesXml, the name in the diag
+ * format is "unset" at this boundary, `*_len == 0`) — the out is 0 on
+ * every failure past the NULL checks (a NULL handle, spec or out leaves
+ * it untouched); -2 MalformedStylesXml, the name in the diag
  * with plane NONE: the part's <styleSheet> is missing or self-closed,
  * an element under it never closes, a stray closing tag sits between
  * tables, a table sits out of the schema's order, a table or a record

@@ -13296,8 +13296,11 @@ fn stylesElementEnd(xml: []const u8, hit: StylesElementHit) ?usize {
 /// B-SCN-601; the class #223 closed for drawings). Refuses
 /// `MalformedStylesXml`: no `<styleSheet>` root, a self-closed root
 /// (a part that holds no table — no producer writes one), an element
-/// the walk cannot close inside the root, a known table out of the
-/// schema's order (the splice's slots would be ambiguous), or a
+/// the walk cannot close inside the root, a stray closing tag between
+/// tables or between a table's records, a known table out of the
+/// schema's order (the splice's slots would be ambiguous), a table or
+/// a record under a prefix, `AlternateContent` at either level, a
+/// table redeclaring its default namespace to another URI, or a
 /// `numFmtId` at `maxInt(u32)` (no id above it).
 fn scanStylesPart(xml: []const u8) Error!StylesLayout {
     const root = (workbook_xml_mod.findTagOpen(xml, 0, "styleSheet") catch return error.MalformedStylesXml) orelse
@@ -13336,8 +13339,10 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                 const t: StylesTable = @enumFromInt(f.value);
                 if (std.mem.eql(u8, local, t.tag())) return error.MalformedStylesXml;
             }
-            if (std.mem.eql(u8, local, "AlternateContent")) return error.MalformedStylesXml;
         }
+        // Prefixed or bound through a default namespace declaration —
+        // the same element to an MC processor (in-house r9 A-SCN-901).
+        if (std.mem.eql(u8, local, "AlternateContent")) return error.MalformedStylesXml;
         var known: ?usize = null;
         inline for (@typeInfo(StylesTable).@"enum".fields) |f| {
             const t: StylesTable = @enumFromInt(f.value);
@@ -13345,6 +13350,12 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
         }
         if (known) |k| {
             if (k < next_table) return error.MalformedStylesXml;
+            // A table's name under a default namespace redeclared to
+            // another URI is not the stylesheet's table (in-house r9
+            // B-SCN-904): refused, never extended.
+            if (workbook_xml_mod.getAttr(xml[el.open.attrs_start..el.open.attrs_end], "xmlns")) |ns| {
+                if (!std.mem.eql(u8, ns, "http://schemas.openxmlformats.org/spreadsheetml/2006/main")) return error.MalformedStylesXml;
+            }
             const t: StylesTable = @enumFromInt(k);
             var b: StylesTableBlock = .{ .open = el.open, .close_lt = null, .end = end, .children = 0 };
             if (!el.open.self_closing) {
@@ -13355,7 +13366,13 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                     const close_lt = b.close_lt.?;
                     var c = el.open.after_tag_close;
                     while (c < close_lt) {
-                        const ch = nextStylesElement(xml, c) orelse break;
+                        const ch = nextStylesElement(xml, c) orelse {
+                            // The table's own close, or a stray closing
+                            // tag that would truncate the count and seed
+                            // the defaults in front (r9 A-SCN-902).
+                            if ((nextMarkupLt(xml, c) orelse close_lt) != close_lt) return error.MalformedStylesXml;
+                            break;
+                        };
                         if (ch.open.open_lt >= close_lt) break;
                         const ch_end = stylesElementEnd(xml, ch) orelse return error.MalformedStylesXml;
                         // A record under a prefix bound to the main
@@ -13366,9 +13383,8 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                         // A-SCN-801): refused, as the table's own
                         // prefix is (r7 A-SCN-701).
                         const ch_local = if (std.mem.lastIndexOfScalar(u8, ch.name, ':')) |cc| ch.name[cc + 1 ..] else ch.name;
-                        if (ch_local.len != ch.name.len and (std.mem.eql(u8, ch_local, child) or std.mem.eql(u8, ch_local, "AlternateContent"))) {
-                            return error.MalformedStylesXml;
-                        }
+                        if (ch_local.len != ch.name.len and std.mem.eql(u8, ch_local, child)) return error.MalformedStylesXml;
+                        if (std.mem.eql(u8, ch_local, "AlternateContent")) return error.MalformedStylesXml;
                         if (std.mem.eql(u8, ch.name, child)) {
                             b.children = std.math.add(u32, b.children, 1) catch return error.MalformedStylesXml;
                             if (t == .num_fmts) {
@@ -32479,6 +32495,15 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         // every existing index (r8 A-SCN-801).
         "<styleSheet " ++ s3d1_ns ++ " xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><x:font/></fonts>" ++ xf ++ "</styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ " xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><mc:AlternateContent><mc:Choice Requires=\"x14ac\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></mc:Choice></mc:AlternateContent></cellXfs></styleSheet>",
+        // AlternateContent bound through a default namespace, at both
+        // levels (r9 A-SCN-901); a stray close inside a table (r9
+        // A-SCN-902).
+        "<styleSheet " ++ s3d1_ns ++ "><AlternateContent xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><Choice Requires=\"x14ac\"><fonts xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\"><font/></fonts></Choice></AlternateContent>" ++ xf ++ "</styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><AlternateContent xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><Choice Requires=\"x14ac\"><xf xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></Choice></AlternateContent></cellXfs></styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"2\"></bogus><font/><font/></fonts>" ++ xf ++ "</styleSheet>",
+        // A table redeclaring its default namespace to another URI is
+        // not the stylesheet's (r9 B-SCN-904).
+        "<styleSheet " ++ s3d1_ns ++ "><fonts xmlns=\"urn:other\" count=\"1\"><font/></fonts>" ++ xf ++ "</styleSheet>",
     }) |styles| {
         // (the refusal shapes)
         const path = try writeS3d1WithStyles(a, io, dir, "s3d1_refused.xlsx", styles);
