@@ -4122,7 +4122,7 @@ class Editor:
             # as visual gaps between data blocks.
             rc = _ffi.lib.zlsx_editor_append_row(
                 self._handle,
-                int(sheet_idx),
+                self._u32("sheet_idx", sheet_idx),
                 cells_arg,
                 n,
                 self._err,
@@ -5378,8 +5378,9 @@ class Editor:
     def intern_num_fmt(self, format_code: str) -> int:
         """Intern an OOXML number format (``"0.00"``, ``"m/d/yyyy"``) on
         this workbook and return the ``numFmtId`` it takes in the saved
-        part: the first free id above every ``<numFmt>`` the part holds,
-        164 at least; the same id for the same string within one save.
+        part: the first free id above every ``<numFmt>`` of the part's
+        ``<numFmts>`` table (a dxf's inline format is not counted), 164
+        at least; the same id for the same string within one save.
         A :class:`Style` with ``number_format`` set interns its format
         by itself — this is for a caller writing ``numFmtId`` elsewhere.
         :meth:`add_style`'s refusal; :class:`ZlsxError` ``InvalidStyle``
@@ -5416,7 +5417,8 @@ class Editor:
         refuses ``SheetHasUnsavedAppends``. The sheet is re-emitted at
         save as a sheet with a :meth:`set_cell` is — its ``<sheetData>``
         regenerated from the typed view, row attributes (heights, hidden,
-        spans) and shared-formula group attributes not carried
+        spans) and shared-formula group attributes not carried, a cell
+        without an ``r`` attribute or a row holding no cell dropped
         (:meth:`set_cell`'s rule, pre-existing) — so a style alone costs
         what a value write costs.
 

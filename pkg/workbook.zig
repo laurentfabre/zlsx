@@ -13039,7 +13039,7 @@ fn injectWorkbookRelationship(
 // one lexical walk (`scanStylesPart`) that both the baseline and the
 // splice read, so the index a caller was given is the slot the record
 // takes. The walk rides the workbook scanner (`findTagOpen` /
-// `findClosingTag`: comment / CDATA / PI decoys skipped, quoted `>`
+// `findCloseTagLoose`: comment / CDATA / PI decoys skipped, quoted `>`
 // respected) and counts CHILDREN, never a `count` attribute.
 
 const styles_part_name = "xl/styles.xml";
@@ -13306,10 +13306,30 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
     var next_table: usize = 0;
     var cursor: usize = root.after_tag_close;
     while (cursor < root_close) {
-        const el = nextStylesElement(xml, cursor) orelse break;
+        const el = nextStylesElement(xml, cursor) orelse {
+            // No element before the next real markup: the root's own
+            // close, or a stray closing tag the walk would otherwise
+            // step over, leaving later tables "absent" and duplicated
+            // (in-house r7 A-SCN-705).
+            if ((nextMarkupLt(xml, cursor) orelse root_close) != root_close) return error.MalformedStylesXml;
+            break;
+        };
         if (el.open.open_lt >= root_close) break;
         const end = stylesElementEnd(xml, el) orelse return error.MalformedStylesXml;
         if (end > root_close) return error.MalformedStylesXml;
+        // A direct child whose LOCAL name is a table's under a prefix
+        // (`<x:fonts>` bound to the main namespace), or an
+        // `mc:AlternateContent` that could hold one, is a table the
+        // splice cannot rewrite in place: refused, never duplicated
+        // beside it (in-house r7 A-SCN-701).
+        const local = if (std.mem.lastIndexOfScalar(u8, el.name, ':')) |c| el.name[c + 1 ..] else el.name;
+        if (local.len != el.name.len) {
+            inline for (@typeInfo(StylesTable).@"enum".fields[0..StylesTable.owned_count]) |f| {
+                const t: StylesTable = @enumFromInt(f.value);
+                if (std.mem.eql(u8, local, t.tag())) return error.MalformedStylesXml;
+            }
+            if (std.mem.eql(u8, local, "AlternateContent")) return error.MalformedStylesXml;
+        }
         var known: ?usize = null;
         inline for (@typeInfo(StylesTable).@"enum".fields) |f| {
             const t: StylesTable = @enumFromInt(f.value);
@@ -13358,6 +13378,21 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
         cursor = end;
     }
     return layout;
+}
+
+/// The next `<` that opens real markup from `from` — decoys skipped.
+fn nextMarkupLt(xml: []const u8, from: usize) ?usize {
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = workbook_xml_mod.skipNonElement(xml, lt) catch return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        return lt;
+    }
+    return null;
 }
 
 /// The `<` of the closing tag of `tag` that ends at `end` — the last
@@ -32412,6 +32447,14 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/>" ++ xf ++ "</styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ "><numFmts count=\"1\"><numFmt numFmtId=\"4294967295\" formatCode=\"0\"/></numFmts>" ++ xf ++ "</styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts>" ++ xf,
+        // A table under a prefix bound to the main namespace, or inside
+        // `mc:AlternateContent`: read as absent, the save would have
+        // written a second one beside it (r7 A-SCN-701).
+        "<styleSheet " ++ s3d1_ns ++ " xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><x:fonts count=\"1\"><x:font/></x:fonts><x:cellXfs count=\"2\"><x:xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><x:xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></x:cellXfs></styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ " xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:AlternateContent><mc:Choice Requires=\"x14ac\"><fonts count=\"1\"><font/></fonts></mc:Choice></mc:AlternateContent>" ++ xf ++ "</styleSheet>",
+        // A stray closing tag between tables: the walk refuses rather
+        // than step over it (r7 A-SCN-705).
+        "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts></bogus>" ++ xf ++ "</styleSheet>",
     }) |styles| {
         // (the refusal shapes)
         const path = try writeS3d1WithStyles(a, io, dir, "s3d1_refused.xlsx", styles);

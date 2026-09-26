@@ -471,7 +471,8 @@ editor. `save_to_buffer` and `save_with_recalc` carry them like `save`.
 
 A sheet with a staged style is re-emitted at save as a sheet with a `set_cell`
 is (row heights / hidden flags / spans and shared-formula group attributes are
-not carried — `set_cell`'s pre-existing rule). A staged style is a staged cell
+not carried; a cell without an `r` attribute or a row holding no cell is
+dropped — `set_cell`'s pre-existing rule). A staged style is a staged cell
 write to the structural edits and
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the

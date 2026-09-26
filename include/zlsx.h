@@ -2626,9 +2626,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * A sheet with a staged cell style is re-emitted at save as a sheet
  * with a staged cell write is: its <sheetData> regenerated from the
  * typed view — row attributes (ht, customHeight, hidden, spans, a
- * row's own s) and shared-formula group attributes are not carried
- * (zlsx_editor_set_cell's rule, pre-existing) — so a style alone costs
- * what a value write costs. */
+ * row's own s) and shared-formula group attributes are not carried,
+ * and a cell without an r attribute or a row holding no cell is
+ * dropped (zlsx_editor_set_cell's rule, pre-existing) — so a style
+ * alone costs what a value write costs. */
 int32_t zlsx_editor_add_style(zlsx_editor_t * ed,
         const zlsx_style_t * spec, uint32_t * out_index,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
@@ -2643,7 +2644,8 @@ int32_t zlsx_editor_add_dxf(zlsx_editor_t * ed,
 
 /* Intern a number format (`ptr`, `len` bytes, not null-terminated):
  * *out_id is the numFmtId it takes in the saved part — the first free
- * id above every <numFmt> the part holds, 164 at least — the same id
+ * id above every <numFmt> of the part's <numFmts> table (a dxf's own
+ * inline numFmt is not counted), 164 at least — the same id
  * for the same bytes within one save. Statuses as
  * zlsx_editor_add_style's; an empty format is InvalidStyle. */
 int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,

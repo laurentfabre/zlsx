@@ -3136,7 +3136,9 @@ direct CHILDREN of `<numFmts>` / `<fonts>` /
 next record takes, and the first free `numFmtId` above every `<numFmt>`
 present (164 at least). `addStyle` returns `base.cell_xfs + position`,
 `addDxf` `base.dxfs + position`, `internNumFmt` `base.num_fmt_next +
-position`; the fresh layout (`Base.fresh`: one font, two fills, one
+position` (the first free id above every `<numFmt>` of the part's
+`<numFmts>` table — a `<dxf>`'s own inline `<numFmt>` is not a table
+record and is not counted, r7 B-DOC-705); the fresh layout (`Base.fresh`: one font, two fills, one
 border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
 so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
 unchanged byte for byte (its parity pins hold). The walk's agreement
@@ -3231,7 +3233,10 @@ re-emitted at save as a sheet with a staged cell write is: its
 row attributes (`ht`, `customHeight`, `hidden`, `spans`, a row's own
 `s` / `customFormat`), shared-formula group attributes (`t="shared"
 ref si`, the follower's empty `<f>`) and rich inline runs are not
-carried, and `<dimension>` is not widened — pre-existing since the
+carried, a positional `<c>` (no `r`) and a `<row>` holding no cell are
+DROPPED (values, not only formatting — in-house r7 B-EMT-702; the read
+path's rule for a positional cell is a `MalformedSheetXml` refusal,
+`embeddableRows`), and `<dimension>` is not widened — pre-existing since the
 delta emitter (`setCell` does the same), newly reachable from a call
 that changes only a style (in-house r2 A/B-EMT-202, measured on
 `worldbank_catalog.xlsx`: the header row's `s="3" customFormat="1"`
@@ -3255,8 +3260,10 @@ resolving "none" against the part's own records — appending a none
 fill / empty border where record 0 is not one — is an owner call
 recorded here, not this slice's. The delta emitter locates
 `<sheetData>` by substring (pre-existing; a comment spelling one ahead
-of the real element takes the whole re-emit — r6 A-EMT-603), one more
-item of "what a cell style costs", the same follow-up.
+of the real element takes the whole re-emit INTO the comment — the
+write silently lost, a `--` in the payload leaving the part not
+well-formed — r6 A-EMT-603 / r7 B-DOC-706), one more item of "what a
+cell style costs", the same follow-up.
 
 **Round 6.** `Editor.set_cell_style`'s four indices go through the
 class's `_u32` guard (`2**32` is `ValueError`, never a wrap to another
@@ -3266,7 +3273,21 @@ override rides `PartStore.addPart` (pre-existing: a package that
 already declares an override for the name gets a second — r6
 B-CT-603, recorded). A save that rendered the plan invalidates the
 view `Workbook.styles()` handed out, as an SST extension invalidates
-`sst()`'s (r6 B-VIEW-604, stated here).
+`sst()`'s (r6 B-VIEW-605, stated here).
+
+**Round 7.** A root's direct child whose LOCAL name is an owned
+table's under a prefix (`<x:fonts>` bound to the main namespace), or
+an `mc:AlternateContent` that could hold one, refuses
+`MalformedStylesXml` — the walk read it as absent and the save wrote a
+second table beside it, schema-invalid (in-house r7 A-SCN-701; the
+one-prefix-resolution rewrite #223 gave the drawings is the follow-up
+that would extend such a part instead). A stray closing tag between
+tables refuses rather than being stepped over (A-SCN-705).
+`Editor.append_rows`' sheet index goes through `_u32` too (A-PY-702 —
+the last bare `int()` under `c_uint32` on the editor). Seeding an
+empty table gives the part's dangling ids (`fontId="1"` in an existing
+`<xf>` over a `<fonts>` holding nothing) this save's records — the
+mirror of the record-0 statement (A-SPL-706).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
