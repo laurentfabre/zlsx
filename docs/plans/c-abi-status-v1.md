@@ -3121,10 +3121,16 @@ relationship) — resolved through the store's relationship map at the
 first registration, in two questions (`resolvePartTarget`; in-house
 r13 A-REL-1302, r14 A-REL-1401, r15 A-PART-1501 / B-REL-1501, r16
 B-PART-1601 / B-REL-1602 / B-REL-1603, r17 A-PART-1701 / A-PART-1702 /
-A-REL-1703). A target naming a part the package HOLDS names it,
-whatever its spelling: the part is extended in place (a non-ASCII
-name, a trailing slash — refusing a real part's name for its
-spelling would orphan it). A target naming no part is the name the
+A-REL-1703; r18 A-PART-1801 / A-CT-1802 / A-REL-1803 / B-PKG-1801). A
+target naming a part the package HOLDS — under any ASCII case, the
+store's own spelling handed on — names it, whatever the target's
+spelling: the part is extended in place (a non-ASCII name — its
+archive entry flagged UTF-8 on the rewrite — a trailing slash, a
+numeric reference; refusing a real part's name for its spelling would
+orphan it), and it gains the styles content-type `<Override>` when the
+package resolves it to another type through a Default; a held part
+that is no stylesheet refuses `MalformedStylesXml`. A target naming
+no part is the name the
 slice would CREATE at, and it creates only where (i) the resolver
 answers a name at all (not empty, a scheme, a backslash or
 forward-slash UNC, a drive letter, a package-escaping or root-naming
@@ -3246,10 +3252,12 @@ schema's order (the splice's slots would be ambiguous), a table or a
 record under a prefix, inside a markup-compatibility element
 (`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
 its default namespace to a URI other than the root's (the splice cannot rewrite it in
-place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)`, or — the
-part absent — an entry under `xl/styles.xml/` so no part may be
-created at the conventional name (r16 B-PART-1601 / r17 B-DOC-1723)
-— judged at the FIRST
+place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)`, the
+relationship's target a part the package holds that is no stylesheet
+(`sharedStrings.xml`, `workbook.xml` — the scan refuses its root; r18
+B-DOC-1804), or — the part absent — an entry under `xl/styles.xml/`
+so no part may be created at the conventional name (r16 B-PART-1601 /
+r17 B-DOC-1723) — judged at the FIRST
 registration or cell
 style, nothing staged, so a refused editor saves the passthrough
 (pinned on C and Python: byte-identical to the source). `-3`
@@ -3476,11 +3484,11 @@ fallback passes the same test the relationship's name did, else
 beside a bare `xl` entry). A percent escape must be two hex digits
 spelling neither an unreserved character nor a slash (`styles%2Exml`
 is `styles.xml` to a normalizing consumer and another name to a
-literal one — B-REL-1602); a byte above ASCII names no part (the
-grammar wants it escaped; an unescaped one would be an entry
-`pkg/zip.zig` cannot flag as UTF-8 — bit 11 is never set, for any
-entry, a pre-existing package-layer item recorded as an owner
-follow-up beside B-CT-603 / B-RD-1204: B-PKG-1605); a network-path
+literal one — B-REL-1602); a byte above ASCII names no part to
+create (the grammar wants it escaped; and, as recorded then, the
+archive writer never set the UTF-8 name bit for any rewritten entry
+— B-PKG-1605, a pre-existing package-layer item closed in round 18
+once r17 made a held part at such a name reachable); a network-path
 target (`//host/path`) is external to the resolver, as the
 backslash UNC is (B-REL-1603; A-REL-1601 found both faces). The
 injector decodes a `Type` and a `Target` into a buffer the raw
@@ -3513,6 +3521,33 @@ B-DOC-1723); a `.` or `/xl` beside a bare `xl` entry names the marker,
 no part — the conventional part (B's cross of r15 and r16, pinned);
 the resolver's two doc lists name the forward-slash network path
 (B-DOC-1724).
+
+**Round 18.** The held-part question compared names byte-exactly
+where OPC compares ASCII case-insensitively: `Styles.xml` created a
+twin part beside `xl/styles.xml`, two overrides, the cell against the
+fresh base (in-house r18 A-PART-1801) → held under any case, the
+store's own spelling handed on, the create-side prefix tests
+case-insensitive too. A held styles part the package resolved to
+`application/xml` through a Default was extended and never declared
+(A-CT-1802) → `PartStore.ensureContentTypeOverride`: one `<Override>`
+when the package names the part in none (a part it names under any
+type keeps the producer's statement). The injector decoded through
+the ASCII-only scalar decoder where the resolver had the store's:
+`styl&#233;s.xml` naming a held `xl/stylés.xml` gained a second
+relationship (A-REL-1803 / B-REL-1802) → the store's decoder, gated
+on `&`. `partEmptyAt` read a size `addPart` never set and
+`replacePart` never updated — an added part read as a directory
+marker, a name under it creatable (A-STORE-1804 / B-PART-1803) → both
+mutators record their bytes' length, pinned. The archive writer
+hard-coded the general-purpose flags to zero, so rewriting a held
+part at a non-ASCII name stripped the UTF-8 name bit its source
+carried — the whole stylesheet lost to a `zipfile` consumer
+(B-PKG-1801, r16 B-PKG-1605 made reachable by r17) → a fresh header
+carries bit 11 for a name above ASCII (pinned on both headers, and
+across the extension); the create-side rule (iii) keeps refusing an
+unescaped name, the grammar's own reason. The "no stylesheet" shape
+reached every refusal-shape list and footnote ³⁰'s identity summary
+(B-DOC-1804).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

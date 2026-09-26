@@ -486,7 +486,8 @@ self-closed one or one whose default namespace is not the main spreadsheetml
 one (Transitional or ISO-Strict), an element that never closes, a stray closing tag between
 tables or records, a table out of the schema's order, a table or a record under
 a prefix, inside a markup-compatibility element or redeclaring its default
-namespace to a URI other than the root's, a `numFmtId` with no id above it — or,
+namespace to a URI other than the root's, a `numFmtId` with no id above it — or
+the relationship's target is a part the package holds that is no stylesheet — or,
 the part absent, an entry under `xl/styles.xml/` so no part may be created at the
 conventional name) raises
 `ZlsxRefusal` `MalformedStylesXml` at the first registration — nothing

@@ -1799,9 +1799,20 @@ pub const Workbook = struct {
         const name = try store.resolveOwned(allocator, "xl/workbook.xml", target) orelse return null;
         // A held entry is the part unless it is a directory marker —
         // a `.` beside a bare `xl` entry names the marker, no part
-        // (r17 B, the cross of r15's `.` and r16's marker).
+        // (r17 B, the cross of r15's `.` and r16's marker). Held under
+        // ANY case: part names compare ASCII case-insensitively
+        // (ECMA-376 Part 2 §9.1.1), and the name handed back is the
+        // store's own spelling, the one its lookups take (r18
+        // A-PART-1801: `Styles.xml` had created a twin part).
         if (heldPartIndex(store, name)) |i| {
-            if (!isDirectoryMarker(store, i)) return name;
+            if (!isDirectoryMarker(store, i)) {
+                const held = allocator.dupe(u8, store.partNameAt(i)) catch |e| {
+                    allocator.free(name);
+                    return e;
+                };
+                allocator.free(name);
+                return held;
+            }
         }
         if (!targetSpellsPart(target) or !partNameCreatable(store, name)) {
             allocator.free(name);
@@ -1810,11 +1821,12 @@ pub const Workbook = struct {
         return name;
     }
 
-    /// The index of the entry named `name`, if the store holds one.
+    /// The index of the entry named `name` under any ASCII case, if
+    /// the store holds one.
     fn heldPartIndex(store: *const PartStore, name: []const u8) ?usize {
         var i: usize = 0;
         while (i < store.partCount()) : (i += 1) {
-            if (std.mem.eql(u8, store.partNameAt(i), name)) return i;
+            if (std.ascii.eqlIgnoreCase(store.partNameAt(i), name)) return i;
         }
         return null;
     }
@@ -1847,9 +1859,10 @@ pub const Workbook = struct {
         var i: usize = 0;
         while (i < store.partCount()) : (i += 1) {
             const p = store.partNameAt(i);
-            const under = p.len > name.len and p[name.len] == '/' and std.mem.startsWith(u8, p, name);
+            // Under any ASCII case (r18 A-PART-1801).
+            const under = p.len > name.len and p[name.len] == '/' and std.ascii.startsWithIgnoreCase(p, name);
             if (under) return false;
-            const over = name.len > p.len and name[p.len] == '/' and std.mem.startsWith(u8, name, p);
+            const over = name.len > p.len and name[p.len] == '/' and std.ascii.startsWithIgnoreCase(name, p);
             if (over and !isDirectoryMarker(store, i)) return false;
         }
         return true;
@@ -1867,7 +1880,7 @@ pub const Workbook = struct {
         var k: usize = 0;
         while (k < store.partCount()) : (k += 1) {
             const p = store.partNameAt(k);
-            if (p.len > entry.len and p[entry.len] == '/' and std.mem.startsWith(u8, p, entry)) return true;
+            if (p.len > entry.len and p[entry.len] == '/' and std.ascii.startsWithIgnoreCase(p, entry)) return true;
         }
         return false;
     }
@@ -2042,6 +2055,9 @@ pub const Workbook = struct {
         // (in-house r3 A-PART-301, the present branch) — with it, not
         // on a save that renders nothing (r4 B-INS-403).
         try self.ensureStylesRelationship(store, name, if (try self.packageIsStrict(store)) strict_styles_rel_type else styles_rel_type);
+        // A held part the package never declared a stylesheet gains
+        // its `<Override>` with the extension too (r18 A-CT-1802).
+        try store.ensureContentTypeOverride(name, styles_content_type);
         var frags = try self.styles_plan.emitFragments(a, base);
         defer frags.deinit(a);
         const spliced = try spliceStylesFragments(a, part.bytes, &layout, &frags);
@@ -13215,12 +13231,16 @@ fn injectWorkbookRelationship(
             // decode never grows), as the store's reader decodes —
             // the fixed buffer's overflow fell back to the RAW text,
             // whose `#` read as unspellable, and a second relationship
-            // was injected (in-house r16 A-REL-1602). A spelling
-            // without `&` is its own decoding: no allocation for it
-            // (r17 A-PIN-1704, r15 A-REL-1502's invariant).
-            const t_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, t_raw, '&') != null) try allocator.alloc(u8, t_raw.len) else null;
+            // was injected (in-house r16 A-REL-1602). THE store's
+            // decoder, whose answer the resolver consumed — the scalar
+            // one refused a reference above ASCII, and a held part at
+            // `stylés.xml` spelled `styl&#233;s.xml` gained a second
+            // relationship (r18 A-REL-1803). A spelling without `&` is
+            // its own decoding: no allocation for it (r17 A-PIN-1704,
+            // r15 A-REL-1502's invariant).
+            const t_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, t_raw, '&') != null) try store_mod.decodeXmlEntities(allocator, t_raw) else null;
             defer if (t_owned) |b| allocator.free(b);
-            const t = if (t_owned) |b| (workbook_xml_mod.decodeScalarAttr(b, t_raw) orelse t_raw) else t_raw;
+            const t = t_owned orelse t_raw;
             var m_buf: [32]u8 = undefined;
             const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| std.mem.eql(u8, workbook_xml_mod.decodeScalarAttr(&m_buf, m_raw) orelse m_raw, "External") else false;
             const same = std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t));
@@ -13234,13 +13254,9 @@ fn injectWorkbookRelationship(
             // allocate nor abort the save.
             if (same and !external) {
                 if (workbook_xml_mod.getAttr(attrs, "Target")) |tg_raw| {
-                    const tg_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, tg_raw, '&') != null) try allocator.alloc(u8, tg_raw.len) else null;
+                    const tg_owned: ?[]u8 = if (std.mem.indexOfScalar(u8, tg_raw, '&') != null) try store_mod.decodeXmlEntities(allocator, tg_raw) else null;
                     defer if (tg_owned) |b| allocator.free(b);
-                    // A reference the decoder refuses (malformed, or
-                    // one decoding above ASCII) spells no part name
-                    // either way: the raw text is judged, and its `&`
-                    // / `#` fail the grammar.
-                    const tg = if (tg_owned) |b| (workbook_xml_mod.decodeScalarAttr(b, tg_raw) orelse tg_raw) else tg_raw;
+                    const tg = tg_owned orelse tg_raw;
                     if (try Workbook.resolvePartTarget(allocator, store, tg)) |resolved| {
                         allocator.free(resolved);
                         return try allocator.dupe(u8, xml);
@@ -33300,6 +33316,16 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const type_same = try injectWorkbookRelationship(a, &rs.store, long_type, styles_rel_type, "styles.xml");
         defer a.free(type_same);
         try std.testing.expectEqualStrings(long_type, type_same);
+        // A held part at a non-ASCII name, its relationship spelling
+        // it by a numeric reference, IS the part's: the store's
+        // decoder, nothing added (r18 A-REL-1803).
+        var rs2 = try Workbook.open(a, io, src);
+        defer rs2.deinit();
+        try rs2.store.addPart("xl/stylés.xml", styles_content_type, "<styleSheet/>");
+        const spelled_target = "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styl&#233;s.xml\"/></Relationships>";
+        const held_same = try injectWorkbookRelationship(a, &rs2.store, spelled_target, styles_rel_type, "stylés.xml");
+        defer a.free(held_same);
+        try std.testing.expectEqualStrings(spelled_target, held_same);
         // An entity-spelled Id counts toward the next id (r12
         // B-REL-1202).
         const spelled = "<Relationships><Relationship Id=\"&#114;Id3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
@@ -33729,6 +33755,9 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         // A `.` or `/xl` beside a bare `xl` entry names the marker, no part: the conventional part (r15 × r16).
         .{ .target = ".", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
         .{ .target = "/xl", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
+        // The held part under another case is the part (r18 A-PART-1801).
+        .{ .target = "Styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/Styles.xml", .rels = 1 },
+        .{ .target = "/XL/styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "XL/styles.xml", .rels = 1 },
     };
     for (arms, 0..) |arm, i| {
         const in_path = try std.fmt.allocPrint(a, "{s}/s3d1_r17_in{d}.xlsx", .{ dir, i });
@@ -33776,4 +33805,133 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         defer a.free(ct);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
     }
+}
+
+test "S3d slice 1: a held styles part the package never declared gains its content-type override with the extension, once (r18 A-CT-1802)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r18_src.xlsx");
+    defer a.free(src);
+    const undeclared = try std.fs.path.join(a, &.{ dir, "s3d1_r18_undeclared.xlsx" });
+    defer a.free(undeclared);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r18_out.xlsx" });
+    defer a.free(out);
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const ct = try s3d1PartBytes(a, &wb, "[Content_Types].xml");
+        defer a.free(ct);
+        const at = std.mem.indexOf(u8, ct, "PartName=\"/xl/styles.xml\"") orelse return error.TestUnexpectedResult;
+        const open_at = std.mem.lastIndexOf(u8, ct[0..at], "<Override") orelse return error.TestUnexpectedResult;
+        const close_at = (std.mem.indexOfPos(u8, ct, at, "/>") orelse return error.TestUnexpectedResult) + "/>".len;
+        const stripped = try std.mem.concat(a, u8, &.{ ct[0..open_at], ct[close_at..] });
+        defer a.free(stripped);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, stripped, "spreadsheetml.styles+xml"));
+        try wb.store.replacePart("[Content_Types].xml", stripped);
+        try wb.save(io, undeclared);
+    }
+    var wb = try Workbook.open(a, io, undeclared);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true, .font_italic = true }));
+    try wb.save(io, out);
+    var re = try Workbook.open(a, io, out);
+    defer re.deinit();
+    const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+    defer a.free(ct);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "spreadsheetml.styles+xml"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct, "PartName=\"/xl/styles.xml\""));
+    const styles = try s3d1PartBytes(a, &re, "xl/styles.xml");
+    defer a.free(styles);
+    try std.testing.expect(std.mem.indexOf(u8, styles, "<cellXfs count=\"4\">") != null);
+    // Declared now: a second save with another style adds no second element.
+    try std.testing.expectEqual(@as(u32, 4), try re.addStyle(.{ .font_bold = true }));
+    try re.save(io, undeclared);
+    var re2 = try Workbook.open(a, io, undeclared);
+    defer re2.deinit();
+    const ct2 = try s3d1PartBytes(a, &re2, "[Content_Types].xml");
+    defer a.free(ct2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ct2, "PartName=\"/xl/styles.xml\""));
+}
+
+test "S3d slice 1: a rewritten entry whose name is not ASCII carries the UTF-8 name flag in both headers — an extended part at `xl/stylés.xml` is the part a zipfile consumer finds (r18 B-PKG-1801)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d1Fixture(a, io, dir, "s3d1_r18b_src.xlsx");
+    defer a.free(src);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d1_r18b_out.xlsx" });
+    defer a.free(out);
+    const name = "xl/stylés.xml";
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const styles = try s3d1PartBytes(a, &wb, "xl/styles.xml");
+        defer a.free(styles);
+        try wb.store.addPart(name, styles_content_type, styles);
+        try wb.store.removePart("xl/styles.xml");
+        const rels = try s3d1PartBytes(a, &wb, workbook_rels_part_name);
+        defer a.free(rels);
+        const patched = try std.mem.replaceOwned(u8, a, rels, "Target=\"styles.xml\"", "Target=\"stylés.xml\"");
+        defer a.free(patched);
+        try wb.store.replacePart(workbook_rels_part_name, patched);
+        try wb.save(io, out);
+    }
+    // The archive's two headers for the entry, found by the name that
+    // follows each: the local header's flags sit 24 bytes before the
+    // name, the central one's 38.
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, out, a, .limited(1 << 24));
+    defer a.free(raw);
+    var seen: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, raw, pos, name)) |at| : (pos = at + name.len) {
+        if (at >= 30 and std.mem.eql(u8, raw[at - 30 .. at - 26], "PK\x03\x04")) {
+            try std.testing.expect(std.mem.readInt(u16, raw[at - 24 ..][0..2], .little) & 0x0800 != 0);
+            seen += 1;
+        } else if (at >= 46 and std.mem.eql(u8, raw[at - 46 .. at - 42], "PK\x01\x02")) {
+            try std.testing.expect(std.mem.readInt(u16, raw[at - 38 ..][0..2], .little) & 0x0800 != 0);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    // An ASCII-named rewritten entry stays unflagged.
+    var ascii_seen: usize = 0;
+    pos = 0;
+    const sheet = "xl/worksheets/sheet1.xml";
+    while (std.mem.indexOfPos(u8, raw, pos, sheet)) |at| : (pos = at + sheet.len) {
+        if (at >= 30 and std.mem.eql(u8, raw[at - 30 .. at - 26], "PK\x03\x04")) {
+            try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[at - 24 ..][0..2], .little) & 0x0800);
+            ascii_seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), ascii_seen);
+    // And the extension over that held part: the flag survives its rewrite too.
+    var wb = try Workbook.open(a, io, out);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true, .font_italic = true }));
+    try wb.save(io, src);
+    const raw2 = try std.Io.Dir.cwd().readFileAlloc(io, src, a, .limited(1 << 24));
+    defer a.free(raw2);
+    var seen2: usize = 0;
+    pos = 0;
+    while (std.mem.indexOfPos(u8, raw2, pos, name)) |at| : (pos = at + name.len) {
+        if (at >= 30 and std.mem.eql(u8, raw2[at - 30 .. at - 26], "PK\x03\x04")) {
+            try std.testing.expect(std.mem.readInt(u16, raw2[at - 24 ..][0..2], .little) & 0x0800 != 0);
+            seen2 += 1;
+        } else if (at >= 46 and std.mem.eql(u8, raw2[at - 46 .. at - 42], "PK\x01\x02")) {
+            try std.testing.expect(std.mem.readInt(u16, raw2[at - 38 ..][0..2], .little) & 0x0800 != 0);
+            seen2 += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen2);
 }
