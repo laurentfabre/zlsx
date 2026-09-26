@@ -7569,7 +7569,7 @@ test "fuzz writer.addConditionalFormat + addDxf: adversarial inputs never crash 
         var w = writer.Writer.init(std.testing.allocator);
         defer w.deinit();
         // addDxf with adversarial ARGB-like u32: always succeeds
-        // (Dxf has no intake validation beyond u32 bounds).
+        // (Dxf's only intake validation is the font size, unset here).
         const dxf_id = w.addDxf(.{
             .font_bold = (input.len & 1) != 0,
             .font_italic = (input.len & 2) != 0,

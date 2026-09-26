@@ -2601,7 +2601,10 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * dxf or a number format registered here lands in the workbook's
  * styles part — the target of the workbook's styles relationship (a
  * part the package holds under any case; a zero-length directory entry
- * is none), xl/styles.xml when none names one — at the next zlsx_editor_save / save_to_buffer /
+ * is none), xl/styles.xml when none names one; the READER — the
+ * zlsx_book_* cell-format exports, `zlsx styles` — still addresses
+ * xl/styles.xml literally, so an index registered against a part under
+ * another name resolves to none there (pre-existing) — at the next zlsx_editor_save / save_to_buffer /
  * save_with_recalc: each table of the part extended after the records
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part
@@ -2704,9 +2707,11 @@ int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
  * value, staged or not, keeps it; the last call for a cell wins, and
  * a delete of the cell wins over its style. -1: InvalidInput (NULL
  * handle), SheetIndexOutOfRange, RowIndexOutOfRange,
- * ColumnIndexOutOfRange, UnknownStyleIndex (past both ranges —
- * judged before anything is staged), SheetHasUnsavedAppends;
- * -2 MalformedStylesXml; -3 OutOfMemory. The save itself may
+ * ColumnIndexOutOfRange (the cell's address, judged first),
+ * UnknownStyleIndex (past both ranges — judged after the part, before
+ * anything is staged), SheetHasUnsavedAppends;
+ * -2 MalformedStylesXml (the part, judged after the address and before
+ * the style index); -3 OutOfMemory. The save itself may
  * refuse -1 StylesPartChanged (see zlsx_editor_save). */
 int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
         uint32_t sheet_idx, uint32_t row, uint32_t col, uint32_t style_idx,

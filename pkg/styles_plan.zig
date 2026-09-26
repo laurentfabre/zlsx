@@ -177,6 +177,8 @@ pub const Dxf = struct {
     /// Font size in points. Rare in CF rules but cheap to support —
     /// the `<sz val="…"/>` child renders the differential font at
     /// an explicit pt size instead of inheriting the cell style.
+    /// Finite and positive, as `Style.font_size` — `addDxf` refuses
+    /// `InvalidFontSize` otherwise (S3d slice 1 r28).
     font_size: ?f32 = null,
     fill_fg_argb: ?u32 = null,
     /// Per-side border overrides — emitted inside the dxf's
@@ -895,6 +897,12 @@ test "StylesPlan: addStyle rejects invalid inputs" {
         error.InvalidFontSize,
         plan.addStyle(a, .{ .font_size = -1.0 }),
     );
+    // A dxf keeps the same size rule on the plan itself — the fresh
+    // writer's half (S3d slice 1 r28 A-DOC-2804, pinned r29 A-PIN-2901).
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = -3.0 }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.inf(f32) }));
+    try std.testing.expectEqual(@as(usize, 0), plan.dxfs.items.len);
     try std.testing.expectError(
         error.InvalidFontName,
         plan.addStyle(a, .{ .font_name = "" }),

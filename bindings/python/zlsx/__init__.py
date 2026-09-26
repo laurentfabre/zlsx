@@ -5411,7 +5411,9 @@ class Editor:
         """Register a differential format on this workbook and return
         the ``dxfId`` its record takes in the saved part — after the
         ``<dxf>`` records it already holds. :meth:`add_style`'s rules
-        (dedup within the save, the refusal, the drain at save)."""
+        (dedup within the save, the refusal, the drain at save) and its
+        font-size verdict: a non-finite or non-positive size is
+        :class:`ZlsxError` ``InvalidStyle``, judged after the part."""
         self._styles_available()
         c = _dxf_spec(dxf)
         out = ctypes.c_uint32(0)

@@ -385,7 +385,9 @@ pub const Writer = struct {
     /// id (0-based into `<dxfs>`), distinct from the style id used
     /// by `addStyle`.
     ///
-    /// Thin pass-through to `StylesPlan.addDxf`.
+    /// Thin pass-through to `StylesPlan.addDxf` — which refuses
+    /// `InvalidFontSize` for a non-finite or non-positive font size, the
+    /// rule `addStyle` keeps (S3d slice 1 r28).
     pub fn addDxf(self: *Writer, dxf: Dxf) !u32 {
         return try self.styles_plan.addDxf(self.allocator, dxf);
     }

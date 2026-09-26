@@ -3790,9 +3790,11 @@ the created part taking the manifest's `Default` (B-DOC-2701);
 (`StylesPlan.addDxf`, `InvalidFontSize`), so the fresh writer refuses
 it as `addStyle` does and the editor folds it to `InvalidStyle` — the
 "mirrors `Writer.addDxf`" line true again (in-house r28 A-DOC-2804);
-every registration judges the part before the argument (a torn part
-refuses `MalformedStylesXml` whatever the argument — A-ABI-2806,
-pinned); the case-insensitive marker skip pinned with the marker
+every registration judges the part before the argument the Zig call
+receives (a torn part refuses `MalformedStylesXml` whatever that
+argument — A-ABI-2806, pinned; the C boundary's own readings — a
+NULL pointer with a length, an enum it does not spell — are `-1`
+before the call, r29 B-ABI-2904); the case-insensitive marker skip pinned with the marker
 listed ahead (A-PIN-2801); the dxf rule pinned on Python
 (A-PIN-2807); the two redundant marker checks behind `heldPartIndex`
 removed (A-DUP-2805); `applyStylesPlanInto`'s doc and the
@@ -3800,6 +3802,22 @@ removed (A-DUP-2805); `applyStylesPlanInto`'s doc and the
 "non-finite or non-positive" on every surface (A-DOC-2802 /
 A-DOC-2803). B: the held-side marker rule on "Which part", footnote
 ³⁰ and the header (B-DOC-2805); the rest converging with A's.
+
+**Round 29.** The dxf size rule pinned on the plan and on the Python
+writer (A-PIN-2901 / B-PIN-2901); `internNumFmt` judges the part's
+numFmt room before the empty argument, as `addStyle` does (A-ABI-2903
+/ B-ABI-2905); the `set_cell_style` order stated — the address, the
+part, the style index (A-ABI-2903); `Dxf.font_size`'s field doc, the
+writer's fuzz comment, `Writer.addDxf`'s doc, `Editor.add_dxf`'s
+docstring and matrix row 101 name the rule (A-DOC-2904 / B-DOC-2903);
+the C boundary's own readings stated ahead of the part (B-ABI-2904);
+the marker arms assert no vacuous absence (A-PIN-2905). Owner ruling
+recorded (B-PART-2906): the held-side marker rule extends a
+case-variant part a case-sensitive consumer cannot reach behind a
+marker spelled as the conventional name — LibreOffice renders the
+sheet unstyled, openpyxl refuses — not a regression (the source is
+already so), left as it is. The reader's conventional-name rule on
+the caller surfaces (B-DOC-2907).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

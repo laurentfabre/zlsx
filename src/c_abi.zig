@@ -11787,7 +11787,7 @@ export fn zlsx_editor_strip_embeddings(
 /// the `s="…"` slot the record takes in the saved part; dedup within
 /// the save. -1: InvalidInput (a NULL handle, spec or out; a NULL
 /// font-name or format pointer with a non-zero length), the enum
-/// verdicts `styleFromC` names, InvalidStyle (a non-positive font size
+/// verdicts `styleFromC` names, InvalidStyle (a non-finite or non-positive font size
 /// — an empty font name or format is "unset" here, `*_len == 0`); -2 MalformedStylesXml with the name
 /// in the diag and no plane, nothing staged; -3 OutOfMemory.
 /// `*out_index` is 0 on every failure past the NULL checks.

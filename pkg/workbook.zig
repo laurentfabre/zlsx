@@ -1697,10 +1697,12 @@ pub const Workbook = struct {
     /// `NUM_FMT_BASE`, 164, at least — fresh workbooks start there),
     /// the same id for the same `format_code` within a save.
     pub fn internNumFmt(self: *Workbook, format_code: []const u8) Error!u32 {
-        // The part first, then the argument (r28 A-ABI-2806).
+        // The part first — its layout and its room — then the argument
+        // (r28 A-ABI-2806, r29 A-ABI-2903: `addStyle` with an empty
+        // format judges the room first too).
         const base = try self.stylesBaseline();
-        if (format_code.len == 0) return error.InvalidStyle;
         try self.requireNumFmtRoom(base, format_code);
+        if (format_code.len == 0) return error.InvalidStyle;
         const fresh_id = self.styles_plan.internNumFmt(self.allocator, format_code) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => unreachable,
@@ -33863,7 +33865,7 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
     defer a.free(src);
     const out = try std.fs.path.join(a, &.{ dir, "s3d1_r17_out.xlsx" });
     defer a.free(out);
-    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", stray_ct: []const u8 = "application/octet-stream", stray_child: bool = false, marker_first: bool = false, twin_first: bool = false, remove: bool, idx: u32, part: []const u8, absent: []const u8, rels: usize };
+    const Arm = struct { target: []const u8, moved_to: ?[]const u8, stray: ?[]const u8, stray_bytes: []const u8 = "x", stray_ct: []const u8 = "application/octet-stream", stray_child: bool = false, marker_first: bool = false, twin_first: bool = false, remove: bool, idx: u32, part: []const u8, absent: ?[]const u8, rels: usize };
     const arms = [_]Arm{
         // The part lives at a non-ASCII name: extended there.
         .{ .target = "stylés.xml", .moved_to = "xl/stylés.xml", .stray = null, .remove = false, .idx = 3, .part = "xl/stylés.xml", .absent = "xl/styles.xml", .rels = 1 },
@@ -33874,24 +33876,24 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         // An interior empty segment names no part to create: the conventional one is created and addressed.
         .{ .target = "sub//styles.xml", .moved_to = null, .stray = null, .remove = true, .idx = 1, .part = "xl/styles.xml", .absent = "xl/sub/styles.xml", .rels = 2 },
         // A case-variant twin AHEAD of the real part in the archive: the exact spelling wins (r19 B-PART-1901).
-        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .twin_first = true, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 1 },
-        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .twin_first = true, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = null, .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = null, .stray = "xl/Styles.xml", .stray_bytes = "<notAStyleSheet/>", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = null, .rels = 1 },
         // The create-side prefix tests under any case: a name under the real part spelled otherwise, a marker spelled `XL` (r19 A-PIN-1905).
         .{ .target = "WORKBOOK.XML/styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/WORKBOOK.XML/styles.xml", .rels = 2 },
-        .{ .target = "/XL", .moved_to = null, .stray = "XL", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
+        .{ .target = "/XL", .moved_to = null, .stray = "XL", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = null, .rels = 2 },
         // A `.` or `/xl` beside a bare `xl` entry names the marker, no part: the conventional part (r15 × r16).
-        .{ .target = ".", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
-        .{ .target = "/xl", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/x", .rels = 2 },
+        .{ .target = ".", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = null, .rels = 2 },
+        .{ .target = "/xl", .moved_to = null, .stray = "xl", .stray_bytes = "", .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = null, .rels = 2 },
         // A directory marker spelled as the target, ahead of a real part
         // spelled in another case: the part (r27 B-PART-2702).
         // (The marker's own declaration spells the stylesheet type: a
         // declaration under another type would be the producer's
         // statement about the OPC-equivalent name and would stay.)
-        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = "xl/x", .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = null, .rels = 1 },
         // …and the same entries with the marker listed AHEAD of the
         // real part: the case-insensitive pass skips it too (r28
         // A-PIN-2801).
-        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .marker_first = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = "xl/x", .rels = 1 },
+        .{ .target = "styles.xml", .moved_to = "xl/Styles.xml", .stray = "xl/styles.xml", .stray_bytes = "", .stray_ct = styles_content_type, .stray_child = true, .marker_first = true, .remove = false, .idx = 3, .part = "xl/Styles.xml", .absent = null, .rels = 1 },
         // The held part under another case is the part (r18 A-PART-1801).
         .{ .target = "Styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "xl/Styles.xml", .rels = 1 },
         .{ .target = "/XL/styles.xml", .moved_to = null, .stray = null, .remove = false, .idx = 3, .part = "xl/styles.xml", .absent = "XL/styles.xml", .rels = 1 },
@@ -33954,7 +33956,9 @@ test "S3d slice 1: a part the package holds is the part whatever its name spells
         try wb.save(io, out);
         var re = try Workbook.open(a, io, out);
         defer re.deinit();
-        try std.testing.expect(!re.store.hasPart(arm.absent));
+        // `absent`: the name a wrong resolution would have created at,
+        // where one exists (r29 A-PIN-2905: none for the marker arms).
+        if (arm.absent) |absent| try std.testing.expect(!re.store.hasPart(absent));
         const styles = try s3d1PartBytes(a, &re, arm.part);
         defer a.free(styles);
         try std.testing.expect(std.mem.indexOf(u8, styles, "<font><b/><i/>") != null);
