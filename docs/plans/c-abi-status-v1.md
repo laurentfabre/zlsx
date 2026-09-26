@@ -3151,7 +3151,11 @@ name and no part with bytes sits over it (a zero-length entry beside
 `xl/…` is a directory marker, no part). Otherwise `xl/styles.xml`,
 extended when held under any case (the store's spelling), created
 when not; a part the workbook holds without its relationship — and a
-created part — gains the internal relationship with the extension,
+created part — gains the internal relationship with the extension
+(a created part its content-type `<Override>` too: one the package
+already holds for the name is re-typed, or given the attribute it
+lacks, unless it is a held case-variant twin's, which stays — r21
+A-CT-2101, r22 A-CT-2201, r23 A-CT-2301 / B-CT-2302),
 its target relative to the workbook part's directory when the name
 sits under `xl/` as spelled, any other name — a case-variant
 directory such as `XL/` included — spelled absolute, which a
@@ -3675,6 +3679,30 @@ being the same generation by the transaction guard. Pins: the
 `TargetMode` decoder isolated (a target that names a part), the
 retype's three states, the remover's twin rule, the resolver's
 precedence (A-PIN-2204).
+
+**Round 23.** The remover ended a non-self-closing `<Override>` at
+the first RAW `</Override>`: a comment inside the element made
+`removePart` cut mid-comment and the saved manifest ill-formed —
+openpyxl refused the workbook (in-house r23 B-CT-2301 / A-CT-2304) →
+the live end tag. A slash-less `PartName` was a declaration to the
+resolver and to nothing else — a second element appended, a stale
+one left behind (B-CT-2302 / A-CT-2303) → the resolver's rule
+everywhere. The twin rule asked `findIndex` byte-exactly, so a twin
+in a THIRD case was re-typed and then deleted (A-CT-2301) → a twin is
+any held part spelling the declaration's name under any case. The
+extend path counted a `ContentType`-less declaration as one and
+staged nothing (B-CT-2303) → it gains the attribute, a typed one
+stays (the producer's). The `.keep` compared a raw value to a decoded
+type (A-CT-2305) → decoded, and the keep pinned by the bytes'
+identity. A part replaced unreadable under a staged plan refused
+`MalformedStylesXml` at the save where the contract says
+`StylesPartChanged` (A-DOC-2308 / B-DOC-2305) → the walk's refusal at
+the splice reads `StylesPartChanged`, the `Error` doc and footnote ³⁰
+name it. `overridePartNameOf` borrows unless a reference is spelled
+(A-MEM-2302); `<DefaultX` and the unterminated element pinned
+(A-PIN-2306); the twin qualifier on the last two surfaces, the
+created part's content-type rule in "Which part" (A-DOC-2307 /
+B-DOC-2304).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

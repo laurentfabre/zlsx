@@ -190,11 +190,14 @@ pub const Error = error{
     UnknownStyleIndex,
     /// `xl/styles.xml` changed underneath a staged styles plan — a
     /// `PartStore.replacePart` / `removePart` / `addPart` of the part
-    /// between a registration and the save — so the indices the
-    /// registrations handed out name slots the part no longer has.
-    /// The save refuses rather than splice against a moved layout;
-    /// discard the workbook or re-open (in-house S3d slice 1 r1
-    /// A-BASE-103).
+    /// (or of a case-variant twin, or of an entry under the
+    /// conventional name) between a registration and the save — so
+    /// the indices the registrations handed out name slots the part
+    /// no longer has, or the package no longer resolves to the part,
+    /// or the part is one the walk can no longer read. The save
+    /// refuses rather than splice against a moved layout; discard the
+    /// workbook or re-open (in-house S3d slice 1 r1 A-BASE-103, r22
+    /// A-DOC-2205, r23 A-DOC-2308).
     StylesPartChanged,
     MissingWorkbookPart,
     MissingSheetPart,
@@ -2027,7 +2030,8 @@ pub const Workbook = struct {
     /// preserved; a table the part lacks created at its schema slot; a
     /// missing part created whole, the fresh emitter's bytes, with its
     /// relationship and content type (an `<Override>` the package
-    /// already holds for the name is re-typed). Run by `applySavePlans` over the
+    /// already holds for the name is re-typed, unless it is a
+    /// case-variant twin's, which stays). Run by `applySavePlans` over the
     /// live store and by `foldSavePlansInto` over a candidate — the
     /// same bytes either way, since a recalc transaction never touches
     /// the part. A part whose layout is no longer the one the
@@ -2084,7 +2088,12 @@ pub const Workbook = struct {
             try store.addPart(name, styles_content_type, created);
             return;
         };
-        const layout = try scanStylesPart(part.bytes);
+        // A part the walk can no longer read was replaced underneath
+        // the staged plan: it moved (r23 A-DOC-2308).
+        const layout = scanStylesPart(part.bytes) catch |e| switch (e) {
+            error.MalformedStylesXml => return error.StylesPartChanged,
+            else => return e,
+        };
         // The layout the registrations mapped against must be the one
         // the splice reads: the store is a public surface
         // (`replacePart` / `removePart`), so a moved part is refused,
@@ -34264,12 +34273,19 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         const close_at = std.mem.lastIndexOf(u8, ct, "</Types>") orelse return error.TestUnexpectedResult;
         const loose_after = try std.mem.concat(a, u8, &.{ ct[0..close_at], "<Override PartName=\"/xl/STYLES.xml\" ContentType=\"application/x-loose\"/><OverrideX PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/x-x\"/>", ct[close_at..] });
         defer a.free(loose_after);
-        try wb.store.replacePart("[Content_Types].xml", loose_after);
+        // …and a `<DefaultX>` ahead of the real Defaults declares
+        // nothing either (r23 A-PIN-2306).
+        const types_end = (std.mem.indexOf(u8, loose_after, "<Types") orelse return error.TestUnexpectedResult);
+        const types_close = (std.mem.indexOfScalarPos(u8, loose_after, types_end, '>') orelse return error.TestUnexpectedResult) + 1;
+        const with_defaultx = try std.mem.concat(a, u8, &.{ loose_after[0..types_close], "<DefaultX Extension=\"rels\" ContentType=\"application/x-x\"/>", loose_after[types_close..] });
+        defer a.free(with_defaultx);
+        try wb.store.replacePart("[Content_Types].xml", with_defaultx);
         try wb.save(io, out);
         var re = try Workbook.open(a, io, out);
         defer re.deinit();
         try std.testing.expectEqualStrings(styles_content_type, ((try re.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).content_type.?);
         try std.testing.expect(std.mem.indexOf(u8, ((try re.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).content_type.?, "x-x") == null);
+        try std.testing.expect(std.mem.indexOf(u8, ((try re.store.part(workbook_rels_part_name)) orelse return error.TestUnexpectedResult).content_type.?, "relationships+xml") != null);
     }
     {
         var wb = try Workbook.open(a, io, variant);
