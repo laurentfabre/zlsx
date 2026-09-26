@@ -5401,10 +5401,10 @@ class Editor:
         conventional name);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
-        :meth:`Writer.add_style` judges them) — ``InvalidStyle`` for one
-        that is not XML text throughout (a C0 control other than tab, LF or CR, U+FFFE /
-        U+FFFF; a ``str`` is valid UTF-8 already) — and (judged here, as
-        :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
+        :meth:`Writer.add_style` judges them); ``InvalidStyle`` for one
+        that is not XML text throughout (a C0 control other than tab,
+        LF or CR, U+FFFE / U+FFFF; a ``str`` is valid UTF-8 already) and
+        ``InvalidStyle`` for a
         non-finite or non-positive font size — where :meth:`Writer.add_style` names
         the writer's ``InvalidFontSize``: the editor folds the plan's
         verdicts as ``Workbook.addStyle`` does."""
@@ -5445,7 +5445,9 @@ class Editor:
         extension cannot read, or one whose numFmt ids leave no room,
         is the :class:`ZlsxRefusal` whatever the format; then
         :class:`ZlsxError` ``InvalidStyle`` for an empty string, or one
-        holding a control byte or invalid UTF-8."""
+        that is not XML text throughout (a C0 control other than tab,
+        LF or CR, U+FFFE / U+FFFF; a ``str`` is valid UTF-8 already) —
+        tab, LF and CR are carried as character references."""
         self._styles_available()
         code = format_code.encode("utf-8")
         buf = (ctypes.c_ubyte * max(len(code), 1)).from_buffer_copy(code or b"\x00")

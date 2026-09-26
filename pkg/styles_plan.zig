@@ -640,7 +640,9 @@ pub const StylesPlan = struct {
     /// Emit `xl/styles.xml` to `out` — the fresh part: the OOXML
     /// default records in the first slots of every table, then this
     /// plan's records after them (`Base.fresh`). Byte-identical to the
-    /// pre-iter-wr-2 `emitStylesXml` function from `src/writer.zig`.
+    /// pre-iter-wr-2 `emitStylesXml` function from `src/writer.zig` for
+    /// every value XML carries literally — a tab, LF or CR in a name or
+    /// format is spelled as a character reference since S3d slice 1 r31.
     /// Caller owns `out`; this function only appends.
     ///
     /// Element order (rigid OOXML `CT_Stylesheet` schema):
@@ -961,6 +963,14 @@ test "StylesPlan: addStyle rejects invalid inputs" {
     defer emitted.deinit(a);
     try plan.emit(a, &emitted);
     try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#9;0\"") != null);
+    // …LF and CR too, and a non-ASCII name is XML text (r32
+    // A-PIN-3205 / A-PIN-3206).
+    _ = try plan.internNumFmt(a, "0\n0\r");
+    _ = try plan.addStyle(a, .{ .font_name = "Ärial" });
+    emitted.clearRetainingCapacity();
+    try plan.emit(a, &emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#10;0&#13;\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "<name val=\"Ärial\"/>") != null);
     // The boundary itself: 0 is refused, on both (r30 A-PIN-3002).
     try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = 0 }));
     try std.testing.expectError(error.InvalidFontSize, plan.addStyle(a, .{ .font_size = 0 }));

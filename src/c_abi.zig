@@ -2653,6 +2653,12 @@ fn styleFromC(spec: *const CStyle, err_buf: ?[*]u8, err_buf_len: usize) ?writer_
 /// `font_name_*` plus cleared flag bits to opt out of any field.
 /// The ABI is additive on top of zlsx_writer_add_style — existing
 /// callers that only need bold/italic keep using the simpler function.
+/// -1 with err="InvalidFontSize" for a non-finite or non-positive
+/// font size, "InvalidFontName" / "InvalidNumberFormat" for a name or
+/// format that is not XML text throughout (a C0 control other than
+/// tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF; a NULL pointer with
+/// a length is InvalidInput); tab, LF and CR are carried as character
+/// references (S3d slice 1 r30–r32).
 export fn zlsx_writer_add_style_ex(
     w: *Writer,
     spec: *const CStyle,
@@ -11867,7 +11873,9 @@ export fn zlsx_editor_add_dxf(
 /// least; the same id for the
 /// same bytes within a save. -1: InvalidInput (a NULL handle or out,
 /// a NULL `ptr` with a non-zero `len`), InvalidStyle (an empty
-/// format); -2 / -3 as `zlsx_editor_add_style`'s.
+/// format, or one that is not XML text throughout — a C0 control
+/// other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF — judged
+/// after the part); -2 / -3 as `zlsx_editor_add_style`'s.
 export fn zlsx_editor_intern_num_fmt(
     ed: ?*Editor,
     ptr: ?[*]const u8,

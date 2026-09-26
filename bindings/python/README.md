@@ -492,10 +492,12 @@ write to the structural edits (`RowEditRequiresCleanSheet` /
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
 staged; a font size not finite and positive, or a font name or format that is
-empty or not XML text throughout (a C0 control other than tab, LF or CR,
-U+FFFE / U+FFFF) is `ZlsxError` `InvalidStyle`, judged after the part — the
-fresh `Writer` names the same refusals `InvalidFontSize` / `InvalidFontName` /
-`InvalidNumberFormat`. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
+not XML text throughout (a C0 control other than tab, LF or CR, U+FFFE /
+U+FFFF) is `ZlsxError` `InvalidStyle`, judged after the part; an empty font
+name or format is `InvalidFontName` / `InvalidNumberFormat`, judged in Python
+before the part (as `Writer.add_style` judges it — on C an empty value is
+"unset") — the fresh `Writer` names the same text and size refusals
+`InvalidFontSize` / `InvalidFontName` / `InvalidNumberFormat`. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
 registration mapped against is no longer the one the package resolves to, or
 one the extension can read — a structural edit created the part the styles
 relationship names (`add_sheet` on a package whose relationship targets a

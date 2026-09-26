@@ -1709,8 +1709,10 @@ pub const Workbook = struct {
         // format judges the room first too).
         const base = try self.stylesBaseline();
         try self.requireNumFmtRoom(base, format_code);
-        // The plan's text rule — empty, a control byte, invalid UTF-8
-        // (r30 B-TXT-3001) — folds to `InvalidStyle`.
+        // The plan's text rule — empty, or not XML text throughout (a
+        // C0 control other than tab, LF or CR, invalid UTF-8, U+FFFE /
+        // U+FFFF; r30 B-TXT-3001, r31 A-TXT-3101) — folds to
+        // `InvalidStyle`.
         const fresh_id = self.styles_plan.internNumFmt(self.allocator, format_code) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidNumberFormat => return error.InvalidStyle,

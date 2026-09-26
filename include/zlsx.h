@@ -1197,7 +1197,7 @@ typedef struct {
 
 /* Statuses: -1 with err="InvalidFontSize" for a non-finite or
  * non-positive font size, "InvalidFontName" / "InvalidNumberFormat" for a
- * font name or format that is empty or not XML text throughout (a C0
+ * font name or format that is not XML text throughout (a C0
  * control other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF) —
  * tab, LF and CR are carried as character references (0.9.0+). */
 int32_t zlsx_writer_add_style_ex(
@@ -2705,8 +2705,10 @@ int32_t zlsx_editor_add_dxf(zlsx_editor_t * ed,
  * for the same bytes within one save. Statuses as
  * zlsx_editor_add_style's — the part first: a part the walk cannot
  * read, or one whose numFmt ids leave no room, is -2 whatever the
- * format; then -1 InvalidStyle for an empty format, one holding a
- * control byte or invalid UTF-8. */
+ * format; then -1 InvalidStyle for an empty format, or one that is not
+ * XML text throughout (a C0 control other than tab, LF or CR, invalid
+ * UTF-8, U+FFFE / U+FFFF) — tab, LF and CR are carried as character
+ * references. */
 int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
         const uint8_t * ptr, size_t len, uint32_t * out_id,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

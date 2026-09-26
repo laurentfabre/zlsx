@@ -3200,7 +3200,10 @@ position` (the first free id above every `<numFmt>` of the part's
 record and is not counted, r7 B-DOC-705); the fresh layout (`Base.fresh`: one font, two fills, one
 border, one `<xf>`, no dxf, 164) is the identity of the same mapping,
 so the fresh path — `Workbook.empty` → `saveFreshEmit`, the writer — is
-unchanged byte for byte (its parity pins hold). The walk's agreement
+unchanged byte for byte for every value XML carries literally (its
+parity pins hold); a tab, LF or CR in a name or format is spelled as
+a character reference since r31, which every reader decodes (r32
+A-DOC-3202). The walk's agreement
 with the typed parser (`styles_xml.parse`) is pinned over the corpus:
 on every fixture with a styles part the index equals the parser's
 `cell_xfs.len`, and after the save the parser's tables have grown by
@@ -3860,6 +3863,29 @@ defects (B-TXT-3101 / B-TXT-3102 / B-DUP-3106) and the split doc
 ³⁰, the Python README, `Workbook.addStyle`'s doc — reads "a C0
 control other than tab, LF or CR" (B-DOC-3103); the writer half named
 on `zlsx_writer_add_style_ex` and `Writer.add_style` (B-DOC-3104).
+
+**Round 32.** The text rule reached every `add_style` surface and no
+`intern_num_fmt` surface (in-house r32 A-DOC-3201) → all four; the
+fresh path's "unchanged byte for byte" qualified for the three
+characters now spelled as references (A-DOC-3202); the `add_style`
+docstring's duplicated clause (A-PY-3203); the writer block's
+unreachable "empty" status dropped (A-ABI-3204); the escaper's LF /
+CR arms and the code-point walk's accept side pinned (A-PIN-3205 /
+A-PIN-3206). Recorded, pre-existing and outside the diff, as owner
+follow-ups: the reader's `parseStyles` scans with a raw `indexOf`
+where `scanStylesPart` reads live markup — on a commented-out
+`<cellXfs>` decoy the saved file is right (openpyxl reads the new
+format) but `zlsx styles` reports the decoy and `Book.number_format`
+none (A-RD-3207); the sibling channels (`set_cell`, `write_row`,
+`add_sheet`) refuse the C0 set but write U+FFFE / U+FFFF verbatim into
+a sheet part, one class narrower than this slice's rule (A-TXT-3208).
+B: the "empty is `InvalidStyle` after the part" clause on footnote ³⁰
+and the Python README was false — empty is "unset" at the C boundary
+and `InvalidFontName` / `InvalidNumberFormat` on Python before the
+part (B-DOC-3201); the writer's own two surfaces —
+`zlsx_writer_add_style_ex`'s export doc and matrix row 93 — name the
+r30/r31 writer rule, a change to the shipped 0.8.0 writer (a tab in a
+name a reference now, a C0 control or U+FFFE refused; B-DOC-3202).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
