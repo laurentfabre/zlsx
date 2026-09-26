@@ -5355,8 +5355,8 @@ class Editor:
         closing tag between tables or records, a table out of the
         schema's order, a table or a record under a prefix, inside a
         markup-compatibility element (``AlternateContent`` / ``Choice``
-        / ``Fallback``) or redeclaring its default namespace to another
-        URI, a ``numFmtId`` with no id above it);
+        / ``Fallback``) or redeclaring its default namespace to a URI
+        other than the root's, a ``numFmtId`` with no id above it);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
@@ -5569,8 +5569,10 @@ class Editor:
         rule) and the run would build a candidate; a workbook with
         nothing to recalculate writes the live store's parts, installs
         carried — not refused. The file is the plain save plus the
-        recalc (the save-plan fold): a staged :meth:`set_cell` on any
-        sheet, and the staged defined names :meth:`set_embeddings`
+        recalc (the save-plan fold): a staged :meth:`set_cell` or
+        :meth:`set_cell_style` on any sheet, the registrations of
+        :meth:`add_style` / :meth:`add_dxf` / :meth:`intern_num_fmt`,
+        and the staged defined names :meth:`set_embeddings`
         leaves (its recovery carrier), go into the candidate and are
         drained from the editor at the swap — a failure before the
         rename leaves them staged; the arm with nothing to recalculate

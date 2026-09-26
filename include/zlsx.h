@@ -2619,7 +2619,7 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * tables or between a table's records, a table sits out of the
  * schema's order, a table or a record carries a prefix, sits inside a
  * markup-compatibility element (AlternateContent, Choice, Fallback)
- * or redeclares its default namespace to another URI — the splice
+ * or redeclares its default namespace to a URI other than the root's — the splice
  * cannot rewrite it in place — or a numFmtId leaves no id above it —
  * judged at the FIRST registration
  * (or cell style) before anything is staged, so a refused editor

@@ -2571,7 +2571,7 @@ rows plus an added sheet; either write over a no-formula workbook). `recalculate
 candidate shipped on 2026-09-11 — the paragraph after this one; the two
 `-1` names those rounds gated with are history from that date.
 
-**The save-plan fold (2026-09-11)**: `saveWithRecalc`'s file is the plain
+**The save-plan fold (2026-09-11; widened by S3d slice 1, 2026-09-25, to the styles plan and the staged cell styles — §25)**: `saveWithRecalc`'s file is the plain
 save plus the recalc on both arms, and the two gates above are retired
 (`SheetHasUnsavedMutations` no longer fires from the transaction —
 `appendRows` and `embeddableRows` keep it; `WorkbookHasStagedDefinedNames`
@@ -3227,7 +3227,7 @@ tag between tables or between a table's records, a table out of the
 schema's order (the splice's slots would be ambiguous), a table or a
 record under a prefix, inside a markup-compatibility element
 (`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
-its default namespace to another URI (the splice cannot rewrite it in
+its default namespace to a URI other than the root's (the splice cannot rewrite it in
 place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)` — judged at the FIRST
 registration or cell
 style, nothing staged, so a refused editor saves the passthrough
@@ -3332,7 +3332,7 @@ B-ABI-903).
 
 **Round 10.** A bare `Choice` / `Fallback` reached directly refuses as
 `AlternateContent` does (in-house r10 A-SCN-1001); a record redeclaring
-its default namespace to another URI is not one of the table's
+its default namespace to a URI other than the root's is not one of the table's
 (A-SCN-1002); the accept side pinned — a table and a record spelling
 the main namespace explicitly are the stylesheet's (A-PIN-1003); the
 two new shapes and the structural edits' actual names carried to every
@@ -3383,6 +3383,23 @@ such a part (`frictionless_2sheets.xlsx`) — the saved file is right
 (openpyxl and LibreOffice resolve it), the read-back of the index this
 slice hands out is not; the typed view counts it correctly, so the
 corpus pin cannot see the divergence (B-RD-1204, owner follow-up).
+
+**Round 13.** The package's conformance is the workbook part's own
+root namespace, not any one relationship's spelling (a purl-typed
+decoy on a Transitional package made a Strict part registered
+Transitional — in-house r13 A-NS-1301, pinned); a styles relationship
+whose target names no part (empty, or a URI) does not satisfy the
+injector's presence test, as the resolver rejects it (A-REL-1302,
+pinned); the below-root namespace rule reads "a URI other than the
+root's" on every surface (A-DOC-1303). B: the eight enumerations of
+what the fold carries and what `hasUnsavedChanges` reports name the
+styles work now (B-DOC-1302). Recorded, pre-existing and outside the
+diff: the recalc engine refuses `FormulaUnsupportedConstruct` on any
+ISO-Strict package (bisected to the Strict main namespace on
+`xl/workbook.xml`), so `saveWithRecalc`'s candidate arm is unreachable
+over a Strict package — the fold over Strict is pinned through the
+mark-only arm; an owner follow-up, `docs/package-layer.md` admitting
+Strict by contract (B r13, unverified note).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

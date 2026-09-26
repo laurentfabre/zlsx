@@ -64,7 +64,8 @@
 //! What a candidate carries beyond the run (the save-plan fold)
 //! ------------------------------------------------------------
 //! The file transaction's candidate also carries the workbook's staged
-//! save plans — every sheet's cell deltas, the workbook.xml plan's
+//! save plans — every sheet's cell deltas and cell styles, the styles
+//! plan (`xl/styles.xml` extended, S3d slice 1), the workbook.xml plan's
 //! defined names, the shared strings they extend, the refresh marker on
 //! a pivot cache a write lands in — rendered over the candidate's parts
 //! by `Workbook.foldSavePlansInto` (`Options.fold_save_plans`), so the
@@ -166,9 +167,10 @@ pub const Options = struct {
     /// see what the run was actually given.
     resolved: ?run_inputs.EffectiveRunInputs = null,
     /// The save-plan fold (2026-09-11): render the workbook's staged
-    /// save plans — every sheet's cell deltas, the workbook.xml plan's
-    /// defined names, the shared strings and pivot markers they imply
-    /// — over the candidate (`Workbook.foldSavePlansInto`), and drain
+    /// save plans — every sheet's cell deltas and cell styles, the
+    /// styles plan, the workbook.xml plan's defined names, the shared
+    /// strings and pivot markers they imply — over the candidate
+    /// (`Workbook.foldSavePlansInto`), and drain
     /// them at the swap. The file transaction's, so its file is the
     /// plain save plus the recalc; the in-memory transactions leave the
     /// plans staged for the plain `save` that follows them.
@@ -487,8 +489,9 @@ pub const Candidate = struct {
         // refuses as one after `save` does.
         assert(wb.store.installs >= self.fold_installs);
         wb.generation_installs = wb.store.installs - self.fold_installs;
-        // The deltas and the defined-name plan the fold rendered into
-        // this generation's parts are staged no longer. Frees only.
+        // The deltas, the cell styles, the styles plan and the
+        // defined-name plan the fold rendered into this generation's
+        // parts are staged no longer. Frees only.
         if (self.drain_save_plans) wb.drainSavePlans();
 
         self.gpa.free(self.sheet_views);

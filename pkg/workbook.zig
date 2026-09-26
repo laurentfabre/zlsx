@@ -175,8 +175,8 @@ pub const Error = error{
     /// closing tag between tables or between a table's records, a
     /// table out of the schema's order, a table or a record under a
     /// prefix, inside a markup-compatibility element or redeclaring
-    /// its default namespace to another URI (the splice cannot rewrite
-    /// it in place), or ids that leave the plan no room.
+    /// its default namespace to a URI other than the root's (the splice
+    /// cannot rewrite it in place), or ids that leave the plan no room.
     /// Judged at `addStyle` / `addDxf` / `internNumFmt` /
     /// `Worksheet.setCellStyle`, before anything is staged (S3d slice
     /// 1).
@@ -1608,7 +1608,10 @@ pub const Workbook = struct {
     /// the one the run publishes into: the file carries its formula
     /// cache-free, as `recalculate` then `save` writes it, while the
     /// report counted the value. Appended rows stay refused
-    /// (`SheetHasUnsavedAppends`): the model cannot read them.
+    /// (`SheetHasUnsavedAppends`): the model cannot read them. The
+    /// styles plan and every staged cell style ride the same fold
+    /// (S3d slice 1): the part extended, the `s="…"` landed, drained at
+    /// the swap.
     pub fn saveWithRecalc(
         self: *Workbook,
         allocator: Allocator,
@@ -1774,16 +1777,22 @@ pub const Workbook = struct {
         try store.replacePart(workbook_rels_part_name, patched);
     }
 
-    /// Whether the package speaks ISO-Strict: any workbook relationship
-    /// of a Strict type (the store's reader, entity-decoded). A Strict
-    /// package is given Strict parts and relationships when the slice
-    /// creates them (in-house r12 A-NS-1202).
+    /// Whether the package speaks ISO-Strict: the workbook part's root
+    /// namespace. A Strict package is given Strict parts and
+    /// relationships when the slice creates them (in-house r12
+    /// A-NS-1202).
     fn packageIsStrict(self: *const Workbook, store: *const PartStore) bool {
         _ = self;
-        for (store.rels("xl/workbook.xml")) |rel| {
-            if (std.mem.startsWith(u8, rel.type, "http://purl.oclc.org/ooxml/")) return true;
-        }
-        return false;
+        // The workbook part's own root namespace — what the package
+        // speaks, not any one relationship's spelling (a purl-typed
+        // decoy on a Transitional package made a Strict part registered
+        // Transitional; in-house r13 A-NS-1301).
+        const part = (store.part("xl/workbook.xml") catch return false) orelse return false;
+        const root = (workbook_xml_mod.findTagOpen(part.bytes, 0, "workbook") catch return false) orelse return false;
+        const ns_raw = workbook_xml_mod.getAttr(part.bytes[root.attrs_start..root.attrs_end], "xmlns") orelse return false;
+        var buf: [128]u8 = undefined;
+        const ns = workbook_xml_mod.decodeScalarAttr(&buf, ns_raw) orelse ns_raw;
+        return std.mem.eql(u8, ns, strict_main_ns);
     }
 
     /// One past the last `s="…"` index a cell may take: the part's
@@ -4985,9 +4994,10 @@ pub const Workbook = struct {
     /// over `next` — a recalc transaction's candidate — instead of the
     /// live store, so `saveWithRecalc`'s file is the plain save plus
     /// the recalc. Reads this workbook's staged state (every sheet's
-    /// deltas, the workbook.xml plan) and `next`'s own parts; writes
-    /// `next` only. Nothing of this workbook changes: the deltas and
-    /// the plan stay staged until `Candidate.swap` drains them
+    /// deltas and cell styles, the styles plan, the workbook.xml plan)
+    /// and `next`'s own parts; writes `next` only. Nothing of this
+    /// workbook changes: the deltas, the styles and the plans stay
+    /// staged until `Candidate.swap` drains them
     /// (`drainSavePlans`), so a transaction that fails before its
     /// rename leaves them exactly where they were — and its views over
     /// the live bytes stay valid, the candidate's views being the
@@ -4996,8 +5006,9 @@ pub const Workbook = struct {
     /// The phases are `applySavePlans`', in its order, each over
     /// `next`'s part where the save reads the live one: the names
     /// merged with the block the candidate's `xl/workbook.xml` holds,
-    /// the shared strings extended from the candidate's table, every
-    /// sheet with deltas re-emitted from the candidate's bytes (the
+    /// the styles plan rendered into the candidate's styles part, the
+    /// shared strings extended from the candidate's table, every
+    /// sheet with deltas or cell styles re-emitted from the candidate's bytes (the
     /// run's own patches already in them, so a write over a formula
     /// cell replaces the recalculated cell as it replaces any other).
     /// One phase differs: a staged write inside a pivot source takes
@@ -5132,8 +5143,9 @@ pub const Workbook = struct {
 
     /// The fold's other half, run by `Candidate.swap` once the
     /// candidate that carried the plans is the live generation: the
-    /// deltas and the workbook.xml plan are in its parts now, so they
-    /// are staged no longer. Frees only — the swap cannot fail, and
+    /// deltas, the cell styles, the styles plan and the workbook.xml
+    /// plan are in its parts now, so they are staged no longer. Frees
+    /// only — the swap cannot fail, and
     /// this is one of its moves.
     pub fn drainSavePlans(self: *Workbook) void {
         for (self.worksheets) |*ws| {
@@ -7665,9 +7677,11 @@ pub const Workbook = struct {
     /// Read-only predicate: does the workbook carry any pending
     /// mutation that has not yet been flushed via `save`?
     ///
-    /// Returns `true` if EITHER:
+    /// Returns `true` if ANY of:
     ///   1. any `Worksheet.deltas` map is non-empty (uncommitted
     ///      `setCell` mutations), OR
+    ///   1b. the styles plan holds a registration or any sheet a staged
+    ///      cell style (`hasStagedStyleWork`, S3d slice 1), OR
     ///   2. the underlying `PartStore` has any override (uncommitted
     ///      `replacePart` / `addPart` from e.g. `renameSheet`,
     ///      `rewriteAllFormulas`, the SST extension path).
@@ -13044,8 +13058,16 @@ fn injectWorkbookRelationship(
             const t = workbook_xml_mod.decodeScalarAttr(&t_buf, t_raw) orelse t_raw;
             var m_buf: [32]u8 = undefined;
             const external = if (workbook_xml_mod.getAttr(attrs, "TargetMode")) |m_raw| std.mem.eql(u8, workbook_xml_mod.decodeScalarAttr(&m_buf, m_raw) orelse m_raw, "External") else false;
+            // A target that names no part — empty, or a URI — is what
+            // the resolver rejects (`resolveOwned`); such a relationship
+            // is not the part's either (in-house r13 A-REL-1302).
+            var tg_buf: [512]u8 = undefined;
+            const target_ok = if (workbook_xml_mod.getAttr(attrs, "Target")) |tg_raw| blk: {
+                const tg = workbook_xml_mod.decodeScalarAttr(&tg_buf, tg_raw) orelse tg_raw;
+                break :blk tg.len > 0 and std.mem.indexOf(u8, tg, "://") == null;
+            } else false;
             const same = std.mem.eql(u8, t, type_uri) or (isStylesRelType(type_uri) and isStylesRelType(t));
-            if (same and !external) return try allocator.dupe(u8, xml);
+            if (same and !external and target_ok) return try allocator.dupe(u8, xml);
         }
         if (workbook_xml_mod.getAttr(attrs, "Id")) |id_raw| {
             var id_buf: [64]u8 = undefined;
@@ -32617,7 +32639,7 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         "<styleSheet " ++ s3d1_ns ++ "><AlternateContent xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><Choice Requires=\"x14ac\"><fonts xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\"><font/></fonts></Choice></AlternateContent>" ++ xf ++ "</styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><AlternateContent xmlns=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><Choice Requires=\"x14ac\"><xf xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></Choice></AlternateContent></cellXfs></styleSheet>",
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"2\"></bogus><font/><font/></fonts>" ++ xf ++ "</styleSheet>",
-        // A table redeclaring its default namespace to another URI is
+        // A table redeclaring its default namespace to a URI other than the root's is
         // not the stylesheet's (r9 B-SCN-904); a record likewise (r10
         // A-SCN-1002); a bare Choice / Fallback at either level (r10
         // A-SCN-1001).
@@ -33053,6 +33075,16 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const untouched = try injectWorkbookRelationship(a, int_rel, styles_rel_type, "styles.xml");
         defer a.free(untouched);
         try std.testing.expectEqualStrings(int_rel, untouched);
+        // A styles relationship whose target names no part — empty or
+        // a URI — is not the part's: the internal one is added (r13
+        // A-REL-1302).
+        for ([_][]const u8{ "", "http://example.com/s.xml" }) |bad| {
+            const no_part = try std.fmt.allocPrint(a, "<Relationships><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"{s}\"/></Relationships>", .{bad});
+            defer a.free(no_part);
+            const fixed = try injectWorkbookRelationship(a, no_part, styles_rel_type, "styles.xml");
+            defer a.free(fixed);
+            try std.testing.expect(std.mem.indexOf(u8, fixed, "Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>") != null);
+        }
         // An entity-spelled Id counts toward the next id (r12
         // B-REL-1202).
         const spelled = "<Relationships><Relationship Id=\"&#114;Id3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
@@ -33121,11 +33153,18 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
             defer wb.deinit();
             const rels = try s3d1PartBytes(a, &wb, "xl/_rels/workbook.xml.rels");
             defer a.free(rels);
-            // Every workbook relationship in the Strict spelling — the
-            // package's conformance, not one relationship's.
+            // Every workbook relationship AND the workbook part's own
+            // root namespace in the Strict spelling — the package's
+            // conformance (r13 A-NS-1301), not one relationship's.
             const patched = try std.mem.replaceOwned(u8, a, rels, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/", "http://purl.oclc.org/ooxml/officeDocument/relationships/");
             defer a.free(patched);
             try wb.store.replacePart("xl/_rels/workbook.xml.rels", patched);
+            const wbx = try s3d1PartBytes(a, &wb, "xl/workbook.xml");
+            defer a.free(wbx);
+            const wbx_strict = try std.mem.replaceOwned(u8, a, wbx, "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"", "xmlns=\"http://purl.oclc.org/ooxml/spreadsheetml/main\"");
+            defer a.free(wbx_strict);
+            try std.testing.expect(!std.mem.eql(u8, wbx, wbx_strict));
+            try wb.store.replacePart("xl/workbook.xml", wbx_strict);
             try wb.save(io, strict);
         }
         var wb = try Workbook.open(a, io, strict);
@@ -33173,6 +33212,40 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         try wb4.save(io, out);
         var re4 = try Workbook.open(a, io, out);
         defer re4.deinit();
+        // A Transitional package with one purl-typed decoy relationship
+        // is not Strict: the created part and its relationship are
+        // Transitional (r13 A-NS-1301).
+        {
+            const decoyed = try std.fs.path.join(a, &.{ dir, "s3d1_r13_decoy.xlsx" });
+            defer a.free(decoyed);
+            {
+                var wbd = try Workbook.open(a, io, src);
+                defer wbd.deinit();
+                try wbd.store.removePart("xl/styles.xml");
+                const r = try s3d1PartBytes(a, &wbd, "xl/_rels/workbook.xml.rels");
+                defer a.free(r);
+                const type_at = std.mem.indexOf(u8, r, "/relationships/styles\"").?;
+                const at = std.mem.lastIndexOf(u8, r[0..type_at], "<Relationship ").?;
+                const end = std.mem.indexOfPos(u8, r, at, "/>").? + 2;
+                const patched = try std.mem.concat(a, u8, &.{ r[0..at], "<Relationship Id=\"rId77\" Type=\"http://purl.oclc.org/ooxml/officeDocument/relationships/decoy\" Target=\"decoy.xml\"/>", r[end..] });
+                defer a.free(patched);
+                try wbd.store.replacePart("xl/_rels/workbook.xml.rels", patched);
+                try wbd.save(io, decoyed);
+            }
+            var wbd = try Workbook.open(a, io, decoyed);
+            defer wbd.deinit();
+            try std.testing.expectEqual(@as(u32, 1), try wbd.addStyle(.{ .font_bold = true }));
+            try wbd.save(io, out);
+            var red = try Workbook.open(a, io, out);
+            defer red.deinit();
+            const part = try s3d1PartBytes(a, &red, "xl/styles.xml");
+            defer a.free(part);
+            try std.testing.expect(std.mem.indexOf(u8, part, "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">") != null);
+            const rd = try s3d1PartBytes(a, &red, "xl/_rels/workbook.xml.rels");
+            defer a.free(rd);
+            try std.testing.expect(std.mem.indexOf(u8, rd, "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, rd, "purl.oclc.org/ooxml/officeDocument/relationships/styles") == null);
+        }
         const created = try s3d1PartBytes(a, &re4, "xl/styles.xml");
         defer a.free(created);
         try std.testing.expect(std.mem.startsWith(u8, created, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://purl.oclc.org/ooxml/spreadsheetml/main\">"));
