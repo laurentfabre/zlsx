@@ -2605,14 +2605,17 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * afresh, so indices keep counting up across saves in one editor.
  *
  * Statuses (status_v1): 0 with the out written; -1 a statement about
- * the call — InvalidInput (a NULL handle, spec or out; a NULL format
- * pointer with a non-zero length), BadAlignmentValue / BadFillPattern
+ * the call — InvalidInput (a NULL handle, spec or out; a NULL font-name
+ * or format pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
  * InvalidStyle (a non-positive font size; an empty font name or
  * format is "unset" at this boundary, `*_len == 0`) — the out is 0; -2 MalformedStylesXml, the name in the diag
  * with plane NONE: the part's <styleSheet> is missing or self-closed,
- * a table never closes, a table sits out of the schema's order, or a
- * numFmtId leaves no id above it — judged at the FIRST registration
+ * an element under it never closes, a stray closing tag sits between
+ * tables, a table sits out of the schema's order, a table or a record
+ * carries a prefix (or sits inside mc:AlternateContent) the splice
+ * cannot rewrite in place, or a numFmtId leaves no id above it —
+ * judged at the FIRST registration
  * (or cell style) before anything is staged, so a refused editor
  * saves the passthrough; -3 OutOfMemory. diag is optional (NULL ok).
  *

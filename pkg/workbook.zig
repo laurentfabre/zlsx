@@ -168,12 +168,15 @@ pub const Error = error{
     /// size, or empty number format string. Surfaces from
     /// `Workbook.addStyle` / `Workbook.internNumFmt`.
     InvalidStyle,
-    /// The workbook's `xl/styles.xml` cannot take the styles plan: no
-    /// `<styleSheet>` root, a table the extension walk cannot close, a
-    /// table out of the schema's order, or tables so large the plan's
-    /// ids have no room. Judged at `addStyle` / `addDxf` /
-    /// `internNumFmt` / `Worksheet.setCellStyle`, before anything is
-    /// staged (S3d slice 1).
+    /// The workbook's styles part cannot take the styles plan: no
+    /// `<styleSheet>` root or a self-closed one, an element under it
+    /// the extension walk cannot close, a stray closing tag between
+    /// tables, a table out of the schema's order, a table or a record
+    /// under a prefix (or inside `mc:AlternateContent`) the splice
+    /// cannot rewrite in place, or ids that leave the plan no room.
+    /// Judged at `addStyle` / `addDxf` / `internNumFmt` /
+    /// `Worksheet.setCellStyle`, before anything is staged (S3d slice
+    /// 1).
     MalformedStylesXml,
     /// `Worksheet.setCellStyle` named an `s="…"` index the workbook's
     /// `<cellXfs>` does not hold and no `addStyle` of this save
@@ -1665,9 +1668,10 @@ pub const Workbook = struct {
 
     /// Intern a custom number format string into the workbook's
     /// numFmt pool and return its numFmtId in the saved part: the first
-    /// free id above every `<numFmt>` the part holds (`NUM_FMT_BASE`,
-    /// 164, at least — fresh workbooks start there), the same id for
-    /// the same `format_code` within a save.
+    /// free id above every `<numFmt>` of the part's `<numFmts>` table
+    /// (a dxf's inline format is not a table record and is not counted;
+    /// `NUM_FMT_BASE`, 164, at least — fresh workbooks start there),
+    /// the same id for the same `format_code` within a save.
     pub fn internNumFmt(self: *Workbook, format_code: []const u8) Error!u32 {
         if (format_code.len == 0) return error.InvalidStyle;
         const base = try self.stylesBaseline();
@@ -4853,8 +4857,12 @@ pub const Workbook = struct {
         // Phase 0a (S3d slice 1): the styles plan into `xl/styles.xml`
         // — the records every staged `s="…"` names, rendered before the
         // sheets that name them; drained once they are in the part.
+        // A baseline a REFUSED registration armed (the plan took
+        // nothing) is forgotten, not re-read: a save with nothing
+        // staged never refuses `StylesPartChanged` (in-house r8
+        // A-BASE-802).
         if (self.styles_base != null) {
-            try self.applyStylesPlanInto(&self.store);
+            if (self.hasStagedStyleWork()) try self.applyStylesPlanInto(&self.store);
             self.drainStylesPlan();
         }
 
@@ -4986,7 +4994,7 @@ pub const Workbook = struct {
 
         // Phase 0a: the styles plan over the candidate's part — the
         // live one's bytes, a transaction never touching it.
-        if (self.styles_base != null) try self.applyStylesPlanInto(next);
+        if (self.hasStagedStyleWork()) try self.applyStylesPlanInto(next);
 
         // Phases 0b, 1 and 2 are the writes': nothing to mark or render,
         // no part to parse, when no sheet holds one (in-house fold r3
@@ -13350,6 +13358,17 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
                         const ch = nextStylesElement(xml, c) orelse break;
                         if (ch.open.open_lt >= close_lt) break;
                         const ch_end = stylesElementEnd(xml, ch) orelse return error.MalformedStylesXml;
+                        // A record under a prefix bound to the main
+                        // namespace, or wrapped in `mc:AlternateContent`,
+                        // would read the table as EMPTY and seed the
+                        // defaults in front of its records — every
+                        // existing index shifted (in-house r8
+                        // A-SCN-801): refused, as the table's own
+                        // prefix is (r7 A-SCN-701).
+                        const ch_local = if (std.mem.lastIndexOfScalar(u8, ch.name, ':')) |cc| ch.name[cc + 1 ..] else ch.name;
+                        if (ch_local.len != ch.name.len and (std.mem.eql(u8, ch_local, child) or std.mem.eql(u8, ch_local, "AlternateContent"))) {
+                            return error.MalformedStylesXml;
+                        }
                         if (std.mem.eql(u8, ch.name, child)) {
                             b.children = std.math.add(u32, b.children, 1) catch return error.MalformedStylesXml;
                             if (t == .num_fmts) {
@@ -32455,6 +32474,11 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         // A stray closing tag between tables: the walk refuses rather
         // than step over it (r7 A-SCN-705).
         "<styleSheet " ++ s3d1_ns ++ "><fonts count=\"1\"><font/></fonts></bogus>" ++ xf ++ "</styleSheet>",
+        // A record under a prefix, or wrapped in mc:AlternateContent:
+        // the table would read as empty and the defaults would shift
+        // every existing index (r8 A-SCN-801).
+        "<styleSheet " ++ s3d1_ns ++ " xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><x:font/></fonts>" ++ xf ++ "</styleSheet>",
+        "<styleSheet " ++ s3d1_ns ++ " xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><mc:AlternateContent><mc:Choice Requires=\"x14ac\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></mc:Choice></mc:AlternateContent></cellXfs></styleSheet>",
     }) |styles| {
         // (the refusal shapes)
         const path = try writeS3d1WithStyles(a, io, dir, "s3d1_refused.xlsx", styles);
@@ -32470,6 +32494,24 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         try std.testing.expect(wb.styles_part_resolved == null);
         try std.testing.expectEqual(@as(usize, 0), (try wb.sheet(1)).cell_styles.count());
         try std.testing.expect(!wb.hasUnsavedChanges());
+    }
+    // A registration the PLAN refuses arms no baseline the save would
+    // re-read: the part replaced afterwards, a save with nothing
+    // staged writes it (r8 A-BASE-802).
+    {
+        const path = try writeS3d1Fixture(a, io, dir, "s3d1_r8_refused.xlsx");
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectError(error.InvalidStyle, wb.addStyle(.{ .font_size = -1 }));
+        try std.testing.expectError(error.UnknownStyleIndex, (try wb.sheet(1)).setCellStyle("A1", 9));
+        try std.testing.expect(wb.styles_base != null);
+        try wb.store.replacePart("xl/styles.xml", "<styleSheet " ++ s3d1_ns ++ ">" ++ xf ++ "</styleSheet>");
+        try (try wb.sheet(1)).setCell("B1", .{ .number = 1 });
+        const moved = try std.fs.path.join(a, &.{ dir, "s3d1_r8_moved.xlsx" });
+        defer a.free(moved);
+        try wb.save(io, moved);
+        try std.testing.expect(wb.styles_base == null);
     }
     // No id above the part's: the second format overflows (r2 A-OVF-201),
     // and an entity-spelled id is read as the number it is (r2 A-FMT-203).

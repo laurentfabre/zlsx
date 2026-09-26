@@ -5345,8 +5345,10 @@ class Editor:
         Raises :class:`ZlsxRefusal` ``MalformedStylesXml`` — nothing
         staged, the editor still saves the passthrough — when the
         workbook's styles part cannot take an extension (no
-        ``<styleSheet>`` root, a table that never closes or sits out of
-        the schema's order, a ``numFmtId`` with no id above it);
+        ``<styleSheet>`` root, an element that never closes, a stray
+        closing tag between tables, a table out of the schema's order,
+        a table or a record under a prefix or inside
+        ``mc:AlternateContent``, a ``numFmtId`` with no id above it);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a

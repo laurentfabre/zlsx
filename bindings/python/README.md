@@ -477,8 +477,10 @@ write to the structural edits and
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
-staged. A styles part the extension cannot read (no `<styleSheet>` root, a
-table that never closes or sits out of the schema's order) raises
+staged. A styles part the extension cannot read (no `<styleSheet>` root, an
+element that never closes, a stray closing tag between tables, a table out
+of the schema's order, a table or a record under a prefix or inside
+`mc:AlternateContent`, a `numFmtId` with no id above it) raises
 `ZlsxRefusal` `MalformedStylesXml` at the first registration — nothing
 staged, the editor still saves the passthrough. The per-sheet layout
 registrations (column widths, panes, merges, hyperlinks, comments, DV / CF)

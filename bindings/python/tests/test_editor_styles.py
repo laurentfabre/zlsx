@@ -155,6 +155,11 @@ def test_statements_about_the_call_stage_nothing(tmp_path):
             ed.set_cell_style(0, 1.9, 0, 0)
         with pytest.raises(TypeError):
             ed.set_cell_style(0, 1, True, 0)
+        # The same guard on the two writers that shared the gap (r6/r7).
+        with pytest.raises(ValueError):
+            ed.append_rows(2**32, [[9]])
+        with pytest.raises(ValueError):
+            ed.set_cell(2**32, 1, 0, 1)
         with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
             ed.intern_num_fmt("")
         with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):

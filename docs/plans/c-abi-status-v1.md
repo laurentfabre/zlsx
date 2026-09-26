@@ -3131,10 +3131,12 @@ allowed) over the root's DIRECT children — a known table recorded, any
 other element skipped whole, so a table's name inside an `<extLst>`
 extension is never the stylesheet's (in-house r6 B-SCN-601) — the
 direct CHILDREN of `<numFmts>` / `<fonts>` /
-`<fills>` / `<borders>` / `<cellXfs>` / `<dxfs>` counted, never a
-`count` attribute — into a `styles_plan.Base`: the slot each table's
+`<fills>` / `<borders>` / `<cellStyleXfs>` / `<cellXfs>` /
+`<cellStyles>` / `<dxfs>` counted (the eight the fresh emitter owns;
+the last two drive the seed decision alone), never a `count`
+attribute — into a `styles_plan.Base`: the slot each table's
 next record takes, and the first free `numFmtId` above every `<numFmt>`
-present (164 at least). `addStyle` returns `base.cell_xfs + position`,
+of the `<numFmts>` table (164 at least). `addStyle` returns `base.cell_xfs + position`,
 `addDxf` `base.dxfs + position`, `internNumFmt` `base.num_fmt_next +
 position` (the first free id above every `<numFmt>` of the part's
 `<numFmts>` table — a `<dxf>`'s own inline `<numFmt>` is not a table
@@ -3195,8 +3197,9 @@ present or created, the plan drained at the swap, the next transaction
 hearing the guard (the fold's installs are a save's).
 
 **Statuses.** `0` with the out written. `-1`, a statement about the
-call — `InvalidInput` (a NULL handle, spec or out; a NULL format pointer
-with a non-zero length), the writer's enum verdicts
+call — `InvalidInput` (a NULL handle, spec or out; a NULL font-name or
+format pointer with a non-zero length — judged in `styleFromC`, the
+writer's export with it, r8 B-DOC-803), the writer's enum verdicts
 `BadAlignmentValue` / `BadFillPattern` / `BadBorderStyle` (the
 `zlsx_style_t` reading is `styleFromC`, factored out of
 `zlsx_writer_add_style_ex` — one reading, the writer's error names
@@ -3212,9 +3215,12 @@ registrations — judged before anything is staged) /
 `SheetHasUnsavedAppends`; the out is 0 on every failure past the NULL
 checks. `-2` `MalformedStylesXml`, the name in the diag, plane NONE, in
 `structural_refusals`: the part's `<styleSheet>` missing or
-self-closed, a table that never closes inside the root, a table out of
-the schema's order (the splice's slots would be ambiguous), a
-`numFmtId` at `maxInt(u32)` — judged at the FIRST registration or cell
+self-closed, an element under it that never closes, a stray closing
+tag between tables, a table out of the schema's order (the splice's
+slots would be ambiguous), a table or a record under a prefix or
+inside `mc:AlternateContent` (the splice cannot rewrite it in place —
+r7 / r8), a `numFmtId` at `maxInt(u32)` — judged at the FIRST
+registration or cell
 style, nothing staged, so a refused editor saves the passthrough
 (pinned on C and Python: byte-identical to the source). `-3`
 `OutOfMemory` (the Zig sweep: every allocation failure across the open,
@@ -3260,10 +3266,11 @@ resolving "none" against the part's own records — appending a none
 fill / empty border where record 0 is not one — is an owner call
 recorded here, not this slice's. The delta emitter locates
 `<sheetData>` by substring (pre-existing; a comment spelling one ahead
-of the real element takes the whole re-emit INTO the comment — the
-write silently lost, a `--` in the payload leaving the part not
-well-formed — r6 A-EMT-603 / r7 B-DOC-706), one more item of "what a
-cell style costs", the same follow-up.
+of the real element takes the whole re-emit INTO the comment: the
+comment is never closed, the real open tag is consumed, the sheet's
+own cells end up inside the comment and the part is not well-formed —
+r6 A-EMT-603 / r7 B-DOC-706 / r8 B-DOC-802, measured), one more item
+of "what a cell style costs", the same follow-up.
 
 **Round 6.** `Editor.set_cell_style`'s four indices go through the
 class's `_u32` guard (`2**32` is `ValueError`, never a wrap to another
@@ -3288,6 +3295,18 @@ the last bare `int()` under `c_uint32` on the editor). Seeding an
 empty table gives the part's dangling ids (`fontId="1"` in an existing
 `<xf>` over a `<fonts>` holding nothing) this save's records — the
 mirror of the record-0 statement (A-SPL-706).
+
+**Round 8.** A record under a prefix bound to the main namespace, or
+wrapped in `mc:AlternateContent`, inside an owned table refuses as the
+table's own prefix does — the table would have read as EMPTY and the
+seed rule would have put the defaults in front of its records, shifting
+every existing index (in-house r8 A-SCN-801). The save's phase 0a
+renders and re-reads only with style work staged: a baseline a REFUSED
+registration armed is forgotten at the save, so a save with nothing
+staged never refuses `StylesPartChanged` (A-BASE-802). `append_rows`'
+guard pinned (A-PIN-803); the `<numFmts>`-table scope and the
+refusal-shape lists carried to every surface (A-DOC-804/805,
+B-DOC-801); the NULL-string guard on `styleFromC` (B-DOC-803).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

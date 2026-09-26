@@ -2627,10 +2627,21 @@ fn styleFromC(spec: *const CStyle, err_buf: ?[*]u8, err_buf_len: usize) ?writer_
     style.diagonal_up = spec.diagonal_up != 0;
     style.diagonal_down = spec.diagonal_down != 0;
 
+    // A NULL string pointer with a non-zero length is a statement
+    // about the call, never a slice (in-house S3d slice 1 r8
+    // B-DOC-803: the header promised it; the two exports share it).
     if (spec.font_name_len > 0) {
+        if (@intFromPtr(spec.font_name_ptr) == 0) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        }
         style.font_name = spec.font_name_ptr[0..spec.font_name_len];
     }
     if (spec.num_fmt_len > 0) {
+        if (@intFromPtr(spec.num_fmt_ptr) == 0) {
+            writeError(err_buf, err_buf_len, "InvalidInput");
+            return null;
+        }
         style.number_format = spec.num_fmt_ptr[0..spec.num_fmt_len];
     }
 
@@ -11844,7 +11855,8 @@ export fn zlsx_editor_add_dxf(
 
 /// Intern a number format on the editor's workbook. `*out_id` is the
 /// numFmtId the format takes in the saved part — the first free id
-/// above every `<numFmt>` it holds, 164 at least; the same id for the
+/// above every `<numFmt>` of its `<numFmts>` table (a dxf's inline
+/// format is not counted), 164 at least; the same id for the
 /// same bytes within a save. -1: InvalidInput (a NULL handle or out,
 /// a NULL `ptr` with a non-zero `len`), InvalidStyle (an empty
 /// format); -2 / -3 as `zlsx_editor_add_style`'s.
