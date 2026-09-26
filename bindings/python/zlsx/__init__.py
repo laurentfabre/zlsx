@@ -5359,7 +5359,9 @@ class Editor:
         schema's order, a table or a record under a prefix, inside a
         markup-compatibility element (``AlternateContent`` / ``Choice``
         / ``Fallback``) or redeclaring its default namespace to a URI
-        other than the root's, a ``numFmtId`` with no id above it);
+        other than the root's, a ``numFmtId`` with no id above it —
+        or, the part absent, an entry under ``xl/styles.xml/`` so no
+        part may be created at the conventional name);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a

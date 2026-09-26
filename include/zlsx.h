@@ -2625,7 +2625,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * markup-compatibility element (AlternateContent, Choice, Fallback)
  * or redeclares its default namespace to a URI other than the root's — the splice
  * cannot rewrite it in place — or a numFmtId leaves no id above it —
- * judged at the FIRST registration
+ * or, the part absent, an entry sits under xl/styles.xml/ so no part
+ * may be created at the conventional name — judged at the FIRST registration
  * (or cell style) before anything is staged, so a refused editor
  * saves the passthrough; -3 OutOfMemory. diag is optional (NULL ok).
  *

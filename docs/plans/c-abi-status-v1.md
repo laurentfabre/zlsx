@@ -3118,16 +3118,28 @@ A-PART-301: a package holding it as `xl/style2.xml` got an orphan
 `xl/styles.xml` and indices mapped against the fresh layout, so the
 cell styled italic rendered bold in any consumer that follows the
 relationship) — resolved through the store's relationship map at the
-first registration, `xl/styles.xml` when no relationship names a part
-the slice could read or create (the resolver's own "none": empty, a
-scheme, a UNC or drive-letter target, a package-escaping or
-root-naming `..`; plus the OPC prefix rule — a name an existing part
-sits under, `xl` from a `.`, or over, `xl/workbook.xml/x` — which no
-part may take, ECMA-376 Part 2 §9.1.1; in-house r13 A-REL-1302, r14 A-REL-1401, r15
-A-PART-1501); a part the workbook holds without its relationship
-gains the relationship with the extension. The reader and
-`Workbook.styles()` still address the conventional name
-(pre-existing, recorded).
+first registration, in two questions (`resolvePartTarget`; in-house
+r13 A-REL-1302, r14 A-REL-1401, r15 A-PART-1501 / B-REL-1501, r16
+B-PART-1601 / B-REL-1602 / B-REL-1603, r17 A-PART-1701 / A-PART-1702 /
+A-REL-1703). A target naming a part the package HOLDS names it,
+whatever its spelling: the part is extended in place (a non-ASCII
+name, a trailing slash — refusing a real part's name for its
+spelling would orphan it). A target naming no part is the name the
+slice would CREATE at, and it creates only where (i) the resolver
+answers a name at all (not empty, a scheme, a backslash or
+forward-slash UNC, a drive letter, a package-escaping or root-naming
+`..`), (ii) the relationship spells that name (no empty segment —
+`sub//styles.xml`), (iii) the part-name grammar spells it (ECMA-376
+Part 2 §9.1.1: ASCII pchar; a percent escape of two hex digits
+spelling neither an unreserved character nor a slash; no `\`, `#`,
+`?`, space; no segment ending in `.`; no byte above ASCII — the
+archive could not flag it UTF-8), and (iv) no entry sits under the
+name and no part with bytes sits over it (a zero-length entry beside
+`xl/…` is a directory marker, no part). Otherwise `xl/styles.xml`,
+extended when held, created when not; a part the workbook holds
+without its relationship — and a created part — gains the internal
+relationship with the extension. The reader and `Workbook.styles()`
+still address the conventional name (pre-existing, recorded).
 
 **What the index is.** The part's tables are read once per save —
 `scanStylesPart`, one lexical walk on the workbook scanner
@@ -3234,7 +3246,10 @@ schema's order (the splice's slots would be ambiguous), a table or a
 record under a prefix, inside a markup-compatibility element
 (`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
 its default namespace to a URI other than the root's (the splice cannot rewrite it in
-place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)` — judged at the FIRST
+place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)`, or — the
+part absent — an entry under `xl/styles.xml/` so no part may be
+created at the conventional name (r16 B-PART-1601 / r17 B-DOC-1723)
+— judged at the FIRST
 registration or cell
 style, nothing staged, so a refused editor saves the passthrough
 (pinned on C and Python: byte-identical to the source). `-3`
@@ -3475,6 +3490,29 @@ a second relationship was injected, its target written unescaped, a
 rels part no XML parser reads (A-REL-1602: escaped now, pinned). The
 three pivot-read sentences name the staged cell style among what
 reaches the pivot graph at save (B-DOC-1604).
+
+**Round 17.** The r16 rules judged a real part's name by the same
+predicate as a name to create at: a styles part living at a non-ASCII
+name (or under a stray entry) was refused for its spelling and the
+conventional name created beside it — two parts, two relationships,
+the cell against the wrong base (in-house r17 A-PART-1701) → a part
+the package holds is the part, whatever its spelling; the create-side
+rules apply to a name no part sits at. `isDirectoryMarker` read any
+entry with a descendant as a marker, so a stray `xl/workbook.xml/x`
+made `xl/workbook.xml/styles.xml` creatable (A-PART-1702) → a marker
+is a ZERO-LENGTH entry another sits under (`PartStore.partEmptyAt`).
+An interior or trailing empty segment (`sub//styles.xml`) resolved to
+a part the relationship does not address (A-REL-1703) → a created
+name must be one the relationship spells. The injector's heap decode
+runs only on a spelling holding `&` (r15's invariant; A-PIN-1704, the
+`Type` half pinned past 256 raw bytes). This "Which part" paragraph
+and the `styles_part_resolved` doc carry every rule; the
+name-based `MalformedStylesXml` — the part absent, an entry under
+`xl/styles.xml/` — is on every refusal-shape list (A-DOC-1705,
+B-DOC-1723); a `.` or `/xl` beside a bare `xl` entry names the marker,
+no part — the conventional part (B's cross of r15 and r16, pinned);
+the resolver's two doc lists name the forward-slash network path
+(B-DOC-1724).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

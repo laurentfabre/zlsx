@@ -1496,6 +1496,15 @@ pub const PartStore = struct {
         return self.parts[i].name;
     }
 
+    /// Whether the entry at `i` holds no bytes — read without
+    /// materializing it (the archive's own size; an added or replaced
+    /// part records its bytes' length). A zero-length entry another
+    /// entry sits under is a directory spelled as an entry, no part
+    /// (S3d slice 1 r17 A-PART-1702).
+    pub fn partEmptyAt(self: *const PartStore, i: usize) bool {
+        return self.parts[i].uncompressed_size == 0;
+    }
+
     pub fn part(self: *const PartStore, name: []const u8) Error!?Part {
         return self.partControlled(name, .none);
     }
@@ -1659,7 +1668,8 @@ pub const PartStore = struct {
     /// External detection is heuristic on the target string itself
     /// because this method takes a raw target rather than a full
     /// Relationship. It catches URL schemes (`https://`, `mailto:`,
-    /// `file://`), UNC paths (`\\server\share`), and Windows drive
+    /// `file://`), UNC paths (`\\server\share`), network-path
+    /// references (`//host/path`, RFC 3986 §4.2) and Windows drive
     /// letters (`C:\foo`) — the shapes that external relationships
     /// actually take in real workbooks. Callers that already have a
     /// Relationship and want to be exact should branch on
@@ -1758,9 +1768,10 @@ pub const PartStore = struct {
 /// joined with a part-name parent directory. The shapes covered are:
 ///   - URL schemes:    `https://...`, `mailto:...`, `file:///...`
 ///   - UNC paths:      `\\server\share\...`
+///   - Network paths:  `//host/path` (RFC 3986 §4.2, an authority)
 ///   - Drive letters:  `C:\foo` or `C:/foo`
 /// Anything else is treated as a relative or absolute package path
-/// (the `/`-rooted branch in `resolve`).
+/// (a single leading `/` roots it at the package).
 fn looksExternal(target: []const u8) bool {
     if (target.len < 2) return false;
     if (target[0] == '\\' and target[1] == '\\') return true;
