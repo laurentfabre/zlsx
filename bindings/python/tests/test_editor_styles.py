@@ -163,6 +163,12 @@ def test_statements_about_the_call_stage_nothing(tmp_path):
         for bad in (float("nan"), float("inf"), -3.0, 0.0):
             with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
                 ed.add_dxf(Dxf(font_size=bad))
+        # A control byte in a font name or a format is no text the part
+        # can carry (r30 B-TXT-3001).
+        with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
+            ed.add_style(Style(font_name="Ari\x01al"))
+        with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):
+            ed.intern_num_fmt("0\x00")
         with pytest.raises(ValueError):
             ed.set_cell(2**32, 1, 0, 1)
         with pytest.raises(zlsx.ZlsxError, match="InvalidStyle"):

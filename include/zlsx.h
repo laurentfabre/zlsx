@@ -1418,7 +1418,7 @@ typedef struct {
 /* Register a dxf on the workbook-wide `<dxfs>` table. Returns 0 on
  * success with `*out_dxf_id` set; -1 on alloc, or with
  * err="InvalidFontSize" for a non-finite or non-positive font size (the
- * rule zlsx_writer_add_style_ex keeps; S3d slice 1 r28). Content-dedup'd. */
+ * rule zlsx_writer_add_style_ex keeps; 0.9.0+). Content-dedup'd. */
 int32_t zlsx_writer_add_dxf(zlsx_writer_t *   w,
                             const zlsx_dxf_t* dxf,
                             uint32_t *        out_dxf_id,
@@ -2600,11 +2600,9 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * The fresh writer's registrations on an OPENED workbook. A style, a
  * dxf or a number format registered here lands in the workbook's
  * styles part — the target of the workbook's styles relationship (a
- * part the package holds under any case; a zero-length directory entry
- * is none), xl/styles.xml when none names one; the READER — the
- * zlsx_book_* cell-format exports, `zlsx styles` — still addresses
- * xl/styles.xml literally, so an index registered against a part under
- * another name resolves to none there (pre-existing) — at the next zlsx_editor_save / save_to_buffer /
+ * part the package holds: the exact spelling first, then any ASCII
+ * case; a zero-length directory entry is none), xl/styles.xml when
+ * none names one — at the next zlsx_editor_save / save_to_buffer /
  * save_with_recalc: each table of the part extended after the records
  * it already holds (a table the part lacks is created at its schema
  * slot with the OOXML defaults in front; a workbook without the part
@@ -2612,14 +2610,16 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * the package already holds for the name is re-typed, unless it is a
  * case-variant twin's, which stays, typing the twin — the created part
  * then takes the manifest's Default for its extension; a part held
- * without its relationship or without a content-type Override (or with
- * one lacking its ContentType) gains — unless a Default already types
- * it as the stylesheet —
- * them — a part the package declares under another type keeps that
- * declaration), every other
- * byte of the part preserved. The index returned is the slot the
- * record takes in the SAVED part — feed it to
- * zlsx_editor_set_cell_style, or to a cell's s="…" by other means.
+ * without its relationship or without a content-type Override, or
+ * with one lacking its ContentType, gains them, unless a Default
+ * already types it as the stylesheet; a part the package declares
+ * under another type keeps that declaration), every other byte of the
+ * part preserved. The index returned is the slot the record takes in
+ * the SAVED part — feed it to zlsx_editor_set_cell_style, or to a
+ * cell's s="…" by other means. The READER — the zlsx_book_* cell-format
+ * exports, `zlsx styles` — still addresses xl/styles.xml literally, so
+ * an index registered against a part under another name resolves to
+ * none there (pre-existing).
  * A style that sets no fill or border names the part's records 0
  * (fillId="0", borderId="0", and xfId="0"): the none fill, the empty
  * border and the Normal cell style every known producer writes there
@@ -2635,7 +2635,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * the call — InvalidInput (a NULL handle, spec or out; a NULL font-name
  * or format pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
- * InvalidStyle (a non-finite or non-positive font size; an empty font name or
+ * InvalidStyle (a non-finite or non-positive font size; a font name or
+ * format holding a control byte or invalid UTF-8; an empty font name or
  * format is "unset" at this boundary, `*_len == 0`) — the out is 0 on
  * every failure past the NULL checks (a NULL handle, spec or out leaves
  * it untouched); -2 MalformedStylesXml, the name in the diag
@@ -2647,7 +2648,8 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * schema's order, a table or a record carries a prefix, sits inside a
  * markup-compatibility element (AlternateContent, Choice, Fallback)
  * or redeclares its default namespace to a URI other than the root's — the splice
- * cannot rewrite it in place — or a numFmtId leaves no id above it —
+ * cannot rewrite it in place — or the part's numFmt ids leave no room
+ * for the format (the next id would pass 4294967295) —
  * or the relationship's target is a part the package holds that is
  * no stylesheet — or, the part absent, an entry sits under
  * xl/styles.xml/ so no part may be created at the conventional name
@@ -2693,7 +2695,10 @@ int32_t zlsx_editor_add_dxf(zlsx_editor_t * ed,
  * custom id an <xf> names (a dxf's own
  * inline numFmt is not counted), 164 at least — the same id
  * for the same bytes within one save. Statuses as
- * zlsx_editor_add_style's; an empty format is InvalidStyle. */
+ * zlsx_editor_add_style's — the part first: a part the walk cannot
+ * read, or one whose numFmt ids leave no room, is -2 whatever the
+ * format; then -1 InvalidStyle for an empty format, one holding a
+ * control byte or invalid UTF-8. */
 int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
         const uint8_t * ptr, size_t len, uint32_t * out_id,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
@@ -2705,13 +2710,11 @@ int32_t zlsx_editor_intern_num_fmt(zlsx_editor_t * ed,
  * returned for this save. A cell the sheet lacks is created empty
  * with the style (the formatted blank Excel writes); a cell with a
  * value, staged or not, keeps it; the last call for a cell wins, and
- * a delete of the cell wins over its style. -1: InvalidInput (NULL
- * handle), SheetIndexOutOfRange, RowIndexOutOfRange,
- * ColumnIndexOutOfRange (the cell's address, judged first),
- * UnknownStyleIndex (past both ranges — judged after the part, before
- * anything is staged), SheetHasUnsavedAppends;
- * -2 MalformedStylesXml (the part, judged after the address and before
- * the style index); -3 OutOfMemory. The save itself may
+ * a delete of the cell wins over its style. In order: -1 InvalidInput
+ * (NULL handle), SheetIndexOutOfRange, SheetHasUnsavedAppends,
+ * RowIndexOutOfRange, ColumnIndexOutOfRange; then -2
+ * MalformedStylesXml (the part); then -1 UnknownStyleIndex (past both
+ * ranges — judged before anything is staged); -3 OutOfMemory. The save itself may
  * refuse -1 StylesPartChanged (see zlsx_editor_save). */
 int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
         uint32_t sheet_idx, uint32_t row, uint32_t col, uint32_t style_idx,

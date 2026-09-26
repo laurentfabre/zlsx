@@ -523,18 +523,42 @@ pub const StylesPlan = struct {
     /// no-style record.
     ///
     /// Side effect: when `style.number_format` is set, the format
+    /// The one font-size rule, a style's and a dxf's: finite and
+    /// positive (S3d slice 1 r30 A-PIN-3002 tied the two copies).
+    fn fontSizeValid(s: f32) bool {
+        return std.math.isFinite(s) and s > 0;
+    }
+
+    /// A font name or format code the part can carry: non-empty,
+    /// valid UTF-8, no byte XML 1.0 forbids (a C0 control other than
+    /// tab, LF, CR) — the escaper here spells the five markup
+    /// characters only, and a control byte written verbatim made the
+    /// part ill-formed where the sheet writers refuse the same byte
+    /// (S3d slice 1 r30 B-TXT-3001).
+    fn xmlTextValid(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (!std.unicode.utf8ValidateSlice(s)) return false;
+        for (s) |c| {
+            switch (c) {
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => return false,
+                else => {},
+            }
+        }
+        return true;
+    }
+
     /// string is registered into the numFmt pool *before* dedup of
     /// the parent Style runs, so a rejected style doesn't pollute
     /// the format pool.
     pub fn addStyle(self: *StylesPlan, allocator: Allocator, style: Style) Error!u32 {
         if (style.font_size) |s| {
-            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
+            if (!fontSizeValid(s)) return error.InvalidFontSize;
         }
         if (style.font_name) |n| {
-            if (n.len == 0) return error.InvalidFontName;
+            if (!xmlTextValid(n)) return error.InvalidFontName;
         }
         if (style.number_format) |n| {
-            if (n.len == 0) return error.InvalidNumberFormat;
+            if (!xmlTextValid(n)) return error.InvalidNumberFormat;
         }
 
         if (style.number_format) |fmt| {
@@ -569,7 +593,7 @@ pub const StylesPlan = struct {
         // val="nan"/>` in the part — on the fresh writer and the
         // editor alike (S3d slice 1 r27 A-DXF-2701, r28 A-DOC-2804).
         if (dxf.font_size) |s| {
-            if (!std.math.isFinite(s) or s <= 0) return error.InvalidFontSize;
+            if (!fontSizeValid(s)) return error.InvalidFontSize;
         }
         for (self.dxfs.items, 0..) |existing, i| {
             if (std.meta.eql(existing, dxf)) return @intCast(i);
@@ -582,6 +606,7 @@ pub const StylesPlan = struct {
     /// `NUM_FMT_BASE` (164) on first sight. Subsequent calls with the
     /// same content return the same id.
     pub fn internNumFmt(self: *StylesPlan, allocator: Allocator, fmt: []const u8) Error!u32 {
+        if (!xmlTextValid(fmt)) return error.InvalidNumberFormat;
         if (self.num_fmt_index.get(fmt)) |id| return id;
         const owned = try allocator.dupe(u8, fmt);
         errdefer allocator.free(owned);
@@ -902,6 +927,19 @@ test "StylesPlan: addStyle rejects invalid inputs" {
     try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = -3.0 }));
     try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = std.math.inf(f32) }));
+    // A control byte or invalid UTF-8 in a name or a format is no
+    // text the part can carry (r30 B-TXT-3001).
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "Ari\x01al" }));
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "Ar\xffial" }));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.addStyle(a, .{ .number_format = "0\x00" }));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "0\x0b"));
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "\xc3"));
+    try std.testing.expectEqual(@as(usize, 0), plan.num_fmts.items.len);
+    // Tab, LF and CR are XML's own whitespace: carried.
+    _ = try plan.internNumFmt(a, "0\t0");
+    // The boundary itself: 0 is refused, on both (r30 A-PIN-3002).
+    try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = 0 }));
+    try std.testing.expectError(error.InvalidFontSize, plan.addStyle(a, .{ .font_size = 0 }));
     try std.testing.expectEqual(@as(usize, 0), plan.dxfs.items.len);
     try std.testing.expectError(
         error.InvalidFontName,

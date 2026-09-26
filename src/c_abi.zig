@@ -3118,8 +3118,9 @@ pub const CDxf = extern struct {
 
 /// Register a differential format on the workbook-wide `<dxfs>`
 /// table. Returns 0 on success with `*out_dxf_id` set; -1 on
-/// alloc failure. Content-dedup'd: repeat registrations with the
-/// same CDxf return the same id.
+/// alloc failure or with err="InvalidFontSize" for a non-finite or
+/// non-positive font size (S3d slice 1 r28). Content-dedup'd: repeat
+/// registrations with the same CDxf return the same id.
 export fn zlsx_writer_add_dxf(
     w: *Writer,
     dxf: *const CDxf,
@@ -11896,10 +11897,11 @@ export fn zlsx_editor_intern_num_fmt(
 /// workbook's `<cellXfs>` holds, or one `zlsx_editor_add_style`
 /// returned for this save; a cell the sheet lacks is created empty
 /// with it, a cell with a value keeps the value; the last call for a
-/// cell wins. -1: InvalidInput (a NULL handle), SheetIndexOutOfRange,
-/// RowIndexOutOfRange, ColumnIndexOutOfRange, UnknownStyleIndex (past
-/// both ranges — judged before anything is staged),
-/// SheetHasUnsavedAppends; -2 MalformedStylesXml; -3 OutOfMemory.
+/// cell wins. In order: -1 InvalidInput (a NULL handle),
+/// SheetIndexOutOfRange, SheetHasUnsavedAppends, RowIndexOutOfRange,
+/// ColumnIndexOutOfRange; then -2 MalformedStylesXml (the part); then
+/// -1 UnknownStyleIndex (past both ranges — judged before anything is
+/// staged); -3 OutOfMemory (r30 A-ABI-3004).
 export fn zlsx_editor_set_cell_style(
     ed: ?*Editor,
     sheet_idx: u32,

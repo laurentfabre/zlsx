@@ -5388,7 +5388,8 @@ class Editor:
         schema's order, a table or a record under a prefix, inside a
         markup-compatibility element (``AlternateContent`` / ``Choice``
         / ``Fallback``) or redeclaring its default namespace to a URI
-        other than the root's, a ``numFmtId`` with no id above it —
+        other than the root's, numFmt ids leaving no room for the
+        format (the next id past 4294967295) —
         or the relationship's target is a part the package holds that
         is no stylesheet — or, the part absent, an entry under
         ``xl/styles.xml/`` so no part may be created at the
@@ -5432,8 +5433,11 @@ class Editor:
         at least; the same id for the same string within one save.
         A :class:`Style` with ``number_format`` set interns its format
         by itself — this is for a caller writing ``numFmtId`` elsewhere.
-        :meth:`add_style`'s refusal; :class:`ZlsxError` ``InvalidStyle``
-        for an empty string."""
+        :meth:`add_style`'s refusal — the part first: a part the
+        extension cannot read, or one whose numFmt ids leave no room,
+        is the :class:`ZlsxRefusal` whatever the format; then
+        :class:`ZlsxError` ``InvalidStyle`` for an empty string, or one
+        holding a control byte or invalid UTF-8."""
         self._styles_available()
         code = format_code.encode("utf-8")
         buf = (ctypes.c_ubyte * max(len(code), 1)).from_buffer_copy(code or b"\x00")
@@ -5478,7 +5482,9 @@ class Editor:
         Raises :class:`ZlsxError` ``UnknownStyleIndex`` past both ranges
         (judged before anything is staged), ``SheetIndexOutOfRange``,
         ``RowIndexOutOfRange``, ``ColumnIndexOutOfRange``; the
-        :class:`ZlsxRefusal` of :meth:`add_style`. The four indices are
+        :class:`ZlsxRefusal` of :meth:`add_style`. In order: the sheet
+        index, the appends guard, the row, the column; then the part;
+        then the style index. The four indices are
         bounded before ``ctypes`` narrows them (``2**32`` is
         ``ValueError``, ``1.9`` ``TypeError`` — :meth:`insert_row`'s
         rule), never wrapped to another sheet, row or style. The save

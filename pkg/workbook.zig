@@ -1702,9 +1702,11 @@ pub const Workbook = struct {
         // format judges the room first too).
         const base = try self.stylesBaseline();
         try self.requireNumFmtRoom(base, format_code);
-        if (format_code.len == 0) return error.InvalidStyle;
+        // The plan's text rule — empty, a control byte, invalid UTF-8
+        // (r30 B-TXT-3001) — folds to `InvalidStyle`.
         const fresh_id = self.styles_plan.internNumFmt(self.allocator, format_code) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidNumberFormat => return error.InvalidStyle,
             else => unreachable,
         };
         return base.numFmtId(fresh_id);
@@ -34392,6 +34394,27 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         try std.testing.expectEqual(@as(u32, 3), try wb.addStyle(.{ .font_bold = true }));
         try wb.store.replacePart("xl/styles.xml", "<worksheet " ++ s3d1_ns ++ "/>");
         try std.testing.expectError(error.StylesPartChanged, wb.save(io, out));
+    }
+    // The part's numFmt room before the empty argument (r29
+    // A-ABI-2903, pinned r30 A-PIN-3001): a part with no id above its
+    // last refuses `MalformedStylesXml` for an empty format too.
+    {
+        const full = try writeS3d1WithStyles(a, io, dir, "s3d1_r30_full.xlsx", "<styleSheet " ++ s3d1_ns ++ "><numFmts count=\"1\"><numFmt numFmtId=\"4294967295\" formatCode=\"0\"/></numFmts><fonts count=\"1\"><font/></fonts><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet>");
+        defer a.free(full);
+        var wb = try Workbook.open(a, io, full);
+        defer wb.deinit();
+        try std.testing.expectError(error.MalformedStylesXml, wb.internNumFmt(""));
+        try std.testing.expectError(error.MalformedStylesXml, wb.addStyle(.{ .number_format = "" }));
+    }
+    // A control byte or invalid UTF-8 in a name or a format is
+    // `InvalidStyle` on the editor (r30 B-TXT-3001), nothing staged.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try std.testing.expectError(error.InvalidStyle, wb.addStyle(.{ .font_name = "Ari\x01al" }));
+        try std.testing.expectError(error.InvalidStyle, wb.addStyle(.{ .number_format = "0\xff" }));
+        try std.testing.expectError(error.InvalidStyle, wb.internNumFmt("0\x00"));
+        try std.testing.expect(!wb.hasStagedStyleWork());
     }
     // The part first, then the argument, on every registration: a
     // torn part refuses `MalformedStylesXml` whatever the argument

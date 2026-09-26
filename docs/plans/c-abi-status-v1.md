@@ -3292,7 +3292,9 @@ schema's order (the splice's slots would be ambiguous), a table or a
 record under a prefix, inside a markup-compatibility element
 (`AlternateContent`, or a bare `Choice` / `Fallback`) or redeclaring
 its default namespace to a URI other than the root's (the splice cannot rewrite it in
-place — r7 / r8 / r9 / r10), a `numFmtId` at `maxInt(u32)`, the
+place — r7 / r8 / r9 / r10), numFmt ids leaving no room for the
+format — the next id past `maxInt(u32)` (r2 A-OVF-201, on every
+caller list since r30 B-DOC-3005), the
 relationship's target a part the package holds that is no stylesheet
 (`sharedStrings.xml`, `workbook.xml` — the scan refuses its root; r18
 B-DOC-1804), or — the part absent — an entry under `xl/styles.xml/`
@@ -3818,6 +3820,25 @@ marker spelled as the conventional name — LibreOffice renders the
 sheet unstyled, openpyxl refuses — not a regression (the source is
 already so), left as it is. The reader's conventional-name rule on
 the caller surfaces (B-DOC-2907).
+
+**Round 30.** A C0 control byte or invalid UTF-8 in a font name or
+a format was written verbatim into the part — ill-formed XML, openpyxl
+refusing the workbook — where the sheet writers refuse the same byte
+(in-house r30 B-TXT-3001) → the plan's one text rule (`xmlTextValid`:
+non-empty, valid UTF-8, no forbidden byte) on `addStyle`'s name and
+format and on `internNumFmt`, `InvalidFontName` / `InvalidNumberFormat`
+on the writer and `InvalidStyle` on the editor, pinned on the plan,
+the workbook and Python. The one font-size predicate for a style and
+a dxf, the `0` boundary pinned (A-PIN-3002); the numFmt-room refusal
+pinned ahead of the empty argument (A-PIN-3001); `set_cell_style`'s
+real order — the sheet index, the appends guard, the row, the column,
+the part, the style index — on the header, the export's doc and the
+docstring (A-ABI-3004 / B-DOC-3004); the numFmt-ROOM refusal on every
+caller list (B-DOC-3005); the header's S3d block reworded — the reader
+clause at its end, the exact-spelling-first precedence, the verb
+beside its object — and its one round citation a version (A-DOC-3005
+/ A-DOC-3006 / B-DOC-3002 / B-DOC-3003 / B-DOC-3006);
+`zlsx_writer_add_dxf`'s Zig doc names `InvalidFontSize` (A-DOC-3003).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already
