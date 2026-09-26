@@ -329,10 +329,11 @@ fn patternTypeName(p: PatternType) []const u8 {
 }
 
 /// Append `s` to `out`, escaping XML metacharacters (`<`, `>`, `&`,
-/// `"`, `'`). Mirrors the writer-side `appendXmlEscaped` helper.
-/// Caller is responsible for ensuring `s` carries no XML 1.0
-/// forbidden control bytes — that's a writer-side intake concern,
-/// not a styles emit one.
+/// `"`, `'`) and spelling tab, LF and CR as character references —
+/// every value this writes is an attribute, whose normalisation
+/// would fold a literal one to a space (r31 A-TXT-3102). Mirrors the
+/// writer-side `appendXmlEscaped` helper. `xmlTextValid` at intake
+/// keeps every other non-`Char` byte out.
 fn appendXmlEscaped(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -344,6 +345,9 @@ fn appendXmlEscaped(
         '&' => try out.appendSlice(alloc, "&amp;"),
         '"' => try out.appendSlice(alloc, "&quot;"),
         '\'' => try out.appendSlice(alloc, "&apos;"),
+        '\t' => try out.appendSlice(alloc, "&#9;"),
+        '\n' => try out.appendSlice(alloc, "&#10;"),
+        '\r' => try out.appendSlice(alloc, "&#13;"),
         else => try out.append(alloc, b),
     };
 }
@@ -516,6 +520,44 @@ pub const StylesPlan = struct {
         return self.styles.items.len > 0 or self.dxfs.items.len > 0 or self.num_fmts.items.len > 0;
     }
 
+    /// The one font-size rule, a style's and a dxf's: finite and
+    /// positive (S3d slice 1 r30 A-PIN-3002 tied the two copies).
+    fn fontSizeValid(s: f32) bool {
+        return std.math.isFinite(s) and s > 0;
+    }
+
+    /// A font name or format code the part can carry: non-empty and
+    /// XML 1.0 `Char` throughout — valid UTF-8, no forbidden control
+    /// byte (`isForbiddenXmlByte` below — the sheet writers' rule in
+    /// `sheet_plan`, which this module cannot import: the two are
+    /// separate build modules; r31 A-DUP-3103), neither U+FFFE nor
+    /// U+FFFF (valid
+    /// UTF-8, outside `Char`: written verbatim they made the part
+    /// ill-formed through the very rule that closed the control bytes
+    /// — r30 B-TXT-3001, r31 A-TXT-3101). Tab, LF and CR are `Char`
+    /// and pass; the escaper spells them as references so an
+    /// attribute value keeps them (r31 A-TXT-3102).
+    fn xmlTextValid(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (!std.unicode.utf8ValidateSlice(s)) return false;
+        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        while (it.nextCodepoint()) |cp| {
+            if (cp < 0x80 and isForbiddenXmlByte(@intCast(cp))) return false;
+            if (cp == 0xFFFE or cp == 0xFFFF) return false;
+        }
+        return true;
+    }
+
+    /// XML 1.0 §2.2 `Char` on one byte: a C0 control other than tab,
+    /// LF, CR is none. The same switch as `sheet_plan.isForbiddenXmlByte`
+    /// (a separate build module — kept in step by hand).
+    fn isForbiddenXmlByte(c: u8) bool {
+        return switch (c) {
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => true,
+            else => false,
+        };
+    }
+
     /// Register a cell style and return its `s="…"` index. Dedupes
     /// structurally (including content-comparing `font_name` /
     /// `number_format`, not just slice-header comparing). Returning
@@ -523,42 +565,16 @@ pub const StylesPlan = struct {
     /// no-style record.
     ///
     /// Side effect: when `style.number_format` is set, the format
-    /// The one font-size rule, a style's and a dxf's: finite and
-    /// positive (S3d slice 1 r30 A-PIN-3002 tied the two copies).
-    fn fontSizeValid(s: f32) bool {
-        return std.math.isFinite(s) and s > 0;
-    }
-
-    /// A font name or format code the part can carry: non-empty,
-    /// valid UTF-8, no byte XML 1.0 forbids (a C0 control other than
-    /// tab, LF, CR) — the escaper here spells the five markup
-    /// characters only, and a control byte written verbatim made the
-    /// part ill-formed where the sheet writers refuse the same byte
-    /// (S3d slice 1 r30 B-TXT-3001).
-    fn xmlTextValid(s: []const u8) bool {
-        if (s.len == 0) return false;
-        if (!std.unicode.utf8ValidateSlice(s)) return false;
-        for (s) |c| {
-            switch (c) {
-                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => return false,
-                else => {},
-            }
-        }
-        return true;
-    }
-
     /// string is registered into the numFmt pool *before* dedup of
     /// the parent Style runs, so a rejected style doesn't pollute
-    /// the format pool.
+    /// the format pool — and the format's own text rule is judged
+    /// there (one rule, `internNumFmt`'s; r31 A-PIN-3106).
     pub fn addStyle(self: *StylesPlan, allocator: Allocator, style: Style) Error!u32 {
         if (style.font_size) |s| {
             if (!fontSizeValid(s)) return error.InvalidFontSize;
         }
         if (style.font_name) |n| {
             if (!xmlTextValid(n)) return error.InvalidFontName;
-        }
-        if (style.number_format) |n| {
-            if (!xmlTextValid(n)) return error.InvalidNumberFormat;
         }
 
         if (style.number_format) |fmt| {
@@ -935,8 +951,16 @@ test "StylesPlan: addStyle rejects invalid inputs" {
     try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "0\x0b"));
     try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "\xc3"));
     try std.testing.expectEqual(@as(usize, 0), plan.num_fmts.items.len);
-    // Tab, LF and CR are XML's own whitespace: carried.
+    // U+FFFE / U+FFFF: valid UTF-8, no XML `Char` (r31 A-TXT-3101).
+    try std.testing.expectError(error.InvalidNumberFormat, plan.internNumFmt(a, "0\xef\xbf\xbe"));
+    try std.testing.expectError(error.InvalidFontName, plan.addStyle(a, .{ .font_name = "A\xef\xbf\xbf" }));
+    // Tab, LF and CR are XML's own whitespace: carried, spelled as
+    // references so the attribute keeps them (r31 A-TXT-3102).
     _ = try plan.internNumFmt(a, "0\t0");
+    var emitted: std.ArrayListUnmanaged(u8) = .empty;
+    defer emitted.deinit(a);
+    try plan.emit(a, &emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.items, "formatCode=\"0&#9;0\"") != null);
     // The boundary itself: 0 is refused, on both (r30 A-PIN-3002).
     try std.testing.expectError(error.InvalidFontSize, plan.addDxf(a, .{ .font_size = 0 }));
     try std.testing.expectError(error.InvalidFontSize, plan.addStyle(a, .{ .font_size = 0 }));

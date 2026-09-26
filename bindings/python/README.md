@@ -491,7 +491,11 @@ write to the structural edits (`RowEditRequiresCleanSheet` /
 `append_rows` (`SheetHasUnsavedMutations`); on a sheet with appended rows it
 refuses `SheetHasUnsavedAppends`; an index past the part and the
 registrations is `ZlsxError` `UnknownStyleIndex`, judged before anything is
-staged. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
+staged; a font size not finite and positive, or a font name or format that is
+empty or not XML text throughout (a C0 control other than tab, LF or CR,
+U+FFFE / U+FFFF) is `ZlsxError` `InvalidStyle`, judged after the part — the
+fresh `Writer` names the same refusals `InvalidFontSize` / `InvalidFontName` /
+`InvalidNumberFormat`. The save itself raises `ZlsxError` `StylesPartChanged` when the part a
 registration mapped against is no longer the one the package resolves to, or
 one the extension can read — a structural edit created the part the styles
 relationship names (`add_sheet` on a package whose relationship targets a

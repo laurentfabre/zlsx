@@ -1195,6 +1195,11 @@ typedef struct {
 #define ZLSX_BORDER_BOTTOM_COLOR_SET    0x08u /* flags2 bit 3 */
 #define ZLSX_BORDER_DIAGONAL_COLOR_SET  0x10u /* flags2 bit 4 */
 
+/* Statuses: -1 with err="InvalidFontSize" for a non-finite or
+ * non-positive font size, "InvalidFontName" / "InvalidNumberFormat" for a
+ * font name or format that is empty or not XML text throughout (a C0
+ * control other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF) —
+ * tab, LF and CR are carried as character references (0.9.0+). */
 int32_t zlsx_writer_add_style_ex(
     zlsx_writer_t      * writer,
     const zlsx_style_t * spec,
@@ -2632,11 +2637,14 @@ int32_t zlsx_editor_strip_embeddings(zlsx_editor_t * ed,
  * afresh, so indices keep counting up across saves in one editor.
  *
  * Statuses (status_v1): 0 with the out written; -1 a statement about
- * the call — InvalidInput (a NULL handle, spec or out; a NULL font-name
+ * the call, judged after the part (a torn part is -2 whatever the
+ * argument; the boundary's own readings below come first) —
+ * InvalidInput (a NULL handle, spec or out; a NULL font-name
  * or format pointer with a non-zero length), BadAlignmentValue / BadFillPattern
  * / BadBorderStyle (zlsx_writer_add_style_ex's enum verdicts),
  * InvalidStyle (a non-finite or non-positive font size; a font name or
- * format holding a control byte or invalid UTF-8; an empty font name or
+ * format that is not XML text throughout — a C0 control other than tab, LF or CR, invalid
+ * UTF-8, U+FFFE / U+FFFF; an empty font name or
  * format is "unset" at this boundary, `*_len == 0`) — the out is 0 on
  * every failure past the NULL checks (a NULL handle, spec or out leaves
  * it untouched); -2 MalformedStylesXml, the name in the diag

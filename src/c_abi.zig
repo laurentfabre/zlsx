@@ -11788,7 +11788,10 @@ export fn zlsx_editor_strip_embeddings(
 /// the `s="…"` slot the record takes in the saved part; dedup within
 /// the save. -1: InvalidInput (a NULL handle, spec or out; a NULL
 /// font-name or format pointer with a non-zero length), the enum
-/// verdicts `styleFromC` names, InvalidStyle (a non-finite or non-positive font size
+/// verdicts `styleFromC` names — judged after the part (a torn part is
+/// -2 whatever the argument), InvalidStyle (a non-finite or non-positive font size;
+/// a font name or format that is not XML text throughout — a C0 control other
+/// than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF
 /// — an empty font name or format is "unset" here, `*_len == 0`); -2 MalformedStylesXml with the name
 /// in the diag and no plane, nothing staged; -3 OutOfMemory.
 /// `*out_index` is 0 on every failure past the NULL checks.
@@ -11825,8 +11828,9 @@ export fn zlsx_editor_add_style(
 /// Register a differential format on the editor's workbook.
 /// `*out_dxf_id` is the dxfId the record takes in the saved part —
 /// after the `<dxf>` records it holds. Statuses as
-/// `zlsx_editor_add_style`'s, without the enum verdicts (a border code
-/// the header does not spell reads as none).
+/// `zlsx_editor_add_style`'s — the part first, then the dxf's own font
+/// size — without the enum verdicts (a border code the header does
+/// not spell reads as none).
 export fn zlsx_editor_add_dxf(
     ed: ?*Editor,
     dxf: ?*const CDxf,

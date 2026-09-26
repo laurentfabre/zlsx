@@ -3273,7 +3273,7 @@ writer's export with it, r8 B-DOC-803), the writer's enum verdicts
 `zlsx_style_t` reading is `styleFromC`, factored out of
 `zlsx_writer_add_style_ex` — one reading, the writer's error names
 unchanged; the `zlsx_dxf_t` reading `dxfFromC` likewise, a border code
-the header does not spell reading as none), `InvalidStyle` (a non-finite or non-positive font size, judged after the part is read — an empty font name or
+the header does not spell reading as none), `InvalidStyle` (a non-finite or non-positive font size, judged after the part is read; a font name or format that is not XML text throughout — a C0 control other than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF — an empty font name or
 format is "unset" at the C boundary, `*_len == 0`, and Python raises
 the writer's `InvalidFontName` / `InvalidNumberFormat` before the call;
 `zlsx_editor_intern_num_fmt` alone reaches `InvalidStyle` with an empty
@@ -3839,6 +3839,27 @@ clause at its end, the exact-spelling-first precedence, the verb
 beside its object — and its one round citation a version (A-DOC-3005
 / A-DOC-3006 / B-DOC-3002 / B-DOC-3003 / B-DOC-3006);
 `zlsx_writer_add_dxf`'s Zig doc names `InvalidFontSize` (A-DOC-3003).
+
+**Round 31.** `xmlTextValid` admitted U+FFFE / U+FFFF — valid UTF-8
+outside XML 1.0 `Char`, written verbatim, expat refusing the part
+(in-house r31 A-TXT-3101) → the rule walks code points: the C0 set,
+the two noncharacters. The two guarded values are attributes, whose
+normalisation folds a literal tab, LF or CR to a space (A-TXT-3102) →
+the plan's escaper spells the three as character references (pinned
+on the emit). The byte switch a third copy of
+`sheet_plan.isForbiddenXmlByte` (A-DUP-3103) — the two are separate
+build modules and cannot import each other, so the copy stays, named
+and kept in step. `addStyle`'s dominated format check removed, one
+rule — `internNumFmt`'s (A-PIN-3106); the r30 helpers moved out of
+`addStyle`'s doc comment, the escaper's comment true (A-DOC-3104);
+the text rule on every `InvalidStyle` enumeration and the
+part-before-argument precedence on the `add_style` / `add_dxf`
+status blocks (A-DOC-3105 / A-DOC-3107). B converged on the three
+defects (B-TXT-3101 / B-TXT-3102 / B-DUP-3106) and the split doc
+(B-DOC-3105); the text rule on the last caller surfaces — footnote
+³⁰, the Python README, `Workbook.addStyle`'s doc — reads "a C0
+control other than tab, LF or CR" (B-DOC-3103); the writer half named
+on `zlsx_writer_add_style_ex` and `Writer.add_style` (B-DOC-3104).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

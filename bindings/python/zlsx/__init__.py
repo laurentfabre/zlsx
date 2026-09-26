@@ -3304,7 +3304,12 @@ class Writer:
         stage-1 ``zlsx_writer_add_style`` for backward compatibility with
         libzlsx 0.2.3. Any stage-2 field (size, name, color, alignment,
         wrap_text) promotes the call to ``zlsx_writer_add_style_ex``
-        (libzlsx 0.2.4+)."""
+        (libzlsx 0.2.4+). Raises :class:`ZlsxError` ``InvalidFontSize``
+        for a non-finite or non-positive font size, ``InvalidFontName`` /
+        ``InvalidNumberFormat`` for a name or format that is not XML text
+        throughout (a C0 control other than tab, LF or CR, U+FFFE /
+        U+FFFF; 0.9.0+) — the same rules :meth:`Editor.add_style` folds
+        to ``InvalidStyle``."""
         if not _ffi._HAS_STYLES:
             raise RuntimeError(
                 "loaded libzlsx does not expose zlsx_writer_add_style "
@@ -5396,6 +5401,9 @@ class Editor:
         conventional name);
         :class:`ZlsxError` ``InvalidFontName`` / ``InvalidNumberFormat``
         for an empty font name or format string (judged here, as
+        :meth:`Writer.add_style` judges them) — ``InvalidStyle`` for one
+        that is not XML text throughout (a C0 control other than tab, LF or CR, U+FFFE /
+        U+FFFF; a ``str`` is valid UTF-8 already) — and (judged here, as
         :meth:`Writer.add_style` judges them), ``InvalidStyle`` for a
         non-finite or non-positive font size — where :meth:`Writer.add_style` names
         the writer's ``InvalidFontSize``: the editor folds the plan's

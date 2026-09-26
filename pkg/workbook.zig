@@ -165,7 +165,10 @@ pub const Error = error{
     RecalcRequiresReopen,
 
     /// Style validation failed — empty font name, non-finite or
-    /// non-positive font size, or empty number format string. Surfaces
+    /// non-positive font size, or empty number format string — or a
+    /// font name or format that is not XML text throughout (a C0 control other
+    /// than tab, LF or CR, invalid UTF-8, U+FFFE / U+FFFF; r30 B-TXT-3001, r31
+    /// A-TXT-3101). Surfaces
     /// from `Workbook.addStyle` / `Workbook.addDxf` /
     /// `Workbook.internNumFmt`, after the part has been read (the part
     /// first, then the argument — r28 A-ABI-2806).
@@ -1648,7 +1651,11 @@ pub const Workbook = struct {
     /// `xlsx.Writer.addStyle` byte-for-byte (both route through
     /// `StylesPlan.addStyle`). Pair with `Worksheet.setCellStyle`.
     /// Refuses `MalformedStylesXml` — nothing staged — when the part
-    /// cannot take an extension.
+    /// cannot take an extension; then `InvalidStyle` for a font size
+    /// not finite and positive, or a name or format that is empty or
+    /// not XML text throughout (a C0 control other than tab, LF or CR,
+    /// invalid UTF-8, U+FFFE / U+FFFF) — the part first, then the
+    /// argument (r31 B-DOC-3103).
     pub fn addStyle(self: *Workbook, style: Style) Error!u32 {
         const base = try self.stylesBaseline();
         // The slot the record would take in every table it lands in
