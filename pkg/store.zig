@@ -1764,6 +1764,10 @@ pub const PartStore = struct {
 fn looksExternal(target: []const u8) bool {
     if (target.len < 2) return false;
     if (target[0] == '\\' and target[1] == '\\') return true;
+    // A network-path reference (RFC 3986 §4.2: `//host/path`) names
+    // an authority, nothing in the package — the forward-slash UNC
+    // (in-house S3d slice 1 r16 B-REL-1603).
+    if (target[0] == '/' and target[1] == '/') return true;
     if (target.len >= 3 and isAsciiAlpha(target[0]) and target[1] == ':' and
         (target[2] == '\\' or target[2] == '/'))
     {
@@ -2773,7 +2777,7 @@ test "PartStore.resolve: relative + absolute targets" {
     // A target that collapses to the package root names no part —
     // relative or absolute (in-house S3d slice 1 r15 A-PART-1501);
     // an absolute target collapses its own `.` and `..` segments.
-    for ([_][]const u8{ "..", "./..", "/", "/.", "/..", "/xl/..", "../." }) |root_target| {
+    for ([_][]const u8{ "..", "./..", "/", "/.", "/..", "/xl/..", "../.", "//styles.xml", "//srv/share/x", "///a.xml" }) |root_target| {
         try std.testing.expectEqual(@as(?[]const u8, null), try store.resolve("xl/workbook.xml", root_target));
     }
     const r4 = (try store.resolve("anywhere", "/xl/./worksheets/../styles.xml")).?;

@@ -4399,8 +4399,9 @@ class Editor:
         the same NDJSON bytes the CLI prints. Read over the editor's
         current workbook state: structural edits (rows, columns,
         sheets, table columns) are visible immediately; staged
-        :meth:`set_cell` / :meth:`append_rows` writes reach the pivot
-        graph at :meth:`save`, where a cache whose source they change
+        :meth:`set_cell` / :meth:`set_cell_style` / :meth:`append_rows`
+        writes reach the pivot graph at :meth:`save`, where a cache
+        whose source they change
         is rebuilt or marked — save, then read, to see them. ``[]``
         for a workbook without pivots. A graph that cannot be read whole raises
         :class:`ZlsxRefusal` (``MalformedPivotXml``) rather than a

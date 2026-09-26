@@ -368,8 +368,9 @@ checked before the call — ctypes would otherwise truncate or wrap them.
 `{"kind": "pivot_cache", …}` per cache no table reads; `[]` for a
 workbook without pivots. It reads the editor's current workbook state:
 structural edits are visible immediately — rename the host sheet and
-the record names it — while staged `set_cell` / `append_rows` writes
-reach the pivot graph at `save`, where a cache whose source they change
+the record names it — while staged `set_cell` / `set_cell_style` /
+`append_rows` writes reach the pivot graph at `save`, where a cache
+whose source they change
 is rebuilt or marked; save, then read, to see them.
 
 `Editor.defined_names()` / `zlsx.defined_names(path)` are the same

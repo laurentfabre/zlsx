@@ -3123,7 +3123,7 @@ the slice could read or create (the resolver's own "none": empty, a
 scheme, a UNC or drive-letter target, a package-escaping or
 root-naming `..`; plus the OPC prefix rule — a name an existing part
 sits under, `xl` from a `.`, or over, `xl/workbook.xml/x` — which no
-part may take, §M1.11; in-house r13 A-REL-1302, r14 A-REL-1401, r15
+part may take, ECMA-376 Part 2 §9.1.1; in-house r13 A-REL-1302, r14 A-REL-1401, r15
 A-PART-1501); a part the workbook holds without its relationship
 gains the relationship with the extension. The reader and
 `Workbook.styles()` still address the conventional name
@@ -3447,6 +3447,34 @@ on the header, the Editor, the Python docstrings and README) name the
 staged cell style beside the writes and the appends (B-DOC-1503); the
 ladder row no longer counts mark-recalc-on-load as Zig-only
 (B-DOC-1502).
+
+**Round 16.** The r15 prefix rule judged every ZIP entry: a
+zero-length `xl` entry beside `xl/…` (the directory spelled without
+its slash, as a producer may) made every name under `xl/` uncreatable
+— a moved styles part orphaned again, a second part created, two
+internal relationships, and the conventional fallback created at a
+name the rule had just refused (in-house r16 B-PART-1601, a
+regression over r15) → an entry another entry sits under is a
+directory marker, no part (`isDirectoryMarker`); the conventional
+fallback passes the same test the relationship's name did, else
+`MalformedStylesXml` (pinned: the moved and the conventional part
+beside a bare `xl` entry). A percent escape must be two hex digits
+spelling neither an unreserved character nor a slash (`styles%2Exml`
+is `styles.xml` to a normalizing consumer and another name to a
+literal one — B-REL-1602); a byte above ASCII names no part (the
+grammar wants it escaped; an unescaped one would be an entry
+`pkg/zip.zig` cannot flag as UTF-8 — bit 11 is never set, for any
+entry, a pre-existing package-layer item recorded as an owner
+follow-up beside B-CT-603 / B-RD-1204: B-PKG-1605); a network-path
+target (`//host/path`) is external to the resolver, as the
+backslash UNC is (B-REL-1603; A-REL-1601 found both faces). The
+injector decodes a `Type` and a `Target` into a buffer the raw
+spelling always fits, as the store's reader does — the fixed buffer's
+overflow fell back to the raw text, whose `#` read as unspellable and
+a second relationship was injected, its target written unescaped, a
+rels part no XML parser reads (A-REL-1602: escaped now, pinned). The
+three pivot-read sentences name the staged cell style among what
+reaches the pivot graph at save (B-DOC-1604).
 
 **Dedup.** Within one save, against this editor's registrations —
 never against the part's own records: a style the workbook already

@@ -2150,9 +2150,9 @@ int32_t zlsx_editor_rename_table_column(zlsx_editor_t * ed,
  * "pivots"; the shape frozen at the S6 gate). Read over the editor's
  * current workbook state: structural edits (rows, columns, sheets,
  * table columns) are visible immediately; staged zlsx_editor_set_cell /
- * append_row writes reach the pivot graph at save, where a cache whose
- * source they change is rebuilt or marked — save, then read, to see
- * them. A workbook without pivots is
+ * set_cell_style / append_row writes reach the pivot graph at save,
+ * where a cache whose source they change is rebuilt or marked — save,
+ * then read, to see them. A workbook without pivots is
  * ZLSX_OK with (*out, *out_len) = (NULL, 0). Release with
  * zlsx_buffer_release. */
 int32_t zlsx_editor_pivots_ndjson(zlsx_editor_t * ed,
