@@ -2085,3 +2085,66 @@ if _HAS_EDITOR_STYLES:
         ctypes.c_size_t,
     ]
     lib.zlsx_editor_set_cell_style.restype = ctypes.c_int32
+
+# S3d slice 2: the per-sheet registrations on the editor handle —
+# `Worksheet.setColumnWidth` / `setRowHeight` / `freezePanes` /
+# `setAutoFilter` / `addMergedCell` / `addHyperlink` /
+# `addInternalHyperlink` / `addComment` / `addDataValidation*` /
+# `addConditionalFormat*` behind fifteen status_v1 exports under one
+# macro, the header's ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS. The argument
+# shapes and codes are the writer exports' (`zlsx_sheet_writer_*`).
+_EDITOR_SHEET_ATTACHMENT_SYMBOLS = (
+    "zlsx_editor_set_column_width",
+    "zlsx_editor_set_row_height",
+    "zlsx_editor_freeze_panes",
+    "zlsx_editor_set_auto_filter",
+    "zlsx_editor_add_merged_cell",
+    "zlsx_editor_add_hyperlink",
+    "zlsx_editor_add_internal_hyperlink",
+    "zlsx_editor_add_comment",
+    "zlsx_editor_add_data_validation_list",
+    "zlsx_editor_add_data_validation_numeric",
+    "zlsx_editor_add_data_validation_custom",
+    "zlsx_editor_add_conditional_format_cell_is",
+    "zlsx_editor_add_conditional_format_expression",
+    "zlsx_editor_add_conditional_format_color_scale",
+    "zlsx_editor_add_conditional_format_data_bar",
+)
+_HAS_EDITOR_SHEET_ATTACHMENTS = _HAS_DIAG_RELEASE and all(
+    hasattr(lib, s) for s in _EDITOR_SHEET_ATTACHMENT_SYMBOLS
+)
+if _HAS_EDITOR_SHEET_ATTACHMENTS:
+    _u8p = ctypes.POINTER(ctypes.c_ubyte)
+    _tail = [ctypes.POINTER(DiagV1), ctypes.c_char_p, ctypes.c_size_t]
+    lib.zlsx_editor_set_column_width.argtypes = [editor_handle, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_float] + _tail
+    lib.zlsx_editor_set_row_height.argtypes = [editor_handle, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_float] + _tail
+    lib.zlsx_editor_freeze_panes.argtypes = [editor_handle, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32] + _tail
+    lib.zlsx_editor_set_auto_filter.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_merged_cell.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_hyperlink.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_internal_hyperlink.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_comment.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_data_validation_list.argtypes = [
+        editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t,
+        ctypes.POINTER(_u8p), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t,
+    ] + _tail
+    lib.zlsx_editor_add_data_validation_numeric.argtypes = [
+        editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t,
+        ctypes.c_uint32, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t,
+    ] + _tail
+    lib.zlsx_editor_add_data_validation_custom.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t] + _tail
+    lib.zlsx_editor_add_conditional_format_cell_is.argtypes = [
+        editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t,
+        ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t, ctypes.c_uint32,
+    ] + _tail
+    lib.zlsx_editor_add_conditional_format_expression.argtypes = [
+        editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, _u8p, ctypes.c_size_t, ctypes.c_uint32,
+    ] + _tail
+    lib.zlsx_editor_add_conditional_format_color_scale.argtypes = [
+        editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t,
+        ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint32,
+    ] + _tail
+    lib.zlsx_editor_add_conditional_format_data_bar.argtypes = [editor_handle, ctypes.c_uint32, _u8p, ctypes.c_size_t, ctypes.c_uint32] + _tail
+    for _sym in _EDITOR_SHEET_ATTACHMENT_SYMBOLS:
+        getattr(lib, _sym).restype = ctypes.c_int32
+    del _sym, _u8p, _tail

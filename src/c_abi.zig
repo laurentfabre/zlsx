@@ -11936,6 +11936,621 @@ export fn zlsx_editor_set_cell_style(
     return ZLSX_OK;
 }
 
+// ─── S3d slice 2: the per-sheet registrations on the editor handle ──
+//
+// `Editor.setColumnWidth` / `setRowHeight` / `freezePanes` /
+// `setAutoFilter` / `addMergedCell` / `addHyperlink` /
+// `addInternalHyperlink` / `addComment` / `addDataValidation*` /
+// `addConditionalFormat*` behind status_v1 exports — the fresh
+// writer's `zlsx_sheet_writer_*` registrations on an OPENED sheet: each
+// lands in the existing sheet part at save (the element extended in
+// place or created at its schema slot; the sheet's relationships, its
+// comments part and its VML drawing extended or created with it),
+// every other byte preserved. One macro,
+// `ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS`. The argument shapes, codes and
+// -1 names are the writer exports', with `sheet_idx` after the handle
+// and the diag before errbuf.
+
+/// The common prologue: the diag prepped, the handle checked.
+fn sheetAttachmentState(ed: ?*Editor, diag: ?*CDiag, err_buf: ?[*]u8, err_buf_len: usize) ?*EditorState {
+    if (!prepDiag(diag, err_buf, err_buf_len)) return null;
+    return editorStateOrNull(ed, err_buf, err_buf_len);
+}
+
+/// Set the width of column `col_idx` (0-based) on `sheet_idx`: a
+/// `<col>` record the sheet holds over the column is split around it,
+/// its other attributes kept; one it lacks is written. -1
+/// InvalidInput (NULL handle), SheetIndexOutOfRange,
+/// InvalidColumnWidth (not finite and positive), ColumnOutOfRange;
+/// -2 MalformedSheetXml (the part, judged at the sheet's first
+/// registration, nothing staged); -3 OutOfMemory.
+export fn zlsx_editor_set_column_width(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    col_idx: u32,
+    width: f32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.setColumnWidth(sheet_idx, col_idx, width) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Set the height of row `row_idx` (0-based) on `sheet_idx`: the
+/// `<row>` the sheet holds gains `ht` + `customHeight`, one it lacks is
+/// created empty in row order. -1 InvalidRowHeight (not finite and
+/// positive, or past 409.5), RowOutOfRange; the rest as
+/// zlsx_editor_set_column_width's.
+export fn zlsx_editor_set_row_height(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    row_idx: u32,
+    height: f32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.setRowHeight(sheet_idx, row_idx, height) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Freeze `rows` rows and `cols` columns on `sheet_idx`: the `<pane>`
+/// of the sheet's first `<sheetView>` replaced, or created (the view
+/// and the views with it). The checked form only — `rows` past
+/// 1048575 or `cols` past 16383 is -1 RowOutOfRange /
+/// ColumnOutOfRange, never clamped; both 0 registers nothing.
+export fn zlsx_editor_freeze_panes(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    rows: u32,
+    cols: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.freezePanes(sheet_idx, rows, cols) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Set the auto-filter range (`A1:D1`) on `sheet_idx`: the sheet's
+/// `<autoFilter>` element replaced whole (its filter columns and sort
+/// state with it), or created. -1 InvalidAutoFilterRange; InvalidInput
+/// for a NULL range pointer with a non-zero length.
+export fn zlsx_editor_set_auto_filter(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.setAutoFilter(sheet_idx, range) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Merge `range` (`A1:B2`, at least two cells) on `sheet_idx`: the
+/// sheet's `<mergeCells>` extended, or created. -1 InvalidMergeRange,
+/// MergeRangeOverlaps (a cell the sheet's merges or this editor's
+/// staged merges already cover — judged before anything is staged).
+export fn zlsx_editor_add_merged_cell(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addMergedCell(sheet_idx, range) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach an external hyperlink to `range` on `sheet_idx`: a
+/// `<hyperlink r:id>` in the sheet's `<hyperlinks>` (extended or
+/// created) and a TargetMode="External" relationship in the sheet's
+/// rels (extended or created, the id past the highest it spells). -1
+/// InvalidHyperlinkRange, InvalidHyperlinkUrl (empty).
+export fn zlsx_editor_add_hyperlink(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    url_ptr: ?[*]const u8,
+    url_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const url = bytesArg(url_ptr, url_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addHyperlink(sheet_idx, range, url) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a workbook-internal hyperlink (`location`, e.g.
+/// `Sheet2!A1`) to `range` on `sheet_idx`: a `<hyperlink location>`,
+/// no relationship. -1 InvalidHyperlinkRange, InvalidHyperlinkLocation
+/// (empty).
+export fn zlsx_editor_add_internal_hyperlink(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    location_ptr: ?[*]const u8,
+    location_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const location = bytesArg(location_ptr, location_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addInternalHyperlink(sheet_idx, range, location) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a plain-text note to the single cell `ref` on `sheet_idx`:
+/// the comments part the sheet's relationships name extended (a known
+/// author keeps its id), else `xl/comments{N}.xml` created with its
+/// relationship and content type; the VML drawing the sheet's
+/// `<legacyDrawing>` names extended with a note shape, else
+/// `xl/drawings/vmlDrawing{N}.vml` created with the element and the
+/// relationship. -1 InvalidCommentRef (empty, or a range),
+/// InvalidHyperlinkRange (not a cell), CommentRefTaken (a cell the
+/// part or a staged comment already annotates — judged before
+/// anything is staged); -2 MalformedCommentsXml / MalformedVmlDrawing
+/// / MalformedSheetRels (a part or a relationship the extension cannot
+/// follow, judged at the sheet's first comment).
+export fn zlsx_editor_add_comment(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    ref_ptr: ?[*]const u8,
+    ref_len: usize,
+    author_ptr: ?[*]const u8,
+    author_len: usize,
+    text_ptr: ?[*]const u8,
+    text_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const ref = bytesArg(ref_ptr, ref_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const author = bytesArg(author_ptr, author_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const text = bytesArg(text_ptr, text_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addComment(sheet_idx, ref, author, text) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a list (dropdown) validation to `range` on `sheet_idx`:
+/// `values` as `values_count` (pointer, length) pairs, at most 256,
+/// none empty, none holding a comma or a double quote. -1
+/// InvalidHyperlinkRange, InvalidDataValidation,
+/// NullStringInDataValidation (a NULL entry with a non-zero length).
+export fn zlsx_editor_add_data_validation_list(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    values_ptr: ?[*]const ?[*]const u8,
+    lens_ptr: ?[*]const usize,
+    values_count: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    if (values_count > 256) {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return ZLSX_ERROR;
+    }
+    if (values_count > 0 and (values_ptr == null or lens_ptr == null)) {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    }
+    var buf: [256][]const u8 = undefined;
+    for (0..values_count) |i| {
+        const len = lens_ptr.?[i];
+        if (values_ptr.?[i]) |p| {
+            buf[i] = p[0..len];
+        } else if (len == 0) {
+            buf[i] = "";
+        } else {
+            writeError(err_buf, err_buf_len, "NullStringInDataValidation");
+            return ZLSX_ERROR;
+        }
+    }
+    state.inner.addDataValidationList(sheet_idx, range, buf[0..values_count]) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a numeric / date / time / text-length validation to `range`
+/// on `sheet_idx`: `kind_code` one of ZLSX_DV_KIND_WHOLE / DECIMAL /
+/// DATE / TIME / TEXT_LENGTH, `op_code` one of ZLSX_DV_OP_*, `formula2`
+/// required iff the operator is a between (NULL + 0 otherwise). -1
+/// InvalidDataValidation (an unknown code, an empty formula, the
+/// second formula given or missing against the operator).
+export fn zlsx_editor_add_data_validation_numeric(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    kind_code: u32,
+    op_code: u32,
+    formula1_ptr: ?[*]const u8,
+    formula1_len: usize,
+    formula2_ptr: ?[*]const u8,
+    formula2_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const kind = dvKindFromCode(kind_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return ZLSX_ERROR;
+    };
+    const op = dvOpFromCode(op_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return ZLSX_ERROR;
+    };
+    const f1 = bytesArg(formula1_ptr, formula1_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    // A NULL second formula with length 0 is "none"; with a length it
+    // is a call the boundary refuses.
+    const f2: ?[]const u8 = if (formula2_ptr) |p| p[0..formula2_len] else if (formula2_len == 0) null else {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    state.inner.addDataValidationNumeric(sheet_idx, range, kind, op, f1, f2) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a custom-formula validation to `range` on `sheet_idx`. -1
+/// InvalidDataValidation (an empty formula), InvalidHyperlinkRange.
+export fn zlsx_editor_add_data_validation_custom(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    formula_ptr: ?[*]const u8,
+    formula_len: usize,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const formula = bytesArg(formula_ptr, formula_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addDataValidationCustom(sheet_idx, range, formula) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a cellIs conditional-format rule to `range` on `sheet_idx`:
+/// `op_code` one of ZLSX_DV_OP_*, `formula2` required iff a between,
+/// `dxf_id` a slot the workbook's `<dxfs>` holds or one
+/// zlsx_editor_add_dxf returned for this save. The rule lands after
+/// the sheet's last `<conditionalFormatting>` with a priority past the
+/// highest the sheet spells. -1 InvalidDataValidation, UnknownDxfId.
+export fn zlsx_editor_add_conditional_format_cell_is(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    op_code: u32,
+    formula1_ptr: ?[*]const u8,
+    formula1_len: usize,
+    formula2_ptr: ?[*]const u8,
+    formula2_len: usize,
+    dxf_id: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const op = cfOperatorFromCode(op_code) orelse {
+        writeError(err_buf, err_buf_len, @errorName(error.InvalidDataValidation));
+        return ZLSX_ERROR;
+    };
+    const f1 = bytesArg(formula1_ptr, formula1_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const f2: ?[]const u8 = if (formula2_ptr) |p| p[0..formula2_len] else if (formula2_len == 0) null else {
+        writeError(err_buf, err_buf_len, "InvalidInput");
+        return ZLSX_ERROR;
+    };
+    state.inner.addConditionalFormatCellIs(sheet_idx, range, op, f1, f2, dxf_id) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach an expression conditional-format rule to `range` on
+/// `sheet_idx`. Statuses as zlsx_editor_add_conditional_format_cell_is's.
+export fn zlsx_editor_add_conditional_format_expression(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    formula_ptr: ?[*]const u8,
+    formula_len: usize,
+    dxf_id: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const formula = bytesArg(formula_ptr, formula_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addConditionalFormatExpression(sheet_idx, range, formula, dxf_id) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a 2- or 3-stop color scale to `range` on `sheet_idx`
+/// (`has_mid` non-zero for three stops). -1 InvalidHyperlinkRange.
+export fn zlsx_editor_add_conditional_format_color_scale(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    low_color_argb: u32,
+    has_mid: u8,
+    mid_color_argb: u32,
+    high_color_argb: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const mid: ?u32 = if (has_mid != 0) mid_color_argb else null;
+    state.inner.addConditionalFormatColorScale(sheet_idx, range, low_color_argb, mid, high_color_argb) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+/// Attach a data bar to `range` on `sheet_idx`. -1 InvalidHyperlinkRange.
+export fn zlsx_editor_add_conditional_format_data_bar(
+    ed: ?*Editor,
+    sheet_idx: u32,
+    range_ptr: ?[*]const u8,
+    range_len: usize,
+    color_argb: u32,
+    diag: ?*CDiag,
+    err_buf: ?[*]u8,
+    err_buf_len: usize,
+) callconv(.c) i32 {
+    const state = sheetAttachmentState(ed, diag, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    const range = bytesArg(range_ptr, range_len, err_buf, err_buf_len) orelse return ZLSX_ERROR;
+    state.inner.addConditionalFormatDataBar(sheet_idx, range, color_argb) catch |e| return failMapped(e, diag, err_buf, err_buf_len);
+    return ZLSX_OK;
+}
+
+// ─── S3d slice 2 tests ───────────────────────────────────────────────
+
+/// Sheet `S` with a merge, a comment, an external hyperlink and a
+/// column width over two rows; sheet `T` bare with one row; one dxf.
+fn writeS3d2Fixture(io: std.Io, tt: *TestTmp, name: []const u8) ![:0]u8 {
+    const alloc = std.testing.allocator;
+    const path = try tt.path(alloc, io, name);
+    errdefer alloc.free(path);
+    var w = writer_mod.Writer.init(alloc);
+    defer w.deinit();
+    _ = try w.addDxf(.{ .font_bold = true });
+    const s = try w.addSheet("S");
+    try s.writeRow(&.{ .{ .string = "h" }, .{ .number = 2 } });
+    try s.writeRow(&.{ .{ .number = 1 }, .{ .number = 2 } });
+    try s.addMergedCell("D1:E1");
+    try s.addComment("A1", "alice", "old");
+    try s.addHyperlink("B1", "https://a.example/");
+    try s.setColumnWidth(0, 12);
+    const t = try w.addSheet("T");
+    try t.writeRow(&.{.{ .number = 5 }});
+    try w.save(io, path);
+    return path;
+}
+
+fn s3d2Staged(ed: *Editor) bool {
+    const state: *EditorState = @ptrCast(@alignCast(ed));
+    return state.inner.workbook.hasStagedSheetWork();
+}
+
+test "S3d slice 2 editor attachments: every export lands its registration in the saved sheet — the elements extended or created, the relationships, the comments part and the VML with them; the reader resolves them; the ids past the sheet's own" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3d2Fixture(io, &tt, "s3d2_c.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3d2_c_out.xlsx");
+    defer alloc.free(out);
+
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    var diag = freshDiag();
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_column_width(ed, 0, 2, 30, &diag, &err_buf, err_buf.len));
+    try std.testing.expectEqual(plane_none, diag.plane);
+    try std.testing.expectEqual(@as(usize, 0), diagName(&diag).len);
+    zlsx_diag_release(&diag);
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_row_height(ed, 0, 1, 33, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_freeze_panes(ed, 0, 1, 1, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_set_auto_filter(ed, 0, "A1:C1", 5, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_merged_cell(ed, 0, "A5:B5", 5, null, &err_buf, err_buf.len));
+    const url = "https://b.example/?q=1&r=2";
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_hyperlink(ed, 0, "A4", 2, url, url.len, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_internal_hyperlink(ed, 0, "B4", 2, "T!A1", 4, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_comment(ed, 0, "B2", 2, "bob", 3, "new", 3, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_comment(ed, 0, "C2", 2, "alice", 5, "again", 5, null, &err_buf, err_buf.len));
+    const values = [_]?[*]const u8{ "x", "y" };
+    const lens = [_]usize{ 1, 1 };
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_data_validation_list(ed, 0, "C1", 2, &values, &lens, 2, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_data_validation_numeric(ed, 0, "D1", 2, ZLSX_DV_KIND_WHOLE, ZLSX_DV_OP_BETWEEN, "1", 1, "9", 1, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_data_validation_custom(ed, 0, "D2", 2, "D2>0", 4, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_conditional_format_cell_is(ed, 0, "A2:A3", 5, ZLSX_DV_OP_GREATER_THAN, "0", 1, null, 0, 0, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_conditional_format_expression(ed, 0, "B2:B3", 5, "B2>1", 4, 0, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_conditional_format_color_scale(ed, 0, "A1:A9", 5, 0xFF0000FF, 1, 0xFF00FF00, 0xFFFF0000, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_conditional_format_data_bar(ed, 0, "B1:B9", 5, 0xFF0000FF, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_comment(ed, 1, "A1", 2, "carol", 5, "t", 1, null, &err_buf, err_buf.len));
+    try std.testing.expectEqual(ZLSX_OK, zlsx_editor_add_merged_cell(ed, 1, "A2:B2", 5, null, &err_buf, err_buf.len));
+    try std.testing.expect(s3d2Staged(ed));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    try std.testing.expect(!s3d2Staged(ed));
+
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, out);
+        defer wb.deinit();
+        const sheet1 = ((try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).bytes;
+        for ([_][]const u8{
+            "<sheetViews><sheetView workbookViewId=\"0\"><pane xSplit=\"1\" ySplit=\"1\" topLeftCell=\"B2\" activePane=\"bottomRight\" state=\"frozen\"/></sheetView></sheetViews>",
+            "<cols><col min=\"1\" max=\"1\" width=\"12\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"30\" customWidth=\"1\"/></cols>",
+            "<row r=\"2\" ht=\"33\" customHeight=\"1\">",
+            "</sheetData><autoFilter ref=\"A1:C1\"/><mergeCells count=\"2\"><mergeCell ref=\"D1:E1\"/><mergeCell ref=\"A5:B5\"/></mergeCells>",
+            "<conditionalFormatting sqref=\"A2:A3\"><cfRule type=\"cellIs\" dxfId=\"0\" priority=\"1\" operator=\"greaterThan\">",
+            "<cfRule type=\"colorScale\" priority=\"3\"><colorScale><cfvo type=\"min\"/><cfvo type=\"percentile\" val=\"50\"/><cfvo type=\"max\"/>",
+            "<dataValidations count=\"3\">",
+            "<hyperlinks><hyperlink ref=\"B1\" r:id=\"rId1\"/><hyperlink ref=\"A4\" r:id=\"rId4\"/><hyperlink ref=\"B4\" location=\"T!A1\"/></hyperlinks><legacyDrawing r:id=\"rId3\"/></worksheet>",
+        }) |needle| {
+            if (std.mem.indexOf(u8, sheet1, needle) == null) {
+                std.debug.print("\nmissing: {s}\nin: {s}\n", .{ needle, sheet1 });
+                return error.TestUnexpectedResult;
+            }
+        }
+        const comments1 = ((try wb.store.part("xl/comments1.xml")) orelse return error.TestUnexpectedResult).bytes;
+        try std.testing.expect(std.mem.indexOf(u8, comments1, "<authors><author>alice</author><author>bob</author></authors>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, comments1, "<comment ref=\"C2\" authorId=\"0\">") != null);
+        const sheet2 = ((try wb.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult).bytes;
+        try std.testing.expect(std.mem.indexOf(u8, sheet2, "</sheetData><mergeCells count=\"1\"><mergeCell ref=\"A2:B2\"/></mergeCells><legacyDrawing r:id=\"rId2\"/></worksheet>") != null);
+        try std.testing.expect(wb.store.hasPart("xl/comments2.xml"));
+        try std.testing.expect(wb.store.hasPart("xl/drawings/vmlDrawing2.vml"));
+        try std.testing.expectEqual(@as(usize, 4), (try (try wb.sheet(0)).conditionalFormats()).len);
+    }
+    var book = try xlsx.Book.open(alloc, io, out);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.mergedRanges(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 3), book.hyperlinks(book.sheets[0]).len);
+    try std.testing.expectEqualStrings(url, book.hyperlinks(book.sheets[0])[1].url);
+    try std.testing.expectEqual(@as(usize, 3), book.comments(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 3), book.dataValidations(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 1), book.comments(book.sheets[1]).len);
+    try std.testing.expectEqualStrings("carol", book.comments(book.sheets[1])[0].author);
+}
+
+test "S3d slice 2 editor attachments: statements about the call are -1 with the name in errbuf, the diag as prep left it, nothing staged — the save the passthrough; a sheet part the splice cannot extend is -2 MalformedSheetXml on every export, plane NONE" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    var err_buf: [128]u8 = undefined;
+    const path = try writeS3d2Fixture(io, &tt, "s3d2_c_calls.xlsx");
+    defer alloc.free(path);
+    const out = try tt.path(alloc, io, "s3d2_c_calls_out.xlsx");
+    defer alloc.free(out);
+    const ed = zlsx_editor_open(path.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed);
+    const expectCase = struct {
+        fn run(status: i32, name: []const u8, err: []const u8, diag: *CDiag) !void {
+            try std.testing.expectEqual(ZLSX_ERROR, status);
+            try std.testing.expectEqualStrings(name, std.mem.sliceTo(err, 0));
+            try std.testing.expectEqual(plane_none, diag.plane);
+            try std.testing.expectEqual(@as(usize, 0), diagName(diag).len);
+            diag.* = freshDiag();
+            diag.plane = 7;
+            diagSetError(diag, "MalformedSheetXml");
+        }
+    }.run;
+    var diag = freshDiag();
+    diagSetError(&diag, "MalformedSheetXml");
+    // NULL handle on each export; a NULL string with a length.
+    try expectCase(zlsx_editor_set_column_width(null, 0, 0, 9, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_row_height(null, 0, 0, 9, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_freeze_panes(null, 0, 1, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_auto_filter(null, 0, "A1", 2, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_merged_cell(ed, 0, null, 5, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_hyperlink(ed, 0, "A9", 2, null, 3, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_internal_hyperlink(null, 0, "A9", 2, "T!A1", 4, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_comment(ed, 0, "A9", 2, null, 1, "t", 1, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_list(ed, 0, "A9", 2, null, null, 1, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_numeric(ed, 0, "A9", 2, ZLSX_DV_KIND_WHOLE, ZLSX_DV_OP_BETWEEN, "1", 1, null, 3, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_custom(null, 0, "A9", 2, "1", 1, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_cell_is(null, 0, "A9", 2, 0, "1", 1, null, 0, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_expression(null, 0, "A9", 2, "1", 1, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_color_scale(null, 0, "A9", 2, 0, 0, 0, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_data_bar(null, 0, "A9", 2, 0, &diag, &err_buf, err_buf.len), "InvalidInput", &err_buf, &diag);
+    // The sheet bound, the registry's and the workbook's verdicts.
+    try expectCase(zlsx_editor_set_column_width(ed, 2, 0, 9, &diag, &err_buf, err_buf.len), "SheetIndexOutOfRange", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_column_width(ed, 0, 0, -1, &diag, &err_buf, err_buf.len), "InvalidColumnWidth", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_column_width(ed, 0, 16384, 9, &diag, &err_buf, err_buf.len), "ColumnOutOfRange", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_row_height(ed, 0, 0, 500, &diag, &err_buf, err_buf.len), "InvalidRowHeight", &err_buf, &diag);
+    try expectCase(zlsx_editor_freeze_panes(ed, 0, 1048576, 0, &diag, &err_buf, err_buf.len), "RowOutOfRange", &err_buf, &diag);
+    try expectCase(zlsx_editor_set_auto_filter(ed, 0, "B1:A1", 5, &diag, &err_buf, err_buf.len), "InvalidAutoFilterRange", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_merged_cell(ed, 0, "A1", 2, &diag, &err_buf, err_buf.len), "InvalidMergeRange", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_merged_cell(ed, 0, "E1:F2", 5, &diag, &err_buf, err_buf.len), "MergeRangeOverlaps", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_hyperlink(ed, 0, "A9", 2, "", 0, &diag, &err_buf, err_buf.len), "InvalidHyperlinkUrl", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_internal_hyperlink(ed, 0, "A9", 2, "", 0, &diag, &err_buf, err_buf.len), "InvalidHyperlinkLocation", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_comment(ed, 0, "A1", 2, "x", 1, "y", 1, &diag, &err_buf, err_buf.len), "CommentRefTaken", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_comment(ed, 0, "A1:A2", 5, "x", 1, "y", 1, &diag, &err_buf, err_buf.len), "InvalidCommentRef", &err_buf, &diag);
+    const bad = [_]?[*]const u8{"a,b"};
+    const bad_len = [_]usize{3};
+    try expectCase(zlsx_editor_add_data_validation_list(ed, 0, "A9", 2, &bad, &bad_len, 1, &diag, &err_buf, err_buf.len), "InvalidDataValidation", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_numeric(ed, 0, "A9", 2, 99, ZLSX_DV_OP_BETWEEN, "1", 1, "2", 1, &diag, &err_buf, err_buf.len), "InvalidDataValidation", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_numeric(ed, 0, "A9", 2, ZLSX_DV_KIND_WHOLE, ZLSX_DV_OP_BETWEEN, "1", 1, null, 0, &diag, &err_buf, err_buf.len), "InvalidDataValidation", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_cell_is(ed, 0, "A9", 2, ZLSX_DV_OP_EQUAL, "1", 1, null, 0, 7, &diag, &err_buf, err_buf.len), "UnknownDxfId", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_conditional_format_data_bar(ed, 0, "9A", 2, 0, &diag, &err_buf, err_buf.len), "InvalidHyperlinkRange", &err_buf, &diag);
+    try std.testing.expect(!s3d2Staged(ed));
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
+    try expectSameBytes(io, path, out);
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.MergeRangeOverlaps));
+    try std.testing.expectEqual(ZLSX_ERROR, statusOf(error.CommentRefTaken));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedSheetXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedCommentsXml));
+    try std.testing.expectEqual(ZLSX_REFUSED, statusOf(error.MalformedVmlDrawing));
+
+    // A sheet part the splice cannot extend: -2 on every export, the
+    // name in the diag, plane NONE, errbuf agreeing, nothing staged.
+    const torn = try tt.path(alloc, io, "s3d2_c_torn.xlsx");
+    defer alloc.free(torn);
+    {
+        var wb = try zlsx_pkg.Workbook.open(alloc, io, path);
+        defer wb.deinit();
+        try wb.store.replacePart("xl/worksheets/sheet2.xml", "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/><x:mergeCells xmlns:x=\"u\"/></worksheet>");
+        try wb.save(io, torn);
+    }
+    const ed2 = zlsx_editor_open(torn.ptr, &err_buf, err_buf.len) orelse return error.TestUnexpectedResult;
+    defer zlsx_editor_close(ed2);
+    const expectRefusal = struct {
+        fn run(status: i32, err: []const u8, d: *CDiag) !void {
+            try std.testing.expectEqual(ZLSX_REFUSED, status);
+            try std.testing.expectEqualStrings("MalformedSheetXml", std.mem.sliceTo(err, 0));
+            try std.testing.expectEqualStrings("MalformedSheetXml", diagName(d));
+            try std.testing.expectEqual(plane_none, d.plane);
+            zlsx_diag_release(d);
+            d.* = freshDiag();
+        }
+    }.run;
+    try expectRefusal(zlsx_editor_set_column_width(ed2, 1, 0, 9, &diag, &err_buf, err_buf.len), &err_buf, &diag);
+    try expectRefusal(zlsx_editor_add_merged_cell(ed2, 1, "A1:A2", 5, &diag, &err_buf, err_buf.len), &err_buf, &diag);
+    try expectRefusal(zlsx_editor_add_comment(ed2, 1, "A1", 2, "x", 1, "y", 1, &diag, &err_buf, err_buf.len), &err_buf, &diag);
+    try expectRefusal(zlsx_editor_add_hyperlink(ed2, 1, "A1", 2, "https://x/", 10, &diag, &err_buf, err_buf.len), &err_buf, &diag);
+    try expectRefusal(zlsx_editor_add_conditional_format_data_bar(ed2, 1, "A1", 2, 0, &diag, &err_buf, err_buf.len), &err_buf, &diag);
+    try std.testing.expect(!s3d2Staged(ed2));
+    const out2 = try tt.path(alloc, io, "s3d2_c_torn_out.xlsx");
+    defer alloc.free(out2);
+    try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed2, out2.ptr, out2.len, &err_buf, err_buf.len));
+    try expectSameBytes(io, torn, out2);
+}
+
 // ── S3c slice 1 tests ─────────────────────────────────────────────────
 
 /// Two sheets — three text rows under a header on `Docs`, one row on

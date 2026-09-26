@@ -491,8 +491,10 @@ pub const Editor = struct {
         // Refuse to mix appends with `setCell` mutations on the same
         // sheet. Worksheet.appendRows enforces this on existing sheets
         // too, but checking here surfaces a stable error name across
-        // both branches.
-        if (self.sheetHasWorkbookDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
+        // both branches. A staged per-sheet registration (S3d slice 2)
+        // rides beside appended rows — the Workbook's rule — so the
+        // cell-work test alone applies here.
+        if (self.sheetHasWorkbookCellDeltas(sheet_idx)) return error.SheetHasUnsavedMutations;
         // Empty append is a documented no-op — recording it as a
         // pending mutation would underflow the row-index math in
         // `buildSubstitutedSheet` (start_row + 0 - 1 = u32.max).
@@ -726,6 +728,114 @@ pub const Editor = struct {
         const ref = try xlsx.formatCellRef(&ref_buf, row, col);
         const ws = try self.workbook.sheet(sheet_idx);
         try ws.setCellStyle(ref, style_idx);
+    }
+
+    // ─── S3d slice 2: the per-sheet registrations on the editor ─────
+    //
+    // Each forwarder is `Worksheet.<name>` behind the sheet-index
+    // bound; every other verdict is the workbook's (the part at the
+    // first registration, `MergeRangeOverlaps`, `CommentRefTaken`) or
+    // the registry's (a range, a URL, a width). A registration is a
+    // staged write to the row / column edits, `deleteSheet`, the
+    // embedding sweeps and the passthrough save; it rides beside
+    // appended rows and lands at `save` / `saveToOwnedBuffer` /
+    // `saveWithRecalc`.
+
+    fn sheetForRegistration(self: *Editor, sheet_idx: u32) !*workbook_mod.Worksheet {
+        if (sheet_idx >= self.sheet_paths.len) return error.SheetIndexOutOfRange;
+        return try self.workbook.sheet(sheet_idx);
+    }
+
+    pub fn setColumnWidth(self: *Editor, sheet_idx: u32, col_idx: u32, width: f32) !void {
+        try (try self.sheetForRegistration(sheet_idx)).setColumnWidth(col_idx, width);
+    }
+
+    pub fn setRowHeight(self: *Editor, sheet_idx: u32, row_idx: u32, height: f32) !void {
+        try (try self.sheetForRegistration(sheet_idx)).setRowHeight(row_idx, height);
+    }
+
+    pub fn freezePanes(self: *Editor, sheet_idx: u32, rows: u32, cols: u32) !void {
+        try (try self.sheetForRegistration(sheet_idx)).freezePanes(rows, cols);
+    }
+
+    pub fn setAutoFilter(self: *Editor, sheet_idx: u32, range: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).setAutoFilter(range);
+    }
+
+    pub fn addMergedCell(self: *Editor, sheet_idx: u32, range: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addMergedCell(range);
+    }
+
+    pub fn addHyperlink(self: *Editor, sheet_idx: u32, range: []const u8, url: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addHyperlink(range, url);
+    }
+
+    pub fn addInternalHyperlink(self: *Editor, sheet_idx: u32, range: []const u8, location: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addInternalHyperlink(range, location);
+    }
+
+    pub fn addComment(self: *Editor, sheet_idx: u32, ref: []const u8, author: []const u8, text: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addComment(ref, author, text);
+    }
+
+    pub fn addDataValidationList(self: *Editor, sheet_idx: u32, range: []const u8, values: []const []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addDataValidationList(range, values);
+    }
+
+    /// The writer's typed numeric validation: `kind` and `op` spell the
+    /// OOXML names, `formula2` required iff `op` is a `between`.
+    pub fn addDataValidationNumeric(
+        self: *Editor,
+        sheet_idx: u32,
+        range: []const u8,
+        kind: xlsx.writer_types.DataValidationNumericKind,
+        op: xlsx.writer_types.DataValidationOp,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+    ) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addDataValidationRange(
+            range,
+            kind.toOoxml(),
+            op.toOoxml(),
+            formula1,
+            formula2,
+            op.needsSecondFormula(),
+        );
+    }
+
+    pub fn addDataValidationCustom(self: *Editor, sheet_idx: u32, range: []const u8, formula: []const u8) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addDataValidationCustom(range, formula);
+    }
+
+    pub fn addConditionalFormatCellIs(
+        self: *Editor,
+        sheet_idx: u32,
+        range: []const u8,
+        operator: xlsx.writer_types.CfOperator,
+        formula1: []const u8,
+        formula2: ?[]const u8,
+        dxf_id: u32,
+    ) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addConditionalFormatCellIs(range, xlsx.writer_types.projectCfOperator(operator), formula1, formula2, dxf_id);
+    }
+
+    pub fn addConditionalFormatExpression(self: *Editor, sheet_idx: u32, range: []const u8, formula: []const u8, dxf_id: u32) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addConditionalFormatExpression(range, formula, dxf_id);
+    }
+
+    pub fn addConditionalFormatColorScale(
+        self: *Editor,
+        sheet_idx: u32,
+        range: []const u8,
+        low_color_argb: u32,
+        mid_color_argb: ?u32,
+        high_color_argb: u32,
+    ) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addConditionalFormatColorScale(range, low_color_argb, mid_color_argb, high_color_argb);
+    }
+
+    pub fn addConditionalFormatDataBar(self: *Editor, sheet_idx: u32, range: []const u8, color_argb: u32) !void {
+        try (try self.sheetForRegistration(sheet_idx)).addConditionalFormatDataBar(range, color_argb);
     }
 
     pub fn setCells(
@@ -1071,22 +1181,34 @@ pub const Editor = struct {
     }
 
     /// True iff any worksheet in the embedded workbook has staged
-    /// `setCell`/`deleteCell` deltas or `setCellStyle` styles (S3d
-    /// slice 1). B2 iter-er-2 replacement for
+    /// `setCell`/`deleteCell` deltas, `setCellStyle` styles (S3d
+    /// slice 1) or per-sheet registrations (S3d slice 2: a merge, a
+    /// hyperlink, a comment, …). B2 iter-er-2 replacement for
     /// the retired `self.pending_mutations.count() > 0` check.
     fn workbookHasAnyDeltas(self: *Editor) bool {
         var i: u32 = 0;
         while (i < self.workbook.sheetCount()) : (i += 1) {
             const ws = self.workbook.sheet(i) catch unreachable;
-            if (ws.hasStagedCellWork()) return true;
+            if (ws.hasStagedWork()) return true;
         }
         return false;
     }
 
     /// True iff the worksheet at `sheet_idx` has staged
-    /// `setCell`/`deleteCell` deltas or `setCellStyle` styles. B2 iter-er-2 replacement for
+    /// `setCell`/`deleteCell` deltas, `setCellStyle` styles or per-sheet
+    /// registrations (S3d slice 2) — what the row / column edits,
+    /// `deleteSheet`, the embedding sweeps and the passthrough save
+    /// treat as unsaved work on the sheet. B2 iter-er-2 replacement for
     /// `self.pending_mutations.contains(sheet_idx)`.
     fn sheetHasWorkbookDeltas(self: *Editor, sheet_idx: u32) bool {
+        if (sheet_idx >= self.workbook.sheetCount()) return false;
+        const ws = self.workbook.sheet(sheet_idx) catch return false;
+        return ws.hasStagedWork();
+    }
+
+    /// The cell-work half alone: what `appendRows` excludes (a
+    /// registration rides beside appended rows).
+    fn sheetHasWorkbookCellDeltas(self: *Editor, sheet_idx: u32) bool {
         if (sheet_idx >= self.workbook.sheetCount()) return false;
         const ws = self.workbook.sheet(sheet_idx) catch return false;
         return ws.hasStagedCellWork();
@@ -11676,4 +11798,97 @@ test "S3d slice 1: a registration alone — no cell style, no delta — is not t
     const styles = ((try wb.store.part("xl/styles.xml")) orelse return error.TestUnexpectedResult).bytes;
     try std.testing.expect(std.mem.indexOf(u8, styles, "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"0.0\"/></numFmts>") != null);
     try std.testing.expect(std.mem.indexOf(u8, styles, "<dxfs count=\"1\">") != null);
+}
+
+test "S3d slice 2: the Editor's per-sheet registrations — each behind the sheet-index bound, a registration alone is not the passthrough, the file carries every element; a staged registration refuses the row / column edits and deleteSheet, rides beside appended rows; a refused registration stages nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tt = TestTmp.init();
+    defer tt.deinit();
+    const src_path = try tt.path(a, io, "s3d2_editor_src.xlsx");
+    defer a.free(src_path);
+    const dst_path = try tt.path(a, io, "s3d2_editor_dst.xlsx");
+    defer a.free(dst_path);
+    {
+        var w = xlsx.Writer.init(a);
+        defer w.deinit();
+        _ = try w.addDxf(.{ .font_bold = true });
+        var s = try w.addSheet("Data");
+        try s.writeRow(&.{ .{ .string = "h" }, .{ .integer = 42 } });
+        try s.writeRow(&.{ .{ .integer = 1 }, .{ .integer = 2 } });
+        try s.addMergedCell("D1:E1");
+        try s.addComment("A1", "alice", "old");
+        var t = try w.addSheet("Other");
+        try t.writeRow(&.{.{ .integer = 5 }});
+        try w.save(io, src_path);
+    }
+    var ed = try Editor.open(a, io, src_path);
+    defer ed.deinit();
+    // The sheet bound first; the registry's and the workbook's
+    // verdicts after; nothing staged by a refusal.
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.setColumnWidth(2, 0, 9));
+    try std.testing.expectError(error.SheetIndexOutOfRange, ed.addComment(2, "A1", "x", "y"));
+    try std.testing.expectError(error.InvalidColumnWidth, ed.setColumnWidth(0, 0, -1));
+    try std.testing.expectError(error.InvalidMergeRange, ed.addMergedCell(0, "A1"));
+    try std.testing.expectError(error.MergeRangeOverlaps, ed.addMergedCell(0, "E1:F2"));
+    try std.testing.expectError(error.CommentRefTaken, ed.addComment(0, "A1", "x", "y"));
+    try std.testing.expectError(error.InvalidDataValidation, ed.addDataValidationNumeric(0, "A1", .whole, .between, "1", null));
+    try std.testing.expectError(error.UnknownDxfId, ed.addConditionalFormatCellIs(0, "A1:A2", .greater_than, "0", null, 1));
+    try std.testing.expect(!ed.workbook.hasUnsavedChanges());
+    try std.testing.expect(!ed.workbookHasAnyDeltas());
+
+    try ed.setColumnWidth(0, 1, 22);
+    try ed.setRowHeight(0, 0, 30);
+    try ed.freezePanes(0, 1, 0);
+    try ed.setAutoFilter(0, "A1:B1");
+    try ed.addMergedCell(0, "A5:B5");
+    try ed.addHyperlink(0, "A2", "https://example.com/x?a=1&b=2");
+    try ed.addInternalHyperlink(0, "B2", "Other!A1");
+    try ed.addComment(0, "B1", "bob", "new");
+    try ed.addDataValidationList(0, "C1", &.{ "x", "y" });
+    try ed.addDataValidationNumeric(0, "C2", .decimal, .greater_than, "0", null);
+    try ed.addDataValidationCustom(0, "C3", "C3>0");
+    try ed.addConditionalFormatCellIs(0, "A2:A3", .greater_than, "0", null, 0);
+    try ed.addConditionalFormatExpression(0, "B2:B3", "B2>1", 0);
+    try ed.addConditionalFormatColorScale(0, "A1:A9", 0xFF0000FF, 0xFF00FF00, 0xFFFF0000);
+    try ed.addConditionalFormatDataBar(0, "B1:B9", 0xFF0000FF);
+    try ed.addComment(1, "A1", "carol", "t");
+    try std.testing.expect(ed.workbook.hasUnsavedChanges());
+    try std.testing.expect(ed.workbookHasAnyDeltas());
+    // A staged registration is a staged write to the edits.
+    try std.testing.expectError(error.RowEditRequiresCleanSheet, ed.insertRow(0, 1));
+    try std.testing.expectError(error.ColEditRequiresCleanSheet, ed.deleteColumn(0, 1));
+    try std.testing.expectError(error.SheetDeleteRequiresCleanState, ed.deleteSheet(1));
+    // Appended rows ride beside it.
+    const row = [_]xlsx.Cell{.{ .integer = 7 }};
+    try ed.appendRows(1, &.{&row});
+    try ed.save(io, dst_path);
+    try std.testing.expect(!ed.workbook.hasStagedSheetWork());
+
+    var book = try xlsx.Book.open(a, io, dst_path);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.mergedRanges(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 2), book.hyperlinks(book.sheets[0]).len);
+    try std.testing.expectEqualStrings("https://example.com/x?a=1&b=2", book.hyperlinks(book.sheets[0])[0].url);
+    try std.testing.expectEqualStrings("Other!A1", book.hyperlinks(book.sheets[0])[1].location);
+    try std.testing.expectEqual(@as(usize, 2), book.comments(book.sheets[0]).len);
+    try std.testing.expectEqualStrings("new", book.comments(book.sheets[0])[1].text);
+    try std.testing.expectEqual(@as(usize, 3), book.dataValidations(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 1), book.comments(book.sheets[1]).len);
+    var wb = try Workbook.open(a, io, dst_path);
+    defer wb.deinit();
+    try std.testing.expectEqual(@as(usize, 4), (try (try wb.sheet(0)).conditionalFormats()).len);
+    const fp = (try (try wb.sheet(0)).freezePane()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), fp.y_split);
+    const sheet1 = ((try wb.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).bytes;
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "<cols><col min=\"2\" max=\"2\" width=\"22\" customWidth=\"1\"/></cols>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "<row r=\"1\" ht=\"30\" customHeight=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sheet1, "<autoFilter ref=\"A1:B1\"/>") != null);
+    const sheet2 = ((try wb.store.part("xl/worksheets/sheet2.xml")) orelse return error.TestUnexpectedResult).bytes;
+    if (std.mem.indexOf(u8, sheet2, "<row r=\"2\"><c r=\"A2\"><v>7</v></c></row></sheetData><legacyDrawing r:id=\"rId2\"/>") == null) {
+        std.debug.print("\nsheet2: {s}\n", .{sheet2});
+        return error.TestUnexpectedResult;
+    }
 }

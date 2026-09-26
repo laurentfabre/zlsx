@@ -2730,6 +2730,148 @@ int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
         uint32_t sheet_idx, uint32_t row, uint32_t col, uint32_t style_idx,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
 
+/* ── S3d slice 2: the per-sheet registrations on the editor handle (probe: ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS) ──
+ *
+ * The fresh writer's per-sheet registrations (zlsx_sheet_writer_*) on
+ * an OPENED sheet: each lands in the existing sheet part at the next
+ * zlsx_editor_save / save_to_buffer / save_with_recalc — the element
+ * extended in place where the sheet holds it (a merge, a validation, a
+ * hyperlink appended after its records, a count rewritten where the
+ * table spells one; a <col> record covering the column split around
+ * it, its other attributes kept; a held <row> given ht + customHeight;
+ * the first <sheetView>'s <pane> replaced; the <autoFilter> replaced
+ * whole, its filter columns and sort state with it; a rule appended
+ * after the last <conditionalFormatting> with a priority past the
+ * sheet's highest), created at its CT_Worksheet schema slot where not
+ * (after the last present predecessor); the sheet's relationships
+ * extended or created (an external hyperlink's, the comments part's,
+ * the VML drawing's — ids past the highest the part spells); the
+ * comments part the sheet names extended (a known author keeps its
+ * id) or xl/comments{N}.xml created with its content type; the VML
+ * drawing the sheet's <legacyDrawing> names extended with a note shape
+ * (ids past the highest it spells, the id map extended to the block)
+ * or xl/drawings/vmlDrawing{N}.vml created with the element — every
+ * other byte of every part preserved. The argument shapes, codes and
+ * -1 names are the writer exports' (ZLSX_DV_KIND_*, ZLSX_DV_OP_*; a
+ * cellIs operator is a ZLSX_DV_OP_* code), with `sheet_idx` after the
+ * handle and the diag before errbuf; a NULL string pointer with a
+ * non-zero length is -1 InvalidInput.
+ *
+ * Statuses (status_v1): 0; -1 a statement about the call — InvalidInput
+ * (NULL handle; a NULL string with a length), SheetIndexOutOfRange,
+ * the registry's names (InvalidColumnWidth, ColumnOutOfRange,
+ * InvalidRowHeight, RowOutOfRange, InvalidAutoFilterRange,
+ * InvalidMergeRange, InvalidHyperlinkRange, InvalidHyperlinkUrl,
+ * InvalidHyperlinkLocation, InvalidCommentRef, InvalidDataValidation,
+ * NullStringInDataValidation, UnknownDxfId — past the part's <dxfs>
+ * and this save's zlsx_editor_add_dxf registrations) and the
+ * workbook's two: MergeRangeOverlaps (a cell the sheet's merges or a
+ * staged merge already cover — Excel repairs overlapping merges by
+ * dropping them) and CommentRefTaken (a cell the sheet's comments part
+ * or a staged comment already annotates — one note per cell); -2 with
+ * the name in the diag and plane NONE, judged at the sheet's FIRST
+ * registration before anything is staged, so a refused editor saves
+ * the passthrough: MalformedSheetXml (no <worksheet> root, a
+ * self-closed one, an element that never closes, an element the
+ * splice writes — sheetViews, cols, sheetData, autoFilter, mergeCells,
+ * conditionalFormatting, dataValidations, hyperlinks, legacyDrawing —
+ * under a prefix or inside an mc:AlternateContent block; at the save,
+ * a <col> without a readable min / max under a staged width, a cfRule
+ * priority leaving no room), MalformedCommentsXml / MalformedVmlDrawing
+ * / MalformedSheetRels (a comments part, a VML drawing or a sheet
+ * relationship the first comment on the sheet cannot follow — the
+ * relationship's target names no part of the package); -3 OutOfMemory.
+ * diag is optional (NULL ok).
+ *
+ * A staged registration is a staged cell write to the row / column
+ * edits (RowEditRequiresCleanSheet / ColEditRequiresCleanSheet), to
+ * zlsx_editor_delete_sheet (SheetDeleteRequiresCleanState) and to the
+ * embedding sweeps — its refs are pre-shift; it rides beside appended
+ * rows (the registrations land after the appends). The recalc
+ * transactions carry it (the save-plan fold): save_with_recalc writes
+ * it beside the recalc, recalculate leaves it staged for the save
+ * after it. A save drains the registrations. Not judged: a hyperlink,
+ * a validation or a rule over a cell one already covers (the writer's
+ * rule — Excel keeps both); a `_xlnm._FilterDatabase` defined name
+ * naming the replaced auto-filter's range (left as the producer wrote
+ * it); a <selection> naming a pane the new split lacks (left); a
+ * <row> without a readable `r` (neither matched nor an anchor). A
+ * comment's author and text, a hyperlink's URL and a validation's
+ * formulas are XML-escaped on emit; a C0 control byte other than tab,
+ * LF or CR in any of them fails the save (InvalidXmlByte). */
+int32_t zlsx_editor_set_column_width(zlsx_editor_t * ed, uint32_t sheet_idx,
+        uint32_t col_idx, float width,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_set_row_height(zlsx_editor_t * ed, uint32_t sheet_idx,
+        uint32_t row_idx, float height,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+/* The checked form only: rows past 1048575 / cols past 16383 is -1
+ * RowOutOfRange / ColumnOutOfRange, never clamped; both 0 registers
+ * nothing. */
+int32_t zlsx_editor_freeze_panes(zlsx_editor_t * ed, uint32_t sheet_idx,
+        uint32_t rows, uint32_t cols,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_set_auto_filter(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_merged_cell(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_hyperlink(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * url, size_t url_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_internal_hyperlink(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * location, size_t location_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_comment(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * ref, size_t ref_len,
+        const uint8_t * author, size_t author_len,
+        const uint8_t * text, size_t text_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+/* `values` / `lens`: values_count (pointer, length) pairs, at most
+ * 256 (InvalidDataValidation past it), a NULL entry with a non-zero
+ * length NullStringInDataValidation; NULL arrays with a count are
+ * InvalidInput. */
+int32_t zlsx_editor_add_data_validation_list(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * const * values, const size_t * lens, size_t values_count,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+/* formula2 is required iff op_code is ZLSX_DV_OP_BETWEEN / NOT_BETWEEN
+ * (NULL + 0 otherwise). */
+int32_t zlsx_editor_add_data_validation_numeric(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        uint32_t kind_code, uint32_t op_code,
+        const uint8_t * formula1, size_t formula1_len,
+        const uint8_t * formula2, size_t formula2_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_data_validation_custom(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * formula, size_t formula_len,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_conditional_format_cell_is(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        uint32_t op_code,
+        const uint8_t * formula1, size_t formula1_len,
+        const uint8_t * formula2, size_t formula2_len,
+        uint32_t dxf_id,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_conditional_format_expression(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        const uint8_t * formula, size_t formula_len,
+        uint32_t dxf_id,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+/* has_mid non-zero: three stops (min, the 50th percentile, max). */
+int32_t zlsx_editor_add_conditional_format_color_scale(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        uint32_t low_color_argb, uint8_t has_mid, uint32_t mid_color_argb, uint32_t high_color_argb,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+int32_t zlsx_editor_add_conditional_format_data_bar(zlsx_editor_t * ed, uint32_t sheet_idx,
+        const uint8_t * range, size_t range_len,
+        uint32_t color_argb,
+        zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);
+
 /* Feature macros — compile-time counterpart of the dlsym probe. */
 #define ZLSX_HAS_STRUCTURAL_EDITS 1   /* insert/delete row + column, add/rename/delete sheet, rename_table_column */
 #define ZLSX_HAS_PIVOTS           1   /* editor pivots_ndjson */
@@ -2745,6 +2887,7 @@ int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
 #define ZLSX_HAS_LAZY_SHEETS      1   /* reader book_open_lazy + book_preload_sheet + book_stream_sheet (S3e slice 1) */
 #define ZLSX_HAS_LAZY_SST         1   /* reader book_open_sst_lazy + book_shared_string (S3e slice 2) */
 #define ZLSX_HAS_EDITOR_STYLES    1   /* editor add_style + add_dxf + intern_num_fmt + set_cell_style (S3d slice 1) */
+#define ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS 1   /* editor set_column_width + set_row_height + freeze_panes + set_auto_filter + add_merged_cell + add_hyperlink + add_internal_hyperlink + add_comment + add_data_validation_{list,numeric,custom} + add_conditional_format_{cell_is,expression,color_scale,data_bar} (S3d slice 2) */
 
 
 #ifdef __cplusplus

@@ -45,6 +45,7 @@ const typed_parts = @import("typed_parts/root.zig");
 const wbxml_typed = @import("typed_parts/workbook_xml.zig");
 const zlsx = @import("zlsx");
 const drawing_emit = @import("drawing_emit.zig");
+const sheet_splice = @import("sheet_splice.zig");
 const embedding_part = @import("embedding_part.zig");
 const recovery_record = @import("recovery_record.zig");
 const sheet_edit = @import("sheet_edit.zig");
@@ -204,6 +205,15 @@ pub const Error = error{
     /// workbook or re-open (in-house S3d slice 1 r1 A-BASE-103, r22
     /// A-DOC-2205, r23 A-DOC-2308).
     StylesPartChanged,
+    /// S3d slice 2: `Worksheet.addMergedCell` over a cell the sheet's
+    /// `<mergeCells>` or a staged merge already covers — Excel repairs
+    /// a sheet with overlapping merges by dropping them. Judged before
+    /// anything is staged.
+    MergeRangeOverlaps,
+    /// S3d slice 2: `Worksheet.addComment` on a cell the sheet's
+    /// comments part or a staged comment already annotates — one note
+    /// per cell. Judged before anything is staged.
+    CommentRefTaken,
     MissingWorkbookPart,
     MissingSheetPart,
     MissingRelationship,
@@ -2027,6 +2037,317 @@ pub const Workbook = struct {
     fn dxfIdBound(self: *Workbook) usize {
         const base = if (self.styles_base) |b| b else (self.readStylesBaseline() catch StylesBaselineRead{ .base = styles_plan_mod.Base.fresh, .held = 0 }).base;
         return @as(usize, base.dxfs) + self.styles_plan.dxfs.items.len;
+    }
+
+    // ─── S3d slice 2: the per-sheet registrations into the opened sheet parts ───
+
+    /// Whether any sheet holds per-sheet registrations a save renders.
+    pub fn hasStagedSheetWork(self: *const Workbook) bool {
+        for (self.worksheets) |ws| {
+            if (ws.hasStagedSheetWork()) return true;
+        }
+        return false;
+    }
+
+    /// Every sheet's registrations rendered into `store`'s parts — the
+    /// plain save's store, or a recalc transaction's candidate. Runs
+    /// AFTER the cell phases: a row height lands on the `<row>` the
+    /// delta emitter just regenerated, never under it.
+    fn applySheetStatesInto(self: *Workbook, store: *PartStore) Error!void {
+        for (self.worksheets) |*ws| {
+            if (!ws.hasStagedSheetWork()) continue;
+            try self.applySheetStateInto(store, ws);
+        }
+    }
+
+    /// The comments relationship of the sheet's dialect.
+    fn commentsRelType(dialect: drawing_emit.WsDrDialect) []const u8 {
+        return switch (dialect) {
+            .transitional => "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+            .strict => "http://purl.oclc.org/ooxml/officeDocument/relationships/comments",
+        };
+    }
+
+    fn vmlRelType(dialect: drawing_emit.WsDrDialect) []const u8 {
+        return switch (dialect) {
+            .transitional => "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing",
+            .strict => "http://purl.oclc.org/ooxml/officeDocument/relationships/vmlDrawing",
+        };
+    }
+
+    fn hyperlinkRelType(dialect: drawing_emit.WsDrDialect) []const u8 {
+        return switch (dialect) {
+            .transitional => "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+            .strict => "http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink",
+        };
+    }
+
+    const comments_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
+    const vml_content_type = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+    const rels_content_type = "application/vnd.openxmlformats-package.relationships+xml";
+
+    /// `dir/_rels/base.rels` for a part `dir/base`.
+    fn relsPartNameFor(a: Allocator, part_name: []const u8) Error![]u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, part_name, '/');
+        const dir = if (slash) |i| part_name[0 .. i + 1] else "";
+        const base = if (slash) |i| part_name[i + 1 ..] else part_name;
+        return try std.mem.concat(a, u8, &.{ dir, "_rels/", base, ".rels" });
+    }
+
+    /// How a sheet's relationship spells `part_name`: relative to the
+    /// sheet's directory when the sheet sits under `xl/worksheets/`
+    /// as spelled (`../comments1.xml`, the form every producer writes),
+    /// absolute otherwise — a case-variant directory resolves to the
+    /// held entry in a case-sensitive consumer only that way (the S3d
+    /// slice 1 r20 / r21 rule).
+    fn sheetRelTarget(a: Allocator, sheet_part_name: []const u8, part_name: []const u8) Error![]u8 {
+        if (std.mem.startsWith(u8, sheet_part_name, "xl/worksheets/") and
+            std.mem.indexOfScalar(u8, sheet_part_name["xl/worksheets/".len..], '/') == null and
+            std.mem.startsWith(u8, part_name, "xl/"))
+        {
+            return try std.mem.concat(a, u8, &.{ "../", part_name["xl/".len..] });
+        }
+        return try std.mem.concat(a, u8, &.{ "/", part_name });
+    }
+
+    /// The part a sheet relationship of `type_uri` names, resolved
+    /// against the sheet part; null when the sheet has no such
+    /// relationship. A relationship of the type whose target names no
+    /// part of the package is one the splice cannot follow.
+    fn sheetRelTargetPart(self: *Workbook, store: *const PartStore, sheet_part_name: []const u8, rels: []const store_mod.Relationship, type_uri: []const u8) Error!?[]const u8 {
+        _ = self;
+        for (rels) |r| {
+            if (!std.mem.eql(u8, r.type, type_uri)) continue;
+            if (r.target_mode != .internal) return Error.MalformedSheetRels;
+            const name = (try store.resolve(sheet_part_name, r.target)) orelse return Error.MalformedSheetRels;
+            if (!store.hasPart(name)) return Error.MalformedSheetRels;
+            return name;
+        }
+        return null;
+    }
+
+    /// The sheet's relationships as the store's reader reads them —
+    /// from the part's BYTES, so a rels part `addPart` created this
+    /// generation is read too (the cache is not refreshed by an add).
+    fn sheetRels(store: *const PartStore, arena: Allocator, rels_part_name: []const u8) Error![]store_mod.Relationship {
+        const part = (try store.part(rels_part_name)) orelse return &.{};
+        return try store_mod.parseRelationships(arena, part.bytes);
+    }
+
+    /// The splice's verdicts in the workbook's vocabulary. The
+    /// emitters' registration-time names cannot reach a save — every
+    /// value was validated when it was staged — except a control byte
+    /// in a string, which the escaper refuses as the fresh emitter
+    /// does.
+    fn spliceVerdict(e: sheet_splice.Error) Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.MalformedSheetXml => error.MalformedSheetXml,
+            error.MalformedSheetRels => error.MalformedSheetRels,
+            error.MalformedCommentsXml => error.MalformedCommentsXml,
+            error.MalformedVmlDrawing => error.MalformedVmlDrawing,
+            error.IdSpaceExhausted => error.IdSpaceExhausted,
+            error.InvalidXmlByte => error.InvalidXmlByte,
+            else => error.MalformedSheetXml,
+        };
+    }
+
+    /// The comments part of `ws`, if the sheet's relationships name
+    /// one. Owned by `arena`.
+    fn commentsPartOf(self: *Workbook, arena: Allocator, ws: *Worksheet) Error!?[]const u8 {
+        const part_name = try ws.resolvePartName();
+        const sheet_part = (try self.store.part(part_name)) orelse return Error.MissingSheetPart;
+        const dialect = drawing_emit.detectSheetDialect(sheet_part.bytes);
+        const rels_name = try relsPartNameFor(arena, part_name);
+        const rels = try sheetRels(&self.store, arena, rels_name);
+        return try self.sheetRelTargetPart(&self.store, part_name, rels, commentsRelType(dialect));
+    }
+
+    /// `addComment`'s verdict on the cell: the sheet's comments part
+    /// must not annotate it. Reads the comments part and the VML
+    /// drawing the sheet names, so a part the splice cannot extend
+    /// refuses now, nothing staged.
+    fn checkCommentSlot(self: *Workbook, ws: *Worksheet, target: sheet_plan.A1Corner) Error!void {
+        const a = self.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ar = arena.allocator();
+        if (try self.commentsPartOf(ar, ws)) |name| {
+            const part = (try self.store.part(name)) orelse return Error.MalformedSheetRels;
+            const refs = sheet_splice.commentRefs(ar, part.bytes) catch |e| return spliceVerdict(e);
+            for (refs) |r| {
+                const c = sheet_plan.parseA1Corner(r) catch continue;
+                if (c.col == target.col and c.row == target.row) return Error.CommentRefTaken;
+            }
+        }
+        // The VML the sheet's `<legacyDrawing>` names, when it names one.
+        const part_name = try ws.resolvePartName();
+        const sheet_part = (try self.store.part(part_name)) orelse return Error.MissingSheetPart;
+        var facts = sheet_splice.readSheet(ar, sheet_part.bytes) catch |e| return spliceVerdict(e);
+        defer facts.deinit(ar);
+        if (facts.legacy_drawing_rid) |rid| {
+            const rels_name = try relsPartNameFor(ar, part_name);
+            const rels = try sheetRels(&self.store, ar, rels_name);
+            const vml_name = try vmlPartFor(&self.store, part_name, rels, rid);
+            const vml = (try self.store.part(vml_name)) orelse return Error.MalformedSheetRels;
+            sheet_splice.checkVml(ar, vml.bytes) catch |e| return spliceVerdict(e);
+        }
+    }
+
+    /// The VML part a `<legacyDrawing r:id>` names: the relationship
+    /// must exist, be internal and name a part the package holds.
+    fn vmlPartFor(store: *const PartStore, sheet_part_name: []const u8, rels: []const store_mod.Relationship, rid: []const u8) Error![]const u8 {
+        for (rels) |r| {
+            if (!std.mem.eql(u8, r.id, rid)) continue;
+            if (r.target_mode != .internal) return Error.MalformedSheetRels;
+            const name = (try store.resolve(sheet_part_name, r.target)) orelse return Error.MalformedSheetRels;
+            if (!store.hasPart(name)) return Error.MalformedSheetRels;
+            return name;
+        }
+        return Error.MalformedSheetRels;
+    }
+
+    /// One sheet's registrations into `store`: the sheet part (every
+    /// element extended in place or created at its schema slot —
+    /// `sheet_splice.spliceSheet`), the sheet's relationships (one per
+    /// external hyperlink; the comments and VML relationships when the
+    /// sheet gains those parts), the comments part (the one the sheet
+    /// names extended, else `xl/comments{N}.xml` created) and the VML
+    /// drawing (the one `<legacyDrawing>` names extended, else
+    /// `xl/drawings/vmlDrawing{N}.vml` created with the element). Every
+    /// byte is computed before the first install, so a failure leaves
+    /// the store as it was.
+    fn applySheetStateInto(self: *Workbook, store: *PartStore, ws: *Worksheet) Error!void {
+        const a = self.allocator;
+        const st = &ws.sheet_state;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ar = arena.allocator();
+
+        const part_name = try ws.resolvePartName();
+        const sheet_part = (try store.part(part_name)) orelse return Error.MissingSheetPart;
+        const dialect = drawing_emit.detectSheetDialect(sheet_part.bytes);
+        var facts = sheet_splice.readSheet(ar, sheet_part.bytes) catch |e| return spliceVerdict(e);
+        defer facts.deinit(ar);
+
+        const rels_name = try relsPartNameFor(ar, part_name);
+        const rels_part = try store.part(rels_name);
+        const rels = try sheetRels(store, ar, rels_name);
+        var next_rid: u32 = if (rels_part) |p| (sheet_splice.nextFreeRelId(p.bytes) catch |e| return spliceVerdict(e)) else 1;
+        var entries: std.ArrayListUnmanaged(sheet_splice.RelEntry) = .empty;
+
+        const hyperlink_rid_base = next_rid;
+        for (st.hyperlinks.items) |h| {
+            try entries.append(ar, .{ .id = next_rid, .type_uri = hyperlinkRelType(dialect), .target = h.url, .external = true });
+            next_rid = std.math.add(u32, next_rid, 1) catch return Error.IdSpaceExhausted;
+        }
+
+        var comments_name: ?[]const u8 = null;
+        var comments_created = false;
+        var comments_xml: ?[]u8 = null;
+        defer if (comments_xml) |x| a.free(x);
+        var vml_name: ?[]const u8 = null;
+        var vml_created = false;
+        var vml_xml: ?[]u8 = null;
+        defer if (vml_xml) |x| a.free(x);
+        var legacy_drawing_rid: ?u32 = null;
+        if (st.comments.items.len > 0) {
+            const view = try ar.alloc(sheet_plan.Comment, st.comments.items.len);
+            for (st.comments.items, 0..) |c, k| view[k] = .{ .ref = c.ref, .author = c.author, .text = c.text };
+
+            if (try self.sheetRelTargetPart(store, part_name, rels, commentsRelType(dialect))) |name| {
+                const part = (try store.part(name)) orelse return Error.MalformedSheetRels;
+                comments_name = name;
+                comments_xml = sheet_splice.extendComments(a, part.bytes, view) catch |e| return spliceVerdict(e);
+            } else {
+                const n = drawing_emit.nextFreeNumber(store, "xl/comments", ".xml") catch |e| switch (e) {
+                    error.IdSpaceExhausted => return Error.IdSpaceExhausted,
+                    else => return Error.OutOfMemory,
+                };
+                const name = try std.fmt.allocPrint(ar, "xl/comments{d}.xml", .{n});
+                comments_name = name;
+                comments_created = true;
+                var fresh: std.ArrayListUnmanaged(u8) = .empty;
+                defer fresh.deinit(a);
+                sheet_plan.emitCommentsXml(a, &fresh, view) catch |e| return spliceVerdict(e);
+                // A Strict sheet gets a Strict part: the root's one
+                // namespace declaration respelled (the styles part's
+                // rule, S3d slice 1 r12).
+                comments_xml = if (dialect == .strict) blk: {
+                    const decl = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"";
+                    const at = std.mem.indexOf(u8, fresh.items, decl) orelse return Error.MalformedCommentsXml;
+                    break :blk try std.mem.concat(a, u8, &.{ fresh.items[0..at], "xmlns=\"" ++ strict_main_ns ++ "\"", fresh.items[at + decl.len ..] });
+                } else try fresh.toOwnedSlice(a);
+                try entries.append(ar, .{ .id = next_rid, .type_uri = commentsRelType(dialect), .target = try sheetRelTarget(ar, part_name, name), .external = false });
+                next_rid = std.math.add(u32, next_rid, 1) catch return Error.IdSpaceExhausted;
+            }
+
+            if (facts.legacy_drawing_rid) |rid| {
+                const name = try vmlPartFor(store, part_name, rels, rid);
+                const part = (try store.part(name)) orelse return Error.MalformedSheetRels;
+                vml_name = name;
+                vml_xml = sheet_splice.extendVml(a, part.bytes, view) catch |e| return spliceVerdict(e);
+            } else {
+                const n = drawing_emit.nextFreeNumber(store, "xl/drawings/vmlDrawing", ".vml") catch |e| switch (e) {
+                    error.IdSpaceExhausted => return Error.IdSpaceExhausted,
+                    else => return Error.OutOfMemory,
+                };
+                const name = try std.fmt.allocPrint(ar, "xl/drawings/vmlDrawing{d}.vml", .{n});
+                vml_name = name;
+                vml_created = true;
+                var fresh: std.ArrayListUnmanaged(u8) = .empty;
+                defer fresh.deinit(a);
+                sheet_plan.emitVmlDrawingXml(a, &fresh, view) catch |e| return spliceVerdict(e);
+                vml_xml = try fresh.toOwnedSlice(a);
+                legacy_drawing_rid = next_rid;
+                try entries.append(ar, .{ .id = next_rid, .type_uri = vmlRelType(dialect), .target = try sheetRelTarget(ar, part_name, name), .external = false });
+                next_rid = std.math.add(u32, next_rid, 1) catch return Error.IdSpaceExhausted;
+            }
+        }
+
+        const new_sheet = sheet_splice.spliceSheet(a, sheet_part.bytes, st, &facts, .{
+            .hyperlink_rid_base = hyperlink_rid_base,
+            .legacy_drawing_rid = legacy_drawing_rid,
+            .ns_r = dialect.nsR(),
+        }) catch |e| return spliceVerdict(e);
+        defer a.free(new_sheet);
+        const new_rels: ?[]u8 = if (entries.items.len > 0)
+            (sheet_splice.appendRelationships(a, if (rels_part) |p| p.bytes else null, entries.items) catch |e| return spliceVerdict(e))
+        else
+            null;
+        defer if (new_rels) |x| a.free(x);
+
+        // The installs — the sheet last, so no consumer sees a
+        // relationship it names before the part it targets is there.
+        if (comments_xml) |bytes| {
+            if (comments_created) try store.addPart(comments_name.?, comments_content_type, bytes) else try store.replacePart(comments_name.?, bytes);
+        }
+        if (vml_xml) |bytes| {
+            if (vml_created) try store.addPart(vml_name.?, vml_content_type, bytes) else try store.replacePart(vml_name.?, bytes);
+        }
+        if (new_rels) |bytes| {
+            if (rels_part != null) try store.replacePart(rels_name, bytes) else try store.addPart(rels_name, rels_content_type, bytes);
+        }
+        try store.replacePart(part_name, new_sheet);
+        // The parsed view borrowed the part's bytes; its merges,
+        // hyperlinks, validations and freeze pane are stale now.
+        if (store == &self.store) {
+            if (ws.parsed) |*p| {
+                var stale = p.*;
+                stale.deinit(a);
+                ws.parsed = null;
+            }
+        }
+    }
+
+    /// The registrations every sheet holds, freed: the save rendered
+    /// them (or the swap installed the candidate that carried them).
+    fn drainSheetStates(self: *Workbook) void {
+        for (self.worksheets) |*ws| {
+            if (!ws.hasStagedSheetWork()) continue;
+            ws.sheet_state.deinit(self.allocator);
+            ws.sheet_state = .{};
+        }
     }
 
     /// Whether a save has styles work to render: a registered style,
@@ -5225,6 +5546,13 @@ pub const Workbook = struct {
             stale.deinit(self.allocator);
             ws.parsed = null;
         }
+        // Phase 3 (S3d slice 2): the per-sheet registrations into the
+        // sheet parts the phases above left — a row height lands on the
+        // regenerated `<row>`; the sheets' relationships, comments parts
+        // and VML drawings extended or created with them; drained once
+        // they are in the parts.
+        try self.applySheetStatesInto(&self.store);
+        self.drainSheetStates();
         // Invalidate cached SST view — its leaves borrowed from the
         // pre-extension SST bytes which `replacePart` swapped out.
         if (sst_plan.has_new_strings) {
@@ -5295,8 +5623,19 @@ pub const Workbook = struct {
                 break;
             }
         }
-        if (!any_writes) return;
+        if (any_writes) try self.foldCellPhasesInto(next);
 
+        // Phase 3 (S3d slice 2): the per-sheet registrations over the
+        // candidate's sheet parts as the cell phases left them; staged
+        // until the swap drains them, as the deltas are.
+        try self.applySheetStatesInto(next);
+    }
+
+    /// The fold's cell phases (0b, 1, 2) over `next` — split out so the
+    /// registrations phase runs after them whether or not a sheet holds
+    /// a write.
+    fn foldCellPhasesInto(self: *Workbook, next: *PartStore) Error!void {
+        const a = self.allocator;
         // Phase 0b: the refresh marker on every cache a staged write
         // lands in — the graph walked over the candidate's workbook.xml
         // as just spliced, as the save walks it over the re-parsed live
@@ -5403,6 +5742,7 @@ pub const Workbook = struct {
         self.workbook_xml_plan.deinit(self.allocator);
         self.workbook_xml_plan = .{};
         self.drainStylesPlan();
+        self.drainSheetStates();
     }
 
     /// The styles plan rendered: its records are in the part now, the
@@ -7943,6 +8283,7 @@ pub const Workbook = struct {
             if (ws.deltas.count() > 0) return true;
         }
         if (self.hasStagedStyleWork()) return true;
+        if (self.hasStagedSheetWork()) return true;
         return self.store.hasUnsavedChanges();
     }
 
@@ -8146,7 +8487,9 @@ pub const Workbook = struct {
             if (c == 0 or c > zlsx.max_col_1based) return error.ColumnIndexOutOfRange;
         }
         const ws = try self.sheet(sheet_idx);
-        if (ws.hasStagedCellWork()) return error.SheetHasUnsavedMutations;
+        // A staged registration is a staged write here: its refs are
+        // pre-shift (S3d slice 2).
+        if (ws.hasStagedWork()) return error.SheetHasUnsavedMutations;
         if (ws.appended_rows.items.len > 0) return error.SheetHasUnsavedAppends;
 
         const part_name = try ws.resolvePartName();
@@ -13592,6 +13935,21 @@ const StylesLayout = struct {
 
 const CloseTagHit = struct { lt: usize, end: usize };
 
+/// A merge range as a rectangle of 1-based corners (S3d slice 2).
+const MergeRect = struct { c1: u32, r1: u32, c2: u32, r2: u32 };
+
+fn mergeRect(range: []const u8) sheet_plan.Error!MergeRect {
+    const colon = std.mem.indexOfScalar(u8, range, ':') orelse return error.InvalidMergeRange;
+    const tl = sheet_plan.parseA1Corner(range[0..colon]) catch return error.InvalidMergeRange;
+    const br = sheet_plan.parseA1Corner(range[colon + 1 ..]) catch return error.InvalidMergeRange;
+    if (tl.col > br.col or tl.row > br.row) return error.InvalidMergeRange;
+    return .{ .c1 = tl.col, .r1 = tl.row, .c2 = br.col, .r2 = br.row };
+}
+
+fn rectsOverlap(x: MergeRect, y: MergeRect) bool {
+    return x.c1 <= y.c2 and y.c1 <= x.c2 and x.r1 <= y.r2 and y.r1 <= x.r2;
+}
+
 /// The next `</tag>` from `from` as real markup — comments, CDATA,
 /// PIs and DOCTYPEs skipped, the name matched whole, whitespace before
 /// the `>` allowed (`</fonts >` is legal XML; in-house r5 A-SCN-503).
@@ -14062,46 +14420,120 @@ pub const Worksheet = struct {
 
     // ─── B3 iter-wr-7: fresh-emit Worksheet methods ─────────────────
     //
-    // These 13 forwarders mirror `xlsx.Writer.SheetWriter`'s
+    // These 15 forwarders mirror `xlsx.Writer.SheetWriter`'s
     // `add*` / `set*` surface so a `pkg.Workbook` callers can author
     // worksheets without going through the writer's fluent-builder.
-    // Each method delegates straight onto `SheetState` — registration,
+    // Each method delegates onto `SheetState` — registration,
     // validation, and ownership semantics are identical to the
-    // writer-side forwarder set (B3 iter-wr-6).
+    // writer-side forwarder set (B3 iter-wr-6). On an OPENED workbook
+    // the registrations land in the existing sheet part at save (S3d
+    // slice 2, `applySheetStateInto`): the first registration on a
+    // sheet reads the part — one the splice cannot extend in place
+    // refuses `MalformedSheetXml`, nothing staged — and a merge is
+    // judged against the part's merges and the staged ones
+    // (`MergeRangeOverlaps`), a comment against the part's comments
+    // and the staged ones (`CommentRefTaken`), each before anything is
+    // staged.
 
-    pub fn setColumnWidth(self: *Worksheet, col_idx: u32, width: f32) sheet_plan.Error!void {
+    /// What a registration can refuse: the workbook's verdicts (the
+    /// part, the merge, the comment) and the registry's own.
+    pub const RegistrationError = Error || sheet_plan.Error;
+
+    /// Whether the sheet holds per-sheet registrations a save renders.
+    pub fn hasStagedSheetWork(self: *const Worksheet) bool {
+        return self.sheet_state.hasWork();
+    }
+
+    /// Staged cell work or staged registrations: what the structural
+    /// edits and `deleteSheet` exclude (a staged ref is pre-shift).
+    pub fn hasStagedWork(self: *const Worksheet) bool {
+        return self.hasStagedCellWork() or self.hasStagedSheetWork();
+    }
+
+    /// The first registration on a sheet reads its part: a part the
+    /// splice cannot extend in place is refused here, nothing staged
+    /// (the S3d slice 1 rule — a refusal is judged before the plan
+    /// takes anything). A later registration on a sheet that already
+    /// holds work rides the first's verdict; the save re-reads.
+    fn ensureSpliceable(self: *Worksheet) RegistrationError!void {
+        if (self.hasStagedSheetWork()) return;
+        const part_name = try self.resolvePartName();
+        const part = (try self.workbook.store.part(part_name)) orelse return Error.MissingSheetPart;
+        var facts = sheet_splice.readSheet(self.workbook.allocator, part.bytes) catch |e| return Workbook.spliceVerdict(e);
+        facts.deinit(self.workbook.allocator);
+    }
+
+    pub fn setColumnWidth(self: *Worksheet, col_idx: u32, width: f32) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.setColumnWidth(self.workbook.allocator, col_idx, width);
     }
 
-    pub fn setRowHeight(self: *Worksheet, row_idx: u32, height: f32) sheet_plan.Error!void {
+    pub fn setRowHeight(self: *Worksheet, row_idx: u32, height: f32) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.setRowHeight(self.workbook.allocator, row_idx, height);
     }
 
-    pub fn freezePanes(self: *Worksheet, freeze_rows: u32, freeze_cols: u32) sheet_plan.SheetState.FreezePanesError!void {
+    pub fn freezePanes(self: *Worksheet, freeze_rows: u32, freeze_cols: u32) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.freezePanes(freeze_rows, freeze_cols);
     }
 
-    pub fn setAutoFilter(self: *Worksheet, range: []const u8) sheet_plan.Error!void {
+    pub fn setAutoFilter(self: *Worksheet, range: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.setAutoFilter(self.workbook.allocator, range);
     }
 
-    pub fn addMergedCell(self: *Worksheet, range: []const u8) sheet_plan.Error!void {
+    /// A merge over a cell the sheet's `<mergeCells>` or a staged merge
+    /// already covers refuses `MergeRangeOverlaps` — Excel repairs a
+    /// sheet with overlapping merges by dropping them.
+    pub fn addMergedCell(self: *Worksheet, range: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
+        try sheet_plan.validateMergeRange(range);
+        const new = try mergeRect(range);
+        const view = try self.ensureParsed();
+        for (view.merges) |m| {
+            // A merge the reader could not parse is one the file
+            // already carries broken: not this call's to judge.
+            const old = mergeRect(m.ref) catch continue;
+            if (rectsOverlap(new, old)) return Error.MergeRangeOverlaps;
+        }
+        for (self.sheet_state.merged_cells.items) |staged| {
+            if (rectsOverlap(new, try mergeRect(staged))) return Error.MergeRangeOverlaps;
+        }
         try self.sheet_state.addMergedCell(self.workbook.allocator, range);
     }
 
-    pub fn addHyperlink(self: *Worksheet, range: []const u8, url: []const u8) sheet_plan.Error!void {
+    pub fn addHyperlink(self: *Worksheet, range: []const u8, url: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addHyperlink(self.workbook.allocator, range, url);
     }
 
-    pub fn addInternalHyperlink(self: *Worksheet, range: []const u8, location: []const u8) sheet_plan.Error!void {
+    pub fn addInternalHyperlink(self: *Worksheet, range: []const u8, location: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addInternalHyperlink(self.workbook.allocator, range, location);
     }
 
-    pub fn addComment(self: *Worksheet, ref: []const u8, author: []const u8, text: []const u8) sheet_plan.Error!void {
+    /// A comment on a cell the sheet's comments part or a staged
+    /// comment already annotates refuses `CommentRefTaken` (one note
+    /// per cell — Excel repairs a second). The first comment on a sheet
+    /// reads its comments part and its VML drawing: one the splice
+    /// cannot extend refuses `MalformedCommentsXml` /
+    /// `MalformedVmlDrawing`, a sheet relationship it cannot follow
+    /// `MalformedSheetRels`.
+    pub fn addComment(self: *Worksheet, ref: []const u8, author: []const u8, text: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
+        if (ref.len == 0 or std.mem.indexOfScalar(u8, ref, ':') != null) return error.InvalidCommentRef;
+        const target = sheet_plan.parseA1Corner(ref) catch return error.InvalidHyperlinkRange;
+        for (self.sheet_state.comments.items) |c| {
+            const staged = sheet_plan.parseA1Corner(c.ref) catch continue;
+            if (staged.col == target.col and staged.row == target.row) return Error.CommentRefTaken;
+        }
+        try self.workbook.checkCommentSlot(self, target);
         try self.sheet_state.addComment(self.workbook.allocator, ref, author, text);
     }
 
-    pub fn addDataValidationList(self: *Worksheet, range: []const u8, values: []const []const u8) sheet_plan.Error!void {
+    pub fn addDataValidationList(self: *Worksheet, range: []const u8, values: []const []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addDataValidationList(self.workbook.allocator, range, values);
     }
 
@@ -14113,11 +14545,13 @@ pub const Worksheet = struct {
         formula1: []const u8,
         formula2: ?[]const u8,
         needs_two: bool,
-    ) sheet_plan.Error!void {
+    ) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addDataValidationRange(self.workbook.allocator, range, kind_name, op_name, formula1, formula2, needs_two);
     }
 
-    pub fn addDataValidationCustom(self: *Worksheet, range: []const u8, formula: []const u8) sheet_plan.Error!void {
+    pub fn addDataValidationCustom(self: *Worksheet, range: []const u8, formula: []const u8) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addDataValidationCustom(self.workbook.allocator, range, formula);
     }
 
@@ -14128,7 +14562,8 @@ pub const Worksheet = struct {
         formula1: []const u8,
         formula2: ?[]const u8,
         dxf_id: u32,
-    ) sheet_plan.Error!void {
+    ) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addConditionalFormatCellIs(
             self.workbook.allocator,
             range,
@@ -14145,7 +14580,8 @@ pub const Worksheet = struct {
         range: []const u8,
         formula: []const u8,
         dxf_id: u32,
-    ) sheet_plan.Error!void {
+    ) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addConditionalFormatExpression(
             self.workbook.allocator,
             range,
@@ -14161,7 +14597,8 @@ pub const Worksheet = struct {
         low_color_argb: u32,
         mid_color_argb: ?u32,
         high_color_argb: u32,
-    ) sheet_plan.Error!void {
+    ) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addConditionalFormatColorScale(
             self.workbook.allocator,
             range,
@@ -14171,7 +14608,8 @@ pub const Worksheet = struct {
         );
     }
 
-    pub fn addConditionalFormatDataBar(self: *Worksheet, range: []const u8, color_argb: u32) sheet_plan.Error!void {
+    pub fn addConditionalFormatDataBar(self: *Worksheet, range: []const u8, color_argb: u32) RegistrationError!void {
+        try self.ensureSpliceable();
         try self.sheet_state.addConditionalFormatDataBar(self.workbook.allocator, range, color_argb);
     }
 
@@ -17697,6 +18135,8 @@ test {
     // S3c slice 6: same lesson, the shared JSON scalar writers (their
     // pins — the escaper's, `writeF64`'s — ran on no root before).
     _ = @import("json_text.zig");
+    // S3d slice 2: same lesson, the sheet-part splice.
+    _ = @import("sheet_splice.zig");
 }
 
 test "WorkbookEnv.Cell stays at its recorded width (M10s)" {
@@ -34457,4 +34897,301 @@ test "S3d slice 1 r21: a case-variant declaration types the part; a loosely spel
         defer a.free(rels);
         try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles\" Target=\"/styles.xml\"") != null);
     }
+}
+
+// ─── S3d slice 2: the per-sheet registrations on an opened sheet ─────
+
+/// Sheet `S` with every element the writer can attach — a column
+/// width, a frozen row, an auto-filter, a merge, an external and an
+/// internal hyperlink, a comment, a list validation, a cellIs rule —
+/// over three rows; sheet `T` bare with one row.
+fn writeS3d2Fixture(a: Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
+    const path = try std.fs.path.join(a, &.{ dir, name });
+    errdefer a.free(path);
+    const xlsx_w = @import("zlsx");
+    var w = xlsx_w.Writer.init(a);
+    defer w.deinit();
+    const dxf = try w.addDxf(.{ .font_bold = true });
+    const s = try w.addSheet("S");
+    try s.writeRow(&.{ .{ .string = "h" }, .{ .string = "k" } });
+    try s.writeRow(&.{ .{ .number = 1 }, .{ .number = 2 } });
+    try s.writeRow(&.{ .{ .number = 3 }, .{ .number = 4 } });
+    try s.setColumnWidth(0, 12);
+    try s.freezePanes(1, 0);
+    try s.setAutoFilter("A1:B1");
+    try s.addMergedCell("A5:B5");
+    try s.addHyperlink("A2", "https://a.example/");
+    try s.addInternalHyperlink("B2", "T!A1");
+    try s.addComment("A3", "alice", "old");
+    try s.addDataValidationList("C1", &.{"x"});
+    try s.addConditionalFormatCellIs("A2:A3", .greater_than, "0", null, dxf);
+    const t = try w.addSheet("T");
+    try t.writeRow(&.{.{ .number = 5 }});
+    try w.save(io, path);
+    return path;
+}
+
+fn s3d2Contains(hay: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, hay, needle) == null) {
+        std.debug.print("\nmissing: {s}\nin: {s}\n", .{ needle, hay });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "S3d slice 2: every registration lands in the opened sheet part at save — extended where the sheet holds the element, created at its schema slot where not; the comments part, the VML and the relationships extended or created; the reader sees them; the rest of the part preserved" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d2Fixture(a, io, dir, "s3d2_src.xlsx");
+    defer a.free(src);
+    const out = try std.fs.path.join(a, &.{ dir, "s3d2_out.xlsx" });
+    defer a.free(out);
+
+    var before_s: []u8 = undefined;
+    var before_t: []u8 = undefined;
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        before_s = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet1.xml");
+        before_t = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet2.xml");
+        try std.testing.expect(!wb.hasUnsavedChanges());
+        const s = try wb.sheet(0);
+        try s.setColumnWidth(2, 30);
+        try s.setRowHeight(1, 33);
+        try s.freezePanes(2, 1);
+        try s.setAutoFilter("A1:C1");
+        try s.addMergedCell("C5:D5");
+        try s.addHyperlink("A4", "https://b.example/?q=1&r=2");
+        try s.addInternalHyperlink("B4", "T!B1");
+        try s.addComment("B3", "bob", "new");
+        try s.addComment("C3", "alice", "again");
+        try s.addDataValidationRange("D1", "whole", "between", "1", "9", true);
+        try s.addConditionalFormatDataBar("B2:B3", 0xFF00FF00);
+        const t = try wb.sheet(1);
+        try t.addMergedCell("A1:B1");
+        try t.addComment("A1", "carol", "t");
+        try t.setRowHeight(0, 20);
+        try t.addHyperlink("A2", "https://c.example/");
+        try std.testing.expect(wb.hasUnsavedChanges());
+        try std.testing.expect(wb.hasStagedSheetWork());
+        try wb.save(io, out);
+        // Drained: rendered, staged no longer.
+        try std.testing.expect(!wb.hasStagedSheetWork());
+        try std.testing.expect(!s.hasStagedSheetWork());
+        // The live view follows the part.
+        try std.testing.expectEqual(@as(usize, 2), (try s.ensureParsed()).merges.len);
+        try std.testing.expectEqual(@as(usize, 4), (try s.hyperlinks()).len);
+    }
+    defer a.free(before_s);
+    defer a.free(before_t);
+
+    var re = try Workbook.open(a, io, out);
+    defer re.deinit();
+    const after_s = try s3d1PartBytes(a, &re, "xl/worksheets/sheet1.xml");
+    defer a.free(after_s);
+    // Everything up to the first element the slice touched (`<sheetViews>`)
+    // is the writer's byte for byte; so is `<sheetData>` apart from row 2's
+    // open tag.
+    const views_before = std.mem.indexOf(u8, before_s, "<sheetViews>").?;
+    const views_after = std.mem.indexOf(u8, after_s, "<sheetViews>").?;
+    try std.testing.expectEqualSlices(u8, before_s[0..views_before], after_s[0..views_after]);
+    for ([_][]const u8{
+        "<sheetViews><sheetView workbookViewId=\"0\"><pane xSplit=\"1\" ySplit=\"2\" topLeftCell=\"B3\" activePane=\"bottomRight\" state=\"frozen\"/></sheetView></sheetViews>",
+        "<cols><col min=\"1\" max=\"1\" width=\"12\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"30\" customWidth=\"1\"/></cols>",
+        "<row r=\"2\" ht=\"33\" customHeight=\"1\"><c r=\"A2\"><v>1</v></c><c r=\"B2\"><v>2</v></c></row>",
+        "</sheetData><autoFilter ref=\"A1:C1\"/><mergeCells count=\"2\"><mergeCell ref=\"A5:B5\"/><mergeCell ref=\"C5:D5\"/></mergeCells>",
+        "<conditionalFormatting sqref=\"A2:A3\"><cfRule type=\"cellIs\" dxfId=\"0\" priority=\"1\" operator=\"greaterThan\"><formula>0</formula></cfRule></conditionalFormatting>" ++
+            "<conditionalFormatting sqref=\"B2:B3\"><cfRule type=\"dataBar\" priority=\"2\"><dataBar><cfvo type=\"min\"/><cfvo type=\"max\"/><color rgb=\"FF00FF00\"/></dataBar></cfRule></conditionalFormatting>",
+        "<dataValidations count=\"2\"><dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"C1\"><formula1>&quot;x&quot;</formula1></dataValidation>" ++
+            "<dataValidation type=\"whole\" operator=\"between\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"D1\"><formula1>1</formula1><formula2>9</formula2></dataValidation></dataValidations>",
+        "<hyperlinks><hyperlink ref=\"A2\" r:id=\"rId1\"/><hyperlink ref=\"B2\" location=\"T!A1\"/><hyperlink ref=\"A4\" r:id=\"rId4\"/><hyperlink ref=\"B4\" location=\"T!B1\"/></hyperlinks>",
+        "<legacyDrawing r:id=\"rId3\"/></worksheet>",
+    }) |needle| try s3d2Contains(after_s, needle);
+    try std.testing.expect(std.mem.indexOf(u8, after_s, "A1:B1") == null);
+    const rels_s = try s3d1PartBytes(a, &re, "xl/worksheets/_rels/sheet1.xml.rels");
+    defer a.free(rels_s);
+    try s3d2Contains(rels_s, "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://b.example/?q=1&amp;r=2\" TargetMode=\"External\"/></Relationships>");
+    const comments_s = try s3d1PartBytes(a, &re, "xl/comments1.xml");
+    defer a.free(comments_s);
+    try s3d2Contains(comments_s, "<authors><author>alice</author><author>bob</author></authors><commentList><comment ref=\"A3\" authorId=\"0\">");
+    try s3d2Contains(comments_s, "<comment ref=\"B3\" authorId=\"1\"><text><t xml:space=\"preserve\">new</t></text></comment><comment ref=\"C3\" authorId=\"0\"><text><t xml:space=\"preserve\">again</t></text></comment></commentList></comments>");
+    const vml_s = try s3d1PartBytes(a, &re, "xl/drawings/vmlDrawing1.vml");
+    defer a.free(vml_s);
+    try s3d2Contains(vml_s, "id=\"_x0000_s1025\"");
+    try s3d2Contains(vml_s, "id=\"_x0000_s1026\"");
+    try s3d2Contains(vml_s, "id=\"_x0000_s1027\"");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, vml_s, "_x0000_t202\" coordsize"));
+
+    // Sheet T: every part created — the merge block and the legacy
+    // drawing at their slots, the rels part with three entries, the
+    // comments part and the VML numbered past the package's.
+    const after_t = try s3d1PartBytes(a, &re, "xl/worksheets/sheet2.xml");
+    defer a.free(after_t);
+    try s3d2Contains(after_t, "<sheetData><row r=\"1\" ht=\"20\" customHeight=\"1\"><c r=\"A1\"><v>5</v></c></row></sheetData><mergeCells count=\"1\"><mergeCell ref=\"A1:B1\"/></mergeCells><hyperlinks><hyperlink ref=\"A2\" r:id=\"rId1\"/></hyperlinks><legacyDrawing r:id=\"rId3\"/></worksheet>");
+    const head_t = std.mem.indexOf(u8, before_t, "<sheetData>").?;
+    try std.testing.expectEqualSlices(u8, before_t[0..head_t], after_t[0..head_t]);
+    const rels_t = try s3d1PartBytes(a, &re, "xl/worksheets/_rels/sheet2.xml.rels");
+    defer a.free(rels_t);
+    try s3d2Contains(rels_t, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://c.example/\" TargetMode=\"External\"/>" ++
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments2.xml\"/>" ++
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"../drawings/vmlDrawing2.vml\"/></Relationships>");
+    const comments_t = try s3d1PartBytes(a, &re, "xl/comments2.xml");
+    defer a.free(comments_t);
+    try s3d2Contains(comments_t, "<authors><author>carol</author></authors><commentList><comment ref=\"A1\" authorId=\"0\">");
+    try std.testing.expect(re.store.hasPart("xl/drawings/vmlDrawing2.vml"));
+    const ct = try s3d1PartBytes(a, &re, "[Content_Types].xml");
+    defer a.free(ct);
+    try s3d2Contains(ct, "PartName=\"/xl/comments2.xml\"");
+    try s3d2Contains(ct, "PartName=\"/xl/drawings/vmlDrawing2.vml\"");
+
+    // The reader.
+    const xlsx_r = @import("zlsx");
+    var book = try xlsx_r.Book.open(a, io, out);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(usize, 2), book.mergedRanges(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 4), book.hyperlinks(book.sheets[0]).len);
+    try std.testing.expectEqualStrings("https://b.example/?q=1&r=2", book.hyperlinks(book.sheets[0])[2].url);
+    try std.testing.expectEqual(@as(usize, 3), book.comments(book.sheets[0]).len);
+    try std.testing.expectEqualStrings("bob", book.comments(book.sheets[0])[1].author);
+    try std.testing.expectEqual(@as(usize, 2), book.dataValidations(book.sheets[0]).len);
+    try std.testing.expectEqual(@as(usize, 1), book.mergedRanges(book.sheets[1]).len);
+    try std.testing.expectEqual(@as(usize, 1), book.comments(book.sheets[1]).len);
+    try std.testing.expectEqual(@as(usize, 1), book.hyperlinks(book.sheets[1]).len);
+    const fp = (try (try re.sheet(0)).freezePane()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), fp.x_split);
+    try std.testing.expectEqual(@as(u32, 2), fp.y_split);
+}
+
+test "S3d slice 2: the verdicts are judged at the first registration, nothing staged — a sheet part the splice cannot extend, a merge over a held or staged one, a second comment on a cell, a comments part or a VML drawing the walk cannot read" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d2Fixture(a, io, dir, "s3d2_refusals.xlsx");
+    defer a.free(src);
+
+    // The merge and the comment verdicts on the fixture as written.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const s = try wb.sheet(0);
+        try std.testing.expectError(error.MergeRangeOverlaps, s.addMergedCell("B5:C6"));
+        try std.testing.expectError(error.MergeRangeOverlaps, s.addMergedCell("A1:B5"));
+        try std.testing.expectError(error.InvalidMergeRange, s.addMergedCell("A1"));
+        try std.testing.expectError(error.CommentRefTaken, s.addComment("A3", "x", "y"));
+        // The registry's refs are uppercase (the fresh emitter's rule).
+        try std.testing.expectError(error.InvalidHyperlinkRange, s.addComment("a3", "x", "y"));
+        try std.testing.expectError(error.InvalidCommentRef, s.addComment("A3:A4", "x", "y"));
+        try std.testing.expect(!wb.hasUnsavedChanges());
+        try s.addMergedCell("C5:C6");
+        try std.testing.expectError(error.MergeRangeOverlaps, s.addMergedCell("C6:D7"));
+        try s.addComment("B3", "x", "y");
+        try std.testing.expectError(error.CommentRefTaken, s.addComment("B3", "x", "z"));
+        try std.testing.expectEqual(@as(usize, 1), s.sheet_state.merged_cells.items.len);
+        try std.testing.expectEqual(@as(usize, 1), s.sheet_state.comments.items.len);
+    }
+    // A sheet part the splice cannot extend refuses every registration
+    // with nothing staged; a comments part or a VML drawing the walk
+    // cannot read refuses the comment alone.
+    const Shape = struct { part: []const u8, bytes: []const u8, err: anyerror, comment_only: bool };
+    for ([_]Shape{
+        .{ .part = "xl/worksheets/sheet2.xml", .bytes = "<worksheet " ++ s3d1_ns ++ "><sheetData/><x:mergeCells xmlns:x=\"u\"/></worksheet>", .err = error.MalformedSheetXml, .comment_only = false },
+        .{ .part = "xl/worksheets/sheet2.xml", .bytes = "<worksheet " ++ s3d1_ns ++ "><sheetData/><mc:AlternateContent><mc:Choice><legacyDrawing r:id=\"rId1\"/></mc:Choice></mc:AlternateContent></worksheet>", .err = error.MalformedSheetXml, .comment_only = false },
+        .{ .part = "xl/worksheets/sheet2.xml", .bytes = "<worksheet " ++ s3d1_ns ++ "/>", .err = error.MalformedSheetXml, .comment_only = false },
+        .{ .part = "xl/comments1.xml", .bytes = "<x:comments xmlns:x=\"u\"/>", .err = error.MalformedCommentsXml, .comment_only = true },
+        .{ .part = "xl/drawings/vmlDrawing1.vml", .bytes = "<xml><v:shape", .err = error.MalformedVmlDrawing, .comment_only = true },
+    }) |shape| {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try wb.store.replacePart(shape.part, shape.bytes);
+        const sheet_idx: u32 = if (shape.comment_only) 0 else 1;
+        const ws = try wb.sheet(sheet_idx);
+        try std.testing.expectError(shape.err, ws.addComment("D9", "x", "y"));
+        if (!shape.comment_only) {
+            try std.testing.expectError(shape.err, ws.setColumnWidth(0, 9));
+            try std.testing.expectError(shape.err, ws.addMergedCell("A1:A2"));
+            try std.testing.expectError(shape.err, ws.freezePanes(1, 0));
+            try std.testing.expectError(shape.err, ws.addHyperlink("A1", "https://x/"));
+        } else {
+            // The other registrations do not read those parts.
+            try ws.setColumnWidth(0, 9);
+        }
+        try std.testing.expect(!ws.hasStagedSheetWork() or shape.comment_only);
+        try std.testing.expectEqual(@as(usize, 0), ws.sheet_state.comments.items.len);
+    }
+}
+
+test "S3d slice 2: a staged registration excludes the row / column edits and deleteSheet as a staged value does, rides beside appended rows, and is drained by the save" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d2Fixture(a, io, dir, "s3d2_guards.xlsx");
+    defer a.free(src);
+    var wb = try Workbook.open(a, io, src);
+    defer wb.deinit();
+    const t = try wb.sheet(1);
+    try t.addMergedCell("B2:C2");
+    try std.testing.expectError(error.SheetHasUnsavedMutations, wb.insertRow(1, 1));
+    try std.testing.expectError(error.SheetHasUnsavedMutations, wb.deleteRow(1, 1));
+    try std.testing.expectError(error.SheetHasUnsavedMutations, wb.insertColumn(1, 1));
+    // The other sheet is clean: its edits are admitted.
+    try wb.insertRow(0, 9);
+    const row = [_]zlsx.Cell{.{ .number = 6 }};
+    try t.appendRows(&.{&row});
+    try t.setRowHeight(1, 21);
+    const bytes = try wb.saveToOwnedBuffer(a);
+    defer a.free(bytes);
+    try std.testing.expect(!t.hasStagedSheetWork());
+    var re = try Workbook.openBuffer(a, io, bytes);
+    defer re.deinit();
+    const after = try s3d1PartBytes(a, &re, "xl/worksheets/sheet2.xml");
+    defer a.free(after);
+    try s3d2Contains(after, "<row r=\"2\" ht=\"21\" customHeight=\"1\"><c r=\"A2\"><v>6</v></c></row></sheetData><mergeCells count=\"1\"><mergeCell ref=\"B2:C2\"/></mergeCells>");
+}
+
+test "S3d slice 2: every allocation failure across open, the registrations and the save leaks nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d2Fixture(a, io, dir, "s3d2_oom.xlsx");
+    defer a.free(src);
+    const H = struct {
+        fn run(alloc: Allocator, io_: std.Io, path: []const u8) !void {
+            var wb = try Workbook.open(alloc, io_, path);
+            defer wb.deinit();
+            const s = try wb.sheet(0);
+            try s.setColumnWidth(1, 9);
+            try s.setRowHeight(0, 19);
+            try s.freezePanes(1, 1);
+            try s.addMergedCell("C5:D5");
+            try s.addHyperlink("A4", "https://b.example/");
+            try s.addComment("B3", "bob", "new");
+            try s.addDataValidationCustom("D1", "D1>0");
+            try s.addConditionalFormatColorScale("A2:A3", 0xFF0000FF, null, 0xFFFF0000);
+            const t = try wb.sheet(1);
+            try t.addComment("A1", "carol", "t");
+            try t.addHyperlink("A2", "https://c.example/");
+            try wb.applySavePlans();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, H.run, .{ io, src });
 }

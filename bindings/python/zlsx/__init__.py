@@ -5521,6 +5521,450 @@ class Editor:
             self._u32("style_idx", style_idx),
         )
 
+    # ── S3d slice 2: the per-sheet registrations on an opened sheet ──
+
+    def _sheet_attachments_available(self) -> None:
+        if not self._handle:
+            raise ZlsxError("editor is closed")
+        if not _ffi._HAS_EDITOR_SHEET_ATTACHMENTS:
+            raise RuntimeError(
+                "loaded libzlsx does not expose zlsx_editor_set_column_width / "
+                "add_merged_cell / add_comment / … (requires 0.9.0+); "
+                "upgrade libzlsx"
+            )
+
+    @staticmethod
+    def _text_arg(name: str, value: str):
+        """A ``str`` as the boundary takes it: a ``(pointer, length)``
+        pair over its UTF-8 bytes and the buffer keeping them alive."""
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a str, not {type(value).__name__}")
+        raw = value.encode("utf-8")
+        buf = (ctypes.c_ubyte * max(len(raw), 1)).from_buffer_copy(raw or b"\x00")
+        return ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)), len(raw), buf
+
+    def set_column_width(self, sheet_idx: int, col_idx: int, width: float) -> None:
+        """Set the width of column ``col_idx`` (0-based) on
+        ``sheet_idx``, in Excel's character units. At save a ``<col>``
+        record the sheet holds over the column is split around it, its
+        other attributes (``style``, ``hidden``, …) kept; a column no
+        record covers is written as the writer writes it. Raises
+        :class:`ZlsxError` ``InvalidColumnWidth`` (not finite and
+        positive), ``ColumnOutOfRange``, ``SheetIndexOutOfRange``; the
+        :class:`ZlsxRefusal` ``MalformedSheetXml`` at the sheet's first
+        registration (see :meth:`add_merged_cell`)."""
+        self._sheet_attachments_available()
+        self._structural_call(
+            "zlsx_editor_set_column_width",
+            _ffi.lib.zlsx_editor_set_column_width,
+            self._handle,
+            self._u32("sheet_idx", sheet_idx),
+            self._u32("col_idx", col_idx),
+            ctypes.c_float(float(width)),
+        )
+
+    def set_row_height(self, sheet_idx: int, row_idx: int, height: float) -> None:
+        """Set the height of row ``row_idx`` (0-based) on ``sheet_idx``,
+        in points (at most 409.5). At save the ``<row>`` the sheet holds
+        gains ``ht`` + ``customHeight`` on its open tag; one it lacks is
+        created empty in row order (a ``<row>`` without a readable ``r``
+        is neither matched nor an anchor). Raises :class:`ZlsxError`
+        ``InvalidRowHeight``, ``RowOutOfRange``."""
+        self._sheet_attachments_available()
+        self._structural_call(
+            "zlsx_editor_set_row_height",
+            _ffi.lib.zlsx_editor_set_row_height,
+            self._handle,
+            self._u32("sheet_idx", sheet_idx),
+            self._u32("row_idx", row_idx),
+            ctypes.c_float(float(height)),
+        )
+
+    def freeze_panes(self, sheet_idx: int, rows: int = 0, cols: int = 0) -> None:
+        """Freeze the top ``rows`` rows and the left ``cols`` columns
+        of ``sheet_idx``. At save the ``<pane>`` of the sheet's first
+        ``<sheetView>`` is replaced (a ``<selection>`` naming a pane the
+        new split lacks is left), or created — the view and the views
+        with it. Both 0 registers nothing. The checked form: ``rows``
+        past 1048575 / ``cols`` past 16383 raise :class:`ZlsxError`
+        ``RowOutOfRange`` / ``ColumnOutOfRange``, never clamped."""
+        self._sheet_attachments_available()
+        self._structural_call(
+            "zlsx_editor_freeze_panes",
+            _ffi.lib.zlsx_editor_freeze_panes,
+            self._handle,
+            self._u32("sheet_idx", sheet_idx),
+            self._u32("rows", rows),
+            self._u32("cols", cols),
+        )
+
+    def set_auto_filter(self, sheet_idx: int, range_str: str) -> None:
+        """Set the auto-filter range (``"A1:D1"``) of ``sheet_idx``. At
+        save the sheet's ``<autoFilter>`` is replaced whole — its filter
+        columns and sort state with it — or created; a
+        ``_xlnm._FilterDatabase`` defined name naming the old range is
+        left as the producer wrote it. Raises :class:`ZlsxError`
+        ``InvalidAutoFilterRange``."""
+        self._sheet_attachments_available()
+        p, n, keep = self._text_arg("range_str", range_str)
+        try:
+            self._structural_call(
+                "zlsx_editor_set_auto_filter",
+                _ffi.lib.zlsx_editor_set_auto_filter,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                p,
+                n,
+            )
+        finally:
+            del keep
+
+    def add_merged_cell(self, sheet_idx: int, range_str: str) -> None:
+        """Merge ``range_str`` (``"A1:B2"``, at least two cells) on
+        ``sheet_idx``. At save the sheet's ``<mergeCells>`` is extended
+        after the records it holds (its ``count`` rewritten where it
+        spells one), or created at its schema slot. Raises
+        :class:`ZlsxError` ``InvalidMergeRange``, ``MergeRangeOverlaps``
+        (a cell the sheet's merges or this editor's staged merges already
+        cover — Excel repairs overlapping merges by dropping them; judged
+        before anything is staged).
+
+        The first registration on a sheet reads its part: a part the
+        splice cannot extend in place raises :class:`ZlsxRefusal`
+        ``MalformedSheetXml`` (no ``<worksheet>`` root, a self-closed one,
+        an element that never closes, one of the elements the splice
+        writes under a prefix or inside an ``mc:AlternateContent`` block),
+        nothing staged, so a refused editor still saves the passthrough.
+        Every other byte of the part is preserved. A staged registration
+        is a staged cell write to the structural edits
+        (``RowEditRequiresCleanSheet`` / ``ColEditRequiresCleanSheet``),
+        :meth:`delete_sheet` (``SheetDeleteRequiresCleanState``) and the
+        embedding sweeps — its refs are pre-shift; it rides beside
+        :meth:`append_rows`; :meth:`save`, :meth:`save_to_buffer` and
+        :meth:`save_with_recalc` carry it, and drain it."""
+        self._sheet_attachments_available()
+        p, n, keep = self._text_arg("range_str", range_str)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_merged_cell",
+                _ffi.lib.zlsx_editor_add_merged_cell,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                p,
+                n,
+            )
+        finally:
+            del keep
+
+    def add_hyperlink(self, sheet_idx: int, range_str: str, url: str) -> None:
+        """Attach an external hyperlink to ``range_str`` on
+        ``sheet_idx``: a ``<hyperlink r:id>`` in the sheet's
+        ``<hyperlinks>`` (extended or created) and a
+        ``TargetMode="External"`` relationship in the sheet's rels
+        (extended or created, the id past the highest it spells). A
+        hyperlink over a cell one already covers is not judged (the
+        writer's rule). Raises :class:`ZlsxError`
+        ``InvalidHyperlinkRange``, ``InvalidHyperlinkUrl`` (empty)."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        up, un, uk = self._text_arg("url", url)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_hyperlink",
+                _ffi.lib.zlsx_editor_add_hyperlink,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                up,
+                un,
+            )
+        finally:
+            del rk, uk
+
+    def add_internal_hyperlink(self, sheet_idx: int, range_str: str, location: str) -> None:
+        """Attach a workbook-internal hyperlink (``location`` such as
+        ``"Sheet2!A1"``) to ``range_str`` on ``sheet_idx`` — a
+        ``<hyperlink location>``, no relationship. Raises
+        :class:`ZlsxError` ``InvalidHyperlinkRange``,
+        ``InvalidHyperlinkLocation`` (empty)."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        lp, ln, lk = self._text_arg("location", location)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_internal_hyperlink",
+                _ffi.lib.zlsx_editor_add_internal_hyperlink,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                lp,
+                ln,
+            )
+        finally:
+            del rk, lk
+
+    def add_comment(self, sheet_idx: int, ref: str, author: str, text: str) -> None:
+        """Attach a plain-text note to the single cell ``ref`` on
+        ``sheet_idx``. At save the comments part the sheet's
+        relationships name is extended (a known author keeps its id),
+        else ``xl/comments{N}.xml`` is created with its relationship and
+        content type; the VML drawing the sheet's ``<legacyDrawing>``
+        names is extended with a note shape (ids past the highest it
+        spells), else ``xl/drawings/vmlDrawing{N}.vml`` is created with
+        the element. Raises :class:`ZlsxError` ``InvalidCommentRef``
+        (empty, or a range), ``InvalidHyperlinkRange`` (not a cell),
+        ``CommentRefTaken`` (a cell the part or a staged comment already
+        annotates — one note per cell; judged before anything is
+        staged); the :class:`ZlsxRefusal` ``MalformedCommentsXml`` /
+        ``MalformedVmlDrawing`` / ``MalformedSheetRels`` for a part or a
+        relationship the sheet's first comment cannot follow."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("ref", ref)
+        ap, an, ak = self._text_arg("author", author)
+        tp, tn, tk = self._text_arg("text", text)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_comment",
+                _ffi.lib.zlsx_editor_add_comment,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                ap,
+                an,
+                tp,
+                tn,
+            )
+        finally:
+            del rk, ak, tk
+
+    def add_data_validation_list(self, sheet_idx: int, range_str: str, values) -> None:
+        """Attach a list (dropdown) validation to ``range_str`` on
+        ``sheet_idx``: ``values`` a non-empty iterable of at most 256
+        strings, none empty, none holding a comma or a double quote
+        (:class:`ZlsxError` ``InvalidDataValidation``). At save the
+        sheet's ``<dataValidations>`` is extended (its ``count``
+        rewritten), or created; a validation over a cell one already
+        covers is not judged (the writer's rule)."""
+        self._sheet_attachments_available()
+        items = [v if isinstance(v, str) else str(v) for v in values]
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        raws = [v.encode("utf-8") for v in items]
+        bufs = [
+            (ctypes.c_ubyte * max(len(r), 1)).from_buffer_copy(r or b"\x00") for r in raws
+        ]
+        u8p = ctypes.POINTER(ctypes.c_ubyte)
+        ptrs = (u8p * max(len(bufs), 1))(*[ctypes.cast(b, u8p) for b in bufs])
+        lens = (ctypes.c_size_t * max(len(raws), 1))(*[len(r) for r in raws])
+        try:
+            self._structural_call(
+                "zlsx_editor_add_data_validation_list",
+                _ffi.lib.zlsx_editor_add_data_validation_list,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                ptrs,
+                lens,
+                len(raws),
+            )
+        finally:
+            del rk, bufs, ptrs, lens
+
+    def add_data_validation_numeric(
+        self,
+        sheet_idx: int,
+        range_str: str,
+        kind: str,
+        op: str,
+        formula1: str,
+        formula2: str | None = None,
+    ) -> None:
+        """Attach a numeric / date / time / text-length validation to
+        ``range_str`` on ``sheet_idx``: ``kind`` one of ``"whole"``,
+        ``"decimal"``, ``"date"``, ``"time"``, ``"text_length"``; ``op``
+        one of :data:`CF_OPERATORS`; ``formula2`` required iff ``op`` is
+        ``"between"`` / ``"not_between"`` — the writer's
+        :meth:`SheetWriter.add_data_validation_numeric` spelling. Raises
+        :class:`ValueError` on an unknown kind or operator,
+        :class:`ZlsxError` ``InvalidDataValidation``."""
+        self._sheet_attachments_available()
+        kind_code = _DV_WRITER_KIND_CODES.get(kind)
+        if kind_code is None:
+            raise ValueError(
+                f"unknown data validation kind {kind!r}; expected one of "
+                f"{sorted(_DV_WRITER_KIND_CODES)}"
+            )
+        op_code = _DV_WRITER_OP_CODES.get(op)
+        if op_code is None:
+            raise ValueError(
+                f"unknown data validation operator {op!r}; expected one of "
+                f"{sorted(_DV_WRITER_OP_CODES)}"
+            )
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        f1p, f1n, f1k = self._text_arg("formula1", formula1)
+        if formula2 is None:
+            f2p, f2n, f2k = ctypes.POINTER(ctypes.c_ubyte)(), 0, None
+        else:
+            f2p, f2n, f2k = self._text_arg("formula2", formula2)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_data_validation_numeric",
+                _ffi.lib.zlsx_editor_add_data_validation_numeric,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                kind_code,
+                op_code,
+                f1p,
+                f1n,
+                f2p,
+                f2n,
+            )
+        finally:
+            del rk, f1k, f2k
+
+    def add_data_validation_custom(self, sheet_idx: int, range_str: str, formula: str) -> None:
+        """Attach a custom-formula validation to ``range_str`` on
+        ``sheet_idx``. Raises :class:`ZlsxError` ``InvalidDataValidation``
+        (an empty formula), ``InvalidHyperlinkRange``."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        fp, fn, fk = self._text_arg("formula", formula)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_data_validation_custom",
+                _ffi.lib.zlsx_editor_add_data_validation_custom,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                fp,
+                fn,
+            )
+        finally:
+            del rk, fk
+
+    def add_conditional_format_cell_is(
+        self,
+        sheet_idx: int,
+        range_str: str,
+        op: str,
+        formula1: str,
+        formula2: str | None,
+        dxf_id: int,
+    ) -> None:
+        """Attach a cellIs conditional-format rule to ``range_str`` on
+        ``sheet_idx``: ``op`` one of :data:`CF_OPERATORS`, ``formula2``
+        required iff ``op`` is ``"between"`` / ``"not_between"``,
+        ``dxf_id`` a slot the workbook's ``<dxfs>`` holds or one
+        :meth:`add_dxf` returned for this save. At save the rule lands
+        after the sheet's last ``<conditionalFormatting>`` with a
+        priority past the highest the sheet spells (``x14`` rules
+        counted). Raises :class:`ValueError` on an unknown operator,
+        :class:`ZlsxError` ``InvalidDataValidation``, ``UnknownDxfId``."""
+        self._sheet_attachments_available()
+        op_code = _DV_WRITER_OP_CODES.get(op)
+        if op_code is None:
+            raise ValueError(
+                f"unknown conditional-format operator {op!r}; expected one of "
+                f"{sorted(_DV_WRITER_OP_CODES)}"
+            )
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        f1p, f1n, f1k = self._text_arg("formula1", formula1)
+        if formula2 is None:
+            f2p, f2n, f2k = ctypes.POINTER(ctypes.c_ubyte)(), 0, None
+        else:
+            f2p, f2n, f2k = self._text_arg("formula2", formula2)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_conditional_format_cell_is",
+                _ffi.lib.zlsx_editor_add_conditional_format_cell_is,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                op_code,
+                f1p,
+                f1n,
+                f2p,
+                f2n,
+                self._u32("dxf_id", dxf_id),
+            )
+        finally:
+            del rk, f1k, f2k
+
+    def add_conditional_format_expression(self, sheet_idx: int, range_str: str, formula: str, dxf_id: int) -> None:
+        """Attach an expression conditional-format rule to ``range_str``
+        on ``sheet_idx``; statuses as :meth:`add_conditional_format_cell_is`'s."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        fp, fn, fk = self._text_arg("formula", formula)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_conditional_format_expression",
+                _ffi.lib.zlsx_editor_add_conditional_format_expression,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                fp,
+                fn,
+                self._u32("dxf_id", dxf_id),
+            )
+        finally:
+            del rk, fk
+
+    def add_conditional_format_color_scale(
+        self,
+        sheet_idx: int,
+        range_str: str,
+        low_color_argb: int,
+        mid_color_argb: int | None,
+        high_color_argb: int,
+    ) -> None:
+        """Attach a color scale to ``range_str`` on ``sheet_idx``: three
+        stops (min, the 50th percentile, max) when ``mid_color_argb`` is
+        given, two otherwise — the writer's spelling."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_conditional_format_color_scale",
+                _ffi.lib.zlsx_editor_add_conditional_format_color_scale,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                self._u32("low_color_argb", low_color_argb),
+                0 if mid_color_argb is None else 1,
+                0 if mid_color_argb is None else self._u32("mid_color_argb", mid_color_argb),
+                self._u32("high_color_argb", high_color_argb),
+            )
+        finally:
+            del rk
+
+    def add_conditional_format_data_bar(self, sheet_idx: int, range_str: str, color_argb: int) -> None:
+        """Attach a data bar to ``range_str`` on ``sheet_idx``
+        (``color_argb`` the bar fill — Excel's default is ``0xFF638EC6``)."""
+        self._sheet_attachments_available()
+        rp, rn, rk = self._text_arg("range_str", range_str)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_conditional_format_data_bar",
+                _ffi.lib.zlsx_editor_add_conditional_format_data_bar,
+                self._handle,
+                self._u32("sheet_idx", sheet_idx),
+                rp,
+                rn,
+                self._u32("color_argb", color_argb),
+            )
+        finally:
+            del rk
+
     def mark_recalc_on_load(self) -> None:
         """§5.7.7's mark-only transaction: keep every cached value, set
         ``fullCalcOnLoad="1"``, change nothing else.
