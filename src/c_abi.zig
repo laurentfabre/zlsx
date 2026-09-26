@@ -11774,8 +11774,8 @@ export fn zlsx_editor_strip_embeddings(
 /// Register a cell style on the editor's workbook. `*out_index` is
 /// the `s="…"` slot the record takes in the saved part; dedup within
 /// the save. -1: InvalidInput (a NULL handle, spec or out), the enum
-/// verdicts `styleFromC` names, InvalidStyle (an empty font name or
-/// format, a non-positive size); -2 MalformedStylesXml with the name
+/// verdicts `styleFromC` names, InvalidStyle (a non-positive font size
+/// — an empty font name or format is "unset" here, `*_len == 0`); -2 MalformedStylesXml with the name
 /// in the diag and no plane, nothing staged; -3 OutOfMemory.
 /// `*out_index` is 0 on every failure past the NULL checks.
 export fn zlsx_editor_add_style(

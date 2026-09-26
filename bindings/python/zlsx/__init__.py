@@ -5326,15 +5326,6 @@ class Editor:
                 "upgrade libzlsx"
             )
 
-    def _style_status(self, fn_name: str, rc: int, diag) -> None:
-        try:
-            if rc == _ffi.ZLSX_REFUSED:
-                raise _refusal_from_diag(diag)
-            if rc != _ffi.ZLSX_OK:
-                raise ZlsxError(f"{fn_name}: {_decode_err(self._err)}")
-        finally:
-            _ffi.lib.zlsx_diag_release(ctypes.byref(diag))
-
     def add_style(self, style: "Style") -> int:
         """Register a cell style on this workbook and return the
         ``s="…"`` index its record takes in the saved ``xl/styles.xml``
@@ -5365,12 +5356,12 @@ class Editor:
         self._styles_available()
         spec, keepalive = _style_spec(style)
         out = ctypes.c_uint32(0)
-        _report, diag = _fresh_report_and_diag()
-        rc = _ffi.lib.zlsx_editor_add_style(
-            self._handle, ctypes.byref(spec), ctypes.byref(out), ctypes.byref(diag), self._err, _ERR_BUF_LEN
-        )
-        del keepalive
-        self._style_status("zlsx_editor_add_style", rc, diag)
+        try:
+            self._structural_call(
+                "zlsx_editor_add_style", _ffi.lib.zlsx_editor_add_style, self._handle, ctypes.byref(spec), ctypes.byref(out)
+            )
+        finally:
+            del keepalive
         return int(out.value)
 
     def add_dxf(self, dxf: "Dxf") -> int:
@@ -5381,11 +5372,7 @@ class Editor:
         self._styles_available()
         c = _dxf_spec(dxf)
         out = ctypes.c_uint32(0)
-        _report, diag = _fresh_report_and_diag()
-        rc = _ffi.lib.zlsx_editor_add_dxf(
-            self._handle, ctypes.byref(c), ctypes.byref(out), ctypes.byref(diag), self._err, _ERR_BUF_LEN
-        )
-        self._style_status("zlsx_editor_add_dxf", rc, diag)
+        self._structural_call("zlsx_editor_add_dxf", _ffi.lib.zlsx_editor_add_dxf, self._handle, ctypes.byref(c), ctypes.byref(out))
         return int(out.value)
 
     def intern_num_fmt(self, format_code: str) -> int:
@@ -5401,18 +5388,17 @@ class Editor:
         code = format_code.encode("utf-8")
         buf = (ctypes.c_ubyte * max(len(code), 1)).from_buffer_copy(code or b"\x00")
         out = ctypes.c_uint32(0)
-        _report, diag = _fresh_report_and_diag()
-        rc = _ffi.lib.zlsx_editor_intern_num_fmt(
-            self._handle,
-            ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
-            len(code),
-            ctypes.byref(out),
-            ctypes.byref(diag),
-            self._err,
-            _ERR_BUF_LEN,
-        )
-        del buf
-        self._style_status("zlsx_editor_intern_num_fmt", rc, diag)
+        try:
+            self._structural_call(
+                "zlsx_editor_intern_num_fmt",
+                _ffi.lib.zlsx_editor_intern_num_fmt,
+                self._handle,
+                ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+                len(code),
+                ctypes.byref(out),
+            )
+        finally:
+            del buf
         return int(out.value)
 
     def set_cell_style(self, sheet_idx: int, row: int, col: int, style_idx: int) -> None:
@@ -5439,11 +5425,9 @@ class Editor:
         ``RowIndexOutOfRange``, ``ColumnIndexOutOfRange``; the
         :class:`ZlsxRefusal` of :meth:`add_style`."""
         self._styles_available()
-        _report, diag = _fresh_report_and_diag()
-        rc = _ffi.lib.zlsx_editor_set_cell_style(
-            self._handle, int(sheet_idx), int(row), int(col), int(style_idx), ctypes.byref(diag), self._err, _ERR_BUF_LEN
+        self._structural_call(
+            "zlsx_editor_set_cell_style", _ffi.lib.zlsx_editor_set_cell_style, self._handle, int(sheet_idx), int(row), int(col), int(style_idx)
         )
-        self._style_status("zlsx_editor_set_cell_style", rc, diag)
 
     def mark_recalc_on_load(self) -> None:
         """§5.7.7's mark-only transaction: keep every cached value, set

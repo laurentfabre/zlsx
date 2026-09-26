@@ -3286,7 +3286,16 @@ where a substring scan injected a duplicate into a single-quoted part
 resolves the part's name without caching it, so a part moved after a
 rule alone is the one a later registration extends (r4 B-NAM-402); the
 relationship lands with the extension, never on a save that renders
-nothing (r4 B-INS-403); the CF forwarders' bound
+nothing (r4 B-INS-403); round 5: the injector's new element lands after
+the last relationship the walk saw, never at a closing tag found by
+substring (a comment can spell one, legal whitespace respells it — r5
+A-REL-501); the tables' and the root's closing tags are matched as
+markup with whitespace allowed before the `>` (`</fonts >`, r5
+A-SCN-503), so "a table that never closes" is what the refusal means;
+`maxInt(u32)` is never handed out as a `numFmtId` (the walk could not
+read it back — r5 B-FMT-501); a refused registration caches no part
+name (r5 B-NAM-502); the Python methods share `_structural_call` (r5
+A-PY-504); the CF forwarders' bound
 reads the part without arming the save's re-read (A/B-BASE-302); the
 `count` rewrite reads the attribute through the shared scanner, quoted
 sibling values skipped (A/B-SPL-302/303); a padded `numFmtId` is

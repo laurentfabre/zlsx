@@ -1684,8 +1684,12 @@ pub const Workbook = struct {
     /// format already interned takes no new id and needs none.
     fn requireNumFmtRoom(self: *const Workbook, base: styles_plan_mod.Base, format_code: []const u8) Error!void {
         if (self.styles_plan.num_fmt_index.contains(format_code)) return;
-        _ = std.math.add(u32, base.num_fmt_next, @intCast(self.styles_plan.num_fmts.items.len)) catch
+        const id = std.math.add(u32, base.num_fmt_next, @intCast(self.styles_plan.num_fmts.items.len)) catch
             return error.MalformedStylesXml;
+        // `maxInt(u32)` itself is an id the walk refuses to read back
+        // (no id above it): never handed out, or the tool would write
+        // a part it cannot extend again (in-house r5 B-FMT-501).
+        if (id == std.math.maxInt(u32)) return error.MalformedStylesXml;
     }
 
     /// The layout the plan's records extend (`styles_plan_mod.Base`).
@@ -1698,8 +1702,11 @@ pub const Workbook = struct {
     /// splice asserts against.
     fn stylesBaseline(self: *Workbook) Error!styles_plan_mod.Base {
         if (self.styles_base) |b| return b;
-        _ = try self.stylesPartName();
+        // The read first: a refused part leaves nothing cached — a
+        // name armed with no base to refuse on would make a later move
+        // of the part invisible (in-house r5 B-NAM-502).
         const read = try self.readStylesBaseline();
+        _ = try self.stylesPartName();
         self.styles_base = read.base;
         self.styles_xfs_held = read.held;
         return read.base;
@@ -12974,8 +12981,16 @@ fn injectWorkbookRelationship(
     type_uri: []const u8,
     target: []const u8,
 ) Error![]u8 {
+    // The new element lands after the last `<Relationship>` the walk
+    // saw, else right after the root's open tag — never at a closing
+    // tag found by substring, which a comment can spell and legal
+    // whitespace can respell (in-house S3d slice 1 r5 A-REL-501).
+    const root = (workbook_xml_mod.findTagOpen(xml, 0, "Relationships") catch return error.MalformedWorkbookRels) orelse
+        return error.MalformedWorkbookRels;
+    if (root.self_closing) return error.MalformedWorkbookRels;
+    var insert_at: usize = root.after_tag_close;
     var max_id: u32 = 0;
-    var cursor: usize = 0;
+    var cursor: usize = root.after_tag_close;
     while (workbook_xml_mod.findTagOpen(xml, cursor, "Relationship") catch return error.MalformedWorkbookRels) |hit| {
         const attrs = xml[hit.attrs_start..hit.attrs_end];
         if (workbook_xml_mod.getAttr(attrs, "Type")) |t| {
@@ -12988,14 +13003,16 @@ fn injectWorkbookRelationship(
                 } else |_| {}
             }
         }
-        cursor = hit.after_tag_close;
+        // A `<Relationship>` that is not self-closing ends at its own
+        // closing tag; its body is empty by schema, the walk skips it.
+        cursor = if (hit.self_closing) hit.after_tag_close else (findCloseTagLoose(xml, hit.after_tag_close, "Relationship") orelse return error.MalformedWorkbookRels).end;
+        insert_at = cursor;
     }
     // A part may spell `rId4294967295`; the next id is not a trap
     // (Codex #206 r4 SEC-404).
     const new_id = std.math.add(u32, max_id, 1) catch return error.MalformedXml;
 
-    const close = std.mem.indexOf(u8, xml, "</Relationships>") orelse
-        return error.MalformedWorkbookRels;
+    const close = insert_at;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -13188,6 +13205,32 @@ const StylesLayout = struct {
     }
 };
 
+const CloseTagHit = struct { lt: usize, end: usize };
+
+/// The next `</tag>` from `from` as real markup — comments, CDATA,
+/// PIs and DOCTYPEs skipped, the name matched whole, whitespace before
+/// the `>` allowed (`</fonts >` is legal XML; in-house r5 A-SCN-503).
+/// `lt` is the tag's `<`, `end` one past its `>`.
+fn findCloseTagLoose(xml: []const u8, from: usize, tag: []const u8) ?CloseTagHit {
+    var i = from;
+    while (i < xml.len) {
+        const lt = std.mem.indexOfScalarPos(u8, xml, i, '<') orelse return null;
+        const skip_to = workbook_xml_mod.skipNonElement(xml, lt) catch return null;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
+        const name_at = lt + 2;
+        if (lt + 1 < xml.len and xml[lt + 1] == '/' and name_at + tag.len <= xml.len and std.mem.eql(u8, xml[name_at .. name_at + tag.len], tag)) {
+            var j = name_at + tag.len;
+            while (j < xml.len and std.ascii.isWhitespace(xml[j])) : (j += 1) {}
+            if (j < xml.len and xml[j] == '>') return .{ .lt = lt, .end = j + 1 };
+        }
+        i = lt + 1;
+    }
+    return null;
+}
+
 /// Read the layout of a styles part. Refuses `MalformedStylesXml`:
 /// no `<styleSheet>` root, a self-closed root (a part that holds no
 /// table — no producer writes one), a table the walk cannot close
@@ -13198,8 +13241,8 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
     const root = (workbook_xml_mod.findTagOpen(xml, 0, "styleSheet") catch return error.MalformedStylesXml) orelse
         return error.MalformedStylesXml;
     if (root.self_closing) return error.MalformedStylesXml;
-    const root_close = (findClosingTagAware(xml, root.after_tag_close, "</styleSheet>")) orelse
-        return error.MalformedStylesXml;
+    const root_close = (findCloseTagLoose(xml, root.after_tag_close, "styleSheet") orelse
+        return error.MalformedStylesXml).lt;
 
     var layout: StylesLayout = .{
         .root = root,
@@ -13215,11 +13258,12 @@ fn scanStylesPart(xml: []const u8) Error!StylesLayout {
             if (hit.open_lt >= root_close) break :blk;
             var b: StylesTableBlock = .{ .open = hit, .close_lt = null, .end = hit.after_tag_close, .children = 0 };
             if (!hit.self_closing) {
-                const close = findClosingTagAware(xml, hit.after_tag_close, t.closeTag()) orelse
+                const closing = findCloseTagLoose(xml, hit.after_tag_close, t.tag()) orelse
                     return error.MalformedStylesXml;
+                const close = closing.lt;
                 if (close >= root_close) return error.MalformedStylesXml;
                 b.close_lt = close;
-                b.end = close + t.closeTag().len;
+                b.end = closing.end;
                 if (t.child()) |child| {
                     var c = hit.after_tag_close;
                     while ((workbook_xml_mod.findTagOpen(xml, c, child) catch return error.MalformedStylesXml)) |ch| {
@@ -13988,7 +14032,7 @@ pub const Worksheet = struct {
     /// spliced XML only.
     ///
     /// Caller invariants: `appended_rows.items.len > 0`,
-    /// `deltas.count() == 0`, every `.string` payload appearing in
+    /// no staged cell work (`hasStagedCellWork()` false), every `.string` payload appearing in
     /// `appended_rows` is registered in `plan` (either as a new
     /// string or an existing-match entry).
     pub fn emitWithAppendsUsingPlan(
@@ -32311,18 +32355,21 @@ test "S3d slice 1: a styles part the extension cannot read refuses MalformedStyl
         try std.testing.expectError(error.MalformedStylesXml, (try wb.sheet(1)).setCellStyle("A1", 0));
         try std.testing.expect(!wb.styles_plan.hasWork());
         try std.testing.expect(wb.styles_base == null);
+        try std.testing.expect(wb.styles_part_resolved == null);
         try std.testing.expectEqual(@as(usize, 0), (try wb.sheet(1)).cell_styles.count());
         try std.testing.expect(!wb.hasUnsavedChanges());
     }
     // No id above the part's: the second format overflows (r2 A-OVF-201),
     // and an entity-spelled id is read as the number it is (r2 A-FMT-203).
     {
-        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_room.xlsx", "<styleSheet " ++ s3d1_ns ++ "><numFmts count=\"1\"><numFmt numFmtId=\"4294967294\" formatCode=\"0\"/></numFmts>" ++ xf ++ "</styleSheet>");
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_room.xlsx", "<styleSheet " ++ s3d1_ns ++ "><numFmts count=\"1\"><numFmt numFmtId=\"4294967293\" formatCode=\"0\"/></numFmts>" ++ xf ++ "</styleSheet>");
         defer a.free(path);
         var wb = try Workbook.open(a, io, path);
         defer wb.deinit();
-        try std.testing.expectEqual(@as(u32, 4294967295), try wb.internNumFmt("0.0"));
-        try std.testing.expectEqual(@as(u32, 4294967295), try wb.internNumFmt("0.0"));
+        try std.testing.expectEqual(@as(u32, 4294967294), try wb.internNumFmt("0.0"));
+        try std.testing.expectEqual(@as(u32, 4294967294), try wb.internNumFmt("0.0"));
+        // `maxInt(u32)` is never handed out: the walk could not read
+        // the part back (r5 B-FMT-501).
         try std.testing.expectError(error.MalformedStylesXml, wb.internNumFmt("0.00"));
         try std.testing.expectError(error.MalformedStylesXml, wb.addStyle(.{ .number_format = "0.00" }));
         try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
@@ -32675,6 +32722,35 @@ test "S3d slice 1 r3: the styles part is the workbook relationship's target — 
         const rels = try s3d1PartBytes(a, &re, "xl/_rels/workbook.xml.rels");
         defer a.free(rels);
         try std.testing.expect(std.mem.indexOf(u8, rels, "relationships/styles") == null);
+    }
+    // A `</Relationships>` inside a comment and whitespace in the real
+    // closing tag: the injector lands after the last relationship
+    // (r5 A-REL-501); `</fonts >` reads as the table's close (r5
+    // A-SCN-503).
+    {
+        const rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><!-- </Relationships> --><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships >";
+        const injected = try injectWorkbookRelationship(a, rels, styles_rel_type, "styles.xml");
+        defer a.free(injected);
+        try std.testing.expectEqualStrings(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><!-- </Relationships> --><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" ++
+                "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships >",
+            injected,
+        );
+        const empty = try injectWorkbookRelationship(a, "<Relationships></Relationships>", styles_rel_type, "styles.xml");
+        defer a.free(empty);
+        try std.testing.expect(std.mem.startsWith(u8, empty, "<Relationships><Relationship Id=\"rId1\""));
+        const path = try writeS3d1WithStyles(a, io, dir, "s3d1_r5_loose.xlsx", "<styleSheet " ++ s3d1_ns ++ " ><fonts count=\"1\"><font/></fonts ><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs></styleSheet >");
+        defer a.free(path);
+        var wb = try Workbook.open(a, io, path);
+        defer wb.deinit();
+        try std.testing.expectEqual(@as(u32, 1), try wb.addStyle(.{ .font_bold = true }));
+        try wb.save(io, out);
+        var re = try Workbook.open(a, io, out);
+        defer re.deinit();
+        const after = try s3d1PartBytes(a, &re, "xl/styles.xml");
+        defer a.free(after);
+        try std.testing.expect(std.mem.indexOf(u8, after, "<fonts count=\"2\"><font/><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills") != null);
+        try std.testing.expect(std.mem.endsWith(u8, after, "</cellStyles></styleSheet >"));
     }
     // A `count` decoy inside a sibling attribute, a padded numFmtId, a
     // comment inside an empty table.
