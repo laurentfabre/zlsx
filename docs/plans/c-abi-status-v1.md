@@ -3915,8 +3915,8 @@ one editor (pinned: 3, then 5 after a save that added two).
 
 **Not in this slice.** The per-sheet registrations (`Worksheet.set*`
 / `add*` — column widths, panes, merges, hyperlinks, comments, DV, CF)
-on an opened sheet: the same fresh-emit shape, dropped by `save` today
-(the matrix marks them `~`); `addDefinedName` → C + Py (it already
+on an opened sheet: the same fresh-emit shape, dropped by `save` until
+slice 2 (§26; the matrix marked them `~`); `addDefinedName` → C + Py (it already
 lands on an opened workbook); `deleteCell` → C + Py + CLI; a standalone
 mark-recalc; the CLI leg of the trio; dedup against the part's records.
 `sheet_state`'s dxf bound now reads the part's `<dxf>` records
@@ -3974,3 +3974,185 @@ style as staged cell work (in-house r1 A/B-TXN-101: a style-only sheet
 folded through a candidate kept its pre-swap view, and the next plain
 save re-emitted the sheet from it, dropping the style the fold wrote —
 measured, pinned on the mark-only arm with the sheet parsed before).
+
+## 26. S3d slice 2 — the per-sheet registrations on the editor handle (2026-09-27)
+
+Fifteen exports on the EDITOR handle, `zlsx_status_v1`, one macro
+(`ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS`), one probe
+(`_HAS_EDITOR_SHEET_ATTACHMENTS`), no release function, the
+`zlsx_diag_v1` for the refusals. The row's Zig surface is the fifteen
+`Worksheet.set*` / `add*` forwarders — the fresh writer's per-sheet
+registrations (`sheet_plan.SheetState`); what the slice made true first
+is that they land on an OPENED sheet: before it they reached
+`sheet_state` — `saveFreshEmit`'s input — and `Workbook.save` on an
+opened archive never read it (slice 1 marked the row `~`). Now the save
+renders every sheet's registrations INTO its existing part.
+
+| Export | Zig |
+|---|---|
+| `zlsx_editor_set_column_width(ed, sheet_idx, col_idx, width, diag, errbuf, len)` | `Worksheet.setColumnWidth` |
+| `zlsx_editor_set_row_height(ed, sheet_idx, row_idx, height, …)` | `Worksheet.setRowHeight` |
+| `zlsx_editor_freeze_panes(ed, sheet_idx, rows, cols, …)` — the checked form only | `Worksheet.freezePanes` |
+| `zlsx_editor_set_auto_filter(ed, sheet_idx, range, len, …)` | `Worksheet.setAutoFilter` |
+| `zlsx_editor_add_merged_cell(ed, sheet_idx, range, len, …)` | `Worksheet.addMergedCell` |
+| `zlsx_editor_add_hyperlink(ed, sheet_idx, range, len, url, len, …)` | `Worksheet.addHyperlink` |
+| `zlsx_editor_add_internal_hyperlink(ed, sheet_idx, range, len, location, len, …)` | `Worksheet.addInternalHyperlink` |
+| `zlsx_editor_add_comment(ed, sheet_idx, ref, len, author, len, text, len, …)` | `Worksheet.addComment` |
+| `zlsx_editor_add_data_validation_list(ed, sheet_idx, range, len, values, lens, count, …)` | `Worksheet.addDataValidationList` |
+| `zlsx_editor_add_data_validation_numeric(ed, sheet_idx, range, len, kind_code, op_code, f1, len, f2, len, …)` | `Editor.addDataValidationNumeric` → `Worksheet.addDataValidationRange` |
+| `zlsx_editor_add_data_validation_custom(ed, sheet_idx, range, len, formula, len, …)` | `Worksheet.addDataValidationCustom` |
+| `zlsx_editor_add_conditional_format_cell_is(ed, sheet_idx, range, len, op_code, f1, len, f2, len, dxf_id, …)` | `Worksheet.addConditionalFormatCellIs` |
+| `zlsx_editor_add_conditional_format_expression(ed, sheet_idx, range, len, formula, len, dxf_id, …)` | `Worksheet.addConditionalFormatExpression` |
+| `zlsx_editor_add_conditional_format_color_scale(ed, sheet_idx, range, len, low, has_mid, mid, high, …)` | `Worksheet.addConditionalFormatColorScale` |
+| `zlsx_editor_add_conditional_format_data_bar(ed, sheet_idx, range, len, color, …)` | `Worksheet.addConditionalFormatDataBar` |
+
+The argument shapes, codes (`ZLSX_DV_KIND_*`, `ZLSX_DV_OP_*` — a cellIs
+operator is a `ZLSX_DV_OP_*` code) and `-1` names are the writer
+exports' (`zlsx_sheet_writer_*`), with `sheet_idx` after the handle and
+the diag before errbuf. A NULL string pointer with a non-zero length is
+`-1 InvalidInput` (`bytesArg`, the slice-1 reading); `freeze_panes` has
+no clamping form (the writer's `zlsx_sheet_writer_freeze_panes` clamps
+silently — an editor-side registration that lands in a real part refuses
+instead). `Editor.addDataValidationNumeric` and
+`addConditionalFormatCellIs` take the writer's enums
+(`writer_types.DataValidationNumericKind` / `DataValidationOp` /
+`CfOperator`, the projection `projectCfOperator` shared).
+
+**What the save writes** (`pkg/sheet_splice.zig`; footnote ³¹ of the
+matrix is the reference list). `applySavePlans` phase 3 and the fold's
+phase 3 — AFTER the cell phases, so a row height lands on the `<row>`
+the delta emitter regenerated, never under it — call `applySheetStateInto(store, ws)`
+per sheet with work: the part read once (`readSheet`: the root, its
+direct children with the owned-name rule, the `<legacyDrawing>`'s id, the
+highest `cfRule` / `x14:cfRule` priority, whether the root declares
+`xmlns:r`), the sheet's rels read from the part's bytes (an `addPart`ed
+rels part is not in the cache — the image leg's lesson), the next free
+`rId{n}`; the external hyperlinks take consecutive ids from there; a
+comment finds the comments part through the sheet's comments
+relationship (extended — `extendComments`: authors matched by decoded
+text, records appended, tables created where absent) or creates
+`xl/comments{N}.xml` (`nextFreeNumber`, the fresh emitter, a Strict
+sheet's part respelled Strict) with its relationship; the VML through
+the `<legacyDrawing>`'s relationship (extended — `extendVml`: ids past
+the highest `_x0000_s{n}`, the `<o:idmap>` extended to the block, the
+shape type added when missing) or creates
+`xl/drawings/vmlDrawing{N}.vml` with the element and the relationship.
+Every byte is computed before the first install; the new parts are
+added first (a rels part the sheet lacks EMPTY), then the filled rels,
+the extended comments and VML and the sheet in ONE `replaceParts` — no
+consumer sees a relationship before its target, and a failure leaves
+only parts nothing names. Then `spliceSheet` collects one edit per element (an
+insertion at the slot or a replacement of the element's span; edits
+sorted by position, never overlapping) and applies them in one pass.
+The rules per element are the footnote's. A relationship target is
+spelled relative to the sheet's directory when the sheet sits under
+`xl/worksheets/` as spelled, absolute otherwise (the slice-1 r20 / r21
+rule). The parsed view is invalidated after the live install (the fold
+leaves the live view to the swap's rebuild, which counts a registration
+as folded work — the slice-1 r1 A-TXN-101 shape).
+
+**Statuses.** `0`. `-1`, a statement about the call: `InvalidInput`,
+`SheetIndexOutOfRange`, the registry's names (`InvalidColumnWidth`,
+`ColumnOutOfRange`, `InvalidRowHeight`, `RowOutOfRange`,
+`InvalidAutoFilterRange`, `InvalidMergeRange`, `InvalidHyperlinkRange`,
+`InvalidHyperlinkUrl`, `InvalidHyperlinkLocation`, `InvalidCommentRef`,
+`InvalidDataValidation`, `NullStringInDataValidation`, `UnknownDxfId` —
+the slice-1 bound; `InvalidXmlByte` since round 1), and the workbook's two: `MergeRangeOverlaps` (the
+parsed view's merges and the staged ones compared as rectangles; a
+merge the reader could not parse is the file's, not the call's) and
+`CommentRefTaken` (the comments part's refs and the staged ones compared
+as coordinates). `-2` with the name in the diag, plane NONE, judged at
+the sheet's FIRST registration — `ensureSpliceable` reads the part when
+the sheet holds no work yet — nothing staged, so a refused editor saves
+the passthrough (pinned on Zig, C and Python): `MalformedSheetXml`
+(no `<worksheet>` root, a self-closed one, an element that never
+closes, one of the nine owned elements — sheetViews, cols, sheetData,
+autoFilter, mergeCells, conditionalFormatting, dataValidations,
+hyperlinks, legacyDrawing — under a prefix or spelled inside an
+`mc:AlternateContent` block, a `<col>` record without a readable
+`min` / `max` (or `min` 0 or past `max`), a rule priority leaving no
+room for one more staged rule (judged at each rule registration, r4
+B-ORC-401) — the last two judged here since round 3 (B-ORC-301: a sheet
+admitted can always be saved; the save's own `MalformedSheetXml` is
+reserved for a part torn underneath its staged work through the
+public store)); `MalformedCommentsXml` / `MalformedVmlDrawing` /
+`MalformedSheetRels` at the first comment (`checkCommentSlot` reads
+both parts). `-3` `OutOfMemory` (the sweep: every allocation failure
+across open, eleven registrations on two sheets and `applySavePlans`
+leaks nothing).
+
+**Guards.** `Worksheet.hasStagedSheetWork` (`SheetState.hasWork`) and
+`hasStagedWork` (cell or sheet work): the structural-edit entry, the
+Editor's `sheetHasWorkbookDeltas` / `workbookHasAnyDeltas` (the row /
+column edits, `deleteSheet`, the embedding sweeps, the passthrough
+save) and `recalc_txn.buildViews` read `hasStagedWork`; `appendRows`
+(Workbook and Editor — `sheetHasWorkbookCellDeltas`), the pivot
+refresh marker and the fold's cell phases read `hasStagedCellWork`
+(a merge changes no cache content; appends and registrations coexist,
+the registrations landing after the appends). `hasUnsavedChanges`
+counts sheet work. `drainSavePlans` drains it at the swap;
+`applySavePlans` after phase 3.
+
+**Round 1** (in-house, A + B; ledger `codex_findings_s3d2_r1.md`).
+A-ORCH-101 / B-ORC-101 (HIGH): phase 3 installed a sheet's four parts
+through four calls and drained every sheet only after the loop, so a
+failure at a later sheet (a `<col>` without a readable `min` under a
+staged width, an allocation failure) left the earlier sheets rendered
+with their registrations still staged — the repaired save rendered
+them AGAIN (measured: a merge three times, a second VML part). Now the
+new parts are added first (an orphan a failure between two adds can
+leave is a part nothing names — never a duplicate), every replaced
+part lands in ONE `replaceParts`, and the sheet's registrations are
+drained the moment its parts are in the live store; pinned with a
+second-sheet refusal + repair and a once-failing-allocator sweep
+(the workbook's AND the store's allocator) retried at every failure
+point. Round 2 (A-ORCH-201 / B-ORC-201): a rels part the sheet lacked
+was added FILLED before the replacement, naming the new comments part
+— a failure in the replacement let the retry find that part through
+the relationship and extend it twice; the rels part is added empty
+now, the filled one joins the replacement. B-ORC-102 (MEDIUM): a C0 control byte
+in a registration string was judged at the save (`InvalidXmlByte`
+from the escaper), leaving a handle that could not save and could not
+un-stage — now judged at the registration on every text (`xmlText`,
+the registry's `assertNoForbiddenXmlBytes`), nothing staged, pinned on
+Zig, C and Python. B-ORC-106 (MEDIUM, stated): a staged internal
+hyperlink `location`, validation or rule formula naming ANOTHER sheet
+that `renameSheet`, `deleteSheet` or a row / column edit on that sheet
+moves is neither rewritten nor refused — the pre-existing rule for a staged
+`setCell` formula; stated on every surface (save first). A-SPL-102
+(LOW): `stagedColSpans` skipped the span that slid into a removed
+slot (reachable through the public `column_widths` only) — rebuilt
+per registration. A-SPL-103 (LOW): the AlternateContent body scan
+read a comment / CDATA spelling an owned name as a mention — walks
+real markup now. B-ORC-103 (LOW): a self-closed `<Relationships/>`
+root is opened. B-VML-104 (LOW): shape ids counted at every depth (a
+`v:group`'s). A-DOC-104 / B-DOC-105: the lowercase `ref` a comments
+part spells is never matched by `CommentRefTaken` (the registry's
+refs are uppercase); `<hyperlinks>` has no schema `count` (one spelled
+is left); `freezePanes(0, 0)` reads the part and clears a staged
+freeze; the smoke anchor's prototype line.
+
+**Round 2** (in-house, A + B; ledger `codex_findings_s3d2_r2.md`): the
+one MEDIUM above (the empty rels part) and the install-order sentence.
+**Round 3** (converged: A zero findings, B two LOWs; ledger
+`codex_findings_s3d2_r3.md`): B-ORC-301 — the two save-time shapes
+judged at the first registration (above); B-DOC-301 — the slice-1
+record's "stay `~`" sentences respelled, `InvalidXmlByte` in the -1 list.
+
+**Round 4** (confirmation; ledger `codex_findings_s3d2_r4.md`): B-ORC-401
+— the priority room counts the staged rules at each rule registration
+(`ensurePriorityRoom`), pinned; B-DOC-401 — the round-3 shapes on the
+Python docstring and README.
+
+**Not in this slice** (owner follow-ups): the CLI leg; `addDefinedName`
+/ `deleteCell` → C + Py; rich-text comments; a registration that
+removes or edits an element the sheet holds (an existing merge, a
+hyperlink's URL); judging a hyperlink / validation / rule over a cell
+one already covers (the writer's rule, kept); a `_xlnm._FilterDatabase`
+name naming a replaced auto-filter's range (left as written); a
+`<selection>` naming a pane the new split lacks (left); a `<row>`
+without a readable `r` (neither matched nor an anchor); the delta
+emitter's row-attribute drop — a row height registered on a sheet with
+a staged cell write lands on the regenerated `<row>` (phase order), but
+the row's OTHER attributes are still dropped by the emitter (the
+slice-1 record).

@@ -166,7 +166,7 @@ zlsx_book_close(book);
 
 Link the released library from any tarball — `cc app.c -Iinclude -Llib
 -lzlsx`. The row reader and the fresh writer are exported nearly one-for-one,
-plus the editor (append rows, `set_cell`, `add_style` / `set_cell_style`, the structural edits — rows,
+plus the editor (append rows, `set_cell`, `add_style` / `set_cell_style`, the per-sheet attachments — widths, heights, panes, auto-filter, merges, hyperlinks, comments, DV, CF — on an opened sheet, the structural edits — rows,
 columns, sheets, table columns — with their typed refusals, the `pivots`
 read, save, docProps read/strip, recalc / evaluate) — what each surface
 has and lacks, per entry point, is

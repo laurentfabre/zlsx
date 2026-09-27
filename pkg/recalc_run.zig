@@ -3689,3 +3689,78 @@ test "S3d slice 1: a style alone on a sheet a mark-only candidate does not patch
     try testing.expectEqual(@as(?u32, idx), (try (try re.sheet(0)).cellByRef("A1")).?.style_idx);
     try testing.expectEqualStrings("7", (try (try re.sheet(0)).cellByRef("C1")).?.raw_value.?);
 }
+
+test "S3d slice 2: saveWithRecalc carries the per-sheet registrations on both arms — the merge, the comment part and its VML, the hyperlink's relationship in the file; byte-identical to recalculate then save; drained at the swap; the live view rebuilt over the folded part" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(a, io, &tmp);
+    defer a.free(dir);
+    const out = try std.fs.path.join(a, &.{ dir, "out.xlsx" });
+    defer a.free(out);
+    const ordered = try std.fs.path.join(a, &.{ dir, "ordered.xlsx" });
+    defer a.free(ordered);
+
+    for ([_][]const u8{ sheet_stale, sheet_no_formula }) |sheet| {
+        const stale = sheet.ptr == sheet_stale.ptr;
+        const path = try writeFixture(a, io, dir, "in.xlsx", .{ .sheet = sheet });
+        defer a.free(path);
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            const ws = try wb.sheet(0);
+            _ = try ws.ensureParsed();
+            try ws.addMergedCell("C1:D1");
+            try ws.addComment("A1", "me", "note");
+            try ws.addHyperlink("B1", "https://example.com/");
+            try ws.setRowHeight(0, 24);
+            try ws.setCell("C1", .{ .number = 7 });
+            var r = try wb.saveWithRecalc(a, io, out, fixed_run, .{});
+            r.deinit(a);
+            try testing.expect(!wb.hasStagedSheetWork());
+            try testing.expectEqual(@as(usize, 0), ws.deltas.count());
+            // The live view follows the folded part.
+            try testing.expectEqual(@as(usize, 1), (try ws.ensureParsed()).merges.len);
+            try testing.expectEqual(@as(usize, 1), (try ws.hyperlinks()).len);
+            try testing.expectEqualStrings(if (stale) "2" else "999", try cellCache(ws, "B1"));
+            try testing.expectError(error.RecalcRequiresReopen, wb.markRecalcOnLoad());
+        }
+        {
+            var reopened = try Workbook.open(a, io, out);
+            defer reopened.deinit();
+            const sheet_bytes = ((try reopened.store.part("xl/worksheets/sheet1.xml")) orelse return error.TestUnexpectedResult).bytes;
+            try testing.expect(std.mem.indexOf(u8, sheet_bytes, "<row r=\"1\" ht=\"24\" customHeight=\"1\">") != null);
+            try testing.expect(std.mem.indexOf(u8, sheet_bytes, "<mergeCells count=\"1\"><mergeCell ref=\"C1:D1\"/></mergeCells>") != null);
+            try testing.expect(std.mem.indexOf(u8, sheet_bytes, "<hyperlinks><hyperlink ref=\"B1\" r:id=\"rId1\"") != null);
+            try testing.expect(std.mem.indexOf(u8, sheet_bytes, "<legacyDrawing r:id=\"rId3\"") != null);
+            try testing.expect(reopened.store.hasPart("xl/comments1.xml"));
+            try testing.expect(reopened.store.hasPart("xl/drawings/vmlDrawing1.vml"));
+            try testing.expect(reopened.store.hasPart("xl/worksheets/_rels/sheet1.xml.rels"));
+            try testing.expectEqualStrings("7", try cellCache(try reopened.sheet(0), "C1"));
+        }
+        {
+            var wb = try Workbook.open(a, io, path);
+            defer wb.deinit();
+            const ws = try wb.sheet(0);
+            try ws.addMergedCell("C1:D1");
+            try ws.addComment("A1", "me", "note");
+            try ws.addHyperlink("B1", "https://example.com/");
+            try ws.setRowHeight(0, 24);
+            try ws.setCell("C1", .{ .number = 7 });
+            var r = try wb.recalculate(a, io, fixed_run, .{});
+            r.deinit(a);
+            // The in-memory transaction leaves the registrations staged.
+            try testing.expect(wb.hasStagedSheetWork());
+            try wb.save(io, ordered);
+        }
+        const folded = try readAll(a, io, out);
+        defer a.free(folded);
+        const by_order = try readAll(a, io, ordered);
+        defer a.free(by_order);
+        try testing.expectEqualSlices(u8, by_order, folded);
+    }
+}

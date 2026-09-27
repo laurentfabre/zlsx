@@ -110,7 +110,9 @@ fn deflateCompressErased(
 /// Writer-side `CfOperator` enum is a separate (identical-shape) type
 /// from `sheet_plan.CfOperator` and the public `addConditionalFormatCellIs`
 /// signature still takes the Writer-local enum.
-inline fn projectCfOperator(op: CfOperator) sheet_plan.CfOperator {
+/// The writer's operator as the registry spells it — shared with the
+/// editor's forwarders (S3d slice 2), which take the writer's enum.
+pub inline fn projectCfOperator(op: CfOperator) sheet_plan.CfOperator {
     return switch (op) {
         .less_than => .less_than,
         .less_than_or_equal => .less_than_or_equal,
@@ -830,7 +832,7 @@ pub const DataValidationOp = enum {
     greater_than_or_equal,
     less_than_or_equal,
 
-    fn toOoxml(self: DataValidationOp) []const u8 {
+    pub fn toOoxml(self: DataValidationOp) []const u8 {
         return switch (self) {
             .between => "between",
             .not_between => "notBetween",
@@ -843,7 +845,7 @@ pub const DataValidationOp = enum {
         };
     }
 
-    fn needsSecondFormula(self: DataValidationOp) bool {
+    pub fn needsSecondFormula(self: DataValidationOp) bool {
         return self == .between or self == .not_between;
     }
 };
@@ -858,7 +860,7 @@ pub const DataValidationNumericKind = enum {
     time,
     text_length,
 
-    fn toOoxml(self: DataValidationNumericKind) []const u8 {
+    pub fn toOoxml(self: DataValidationNumericKind) []const u8 {
         return switch (self) {
             .whole => "whole",
             .decimal => "decimal",

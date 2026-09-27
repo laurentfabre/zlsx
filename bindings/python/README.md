@@ -512,9 +512,68 @@ the relationship's target is a part the package holds that is no stylesheet — 
 the part absent, an entry under `xl/styles.xml/` so no part may be created at the
 conventional name) raises
 `ZlsxRefusal` `MalformedStylesXml` at the first registration — nothing
-staged, the editor still saves the passthrough. The per-sheet layout
-registrations (column widths, panes, merges, hyperlinks, comments, DV / CF)
-on an opened sheet are the next S3d slice.
+staged, the editor still saves the passthrough.
+
+## Per-sheet attachments on an existing workbook
+
+libzlsx 0.9.0+ exports the fresh writer's per-sheet registrations on an
+*opened* sheet (S3d slice 2): `Editor.set_column_width` / `set_row_height` /
+`freeze_panes` / `set_auto_filter` / `add_merged_cell` / `add_hyperlink` /
+`add_internal_hyperlink` / `add_comment` / `add_data_validation_list` /
+`add_data_validation_numeric` / `add_data_validation_custom` /
+`add_conditional_format_cell_is` / `add_conditional_format_expression` /
+`add_conditional_format_color_scale` / `add_conditional_format_data_bar` — the
+`SheetWriter` methods with `sheet_idx` first. Each lands in the existing sheet
+part at save: the element extended in place where the sheet holds it (a merge,
+a validation or a hyperlink appended after the records, a `count` rewritten
+where the table spells one; a `<col>` record covering the column split around
+it, its other attributes kept; a held `<row>` given `ht` + `customHeight`; the
+first `<sheetView>`'s `<pane>` replaced; the `<autoFilter>` replaced whole,
+its filter columns and sort state with it; a rule appended after the last
+`<conditionalFormatting>` with a priority past the sheet's highest), created
+at its schema slot where not; the sheet's relationships, its comments part
+(a known author keeps its id) and its VML drawing extended or created with it —
+every other byte of every part preserved.
+
+```python
+with zlsx.edit("report.xlsx") as ed:
+    ed.set_column_width(0, 0, 28)                  # sheet 0, column A
+    ed.freeze_panes(0, rows=1)
+    ed.set_auto_filter(0, "A1:F1")
+    ed.add_merged_cell(0, "A10:F10")
+    ed.add_hyperlink(0, "F1", "https://example.com/spec")
+    ed.add_comment(0, "B2", "audit", "checked 2026-09-27")
+    ed.add_data_validation_list(0, "C2:C99", ["open", "closed"])
+    bold = ed.add_dxf(Dxf(font_bold=True))
+    ed.add_conditional_format_cell_is(0, "D2:D99", "greater_than", "100", None, bold)
+    ed.save("report-annotated.xlsx")
+```
+
+A merge over a cell the sheet's merges (or a staged merge) already cover
+raises `ZlsxError` `MergeRangeOverlaps`, a second comment on a cell
+`CommentRefTaken` — both judged before anything is staged; a hyperlink, a
+validation or a rule over a cell one already covers is not judged (the
+writer's rule). The first registration on a sheet reads its part: one the
+splice cannot extend in place (no `<worksheet>` root, a self-closed one, an
+element that never closes, one of the elements the splice writes under a
+prefix or inside an `mc:AlternateContent` block, a `<col>` record without a
+readable `min` / `max`, a rule priority leaving no room for the staged rules)
+raises `ZlsxRefusal`
+`MalformedSheetXml`; the first comment reads the comments part and the VML
+drawing the sheet names (`MalformedCommentsXml` / `MalformedVmlDrawing` /
+`MalformedSheetRels`) — nothing staged, the editor still saves the
+passthrough. A staged registration is a staged cell write to the structural
+edits (`RowEditRequiresCleanSheet` / `ColEditRequiresCleanSheet`),
+`delete_sheet` (`SheetDeleteRequiresCleanState`) and the embedding sweeps —
+its refs are pre-shift — and rides beside `append_rows`; `save`,
+`save_to_buffer` and `save_with_recalc` carry it and drain it. A C0 control
+byte (other than tab, LF, CR) in any registered text is `ZlsxError`
+`InvalidXmlByte` at the registration, nothing staged. A staged internal
+hyperlink `location` or a validation / rule formula naming *another* sheet is
+neither rewritten nor refused by a later `rename_sheet`, `delete_sheet` or row /
+column edit on that sheet (the rule for a staged `set_cell` formula — save first). Not
+carried: rich-text comments; removing or editing an element the sheet already
+holds.
 
 ## Embeddings
 
@@ -839,6 +898,11 @@ with zlsx.write("out.xlsx") as w:
 - Styles on an existing workbook (0.9.0+): `Editor.add_style` / `add_dxf` /
   `intern_num_fmt` return the slot in the saved `xl/styles.xml`,
   `Editor.set_cell_style` puts it on a cell — see *Styles on an existing workbook*
+- Per-sheet attachments on an existing workbook (0.9.0+): `Editor.set_column_width`
+  / `set_row_height` / `freeze_panes` / `set_auto_filter` / `add_merged_cell` /
+  `add_hyperlink` / `add_internal_hyperlink` / `add_comment` /
+  `add_data_validation_*` / `add_conditional_format_*` land in the existing
+  sheet part — see *Per-sheet attachments on an existing workbook*
 - Pivot tables, typed read (0.9.0+): `Editor.pivots()` / `zlsx.pivots(path)`
   — the `zlsx pivots` records as dicts
 - Defined names, typed read (0.9.0+): `Editor.defined_names()` /

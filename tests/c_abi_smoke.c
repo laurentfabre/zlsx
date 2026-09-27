@@ -80,6 +80,9 @@
 #if !defined(ZLSX_HAS_EDITOR_STYLES)
 #error "ZLSX_HAS_EDITOR_STYLES missing"
 #endif
+#if !defined(ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS)
+#error "ZLSX_HAS_EDITOR_SHEET_ATTACHMENTS missing"
+#endif
 
 #define ZLSX_STATIC_ASSERT(cond, name) typedef char name[(cond) ? 1 : -1]
 
@@ -236,3 +239,23 @@ static const void *const s3d1_exports[] = {
 };
 const void *zlsx_c_abi_smoke_anchor_s3d1(void);
 const void *zlsx_c_abi_smoke_anchor_s3d1(void) { return s3d1_exports[0]; }
+
+static const void *const s3d2_exports[] = {
+    (const void *)&zlsx_editor_set_column_width,
+    (const void *)&zlsx_editor_set_row_height,
+    (const void *)&zlsx_editor_freeze_panes,
+    (const void *)&zlsx_editor_set_auto_filter,
+    (const void *)&zlsx_editor_add_merged_cell,
+    (const void *)&zlsx_editor_add_hyperlink,
+    (const void *)&zlsx_editor_add_internal_hyperlink,
+    (const void *)&zlsx_editor_add_comment,
+    (const void *)&zlsx_editor_add_data_validation_list,
+    (const void *)&zlsx_editor_add_data_validation_numeric,
+    (const void *)&zlsx_editor_add_data_validation_custom,
+    (const void *)&zlsx_editor_add_conditional_format_cell_is,
+    (const void *)&zlsx_editor_add_conditional_format_expression,
+    (const void *)&zlsx_editor_add_conditional_format_color_scale,
+    (const void *)&zlsx_editor_add_conditional_format_data_bar,
+};
+const void *zlsx_c_abi_smoke_anchor_s3d2(void);
+const void *zlsx_c_abi_smoke_anchor_s3d2(void) { return s3d2_exports[0]; }

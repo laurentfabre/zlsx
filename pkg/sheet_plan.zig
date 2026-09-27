@@ -251,6 +251,18 @@ pub const SheetState = struct {
     data_validations: std.ArrayListUnmanaged(DataValidationListOwned) = .empty,
     data_validation_ranges: std.ArrayListUnmanaged(DataValidationRangeOwned) = .empty,
 
+    /// Whether anything is registered: what a save renders (S3d slice
+    /// 2) and what `hasUnsavedChanges` counts. A `freezePanes(0, 0)`
+    /// registers nothing — the fresh emitter's rule.
+    pub fn hasWork(self: *const SheetState) bool {
+        return self.column_widths.items.len > 0 or self.row_heights.count() > 0 or
+            self.freeze_rows != 0 or self.freeze_cols != 0 or self.auto_filter_range != null or
+            self.merged_cells.items.len > 0 or self.hyperlinks.items.len > 0 or
+            self.internal_hyperlinks.items.len > 0 or self.comments.items.len > 0 or
+            self.conditional_formats.items.len > 0 or self.data_validations.items.len > 0 or
+            self.data_validation_ranges.items.len > 0;
+    }
+
     pub fn deinit(self: *SheetState, allocator: Allocator) void {
         self.column_widths.deinit(allocator);
         self.row_heights.deinit(allocator);
@@ -750,31 +762,14 @@ pub fn emitWorksheetXml(
     // <sheetViews> — emitted when any pane is frozen.
     if (inputs.freeze_rows != 0 or inputs.freeze_cols != 0) {
         try out.appendSlice(allocator, "<sheetViews><sheetView workbookViewId=\"0\">");
-        try out.appendSlice(allocator, "<pane");
-        if (inputs.freeze_cols != 0) try out.print(allocator, " xSplit=\"{d}\"", .{inputs.freeze_cols});
-        if (inputs.freeze_rows != 0) try out.print(allocator, " ySplit=\"{d}\"", .{inputs.freeze_rows});
-        var tl_buf: [16]u8 = undefined;
-        const top_left = try formatCellRef(&tl_buf, inputs.freeze_rows + 1, inputs.freeze_cols);
-        const active_pane: []const u8 = if (inputs.freeze_rows != 0 and inputs.freeze_cols != 0)
-            "bottomRight"
-        else if (inputs.freeze_rows != 0)
-            "bottomLeft"
-        else
-            "topRight";
-        try out.print(allocator, " topLeftCell=\"{s}\" activePane=\"{s}\" state=\"frozen\"/>", .{ top_left, active_pane });
+        try emitPaneElement(allocator, out, inputs.freeze_rows, inputs.freeze_cols);
         try out.appendSlice(allocator, "</sheetView></sheetViews>");
     }
 
     // <cols> — one <col> per registered width override.
     if (inputs.column_widths.len > 0) {
         try out.appendSlice(allocator, "<cols>");
-        for (inputs.column_widths) |cw| {
-            try out.print(
-                allocator,
-                "<col min=\"{d}\" max=\"{d}\" width=\"{d}\" customWidth=\"1\"/>",
-                .{ cw.col_min, cw.col_max, cw.width },
-            );
-        }
+        try emitColElements(allocator, out, inputs.column_widths);
         try out.appendSlice(allocator, "</cols>");
     }
 
@@ -784,9 +779,7 @@ pub fn emitWorksheetXml(
 
     // <autoFilter> must come after </sheetData>.
     if (inputs.auto_filter_range) |range| {
-        try out.appendSlice(allocator, "<autoFilter ref=\"");
-        try appendXmlEscaped(allocator, out, range);
-        try out.appendSlice(allocator, "\"/>");
+        try emitAutoFilterElement(allocator, out, range);
     }
 
     // <mergeCells> follows <autoFilter> per ECMA-376 CT_Worksheet
@@ -794,17 +787,104 @@ pub fn emitWorksheetXml(
     // xml-escape them on emit anyway.
     if (inputs.merged_cells.len > 0) {
         try out.print(allocator, "<mergeCells count=\"{d}\">", .{inputs.merged_cells.len});
-        for (inputs.merged_cells) |range| {
-            try out.appendSlice(allocator, "<mergeCell ref=\"");
-            try appendXmlEscaped(allocator, out, range);
-            try out.appendSlice(allocator, "\"/>");
-        }
+        try emitMergeCellElements(allocator, out, inputs.merged_cells);
         try out.appendSlice(allocator, "</mergeCells>");
     }
 
     // <conditionalFormatting> — one block per rule. Priority increments
     // per rule so overlapping ranges produce a deterministic cascade.
-    for (inputs.conditional_formats, 1..) |cf, cf_priority| {
+    try emitConditionalFormattingBlocks(allocator, out, inputs.conditional_formats, 0);
+
+    // <dataValidations> — list entries first (iter13 ordering), then
+    // numeric / custom range entries.
+    const dv_list_count = inputs.data_validations.len;
+    const dv_range_count = inputs.data_validation_ranges.len;
+    if (dv_list_count + dv_range_count > 0) {
+        try out.print(allocator, "<dataValidations count=\"{d}\">", .{dv_list_count + dv_range_count});
+        try emitDataValidationElements(allocator, out, inputs.data_validations, inputs.data_validation_ranges);
+        try out.appendSlice(allocator, "</dataValidations>");
+    }
+
+    // <hyperlinks> — external entries (rIds) FIRST, then internal
+    // (`location="…"`); r:id numbering matches the per-sheet rels.
+    if (inputs.hyperlinks.len > 0 or inputs.internal_hyperlinks.len > 0) {
+        try out.appendSlice(allocator, "<hyperlinks>");
+        try emitHyperlinkElements(allocator, out, inputs.hyperlinks, inputs.internal_hyperlinks, 1, null);
+        try out.appendSlice(allocator, "</hyperlinks>");
+    }
+
+    // <legacyDrawing> when comments present. rId scheme: 1..N
+    // external hyperlinks, N+1 = comments part, N+2 = vmlDrawing.
+    if (inputs.comment_count > 0) {
+        const vml_rid = inputs.hyperlinks.len + 2;
+        try emitLegacyDrawingElement(allocator, out, @intCast(vml_rid), null);
+    }
+
+    try out.appendSlice(allocator, "</worksheet>");
+}
+
+// ─── The worksheet's element writers ──────────────────────────────────
+//
+// `emitWorksheetXml` composes the fresh part from these; the splice
+// that lands the same registrations in an OPENED sheet part
+// (`pkg/sheet_splice.zig`, S3d slice 2) writes each element with the
+// same writer, so a merge or a rule is spelled once. The fresh part is
+// byte-identical to the pre-split emitter (its parity pins hold).
+
+/// `<pane …/>` for a frozen split. `freeze_rows` / `freeze_cols` are
+/// the counts above / left of the split, at least one non-zero.
+pub fn emitPaneElement(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), freeze_rows: u32, freeze_cols: u32) Error!void {
+    try out.appendSlice(allocator, "<pane");
+    if (freeze_cols != 0) try out.print(allocator, " xSplit=\"{d}\"", .{freeze_cols});
+    if (freeze_rows != 0) try out.print(allocator, " ySplit=\"{d}\"", .{freeze_rows});
+    var tl_buf: [16]u8 = undefined;
+    const top_left = try formatCellRef(&tl_buf, freeze_rows + 1, freeze_cols);
+    const active_pane: []const u8 = if (freeze_rows != 0 and freeze_cols != 0)
+        "bottomRight"
+    else if (freeze_rows != 0)
+        "bottomLeft"
+    else
+        "topRight";
+    try out.print(allocator, " topLeftCell=\"{s}\" activePane=\"{s}\" state=\"frozen\"/>", .{ top_left, active_pane });
+}
+
+/// One `<col …/>` per width override.
+pub fn emitColElements(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), column_widths: []const ColumnWidth) Error!void {
+    for (column_widths) |cw| {
+        try out.print(
+            allocator,
+            "<col min=\"{d}\" max=\"{d}\" width=\"{d}\" customWidth=\"1\"/>",
+            .{ cw.col_min, cw.col_max, cw.width },
+        );
+    }
+}
+
+pub fn emitAutoFilterElement(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), range: []const u8) Error!void {
+    try out.appendSlice(allocator, "<autoFilter ref=\"");
+    try appendXmlEscaped(allocator, out, range);
+    try out.appendSlice(allocator, "\"/>");
+}
+
+pub fn emitMergeCellElements(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), merged_cells: []const []const u8) Error!void {
+    for (merged_cells) |range| {
+        try out.appendSlice(allocator, "<mergeCell ref=\"");
+        try appendXmlEscaped(allocator, out, range);
+        try out.appendSlice(allocator, "\"/>");
+    }
+}
+
+/// One `<conditionalFormatting>` block per rule, priorities
+/// `priority_base + 1` upward — `0` on the fresh part, the highest
+/// priority the sheet already spells on an opened one, so a staged
+/// rule never ties an existing one.
+pub fn emitConditionalFormattingBlocks(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    conditional_formats: []const ConditionalFormat,
+    priority_base: u32,
+) Error!void {
+    for (conditional_formats, 1..) |cf, k| {
+        const cf_priority: u64 = @as(u64, priority_base) + k;
         try out.appendSlice(allocator, "<conditionalFormatting sqref=\"");
         try appendXmlEscaped(allocator, out, cf.range);
         try out.appendSlice(allocator, "\">");
@@ -868,72 +948,81 @@ pub fn emitWorksheetXml(
         }
         try out.appendSlice(allocator, "</conditionalFormatting>");
     }
+}
 
-    // <dataValidations> — list entries first (iter13 ordering), then
-    // numeric / custom range entries.
-    const dv_list_count = inputs.data_validations.len;
-    const dv_range_count = inputs.data_validation_ranges.len;
-    if (dv_list_count + dv_range_count > 0) {
-        try out.print(allocator, "<dataValidations count=\"{d}\">", .{dv_list_count + dv_range_count});
-        for (inputs.data_validations) |dv| {
-            try out.appendSlice(allocator, "<dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
-            try appendXmlEscaped(allocator, out, dv.range);
-            try out.appendSlice(allocator, "\"><formula1>&quot;");
-            for (dv.values, 0..) |v, vi| {
-                if (vi != 0) try out.append(allocator, ',');
-                try appendXmlEscaped(allocator, out, v);
-            }
-            try out.appendSlice(allocator, "&quot;</formula1></dataValidation>");
+/// The `<dataValidation>` records: list entries first, then the
+/// numeric / custom range entries.
+pub fn emitDataValidationElements(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    data_validations: []const DataValidationList,
+    data_validation_ranges: []const DataValidationRange,
+) Error!void {
+    for (data_validations) |dv| {
+        try out.appendSlice(allocator, "<dataValidation type=\"list\" allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
+        try appendXmlEscaped(allocator, out, dv.range);
+        try out.appendSlice(allocator, "\"><formula1>&quot;");
+        for (dv.values, 0..) |v, vi| {
+            if (vi != 0) try out.append(allocator, ',');
+            try appendXmlEscaped(allocator, out, v);
         }
-        for (inputs.data_validation_ranges) |dv| {
-            try out.appendSlice(allocator, "<dataValidation type=\"");
-            try out.appendSlice(allocator, dv.kind_name);
-            try out.appendSlice(allocator, "\"");
-            if (dv.op_name) |op| {
-                try out.print(allocator, " operator=\"{s}\"", .{op});
-            }
-            try out.appendSlice(allocator, " allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
-            try appendXmlEscaped(allocator, out, dv.range);
-            try out.appendSlice(allocator, "\"><formula1>");
-            try appendXmlEscaped(allocator, out, dv.formula1);
-            try out.appendSlice(allocator, "</formula1>");
-            if (dv.formula2) |f2| {
-                try out.appendSlice(allocator, "<formula2>");
-                try appendXmlEscaped(allocator, out, f2);
-                try out.appendSlice(allocator, "</formula2>");
-            }
-            try out.appendSlice(allocator, "</dataValidation>");
-        }
-        try out.appendSlice(allocator, "</dataValidations>");
+        try out.appendSlice(allocator, "&quot;</formula1></dataValidation>");
     }
-
-    // <hyperlinks> — external entries (rIds) FIRST, then internal
-    // (`location="…"`); r:id numbering matches the per-sheet rels.
-    if (inputs.hyperlinks.len > 0 or inputs.internal_hyperlinks.len > 0) {
-        try out.appendSlice(allocator, "<hyperlinks>");
-        for (inputs.hyperlinks, 0..) |h, idx| {
-            try out.appendSlice(allocator, "<hyperlink ref=\"");
-            try appendXmlEscaped(allocator, out, h.range);
-            try out.print(allocator, "\" r:id=\"rId{d}\"/>", .{idx + 1});
+    for (data_validation_ranges) |dv| {
+        try out.appendSlice(allocator, "<dataValidation type=\"");
+        try out.appendSlice(allocator, dv.kind_name);
+        try out.appendSlice(allocator, "\"");
+        if (dv.op_name) |op| {
+            try out.print(allocator, " operator=\"{s}\"", .{op});
         }
-        for (inputs.internal_hyperlinks) |h| {
-            try out.appendSlice(allocator, "<hyperlink ref=\"");
-            try appendXmlEscaped(allocator, out, h.range);
-            try out.appendSlice(allocator, "\" location=\"");
-            try appendXmlEscaped(allocator, out, h.location);
-            try out.appendSlice(allocator, "\"/>");
+        try out.appendSlice(allocator, " allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"");
+        try appendXmlEscaped(allocator, out, dv.range);
+        try out.appendSlice(allocator, "\"><formula1>");
+        try appendXmlEscaped(allocator, out, dv.formula1);
+        try out.appendSlice(allocator, "</formula1>");
+        if (dv.formula2) |f2| {
+            try out.appendSlice(allocator, "<formula2>");
+            try appendXmlEscaped(allocator, out, f2);
+            try out.appendSlice(allocator, "</formula2>");
         }
-        try out.appendSlice(allocator, "</hyperlinks>");
+        try out.appendSlice(allocator, "</dataValidation>");
     }
+}
 
-    // <legacyDrawing> when comments present. rId scheme: 1..N
-    // external hyperlinks, N+1 = comments part, N+2 = vmlDrawing.
-    if (inputs.comment_count > 0) {
-        const vml_rid = inputs.hyperlinks.len + 2;
-        try out.print(allocator, "<legacyDrawing r:id=\"rId{d}\"/>", .{vml_rid});
+/// The `<hyperlink>` records: external ones first, `r:id="rId{n}"`
+/// from `rid_base` upward (1 on the fresh part, the sheet's next free
+/// id on an opened one), then the internal ones with `location`.
+/// `ns_r` non-null declares the `r` prefix on each external element —
+/// for a sheet root that does not declare it.
+pub fn emitHyperlinkElements(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    hyperlinks: []const Hyperlink,
+    internal_hyperlinks: []const InternalHyperlink,
+    rid_base: u32,
+    ns_r: ?[]const u8,
+) Error!void {
+    for (hyperlinks, 0..) |h, idx| {
+        try out.appendSlice(allocator, "<hyperlink ref=\"");
+        try appendXmlEscaped(allocator, out, h.range);
+        try out.print(allocator, "\" r:id=\"rId{d}\"", .{@as(u64, rid_base) + idx});
+        if (ns_r) |uri| try out.print(allocator, " xmlns:r=\"{s}\"", .{uri});
+        try out.appendSlice(allocator, "/>");
     }
+    for (internal_hyperlinks) |h| {
+        try out.appendSlice(allocator, "<hyperlink ref=\"");
+        try appendXmlEscaped(allocator, out, h.range);
+        try out.appendSlice(allocator, "\" location=\"");
+        try appendXmlEscaped(allocator, out, h.location);
+        try out.appendSlice(allocator, "\"/>");
+    }
+}
 
-    try out.appendSlice(allocator, "</worksheet>");
+/// `<legacyDrawing r:id="rId{n}"/>`; `ns_r` as on `emitHyperlinkElements`.
+pub fn emitLegacyDrawingElement(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), rid: u32, ns_r: ?[]const u8) Error!void {
+    try out.print(allocator, "<legacyDrawing r:id=\"rId{d}\"", .{rid});
+    if (ns_r) |uri| try out.print(allocator, " xmlns:r=\"{s}\"", .{uri});
+    try out.appendSlice(allocator, "/>");
 }
 
 // ─── Per-sheet `xl/worksheets/_rels/sheetN.xml.rels` emitter ──────────
@@ -1015,17 +1104,28 @@ pub fn emitCommentsXml(
     try out.appendSlice(allocator, "<comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
     try out.appendSlice(allocator, "<authors>");
     for (authors.items) |a| {
-        try out.appendSlice(allocator, "<author>");
-        try appendXmlEscaped(allocator, out, a);
-        try out.appendSlice(allocator, "</author>");
+        try emitAuthorElement(allocator, out, a);
     }
     try out.appendSlice(allocator, "</authors><commentList>");
     for (comments, author_ids.items) |c, aid| {
-        try out.print(allocator, "<comment ref=\"{s}\" authorId=\"{d}\"><text><t xml:space=\"preserve\">", .{ c.ref, aid });
-        try appendXmlEscaped(allocator, out, c.text);
-        try out.appendSlice(allocator, "</t></text></comment>");
+        try emitCommentElement(allocator, out, c.ref, aid, c.text);
     }
     try out.appendSlice(allocator, "</commentList></comments>");
+}
+
+/// One `<comment>` record: a plain-text body, no `<r>` wrapper (the
+/// rule `emitCommentsXml` states). `author_id` indexes `<authors>`.
+pub fn emitCommentElement(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), ref: []const u8, author_id: usize, text: []const u8) Error!void {
+    try out.print(allocator, "<comment ref=\"{s}\" authorId=\"{d}\"><text><t xml:space=\"preserve\">", .{ ref, author_id });
+    try appendXmlEscaped(allocator, out, text);
+    try out.appendSlice(allocator, "</t></text></comment>");
+}
+
+/// One `<author>` record.
+pub fn emitAuthorElement(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), author: []const u8) Error!void {
+    try out.appendSlice(allocator, "<author>");
+    try appendXmlEscaped(allocator, out, author);
+    try out.appendSlice(allocator, "</author>");
 }
 
 // ─── `xl/drawings/vmlDrawingN.vml` emitter ────────────────────────────
@@ -1055,26 +1155,34 @@ pub fn emitVmlDrawingXml(
         try out.print(allocator, "{d}", .{k + 1});
     }
     try out.appendSlice(allocator, "\"/></o:shapelayout>");
-    try out.appendSlice(
-        allocator,
-        \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
-        ,
-    );
+    try out.appendSlice(allocator, VML_NOTE_SHAPETYPE);
     for (comments, 0..) |c, shape_idx| {
-        const rc = try parseA1Corner(c.ref);
-        const row0 = rc.row - 1;
-        const col0 = rc.col - 1;
-        const from_col = @min(col0 + 1, EXCEL_MAX_COL - 1);
-        const from_row = @min(row0, EXCEL_MAX_ROW - 1);
-        const to_col = @min(col0 + 3, EXCEL_MAX_COL - 1);
-        const to_row = @min(row0 + 4, EXCEL_MAX_ROW - 1);
-        try out.print(
-            allocator,
-            "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{d}, 15, {d}, 2, {d}, 31, {d}, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
-            .{ 1025 + shape_idx, shape_idx + 1, from_col, from_row, to_col, to_row, row0, col0 },
-        );
+        try emitVmlNoteShape(allocator, out, c.ref, 1025 + shape_idx, shape_idx + 1);
     }
     try out.appendSlice(allocator, "</xml>");
+}
+
+/// The note shape type every `<v:shape>` below references.
+pub const VML_NOTE_SHAPETYPE: []const u8 =
+    \\<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>
+;
+
+/// One note shape anchored beside `ref`. `shape_id` spells
+/// `_x0000_s{shape_id}` (1025 upward on a fresh part; past the highest
+/// the part holds on an extended one), `z_index` the stacking order.
+pub fn emitVmlNoteShape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), ref: []const u8, shape_id: u64, z_index: u64) Error!void {
+    const rc = try parseA1Corner(ref);
+    const row0 = rc.row - 1;
+    const col0 = rc.col - 1;
+    const from_col = @min(col0 + 1, EXCEL_MAX_COL - 1);
+    const from_row = @min(row0, EXCEL_MAX_ROW - 1);
+    const to_col = @min(col0 + 3, EXCEL_MAX_COL - 1);
+    const to_row = @min(row0 + 4, EXCEL_MAX_ROW - 1);
+    try out.print(
+        allocator,
+        "<v:shape id=\"_x0000_s{d}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:60pt;margin-top:10pt;width:100pt;height:60pt;z-index:{d};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\"><v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/><v:textbox><div style=\"text-align:left\"/></v:textbox><x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{d}, 15, {d}, 2, {d}, 31, {d}, 3</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{d}</x:Row><x:Column>{d}</x:Column></x:ClientData></v:shape>",
+        .{ shape_id, z_index, from_col, from_row, to_col, to_row, row0, col0 },
+    );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
