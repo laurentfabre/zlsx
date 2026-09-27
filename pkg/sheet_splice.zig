@@ -452,6 +452,28 @@ pub fn readSheet(a: Allocator, xml: []const u8) Error!SheetFacts {
         rid = try store_mod.decodeXmlEntities(a, raw);
     }
 
+    // The two verdicts the splice would otherwise give at the SAVE —
+    // a `<col>` record without a readable `min` / `max` (or `min` 0 or
+    // past `max`), a rule priority at the ceiling — are judged here, at
+    // the first registration, so a sheet admitted can always be saved
+    // (in-house r3 B-ORC-301).
+    if (childNamed(list, "cols")) |cols| {
+        if (!cols.self_closing) {
+            const inner = children(a, xml, cols.open_end, cols.close_lt) catch |e| switch (e) {
+                error.Malformed => return error.MalformedSheetXml,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            defer a.free(inner);
+            for (inner) |el| {
+                if (!std.mem.eql(u8, el.name, "col")) continue;
+                const attrs = el.attrs(xml);
+                const min = parseU32Attr(attrs, "min") orelse return error.MalformedSheetXml;
+                const max = parseU32Attr(attrs, "max") orelse return error.MalformedSheetXml;
+                if (min > max or min == 0) return error.MalformedSheetXml;
+            }
+        }
+    }
+
     var max_priority: u32 = 0;
     inline for (.{ "cfRule", "x14:cfRule" }) |tag| {
         var cursor: usize = 0;
@@ -462,6 +484,8 @@ pub fn readSheet(a: Allocator, xml: []const u8) Error!SheetFacts {
             cursor = hit.after_tag_close;
         }
     }
+
+    if (max_priority == std.math.maxInt(u32)) return error.MalformedSheetXml;
 
     return .{
         .legacy_drawing_rid = rid,
@@ -1405,6 +1429,10 @@ test "S3d slice 2: the walk refuses what it cannot extend in place — no worksh
     for (refused) |src| {
         try t.expectError(error.MalformedSheetXml, readSheet(a, src));
     }
+    // The save-time shapes, judged at the read (r3 B-ORC-301).
+    try t.expectError(error.MalformedSheetXml, readSheet(a, "<worksheet " ++ ws_ns ++ "><cols><col max=\"2\" width=\"9\"/></cols><sheetData/></worksheet>"));
+    try t.expectError(error.MalformedSheetXml, readSheet(a, "<worksheet " ++ ws_ns ++ "><cols><col min=\"3\" max=\"2\"/></cols><sheetData/></worksheet>"));
+    try t.expectError(error.MalformedSheetXml, readSheet(a, "<worksheet " ++ ws_ns ++ "><sheetData/><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"4294967295\"/></conditionalFormatting></worksheet>"));
     // An AlternateContent holding nothing of ours, a comment spelling a
     // close tag and a CDATA spelling an open one: readable, and the
     // merge lands after the real mergeCells.

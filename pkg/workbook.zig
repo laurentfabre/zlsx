@@ -35291,8 +35291,10 @@ test "S3d slice 2 r1: a later sheet's failure at the save leaves the earlier she
         defer wb.deinit();
         const s = try wb.sheet(0);
         const t = try wb.sheet(1);
-        // Sheet T's part is readable at the registration but its `<cols>`
-        // record has no readable `min` — the save refuses at T, after S.
+        // Sheet T's part is torn UNDERNEATH its staged width (the store
+        // is public): a `<cols>` record without a readable `min`, which
+        // the first registration would have refused (r3 B-ORC-301) —
+        // the save refuses at T, after S.
         try t.setColumnWidth(0, 9);
         try wb.store.replacePart("xl/worksheets/sheet2.xml", "<worksheet " ++ s3d1_ns ++ "><cols><col max=\"2\" width=\"9\"/></cols><sheetData/></worksheet>");
         try s.addMergedCell("C5:D5");

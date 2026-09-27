@@ -3915,8 +3915,8 @@ one editor (pinned: 3, then 5 after a save that added two).
 
 **Not in this slice.** The per-sheet registrations (`Worksheet.set*`
 / `add*` — column widths, panes, merges, hyperlinks, comments, DV, CF)
-on an opened sheet: the same fresh-emit shape, dropped by `save` today
-(the matrix marks them `~`); `addDefinedName` → C + Py (it already
+on an opened sheet: the same fresh-emit shape, dropped by `save` until
+slice 2 (§26; the matrix marked them `~`); `addDefinedName` → C + Py (it already
 lands on an opened workbook); `deleteCell` → C + Py + CLI; a standalone
 mark-recalc; the CLI leg of the trio; dedup against the part's records.
 `sheet_state`'s dxf bound now reads the part's `<dxf>` records
@@ -4057,7 +4057,7 @@ as folded work — the slice-1 r1 A-TXN-101 shape).
 `InvalidAutoFilterRange`, `InvalidMergeRange`, `InvalidHyperlinkRange`,
 `InvalidHyperlinkUrl`, `InvalidHyperlinkLocation`, `InvalidCommentRef`,
 `InvalidDataValidation`, `NullStringInDataValidation`, `UnknownDxfId` —
-the slice-1 bound), and the workbook's two: `MergeRangeOverlaps` (the
+the slice-1 bound; `InvalidXmlByte` since round 1), and the workbook's two: `MergeRangeOverlaps` (the
 parsed view's merges and the staged ones compared as rectangles; a
 merge the reader could not parse is the file's, not the call's) and
 `CommentRefTaken` (the comments part's refs and the staged ones compared
@@ -4069,9 +4069,12 @@ the passthrough (pinned on Zig, C and Python): `MalformedSheetXml`
 closes, one of the nine owned elements — sheetViews, cols, sheetData,
 autoFilter, mergeCells, conditionalFormatting, dataValidations,
 hyperlinks, legacyDrawing — under a prefix or spelled inside an
-`mc:AlternateContent` block; a `<col>` without a readable `min` / `max`
-under a staged width and a priority leaving no room are judged at the
-save); `MalformedCommentsXml` / `MalformedVmlDrawing` /
+`mc:AlternateContent` block, a `<col>` record without a readable
+`min` / `max` (or `min` 0 or past `max`), a rule priority at the
+ceiling — the last two judged here since round 3 (B-ORC-301: a sheet
+admitted can always be saved; the save's own `MalformedSheetXml` is
+reserved for a part torn underneath its staged work through the
+public store)); `MalformedCommentsXml` / `MalformedVmlDrawing` /
 `MalformedSheetRels` at the first comment (`checkCommentSlot` reads
 both parts). `-3` `OutOfMemory` (the sweep: every allocation failure
 across open, eleven registrations on two sheets and `applySavePlans`
@@ -4127,6 +4130,13 @@ part spells is never matched by `CommentRefTaken` (the registry's
 refs are uppercase); `<hyperlinks>` has no schema `count` (one spelled
 is left); `freezePanes(0, 0)` reads the part and clears a staged
 freeze; the smoke anchor's prototype line.
+
+**Round 2** (in-house, A + B; ledger `codex_findings_s3d2_r2.md`): the
+one MEDIUM above (the empty rels part) and the install-order sentence.
+**Round 3** (converged: A zero findings, B two LOWs; ledger
+`codex_findings_s3d2_r3.md`): B-ORC-301 — the two save-time shapes
+judged at the first registration (above); B-DOC-301 — the slice-1
+record's "stay `~`" sentences respelled, `InvalidXmlByte` in the -1 list.
 
 **Not in this slice** (owner follow-ups): the CLI leg; `addDefinedName`
 / `deleteCell` → C + Py; rich-text comments; a registration that
