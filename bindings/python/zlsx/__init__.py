@@ -5634,8 +5634,10 @@ class Editor:
         splice cannot extend in place raises :class:`ZlsxRefusal`
         ``MalformedSheetXml`` (no ``<worksheet>`` root, a self-closed one,
         an element that never closes, one of the elements the splice
-        writes under a prefix or inside an ``mc:AlternateContent`` block),
-        nothing staged, so a refused editor still saves the passthrough.
+        writes under a prefix or inside an ``mc:AlternateContent`` block,
+        a ``<col>`` record without a readable ``min`` / ``max``, a rule
+        priority leaving no room for the staged rules), nothing staged,
+        so a refused editor still saves the passthrough.
         Every other byte of the part is preserved. A staged registration
         is a staged cell write to the structural edits
         (``RowEditRequiresCleanSheet`` / ``ColEditRequiresCleanSheet``),

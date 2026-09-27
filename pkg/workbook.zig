@@ -14626,6 +14626,20 @@ pub const Worksheet = struct {
         try self.sheet_state.addDataValidationCustom(self.workbook.allocator, range, formula);
     }
 
+    /// A rule needs a priority past the sheet's highest and past every
+    /// staged rule's: a part whose priorities leave no room for one
+    /// more refuses here, so a sheet admitted can always be saved
+    /// (in-house r4 B-ORC-401: the ceiling alone was judged at the
+    /// first registration, the room at the save).
+    fn ensurePriorityRoom(self: *Worksheet) RegistrationError!void {
+        const part_name = try self.resolvePartName();
+        const part = (try self.workbook.store.part(part_name)) orelse return Error.MissingSheetPart;
+        var facts = sheet_splice.readSheet(self.workbook.allocator, part.bytes) catch |e| return Workbook.spliceVerdict(e);
+        defer facts.deinit(self.workbook.allocator);
+        const staged = self.sheet_state.conditional_formats.items.len;
+        if (facts.cf_priority_max > std.math.maxInt(u32) - staged - 1) return Error.MalformedSheetXml;
+    }
+
     pub fn addConditionalFormatCellIs(
         self: *Worksheet,
         range: []const u8,
@@ -14635,6 +14649,7 @@ pub const Worksheet = struct {
         dxf_id: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try self.ensurePriorityRoom();
         try xmlText(range);
         try xmlText(formula1);
         if (formula2) |f| try xmlText(f);
@@ -14656,6 +14671,7 @@ pub const Worksheet = struct {
         dxf_id: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try self.ensurePriorityRoom();
         try xmlText(range);
         try xmlText(formula);
         try self.sheet_state.addConditionalFormatExpression(
@@ -14675,6 +14691,7 @@ pub const Worksheet = struct {
         high_color_argb: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try self.ensurePriorityRoom();
         try xmlText(range);
         try self.sheet_state.addConditionalFormatColorScale(
             self.workbook.allocator,
@@ -14687,6 +14704,7 @@ pub const Worksheet = struct {
 
     pub fn addConditionalFormatDataBar(self: *Worksheet, range: []const u8, color_argb: u32) RegistrationError!void {
         try self.ensureSpliceable();
+        try self.ensurePriorityRoom();
         try xmlText(range);
         try self.sheet_state.addConditionalFormatDataBar(self.workbook.allocator, range, color_argb);
     }
@@ -35402,5 +35420,22 @@ test "S3d slice 2 r1: a later sheet's failure at the save leaves the earlier she
         try std.testing.expect(!s.hasStagedSheetWork());
         try s.addComment("D9", "tab\tok", "lf\nok");
         try wb.applySavePlans();
+    }
+    // The priority room counts the staged rules (r4 B-ORC-401): a part
+    // two below the ceiling admits two rules and refuses the third,
+    // and the save never refuses.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        try wb.store.replacePart("xl/worksheets/sheet2.xml", "<worksheet " ++ s3d1_ns ++ "><sheetData/><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"4294967293\"><formula>1</formula></cfRule></conditionalFormatting></worksheet>");
+        const t = try wb.sheet(1);
+        try t.addConditionalFormatDataBar("A1:A2", 0xFF0000FF);
+        try t.addConditionalFormatDataBar("B1:B2", 0xFF0000FF);
+        try std.testing.expectError(error.MalformedSheetXml, t.addConditionalFormatDataBar("C1:C2", 0xFF0000FF));
+        try std.testing.expectEqual(@as(usize, 2), t.sheet_state.conditional_formats.items.len);
+        try wb.applySavePlans();
+        const sheet2 = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet2.xml");
+        defer a.free(sheet2);
+        try std.testing.expect(std.mem.indexOf(u8, sheet2, "priority=\"4294967295\"") != null);
     }
 }

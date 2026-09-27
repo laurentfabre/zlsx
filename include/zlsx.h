@@ -2776,8 +2776,8 @@ int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
  * splice writes — sheetViews, cols, sheetData, autoFilter, mergeCells,
  * conditionalFormatting, dataValidations, hyperlinks, legacyDrawing —
  * under a prefix or inside an mc:AlternateContent block, a <col>
- * record without a readable min / max, a cfRule priority at the
- * ceiling), MalformedCommentsXml / MalformedVmlDrawing
+ * record without a readable min / max, a cfRule priority leaving no
+ * room for the staged rules — judged at each rule registration), MalformedCommentsXml / MalformedVmlDrawing
  * / MalformedSheetRels (a comments part, a VML drawing or a sheet
  * relationship the first comment on the sheet cannot follow — the
  * relationship's target names no part of the package); -3 OutOfMemory.

@@ -556,7 +556,9 @@ validation or a rule over a cell one already covers is not judged (the
 writer's rule). The first registration on a sheet reads its part: one the
 splice cannot extend in place (no `<worksheet>` root, a self-closed one, an
 element that never closes, one of the elements the splice writes under a
-prefix or inside an `mc:AlternateContent` block) raises `ZlsxRefusal`
+prefix or inside an `mc:AlternateContent` block, a `<col>` record without a
+readable `min` / `max`, a rule priority leaving no room for the staged rules)
+raises `ZlsxRefusal`
 `MalformedSheetXml`; the first comment reads the comments part and the VML
 drawing the sheet names (`MalformedCommentsXml` / `MalformedVmlDrawing` /
 `MalformedSheetRels`) — nothing staged, the editor still saves the

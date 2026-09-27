@@ -4070,8 +4070,9 @@ closes, one of the nine owned elements — sheetViews, cols, sheetData,
 autoFilter, mergeCells, conditionalFormatting, dataValidations,
 hyperlinks, legacyDrawing — under a prefix or spelled inside an
 `mc:AlternateContent` block, a `<col>` record without a readable
-`min` / `max` (or `min` 0 or past `max`), a rule priority at the
-ceiling — the last two judged here since round 3 (B-ORC-301: a sheet
+`min` / `max` (or `min` 0 or past `max`), a rule priority leaving no
+room for one more staged rule (judged at each rule registration, r4
+B-ORC-401) — the last two judged here since round 3 (B-ORC-301: a sheet
 admitted can always be saved; the save's own `MalformedSheetXml` is
 reserved for a part torn underneath its staged work through the
 public store)); `MalformedCommentsXml` / `MalformedVmlDrawing` /
@@ -4137,6 +4138,11 @@ one MEDIUM above (the empty rels part) and the install-order sentence.
 `codex_findings_s3d2_r3.md`): B-ORC-301 — the two save-time shapes
 judged at the first registration (above); B-DOC-301 — the slice-1
 record's "stay `~`" sentences respelled, `InvalidXmlByte` in the -1 list.
+
+**Round 4** (confirmation; ledger `codex_findings_s3d2_r4.md`): B-ORC-401
+— the priority room counts the staged rules at each rule registration
+(`ensurePriorityRoom`), pinned; B-DOC-401 — the round-3 shapes on the
+Python docstring and README.
 
 **Not in this slice** (owner follow-ups): the CLI leg; `addDefinedName`
 / `deleteCell` → C + Py; rich-text comments; a registration that
