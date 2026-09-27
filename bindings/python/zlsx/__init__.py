@@ -5646,8 +5646,9 @@ class Editor:
         byte (other than tab, LF, CR) in any registered text is
         ``ZlsxError`` ``InvalidXmlByte`` at the registration, nothing
         staged. A staged ``location`` or formula naming *another* sheet
-        is neither rewritten nor refused by a later :meth:`rename_sheet`
-        or row / column edit on that sheet — save first."""
+        is neither rewritten nor refused by a later :meth:`rename_sheet`,
+        :meth:`delete_sheet` or row / column edit on that sheet — save
+        first."""
         self._sheet_attachments_available()
         p, n, keep = self._text_arg("range_str", range_str)
         try:

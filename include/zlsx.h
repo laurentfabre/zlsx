@@ -2798,8 +2798,8 @@ int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
  * <row> without a readable `r` (neither matched nor an anchor); a
  * comments part's lowercase `ref` (never matched by CommentRefTaken);
  * a staged internal hyperlink `location`, validation or rule formula
- * naming ANOTHER sheet that a later rename_sheet / row or column edit
- * on that sheet moves (the staged string is neither rewritten nor
+ * naming ANOTHER sheet that a later rename_sheet / delete_sheet / row
+ * or column edit on that sheet moves (the staged string is neither rewritten nor
  * refused — the rule for a staged set_cell formula; save first). A
  * comment's author and text, a hyperlink's URL, a validation's values
  * and every formula are XML-escaped on emit; a C0 control byte other

@@ -2216,10 +2216,13 @@ pub const Workbook = struct {
     /// drawing (the one `<legacyDrawing>` names extended, else
     /// `xl/drawings/vmlDrawing{N}.vml` created with the element). Every
     /// byte is computed before the first install; the new parts are
-    /// added first and every replaced part lands in one `replaceParts`,
-    /// so a failure leaves at worst a part nothing names (an orphan the
-    /// next save does not duplicate), and the sheet's registrations
-    /// are drained the moment its parts are in the live store.
+    /// added first (a rels part the sheet lacks EMPTY — the filled one
+    /// names the new parts) and every replaced part — the filled rels,
+    /// the extended comments and VML, the sheet — lands in one
+    /// `replaceParts`, so a failure leaves at worst parts nothing
+    /// names (orphans the next save does not duplicate: it creates
+    /// fresh ones), and the sheet's registrations are drained the
+    /// moment its parts are in the live store.
     fn applySheetStateInto(self: *Workbook, store: *PartStore, ws: *Worksheet) Error!void {
         const a = self.allocator;
         const st = &ws.sheet_state;
@@ -2337,8 +2340,17 @@ pub const Workbook = struct {
         if (vml_xml) |bytes| {
             if (vml_created) try store.addPart(vml_name.?, vml_content_type, bytes);
         }
-        if (new_rels) |bytes| {
-            if (rels_part == null) try store.addPart(rels_name, rels_content_type, bytes);
+        // A rels part the sheet lacks is added EMPTY: the filled one
+        // names the new parts and joins the atomic replacement below,
+        // so a failure there leaves parts nothing names (in-house r2
+        // A-ORCH-201 / B-ORC-201: the filled part added here let the
+        // retry find the comments part through its relationship and
+        // extend it a second time).
+        var empty_rels: ?[]u8 = null;
+        defer if (empty_rels) |x| a.free(x);
+        if (new_rels != null and rels_part == null) {
+            empty_rels = sheet_splice.appendRelationships(a, null, &.{}) catch |e| return spliceVerdict(e);
+            try store.addPart(rels_name, rels_content_type, empty_rels.?);
         }
         var replacements: [4]PartStore.Replacement = undefined;
         var n_repl: usize = 0;
@@ -2355,10 +2367,8 @@ pub const Workbook = struct {
             }
         }
         if (new_rels) |bytes| {
-            if (rels_part != null) {
-                replacements[n_repl] = .{ .name = rels_name, .bytes = bytes };
-                n_repl += 1;
-            }
+            replacements[n_repl] = .{ .name = rels_name, .bytes = bytes };
+            n_repl += 1;
         }
         replacements[n_repl] = .{ .name = part_name, .bytes = new_sheet };
         n_repl += 1;
@@ -35326,9 +35336,12 @@ test "S3d slice 2 r1: a later sheet's failure at the save leaves the earlier she
             // The failing allocator drives the save's own allocations
             // only: swap it in for the phase, back for the retry.
             const real = wb.allocator;
+            const real_store = wb.store.allocator;
             wb.allocator = failing.allocator();
+            wb.store.allocator = failing.allocator();
             const first = wb.applySavePlans();
             wb.allocator = real;
+            wb.store.allocator = real_store;
             if (first) |_| {
                 try std.testing.expect(!failing.has_induced_failure);
                 break;
@@ -35358,9 +35371,16 @@ test "S3d slice 2 r1: a later sheet's failure at the save leaves the earlier she
             const rels2 = try s3d1PartBytes(a, &wb, "xl/worksheets/_rels/sheet2.xml.rels");
             defer a.free(rels2);
             try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rels2, "<Relationship "));
-            // An orphan a failure between two adds can leave is a part
-            // nothing names; the reader ignores it.
-            try std.testing.expect(!wb.store.hasPart("xl/comments4.xml"));
+            // An orphan a failure between the adds and the replacement
+            // can leave is a part nothing names; the retry creates
+            // fresh ones past it and the reader ignores it — but no
+            // comments part ever holds a comment twice.
+            for ([_][]const u8{ "xl/comments1.xml", "xl/comments2.xml", "xl/comments3.xml", "xl/comments4.xml" }) |name| {
+                if (try wb.store.part(name)) |p| {
+                    try std.testing.expect(std.mem.count(u8, p.bytes, "<comment ref=\"B3\"") <= 1);
+                    try std.testing.expect(std.mem.count(u8, p.bytes, "<comment ref=\"A1\"") <= 1);
+                }
+            }
         }
     }
     // A control byte in any text is refused at the registration.

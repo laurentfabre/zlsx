@@ -4037,9 +4037,11 @@ the `<legacyDrawing>`'s relationship (extended — `extendVml`: ids past
 the highest `_x0000_s{n}`, the `<o:idmap>` extended to the block, the
 shape type added when missing) or creates
 `xl/drawings/vmlDrawing{N}.vml` with the element and the relationship.
-Every byte is computed before the first install; the installs run
-comments, VML, rels, sheet last — no consumer sees a relationship before
-its target. Then `spliceSheet` collects one edit per element (an
+Every byte is computed before the first install; the new parts are
+added first (a rels part the sheet lacks EMPTY), then the filled rels,
+the extended comments and VML and the sheet in ONE `replaceParts` — no
+consumer sees a relationship before its target, and a failure leaves
+only parts nothing names. Then `spliceSheet` collects one edit per element (an
 insertion at the slot or a replacement of the element's span; edits
 sorted by position, never overlapping) and applies them in one pass.
 The rules per element are the footnote's. A relationship target is
@@ -4099,15 +4101,20 @@ leave is a part nothing names — never a duplicate), every replaced
 part lands in ONE `replaceParts`, and the sheet's registrations are
 drained the moment its parts are in the live store; pinned with a
 second-sheet refusal + repair and a once-failing-allocator sweep
-retried at every failure point. B-ORC-102 (MEDIUM): a C0 control byte
+(the workbook's AND the store's allocator) retried at every failure
+point. Round 2 (A-ORCH-201 / B-ORC-201): a rels part the sheet lacked
+was added FILLED before the replacement, naming the new comments part
+— a failure in the replacement let the retry find that part through
+the relationship and extend it twice; the rels part is added empty
+now, the filled one joins the replacement. B-ORC-102 (MEDIUM): a C0 control byte
 in a registration string was judged at the save (`InvalidXmlByte`
 from the escaper), leaving a handle that could not save and could not
 un-stage — now judged at the registration on every text (`xmlText`,
 the registry's `assertNoForbiddenXmlBytes`), nothing staged, pinned on
 Zig, C and Python. B-ORC-106 (MEDIUM, stated): a staged internal
 hyperlink `location`, validation or rule formula naming ANOTHER sheet
-that `renameSheet` or a row / column edit on that sheet moves is
-neither rewritten nor refused — the pre-existing rule for a staged
+that `renameSheet`, `deleteSheet` or a row / column edit on that sheet
+moves is neither rewritten nor refused — the pre-existing rule for a staged
 `setCell` formula; stated on every surface (save first). A-SPL-102
 (LOW): `stagedColSpans` skipped the span that slid into a removed
 slot (reachable through the public `column_widths` only) — rebuilt

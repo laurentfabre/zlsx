@@ -568,8 +568,8 @@ its refs are pre-shift — and rides beside `append_rows`; `save`,
 byte (other than tab, LF, CR) in any registered text is `ZlsxError`
 `InvalidXmlByte` at the registration, nothing staged. A staged internal
 hyperlink `location` or a validation / rule formula naming *another* sheet is
-neither rewritten nor refused by a later `rename_sheet` or row / column edit
-on that sheet (the rule for a staged `set_cell` formula — save first). Not
+neither rewritten nor refused by a later `rename_sheet`, `delete_sheet` or row /
+column edit on that sheet (the rule for a staged `set_cell` formula — save first). Not
 carried: rich-text comments; removing or editing an element the sheet already
 holds.
 
