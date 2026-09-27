@@ -12508,6 +12508,11 @@ test "S3d slice 2 editor attachments: statements about the call are -1 with the 
     try expectCase(zlsx_editor_add_data_validation_numeric(ed, 0, "A9", 2, ZLSX_DV_KIND_WHOLE, ZLSX_DV_OP_BETWEEN, "1", 1, null, 0, &diag, &err_buf, err_buf.len), "InvalidDataValidation", &err_buf, &diag);
     try expectCase(zlsx_editor_add_conditional_format_cell_is(ed, 0, "A9", 2, ZLSX_DV_OP_EQUAL, "1", 1, null, 0, 7, &diag, &err_buf, err_buf.len), "UnknownDxfId", &err_buf, &diag);
     try expectCase(zlsx_editor_add_conditional_format_data_bar(ed, 0, "9A", 2, 0, &diag, &err_buf, err_buf.len), "InvalidHyperlinkRange", &err_buf, &diag);
+    // A control byte is judged at the registration, never at the save
+    // (in-house r1 B-ORC-102).
+    try expectCase(zlsx_editor_add_comment(ed, 0, "D9", 2, "b\x01d", 3, "t", 1, &diag, &err_buf, err_buf.len), "InvalidXmlByte", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_hyperlink(ed, 0, "D9", 2, "https://x/\x02", 11, &diag, &err_buf, err_buf.len), "InvalidXmlByte", &err_buf, &diag);
+    try expectCase(zlsx_editor_add_data_validation_custom(ed, 0, "D9", 2, "D9>\x01", 4, &diag, &err_buf, err_buf.len), "InvalidXmlByte", &err_buf, &diag);
     try std.testing.expect(!s3d2Staged(ed));
     try std.testing.expectEqual(@as(i32, 0), zlsx_editor_save(ed, out.ptr, out.len, &err_buf, err_buf.len));
     try expectSameBytes(io, path, out);

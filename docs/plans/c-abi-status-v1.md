@@ -4087,6 +4087,40 @@ the registrations landing after the appends). `hasUnsavedChanges`
 counts sheet work. `drainSavePlans` drains it at the swap;
 `applySavePlans` after phase 3.
 
+**Round 1** (in-house, A + B; ledger `codex_findings_s3d2_r1.md`).
+A-ORCH-101 / B-ORC-101 (HIGH): phase 3 installed a sheet's four parts
+through four calls and drained every sheet only after the loop, so a
+failure at a later sheet (a `<col>` without a readable `min` under a
+staged width, an allocation failure) left the earlier sheets rendered
+with their registrations still staged — the repaired save rendered
+them AGAIN (measured: a merge three times, a second VML part). Now the
+new parts are added first (an orphan a failure between two adds can
+leave is a part nothing names — never a duplicate), every replaced
+part lands in ONE `replaceParts`, and the sheet's registrations are
+drained the moment its parts are in the live store; pinned with a
+second-sheet refusal + repair and a once-failing-allocator sweep
+retried at every failure point. B-ORC-102 (MEDIUM): a C0 control byte
+in a registration string was judged at the save (`InvalidXmlByte`
+from the escaper), leaving a handle that could not save and could not
+un-stage — now judged at the registration on every text (`xmlText`,
+the registry's `assertNoForbiddenXmlBytes`), nothing staged, pinned on
+Zig, C and Python. B-ORC-106 (MEDIUM, stated): a staged internal
+hyperlink `location`, validation or rule formula naming ANOTHER sheet
+that `renameSheet` or a row / column edit on that sheet moves is
+neither rewritten nor refused — the pre-existing rule for a staged
+`setCell` formula; stated on every surface (save first). A-SPL-102
+(LOW): `stagedColSpans` skipped the span that slid into a removed
+slot (reachable through the public `column_widths` only) — rebuilt
+per registration. A-SPL-103 (LOW): the AlternateContent body scan
+read a comment / CDATA spelling an owned name as a mention — walks
+real markup now. B-ORC-103 (LOW): a self-closed `<Relationships/>`
+root is opened. B-VML-104 (LOW): shape ids counted at every depth (a
+`v:group`'s). A-DOC-104 / B-DOC-105: the lowercase `ref` a comments
+part spells is never matched by `CommentRefTaken` (the registry's
+refs are uppercase); `<hyperlinks>` has no schema `count` (one spelled
+is left); `freezePanes(0, 0)` reads the part and clears a staged
+freeze; the smoke anchor's prototype line.
+
 **Not in this slice** (owner follow-ups): the CLI leg; `addDefinedName`
 / `deleteCell` → C + Py; rich-text comments; a registration that
 removes or edits an element the sheet holds (an existing merge, a

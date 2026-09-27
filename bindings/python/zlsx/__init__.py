@@ -5585,7 +5585,8 @@ class Editor:
         of ``sheet_idx``. At save the ``<pane>`` of the sheet's first
         ``<sheetView>`` is replaced (a ``<selection>`` naming a pane the
         new split lacks is left), or created — the view and the views
-        with it. Both 0 registers nothing. The checked form: ``rows``
+        with it. Both 0 registers nothing (and clears a freeze staged
+        earlier). The checked form: ``rows``
         past 1048575 / ``cols`` past 16383 raise :class:`ZlsxError`
         ``RowOutOfRange`` / ``ColumnOutOfRange``, never clamped."""
         self._sheet_attachments_available()
@@ -5641,7 +5642,12 @@ class Editor:
         :meth:`delete_sheet` (``SheetDeleteRequiresCleanState``) and the
         embedding sweeps — its refs are pre-shift; it rides beside
         :meth:`append_rows`; :meth:`save`, :meth:`save_to_buffer` and
-        :meth:`save_with_recalc` carry it, and drain it."""
+        :meth:`save_with_recalc` carry it, and drain it. A C0 control
+        byte (other than tab, LF, CR) in any registered text is
+        ``ZlsxError`` ``InvalidXmlByte`` at the registration, nothing
+        staged. A staged ``location`` or formula naming *another* sheet
+        is neither rewritten nor refused by a later :meth:`rename_sheet`
+        or row / column edit on that sheet — save first."""
         self._sheet_attachments_available()
         p, n, keep = self._text_arg("range_str", range_str)
         try:

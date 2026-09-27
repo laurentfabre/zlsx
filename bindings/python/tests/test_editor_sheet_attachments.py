@@ -166,6 +166,13 @@ def test_statements_about_the_call_stage_nothing_and_the_save_is_the_passthrough
             ed.add_conditional_format_cell_is(0, "A9", "equal", "1", None, 7)
         with pytest.raises(zlsx.ZlsxError, match="InvalidHyperlinkRange"):
             ed.add_conditional_format_data_bar(0, "9A", 0)
+        # A control byte is judged at the registration, never at the save.
+        with pytest.raises(zlsx.ZlsxError, match="InvalidXmlByte"):
+            ed.add_comment(0, "D9", "b\x01d", "t")
+        with pytest.raises(zlsx.ZlsxError, match="InvalidXmlByte"):
+            ed.add_hyperlink(0, "D9", "https://x/\x02")
+        with pytest.raises(zlsx.ZlsxError, match="InvalidXmlByte"):
+            ed.add_data_validation_list(0, "D9", ["a\x1f"])
         with pytest.raises(ValueError):
             ed.add_merged_cell(2**32, "A1:B1")
         with pytest.raises(TypeError):

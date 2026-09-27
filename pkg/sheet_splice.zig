@@ -223,7 +223,14 @@ fn isOwnedLocal(name: []const u8) bool {
 /// element — the test a `mc:AlternateContent` child is put to.
 fn bodyMentionsOwned(body: []const u8) bool {
     var i: usize = 0;
-    while (store_mod.liveIndexOfPos(body, i, "<")) |lt| {
+    while (std.mem.indexOfScalarPos(u8, body, i, '<')) |lt| {
+        // A comment or CDATA spelling one of our names is not markup
+        // (in-house r1 A-SPL-103).
+        const skip_to = wbxml.skipNonElement(body, lt) catch return true;
+        if (skip_to != lt) {
+            i = skip_to;
+            continue;
+        }
         i = lt + 1;
         var name_end = lt + 1;
         while (name_end < body.len and !isNameEnd(body[name_end])) name_end += 1;
@@ -620,21 +627,22 @@ const ColSpan = struct { min: u32, max: u32, width: f32 };
 fn stagedColSpans(s: Allocator, widths: []const sheet_plan.ColumnWidth) Allocator.Error![]ColSpan {
     var spans: std.ArrayListUnmanaged(ColSpan) = .empty;
     for (widths) |cw| {
-        var i: usize = 0;
-        while (i < spans.items.len) {
-            const old = spans.items[i];
+        // The spans outside the new one survive, split where it cuts
+        // them; rebuilt whole rather than edited in place (in-house r1
+        // A-SPL-102: a removal followed by `i += 1` skipped the span
+        // that slid into the slot).
+        var kept: std.ArrayListUnmanaged(ColSpan) = .empty;
+        for (spans.items) |old| {
             if (old.max < cw.col_min or old.min > cw.col_max) {
-                i += 1;
+                try kept.append(s, old);
                 continue;
             }
-            _ = spans.orderedRemove(i);
-            if (old.min < cw.col_min) try spans.insert(s, i, .{ .min = old.min, .max = cw.col_min - 1, .width = old.width });
-            if (old.max > cw.col_max) {
-                try spans.insert(s, i + @as(usize, if (old.min < cw.col_min) 1 else 0), .{ .min = cw.col_max + 1, .max = old.max, .width = old.width });
-            }
-            i += 1;
+            if (old.min < cw.col_min) try kept.append(s, .{ .min = old.min, .max = cw.col_min - 1, .width = old.width });
+            if (old.max > cw.col_max) try kept.append(s, .{ .min = cw.col_max + 1, .max = old.max, .width = old.width });
         }
-        try spans.append(s, .{ .min = cw.col_min, .max = cw.col_max, .width = cw.width });
+        try kept.append(s, .{ .min = cw.col_min, .max = cw.col_max, .width = cw.width });
+        spans.deinit(s);
+        spans = kept;
     }
     return try spans.toOwnedSlice(s);
 }
@@ -949,11 +957,21 @@ pub fn appendRelationships(a: Allocator, rels_xml: ?[]const u8, entries: []const
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(a);
     if (rels_xml) |xml| {
-        const root = rootElement(xml) catch return error.MalformedSheetRels;
+        // A self-closed root (`<Relationships/>`) is opened — the
+        // counted tables' rule (in-house r1 B-ORC-103).
+        const root = (nextElement(xml, 0, xml.len) catch return error.MalformedSheetRels) orelse return error.MalformedSheetRels;
         if (!std.mem.eql(u8, root.name, "Relationships")) return error.MalformedSheetRels;
-        try out.appendSlice(a, xml[0..root.close_lt]);
-        for (entries) |e| try writeRelationship(a, &out, e);
-        try out.appendSlice(a, xml[root.close_lt..]);
+        if (root.self_closing) {
+            try out.appendSlice(a, xml[0..root.lt]);
+            try reopen(a, &out, xml, root);
+            for (entries) |e| try writeRelationship(a, &out, e);
+            try out.appendSlice(a, "</Relationships>");
+            try out.appendSlice(a, xml[root.end..]);
+        } else {
+            try out.appendSlice(a, xml[0..root.close_lt]);
+            for (entries) |e| try writeRelationship(a, &out, e);
+            try out.appendSlice(a, xml[root.close_lt..]);
+        }
     } else {
         try out.appendSlice(a, rels_head);
         for (entries) |e| try writeRelationship(a, &out, e);
@@ -1111,17 +1129,25 @@ pub fn extendVml(a: Allocator, vml_xml: []const u8, comments: []const sheet_plan
     var has_shapetype = false;
     var first_shape_lt: ?usize = null;
     var layout: ?Element = null;
-    for (list) |el| {
-        if (isVmlName(el, "shape")) {
-            shapes += 1;
-            if (first_shape_lt == null) first_shape_lt = el.lt;
-            if (store_mod.xmlAttrValue(el.attrs(vml_xml), "id")) |id| {
+    // Shape ids at EVERY depth — a shape inside a `v:group` holds an
+    // id of the same space (in-house r1 B-VML-104).
+    inline for (.{ "v:shape", "shape" }) |tag| {
+        var cursor: usize = 0;
+        while (wbxml.findTagOpen(vml_xml, cursor, tag) catch return error.MalformedVmlDrawing) |hit| {
+            if (wbxml.getAttr(vml_xml[hit.attrs_start..hit.attrs_end], "id")) |id| {
                 if (std.mem.startsWith(u8, id, "_x0000_s")) {
                     if (std.fmt.parseInt(u64, id["_x0000_s".len..], 10)) |n| {
                         if (n > max_id) max_id = n;
                     } else |_| {}
                 }
             }
+            cursor = hit.after_tag_close;
+        }
+    }
+    for (list) |el| {
+        if (isVmlName(el, "shape")) {
+            shapes += 1;
+            if (first_shape_lt == null) first_shape_lt = el.lt;
         } else if (isVmlName(el, "shapetype")) {
             if (store_mod.xmlAttrValue(el.attrs(vml_xml), "id")) |id| {
                 if (std.mem.eql(u8, id, "_x0000_t202")) has_shapetype = true;
@@ -1473,4 +1499,32 @@ test "S3d slice 2: the attribute rewriter keeps unknown attributes and their spe
     const subs = [_]AttrSub{ .{ .name = "count", .value = "5" }, .{ .name = "new", .value = "y" } };
     try writeTagWithAttrs(a, &out, "mergeCells", " a='1' count = \"2\"  b=\"x>y\"", &subs, ">");
     try t.expectEqualStrings("<mergeCells a='1' count=\"5\" b=\"x>y\" new=\"y\">", out.items);
+}
+
+test "S3d slice 2 r1: a self-closed rels root is opened (B-ORC-103); a shape id nested in a group counts (B-VML-104); overlapping staged spans rebuild without skipping (A-SPL-102); a decoy inside an AlternateContent block is not a mention (A-SPL-103)" {
+    const a = t.allocator;
+    const out = try appendRelationships(a, "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>", &.{.{ .id = 1, .type_uri = "T", .target = "x", .external = false }});
+    defer a.free(out);
+    try t.expectEqualStrings("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"T\" Target=\"x\"/></Relationships>", out);
+
+    const vml = try extendVml(a, "<xml xmlns:v=\"urn:schemas-microsoft-com:vml\"><v:group><v:shape id=\"_x0000_s2000\"/></v:group></xml>", &.{.{ .ref = "A1", .author = "", .text = "" }});
+    defer a.free(vml);
+    try t.expect(std.mem.indexOf(u8, vml, "id=\"_x0000_s2001\"") != null);
+
+    const spans = try stagedColSpans(a, &.{ .{ .col_min = 1, .col_max = 1, .width = 1 }, .{ .col_min = 2, .col_max = 2, .width = 2 }, .{ .col_min = 1, .col_max = 2, .width = 3 } });
+    defer a.free(spans);
+    try t.expectEqual(@as(usize, 1), spans.len);
+    try t.expectEqual(@as(u32, 1), spans[0].min);
+    try t.expectEqual(@as(u32, 2), spans[0].max);
+    const spans2 = try stagedColSpans(a, &.{ .{ .col_min = 1, .col_max = 5, .width = 1 }, .{ .col_min = 3, .col_max = 3, .width = 2 } });
+    defer a.free(spans2);
+    try t.expectEqual(@as(usize, 3), spans2.len);
+
+    var st: sheet_plan.SheetState = .{};
+    defer st.deinit(a);
+    try st.addMergedCell(a, "A1:A2");
+    const src = "<worksheet " ++ ws_ns ++ "><sheetData/><mc:AlternateContent><!-- <mergeCells/> --><mc:Choice><![CDATA[<hyperlinks>]]></mc:Choice></mc:AlternateContent></worksheet>";
+    const spliced = try splice(a, src, &st, .{ .ns_r = ns_r_uri });
+    defer a.free(spliced);
+    try t.expect(std.mem.indexOf(u8, spliced, "<mergeCells count=\"1\"><mergeCell ref=\"A1:A2\"/></mergeCells><mc:AlternateContent>") != null);
 }

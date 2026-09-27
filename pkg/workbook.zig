@@ -2215,8 +2215,11 @@ pub const Workbook = struct {
     /// names extended, else `xl/comments{N}.xml` created) and the VML
     /// drawing (the one `<legacyDrawing>` names extended, else
     /// `xl/drawings/vmlDrawing{N}.vml` created with the element). Every
-    /// byte is computed before the first install, so a failure leaves
-    /// the store as it was.
+    /// byte is computed before the first install; the new parts are
+    /// added first and every replaced part lands in one `replaceParts`,
+    /// so a failure leaves at worst a part nothing names (an orphan the
+    /// next save does not duplicate), and the sheet's registrations
+    /// are drained the moment its parts are in the live store.
     fn applySheetStateInto(self: *Workbook, store: *PartStore, ws: *Worksheet) Error!void {
         const a = self.allocator;
         const st = &ws.sheet_state;
@@ -2317,21 +2320,54 @@ pub const Workbook = struct {
             null;
         defer if (new_rels) |x| a.free(x);
 
-        // The installs — the sheet last, so no consumer sees a
-        // relationship it names before the part it targets is there.
+        // The installs: the NEW parts first (a part nothing names yet
+        // is an orphan a failure can leave — never a duplicate), then
+        // every replaced part in ONE `replaceParts` (atomic against
+        // allocation failure), the sheet among them, so no consumer
+        // sees a relationship before its target. Then THIS sheet's
+        // registrations are drained on the live store, so a later
+        // sheet's failure leaves them rendered and unstaged, never
+        // rendered twice by the next save (in-house r1 A-ORCH-101 /
+        // B-ORC-101: three failed-then-fixed saves gave the merge
+        // three times). On the fold's candidate nothing is drained:
+        // the swap drains, a failed transaction discards the candidate.
         if (comments_xml) |bytes| {
-            if (comments_created) try store.addPart(comments_name.?, comments_content_type, bytes) else try store.replacePart(comments_name.?, bytes);
+            if (comments_created) try store.addPart(comments_name.?, comments_content_type, bytes);
         }
         if (vml_xml) |bytes| {
-            if (vml_created) try store.addPart(vml_name.?, vml_content_type, bytes) else try store.replacePart(vml_name.?, bytes);
+            if (vml_created) try store.addPart(vml_name.?, vml_content_type, bytes);
         }
         if (new_rels) |bytes| {
-            if (rels_part != null) try store.replacePart(rels_name, bytes) else try store.addPart(rels_name, rels_content_type, bytes);
+            if (rels_part == null) try store.addPart(rels_name, rels_content_type, bytes);
         }
-        try store.replacePart(part_name, new_sheet);
-        // The parsed view borrowed the part's bytes; its merges,
-        // hyperlinks, validations and freeze pane are stale now.
+        var replacements: [4]PartStore.Replacement = undefined;
+        var n_repl: usize = 0;
+        if (comments_xml) |bytes| {
+            if (!comments_created) {
+                replacements[n_repl] = .{ .name = comments_name.?, .bytes = bytes };
+                n_repl += 1;
+            }
+        }
+        if (vml_xml) |bytes| {
+            if (!vml_created) {
+                replacements[n_repl] = .{ .name = vml_name.?, .bytes = bytes };
+                n_repl += 1;
+            }
+        }
+        if (new_rels) |bytes| {
+            if (rels_part != null) {
+                replacements[n_repl] = .{ .name = rels_name, .bytes = bytes };
+                n_repl += 1;
+            }
+        }
+        replacements[n_repl] = .{ .name = part_name, .bytes = new_sheet };
+        n_repl += 1;
+        try store.replaceParts(replacements[0..n_repl]);
         if (store == &self.store) {
+            ws.sheet_state.deinit(a);
+            ws.sheet_state = .{};
+            // The parsed view borrowed the part's bytes; its merges,
+            // hyperlinks, validations and freeze pane are stale now.
             if (ws.parsed) |*p| {
                 var stale = p.*;
                 stale.deinit(a);
@@ -14478,8 +14514,18 @@ pub const Worksheet = struct {
         try self.sheet_state.freezePanes(freeze_rows, freeze_cols);
     }
 
+    /// A registration's text is judged for XML content at the
+    /// registration — a C0 control byte other than tab, LF or CR is
+    /// `InvalidXmlByte` here, never at the save (in-house r1
+    /// B-ORC-102: a byte the escaper refuses left a handle that could
+    /// not save and could not un-stage). `setCell`'s rule.
+    fn xmlText(s: []const u8) RegistrationError!void {
+        try sheet_plan.assertNoForbiddenXmlBytes(s);
+    }
+
     pub fn setAutoFilter(self: *Worksheet, range: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
         try self.sheet_state.setAutoFilter(self.workbook.allocator, range);
     }
 
@@ -14488,6 +14534,7 @@ pub const Worksheet = struct {
     /// sheet with overlapping merges by dropping them.
     pub fn addMergedCell(self: *Worksheet, range: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
         try sheet_plan.validateMergeRange(range);
         const new = try mergeRect(range);
         const view = try self.ensureParsed();
@@ -14505,11 +14552,15 @@ pub const Worksheet = struct {
 
     pub fn addHyperlink(self: *Worksheet, range: []const u8, url: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(url);
         try self.sheet_state.addHyperlink(self.workbook.allocator, range, url);
     }
 
     pub fn addInternalHyperlink(self: *Worksheet, range: []const u8, location: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(location);
         try self.sheet_state.addInternalHyperlink(self.workbook.allocator, range, location);
     }
 
@@ -14522,6 +14573,9 @@ pub const Worksheet = struct {
     /// `MalformedSheetRels`.
     pub fn addComment(self: *Worksheet, ref: []const u8, author: []const u8, text: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(ref);
+        try xmlText(author);
+        try xmlText(text);
         if (ref.len == 0 or std.mem.indexOfScalar(u8, ref, ':') != null) return error.InvalidCommentRef;
         const target = sheet_plan.parseA1Corner(ref) catch return error.InvalidHyperlinkRange;
         for (self.sheet_state.comments.items) |c| {
@@ -14534,6 +14588,8 @@ pub const Worksheet = struct {
 
     pub fn addDataValidationList(self: *Worksheet, range: []const u8, values: []const []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        for (values) |v| try xmlText(v);
         try self.sheet_state.addDataValidationList(self.workbook.allocator, range, values);
     }
 
@@ -14547,11 +14603,16 @@ pub const Worksheet = struct {
         needs_two: bool,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(formula1);
+        if (formula2) |f| try xmlText(f);
         try self.sheet_state.addDataValidationRange(self.workbook.allocator, range, kind_name, op_name, formula1, formula2, needs_two);
     }
 
     pub fn addDataValidationCustom(self: *Worksheet, range: []const u8, formula: []const u8) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(formula);
         try self.sheet_state.addDataValidationCustom(self.workbook.allocator, range, formula);
     }
 
@@ -14564,6 +14625,9 @@ pub const Worksheet = struct {
         dxf_id: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(formula1);
+        if (formula2) |f| try xmlText(f);
         try self.sheet_state.addConditionalFormatCellIs(
             self.workbook.allocator,
             range,
@@ -14582,6 +14646,8 @@ pub const Worksheet = struct {
         dxf_id: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
+        try xmlText(formula);
         try self.sheet_state.addConditionalFormatExpression(
             self.workbook.allocator,
             range,
@@ -14599,6 +14665,7 @@ pub const Worksheet = struct {
         high_color_argb: u32,
     ) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
         try self.sheet_state.addConditionalFormatColorScale(
             self.workbook.allocator,
             range,
@@ -14610,6 +14677,7 @@ pub const Worksheet = struct {
 
     pub fn addConditionalFormatDataBar(self: *Worksheet, range: []const u8, color_argb: u32) RegistrationError!void {
         try self.ensureSpliceable();
+        try xmlText(range);
         try self.sheet_state.addConditionalFormatDataBar(self.workbook.allocator, range, color_argb);
     }
 
@@ -35194,4 +35262,123 @@ test "S3d slice 2: every allocation failure across open, the registrations and t
         }
     };
     try std.testing.checkAllAllocationFailures(a, H.run, .{ io, src });
+}
+
+test "S3d slice 2 r1: a later sheet's failure at the save leaves the earlier sheet rendered once and drained — the repaired save adds nothing twice; a once-failing allocator, retried, renders every registration once (A-ORCH-101 / B-ORC-101); a control byte is judged at the registration (B-ORC-102)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const src = try writeS3d2Fixture(a, io, dir, "s3d2_r1_atomic.xlsx");
+    defer a.free(src);
+    const good_t = "<worksheet " ++ s3d1_ns ++ "><sheetData/></worksheet>";
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const s = try wb.sheet(0);
+        const t = try wb.sheet(1);
+        // Sheet T's part is readable at the registration but its `<cols>`
+        // record has no readable `min` — the save refuses at T, after S.
+        try t.setColumnWidth(0, 9);
+        try wb.store.replacePart("xl/worksheets/sheet2.xml", "<worksheet " ++ s3d1_ns ++ "><cols><col max=\"2\" width=\"9\"/></cols><sheetData/></worksheet>");
+        try s.addMergedCell("C5:D5");
+        try s.addComment("B3", "bob", "new");
+        try s.addHyperlink("A4", "https://b.example/");
+        try std.testing.expectError(error.MalformedSheetXml, wb.applySavePlans());
+        try std.testing.expect(!s.hasStagedSheetWork());
+        try std.testing.expect(t.hasStagedSheetWork());
+        try wb.store.replacePart("xl/worksheets/sheet2.xml", good_t);
+        try wb.applySavePlans();
+        try std.testing.expect(!wb.hasStagedSheetWork());
+        const sheet1 = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet1.xml");
+        defer a.free(sheet1);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet1, "<mergeCell ref=\"C5:D5\"/>"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet1, "<hyperlink ref=\"A4\""));
+        const comments = try s3d1PartBytes(a, &wb, "xl/comments1.xml");
+        defer a.free(comments);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, comments, "<comment ref=\"B3\""));
+        const vml = try s3d1PartBytes(a, &wb, "xl/drawings/vmlDrawing1.vml");
+        defer a.free(vml);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, vml, "<v:shape "));
+        const sheet2 = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet2.xml");
+        defer a.free(sheet2);
+        try std.testing.expectEqualStrings("<worksheet " ++ s3d1_ns ++ "><cols><col min=\"1\" max=\"1\" width=\"9\" customWidth=\"1\"/></cols><sheetData/></worksheet>", sheet2);
+    }
+    // Every allocation failure inside the save, then the retry: the
+    // file carries each registration exactly once.
+    {
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            var wb = try Workbook.open(a, io, src);
+            defer wb.deinit();
+            const s = try wb.sheet(0);
+            const t = try wb.sheet(1);
+            try s.addMergedCell("C5:D5");
+            try s.addComment("B3", "bob", "new");
+            try s.addHyperlink("A4", "https://b.example/");
+            try t.addComment("A1", "carol", "t");
+            try t.addMergedCell("A2:B2");
+            // The failing allocator drives the save's own allocations
+            // only: swap it in for the phase, back for the retry.
+            const real = wb.allocator;
+            wb.allocator = failing.allocator();
+            const first = wb.applySavePlans();
+            wb.allocator = real;
+            if (first) |_| {
+                try std.testing.expect(!failing.has_induced_failure);
+                break;
+            } else |e| {
+                try std.testing.expectEqual(error.OutOfMemory, e);
+                try std.testing.expect(failing.has_induced_failure);
+            }
+            try wb.applySavePlans();
+            const sheet1 = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet1.xml");
+            defer a.free(sheet1);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet1, "<mergeCell ref=\"C5:D5\"/>"));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet1, "<hyperlink ref=\"A4\""));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet1, "<legacyDrawing "));
+            const comments = try s3d1PartBytes(a, &wb, "xl/comments1.xml");
+            defer a.free(comments);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, comments, "<comment ref=\"B3\""));
+            const vml = try s3d1PartBytes(a, &wb, "xl/drawings/vmlDrawing1.vml");
+            defer a.free(vml);
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, vml, "<v:shape "));
+            const rels1 = try s3d1PartBytes(a, &wb, "xl/worksheets/_rels/sheet1.xml.rels");
+            defer a.free(rels1);
+            try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, rels1, "<Relationship "));
+            const sheet2 = try s3d1PartBytes(a, &wb, "xl/worksheets/sheet2.xml");
+            defer a.free(sheet2);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet2, "<mergeCell ref=\"A2:B2\"/>"));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sheet2, "<legacyDrawing "));
+            const rels2 = try s3d1PartBytes(a, &wb, "xl/worksheets/_rels/sheet2.xml.rels");
+            defer a.free(rels2);
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rels2, "<Relationship "));
+            // An orphan a failure between two adds can leave is a part
+            // nothing names; the reader ignores it.
+            try std.testing.expect(!wb.store.hasPart("xl/comments4.xml"));
+        }
+    }
+    // A control byte in any text is refused at the registration.
+    {
+        var wb = try Workbook.open(a, io, src);
+        defer wb.deinit();
+        const s = try wb.sheet(0);
+        try std.testing.expectError(error.InvalidXmlByte, s.addComment("D9", "b\x01d", "t"));
+        try std.testing.expectError(error.InvalidXmlByte, s.addComment("D9", "b", "t\x00"));
+        try std.testing.expectError(error.InvalidXmlByte, s.addHyperlink("D9", "https://x/\x02"));
+        try std.testing.expectError(error.InvalidXmlByte, s.addInternalHyperlink("D9", "T!\x03A1"));
+        try std.testing.expectError(error.InvalidXmlByte, s.addDataValidationList("D9", &.{"a\x1f"}));
+        try std.testing.expectError(error.InvalidXmlByte, s.addDataValidationCustom("D9", "D9>\x01"));
+        try std.testing.expectError(error.InvalidXmlByte, s.addDataValidationRange("D9", "whole", "between", "1", "2\x01", true));
+        try std.testing.expectError(error.InvalidXmlByte, s.addConditionalFormatExpression("D9", "D9>\x01", 0));
+        try std.testing.expectError(error.InvalidXmlByte, s.addConditionalFormatCellIs("D9", .equal, "\x01", null, 0));
+        try std.testing.expect(!s.hasStagedSheetWork());
+        try s.addComment("D9", "tab\tok", "lf\nok");
+        try wb.applySavePlans();
+    }
 }

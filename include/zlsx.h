@@ -2795,10 +2795,21 @@ int32_t zlsx_editor_set_cell_style(zlsx_editor_t * ed,
  * rule — Excel keeps both); a `_xlnm._FilterDatabase` defined name
  * naming the replaced auto-filter's range (left as the producer wrote
  * it); a <selection> naming a pane the new split lacks (left); a
- * <row> without a readable `r` (neither matched nor an anchor). A
- * comment's author and text, a hyperlink's URL and a validation's
- * formulas are XML-escaped on emit; a C0 control byte other than tab,
- * LF or CR in any of them fails the save (InvalidXmlByte). */
+ * <row> without a readable `r` (neither matched nor an anchor); a
+ * comments part's lowercase `ref` (never matched by CommentRefTaken);
+ * a staged internal hyperlink `location`, validation or rule formula
+ * naming ANOTHER sheet that a later rename_sheet / row or column edit
+ * on that sheet moves (the staged string is neither rewritten nor
+ * refused — the rule for a staged set_cell formula; save first). A
+ * comment's author and text, a hyperlink's URL, a validation's values
+ * and every formula are XML-escaped on emit; a C0 control byte other
+ * than tab, LF or CR in any of them is -1 InvalidXmlByte at the
+ * registration, nothing staged. freeze_panes(0, 0) reads the part and
+ * clears a previously staged freeze. The installs are per sheet: the
+ * new parts added first, every replaced part in one atomic
+ * replacement, the sheet's registrations drained the moment its parts
+ * are in — a later sheet's refusal at the save leaves the earlier
+ * ones rendered once, never twice. */
 int32_t zlsx_editor_set_column_width(zlsx_editor_t * ed, uint32_t sheet_idx,
         uint32_t col_idx, float width,
         zlsx_diag_v1 * diag, char * errbuf, size_t errbuf_len);

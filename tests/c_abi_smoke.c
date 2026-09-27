@@ -257,4 +257,5 @@ static const void *const s3d2_exports[] = {
     (const void *)&zlsx_editor_add_conditional_format_color_scale,
     (const void *)&zlsx_editor_add_conditional_format_data_bar,
 };
+const void *zlsx_c_abi_smoke_anchor_s3d2(void);
 const void *zlsx_c_abi_smoke_anchor_s3d2(void) { return s3d2_exports[0]; }
